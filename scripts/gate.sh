@@ -30,10 +30,11 @@
 # the `serial-pg` suites and every test container (started through
 # `gate_ownership::GateOwned`) - carries the run's labels
 # `deltaforge.gate.run=<run id>` and `deltaforge.gate.owner=<host>:<boot
-# id>:<pid>:<start time>` of the gate process. On exit, failure or
-# interruption (INT/TERM: the suites are stopped first) the gate removes
-# exactly its own run's containers with their anonymous volumes, and volumes
-# carrying its run label. At start it also removes the resources of earlier
+# id>:<pid>:<start time>` of the gate process. On every exit - success,
+# failure, a shell error, INT/TERM/HUP - the gate stops and waits for every
+# process it started, then removes exactly its own run's containers with
+# their anonymous volumes, and volumes carrying its run label (a SIGKILLed
+# gate cannot: the next gate reaps its run as stale). At start it also removes the resources of earlier
 # runs whose owner is provably gone (same host; another boot, or no process
 # with that pid and start time); a run of another host, of a live owner, or
 # without a readable owner is never touched. A test container created during
@@ -41,8 +42,9 @@
 # reported, not removed. Linux only (/proc).
 #
 # For testing the gate itself (scripts/gate-selftest.sh): GATE_MANIFEST
-# overrides the manifest, and GATE_ONLY_SUITES=1 skips the static checks and
-# the workspace tests.
+# overrides the manifest, GATE_ONLY_SUITES=1 skips the static checks and the
+# workspace tests, and GATE_SELFTEST_BLOCK=<file> first runs a step that
+# blocks until interrupted.
 set -u
 ROOT=$(git rev-parse --show-toplevel)
 cd "$ROOT"
@@ -199,8 +201,20 @@ stop_children() {
   [ -n "$ps" ] && kill -KILL $ps 2>/dev/null
   wait 2>/dev/null
 }
-trap cleanup EXIT
-trap 'trap - INT TERM; echo "gate: interrupted" >&2; stop_children; cleanup; exit 130' INT TERM
+# Every exit - success, failure, a shell error, INT/TERM/HUP - runs one
+# handler: stop and wait for every descendant, then remove this run's
+# resources, then exit with the status the gate was leaving with (130 when
+# interrupted). Signals are ignored while it runs, so it runs once. SIGKILL
+# cannot be handled: its containers are reaped as stale by the next gate.
+finish() { # status
+  trap '' INT TERM HUP
+  trap - EXIT
+  stop_children
+  cleanup
+  exit "$1"
+}
+trap 'finish $?' EXIT
+trap 'echo "gate: interrupted" >&2; finish 130' INT TERM HUP
 reap_stale
 
 echo "tier $TIER" > "$OUT/summary"
@@ -234,6 +248,12 @@ suite() {
 export -f run summ suite
 
 lane() { grep -E "^$1[[:space:]]" "$MANIFEST" | awk '{$1=""; print substr($0, 2)}'; }
+
+# Self-test only: a step that blocks until interrupted (its pid in the file).
+if [ -n "${GATE_SELFTEST_BLOCK:-}" ]; then
+  run selftest-block "$OUT/selftest-block.log" \
+    bash -c 'echo $$ > "$GATE_SELFTEST_BLOCK"; exec sleep 600'
+fi
 
 # ---- static checks and workspace tests
 if [ "${GATE_ONLY_SUITES:-}" != 1 ]; then

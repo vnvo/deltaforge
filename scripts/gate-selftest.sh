@@ -8,6 +8,10 @@
 #                   without the labels fails the gate and is left alone
 #   SIGINT          the probe hangs; SIGINT to the gate stops the suite and
 #                   removes the probe's container (exit 130)
+#   SIGINT during   a step before the suites blocks (GATE_SELFTEST_BLOCK,
+#   a step          through the gate's own step runner); SIGINT stops the gate
+#                   within 10 s (130), the step is gone and the run's
+#                   container is removed
 #
 # Around both runs it plants containers of other runs: a stale run (owner
 # process gone) that the gate start removes, and a live run and another
@@ -114,9 +118,37 @@ check "the run's containers are removed" run_gone "$run_id"
 check "no suite process is left" bash -c '! pgrep -f "deps/gate_probe-[0-9a-f]" >/dev/null'
 others_kept
 
+echo "== SIGINT during a step"
+set -m
+GATE_SELFTEST_BLOCK="$S/block" gate "$TAG-step" > "$S/step.out" 2>&1 &
+gate_pid=$!
+set +m
+for _ in $(seq 120); do [ -s "$S/block" ] && break; sleep 1; done
+blocker=$(cat "$S/block" 2>/dev/null)
+run_id=$(cat "$S/gate/$TAG-step/run-id" 2>/dev/null)
+blocking() { [ -n "$blocker" ] && kill -0 "$blocker" 2>/dev/null; }
+check "the blocking step runs" blocking
+OWNED=$(docker run -d --label "deltaforge.gate.selftest=$TAG" --label "$RUN_LABEL=$run_id" \
+  --entrypoint sleep postgres:17 3600)
+kill -INT $gate_pid
+for _ in $(seq 10); do kill -0 $gate_pid 2>/dev/null || break; sleep 1; done
+if kill -0 $gate_pid 2>/dev/null; then
+  check "the gate stops within 10 s of SIGINT during a step" false
+  kill -KILL -- -$gate_pid 2>/dev/null
+else
+  check "the gate stops within 10 s of SIGINT during a step" true
+fi
+wait $gate_pid
+rc=$?
+check "the interrupted gate exits 130 (rc=$rc)" [ "$rc" -eq 130 ]
+check "the blocking step is gone" bash -c "! kill -0 $blocker 2>/dev/null"
+check "the run's container is removed" gone "$OWNED"
+check "the run's containers are removed" run_gone "$run_id"
+kill -KILL "$blocker" 2>/dev/null
+
 if [ $fails -ne 0 ]; then
-  echo "gate self-test FAILED (logs: fail.out, int.out)"
-  cat "$S/fail.out" "$S/int.out" | tail -40
+  echo "gate self-test FAILED (logs: fail.out, int.out, step.out)"
+  cat "$S/fail.out" "$S/int.out" "$S/step.out" | tail -40
   exit 1
 fi
 echo "gate self-test ok"
