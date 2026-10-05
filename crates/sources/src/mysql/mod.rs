@@ -359,6 +359,12 @@ enum MyStart {
 struct MyGenerationRun {
     anchor: MySqlCheckpoint,
     generation: u64,
+    /// The run that owns the generation, and its publisher: the rows are
+    /// recorded produced and the terminal barrier sent only once every
+    /// final check passed, the anchor baselines included
+    /// ([`MySqlSource::finish_generation`]).
+    run: String,
+    publisher: Arc<crate::snapshot_publish::GenerationPublisher>,
 }
 
 impl MySqlSource {
@@ -997,8 +1003,8 @@ impl MySqlSource {
         drop(extras);
         drop(permits);
 
-        // 7. The anchor's binlog still there, then the rows are produced and
-        // the terminal barrier carries the completing position.
+        // 7. The anchor's binlog still there. The rows are recorded produced
+        // only after the anchor baselines too ([`Self::finish_generation`]).
         let final_started = std::time::Instant::now();
         mysql_health::verify_binlog_position(
             self.dsn.expose(),
@@ -1007,6 +1013,29 @@ impl MySqlSource {
         )
         .await
         .map_err(|e| typed(e, "post-snapshot binlog position verification"))?;
+        crate::snapshot_probe::record_phase(
+            crate::snapshot_probe::Phase::Finalization,
+            final_started.elapsed(),
+        );
+        Ok(MyGenerationRun {
+            anchor: position,
+            generation: control.generation,
+            run,
+            publisher,
+        })
+    }
+
+    /// The last step of a generation, once every final check passed - the
+    /// anchor baselines of its tables established included: `rows_produced`,
+    /// then the terminal barrier with the completing position. Only from
+    /// here can the generation complete (design section 4); a crash before
+    /// it leaves the generation `running`, replaced at the next start.
+    async fn finish_generation(
+        &self,
+        ran: &MyGenerationRun,
+    ) -> SourceResult<()> {
+        let other = |e: anyhow::Error| SourceError::Other(e);
+        let queue = self.queue();
         let current = match queue.read().await {
             Ok(Some(crate::snapshot_queue::Stored::Current {
                 version,
@@ -1014,24 +1043,24 @@ impl MySqlSource {
             })) => (version, *control),
             other_state => {
                 return Err(self
-                    .concurrent_owner(control.generation, &run)
+                    .concurrent_owner(ran.generation, &ran.run)
                     .await
                     .unwrap_or_else(|| {
                         other(anyhow::anyhow!(
-                            "the snapshot control record changed during the \
-                             copy: {other_state:?}"
+                            "the snapshot control record changed before the \
+                             rows were produced: {other_state:?}"
                         ))
                     }));
             }
         };
         let produced = match queue
-            .rows_produced(current.0, &current.1, &run)
+            .rows_produced(current.0, &current.1, &ran.run)
             .await
         {
             Ok((_, produced)) => produced,
             Err(e) => {
                 return Err(self
-                    .concurrent_owner(control.generation, &run)
+                    .concurrent_owner(ran.generation, &ran.run)
                     .await
                     .unwrap_or_else(|| {
                         other(anyhow::anyhow!("record the rows produced: {e}"))
@@ -1041,30 +1070,24 @@ impl MySqlSource {
         let completing = serde_json::to_vec(&MySqlCheckpoint {
             snapshot_completed: Some(produced.generation),
             snapshot_chain: Some(produced.snapshot_chain.clone()),
-            ..position.clone()
+            ..ran.anchor.clone()
         })
         .map_err(|e| other(e.into()))?;
-        if let Err(e) = publisher.terminal(completing).await {
+        if let Err(e) = ran.publisher.terminal(completing).await {
             return Err(self
-                .concurrent_owner(control.generation, &run)
+                .concurrent_owner(ran.generation, &ran.run)
                 .await
                 .unwrap_or_else(|| other(e.into())));
         }
-        crate::snapshot_probe::record_phase(
-            crate::snapshot_probe::Phase::Finalization,
-            final_started.elapsed(),
-        );
         info!(
             source_id = %self.id,
             generation = produced.generation,
-            file = %position.file,
-            pos = position.pos,
-            "snapshot rows produced; the stream starts at the anchor"
+            file = %ran.anchor.file,
+            pos = ran.anchor.pos,
+            "snapshot rows produced; the stream continues from the anchor"
         );
-        Ok(MyGenerationRun {
-            anchor: position,
-            generation: produced.generation,
-        })
+        crate::snapshot_probe::after_terminal().await;
+        Ok(())
     }
 }
 
@@ -1567,9 +1590,11 @@ impl MySqlSource {
         // 7.21). CDC startup work is independent of the catalog.
         ctx.schema.check_binlog_row_image().await?;
         // A snapshot just copied its plan's tables: prove each at the anchor
-        // now (no gap until its first CDC rows), page by page; then record
-        // completion once the frozen policy's frontier covers the terminal
-        // (completion reclaims the plan).
+        // now (no gap until its first CDC rows), page by page, before the
+        // rows are recorded produced and the terminal barrier is sent; then
+        // record completion once the frozen policy's frontier covers the
+        // terminal (completion reclaims the plan). Nothing has been read
+        // from the stream yet.
         if let Some(ran) = &generation_run {
             let mut plan = mysql_snapshot::PlanPages::new(
                 self.queue(),
@@ -1592,6 +1617,10 @@ impl MySqlSource {
                     break;
                 }
             }
+            // Every final check passed, the baselines included: only now
+            // the rows are produced and the terminal barrier is sent, so a
+            // completed generation always has its baselines.
+            self.finish_generation(ran).await?;
             crate::snapshot_driver::spawn_completion_watch(
                 generation_inputs
                     .clone()

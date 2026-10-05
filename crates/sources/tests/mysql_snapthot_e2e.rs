@@ -363,6 +363,138 @@ async fn mysql_an_interrupted_snapshot_restarts_in_full() -> Result<()> {
     Ok(())
 }
 
+/// Baselines precede completion: the process crashes at the earliest point
+/// the generation can complete - right after the sinks acknowledged its
+/// terminal barrier. Every snapshotted table's anchor baseline is already
+/// durable, and the restart completes the generation without copying again
+/// and streams on.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_baselines_precede_completion() -> Result<()> {
+    use sources::snapshot_probe;
+    use storage::adapters::{LineageDescriptor, SchemaKey};
+    let _probe = PROBED_RUN.write().await;
+    let (db, pool, _dsn) = mysql_setup("snap_base").await?;
+    let mut conn = pool.get_conn().await?;
+    conn.query_drop(format!("USE {db}")).await?;
+    for tbl in ["ta", "tb"] {
+        conn.query_drop(format!(
+            "CREATE TABLE {tbl} (id INT PRIMARY KEY, v INT); \
+             INSERT INTO {tbl} VALUES (1, 1), (2, 2);"
+        ))
+        .await?;
+        conn.query_drop(format!(
+            "GRANT SELECT ON {db}.{tbl} TO '{MYSQL_CDC_USER}'@'%'"
+        ))
+        .await?;
+    }
+    let backend = make_storage_backend().await;
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let tables = vec![format!("{db}.ta"), format!("{db}.tb")];
+    let cfg = || SnapshotCfg {
+        mode: SnapshotMode::Initial,
+        ..Default::default()
+    };
+    let id = "snap-base";
+
+    // Generation 1, until the sink acknowledged its terminal barrier.
+    let src = make_source_on(
+        backend.clone(),
+        id,
+        &db,
+        tables.clone(),
+        cfg(),
+        Default::default(),
+    )
+    .await;
+    let (reached, _release) = snapshot_probe::hold_after_terminal();
+    let (tx, _rx) = test_common::acked_channel(&src, &ckpt, &src.id, 256);
+    let handle = src.run(tx, ckpt.clone()).await;
+    tokio::time::timeout(Duration::from_secs(120), reached.notified())
+        .await
+        .expect("the terminal barrier is sent");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let acked = ckpt
+            .get_raw(&format!("{id}::sink::{}", test_common::TEST_SINK))
+            .await?
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .is_some_and(|v| v.get("snapshot_completed").is_some());
+        if acked {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "never acknowledged");
+        sleep(Duration::from_millis(50)).await;
+    }
+    // The crash: nothing more happens in this process.
+    handle.join.abort();
+    let _ = handle.join.await;
+    assert_eq!(
+        test_common::snapshot_state(&backend, id).await,
+        Some(("rows_produced".into(), 1)),
+        "not completed before the crash"
+    );
+
+    // The baselines are already durable.
+    let server_uuid: String = conn
+        .query_first("SELECT @@global.server_uuid")
+        .await?
+        .expect("server_uuid");
+    let hash = LineageDescriptor::mysql(&server_uuid)
+        .unwrap()
+        .lineage_hash();
+    for tbl in ["ta", "tb"] {
+        let key = SchemaKey::new("acme", id, &hash, &db, tbl).backend_key();
+        let records: Vec<serde_json::Value> = backend
+            .log_list("schemas.v1.activation", &key)
+            .await?
+            .into_iter()
+            .map(|(_, b)| serde_json::from_slice(&b).unwrap())
+            .collect();
+        assert!(
+            records.iter().any(|r| r["kind"] == "baseline"),
+            "{tbl}: no baseline before completion: {records:?}"
+        );
+    }
+
+    // The restart completes it without copying and streams (one schema
+    // registry across the restart, as in production).
+    let registry = src.registry.clone();
+    let src = MySqlSource {
+        registry,
+        ..make_source_on(
+            backend.clone(),
+            id,
+            &db,
+            tables,
+            cfg(),
+            Default::default(),
+        )
+        .await
+    };
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 256);
+    let handle = src.run(tx, ckpt.clone()).await;
+    sleep(Duration::from_secs(3)).await;
+    conn.query_drop("INSERT INTO ta VALUES (3, 3)").await?;
+    let events = collect_until(&mut rx, Duration::from_secs(30), |e| {
+        e.iter().any(|x| matches!(x.op, Op::Create))
+    })
+    .await;
+    handle.stop();
+    handle.join.await.ok();
+    assert!(
+        events.iter().all(|e| !matches!(e.op, Op::Read)),
+        "nothing copied again"
+    );
+    assert!(events.iter().any(|e| matches!(e.op, Op::Create)), "streams");
+    assert_eq!(
+        test_common::snapshot_state(&backend, id).await,
+        Some(("completed".into(), 1))
+    );
+    mysql_drop_db(&pool, &db).await;
+    Ok(())
+}
+
 /// Snapshot uses PK-range chunking for integer PK tables.
 #[tokio::test]
 #[ignore = "requires docker"]

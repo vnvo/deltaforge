@@ -248,6 +248,26 @@ pub(crate) fn record_boundary(bytes: usize, d: std::time::Duration) {
     BOUNDARY_MICROS.fetch_add(d.as_micros() as u64, Ordering::Relaxed);
 }
 
+/// One armed hold right after a generation's terminal barrier was sent.
+static AFTER_TERMINAL: Mutex<Option<(Arc<Notify>, Arc<Notify>)>> =
+    Mutex::new(None);
+
+/// Arm a hold right after the next terminal barrier is sent: the first
+/// notify fires when it is reached, the second releases it.
+pub fn hold_after_terminal() -> (Arc<Notify>, Arc<Notify>) {
+    let pair = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    *AFTER_TERMINAL.lock().expect("not poisoned") = Some(pair.clone());
+    pair
+}
+
+pub(crate) async fn after_terminal() {
+    let armed = AFTER_TERMINAL.lock().expect("not poisoned").take();
+    if let Some((reached, release)) = armed {
+        reached.notify_one();
+        release.notified().await;
+    }
+}
+
 /// One armed hold after preparation, right before the snapshot anchor.
 static BEFORE_ANCHOR: Mutex<Option<(Arc<Notify>, Arc<Notify>)>> =
     Mutex::new(None);
