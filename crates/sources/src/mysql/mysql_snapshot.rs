@@ -94,9 +94,6 @@ pub fn progress_key(source_id: &str) -> String {
 /// treating a store error or corrupt bytes as "no progress" would restart the
 /// whole snapshot - re-exporting rows and, for a finished snapshot, discarding
 /// the saved CDC start position.
-// The legacy classification reads pre-queue progress with it (design
-// section 10).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn load_snapshot_progress(
     store: &dyn CheckpointStore,
     source_id: &str,

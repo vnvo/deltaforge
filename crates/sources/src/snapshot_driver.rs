@@ -87,10 +87,27 @@ pub fn sink_state<E: EngineOrder>(
                 }
             }
             Some((Some(_), _)) => Foreign,
-            // A completion written before chains: a legacy position.
-            Some((None, _)) => Behind,
+            // A completion written before chains (MySQL, #131): it completes
+            // only the generation it names, at exactly its anchor - a legacy
+            // generation upgraded in place keeps its number; every later one
+            // is above the legacy ones. Anything else is a legacy position.
+            Some((None, g)) => match anchor {
+                Some(a)
+                    if g == generation
+                        && engine.anchor_vs_stream(a, raw)
+                            == deltaforge_core::CheckpointOrder::Equal =>
+                {
+                    AtOrPast
+                }
+                _ => Behind,
+            },
             None => match anchor.map(|a| engine.anchor_vs_stream(a, raw)) {
                 Some(deltaforge_core::CheckpointOrder::Before) => AtOrPast,
+                Some(deltaforge_core::CheckpointOrder::Equal)
+                    if engine.unmarked_completion_at_anchor() =>
+                {
+                    AtOrPast
+                }
                 Some(deltaforge_core::CheckpointOrder::Incomparable) => Foreign,
                 _ => Behind,
             },
@@ -130,8 +147,14 @@ pub enum DriverError {
          snapshot control record: the snapshot state was lost"
     )]
     StateMissing { sink: String },
-    #[error("legacy snapshot state is classified by the upgrade path")]
-    Legacy,
+    #[error("legacy snapshot state cannot be classified: {0}")]
+    Legacy(String),
+    #[error(
+        "the legacy snapshot generation {generation} is not proven complete \
+         ({why}), and snapshot mode 'never' cannot complete it; set mode \
+         'initial' to copy it again once (a full recopy)"
+    )]
+    LegacyUnproven { generation: u64, why: String },
     #[error("cancelled")]
     Cancelled,
 }
@@ -148,6 +171,36 @@ pub enum Allocation {
     PolicyChanged,
     /// Mode `always` re-snapshots a completed generation.
     Always,
+    /// A legacy snapshot without proof of its completion: one full recopy
+    /// in a new chain.
+    Legacy,
+}
+
+/// What an engine knows about a legacy (pre-queue) snapshot, from its own
+/// progress record (design section 10).
+#[derive(Debug, Clone)]
+pub struct LegacyProof<A> {
+    /// The legacy snapshot's anchor, when its progress records one this
+    /// release trusts: `None` - nothing can prove it complete (one recopy).
+    pub anchor: Option<(A, EngineAnchor)>,
+    /// The generation a legacy completion mark names (MySQL #131).
+    pub mark_generation: Option<u64>,
+    /// Why it is unproven, for an actionable refusal in mode `never`.
+    pub unproven: Option<String>,
+    /// The legacy state cannot be classified (an unknown anchor version, a
+    /// corrupt progress record): refused, everything left untouched.
+    pub refused: Option<String>,
+}
+
+impl<A> Default for LegacyProof<A> {
+    fn default() -> Self {
+        Self {
+            anchor: None,
+            mark_generation: None,
+            unproven: None,
+            refused: None,
+        }
+    }
 }
 
 /// What a start does.
@@ -182,6 +235,9 @@ pub struct StartInput<'a, E: EngineOrder> {
     pub mode: SnapshotMode,
     /// A control record's anchor as the engine's anchor.
     pub anchor_of: &'a (dyn Fn(&EngineAnchor) -> Option<E::Anchor> + Sync),
+    /// What the engine knows about a legacy snapshot (read only when the
+    /// control record is a legacy one).
+    pub legacy: Option<&'a LegacyProof<E::Anchor>>,
 }
 
 impl<E: EngineOrder> StartInput<'_, E> {
@@ -422,7 +478,9 @@ pub async fn decide_start<E: EngineOrder>(
                 why: Allocation::First,
             });
         }
-        Some(Stored::Legacy { .. }) => return Err(DriverError::Legacy),
+        Some(s @ Stored::Legacy { .. }) => {
+            return decide_legacy(input, &s).await;
+        }
         Some(s) => s,
     };
     let Stored::Current { version, control } = &stored else {
@@ -525,6 +583,140 @@ pub async fn decide_start<E: EngineOrder>(
             input.replace(&stored, control.generation, false, why).await
         }
     }
+}
+
+/// Where one sink stands against a legacy snapshot (design section 10, the
+/// #131 rules): its completion proven by the engine's completion mark of
+/// the legacy generation at exactly the anchor, an unmarked position at
+/// exactly the anchor where the engine counts that, or a position strictly
+/// after it. Anything else - a snapshot position, another mark, a position
+/// at, before or incomparable with the anchor - proves nothing. A position
+/// of an unknown format is refused.
+pub fn legacy_state<E: EngineOrder>(
+    engine: &E,
+    raw: Option<&[u8]>,
+    anchor: &E::Anchor,
+    mark_generation: Option<u64>,
+) -> SinkState {
+    use deltaforge_core::CheckpointOrder::{Before, Equal};
+    let Some(raw) = raw else {
+        return SinkState::Behind;
+    };
+    match classify_stored(engine, raw) {
+        None => SinkState::Foreign,
+        Some(Classified::Incomplete(_) | Classified::Adopted(_)) => {
+            SinkState::Behind
+        }
+        Some(Classified::Stream) => {
+            let order = engine.anchor_vs_stream(anchor, raw);
+            let proven = match engine.completion_mark(raw) {
+                Some((None, g)) => Some(g) == mark_generation && order == Equal,
+                Some(_) => false,
+                None => {
+                    order == Before
+                        || (order == Equal
+                            && engine.unmarked_completion_at_anchor())
+                }
+            };
+            if proven {
+                SinkState::AtOrPast
+            } else {
+                SinkState::Behind
+            }
+        }
+    }
+}
+
+/// A start over a legacy (pre-queue) control record (design section 10):
+/// lineage verified first; a completion proven by the sink checkpoints over
+/// the configured policy upgrades it in place to `completed` in a new chain;
+/// anything else (no trusted anchor, no proof, or mode `always`) is replaced
+/// by the next generation in a new chain - one full recopy; mode `never`
+/// refuses an unproven one. An unclassifiable one is refused, untouched.
+async fn decide_legacy<E: EngineOrder>(
+    input: &StartInput<'_, E>,
+    stored: &Stored,
+) -> Result<StartOutcome, DriverError> {
+    let Stored::Legacy { record, .. } = stored else {
+        unreachable!("a legacy record");
+    };
+    let default = LegacyProof::default();
+    let proof = input.legacy.unwrap_or(&default);
+    if let Some(why) = &proof.refused {
+        return Err(DriverError::Legacy(why.clone()));
+    }
+    if !record.lineage.stable_matches(&input.lineage) {
+        return Err(QueueError::ForeignLineage {
+            generation: record.generation,
+        }
+        .into());
+    }
+    if input.mode != SnapshotMode::Always
+        && let Some((anchor, engine_anchor)) = &proof.anchor
+    {
+        let mut states = Vec::new();
+        for sink in &input.policy.sinks {
+            let raw = input.stored(&sink.id).await?;
+            let state = legacy_state(
+                input.engine,
+                raw.as_deref(),
+                anchor,
+                proof.mark_generation,
+            );
+            if state == SinkState::Foreign {
+                return Err(DriverError::Foreign {
+                    sink: sink.id.clone(),
+                    chain: "(legacy)".into(),
+                });
+            }
+            states.push((sink.id.clone(), state, raw));
+        }
+        if let Some(completion) =
+            frontier(input.engine, &input.policy, &states)?
+            && !completion.acks.is_empty()
+        {
+            let (_, completed) = input
+                .store
+                .upgrade_completed_legacy(
+                    stored,
+                    &input.lineage,
+                    input.config_fingerprint,
+                    input.policy.clone(),
+                    completion,
+                    engine_anchor.clone(),
+                )
+                .await?;
+            tracing::info!(
+                source_id = %input.source_id,
+                generation = completed.generation,
+                snapshot_chain = %completed.snapshot_chain,
+                "a legacy snapshot proven complete by the sink checkpoints: \
+                 upgraded in place, not copied again"
+            );
+            let lagging = lagging(input, &completed).await?;
+            return Ok(StartOutcome::Stream {
+                lagging,
+                completed_now: Some(completed),
+            });
+        }
+    }
+    if input.mode == SnapshotMode::Never {
+        return Err(DriverError::LegacyUnproven {
+            generation: record.generation,
+            why: proof.unproven.clone().unwrap_or_else(|| {
+                "the sink checkpoints do not prove its completion".into()
+            }),
+        });
+    }
+    tracing::warn!(
+        source_id = %input.source_id,
+        generation = record.generation,
+        "a legacy snapshot without proof of its completion: one full recopy \
+         as the next generation"
+    );
+    input
+        .replace(stored, record.generation, false, Allocation::Legacy)
+        .await
 }
 
 /// The configured sinks behind a completed generation.
@@ -844,6 +1036,7 @@ mod tests {
             policy: contract::policy(),
             mode: SnapshotMode::Initial,
             anchor_of: &|_| Some(100),
+            legacy: None,
         }
     }
 
@@ -1062,6 +1255,206 @@ mod tests {
         ));
     }
 
+    /// A legacy control record of generation 3 (status running) with
+    /// `lineage`.
+    async fn legacy_store(lineage: PersistedLineage) -> (QueueStore, Vec<u8>) {
+        let backend = mem();
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "generation": 3,
+            "lineage": lineage,
+            "status": "running",
+            "config_fingerprint": "old",
+            "fingerprint_format": 2,
+        }))
+        .unwrap();
+        backend
+            .slot_create(
+                crate::snapshot_queue::CONTROL_NS,
+                &crate::snapshot_queue::control_key("src"),
+                &bytes,
+            )
+            .await
+            .unwrap();
+        (QueueStore::new(backend, "src"), bytes)
+    }
+
+    async fn raw(q: &QueueStore) -> Option<Vec<u8>> {
+        match q.read().await.unwrap() {
+            Some(Stored::Legacy { record, .. }) => {
+                Some(serde_json::to_vec(&record).unwrap())
+            }
+            _ => None,
+        }
+    }
+
+    fn proof_at(anchor: u64, mark: Option<u64>) -> LegacyProof<u64> {
+        LegacyProof {
+            anchor: Some((
+                anchor,
+                EngineAnchor::Postgres {
+                    lsn: anchor.to_string(),
+                    timeline: None,
+                    chain: None,
+                    transition: None,
+                },
+            )),
+            mark_generation: mark,
+            ..Default::default()
+        }
+    }
+
+    fn legacy_mark(p: u64, g: u64) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({ "p": p, "mark": [null, g] }))
+            .unwrap()
+    }
+
+    /// A legacy snapshot the sink checkpoints prove complete over the
+    /// configured policy (the required sink strictly past its anchor) is
+    /// upgraded in place to `completed` in a new chain, not copied again.
+    #[tokio::test]
+    async fn a_proven_legacy_snapshot_is_upgraded_in_place() {
+        let (q, _) = legacy_store(contract::lineage()).await;
+        let ck = MemCheckpointStore::new().unwrap();
+        ck.put_raw(&sink_key("src", "s3"), &stream(150))
+            .await
+            .unwrap();
+        let proof = proof_at(100, None);
+        let mut i = input(&q, &ck);
+        i.legacy = Some(&proof);
+        match decide_start(&i).await.unwrap() {
+            StartOutcome::Stream {
+                completed_now: Some(c),
+                lagging,
+            } => {
+                assert_eq!(c.state, State::Completed);
+                assert_eq!((c.generation, c.legacy_through), (3, Some(3)));
+                assert!(c.anchor.is_some());
+                assert_eq!(c.completion.unwrap().acks, ["s3"]);
+                assert_eq!(lagging, ["kafka"], "the optional sink is behind");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The #131 completion mark proves the generation it names, at exactly
+    /// the anchor; an unmarked position at the anchor proves nothing here.
+    #[tokio::test]
+    async fn a_legacy_mark_proves_only_its_generation_at_the_anchor() {
+        for (raw, mark, proven) in [
+            (legacy_mark(100, 3), Some(3), true),
+            (legacy_mark(100, 2), Some(3), false),
+            (legacy_mark(120, 3), Some(3), false),
+            (legacy_mark(100, 3), None, false),
+            (stream(100), Some(3), false),
+        ] {
+            let (q, _) = legacy_store(contract::lineage()).await;
+            let ck = MemCheckpointStore::new().unwrap();
+            ck.put_raw(&sink_key("src", "s3"), &raw).await.unwrap();
+            let proof = proof_at(100, mark);
+            let mut i = input(&q, &ck);
+            i.legacy = Some(&proof);
+            let upgraded = matches!(
+                decide_start(&i).await.unwrap(),
+                StartOutcome::Stream { .. }
+            );
+            assert_eq!(upgraded, proven, "{}", String::from_utf8_lossy(&raw));
+        }
+    }
+
+    /// Without proof - no trusted anchor, or the sinks behind it - the
+    /// legacy snapshot is copied once more as the next generation of a new
+    /// chain; mode `always` does so even when proven; mode `never` refuses
+    /// with the reason.
+    #[tokio::test]
+    async fn an_unproven_legacy_snapshot_is_copied_once_more() {
+        let unproven = LegacyProof {
+            unproven: Some("taken under the pre-hardening anchor".into()),
+            ..Default::default()
+        };
+        let behind = proof_at(100, None);
+        for (proof, sink) in [(&unproven, stream(150)), (&behind, stream(50))] {
+            let (q, _) = legacy_store(contract::lineage()).await;
+            let ck = MemCheckpointStore::new().unwrap();
+            ck.put_raw(&sink_key("src", "s3"), &sink).await.unwrap();
+            let mut i = input(&q, &ck);
+            i.legacy = Some(proof);
+            match decide_start(&i).await.unwrap() {
+                StartOutcome::Snapshot { control, why, .. } => {
+                    assert_eq!(why, Allocation::Legacy);
+                    assert_eq!(control.generation, 4);
+                    assert_eq!(control.legacy_through, Some(3));
+                    assert_eq!(
+                        control.adoption,
+                        crate::snapshot_queue::Adoption::Pending
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let (q, _) = legacy_store(contract::lineage()).await;
+        let ck = MemCheckpointStore::new().unwrap();
+        ck.put_raw(&sink_key("src", "s3"), &stream(150))
+            .await
+            .unwrap();
+        let proof = proof_at(100, None);
+        let mut i = input(&q, &ck);
+        i.legacy = Some(&proof);
+        i.mode = SnapshotMode::Always;
+        assert!(matches!(
+            decide_start(&i).await.unwrap(),
+            StartOutcome::Snapshot {
+                why: Allocation::Legacy,
+                ..
+            }
+        ));
+        let (q, before) = legacy_store(contract::lineage()).await;
+        let mut i = input(&q, &ck);
+        i.legacy = Some(&unproven);
+        i.mode = SnapshotMode::Never;
+        let err = decide_start(&i).await.unwrap_err();
+        assert!(err.to_string().contains("pre-hardening anchor"), "{err}");
+        assert_eq!(raw(&q).await.unwrap(), {
+            let v: serde_json::Value = serde_json::from_slice(&before).unwrap();
+            let r: crate::snapshot_generation::SnapshotGenerationRecord =
+                serde_json::from_value(v).unwrap();
+            serde_json::to_vec(&r).unwrap()
+        });
+    }
+
+    /// Unclassifiable legacy state, or another lineage's, is refused and
+    /// left untouched.
+    #[tokio::test]
+    async fn unclassifiable_or_foreign_legacy_state_is_refused_untouched() {
+        let refused = LegacyProof {
+            refused: Some("anchor version 9".into()),
+            ..Default::default()
+        };
+        let (q, _) = legacy_store(contract::lineage()).await;
+        let before = raw(&q).await;
+        let ck = MemCheckpointStore::new().unwrap();
+        let mut i = input(&q, &ck);
+        i.legacy = Some(&refused);
+        assert!(matches!(
+            decide_start(&i).await,
+            Err(DriverError::Legacy(why)) if why.contains("anchor version 9")
+        ));
+        assert_eq!(raw(&q).await, before);
+
+        let (q, _) = legacy_store(PersistedLineage::Postgres {
+            system_identifier: 999,
+        })
+        .await;
+        let before = raw(&q).await;
+        let proof = proof_at(100, None);
+        let mut i = input(&q, &ck);
+        i.legacy = Some(&proof);
+        assert!(matches!(
+            decide_start(&i).await,
+            Err(DriverError::Queue(QueueError::ForeignLineage { .. }))
+        ));
+        assert_eq!(raw(&q).await, before);
+    }
+
     /// Snapshot positions without a control record fail the start closed.
     #[tokio::test]
     async fn snapshot_positions_without_their_control_record_fail_closed() {
@@ -1194,6 +1587,13 @@ pub async fn report_start(
                         source_id,
                         old,
                         "policy_changed",
+                    ));
+                }
+                (Allocation::Legacy, Some(old)) => {
+                    drafts.push(incidents::snapshot_replaced(
+                        source_id,
+                        old,
+                        "legacy_recopy",
                     ));
                 }
                 (Allocation::ViewLost, Some(old)) => tracing::info!(
@@ -1339,6 +1739,8 @@ pub struct GenerationInputs<E: EngineOrder> {
     pub engine: E,
     /// A control record's anchor as the engine's anchor.
     pub anchor_of: fn(&EngineAnchor) -> Option<E::Anchor>,
+    /// What the engine knows about a legacy snapshot.
+    pub legacy: Option<LegacyProof<E::Anchor>>,
 }
 
 impl<E: EngineOrder> GenerationInputs<E> {
@@ -1353,6 +1755,7 @@ impl<E: EngineOrder> GenerationInputs<E> {
             policy: self.policy.clone(),
             mode: self.mode.clone(),
             anchor_of: &self.anchor_of,
+            legacy: self.legacy.as_ref(),
         }
     }
 }
@@ -1498,9 +1901,12 @@ pub fn source_error(
         | DriverError::Foreign { .. }
         | DriverError::IncomparableAcks { .. }
         | DriverError::StateMissing { .. }
-        | DriverError::Legacy => deltaforge_core::SourceError::Checkpoint {
-            details: msg.into(),
-        },
+        | DriverError::Legacy(_)
+        | DriverError::LegacyUnproven { .. } => {
+            deltaforge_core::SourceError::Checkpoint {
+                details: msg.into(),
+            }
+        }
         DriverError::Cancelled => deltaforge_core::SourceError::Cancelled,
         _ => deltaforge_core::SourceError::Other(anyhow::anyhow!(msg)),
     }

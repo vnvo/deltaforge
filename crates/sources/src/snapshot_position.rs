@@ -207,7 +207,7 @@ pub fn decode<A: DeserializeOwned>(
 /// What an engine supplies to order its snapshot and stream positions.
 pub trait EngineOrder {
     /// The engine's anchor type.
-    type Anchor: DeserializeOwned + PartialEq;
+    type Anchor: DeserializeOwned + PartialEq + Clone;
 
     /// Order two stream positions.
     fn stream_order(&self, a: &[u8], b: &[u8]) -> CheckpointOrder;
@@ -229,6 +229,14 @@ pub trait EngineOrder {
     /// text), as an incomplete position without chain or generation.
     fn bare_legacy(&self, _raw: &[u8]) -> Option<Self::Anchor> {
         None
+    }
+
+    /// Whether an unmarked stream position exactly at a generation's anchor
+    /// proves its completion: PostgreSQL's #131 completing checkpoints are
+    /// unmarked, and no change can commit exactly at its slot's consistent
+    /// point. MySQL needs the completion mark.
+    fn unmarked_completion_at_anchor(&self) -> bool {
+        false
     }
 
     /// The source lineage a stream position records, when the engine's

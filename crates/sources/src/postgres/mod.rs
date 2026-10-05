@@ -535,6 +535,7 @@ impl PostgresSource {
             mode: self.snapshot_cfg.mode.clone(),
             engine: PgOrder,
             anchor_of: pg_anchor_of,
+            legacy: self.legacy_proof(chkpt_store).await?,
         };
         let decided = crate::snapshot_driver::decide(
             &inputs,
@@ -543,6 +544,7 @@ impl PostgresSource {
         )
         .await
         .map_err(|e| crate::snapshot_driver::source_error(&self.id, e))?;
+        self.retire_legacy_progress(chkpt_store).await?;
         let start = match decided {
             crate::snapshot_driver::Decided::Stream { completed } => {
                 PgStart::Stream {
@@ -813,6 +815,121 @@ impl PostgresSource {
         }
         task.abort();
         Ok(total)
+    }
+
+    /// What this source's legacy snapshot progress proves (design section
+    /// 10), read only when the control record is a legacy one. A snapshot
+    /// taken under the pre-hardening anchor (anchor version 0) is never
+    /// proven, whatever its sinks committed: rows committed at the
+    /// snapshot-to-stream seam may be missing, so it is copied once more.
+    /// A malformed anchor proves nothing; an unknown anchor version or a
+    /// corrupt record is refused, untouched.
+    async fn legacy_proof(
+        &self,
+        chkpt_store: &Arc<dyn CheckpointStore>,
+    ) -> SourceResult<Option<crate::snapshot_driver::LegacyProof<PgAnchor>>>
+    {
+        use crate::snapshot_driver::LegacyProof;
+        let legacy = matches!(
+            self.queue().read().await,
+            Ok(Some(crate::snapshot_queue::Stored::Legacy { .. }))
+        );
+        if !legacy {
+            return Ok(None);
+        }
+        let unproven = |why: &str| LegacyProof {
+            unproven: Some(why.to_string()),
+            ..Default::default()
+        };
+        let refused = |why: String| LegacyProof {
+            refused: Some(why),
+            ..Default::default()
+        };
+        let raw = chkpt_store
+            .get_raw(&postgres_snapshot::progress_key(&self.id))
+            .await
+            .map_err(|e| SourceError::Checkpoint {
+                details: format!("read the legacy snapshot progress: {e}")
+                    .into(),
+            })?;
+        let Some(raw) = raw else {
+            return Ok(Some(unproven(
+                "no snapshot progress records its anchor",
+            )));
+        };
+        let progress: SnapshotProgress = match serde_json::from_slice(&raw) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(Some(refused(format!(
+                    "the legacy snapshot progress is corrupt: {e}"
+                ))));
+            }
+        };
+        let proof = match progress.anchor_version {
+            v if v > postgres_snapshot::SNAPSHOT_ANCHOR_VERSION => {
+                refused(format!(
+                    "the legacy snapshot progress has anchor version {v}, which \
+                 this release does not know"
+                ))
+            }
+            0 => unproven(
+                "it was taken under the pre-hardening anchor (anchor version \
+                 0), which can lose rows committed at the snapshot-to-stream \
+                 seam",
+            ),
+            _ if progress.start_lsn.is_empty() => {
+                unproven("its progress records no anchor")
+            }
+            _ => match Lsn::parse(&progress.start_lsn) {
+                Ok(lsn) => {
+                    let anchor = PgAnchor::new(lsn, None);
+                    LegacyProof {
+                        anchor: Some((
+                            anchor.clone(),
+                            crate::snapshot_queue::EngineAnchor::Postgres {
+                                lsn: anchor.lsn,
+                                timeline: None,
+                                chain: None,
+                                transition: None,
+                            },
+                        )),
+                        ..Default::default()
+                    }
+                }
+                Err(e) => LegacyProof {
+                    unproven: Some(format!(
+                        "its recorded anchor {:?} is malformed: {e}",
+                        progress.start_lsn
+                    )),
+                    ..Default::default()
+                },
+            },
+        };
+        Ok(Some(proof))
+    }
+
+    /// Once the control record is this release's, the legacy progress record
+    /// is no longer read: delete it (idempotent; design section 3.3).
+    async fn retire_legacy_progress(
+        &self,
+        chkpt_store: &Arc<dyn CheckpointStore>,
+    ) -> SourceResult<()> {
+        let current = matches!(
+            self.queue().read().await,
+            Ok(Some(crate::snapshot_queue::Stored::Current { .. }))
+        );
+        if current {
+            chkpt_store
+                .delete(&postgres_snapshot::progress_key(&self.id))
+                .await
+                .map_err(|e| SourceError::Checkpoint {
+                    details: format!(
+                        "retire the legacy snapshot progress: {e}"
+                    )
+                    .into(),
+                })?;
+        }
+        Ok(())
     }
 
     /// Run generation `control` (design sections 2 to 6): the snapshot
@@ -2110,6 +2227,10 @@ impl crate::snapshot_position::EngineOrder for PgOrder {
     fn completion_mark(&self, stream: &[u8]) -> Option<(Option<String>, u64)> {
         let cp = serde_json::from_slice::<PostgresCheckpoint>(stream).ok()?;
         cp.snapshot_completed.map(|g| (cp.snapshot_chain, g))
+    }
+
+    fn unmarked_completion_at_anchor(&self) -> bool {
+        true
     }
 
     fn bare_legacy(&self, raw: &[u8]) -> Option<PgAnchor> {
@@ -4278,5 +4399,7 @@ mod pg_anchor_tests {
         foreign.chain_id = "other".into();
         assert_eq!(state(&cdc("0/600", &foreign)), SinkState::Foreign);
         assert_eq!(state(&cdc("0/400", &s)), SinkState::Behind);
+        // #131: an unmarked position exactly at the anchor completed it.
+        assert_eq!(state(&cdc("0/500", &s)), SinkState::AtOrPast);
     }
 }

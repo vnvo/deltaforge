@@ -956,25 +956,47 @@ async fn the_anchor_compares_the_registered_schema() -> Result<()> {
     Ok(())
 }
 
-/// Upgrade: a snapshot generation recorded by an earlier release is not
-/// taken for this release's state. Until its classification with
-/// sink-checkpoint proof (design section 10) lands, the start fails closed
-/// before any row, with the record untouched.
-#[tokio::test]
-#[ignore = "requires docker"]
-async fn an_earlier_format_generation_fails_closed_untouched() -> Result<()> {
-    let _probe = PROBED_RUN.read().await;
+/// The state an earlier release leaves after a completed snapshot of
+/// generation 3: its owned slot (the anchor is the slot's consistent
+/// point), its progress record (`anchor_version`), a pre-queue control
+/// record, and a sink checkpoint strictly past the anchor. Returns the
+/// source and its stores.
+async fn legacy_completed(
+    db: &str,
+    client: &tokio_postgres::Client,
+    id: &str,
+    anchor_version: u32,
+) -> Result<(PostgresSource, Arc<dyn CheckpointStore>)> {
     use checkpoints::SnapshotStateStore;
-    let (db, client) = pg_setup("fpupgrade").await?;
     client
         .batch_execute(
-            "CREATE TABLE up_a (id INT PRIMARY KEY); INSERT INTO up_a VALUES (1), (2); \
-             CREATE PUBLICATION pub_up FOR ALL TABLES;",
+            "CREATE TABLE up_a (id INT PRIMARY KEY); \
+             INSERT INTO up_a VALUES (1), (2);",
         )
         .await?;
     let backend = test_common::make_storage_backend().await;
-    // The source's own lineage: an earlier-format record is replaced only
-    // within it.
+    let src =
+        pg_source(db, client, id, &["public.up_*"], initial_cfg(), backend)
+            .await?;
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let anchor =
+        sources::postgres::postgres_slot_owner::prepare_snapshot_slot_anchor(
+            &pg_admin_dsn(db).await,
+            &src.slot,
+            &src.pipeline,
+            id,
+            &ckpt,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let progress = serde_json::json!({
+        "start_lsn": anchor.to_string(),
+        "done_tables": ["public.up_a"],
+        "finished": true,
+        "anchor_version": anchor_version,
+    });
+    ckpt.put_raw(&progress_key(id), &serde_json::to_vec(&progress)?)
+        .await?;
     let sysid: i64 = client
         .query_one("SELECT system_identifier FROM pg_control_system()", &[])
         .await?
@@ -982,49 +1004,115 @@ async fn an_earlier_format_generation_fails_closed_untouched() -> Result<()> {
     let legacy = serde_json::json!({
         "generation": 3,
         "lineage": PersistedLineage::Postgres { system_identifier: sysid as u64 },
-        "status": "running",
-        "config_fingerprint": "a-format-1-fingerprint",
+        "status": "completed",
+        "config_fingerprint": "a-format-2-fingerprint",
+        "fingerprint_format": 2,
     });
-    let store = storage::adapters::BackendCheckpointStore::new(backend.clone());
-    store
+    storage::adapters::BackendCheckpointStore::new(src.backend.clone())
         .compare_and_swap(
-            "snapshot_generation:fpupgrade",
+            &format!("snapshot_generation:{id}"),
             None,
             &serde_json::to_vec(&legacy)?,
         )
         .await?;
-    let src = PostgresSource {
-        id: "fpupgrade".into(),
-        dsn: pg_admin_dsn(&db).await.into(),
-        slot: "slot_fpupgrade".into(),
-        publication: "pub_up".into(),
-        tables: vec!["public.up_*".into()],
-        tenant: "acme".into(),
-        pipeline: "test".into(),
-        registry: test_common::make_registry().await,
-        registry_scope: sources::registry_scope::SharedRegistryScope::default(),
-        backend,
-        outbox_prefixes: common::AllowList::default(),
-        snapshot_cfg: initial_cfg(),
-        on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
-        table_options: Default::default(),
-        rotation: None,
-        snapshot_cohort: Default::default(),
-    };
-    let chkpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (reads, err) = run_until(&src, &chkpt, 1, false).await?;
-    assert!(reads.is_empty(), "no row");
-    let err = err.expect("refused");
-    assert!(err.contains("legacy"), "{err}");
-    let (_, stored) = store
-        .get_versioned("snapshot_generation:fpupgrade")
+    // The sink committed past the anchor: a change after it.
+    client.execute("INSERT INTO up_a VALUES (3)", &[]).await?;
+    let after: String = client
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
         .await?
-        .expect("kept");
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&stored)?,
-        legacy,
-        "untouched"
+        .get(0);
+    ckpt.put_raw(
+        &format!("{id}::sink::{TEST_SINK}"),
+        format!(r#"{{"lsn":"{after}","tx_id":null}}"#).as_bytes(),
+    )
+    .await?;
+    Ok((src, ckpt))
+}
+
+/// Upgrade: a snapshot an earlier release took under the pre-hardening
+/// anchor (anchor version 0) is never proven, even though it looks
+/// completed and its sink committed past the anchor: rows committed at the
+/// snapshot-to-stream seam may be missing. It is copied once more, as the
+/// next generation (generation 4) of a new chain.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn a_version_0_legacy_snapshot_is_copied_once_more() -> Result<()> {
+    let _probe = PROBED_RUN.read().await;
+    let (db, client) = pg_setup("legacy_v0").await?;
+    let (src, ckpt) = legacy_completed(&db, &client, "legacy_v0", 0).await?;
+    let (reads, err) = run_until(&src, &ckpt, 3, true).await?;
+    assert!(err.is_none(), "{err:?}");
+    assert_eq!(reads.len(), 3, "every row copied again");
+    assert!(
+        reads
+            .iter()
+            .all(|e| e.source.position.snapshot_generation == Some(4)),
+        "the next generation"
     );
+    assert_eq!(
+        snapshot_state(&src.backend, &src.id).await,
+        Some(("completed".into(), 4))
+    );
+    assert!(
+        ckpt.get_raw(&progress_key(&src.id)).await?.is_none(),
+        "the legacy progress is retired"
+    );
+    drop_slot(&client, &src).await;
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+/// Upgrade: the same state under the hardened anchor (anchor version 1),
+/// with the sink checkpoint proving completion over the policy, is upgraded
+/// in place to a completed generation 3 of a new chain: nothing is copied
+/// again and the stream continues from the anchor.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn a_proven_hardened_legacy_snapshot_is_upgraded_in_place() -> Result<()>
+{
+    let _probe = PROBED_RUN.read().await;
+    let (db, client) = pg_setup("legacy_v1").await?;
+    let (src, ckpt) = legacy_completed(&db, &client, "legacy_v1", 1).await?;
+    let (tx, mut rx) = acked_channel(&src, &ckpt, &src.id, 256);
+    let handle = src.run(tx, Arc::clone(&ckpt)).await;
+    tokio::time::timeout(Duration::from_secs(60), handle.ready.wait())
+        .await
+        .expect("streaming");
+    client.execute("INSERT INTO up_a VALUES (4)", &[]).await?;
+    let mut events = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !events
+        .iter()
+        .any(|e: &Event| ids(std::slice::from_ref(e)).contains(&4))
+    {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(SourceItem::Event(ev))) => events.push(ev),
+            Ok(Some(_)) => continue,
+            _ => break,
+        }
+    }
+    handle.stop();
+    let _ = handle.join().await;
+    assert!(
+        events.iter().all(|e| e.op != Op::Read),
+        "nothing copied again: {events:?}"
+    );
+    assert!(ids(&events).contains(&4), "the stream continues");
+    let Some(Stored::Current { control, .. }) =
+        QueueStore::new(src.backend.clone(), &src.id).read().await?
+    else {
+        panic!("upgraded")
+    };
+    assert_eq!(
+        serde_json::to_value(control.state)?,
+        serde_json::json!("completed")
+    );
+    assert_eq!((control.generation, control.legacy_through), (3, Some(3)));
+    assert!(
+        ckpt.get_raw(&progress_key(&src.id)).await?.is_none(),
+        "the legacy progress is retired"
+    );
+    drop_slot(&client, &src).await;
     pg_drop_db(&db).await;
     Ok(())
 }

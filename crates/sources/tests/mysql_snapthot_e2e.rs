@@ -1231,13 +1231,13 @@ async fn mysql_the_anchor_compares_the_registered_schema() -> Result<()> {
     Ok(())
 }
 
-/// Upgrade: a snapshot generation recorded by an earlier release is not
-/// taken for this release's state. Until its classification with
-/// sink-checkpoint proof (design section 10) lands, the start fails closed
-/// before any row, with the record untouched.
+/// Upgrade: a snapshot generation recorded by an earlier release whose
+/// completion nothing proves (here no progress records an anchor) is
+/// copied once more, as the next generation of a new chain (design section
+/// 10).
 #[tokio::test]
 #[ignore = "requires docker"]
-async fn mysql_an_earlier_format_generation_fails_closed_untouched()
+async fn mysql_an_earlier_format_generation_restarts_as_the_next_one()
 -> Result<()> {
     let _probe = PROBED_RUN.read().await;
     use checkpoints::SnapshotStateStore;
@@ -1289,23 +1289,27 @@ async fn mysql_an_earlier_format_generation_fails_closed_untouched()
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 256);
     let handle = src.run(tx, ckpt).await;
-    let events = collect_until(&mut rx, Duration::from_secs(30), |e| {
-        e.iter().any(|x| matches!(x.op, Op::Read))
+    let events = collect_until(&mut rx, Duration::from_secs(60), |e| {
+        e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 2
     })
     .await;
-    let err = handle.join().await.err().map(|e| format!("{e:#}"));
-    assert!(events.iter().all(|e| !matches!(e.op, Op::Read)), "no row");
-    let err = err.expect("refused");
-    assert!(err.contains("legacy"), "{err}");
-    let (_, stored) =
-        storage::adapters::BackendCheckpointStore::new(src.backend.clone())
-            .get_versioned("snapshot_generation:fpupgrade")
-            .await?
-            .expect("kept");
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&stored)?,
-        legacy,
-        "untouched"
+    handle.stop();
+    // Stopping a running source ends it with `Cancelled`: not a failure.
+    let err = handle
+        .join()
+        .await
+        .err()
+        .map(|e| format!("{e:#}"))
+        .filter(|e| e != "operation cancelled");
+    assert!(err.is_none(), "{err:?}");
+    let reads: Vec<_> =
+        events.iter().filter(|e| matches!(e.op, Op::Read)).collect();
+    assert_eq!(reads.len(), 2, "the snapshot ran");
+    assert!(
+        reads
+            .iter()
+            .all(|e| e.source.position.snapshot_generation == Some(4)),
+        "the next generation"
     );
     mysql_drop_db(&pool, &db).await;
     Ok(())

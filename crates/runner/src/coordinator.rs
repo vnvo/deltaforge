@@ -7580,6 +7580,7 @@ mod generation_flow_tests {
             policy,
             mode,
             anchor_of: &anchor_of,
+            legacy: None,
         }
     }
 

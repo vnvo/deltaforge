@@ -137,40 +137,6 @@ pub(crate) fn classify_mysql_checkpoint(
 /// comparator orders strictly after the anchor. A missing or unreadable
 /// anchor, another generation, or a position at, before or incomparable with
 /// the anchor proves nothing.
-// The legacy classification proves a completed pre-queue snapshot with
-// this #131 rule (design section 10).
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn snapshot_completion_proven(
-    progress: Option<&MysqlSnapshotProgress>,
-    resume: Option<&MySqlCheckpoint>,
-) -> bool {
-    let (Some(progress), Some(cp)) = (progress, resume) else {
-        return false;
-    };
-    let Ok(anchor) =
-        serde_json::from_str::<MySqlCheckpoint>(&progress.start_position)
-    else {
-        return false;
-    };
-    if let Some(generation) = cp.snapshot_completed {
-        return progress.generation != 0
-            && generation == progress.generation
-            && same_position(cp, &anchor)
-            && cp.lineage == anchor.lineage;
-    }
-    let (Ok(a), Ok(c)) = (serde_json::to_vec(&anchor), serde_json::to_vec(cp))
-    else {
-        return false;
-    };
-    compare_mysql_stream_checkpoints(&a, &c) == CheckpointOrder::Before
-}
-
-/// Whether two checkpoints name the same binlog position (file, position and
-/// GTID set; lineage and the completion mark aside).
-#[cfg_attr(not(test), allow(dead_code))]
-fn same_position(a: &MySqlCheckpoint, b: &MySqlCheckpoint) -> bool {
-    a.file == b.file && a.pos == b.pos && a.gtid_set == b.gtid_set
-}
 
 #[derive(Debug, Clone)]
 pub struct MySqlSource {
@@ -438,6 +404,7 @@ impl MySqlSource {
             mode: self.snapshot_cfg.mode.clone(),
             engine: MyOrder,
             anchor_of: my_anchor_of,
+            legacy: self.legacy_proof(chkpt_store).await?,
         };
         let decided = crate::snapshot_driver::decide(
             &inputs,
@@ -446,6 +413,7 @@ impl MySqlSource {
         )
         .await
         .map_err(|e| crate::snapshot_driver::source_error(&self.id, e))?;
+        self.retire_legacy_progress(chkpt_store).await?;
         let start = match decided {
             crate::snapshot_driver::Decided::Stream { completed } => {
                 MyStart::Stream {
@@ -742,6 +710,101 @@ impl MySqlSource {
         .map(|why| SourceError::Incompatible {
             details: format!("source {}: {why}", self.id).into(),
         })
+    }
+
+    /// What this source's legacy snapshot progress proves (design section
+    /// 10, the #131 rules), read only when the control record is a legacy
+    /// one: its anchor (in the verified lineage, which the startup
+    /// reconciliation already adopted pre-lineage checkpoints into) and the
+    /// generation its completion mark names. A malformed anchor proves
+    /// nothing; a corrupt record is refused, untouched.
+    async fn legacy_proof(
+        &self,
+        chkpt_store: &Arc<dyn CheckpointStore>,
+    ) -> SourceResult<
+        Option<crate::snapshot_driver::LegacyProof<MySqlCheckpoint>>,
+    > {
+        use crate::snapshot_driver::LegacyProof;
+        let legacy = matches!(
+            self.queue().read().await,
+            Ok(Some(crate::snapshot_queue::Stored::Legacy { .. }))
+        );
+        if !legacy {
+            return Ok(None);
+        }
+        let progress = match mysql_snapshot::load_snapshot_progress(
+            chkpt_store.as_ref(),
+            &self.id,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(Some(LegacyProof {
+                    refused: Some(format!("{e:#}")),
+                    ..Default::default()
+                }));
+            }
+        };
+        if progress.start_position.is_empty() {
+            return Ok(Some(LegacyProof {
+                unproven: Some("its progress records no anchor".into()),
+                ..Default::default()
+            }));
+        }
+        let mut anchor: MySqlCheckpoint =
+            match serde_json::from_str(&progress.start_position) {
+                Ok(a) => a,
+                Err(e) => {
+                    return Ok(Some(LegacyProof {
+                        unproven: Some(format!(
+                            "its recorded anchor is malformed: {e}"
+                        )),
+                        ..Default::default()
+                    }));
+                }
+            };
+        if anchor.lineage.is_none() {
+            anchor.lineage = checkpoint_lineage(&self.registry_scope);
+        }
+        Ok(Some(LegacyProof {
+            anchor: Some((
+                anchor.clone(),
+                crate::snapshot_queue::EngineAnchor::Mysql {
+                    file: anchor.file,
+                    pos: anchor.pos,
+                    gtid_set: anchor.gtid_set,
+                    lineage: anchor.lineage,
+                },
+            )),
+            mark_generation: (progress.generation != 0)
+                .then_some(progress.generation),
+            ..Default::default()
+        }))
+    }
+
+    /// Once the control record is this release's, the legacy progress record
+    /// is no longer read: delete it (idempotent; design section 3.3).
+    async fn retire_legacy_progress(
+        &self,
+        chkpt_store: &Arc<dyn CheckpointStore>,
+    ) -> SourceResult<()> {
+        let current = matches!(
+            self.queue().read().await,
+            Ok(Some(crate::snapshot_queue::Stored::Current { .. }))
+        );
+        if current {
+            chkpt_store
+                .delete(&mysql_snapshot::progress_key(&self.id))
+                .await
+                .map_err(|e| SourceError::Checkpoint {
+                    details: format!(
+                        "retire the legacy snapshot progress: {e}"
+                    )
+                    .into(),
+                })?;
+        }
+        Ok(())
     }
 
     /// Run generation `control` (design sections 2 to 6): the snapshot
@@ -3356,7 +3419,10 @@ mod identity_fail_closed_tests {
 
 #[cfg(test)]
 mod snapshot_completion_tests {
+    //! The #131 rules a legacy snapshot is proven complete by (design
+    //! section 10), as the driver applies them with MySQL's order.
     use super::*;
+    use crate::snapshot_driver::{SinkState, legacy_state};
 
     const UUID: &str = "3E11FA47-71CA-11E1-9E33-C80AA9429562";
     const LINEAGE: &str = "0123456789abcdef0123456789abcdef";
@@ -3379,64 +3445,55 @@ mod snapshot_completion_tests {
         }
     }
 
-    /// A finished snapshot of generation 3 anchored at `1-5`.
-    fn progress(generation: u64) -> MysqlSnapshotProgress {
-        MysqlSnapshotProgress {
-            start_position: serde_json::to_string(&at("1-5")).unwrap(),
-            finished: true,
-            generation,
-            ..Default::default()
-        }
-    }
-
-    fn proven(p: &MysqlSnapshotProgress, cp: &MySqlCheckpoint) -> bool {
-        snapshot_completion_proven(Some(p), Some(cp))
+    /// Whether `cp` proves the legacy snapshot of generation `generation`
+    /// (`0`: its progress recorded none) anchored at `1-5` complete.
+    fn proven(generation: u64, cp: &MySqlCheckpoint) -> bool {
+        legacy_state(
+            &MyOrder,
+            Some(&serde_json::to_vec(cp).unwrap()),
+            &at("1-5"),
+            (generation != 0).then_some(generation),
+        ) == SinkState::AtOrPast
     }
 
     #[test]
     fn completion_is_proven_only_at_the_anchor_or_strictly_after_it() {
-        let p = progress(3);
         // The completing checkpoint of this generation, at the anchor.
-        assert!(proven(&p, &marked("1-5", 3)));
+        assert!(proven(3, &marked("1-5", 3)));
         // Unmarked and strictly after the anchor (CDC past it).
-        assert!(proven(&p, &at("1-9")));
+        assert!(proven(3, &at("1-9")));
 
         // Marked for another generation, or not at the anchor.
-        assert!(!proven(&p, &marked("1-5", 2)));
-        assert!(!proven(&p, &marked("1-9", 3)));
+        assert!(!proven(3, &marked("1-5", 2)));
+        assert!(!proven(3, &marked("1-9", 3)));
         // Unmarked at the anchor (what earlier releases committed), or before.
-        assert!(!proven(&p, &at("1-5")));
-        assert!(!proven(&p, &at("1-2")));
+        assert!(!proven(3, &at("1-5")));
+        assert!(!proven(3, &at("1-2")));
         // Another server (lineage), or incomparable (file/pos vs GTID).
         let foreign = MySqlCheckpoint {
             lineage: Some("fedcba9876543210fedcba9876543210".into()),
             ..at("1-9")
         };
-        assert!(!proven(&p, &foreign));
+        assert!(!proven(3, &foreign));
         let file_pos = MySqlCheckpoint {
             gtid_set: None,
             pos: 900,
             ..at("1-9")
         };
-        assert!(!proven(&p, &file_pos));
-        // No resume position at all.
-        assert!(!snapshot_completion_proven(Some(&p), None));
+        assert!(!proven(3, &file_pos));
+        // No checkpoint at all.
+        assert_eq!(
+            legacy_state(&MyOrder, None, &at("1-5"), Some(3)),
+            SinkState::Behind
+        );
     }
 
     #[test]
-    fn a_missing_or_unreadable_anchor_proves_nothing() {
-        let later = at("1-9");
-        assert!(!snapshot_completion_proven(None, Some(&later)));
-        let mut p = progress(3);
-        p.start_position = String::new();
-        assert!(!proven(&p, &later));
-        p.start_position = "not a checkpoint".into();
-        assert!(!proven(&p, &later));
+    fn a_record_without_a_generation_proves_only_past_the_anchor() {
         // A record without a generation proves completion only past the
         // anchor, never by a mark.
-        let legacy = progress(0);
-        assert!(!proven(&legacy, &marked("1-5", 0)));
-        assert!(proven(&legacy, &at("1-9")));
+        assert!(!proven(0, &marked("1-5", 0)));
+        assert!(proven(0, &at("1-9")));
     }
 }
 
@@ -3483,5 +3540,16 @@ mod my_completion_tests {
         assert_eq!(state(&after), SinkState::AtOrPast);
         let at_anchor = serde_json::to_vec(&at("1-5")).unwrap();
         assert_eq!(state(&at_anchor), SinkState::Behind, "unmarked");
+        // A #131 mark (no chain) completes only the generation it names (a
+        // legacy generation upgraded in place keeps its number).
+        let legacy = |g| {
+            serde_json::to_vec(&MySqlCheckpoint {
+                snapshot_completed: Some(g),
+                ..at("1-5")
+            })
+            .unwrap()
+        };
+        assert_eq!(state(&legacy(4)), SinkState::AtOrPast);
+        assert_eq!(state(&legacy(3)), SinkState::Behind);
     }
 }

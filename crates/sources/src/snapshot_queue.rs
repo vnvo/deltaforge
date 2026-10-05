@@ -644,8 +644,9 @@ impl QueueStore {
     }
 
     /// A legacy record whose completion the caller proved from the sink
-    /// checkpoints, upgraded in place: `completed` in a new chain whose later
-    /// generations' start barriers accept its legacy positions.
+    /// checkpoints at its `anchor`, upgraded in place: `completed` in a new
+    /// chain whose later generations' start barriers accept its legacy
+    /// positions.
     pub async fn upgrade_completed_legacy(
         &self,
         stored: &Stored,
@@ -653,6 +654,7 @@ impl QueueStore {
         config_fingerprint: &str,
         policy: PolicySnapshot,
         completion: Completion,
+        anchor: EngineAnchor,
     ) -> Result<(u64, GenerationControl)> {
         policy.validate().map_err(QueueError::InvalidPolicy)?;
         let Stored::Legacy { version, record } = stored else {
@@ -676,7 +678,7 @@ impl QueueStore {
             state: State::Completed,
             run: None,
             plan: PlanSummary::default(),
-            anchor: None,
+            anchor: Some(anchor),
             anchored_at_ms: None,
             policy,
             terminal: None,
@@ -1256,6 +1258,12 @@ pub(crate) mod contract {
                 Completion {
                     acks: vec!["s3".into()],
                     frontier: "f".into(),
+                },
+                EngineAnchor::Postgres {
+                    lsn: "0/10".into(),
+                    timeline: None,
+                    chain: None,
+                    transition: None,
                 },
             )
             .await
