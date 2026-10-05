@@ -335,12 +335,21 @@ Every generation starts with each sink of its frozen cohort moving its own durab
      - a CDC position of `lineage`.
 
      The sink compare-and-swaps it, from exactly the state read, to `D(c, generation)`, recording the digest of the replaced state. S3 `durable_v2` does this with a HEAD CAS whose expected value is the exact HEAD it read.
-   - **Already in the generation.** `D(c, generation)` or any later position of chain `c`: acknowledge (idempotent).
-   - **Anything else** (another chain, another lineage, a generation of `c` above `generation`, an unknown format): refuse.
+   - **Already in the generation.** `D(c, generation)` or any other position of generation `generation` of chain `c`: acknowledge (idempotent).
+   - **Anything else** refuses, including a position of a **later** generation of chain `c` (the caller's control state is stale, rewound or corrupt; acknowledging it could let `generation` publish while the sink is already past it), another chain, another lineage, or an unknown format.
+
+   | Stored state | Decision |
+   |---|---|
+   | empty | move |
+   | chain `c`, generation below `generation` | move |
+   | chain `c`, generation equal to `generation` | already (acknowledge) |
+   | chain `c`, generation above `generation` | refuse |
+   | approved legacy (up to `legacy_through`) or CDC of `lineage` | move |
+   | another chain, another lineage, unknown format | refuse |
 3. The delivery task commits `D(c, generation)` to the per-sink key of every sink that acknowledged.
 4. When **every** sink of the frozen cohort has acknowledged (not policy-weighted: a sink left behind could never accept the generation), the source sets `adoption = done` by control CAS. A refusal fails the run with `snapshot_state_invalid`, class `adoption_refused`, which blocks.
 
-**Empty state.** It is accepted for any generation, not only a chain's first. A sink added to the cohort later starts empty in a later generation, and the policy-change replacement (section 6.2) would otherwise block on it forever. An empty state holds nothing the new copy could lose. *(This widens the reviewer's "empty for the first generation"; confirmation requested.)*
+**Empty state.** It is accepted for any generation, not only a chain's first (approved). A sink added to the cohort later starts empty in a later generation, and the policy-change replacement (section 6.2) would otherwise block on it forever. It has no prior checkpoint to preserve, and the full replacement snapshot supplies its baseline. External side effects it made without a checkpoint may be duplicated, which is within the at-least-once contract.
 
 **Comparators.**
 - A comparator never orders a legacy or CDC position against `D`: entering a generation is the sink's own checked transition, not an order.
