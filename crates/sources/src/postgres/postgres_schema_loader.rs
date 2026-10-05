@@ -287,151 +287,113 @@ impl PostgresSchemaLoader {
         self.registry.current_sequence()
     }
 
-    /// Expand wildcard patterns and preload all matching schemas.
-    ///
-    /// This is the eager (catalog-sized) startup path. It is deliberately
-    /// self-contained - it only reads latest versions through the scoped
-    /// registry and falls back to [`Self::load_schema`] - so removing the eager
-    /// preload later changes only its call sites, not the registry contract.
-    ///
-    /// Warm-start path: schemas already known to the durable registry are
-    /// deserialized directly into the in-memory cache, avoiding a
-    /// information_schema query per table on restart. Tables missing from the
-    /// registry (first-ever run, or new tables) are fetched from the source.
+    /// Every table `patterns` capture, with its schema resolved (from the
+    /// durable registry when known, otherwise from the catalog). Collects
+    /// all pages: diagnostics and tests only; a snapshot consumes the pages
+    /// one at a time ([`discovery_page`], [`Self::warm_from_registry`]).
     pub async fn preload(
         &self,
         patterns: &[String],
     ) -> SourceResult<Vec<(String, String)>> {
-        let t0 = Instant::now();
-        let scope = self.current_scope()?;
         let tables = self.expand_patterns(patterns).await?;
-
-        info!(
-            dsn = redact_password(self.dsn.expose()),
-            patterns = ?patterns,
-            matched_tables = tables.len(),
-            "expanded table patterns"
-        );
-
-        // Warm cache from the durable registry first. A registry storage error
-        // fails closed; only a genuinely absent schema falls back to the source.
-        let mut from_registry = 0usize;
-        let mut needs_fetch: Vec<&(String, String)> = Vec::new();
-        for pair in &tables {
-            let (schema, table) = pair;
-            let latest = self
-                .registry
-                .get_latest(&scope.key(schema, table))
-                .await
-                .map_err(RegistryError::Storage)?;
-            match latest {
-                Some(sv) => {
-                    match serde_json::from_value::<PostgresTableSchema>(
-                        sv.schema_json,
-                    ) {
-                        Ok(pg_schema) => {
-                            let fingerprint = pg_schema.fingerprint();
-                            let column_names = Arc::new(
-                                pg_schema
-                                    .columns
-                                    .iter()
-                                    .map(|c| c.name.clone())
-                                    .collect::<Vec<_>>(),
-                            );
-                            let loaded = LoadedSchema {
-                                schema: Arc::new(pg_schema),
-                                registry_version: sv.version,
-                                fingerprint: fingerprint.into(),
-                                sequence: sv.sequence,
-                                column_names,
-                            };
-                            if !self
-                                .cache_insert(
-                                    &scope,
-                                    (schema.clone(), table.clone()),
-                                    loaded,
-                                )
-                                .await
-                            {
-                                return Err(self.scope_changed());
-                            }
-                            from_registry += 1;
-                        }
-                        // Stored history that cannot be read is corrupt: never
-                        // replaced by the live catalog.
-                        Err(e) => {
-                            return Err(SourceError::Schema {
-                                details: format!(
-                                    "stored schema of {schema}.{table} \
-                                     (version {}) is unreadable: {e}",
-                                    sv.version
-                                )
-                                .into(),
-                            });
-                        }
-                    }
-                }
-                None => needs_fetch.push(pair),
+        for page in tables.chunks(1_000) {
+            self.warm_from_registry(page).await?;
+            for (schema, table) in page {
+                self.load_schema(schema, table).await?;
             }
         }
-
-        for (schema, table) in &needs_fetch {
-            if let Err(e) = self.load_schema(schema, table).await {
-                warn!(schema = %schema, table = %table, error = %e, "failed to preload schema");
-            }
-        }
-
-        info!(
-            tables_loaded = tables.len(),
-            from_registry,
-            from_source = needs_fetch.len(),
-            elapsed_ms = t0.elapsed().as_millis(),
-            "schema preload complete"
-        );
         Ok(tables)
     }
 
-    /// Expand wildcard patterns to actual table list.
+    /// Every table `patterns` capture, in discovery order (all pages
+    /// collected: diagnostics and tests only).
     pub async fn expand_patterns(
         &self,
         patterns: &[String],
     ) -> SourceResult<Vec<(String, String)>> {
         let client = self.connect().await?;
-        let mut results = Vec::new();
+        client
+            .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await
+            .map_err(query_error)?;
+        let mut discovery =
+            crate::snapshot_discovery::Discovery::new(patterns, 1_000);
+        let mut tables = Vec::new();
+        while !discovery.is_done() {
+            let rows = discovery_page(
+                &client,
+                patterns,
+                discovery.after(),
+                discovery.page_size(),
+            )
+            .await?;
+            tables.extend(discovery.accept(rows)?);
+        }
+        Ok(tables)
+    }
 
-        if patterns.is_empty() {
-            let rows = client
-                .query(
-                    "SELECT table_schema, table_name FROM information_schema.tables \
-                     WHERE table_type = 'BASE TABLE' \
-                     AND table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')",
-                    &[],
-                )
+    /// Resolve a page of tables from the durable registry: a table with
+    /// stored history enters the cache (pinned) without a catalog query; the
+    /// others are left for [`Self::load_schema`]. Stored history that cannot
+    /// be read fails closed (never replaced by the live catalog), as does a
+    /// registry storage error.
+    pub async fn warm_from_registry(
+        &self,
+        page: &[(String, String)],
+    ) -> SourceResult<usize> {
+        let scope = self.current_scope()?;
+        let mut from_registry = 0usize;
+        for (schema, table) in page {
+            let key = (schema.clone(), table.clone());
+            if self
+                .cache
+                .read()
                 .await
-                .map_err(query_error)?;
-
-            for row in rows {
-                results.push((row.get(0), row.get(1)));
+                .get(scope.generation(), &key)
+                .is_some()
+            {
+                continue;
             }
-            return Ok(results);
-        }
-
-        // Exactly the tables CDC captures (see `table_patterns`).
-        for pattern in patterns {
-            let query = build_pattern_query(pattern);
-            let rows = client.query(&query, &[]).await.map_err(query_error)?;
-
-            for row in rows {
-                let entry: (String, String) = (row.get(0), row.get(1));
-                if crate::table_patterns::captures(pattern, &entry.0, &entry.1)
-                    && !results.contains(&entry)
-                {
-                    results.push(entry);
-                }
+            crate::snapshot_probe::record_registry_read();
+            let Some(sv) = self
+                .registry
+                .get_latest(&scope.key(schema, table))
+                .await
+                .map_err(RegistryError::Storage)?
+            else {
+                continue;
+            };
+            let pg_schema =
+                serde_json::from_value::<PostgresTableSchema>(sv.schema_json)
+                    .map_err(|e| SourceError::Schema {
+                    details: format!(
+                        "stored schema of {schema}.{table} (version {}) is \
+                     unreadable: {e}",
+                        sv.version
+                    )
+                    .into(),
+                })?;
+            let fingerprint = pg_schema.fingerprint();
+            let column_names = Arc::new(
+                pg_schema
+                    .columns
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect::<Vec<_>>(),
+            );
+            let loaded = LoadedSchema {
+                schema: Arc::new(pg_schema),
+                registry_version: sv.version,
+                fingerprint: fingerprint.into(),
+                sequence: sv.sequence,
+                column_names,
+            };
+            if !self.cache_insert(&scope, key, loaded).await {
+                return Err(self.scope_changed());
             }
+            from_registry += 1;
         }
-
-        Ok(results)
+        Ok(from_registry)
     }
 
     /// Load full schema for a table.
@@ -1079,24 +1041,46 @@ fn build_column(row: &tokio_postgres::Row) -> PostgresColumn {
     col
 }
 
-/// A catalog query for a superset of the tables `pattern` captures (system
-/// schemas excluded unless named). A pattern without a schema matches every
-/// schema, as CDC filtering does.
-fn build_pattern_query(pattern: &str) -> String {
-    use crate::table_patterns::{split, superset_clause};
-    let (schema, table) = split(pattern);
-    let schema_clause = match schema {
-        None | Some("*") | Some("%") => "table_schema NOT IN ('pg_catalog', \
-             'information_schema', 'pg_toast')"
-            .to_string(),
-        Some(schema) => superset_clause("table_schema", schema),
+/// System schemas a pattern without a schema never matches.
+const ANY_SCHEMA: &str =
+    "table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')";
+
+/// One keyset page of the tables `patterns` may capture (a superset; the
+/// caller applies the CDC matcher): base tables strictly after `after` in
+/// bytewise `(schema, table)` order (`COLLATE "C"`), at most `limit` rows.
+pub(crate) async fn discovery_page(
+    client: &tokio_postgres::Client,
+    patterns: &[String],
+    after: Option<&(String, String)>,
+    limit: usize,
+) -> SourceResult<Vec<(String, String)>> {
+    let filter = crate::table_patterns::combined_superset(
+        patterns,
+        "table_schema",
+        "table_name",
+        ANY_SCHEMA,
+    );
+    let sql = format!(
+        "SELECT table_schema::text, table_name::text \
+         FROM information_schema.tables \
+         WHERE table_type = 'BASE TABLE' AND {filter} \
+           AND ($1::text IS NULL \
+             OR table_schema::text COLLATE \"C\" > $1::text COLLATE \"C\" \
+             OR (table_schema::text COLLATE \"C\" = $1::text COLLATE \"C\" \
+                 AND table_name::text COLLATE \"C\" > $2::text COLLATE \"C\")) \
+         ORDER BY table_schema::text COLLATE \"C\", \
+                  table_name::text COLLATE \"C\" \
+         LIMIT $3"
+    );
+    let (schema, table) = match after {
+        Some((s, t)) => (Some(s.as_str()), Some(t.as_str())),
+        None => (None, None),
     };
-    format!(
-        "SELECT table_schema, table_name FROM information_schema.tables \
-         WHERE table_type = 'BASE TABLE' AND {} AND {}",
-        schema_clause,
-        superset_clause("table_name", table)
-    )
+    let rows = client
+        .query(&sql, &[&schema, &table, &(limit as i64)])
+        .await
+        .map_err(query_error)?;
+    Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
 }
 
 fn query_error(e: tokio_postgres::Error) -> SourceError {
@@ -1776,18 +1760,38 @@ mod tests {
     /// inside names are literal.
     #[test]
     fn pattern_queries_follow_cdc_filtering() {
-        let q = build_pattern_query("public.users");
+        let q = crate::table_patterns::combined_superset(
+            &["public.users".to_string()],
+            "table_schema",
+            "table_name",
+            ANY_SCHEMA,
+        );
         assert!(q.contains("table_schema = 'public'"));
         assert!(q.contains("table_name = 'users'"));
-        let q = build_pattern_query("public.*");
+        let q = crate::table_patterns::combined_superset(
+            &["public.*".to_string()],
+            "table_schema",
+            "table_name",
+            ANY_SCHEMA,
+        );
         assert!(q.contains("table_schema = 'public'") && q.contains("1=1"));
-        let q = build_pattern_query("orders");
+        let q = crate::table_patterns::combined_superset(
+            &["orders".to_string()],
+            "table_schema",
+            "table_name",
+            ANY_SCHEMA,
+        );
         assert!(
             q.contains("table_schema NOT IN")
                 && q.contains("table_name = 'orders'")
         );
         for p in ["public.audit_*", "public.audit_%"] {
-            let q = build_pattern_query(p);
+            let q = crate::table_patterns::combined_superset(
+                &[p.to_string()],
+                "table_schema",
+                "table_name",
+                ANY_SCHEMA,
+            );
             assert!(q.contains("table_name LIKE 'audit|_%' ESCAPE '|'"), "{q}");
         }
     }

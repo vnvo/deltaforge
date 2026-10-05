@@ -107,14 +107,16 @@ pub enum SlotPresence {
     CreatedByDeltaforge,
 }
 
-/// Run all preflight checks.
-pub async fn run_preflight(
+/// Run all preflight checks. The table size estimate reads `tables` (schema,
+/// table) in batches of `batch_size` (the snapshot's discovery page size).
+pub async fn run_preflight<S: AsRef<str>>(
     dsn: &str,
     slot_name: Option<&str>,
     slot_presence: SlotPresence,
     publication: &str,
-    tables: &[(String, String)], // (schema, table)
+    tables: &[(S, S)],
     max_parallel_tables: usize,
+    batch_size: usize,
 ) -> Result<PreflightReport> {
     let (client, conn) = tokio_postgres::connect(dsn, NoTls)
         .await
@@ -236,22 +238,25 @@ pub async fn run_preflight(
     // 4. table size estimation
 
     if !tables.is_empty() {
-        let table_exprs: Vec<String> = tables
-            .iter()
-            .map(|(s, t)| format!("'{s}.{t}'::regclass"))
-            .collect();
-
-        let query = format!(
-            "SELECT COALESCE(SUM(pg_total_relation_size(t)), 0)::bigint \
-             FROM unnest(ARRAY[{}]) AS t",
-            table_exprs.join(", ")
-        );
-
-        let total_bytes: i64 = client
-            .query_one(&query, &[])
-            .await
-            .map(|r| r.get(0))
-            .unwrap_or(0);
+        // One parameterized query per batch (identifiers quoted by
+        // `format('%I.%I')`), so no statement grows with the table count.
+        let mut total_bytes: i64 = 0;
+        for batch in tables.chunks(batch_size.max(1)) {
+            let schemas: Vec<&str> =
+                batch.iter().map(|(s, _)| s.as_ref()).collect();
+            let names: Vec<&str> =
+                batch.iter().map(|(_, t)| t.as_ref()).collect();
+            total_bytes += client
+                .query_one(
+                    "SELECT COALESCE(SUM(pg_total_relation_size(\
+                       format('%I.%I', s, t)::regclass)), 0)::bigint \
+                     FROM unnest($1::text[], $2::text[]) AS x(s, t)",
+                    &[&schemas, &names],
+                )
+                .await
+                .map(|r| r.get::<_, i64>(0))
+                .unwrap_or(0);
+        }
 
         if total_bytes > 0 {
             let total_bytes = total_bytes as u64;

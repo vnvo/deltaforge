@@ -111,56 +111,94 @@ pub struct SnapshotGenerationRecord {
     pub config_fingerprint: String,
 }
 
-/// One table's identity-relevant configuration, hashed into the fingerprint.
-#[derive(Debug, Clone)]
-pub struct TableIdentitySpec {
-    /// Database name.
-    pub db: String,
-    /// Schema name (PostgreSQL), if any.
-    pub schema: Option<String>,
-    /// Table name.
-    pub table: String,
-    /// Effective identity columns **in declared order** (order is significant —
-    /// it changes composite-key ids, so a reorder must change the fingerprint).
-    pub identity_columns: Vec<String>,
-}
-
-/// A stable fingerprint over the identity-relevant snapshot configuration
-/// (the set of tables and each table's effective identity columns). A resume
-/// may reuse a generation only when this matches the persisted one.
+/// A stable fingerprint over the snapshot-relevant configuration. A resume
+/// may reuse a generation only when this matches the persisted one; anything
+/// else (including a fingerprint of an earlier format) starts a new
+/// generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotConfigFingerprint(String);
 
 impl SnapshotConfigFingerprint {
-    /// Compute the fingerprint. Independent of the *listing order* of tables
-    /// (they are sorted), but sensitive to each table's identity and to the
-    /// **order** of its identity columns.
-    pub fn compute(tables: &[TableIdentitySpec]) -> Self {
-        let mut canon: Vec<String> = tables
-            .iter()
-            .map(|t| {
-                format!(
-                    "{}\u{1f}{}\u{1f}{}\u{1f}{}",
-                    t.db,
-                    t.schema.as_deref().unwrap_or(""),
-                    t.table,
-                    t.identity_columns.join("\u{1f}"),
-                )
-            })
-            .collect();
-        canon.sort();
-        let mut h = Sha256::new();
-        h.update(b"dfsnapfp:v1");
-        for row in &canon {
-            h.update((row.len() as u64).to_be_bytes());
-            h.update(row.as_bytes());
-        }
-        SnapshotConfigFingerprint(hex::encode(h.finalize()))
-    }
-
     /// The fingerprint as a hex string.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// Builds the fingerprint (format v2) while tables are discovered, without
+/// holding the table list: every field is length-delimited, so the encoding
+/// is canonical. It binds the format version, the engine and the configured
+/// table patterns, then, in discovery order (bytewise `(schema, table)`),
+/// each table's canonical identity, identity columns (in identity order),
+/// cursor kind and schema version, and finally the table count.
+pub struct SnapshotFingerprintBuilder {
+    h: Sha256,
+    tables: u64,
+}
+
+impl SnapshotFingerprintBuilder {
+    pub fn new(engine: &str, patterns: &[String]) -> Self {
+        let mut b = Self {
+            h: Sha256::new(),
+            tables: 0,
+        };
+        b.field(b"dfsnapfp:v2");
+        b.field(engine.as_bytes());
+        b.count(patterns.len());
+        for p in patterns {
+            b.field(p.as_bytes());
+        }
+        b
+    }
+
+    /// The next table in discovery order.
+    pub fn table(
+        &mut self,
+        db: &str,
+        schema: Option<&str>,
+        table: &str,
+        identity_columns: &[String],
+        cursor_kind: crate::durable_checkpoint::CursorKind,
+        schema_version: i32,
+    ) {
+        use crate::durable_checkpoint::CursorKind;
+        self.h.update(b"T");
+        self.field(db.as_bytes());
+        match schema {
+            Some(s) => {
+                self.h.update([1]);
+                self.field(s.as_bytes());
+            }
+            None => self.h.update([0]),
+        }
+        self.field(table.as_bytes());
+        self.count(identity_columns.len());
+        for c in identity_columns {
+            self.field(c.as_bytes());
+        }
+        self.field(match cursor_kind {
+            CursorKind::Signed => b"signed",
+            CursorKind::Unsigned => b"unsigned",
+            CursorKind::CtidBlock => b"ctid_block",
+        });
+        self.h.update(schema_version.to_be_bytes());
+        self.tables += 1;
+    }
+
+    pub fn finish(mut self) -> SnapshotConfigFingerprint {
+        self.h.update(b"N");
+        let tables = self.tables;
+        self.count(tables as usize);
+        SnapshotConfigFingerprint(hex::encode(self.h.finalize()))
+    }
+
+    fn field(&mut self, bytes: &[u8]) {
+        self.h.update((bytes.len() as u64).to_be_bytes());
+        self.h.update(bytes);
+    }
+
+    fn count(&mut self, n: usize) {
+        self.h.update((n as u64).to_be_bytes());
     }
 }
 
@@ -375,12 +413,16 @@ mod tests {
     }
 
     fn fp(cols: &[&str]) -> SnapshotConfigFingerprint {
-        SnapshotConfigFingerprint::compute(&[TableIdentitySpec {
-            db: "shop".into(),
-            schema: Some("public".into()),
-            table: "orders".into(),
-            identity_columns: cols.iter().map(|s| s.to_string()).collect(),
-        }])
+        let mut b = SnapshotFingerprintBuilder::new("postgres", &[]);
+        b.table(
+            "public",
+            Some("public"),
+            "orders",
+            &cols.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            crate::durable_checkpoint::CursorKind::Signed,
+            1,
+        );
+        b.finish()
     }
 
     const KEY: &str = "snapshot_generation:src-1";
@@ -598,37 +640,59 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_ignores_table_order_but_tracks_identity() {
-        let a = TableIdentitySpec {
-            db: "d".into(),
-            schema: None,
-            table: "a".into(),
-            identity_columns: vec!["id".into()],
+    fn the_fingerprint_binds_everything_snapshot_relevant() {
+        use crate::durable_checkpoint::CursorKind;
+        type T<'a> = (&'a str, &'a [&'a str], CursorKind, i32);
+        let build = |patterns: &[&str], tables: &[T<'_>]| {
+            let patterns: Vec<String> =
+                patterns.iter().map(|s| s.to_string()).collect();
+            let mut b = SnapshotFingerprintBuilder::new("mysql", &patterns);
+            for (name, ids, kind, version) in tables {
+                let ids: Vec<String> =
+                    ids.iter().map(|s| s.to_string()).collect();
+                b.table("d", None, name, &ids, *kind, *version);
+            }
+            b.finish()
         };
-        let b = TableIdentitySpec {
-            db: "d".into(),
-            schema: None,
-            table: "b".into(),
-            identity_columns: vec!["k1".into(), "k2".into()],
-        };
-        let ab = SnapshotConfigFingerprint::compute(&[a.clone(), b.clone()]);
-        let ba = SnapshotConfigFingerprint::compute(&[b, a]);
-        assert_eq!(ab, ba, "listing order must not matter");
-
-        // Composite-key column order is significant.
-        let k12 = SnapshotConfigFingerprint::compute(&[TableIdentitySpec {
-            db: "d".into(),
-            schema: None,
-            table: "t".into(),
-            identity_columns: vec!["k1".into(), "k2".into()],
-        }]);
-        let k21 = SnapshotConfigFingerprint::compute(&[TableIdentitySpec {
-            db: "d".into(),
-            schema: None,
-            table: "t".into(),
-            identity_columns: vec!["k2".into(), "k1".into()],
-        }]);
-        assert_ne!(k12, k21, "identity column order must matter");
+        let base: Vec<T<'_>> = vec![
+            ("a", &["id"], CursorKind::Signed, 1),
+            ("b", &["k1", "k2"], CursorKind::CtidBlock, 3),
+        ];
+        let fp = build(&["d.*"], &base);
+        assert_eq!(fp, build(&["d.*"], &base), "deterministic");
+        let variants: Vec<(&str, SnapshotConfigFingerprint)> = vec![
+            ("patterns", build(&["d.a", "d.b"], &base)),
+            ("discovery order", build(&["d.*"], &[base[1], base[0]])),
+            (
+                "identity column order",
+                build(
+                    &["d.*"],
+                    &[base[0], ("b", &["k2", "k1"], CursorKind::CtidBlock, 3)],
+                ),
+            ),
+            (
+                "cursor kind",
+                build(
+                    &["d.*"],
+                    &[base[0], ("b", &["k1", "k2"], CursorKind::Signed, 3)],
+                ),
+            ),
+            (
+                "schema version",
+                build(
+                    &["d.*"],
+                    &[base[0], ("b", &["k1", "k2"], CursorKind::CtidBlock, 4)],
+                ),
+            ),
+            ("table count", build(&["d.*"], &base[..1])),
+        ];
+        for (what, other) in variants {
+            assert_ne!(fp, other, "{what} must change the fingerprint");
+        }
+        // Length-delimited: moving bytes between adjacent fields changes it.
+        let ab = build(&["d.*"], &[("ab", &["c"], CursorKind::Signed, 1)]);
+        let a_bc = build(&["d.*"], &[("a", &["bc"], CursorKind::Signed, 1)]);
+        assert_ne!(ab, a_bc);
     }
 
     #[tokio::test]

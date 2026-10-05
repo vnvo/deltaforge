@@ -109,9 +109,9 @@ impl PreflightReport {
 
 /// Run all preflight checks and return a report.
 /// Does not abort — callers decide what to do with hard errors.
-pub async fn run_preflight(
+pub async fn run_preflight<S: AsRef<str>>(
     dsn: &str,
-    tables: &[(String, String)], // (db, table)
+    tables: &[(S, S)], // (db, table)
     max_parallel_tables: usize,
 ) -> Result<PreflightReport> {
     let pool = Pool::new(dsn);
@@ -126,10 +126,10 @@ pub async fn run_preflight(
 
 /// [`run_preflight`] on a control connection verified as `expected_uuid`:
 /// the checks that gate a snapshot describe the verified server only.
-pub(crate) async fn run_preflight_verified(
+pub(crate) async fn run_preflight_verified<S: AsRef<str>>(
     dsn: &str,
     expected_uuid: &str,
-    tables: &[(String, String)],
+    tables: &[(S, S)],
     max_parallel_tables: usize,
 ) -> Result<PreflightReport> {
     let mut conn = super::mysql_session::open_control_connection(
@@ -144,9 +144,9 @@ pub(crate) async fn run_preflight_verified(
     report
 }
 
-async fn run_preflight_on(
+async fn run_preflight_on<S: AsRef<str>>(
     conn: &mut mysql_async::Conn,
-    tables: &[(String, String)], // (db, table)
+    tables: &[(S, S)], // (db, table)
     max_parallel_tables: usize,
 ) -> Result<PreflightReport> {
     let mut report = PreflightReport {
@@ -254,12 +254,19 @@ async fn run_preflight_on(
         let mut by_db: std::collections::HashMap<&str, Vec<&str>> =
             std::collections::HashMap::new();
         for (db, table) in tables {
-            by_db.entry(db.as_str()).or_default().push(table.as_str());
+            by_db.entry(db.as_ref()).or_default().push(table.as_ref());
         }
 
         let mut total_bytes: u64 = 0;
 
-        for (db, tbl_names) in &by_db {
+        // Bounded statements: at most 1000 names per `IN (...)` list.
+        let mut batches: Vec<(&str, &[&str])> = Vec::new();
+        for (db, names) in &by_db {
+            for chunk in names.chunks(1_000) {
+                batches.push((db, chunk));
+            }
+        }
+        for (db, tbl_names) in batches {
             let placeholders = tbl_names
                 .iter()
                 .enumerate()

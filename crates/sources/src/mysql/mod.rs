@@ -212,24 +212,39 @@ pub(crate) struct RunCtx {
     durable_lineage: Option<PersistedLineage>,
 }
 
-/// Outcome of the pre-snapshot validate/allocate flow: the frozen generation,
-/// its persisted lineage, and the per-table resolved identity columns.
+/// A table of the snapshot plan: its identity column names (in identity
+/// order).
+pub(crate) type MyPlannedTable =
+    crate::snapshot_plan::PlannedTable<Vec<String>>;
+
+/// Outcome of the pre-snapshot discover/prepare/allocate flow: the frozen
+/// generation, its persisted lineage, and every table to copy (in discovery
+/// order).
 struct SnapshotPlan {
     generation: u64,
     lineage: PersistedLineage,
-    /// `db.table` → resolved identity column names (in identity order).
-    identity_map: HashMap<String, Vec<String>>,
+    tables: Vec<MyPlannedTable>,
+}
+
+/// What the preparation pass needs to apply the failover drift policy.
+struct DriftCheck<'a> {
+    anchor: &'a mysql_failover_drift::FailoverAnchor,
+    env: mysql_failover_drift::DriftEnv<'a>,
 }
 
 impl MySqlSource {
-    /// Validate every selected table's identity, freeze source lineage, compute
-    /// the config fingerprint, and atomically allocate (or resume) the snapshot
+    /// Discover the tables to copy (keyset pages of the catalog, filtered by
+    /// the CDC matcher) and prepare each exactly once - after a failover its
+    /// drift policy first (before its schema is loaded or registered), then
+    /// one schema resolution, identity resolution and type validation, cursor
+    /// kind - into a compact plan entry and the streaming generation
+    /// fingerprint, then atomically allocate (or resume) the snapshot
     /// generation - all **before** any row is emitted. Keyless tables or
     /// unsupported identity types fail here, before allocation.
-    async fn prepare_snapshot_generation(
+    async fn prepare_snapshot(
         &self,
         loader: &MySqlSchemaLoader,
-        tracked: &[(String, String)],
+        drift: Option<&DriftCheck<'_>>,
         lineage: PersistedLineage,
         force_new: bool,
     ) -> SourceResult<SnapshotPlan> {
@@ -237,58 +252,101 @@ impl MySqlSource {
             IdentitySchemaView, resolve_identity,
         };
         use crate::snapshot_generation::{
-            AllocationMode, SnapshotConfigFingerprint, TableIdentitySpec,
-            allocate_generation,
+            AllocationMode, SnapshotFingerprintBuilder, allocate_generation,
         };
 
-        let mut specs: Vec<TableIdentitySpec> =
-            Vec::with_capacity(tracked.len());
-        let mut identity_map: HashMap<String, Vec<String>> = HashMap::new();
-
-        // Steps 2-4: schema, identity resolution, and type validation for
-        // EVERY table - so an invalid table fails before a generation is
-        // allocated or any row emitted.
-        for (db, table) in tracked {
-            let loaded = loader.load_schema(db, table).await?;
-            let schema = &loaded.schema;
-            let col_names: Vec<String> =
-                schema.columns.iter().map(|c| c.name.clone()).collect();
-            let fqn = format!("{db}.{table}");
-            let opts = self.table_options.get(&fqn);
-            let view = IdentitySchemaView {
-                columns: &col_names,
-                primary_key: &schema.primary_key,
-                unique_constraints: &[],
-            };
-            let resolved = resolve_identity(
-                db,
-                table,
-                &view,
-                opts.and_then(|o| o.identity_columns.as_deref()),
-                opts.map(|o| o.assume_unique).unwrap_or(false),
+        let started = std::time::Instant::now();
+        let fetches_before = loader.live_fetch_count();
+        let mut conn = loader.discovery_conn().await?;
+        crate::snapshot_probe::record_fixed(
+            crate::snapshot_probe::FixedOp::CatalogSession,
+        );
+        let mut discovery = crate::snapshot_discovery::Discovery::new(
+            &self.tables,
+            self.snapshot_cfg.discovery_page_size,
+        );
+        let mut fingerprint =
+            SnapshotFingerprintBuilder::new("mysql", &self.tables);
+        let mut tables: Vec<MyPlannedTable> = Vec::new();
+        while !discovery.is_done() {
+            let t = std::time::Instant::now();
+            let rows = mysql_schema_loader::discovery_page(
+                &mut conn,
+                &self.tables,
+                discovery.after(),
+                discovery.page_size(),
             )
-            .map_err(|e| SourceError::Other(anyhow::anyhow!(e)))?;
-            for name in &resolved.columns {
-                let col = schema.column(name).ok_or_else(|| {
-                    SourceError::Other(anyhow::anyhow!(
-                        "identity column {name:?} vanished from schema"
-                    ))
-                })?;
-                mysql_identity_kind(col)
-                    .map_err(|e| SourceError::Other(anyhow::anyhow!(e)))?;
+            .await?;
+            crate::snapshot_probe::record_discovery_time(t.elapsed());
+            let page = discovery.accept(rows)?;
+            crate::snapshot_probe::after_discovery_page().await;
+            if let Some(d) = drift {
+                for (db, table) in &page {
+                    mysql_failover_drift::check(
+                        &d.env,
+                        d.anchor,
+                        db,
+                        table,
+                        mysql_failover_drift::FirstEvent::Snapshot,
+                    )
+                    .await?;
+                }
             }
-            specs.push(TableIdentitySpec {
-                db: db.clone(),
-                schema: None,
-                table: table.clone(),
-                identity_columns: resolved.columns.clone(),
-            });
-            identity_map.insert(fqn, resolved.columns);
+            loader.warm_from_registry(&page).await?;
+            for (db, table) in page {
+                let loaded = loader.load_schema(&db, &table).await?;
+                let schema = &loaded.schema;
+                let col_names: Vec<String> =
+                    schema.columns.iter().map(|c| c.name.clone()).collect();
+                let fqn = format!("{db}.{table}");
+                let opts = self.table_options.get(&fqn);
+                let view = IdentitySchemaView {
+                    columns: &col_names,
+                    primary_key: &schema.primary_key,
+                    unique_constraints: &[],
+                };
+                let resolved = resolve_identity(
+                    &db,
+                    &table,
+                    &view,
+                    opts.and_then(|o| o.identity_columns.as_deref()),
+                    opts.map(|o| o.assume_unique).unwrap_or(false),
+                )
+                .map_err(|e| SourceError::Other(anyhow::anyhow!(e)))?;
+                for name in &resolved.columns {
+                    let col = schema.column(name).ok_or_else(|| {
+                        SourceError::Other(anyhow::anyhow!(
+                            "identity column {name:?} vanished from schema"
+                        ))
+                    })?;
+                    mysql_identity_kind(col)
+                        .map_err(|e| SourceError::Other(anyhow::anyhow!(e)))?;
+                }
+                let cursor_kind = mysql_snapshot::mysql_cursor_kind(schema);
+                fingerprint.table(
+                    &db,
+                    None,
+                    &table,
+                    &resolved.columns,
+                    cursor_kind,
+                    loaded.registry_version,
+                );
+                crate::snapshot_probe::record_prepared_table();
+                tables.push(MyPlannedTable {
+                    qualifier: db,
+                    table,
+                    identity: resolved.columns,
+                    cursor_kind,
+                });
+            }
         }
+        drop(conn);
+        loader.check_binlog_row_image().await?;
+        crate::snapshot_probe::record_fixed(
+            crate::snapshot_probe::FixedOp::RowImageCheck,
+        );
 
-        // Step 5: lineage is captured once by the caller and passed in. Step 6:
-        // fingerprint. Step 7: allocate.
-        let fingerprint = SnapshotConfigFingerprint::compute(&specs);
+        let fingerprint = fingerprint.finish();
         let mode = if force_new {
             AllocationMode::ForceNew
         } else {
@@ -300,18 +358,67 @@ impl MySqlSource {
             allocate_generation(&store, &key, lineage, &fingerprint, mode)
                 .await
                 .map_err(|e| SourceError::Other(anyhow::anyhow!(e)))?;
+        crate::snapshot_probe::record_fixed(
+            crate::snapshot_probe::FixedOp::GenerationAllocation,
+        );
+        crate::snapshot_probe::record_preparation(
+            started.elapsed(),
+            crate::snapshot_plan::plan_bytes(&tables, |ids| {
+                ids.iter()
+                    .map(|i| std::mem::size_of::<String>() + i.len())
+                    .sum()
+            }),
+            loader.live_fetch_count() - fetches_before,
+        );
 
         info!(
             source_id = %self.id,
             generation = alloc.record.generation,
-            tables = tracked.len(),
+            tables = tables.len(),
             "snapshot generation allocated"
         );
         Ok(SnapshotPlan {
             generation: alloc.record.generation,
             lineage: alloc.record.lineage,
-            identity_map,
+            tables,
         })
+    }
+
+    /// Whether unfinished legacy snapshot progress is ambiguous: among the
+    /// tables the configured patterns expand to now (paged discovery, the
+    /// same canonical `db.table` identities the snapshot records), some are
+    /// done and some pending.
+    async fn legacy_progress_is_ambiguous(
+        &self,
+        progress: &mysql_snapshot::MysqlSnapshotProgress,
+    ) -> SourceResult<bool> {
+        let mut conn = mysql_async::Conn::from_url(self.dsn.expose())
+            .await
+            .map_err(|e| SourceError::Connect {
+                details: format!(
+                    "discover tables to check snapshot progress: {e}"
+                )
+                .into(),
+            })?;
+        let mut discovery = crate::snapshot_discovery::Discovery::new(
+            &self.tables,
+            self.snapshot_cfg.discovery_page_size,
+        );
+        let mut scan = crate::snapshot_frontier::LegacyProgressScan::default();
+        while !discovery.is_done() && !scan.settled() {
+            let rows = mysql_schema_loader::discovery_page(
+                &mut conn,
+                &self.tables,
+                discovery.after(),
+                discovery.page_size(),
+            )
+            .await?;
+            for (db, table) in discovery.accept(rows)? {
+                scan.observe(progress.table_done(&db, &table));
+            }
+        }
+        conn.disconnect().await.ok();
+        Ok(scan.ambiguous(progress.finished))
     }
 
     /// Freeze the source lineage for snapshot identity: prefer the stable
@@ -554,53 +661,45 @@ impl MySqlSource {
             );
             // After a failover, each snapshotted table's drift policy
             // applies before its schema is loaded or registered and before
-            // any snapshot row (Round 38).
-            if let Some(anchor) = mysql_failover_drift::load_anchor(
+            // any snapshot row (Round 38): in the preparation pass, page by
+            // page, from the one discovery.
+            let drift_anchor = mysql_failover_drift::load_anchor(
                 &self.backend,
                 &self.tenant,
                 &self.id,
             )
             .await
-            .map_err(SourceError::Other)?
-            {
-                let tables =
-                    snap_schema_loader.expand_patterns(&self.tables).await?;
-                let scope = self.registry_scope.current()?;
-                let lctn = fetch_lower_case_table_names(
-                    self.dsn.expose(),
-                    &server_uuid,
-                )
-                .await?;
-                let env = mysql_failover_drift::DriftEnv {
-                    backend: &self.backend,
-                    loader: &snap_schema_loader,
-                    scope: &scope,
-                    dsn: self.dsn.expose(),
-                    server_uuid: &server_uuid,
-                    source_id: &self.id,
-                    halt: self.on_schema_drift
-                        == deltaforge_config::OnSchemaDrift::Halt,
-                    lower_case_table_names: lctn,
-                };
-                for (db, table) in &tables {
-                    mysql_failover_drift::check(
-                        &env,
-                        &anchor,
-                        db,
-                        table,
-                        mysql_failover_drift::FirstEvent::Snapshot,
-                    )
-                    .await?;
-                }
-            }
-            let tracked = snap_schema_loader.preload(&self.tables).await?;
+            .map_err(SourceError::Other)?;
+            let drift_scope = self.registry_scope.current()?;
+            let drift = match &drift_anchor {
+                Some(anchor) => Some(DriftCheck {
+                    anchor,
+                    env: mysql_failover_drift::DriftEnv {
+                        backend: &self.backend,
+                        loader: &snap_schema_loader,
+                        scope: &drift_scope,
+                        dsn: self.dsn.expose(),
+                        server_uuid: &server_uuid,
+                        source_id: &self.id,
+                        halt: self.on_schema_drift
+                            == deltaforge_config::OnSchemaDrift::Halt,
+                        lower_case_table_names: fetch_lower_case_table_names(
+                            self.dsn.expose(),
+                            &server_uuid,
+                        )
+                        .await?,
+                    },
+                }),
+                None => None,
+            };
 
-            // Validate every table + freeze lineage + allocate the generation
-            // BEFORE emitting any row (keyless/unsupported tables fail here).
+            // Discover + validate every table, freeze lineage, allocate the
+            // generation BEFORE emitting any row (keyless/unsupported tables
+            // fail here).
             let plan = self
-                .prepare_snapshot_generation(
+                .prepare_snapshot(
                     &snap_schema_loader,
-                    &tracked,
+                    drift.as_ref(),
                     durable_lineage.clone(),
                     restart,
                 )
@@ -626,16 +725,16 @@ impl MySqlSource {
                 pipeline: &self.pipeline,
                 tenant: &self.tenant,
                 cfg: &self.snapshot_cfg,
+                table_patterns: &self.tables,
                 schema_loader: &snap_schema_loader,
                 chkpt_store: chkpt_store.clone(),
                 tx: tx.clone(),
                 cancel: cancel.clone(),
                 generation: plan.generation,
                 lineage: plan.lineage,
-                identity_map: plan.identity_map,
             };
             let snapshot_position =
-                mysql_snapshot::run_snapshot(&snapshot_ctx, &tracked)
+                mysql_snapshot::run_snapshot(&snapshot_ctx, &plan.tables)
                     .await
                     // Preserve a typed preflight refusal (Permission/Incompatible)
                     // if run_snapshot produced one; otherwise wrap as Other.
@@ -649,7 +748,11 @@ impl MySqlSource {
                 .await
                 .map_err(|e| SourceError::Other(e.into()))?;
 
-            snapshot_tables = tracked;
+            snapshot_tables = plan
+                .tables
+                .into_iter()
+                .map(|t| (t.qualifier, t.table))
+                .collect();
             info!(source_id = %self.id, "snapshot complete, starting binlog streaming");
         }
 
@@ -1101,11 +1204,10 @@ impl Source for MySqlSource {
             .flatten()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
-        if crate::snapshot_frontier::is_ambiguous_legacy_progress(
-            &self.tables,
-            &progress.done_tables,
-            progress.finished,
-        ) {
+        if !progress.finished
+            && !progress.done_tables.is_empty()
+            && self.legacy_progress_is_ambiguous(&progress).await?
+        {
             return Err(SourceError::Other(anyhow::anyhow!(
                 "durable_v2: interrupted legacy snapshot progress for source \
                  {} cannot be adopted (some tables done, some pending); finish \

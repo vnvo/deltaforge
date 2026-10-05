@@ -231,101 +231,143 @@ impl RunCtx {
 
 const MAX_STARTUP_BACKOFF_SECS: u64 = 60;
 
-/// Outcome of the pre-snapshot validate/allocate flow.
+/// A table of the snapshot plan: its identity columns with their kinds.
+pub type PgPlannedTable = crate::snapshot_plan::PlannedTable<Vec<IdentitySpec>>;
+
+/// Outcome of the pre-snapshot discover/prepare/allocate flow.
 struct SnapshotPlan {
     generation: u64,
     lineage: PersistedLineage,
-    /// `schema.table` → resolved identity columns (name + kind).
-    identity_map: HashMap<String, Vec<IdentitySpec>>,
+    /// Every table to copy, in discovery order.
+    tables: Vec<PgPlannedTable>,
 }
 
 impl PostgresSource {
-    /// Validate every selected table's identity (resolution + catalog type
-    /// support), freeze the cluster lineage, compute the config fingerprint, and
-    /// atomically allocate (or resume) the snapshot generation - all **before**
-    /// any row is emitted. Keyless tables or unsupported identity types fail
-    /// here, before allocation.
-    async fn prepare_snapshot_generation(
+    /// Discover the tables to copy (keyset pages of the catalog, filtered
+    /// by the CDC matcher), prepare each exactly once - one schema
+    /// resolution, identity resolution and type validation, cursor kind -
+    /// into a compact plan entry and the streaming generation fingerprint,
+    /// freeze the cluster lineage and atomically allocate (or resume) the
+    /// snapshot generation - all **before** any row is emitted. Keyless
+    /// tables or unsupported identity types fail here, before allocation.
+    async fn prepare_snapshot(
         &self,
         loader: &PostgresSchemaLoader,
-        tracked: &[(String, String)],
     ) -> SourceResult<SnapshotPlan> {
         use crate::identity_resolution::{
             IdentitySchemaView, resolve_identity,
         };
         use crate::snapshot_generation::{
-            AllocationMode, SnapshotConfigFingerprint, TableIdentitySpec,
-            allocate_generation,
+            AllocationMode, SnapshotFingerprintBuilder, allocate_generation,
         };
         use tokio_postgres::NoTls;
 
-        // One catalog connection for identity-kind resolution + lineage.
+        let started = std::time::Instant::now();
+        let fetches_before = loader.live_fetch_count();
+        // One catalog session: discovery, identity kinds and lineage, all in
+        // one repeatable-read transaction, so every discovery page (and every
+        // catalog read of the preparation) sees the same catalog snapshot:
+        // a concurrent CREATE, DROP or RENAME cannot change the table set
+        // between pages. Discovery runs after the slot anchor, so a table
+        // created after this snapshot is the CDC stream's.
         let (client, conn) = tokio_postgres::connect(self.dsn.expose(), NoTls)
             .await
             .map_err(|e| SourceError::Other(e.into()))?;
         let conn_task = tokio::spawn(async move {
             let _ = conn.await;
         });
-
-        let mut specs: Vec<TableIdentitySpec> =
-            Vec::with_capacity(tracked.len());
-        let mut identity_map: HashMap<String, Vec<IdentitySpec>> =
-            HashMap::new();
-
-        for (schema, table) in tracked {
-            let loaded = loader.load_schema(schema, table).await?;
-            let s = &loaded.schema;
-            let col_names: Vec<String> =
-                s.columns.iter().map(|c| c.name.clone()).collect();
-            let fqn = format!("{schema}.{table}");
-            let opts = self.table_options.get(&fqn);
-            let view = IdentitySchemaView {
-                columns: &col_names,
-                primary_key: &s.primary_key,
-                // Unique constraints are not captured in the schema today;
-                // non-PK identity columns require assume_unique.
-                unique_constraints: &[],
-            };
-            let resolved = resolve_identity(
-                schema,
-                table,
-                &view,
-                opts.and_then(|o| o.identity_columns.as_deref()),
-                opts.map(|o| o.assume_unique).unwrap_or(false),
-            )
-            .map_err(|e| SourceError::Other(anyhow::anyhow!(e)))?;
-
-            // Resolve + validate the identity column types from the catalog
-            // (rejects unsupported types before allocation).
-            let kinds = resolve_identity_kinds(
-                &client,
-                schema,
-                table,
-                &resolved.columns,
-            )
+        client
+            .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .await
-            .map_err(SourceError::Other)?;
+            .map_err(|e| SourceError::Other(e.into()))?;
+        crate::snapshot_probe::record_fixed(
+            crate::snapshot_probe::FixedOp::CatalogSession,
+        );
 
-            specs.push(TableIdentitySpec {
-                db: schema.clone(),
-                schema: Some(schema.clone()),
-                table: table.clone(),
-                identity_columns: resolved.columns.clone(),
-            });
-            identity_map.insert(
-                fqn,
-                kinds
-                    .into_iter()
-                    .map(|(name, kind)| IdentitySpec { name, kind })
-                    .collect(),
-            );
+        let mut discovery = crate::snapshot_discovery::Discovery::new(
+            &self.tables,
+            self.snapshot_cfg.discovery_page_size,
+        );
+        let mut fingerprint =
+            SnapshotFingerprintBuilder::new("postgres", &self.tables);
+        let mut tables: Vec<PgPlannedTable> = Vec::new();
+        while !discovery.is_done() {
+            let t = std::time::Instant::now();
+            let rows = postgres_schema_loader::discovery_page(
+                &client,
+                &self.tables,
+                discovery.after(),
+                discovery.page_size(),
+            )
+            .await?;
+            crate::snapshot_probe::record_discovery_time(t.elapsed());
+            let page = discovery.accept(rows)?;
+            crate::snapshot_probe::after_discovery_page().await;
+            loader.warm_from_registry(&page).await?;
+            for (schema, table) in page {
+                let loaded = loader.load_schema(&schema, &table).await?;
+                let s = &loaded.schema;
+                let col_names: Vec<String> =
+                    s.columns.iter().map(|c| c.name.clone()).collect();
+                let fqn = format!("{schema}.{table}");
+                let opts = self.table_options.get(&fqn);
+                let view = IdentitySchemaView {
+                    columns: &col_names,
+                    primary_key: &s.primary_key,
+                    // Unique constraints are not captured in the schema
+                    // today; non-PK identity columns require assume_unique.
+                    unique_constraints: &[],
+                };
+                let resolved = resolve_identity(
+                    &schema,
+                    &table,
+                    &view,
+                    opts.and_then(|o| o.identity_columns.as_deref()),
+                    opts.map(|o| o.assume_unique).unwrap_or(false),
+                )
+                .map_err(|e| SourceError::Other(anyhow::anyhow!(e)))?;
+
+                // Resolve + validate the identity column types from the
+                // catalog (rejects unsupported types before allocation).
+                let kinds = resolve_identity_kinds(
+                    &client,
+                    &schema,
+                    &table,
+                    &resolved.columns,
+                )
+                .await
+                .map_err(SourceError::Other)?;
+                let cursor_kind = postgres_snapshot::pg_cursor_kind(s);
+                fingerprint.table(
+                    &schema,
+                    Some(&schema),
+                    &table,
+                    &resolved.columns,
+                    cursor_kind,
+                    loaded.registry_version,
+                );
+                crate::snapshot_probe::record_prepared_table();
+                tables.push(PgPlannedTable {
+                    qualifier: schema,
+                    table,
+                    identity: kinds
+                        .into_iter()
+                        .map(|(name, kind)| IdentitySpec { name, kind })
+                        .collect(),
+                    cursor_kind,
+                });
+            }
         }
 
         // Freeze lineage from the existing system_identifier authority.
         let lineage = self.capture_snapshot_lineage(&client).await?;
+        crate::snapshot_probe::record_fixed(
+            crate::snapshot_probe::FixedOp::LineageCapture,
+        );
+        client.batch_execute("COMMIT").await.ok();
         conn_task.abort();
 
-        let fingerprint = SnapshotConfigFingerprint::compute(&specs);
+        let fingerprint = fingerprint.finish();
         let mode = if self.snapshot_cfg.mode == SnapshotMode::Always {
             AllocationMode::ForceNew
         } else {
@@ -337,18 +379,76 @@ impl PostgresSource {
             allocate_generation(&store, &key, lineage, &fingerprint, mode)
                 .await
                 .map_err(|e| SourceError::Other(anyhow::anyhow!(e)))?;
+        crate::snapshot_probe::record_fixed(
+            crate::snapshot_probe::FixedOp::GenerationAllocation,
+        );
+        crate::snapshot_probe::record_preparation(
+            started.elapsed(),
+            crate::snapshot_plan::plan_bytes(&tables, |ids| {
+                ids.iter()
+                    .map(|i| std::mem::size_of::<IdentitySpec>() + i.name.len())
+                    .sum()
+            }),
+            loader.live_fetch_count() - fetches_before,
+        );
 
         info!(
             source_id = %self.id,
             generation = alloc.record.generation,
-            tables = tracked.len(),
+            tables = tables.len(),
             "snapshot generation allocated"
         );
         Ok(SnapshotPlan {
             generation: alloc.record.generation,
             lineage: alloc.record.lineage,
-            identity_map,
+            tables,
         })
+    }
+
+    /// Whether unfinished legacy snapshot progress is ambiguous: among the
+    /// tables the configured patterns expand to now (paged discovery, the
+    /// same canonical `schema.table` identities the snapshot records), some
+    /// are done and some pending.
+    async fn legacy_progress_is_ambiguous(
+        &self,
+        progress: &postgres_snapshot::SnapshotProgress,
+    ) -> SourceResult<bool> {
+        let (client, conn) =
+            tokio_postgres::connect(self.dsn.expose(), tokio_postgres::NoTls)
+                .await
+                .map_err(|e| SourceError::Connect {
+                    details: format!(
+                        "discover tables to check snapshot progress: {e}"
+                    )
+                    .into(),
+                })?;
+        let conn_task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        // One catalog snapshot for every page.
+        client
+            .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await
+            .map_err(|e| SourceError::Other(e.into()))?;
+        let mut discovery = crate::snapshot_discovery::Discovery::new(
+            &self.tables,
+            self.snapshot_cfg.discovery_page_size,
+        );
+        let mut scan = crate::snapshot_frontier::LegacyProgressScan::default();
+        while !discovery.is_done() && !scan.settled() {
+            let rows = postgres_schema_loader::discovery_page(
+                &client,
+                &self.tables,
+                discovery.after(),
+                discovery.page_size(),
+            )
+            .await?;
+            for (schema, table) in discovery.accept(rows)? {
+                scan.observe(progress.table_done(&schema, &table));
+            }
+        }
+        conn_task.abort();
+        Ok(scan.ambiguous(progress.finished))
     }
 
     /// Freeze the PostgreSQL cluster lineage from `system_identifier` - the same
@@ -501,14 +601,9 @@ impl PostgresSource {
         );
         // No schema is enumerated or loaded at a CDC start: each table is
         // resolved at its first Relation (design spec 7.23). Only a snapshot
-        // expands the patterns and loads the tables it copies; the
+        // discovers the tables it copies (paged, in `prepare_snapshot`); the
         // per-Relation replica-identity warning covers what the startup loop
         // used to report.
-        let tracked = if needs_snapshot {
-            schema_loader.preload(&self.tables).await?
-        } else {
-            Vec::new()
-        };
 
         let start_lsn = if needs_snapshot {
             info!(source_id = %self.id, "starting initial snapshot");
@@ -540,11 +635,10 @@ impl PostgresSource {
                 .map_err(SourceError::Other)?;
             }
 
-            // Validate every table + freeze lineage + allocate the generation
-            // BEFORE emitting any row (keyless/unsupported tables fail here).
-            let plan = self
-                .prepare_snapshot_generation(&schema_loader, &tracked)
-                .await?;
+            // Discover + validate every table, freeze lineage, allocate the
+            // generation BEFORE emitting any row (keyless/unsupported tables
+            // fail here).
+            let plan = self.prepare_snapshot(&schema_loader).await?;
 
             let snapshot_ctx = postgres_snapshot::PgSnapshotCtx {
                 dsn: self.dsn.expose(),
@@ -559,9 +653,8 @@ impl PostgresSource {
                 slot_name: Some(&self.slot),
                 generation: plan.generation,
                 lineage: plan.lineage,
-                identity_map: plan.identity_map,
             };
-            postgres_snapshot::run_snapshot(&snapshot_ctx, &tracked, anchor)
+            postgres_snapshot::run_snapshot(&snapshot_ctx, &plan.tables, anchor)
                 .await
                 .map_err(SourceError::Other)?
         } else {
@@ -1323,11 +1416,10 @@ impl Source for PostgresSource {
             .flatten()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
-        if crate::snapshot_frontier::is_ambiguous_legacy_progress(
-            &self.tables,
-            &progress.done_tables,
-            progress.finished,
-        ) {
+        if !progress.finished
+            && !progress.done_tables.is_empty()
+            && self.legacy_progress_is_ambiguous(&progress).await?
+        {
             return Err(SourceError::Other(anyhow::anyhow!(
                 "durable_v2: interrupted legacy snapshot progress for source \
                  {} cannot be adopted (some tables done, some pending); finish \

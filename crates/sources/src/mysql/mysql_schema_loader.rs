@@ -276,130 +276,94 @@ impl MySqlSchemaLoader {
         self.dsn = dsn;
     }
 
-    /// Expand wildcard patterns and preload all matching schemas.
-    ///
-    /// This is the eager (catalog-sized) startup path. It is deliberately
-    /// self-contained - it only reads latest versions through the scoped
-    /// registry and falls back to [`Self::load_schema`] - so removing the eager
-    /// preload later changes only its call sites, not the registry contract.
-    ///
-    /// Warm-start path: schemas already known to the durable registry are
-    /// deserialized directly into the in-memory cache, avoiding an
-    /// INFORMATION_SCHEMA query per table on restart. Tables missing from the
-    /// registry (first-ever run, or new tables) are fetched from the source.
-    ///
-    /// Patterns support:
-    /// - `db.table` - exact match
-    /// - `db.*` - all tables in db
-    /// - `db.prefix%` - tables starting with prefix
-    /// - `%.table` - table in any database
-    /// - `*` or empty - all tables (use with caution)
+    /// Every table `patterns` capture, with its schema resolved (from the
+    /// durable registry when known, otherwise from the catalog). Collects
+    /// all pages: diagnostics and tests only; a snapshot consumes the pages
+    /// one at a time ([`discovery_page`], [`Self::warm_from_registry`]).
     pub async fn preload(
         &self,
         patterns: &[String],
     ) -> SourceResult<Vec<(String, String)>> {
-        let t0 = Instant::now();
-        let scope = self.current_scope()?;
         let tables = self.expand_patterns(patterns).await?;
+        for page in tables.chunks(1_000) {
+            self.warm_from_registry(page).await?;
+            for (db, table) in page {
+                self.load_schema(db, table).await?;
+            }
+        }
+        self.check_binlog_row_image().await?;
+        Ok(tables)
+    }
 
-        info!(
-            dns=redact_password(self.dsn.expose()),
-            patterns = ?patterns,
-            matched_tables = tables.len(),
-            "expanded table patterns"
-        );
-
-        // Warm cache from the durable registry first.  On restart this means
-        // all previously-seen tables skip the INFORMATION_SCHEMA fetch and
-        // don't appear as cache misses.  If a table's schema is stale (ALTER
-        // happened while the process was down) the binlog drift handler will
-        // call reload_schema for just that table when the mismatch is detected.
+    /// Resolve a page of tables from the durable registry: a table with
+    /// stored history enters the cache (pinned) without a catalog query; the
+    /// others are left for [`Self::load_schema`]. Stored history that cannot
+    /// be read fails closed (never replaced by the live catalog), as does a
+    /// registry storage error.
+    pub async fn warm_from_registry(
+        &self,
+        page: &[(String, String)],
+    ) -> SourceResult<usize> {
+        let scope = self.current_scope()?;
         let mut from_registry = 0usize;
-        let mut needs_fetch: Vec<&(String, String)> = Vec::new();
-        for pair in &tables {
-            let (db, table) = pair;
-            // A registry storage error fails closed; only a genuinely absent
-            // schema falls back to INFORMATION_SCHEMA.
-            let latest = self
+        for (db, table) in page {
+            let key = (db.clone(), table.clone());
+            if self
+                .cache
+                .read()
+                .await
+                .get(scope.generation(), &key)
+                .is_some()
+            {
+                continue;
+            }
+            crate::snapshot_probe::record_registry_read();
+            let Some(sv) = self
                 .registry
                 .get_latest(&scope.key(db, table))
                 .await
-                .map_err(RegistryError::Storage)?;
-            match latest {
-                Some(sv) => {
-                    match serde_json::from_value::<MySqlTableSchema>(
-                        sv.schema_json,
-                    ) {
-                        Ok(schema) => {
-                            let fingerprint = schema.fingerprint();
-                            let column_names = Arc::new(
-                                schema
-                                    .columns
-                                    .iter()
-                                    .map(|c| c.name.clone())
-                                    .collect::<Vec<_>>(),
-                            );
-                            let loaded = Arc::new(LoadedSchema {
-                                schema,
-                                registry_version: sv.version,
-                                fingerprint: fingerprint.into(),
-                                sequence: sv.sequence,
-                                column_names,
-                            });
-                            if !self
-                                .cache_insert(
-                                    &scope,
-                                    (db.clone(), table.clone()),
-                                    loaded,
-                                )
-                                .await
-                            {
-                                return Err(self.scope_changed());
-                            }
-                            from_registry += 1;
-                        }
-                        // Stored history that cannot be read is corrupt: never
-                        // replaced by the live catalog.
-                        Err(e) => {
-                            return Err(SourceError::Schema {
-                                details: format!(
-                                    "stored schema of {db}.{table} (version {}) \
-                                     is unreadable: {e}",
-                                    sv.version
-                                )
-                                .into(),
-                            });
-                        }
-                    }
-                }
-                None => needs_fetch.push(pair),
+                .map_err(RegistryError::Storage)?
+            else {
+                continue;
+            };
+            let schema =
+                serde_json::from_value::<MySqlTableSchema>(sv.schema_json)
+                    .map_err(|e| SourceError::Schema {
+                        details: format!(
+                            "stored schema of {db}.{table} (version {}) is \
+                     unreadable: {e}",
+                            sv.version
+                        )
+                        .into(),
+                    })?;
+            let fingerprint = schema.fingerprint();
+            let column_names = Arc::new(
+                schema
+                    .columns
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect::<Vec<_>>(),
+            );
+            let loaded = Arc::new(LoadedSchema {
+                schema,
+                registry_version: sv.version,
+                fingerprint: fingerprint.into(),
+                sequence: sv.sequence,
+                column_names,
+            });
+            if !self.cache_insert(&scope, key, loaded).await {
+                return Err(self.scope_changed());
             }
+            from_registry += 1;
         }
+        Ok(from_registry)
+    }
 
-        // Fetch from INFORMATION_SCHEMA only for tables absent from registry.
-        for (db, table) in &needs_fetch {
-            match self.load_schema(db, table).await {
-                Ok(_) => {}
-                // The connection reached another server: not a missing
-                // table, and nothing may continue on that assumption.
-                Err(e @ SourceError::Lineage { .. }) => return Err(e),
-                Err(e) => {
-                    warn!(db = %db, table = %table, error = %e, "failed to preload schema");
-                }
-            }
-        }
-
-        let elapsed = t0.elapsed();
-        info!(
-            tables_loaded = tables.len(),
-            from_registry,
-            from_source = needs_fetch.len(),
-            elapsed_ms = elapsed.as_millis(),
-            "schema preload complete"
-        );
-
-        self.check_binlog_row_image().await?;
-        Ok(tables)
+    /// A connection verified to reach the scoped server, for discovery.
+    pub(crate) async fn discovery_conn(
+        &self,
+    ) -> SourceResult<mysql_async::Conn> {
+        self.verified_conn().await
     }
 
     /// Warn when `binlog_row_image` is not FULL (before images incomplete).
@@ -424,51 +388,27 @@ impl MySqlSchemaLoader {
         Ok(())
     }
 
-    /// Expand wildcard patterns to actual table list.
+    /// Every table `patterns` capture, in discovery order (all pages
+    /// collected: diagnostics and tests only).
     pub async fn expand_patterns(
         &self,
         patterns: &[String],
     ) -> SourceResult<Vec<(String, String)>> {
         let mut conn = self.verified_conn().await?;
-        let mut results = Vec::new();
-
-        // Handle empty patterns = all tables
-        if patterns.is_empty() {
-            let rows: Vec<Row> = conn
-                .query(
-                    "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES 
-                     WHERE TABLE_TYPE = 'BASE TABLE' 
-                     AND TABLE_SCHEMA NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')",
-                )
-                .await
-                .map_err(query_error)?;
-
-            for mut row in rows {
-                let db: String = row.take("TABLE_SCHEMA").unwrap();
-                let table: String = row.take("TABLE_NAME").unwrap();
-                results.push((db, table));
-            }
-            return Ok(results);
+        let mut discovery =
+            crate::snapshot_discovery::Discovery::new(patterns, 1_000);
+        let mut tables = Vec::new();
+        while !discovery.is_done() {
+            let rows = discovery_page(
+                &mut conn,
+                patterns,
+                discovery.after(),
+                discovery.page_size(),
+            )
+            .await?;
+            tables.extend(discovery.accept(rows)?);
         }
-
-        // Exactly the tables CDC captures (see `table_patterns`).
-        for pattern in patterns {
-            let query = build_pattern_query(pattern);
-            let rows: Vec<Row> =
-                conn.query(&query).await.map_err(query_error)?;
-
-            for mut row in rows {
-                let db: String = row.take("TABLE_SCHEMA").unwrap();
-                let table: String = row.take("TABLE_NAME").unwrap();
-                if crate::table_patterns::captures(pattern, &db, &table)
-                    && !results.contains(&(db.clone(), table.clone()))
-                {
-                    results.push((db, table));
-                }
-            }
-        }
-
-        Ok(results)
+        Ok(tables)
     }
 
     /// Load full schema for a table.
@@ -826,23 +766,47 @@ impl MySqlSchemaLoader {
     }
 }
 
-/// A catalog query for a superset of the tables `pattern` captures (system
-/// databases excluded unless named).
-fn build_pattern_query(pattern: &str) -> String {
-    use crate::table_patterns::{split, superset_clause};
-    let (db, table) = split(pattern);
-    let db_clause = match db {
-        None | Some("*") | Some("%") => "TABLE_SCHEMA NOT IN ('mysql', \
-             'information_schema', 'performance_schema', 'sys')"
-            .to_string(),
-        Some(db) => superset_clause("TABLE_SCHEMA", db),
+/// System databases a pattern without a database never matches.
+const ANY_DATABASE: &str = "TABLE_SCHEMA NOT IN ('mysql', \
+     'information_schema', 'performance_schema', 'sys')";
+
+/// One keyset page of the tables `patterns` may capture (a superset; the
+/// caller applies the CDC matcher): base tables strictly after `after` in
+/// bytewise `(database, table)` order (binary comparison of both), at most
+/// `limit` rows.
+pub(crate) async fn discovery_page(
+    conn: &mut mysql_async::Conn,
+    patterns: &[String],
+    after: Option<&(String, String)>,
+    limit: usize,
+) -> SourceResult<Vec<(String, String)>> {
+    let filter = crate::table_patterns::combined_superset(
+        patterns,
+        "TABLE_SCHEMA",
+        "TABLE_NAME",
+        ANY_DATABASE,
+    );
+    let cursor = if after.is_some() {
+        "AND (CAST(TABLE_SCHEMA AS BINARY) > CAST(? AS BINARY) \
+           OR (CAST(TABLE_SCHEMA AS BINARY) = CAST(? AS BINARY) \
+               AND CAST(TABLE_NAME AS BINARY) > CAST(? AS BINARY)))"
+    } else {
+        ""
     };
-    format!(
+    let sql = format!(
         "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
-         WHERE TABLE_TYPE = 'BASE TABLE' AND {} AND {}",
-        db_clause,
-        superset_clause("TABLE_NAME", table)
-    )
+         WHERE TABLE_TYPE = 'BASE TABLE' AND {filter} {cursor} \
+         ORDER BY CAST(TABLE_SCHEMA AS BINARY), CAST(TABLE_NAME AS BINARY) \
+         LIMIT {limit}"
+    );
+    let rows: Vec<(String, String)> = match after {
+        Some((db, table)) => conn
+            .exec(&sql, (db.as_str(), db.as_str(), table.as_str()))
+            .await
+            .map_err(query_error)?,
+        None => conn.query(&sql).await.map_err(query_error)?,
+    };
+    Ok(rows)
 }
 
 fn conn_error(e: mysql_async::Error) -> SourceError {
@@ -1181,18 +1145,38 @@ mod tests {
     /// inside names are literal.
     #[test]
     fn pattern_queries_follow_cdc_filtering() {
-        let q = build_pattern_query("orders.items");
+        let q = crate::table_patterns::combined_superset(
+            &["orders.items".to_string()],
+            "TABLE_SCHEMA",
+            "TABLE_NAME",
+            ANY_DATABASE,
+        );
         assert!(q.contains("TABLE_SCHEMA = 'orders'"));
         assert!(q.contains("TABLE_NAME = 'items'"));
-        let q = build_pattern_query("orders.*");
+        let q = crate::table_patterns::combined_superset(
+            &["orders.*".to_string()],
+            "TABLE_SCHEMA",
+            "TABLE_NAME",
+            ANY_DATABASE,
+        );
         assert!(q.contains("TABLE_SCHEMA = 'orders'") && q.contains("1=1"));
-        let q = build_pattern_query("audit");
+        let q = crate::table_patterns::combined_superset(
+            &["audit".to_string()],
+            "TABLE_SCHEMA",
+            "TABLE_NAME",
+            ANY_DATABASE,
+        );
         assert!(
             q.contains("TABLE_SCHEMA NOT IN")
                 && q.contains("TABLE_NAME = 'audit'")
         );
         for p in ["shop.audit_*", "shop.audit_%"] {
-            let q = build_pattern_query(p);
+            let q = crate::table_patterns::combined_superset(
+                &[p.to_string()],
+                "TABLE_SCHEMA",
+                "TABLE_NAME",
+                ANY_DATABASE,
+            );
             assert!(q.contains("TABLE_NAME LIKE 'audit|_%' ESCAPE '|'"), "{q}");
         }
     }

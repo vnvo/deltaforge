@@ -19,9 +19,12 @@ pub mod registry_scope;
 pub mod rotation;
 pub mod rotation_manager;
 pub mod schema_loader;
+pub(crate) mod snapshot_discovery;
 pub mod snapshot_event_id;
 pub mod snapshot_frontier;
 pub mod snapshot_generation;
+pub mod snapshot_plan;
+pub mod snapshot_probe;
 pub mod stream_probe;
 mod table_patterns;
 // Phase 2 lease-lifecycle machinery (models + durable store + pure state machine).

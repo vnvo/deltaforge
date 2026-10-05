@@ -53,8 +53,9 @@ use super::postgres_schema_loader::PostgresSchemaLoader;
 pub struct SnapshotProgress {
     /// The anchor LSN: the replication slot's consistent point (PG-A-lite).
     pub start_lsn: String,
-    /// Tables that have been fully snapshotted ("schema.table").
-    pub done_tables: Vec<String>,
+    /// Tables that have been fully snapshotted ("schema.table"); a JSON
+    /// array of names, as always.
+    pub done_tables: std::collections::BTreeSet<String>,
     /// True once every table is complete.
     pub finished: bool,
     /// Anchor protocol version. 0 (default, for records written before this
@@ -74,10 +75,7 @@ impl SnapshotProgress {
     }
 
     pub fn mark_done(&mut self, schema: &str, table: &str) {
-        let key = fqn(schema, table);
-        if !self.done_tables.contains(&key) {
-            self.done_tables.push(key);
-        }
+        self.done_tables.insert(fqn(schema, table));
     }
 }
 
@@ -171,8 +169,6 @@ pub struct PgSnapshotCtx<'a> {
     pub generation: u64,
     /// Frozen source lineage for snapshot identity.
     pub lineage: PersistedLineage,
-    /// `schema.table` → resolved identity columns (name + kind, identity order).
-    pub identity_map: HashMap<String, Vec<IdentitySpec>>,
 }
 
 /// Run a consistent snapshot of `tables`.
@@ -185,7 +181,7 @@ pub struct PgSnapshotCtx<'a> {
 /// and expected - it is not exactly-once (PG-A-lite).
 pub async fn run_snapshot(
     ctx: &PgSnapshotCtx<'_>,
-    tables: &[(String, String)],
+    tables: &[super::PgPlannedTable],
     // The anchor LSN: the replication slot's consistent point, established by
     // prepare_snapshot_slot_anchor. CDC resumes from here; rows committed in
     // (anchor, snapshot-export] are re-delivered by CDC (bounded at-least-once
@@ -214,6 +210,10 @@ pub async fn run_snapshot(
     }
 
     // preflight
+    let names: Vec<(&str, &str)> = tables
+        .iter()
+        .map(|t| (t.qualifier.as_str(), t.table.as_str()))
+        .collect();
     let preflight = health::run_preflight(
         ctx.dsn,
         ctx.slot_name,
@@ -224,11 +224,16 @@ pub async fn run_snapshot(
         // is already done in ensure_slot_and_publication before we get here.
         // Pass slot_name here only for slot health checks.
         "",
-        tables,
+        &names,
         ctx.cfg.max_parallel_tables,
+        ctx.cfg.discovery_page_size,
     )
     .await
     .context("postgres snapshot preflight")?;
+    crate::snapshot_probe::record_fixed(
+        crate::snapshot_probe::FixedOp::Preflight,
+    );
+    drop(names);
     preflight.emit_and_check(ctx.source_id, tables.len())?;
 
     // step 1: coordinator connection - export snapshot + capture LSN
@@ -257,12 +262,17 @@ pub async fn run_snapshot(
         .context("export snapshot")?;
 
     let snapshot_id: String = row.get(0);
+    crate::snapshot_probe::record_fixed(crate::snapshot_probe::FixedOp::Anchor);
     let start_lsn = anchor;
 
     // Save start_lsn immediately - if we crash before finishing, we know
     // where to resume streaming from.
     progress.start_lsn = anchor.to_string();
     save_progress(&ctx.chkpt_store, ctx.source_id, &progress).await;
+    crate::snapshot_probe::record_phase(
+        crate::snapshot_probe::Phase::PreflightAnchor,
+        t0.elapsed(),
+    );
 
     let abort_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let guard_cancel = ctx.cancel.child_token();
@@ -286,30 +296,25 @@ pub async fn run_snapshot(
 
     // Build the aggregation owner. Its source vector is restored from the
     // source's own progress (done_tables + finished) - NEVER from any sink's
-    // HEAD. Resolve every table's cursor kind up front (integer-PK signed range
-    // or ctid page-block); already-done tables enter the vector complete at their
-    // kind's max, so the key set and cursor kinds are fixed from the first batch.
-    let mut kinds: HashMap<String, CursorKind> = HashMap::new();
-    for (schema, table) in tables {
-        let loaded = ctx
-            .schema_loader
-            .load_schema(schema, table)
-            .await
-            .with_context(|| {
-                format!("load schema (cursor kind) for {}", fqn(schema, table))
-            })?;
-        kinds.insert(fqn(schema, table), pg_cursor_kind(&loaded.schema));
-    }
+    // HEAD. Every table's cursor kind (integer-PK signed range or ctid
+    // page-block) comes from the plan; already-done tables enter the vector
+    // complete at their kind's max, so the key set and cursor kinds are fixed
+    // from the first batch.
     let resume: Vec<(String, TableResume)> = tables
         .iter()
-        .map(|(schema, table)| {
-            let key = fqn(schema, table);
-            let kind =
-                kinds.get(&key).copied().unwrap_or(CursorKind::CtidBlock);
-            let done = progress.finished || progress.table_done(schema, table);
-            (key, TableResume { kind, done })
+        .map(|t| {
+            let done = progress.finished
+                || progress.table_done(&t.qualifier, &t.table);
+            (
+                t.key(),
+                TableResume {
+                    kind: t.cursor_kind,
+                    done,
+                },
+            )
         })
         .collect();
+    crate::snapshot_probe::record_frontier_tables(resume.len());
     let snapshot_checkpoint =
         CheckpointMeta::from_vec(anchor.to_string().into_bytes());
     let publisher = Arc::new(SnapshotPublisher::new(
@@ -322,24 +327,37 @@ pub async fn run_snapshot(
         ctx.tx.clone(),
     ));
 
-    // step 2: fan out parallel table workers
-    let max_parallel = ctx.cfg.max_parallel_tables.min(tables.len()).max(1);
-    let semaphore = Arc::new(Semaphore::new(max_parallel));
-    let mut handles = Vec::new();
+    let copy_started = Instant::now();
+    // step 2: table workers, at most `max_parallel_tables` alive at once;
+    // each result is recorded as it completes.
+    let max_parallel = ctx.cfg.max_parallel_tables.max(1);
+    let fetches_before = ctx.schema_loader.live_fetch_count();
+    let mut running: tokio::task::JoinSet<Result<u64>> =
+        tokio::task::JoinSet::new();
+    // The table of each running task (at most `max_parallel` entries).
+    let mut names: HashMap<tokio::task::Id, String> = HashMap::new();
+    let mut failed = Vec::new();
 
-    for (schema, table) in tables {
+    for planned in tables {
+        let (schema, table) = (&planned.qualifier, &planned.table);
         if progress.table_done(schema, table) {
-            info!(table = %fqn(schema, table), "already complete, skipping");
+            info!(table = %planned.key(), "already complete, skipping");
             continue;
         }
+        while running.len() >= max_parallel {
+            let done =
+                running.join_next_with_id().await.expect("a running table");
+            record_table_result(
+                ctx,
+                &publisher,
+                &mut progress,
+                &mut failed,
+                &mut names,
+                done,
+            )
+            .await?;
+        }
 
-        let permit = semaphore.clone().acquire_owned().await?;
-
-        let identity = ctx
-            .identity_map
-            .get(&fqn(schema, table))
-            .cloned()
-            .unwrap_or_default();
         let worker = TableWorker {
             dsn: crate::credentials::ProtectedDsn::from(ctx.dsn),
             schema: schema.clone(),
@@ -354,57 +372,36 @@ pub async fn run_snapshot(
             cancel: ctx.cancel.clone(),
             generation: ctx.generation,
             lineage: ctx.lineage.clone(),
-            identity,
-            table_key: fqn(schema, table),
-            cursor_kind: kinds
-                .get(&fqn(schema, table))
-                .copied()
-                .unwrap_or(CursorKind::CtidBlock),
+            identity: planned.identity.clone(),
+            table_key: planned.key(),
+            cursor_kind: planned.cursor_kind,
             publisher: Arc::clone(&publisher),
         };
-
-        let handle = tokio::spawn(async move {
-            let result = worker.run().await;
-            drop(permit);
-            result
-        });
-
-        handles.push((fqn(schema, table), handle));
+        let task = running.spawn(worker.run());
+        names.insert(task.id(), planned.key());
+        crate::snapshot_probe::record_table_tasks(running.len());
     }
 
-    // step 3: collect results
-    let mut failed = Vec::new();
-
-    for (name, handle) in handles {
-        match handle.await {
-            Ok(Ok(_rows)) => {
-                let parts: Vec<&str> = name.splitn(2, '.').collect();
-                if parts.len() == 2 {
-                    progress.mark_done(parts[0], parts[1]);
-                    save_progress(&ctx.chkpt_store, ctx.source_id, &progress)
-                        .await;
-                }
-                // Explicit table completion: emits a table-complete boundary, and
-                // the `completed = true` snapshot boundary once every scanned
-                // table is done (delivered and durably acked with no trailing
-                // data rows).
-                if publisher.complete_table(&name).await.is_err() {
-                    bail!("event channel closed at table completion");
-                }
-                info!(table = %name, "snapshot complete");
-            }
-            Ok(Err(e)) => {
-                // Preserve the full anyhow cause chain, not just the outer message.
-                let chain = format!("{e:#}");
-                error!(table = %name, error = %chain, "table snapshot failed");
-                failed.push(name);
-            }
-            Err(e) => {
-                error!(table = %name, error = %e, "snapshot worker panicked");
-                failed.push(name);
-            }
-        }
+    // step 3: the remaining results
+    while let Some(done) = running.join_next_with_id().await {
+        record_table_result(
+            ctx,
+            &publisher,
+            &mut progress,
+            &mut failed,
+            &mut names,
+            done,
+        )
+        .await?;
     }
+    crate::snapshot_probe::record_worker_live_fetches(
+        ctx.schema_loader.live_fetch_count() - fetches_before,
+    );
+    crate::snapshot_probe::record_phase(
+        crate::snapshot_probe::Phase::RowCopy,
+        copy_started.elapsed(),
+    );
+    let final_started = Instant::now();
 
     // guard check takes priority
     if let Some(reason) = abort_reason.lock().unwrap().take() {
@@ -438,7 +435,76 @@ pub async fn run_snapshot(
     );
 
     guard_cancel.cancel();
+    crate::snapshot_probe::record_phase(
+        crate::snapshot_probe::Phase::Finalization,
+        final_started.elapsed(),
+    );
     Ok(start_lsn)
+}
+
+/// The plan entry of `schema.table` with `identity`, its cursor kind from
+/// the schema `loader` resolves (as the preparation pass derives it). For
+/// driving [`run_snapshot`] directly.
+pub async fn plan_table(
+    loader: &PostgresSchemaLoader,
+    schema: &str,
+    table: &str,
+    identity: Vec<IdentitySpec>,
+) -> Result<super::PgPlannedTable> {
+    let loaded = loader.load_schema(schema, table).await?;
+    Ok(super::PgPlannedTable {
+        qualifier: schema.to_string(),
+        table: table.to_string(),
+        identity,
+        cursor_kind: pg_cursor_kind(&loaded.schema),
+    })
+}
+
+/// Record one finished table task: a completed table is marked done,
+/// persisted and completed in the aggregator; a failure is collected.
+async fn record_table_result(
+    ctx: &PgSnapshotCtx<'_>,
+    publisher: &SnapshotPublisher,
+    progress: &mut SnapshotProgress,
+    failed: &mut Vec<String>,
+    names: &mut HashMap<tokio::task::Id, String>,
+    done: std::result::Result<
+        (tokio::task::Id, Result<u64>),
+        tokio::task::JoinError,
+    >,
+) -> Result<()> {
+    let id = match &done {
+        Ok((id, _)) => *id,
+        Err(e) => e.id(),
+    };
+    let name = names.remove(&id).unwrap_or_default();
+    match done {
+        Ok((_, Ok(_rows))) => {
+            if let Some((schema, table)) = name.split_once('.') {
+                progress.mark_done(schema, table);
+                save_progress(&ctx.chkpt_store, ctx.source_id, progress).await;
+            }
+            // Explicit table completion: emits a table-complete boundary, and
+            // the `completed = true` snapshot boundary once every scanned
+            // table is done (delivered and durably acked with no trailing
+            // data rows).
+            if publisher.complete_table(&name).await.is_err() {
+                bail!("event channel closed at table completion");
+            }
+            info!(table = %name, "snapshot complete");
+        }
+        Ok((_, Err(e))) => {
+            // Preserve the full anyhow cause chain, not just the outer message.
+            let chain = format!("{e:#}");
+            error!(table = %name, error = %chain, "table snapshot failed");
+            failed.push(name);
+        }
+        Err(e) => {
+            error!(table = %name, error = %e, "snapshot worker panicked");
+            failed.push(name);
+        }
+    }
+    Ok(())
 }
 
 async fn save_progress(
@@ -447,7 +513,12 @@ async fn save_progress(
     progress: &SnapshotProgress,
 ) {
     if let Ok(bytes) = serde_json::to_vec(progress) {
+        let started = std::time::Instant::now();
         let _ = store.put_raw(&progress_key(source_id), &bytes).await;
+        crate::snapshot_probe::record_progress_write(
+            bytes.len(),
+            started.elapsed(),
+        );
     }
 }
 
@@ -1007,7 +1078,7 @@ fn build_pg_snapshot_event(
 /// integer types are all signed) or a ctid page-block frontier for
 /// composite/non-integer/no-PK tables. ctid is a SCAN frontier only, never row
 /// identity (identity comes from the explicit native identity columns).
-fn pg_cursor_kind(
+pub(crate) fn pg_cursor_kind(
     schema: &crate::postgres::postgres_table_schema::PostgresTableSchema,
 ) -> CursorKind {
     let pk = &schema.primary_key;

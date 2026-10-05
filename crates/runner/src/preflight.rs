@@ -236,6 +236,7 @@ async fn check_source_live(
                 &c.publication,
                 &tables,
                 c.snapshot.max_parallel_tables,
+                c.snapshot.discovery_page_size,
             )
             .await
             {

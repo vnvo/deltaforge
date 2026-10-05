@@ -1,14 +1,12 @@
 //! Table-pattern expansion that agrees with CDC filtering.
 //!
 //! A snapshot must copy exactly the tables whose changes CDC captures. CDC
-//! filters rows with [`AllowList`]: a pattern part is `*` / `%` (anything), a
+//! filters rows with [`AllowList`](common::AllowList): a pattern part is `*` / `%` (anything), a
 //! prefix ending in `*` or `%`, or an exact name; a pattern without a
 //! qualifier matches any schema/database. Expansion therefore narrows the
 //! catalog query to a superset with these rules (an escaped `LIKE` prefix, so
 //! `_` and `%` in names are literal) and keeps only the rows the same
-//! [`AllowList`] matches, whatever the server's name comparison.
-
-use common::AllowList;
+//! [`AllowList`](common::AllowList) matches, whatever the server's name comparison.
 
 /// A SQL condition on `column` selecting at least every name `part` matches.
 pub(crate) fn superset_clause(column: &str, part: &str) -> String {
@@ -22,7 +20,7 @@ pub(crate) fn superset_clause(column: &str, part: &str) -> String {
     }
 }
 
-/// `pattern` split like [`AllowList`] does: `(Some(qualifier), name)` or
+/// `pattern` split like [`AllowList`](common::AllowList) does: `(Some(qualifier), name)` or
 /// `(None, name)` for any qualifier.
 pub(crate) fn split(pattern: &str) -> (Option<&str>, &str) {
     match pattern.split_once('.') {
@@ -31,9 +29,31 @@ pub(crate) fn split(pattern: &str) -> (Option<&str>, &str) {
     }
 }
 
-/// Whether CDC captures `qualifier.name` under `pattern`.
-pub(crate) fn captures(pattern: &str, qualifier: &str, name: &str) -> bool {
-    AllowList::new(&[pattern.to_string()]).matches(qualifier, name)
+/// One SQL condition selecting at least every table any of `patterns`
+/// captures (each pattern's qualifier and name superset, OR-ed).
+/// `any_qualifier` is the condition for a pattern without a qualifier (system
+/// schemas/databases excluded); no pattern means every table under it.
+pub(crate) fn combined_superset(
+    patterns: &[String],
+    qualifier_col: &str,
+    name_col: &str,
+    any_qualifier: &str,
+) -> String {
+    if patterns.is_empty() {
+        return format!("({any_qualifier})");
+    }
+    let parts: Vec<String> = patterns
+        .iter()
+        .map(|p| {
+            let (qualifier, name) = split(p);
+            let q = match qualifier {
+                None | Some("*") | Some("%") => any_qualifier.to_string(),
+                Some(q) => superset_clause(qualifier_col, q),
+            };
+            format!("({q} AND {})", superset_clause(name_col, name))
+        })
+        .collect();
+    format!("({})", parts.join(" OR "))
 }
 
 /// A literal for a `LIKE ... ESCAPE '|'` prefix: quotes doubled, `|`, `%`
@@ -48,6 +68,27 @@ fn escape_like_literal(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether CDC captures `qualifier.name` under `pattern`.
+    fn captures(pattern: &str, qualifier: &str, name: &str) -> bool {
+        common::AllowList::new(&[pattern.to_string()]).matches(qualifier, name)
+    }
+
+    #[test]
+    fn patterns_combine_into_one_condition() {
+        let any = "s NOT IN ('sys')";
+        assert_eq!(combined_superset(&[], "s", "t", any), "(s NOT IN ('sys'))");
+        assert_eq!(
+            combined_superset(
+                &["public.order_*".into(), "audit".into()],
+                "s",
+                "t",
+                any
+            ),
+            "((s = 'public' AND t LIKE 'order|_%' ESCAPE '|') OR \
+             (s NOT IN ('sys') AND t = 'audit'))"
+        );
+    }
 
     #[test]
     fn clauses_select_a_superset_with_literal_metacharacters() {

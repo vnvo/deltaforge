@@ -143,18 +143,48 @@ impl std::error::Error for AmbiguousLegacySnapshot {}
 /// Whether a table-level source checkpoint is an interrupted legacy snapshot
 /// (some tables done, some pending, not finished) - the ambiguous case durable
 /// startup must reject. Names-only, so a source can check it without resolving
-/// cursor kinds. See [`convert_legacy_progress`] for the full conversion.
+/// cursor kinds. See [`convert_legacy_progress`] for the full conversion and
+/// [`LegacyProgressScan`] to check discovered tables page by page.
 pub fn is_ambiguous_legacy_progress(
     all_tables: &[String],
     done_tables: &[String],
     finished: bool,
 ) -> bool {
-    if finished {
-        return false;
+    let done: std::collections::HashSet<&str> =
+        done_tables.iter().map(String::as_str).collect();
+    let mut scan = LegacyProgressScan::default();
+    for t in all_tables {
+        scan.observe(done.contains(t.as_str()));
     }
-    let any_done = all_tables.iter().any(|t| done_tables.contains(t));
-    let any_pending = all_tables.iter().any(|t| !done_tables.contains(t));
-    any_done && any_pending
+    scan.ambiguous(finished)
+}
+
+/// [`is_ambiguous_legacy_progress`] over tables seen one at a time (the
+/// expanded tables of a paged discovery): whether any is done and any is
+/// pending.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LegacyProgressScan {
+    any_done: bool,
+    any_pending: bool,
+}
+
+impl LegacyProgressScan {
+    pub fn observe(&mut self, done: bool) {
+        if done {
+            self.any_done = true;
+        } else {
+            self.any_pending = true;
+        }
+    }
+
+    /// Both seen: the answer can no longer change.
+    pub fn settled(&self) -> bool {
+        self.any_done && self.any_pending
+    }
+
+    pub fn ambiguous(&self, finished: bool) -> bool {
+        !finished && self.settled()
+    }
 }
 
 /// Convert a legacy table-level source checkpoint (`done_tables` + `finished`)
@@ -254,6 +284,7 @@ impl SnapshotAggregator {
     /// Snapshot the complete current vector into a boundary (its `completed` flag
     /// reflects whether every table is done).
     pub fn current_boundary(&self) -> SourceBoundary {
+        let started = std::time::Instant::now();
         let table_cursors: BTreeMap<String, SnapshotCursor> = self
             .tables
             .iter()
@@ -267,9 +298,11 @@ impl SnapshotAggregator {
                 table_cursors,
             },
         );
+        let bytes = wm.to_bytes();
+        crate::snapshot_probe::record_boundary(bytes.len(), started.elapsed());
         SourceBoundary {
             checkpoint: self.snapshot_checkpoint.clone(),
-            durable_watermark: Some(std::sync::Arc::from(wm.to_bytes())),
+            durable_watermark: Some(std::sync::Arc::from(bytes)),
         }
     }
 
