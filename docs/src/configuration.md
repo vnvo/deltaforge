@@ -84,6 +84,7 @@ source:
 | `outbox.tables` | array | Table patterns to tag as outbox events. Must also appear in `tables`. Supports globs: `shop.outbox`, `*.outbox`, `shop.outbox_%`. |
 | `snapshot.mode` | string | `never` (default), `initial` - run once if no checkpoint exists, `always` - re-snapshot on every restart |
 | `snapshot.max_parallel_tables` | int | Tables snapshotted concurrently (default: `8`) |
+| `snapshot.discovery_page_size` | int | Tables read per catalog query while discovering the tables a snapshot copies (default: `1000`, allowed `1`-`10000`) |
 | `snapshot.chunk_size` | int | Rows per range chunk for integer-PK tables (default: `10000`) |
 | `on_schema_drift` | string | `adapt` (default) - reload schema and continue after failover drift; `halt` — stop and require operator intervention. See [Failover Handling](failover.md). |
 
@@ -138,6 +139,7 @@ source:
 | `outbox.prefixes` | array | `pg_logical_emit_message` prefixes to tag as outbox events. Supports globs: `outbox`, `outbox_%`, `*`. |
 | `snapshot.mode` | string | `never` (default), `initial` - run once if no checkpoint exists, `always` - re-snapshot on every restart |
 | `snapshot.max_parallel_tables` | int | Tables snapshotted concurrently (default: `8`) |
+| `snapshot.discovery_page_size` | int | Tables read per catalog query while discovering the tables a snapshot copies (default: `1000`, allowed `1`-`10000`) |
 | `snapshot.chunk_size` | int | Rows per range chunk (default: `10000`) |
 | `on_schema_drift` | string | `adapt` (default) — reload schema and continue after failover drift; `halt` — stop and require operator intervention. See [Failover Handling](failover.md). |
 
