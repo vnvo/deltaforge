@@ -180,8 +180,17 @@ the CDC resume point, so no rows are missed or duplicated.
 
 ### Resume after interruption
 
-If the snapshot is interrupted, DeltaForge resumes at table granularity on the next
-restart - already-completed tables are skipped.
+An interrupted snapshot is **copied again in full** on the next restart, as a new
+snapshot generation with a new anchor; it is never resumed table by table.
+
+A snapshot counts as complete only once the sinks have committed it. While it is
+in progress, its checkpoints are snapshot positions, which a restart never
+resumes as a binlog position. Only the last row of the snapshot, sent after every
+table was read and the binlog position was verified, carries the anchor as a
+binlog position, marked as the snapshot's completion. A restart before every
+sink has committed that row copies the snapshot again (duplicates, never loss).
+If every table is empty, no row can carry it, so such a snapshot is copied again
+on each restart until the first change is committed.
 
 ### Binlog retention safety
 

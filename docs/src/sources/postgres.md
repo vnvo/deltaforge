@@ -251,12 +251,19 @@ Re-snapshotting under this version records the safe anchor and resets the gauge 
 
 ### Resume after interruption
 
-If a snapshot is interrupted, DeltaForge resumes at table granularity on the next
-restart when there is a durable checkpoint - already-completed tables are skipped.
-If the snapshot was interrupted before any checkpoint (slot created, no rows yet
-committed to a checkpoint) and DeltaForge can prove it owns the now-inactive slot,
-it **re-anchors** (drops and recreates its slot for a fresh `C`) and performs a
-**full re-snapshot**, rather than reusing a stale anchor.
+An interrupted snapshot is **copied again in full** on the next restart; it is
+never resumed table by table. When DeltaForge can prove it owns the now-inactive
+slot, it **re-anchors** (drops and recreates its slot for a fresh `C`) and every
+table is read again.
+
+A snapshot counts as complete only once the sinks have committed it. While it is
+in progress, its checkpoints are snapshot positions, which a restart never
+resumes as a stream position. Only the last row of the snapshot, sent after every
+table was read and every final check passed, carries a stream position at the
+anchor. A restart before every sink has committed that row copies the snapshot
+again (duplicates, never loss). If every table is empty, no row can carry it, so
+such a snapshot is copied again on each restart until the first change is
+committed.
 
 ### WAL slot retention safety
 
