@@ -120,6 +120,11 @@ pub enum DriverError {
          (another chain, a later generation, or unreadable)"
     )]
     Foreign { sink: String, chain: String },
+    #[error(
+        "sinks {first} and {second} acknowledged positions that cannot be \
+         ordered against each other; the snapshot cannot complete on them"
+    )]
+    IncomparableAcks { first: String, second: String },
     #[error("legacy snapshot state is classified by the upgrade path")]
     Legacy,
     #[error("cancelled")]
@@ -245,11 +250,18 @@ impl<E: EngineOrder> StartInput<'_, E> {
 
 /// The policy frontier over the frozen cohort (design section 6.2): `Some`
 /// with what justified completion when it covers the terminal.
+///
+/// Fails closed: the policy must validate, and the acknowledgements that
+/// decide (every acknowledgement, under quorum, since all of them rank) must
+/// be mutually ordered. Two incomparable acknowledgements are never treated
+/// as equal, whatever each of them is relative to the anchor.
 pub fn frontier<E: EngineOrder>(
     engine: &E,
     policy: &PolicySnapshot,
     states: &[(String, SinkState, Option<Vec<u8>>)],
-) -> Option<Completion> {
+) -> Result<Option<Completion>, DriverError> {
+    use deltaforge_core::CheckpointOrder;
+    policy.validate().map_err(QueueError::InvalidPolicy)?;
     let at = |id: &str| {
         states
             .iter()
@@ -262,12 +274,12 @@ pub fn frontier<E: EngineOrder>(
         .iter()
         .filter_map(|s| at(&s.id).map(|raw| (s.id.clone(), raw)))
         .collect();
-    let deciding: Vec<&Vec<u8>> = match policy.mode {
+    let deciding: Vec<&(String, Vec<u8>)> = match policy.mode {
         PolicyMode::All => {
             if acks.len() != policy.sinks.len() {
-                return None;
+                return Ok(None);
             }
-            acks.iter().map(|(_, r)| r).collect()
+            acks.iter().collect()
         }
         PolicyMode::Required => {
             let required: Vec<&str> = policy
@@ -276,59 +288,69 @@ pub fn frontier<E: EngineOrder>(
                 .filter(|s| s.required)
                 .map(|s| s.id.as_str())
                 .collect();
-            let got: Vec<&Vec<u8>> = acks
+            let got: Vec<&(String, Vec<u8>)> = acks
                 .iter()
                 .filter(|(id, _)| required.contains(&id.as_str()))
-                .map(|(_, r)| r)
                 .collect();
             if got.len() != required.len() {
-                return None;
+                return Ok(None);
             }
             got
         }
         PolicyMode::Quorum => {
+            // `validate` proved 1 <= quorum <= cohort size.
             let q = policy.quorum.unwrap_or(u32::MAX) as usize;
             if acks.len() < q {
-                return None;
+                return Ok(None);
             }
-            // The quorum's position is the q-th highest acknowledged one.
-            let mut all: Vec<&Vec<u8>> = acks.iter().map(|(_, r)| r).collect();
-            all.sort_by(|a, b| {
-                match crate::snapshot_position::order(engine, b, a) {
-                    deltaforge_core::CheckpointOrder::Before => {
-                        std::cmp::Ordering::Less
-                    }
-                    deltaforge_core::CheckpointOrder::After => {
-                        std::cmp::Ordering::Greater
-                    }
-                    _ => std::cmp::Ordering::Equal,
-                }
-            });
-            all.into_iter().take(q).collect()
+            acks.iter().collect()
         }
     };
-    // The frontier position is the lowest of the deciding positions.
-    let frontier = deciding
-        .iter()
-        .copied()
-        .reduce(
-            |lo, x| match crate::snapshot_position::order(engine, x, lo) {
-                deltaforge_core::CheckpointOrder::Before => x,
-                _ => lo,
-            },
-        )
-        .map(|r| String::from_utf8_lossy(r).into_owned())
-        .unwrap_or_default();
-    Some(Completion {
-        acks: acks.into_iter().map(|(id, _)| id).collect(),
-        frontier,
-    })
+    // Every pair must be ordered before anything is ranked.
+    let ordering = |x: &[u8], y: &[u8]| match crate::snapshot_position::order(
+        engine, x, y,
+    ) {
+        CheckpointOrder::Before => Some(std::cmp::Ordering::Less),
+        CheckpointOrder::After => Some(std::cmp::Ordering::Greater),
+        CheckpointOrder::Equal => Some(std::cmp::Ordering::Equal),
+        CheckpointOrder::Incomparable => None,
+    };
+    for (i, x) in deciding.iter().enumerate() {
+        for y in &deciding[i + 1..] {
+            if ordering(&x.1, &y.1).is_none() {
+                return Err(DriverError::IncomparableAcks {
+                    first: x.0.clone(),
+                    second: y.0.clone(),
+                });
+            }
+        }
+    }
+    let mut ranked = deciding;
+    // Highest first.
+    ranked.sort_by(|a, b| {
+        ordering(&b.1, &a.1).expect("every pair was proven ordered")
+    });
+    let frontier = match policy.mode {
+        // The quorum's position is the q-th highest acknowledged one.
+        PolicyMode::Quorum => {
+            ranked.get(policy.quorum.unwrap_or(u32::MAX) as usize - 1)
+        }
+        // Otherwise the lowest deciding one (none: no sink is required).
+        _ => ranked.last(),
+    };
+    Ok(Some(Completion {
+        acks: acks.iter().map(|(id, _)| id.clone()).collect(),
+        frontier: frontier
+            .map(|(_, raw)| String::from_utf8_lossy(raw).into_owned())
+            .unwrap_or_default(),
+    }))
 }
 
 /// Decide what a start does (design section 4).
 pub async fn decide_start<E: EngineOrder>(
     input: &StartInput<'_, E>,
 ) -> Result<StartOutcome, DriverError> {
+    input.policy.validate().map_err(QueueError::InvalidPolicy)?;
     let never = input.mode == SnapshotMode::Never;
     let stored = match input.store.read().await? {
         None => {
@@ -463,7 +485,7 @@ pub async fn try_complete<E: EngineOrder>(
     let states = input
         .states(control, control.policy.sinks.iter().map(|s| s.id.as_str()))
         .await?;
-    let Some(completion) = frontier(input.engine, &control.policy, &states)
+    let Some(completion) = frontier(input.engine, &control.policy, &states)?
     else {
         return Ok(None);
     };
@@ -604,14 +626,26 @@ mod tests {
     }
     use deltaforge_core::CheckpointOrder;
 
-    /// Anchors are numbers; streams are `{"p": n, "mark": [chain, g]?}`.
+    /// Anchors are numbers; streams are `{"p": n, "mark": [chain, g]?,
+    /// "branch": name?}`. Streams on two different branches (two timelines
+    /// forked after the anchor) are incomparable.
     struct T;
     fn p(raw: &[u8]) -> Option<u64> {
         serde_json::from_slice::<serde_json::Value>(raw).ok()?["p"].as_u64()
     }
+    fn branch(raw: &[u8]) -> Option<String> {
+        serde_json::from_slice::<serde_json::Value>(raw).ok()?["branch"]
+            .as_str()
+            .map(str::to_string)
+    }
     impl EngineOrder for T {
         type Anchor = u64;
         fn stream_order(&self, a: &[u8], b: &[u8]) -> CheckpointOrder {
+            if let (Some(x), Some(y)) = (branch(a), branch(b))
+                && x != y
+            {
+                return CheckpointOrder::Incomparable;
+            }
             match (p(a), p(b)) {
                 (Some(a), Some(b)) => match a.cmp(&b) {
                     std::cmp::Ordering::Less => CheckpointOrder::Before,
@@ -639,6 +673,86 @@ mod tests {
     }
     fn st(raw: Option<&[u8]>) -> SinkState {
         sink_state(&T, raw, "c", 4, Some(&100))
+    }
+
+    fn forked(p: u64, b: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({ "p": p, "branch": b })).unwrap()
+    }
+
+    /// Two acknowledgements each past the anchor but on forked timelines:
+    /// no policy that ranks both may complete on them.
+    #[test]
+    fn incomparable_acknowledgements_never_complete() {
+        use crate::snapshot_queue::{PolicyMode, PolicySink};
+        let (x, y) = (forked(101, "x"), forked(102, "y"));
+        assert_eq!(st(Some(&x)), SinkState::AtOrPast);
+        assert_eq!(st(Some(&y)), SinkState::AtOrPast);
+        let states = vec![
+            ("a".to_string(), st(Some(&x)), Some(x.clone())),
+            ("b".to_string(), st(Some(&y)), Some(y.clone())),
+        ];
+        let sinks = |a_required| {
+            vec![
+                PolicySink {
+                    id: "a".into(),
+                    required: a_required,
+                },
+                PolicySink {
+                    id: "b".into(),
+                    required: true,
+                },
+            ]
+        };
+        for (mode, quorum) in [
+            (PolicyMode::All, None),
+            (PolicyMode::Required, None),
+            (PolicyMode::Quorum, Some(1)),
+            (PolicyMode::Quorum, Some(2)),
+        ] {
+            let policy = PolicySnapshot::new(mode, quorum, sinks(true));
+            assert!(
+                matches!(
+                    frontier(&T, &policy, &states),
+                    Err(DriverError::IncomparableAcks { .. })
+                ),
+                "{mode:?} {quorum:?}"
+            );
+        }
+        // Only `b` decides under Required when `a` is optional.
+        let policy =
+            PolicySnapshot::new(PolicyMode::Required, None, sinks(false));
+        let done = frontier(&T, &policy, &states).unwrap().unwrap();
+        assert_eq!(done.frontier, String::from_utf8(y).unwrap());
+        // Ordered acknowledgements rank: quorum 1 takes the highest.
+        let (lo, hi) = (stream(101), stream(150));
+        let ordered = vec![
+            ("a".to_string(), st(Some(&lo)), Some(lo.clone())),
+            ("b".to_string(), st(Some(&hi)), Some(hi.clone())),
+        ];
+        let q1 = PolicySnapshot::new(PolicyMode::Quorum, Some(1), sinks(true));
+        let all = PolicySnapshot::new(PolicyMode::All, None, sinks(true));
+        assert_eq!(
+            frontier(&T, &q1, &ordered)
+                .unwrap()
+                .unwrap()
+                .frontier
+                .as_bytes(),
+            hi.as_slice()
+        );
+        assert_eq!(
+            frontier(&T, &all, &ordered)
+                .unwrap()
+                .unwrap()
+                .frontier
+                .as_bytes(),
+            lo.as_slice()
+        );
+        // An invalid frozen policy decides nothing.
+        let q3 = PolicySnapshot::new(PolicyMode::Quorum, Some(3), sinks(true));
+        assert!(matches!(
+            frontier(&T, &q3, &ordered),
+            Err(DriverError::Queue(QueueError::InvalidPolicy(_)))
+        ));
     }
 
     #[test]

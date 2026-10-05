@@ -110,6 +110,61 @@ impl PolicySnapshot {
             digest: hex::encode(h.finalize()),
         }
     }
+
+    /// Refuse a cohort no completion can be decided over: no sinks, an empty
+    /// or duplicate sink id (one sink counted twice), a quorum that is zero,
+    /// above the cohort size or set outside quorum mode, sinks out of their
+    /// canonical order, or a digest its contents do not rederive.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.sinks.is_empty() {
+            return Err("the sink cohort is empty".into());
+        }
+        for s in &self.sinks {
+            if s.id.trim().is_empty() {
+                return Err("the sink cohort has an empty sink id".into());
+            }
+        }
+        for w in self.sinks.windows(2) {
+            match w[0].id.cmp(&w[1].id) {
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Equal => {
+                    return Err(format!(
+                        "sink {} appears more than once in the cohort",
+                        w[0].id
+                    ));
+                }
+                std::cmp::Ordering::Greater => {
+                    return Err(
+                        "the sink cohort is not in canonical order".into()
+                    );
+                }
+            }
+        }
+        match (self.mode, self.quorum) {
+            (PolicyMode::Quorum, Some(q)) => {
+                if q == 0 || q as usize > self.sinks.len() {
+                    return Err(format!(
+                        "quorum {q} is outside 1..={} (the cohort size)",
+                        self.sinks.len()
+                    ));
+                }
+            }
+            (PolicyMode::Quorum, None) => {
+                return Err("quorum mode without a quorum".into());
+            }
+            (_, Some(_)) => {
+                return Err("a quorum outside quorum mode".into());
+            }
+            (_, None) => {}
+        }
+        let canonical = Self::new(self.mode, self.quorum, self.sinks.clone());
+        if canonical.digest != self.digest {
+            return Err(
+                "the policy digest does not match the policy's contents".into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 impl From<&deltaforge_core::SnapshotCohort> for PolicySnapshot {
@@ -314,6 +369,8 @@ pub enum QueueError {
     Blocked { generation: u64, reason: String },
     #[error("invalid snapshot state transition: {0}")]
     InvalidTransition(String),
+    #[error("invalid snapshot commit policy: {0}")]
+    InvalidPolicy(String),
 }
 
 type Result<T> = std::result::Result<T, QueueError>;
@@ -461,6 +518,7 @@ impl QueueStore {
         config_fingerprint: &str,
         policy: PolicySnapshot,
     ) -> Result<(u64, GenerationControl)> {
+        policy.validate().map_err(QueueError::InvalidPolicy)?;
         let control = GenerationControl {
             record_format: RECORD_FORMAT,
             snapshot_chain: new_id(),
@@ -503,6 +561,7 @@ impl QueueStore {
         policy: PolicySnapshot,
         by_recovery: bool,
     ) -> Result<(u64, GenerationControl)> {
+        policy.validate().map_err(QueueError::InvalidPolicy)?;
         let (version, next) = match stored {
             Stored::Current { version, control } => {
                 if !control.lineage.stable_matches(lineage) {
@@ -595,6 +654,7 @@ impl QueueStore {
         policy: PolicySnapshot,
         completion: Completion,
     ) -> Result<(u64, GenerationControl)> {
+        policy.validate().map_err(QueueError::InvalidPolicy)?;
         let Stored::Legacy { version, record } = stored else {
             return Err(QueueError::InvalidTransition(
                 "only a legacy record is upgraded".into(),
@@ -909,6 +969,9 @@ fn classify(version: u64, bytes: &[u8]) -> Result<Stored> {
                 .map_err(|e| {
                     QueueError::Corrupt(format!("control record: {e}"))
                 })?;
+            control.policy.validate().map_err(|e| {
+                QueueError::Corrupt(format!("control record policy: {e}"))
+            })?;
             if control.fingerprint_format != CONFIG_FINGERPRINT_FORMAT {
                 return Err(QueueError::UnsupportedFormat(format!(
                     "control record with fingerprint format {}",
@@ -1493,6 +1556,129 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(c.generation, 2);
+    }
+
+    #[test]
+    fn an_invalid_cohort_is_refused() {
+        let s = |id: &str, required| PolicySink {
+            id: id.into(),
+            required,
+        };
+        let ab = || vec![s("a", true), s("b", false)];
+        let q = |n| PolicySnapshot::new(PolicyMode::Quorum, Some(n), ab());
+        // Reordered sinks are the same, valid policy.
+        let fwd = q(2);
+        let rev = PolicySnapshot::new(
+            PolicyMode::Quorum,
+            Some(2),
+            vec![s("b", false), s("a", true)],
+        );
+        assert_eq!(fwd, rev);
+        assert!(fwd.validate().is_ok());
+        assert!(q(1).validate().is_ok());
+        // One sink twice would count twice.
+        let dup = PolicySnapshot::new(
+            PolicyMode::Quorum,
+            Some(2),
+            vec![s("a", true), s("a", true)],
+        );
+        assert!(dup.validate().unwrap_err().contains("more than once"));
+        for (bad, why) in [
+            (q(0), "quorum 0"),
+            (q(3), "quorum above the cohort size"),
+            (
+                PolicySnapshot::new(PolicyMode::Quorum, None, ab()),
+                "no quorum",
+            ),
+            (
+                PolicySnapshot::new(PolicyMode::All, Some(1), ab()),
+                "a quorum outside quorum mode",
+            ),
+            (
+                PolicySnapshot::new(
+                    PolicyMode::All,
+                    None,
+                    vec![s("", true), s("a", true)],
+                ),
+                "empty id",
+            ),
+            (
+                PolicySnapshot::new(PolicyMode::All, None, vec![]),
+                "empty cohort",
+            ),
+            (
+                PolicySnapshot {
+                    digest: "0".repeat(64),
+                    ..q(2)
+                },
+                "digest not rederived",
+            ),
+            (
+                PolicySnapshot {
+                    sinks: vec![s("b", false), s("a", true)],
+                    ..q(2)
+                },
+                "non-canonical order",
+            ),
+            (
+                PolicySnapshot {
+                    quorum: Some(1),
+                    ..q(2)
+                },
+                "contents changed under the digest",
+            ),
+        ] {
+            assert!(bad.validate().is_err(), "{why}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_invalid_policy_is_never_stored_or_trusted() {
+        let backend: ArcStorageBackend =
+            Arc::new(storage::MemoryStorageBackend::new());
+        let q = QueueStore::new(backend.clone(), "src");
+        let dup = PolicySnapshot::new(
+            PolicyMode::All,
+            None,
+            vec![
+                PolicySink {
+                    id: "s3".into(),
+                    required: true,
+                },
+                PolicySink {
+                    id: "s3".into(),
+                    required: true,
+                },
+            ],
+        );
+        assert!(matches!(
+            q.allocate_first(contract::lineage(), "fp", dup).await,
+            Err(QueueError::InvalidPolicy(_))
+        ));
+        assert!(q.read().await.unwrap().is_none(), "nothing allocated");
+        // A stored policy whose digest does not rederive is corrupt.
+        q.allocate_first(contract::lineage(), "fp", contract::policy())
+            .await
+            .unwrap();
+        let (version, bytes) = backend
+            .slot_get(CONTROL_NS, &control_key("src"))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        v["policy"]["sinks"][0]["required"] = serde_json::json!(true);
+        assert!(
+            backend
+                .slot_cas(
+                    CONTROL_NS,
+                    &control_key("src"),
+                    version,
+                    &serde_json::to_vec(&v).unwrap(),
+                )
+                .await
+                .unwrap()
+        );
+        assert!(matches!(q.read().await, Err(QueueError::Corrupt(_))));
     }
 
     #[test]
