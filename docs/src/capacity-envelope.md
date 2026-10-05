@@ -17,7 +17,7 @@ This page states DeltaForge's resource behaviour so operators can size a deploym
 | Dimension | Conservative starting guidance | Basis |
 |---|---|---|
 | Pipelines (source units) per instance | Unvalidated starting point: a small number (single digits); single instance only. Not a supported ceiling either way. | [unknown] scale; single-owner is [code-derived] |
-| Tables per source | Tens to low hundreds; watch metric cardinality and snapshot cost. A CDC start neither enumerates the catalog nor loads schemas up front, the schema registry's cache is bounded, and each source's resident schemas are capped (a compact per-table record still grows with the tables used; see [Schema registry at scale](#schema-registry-at-scale)); an initial snapshot's table discovery and per-table metrics still grow with the catalog | registry [measured] to 1M tables; CDC restart [measured] flat from 20 to 1,000 matched tables; snapshot discovery O(tables²) [code-derived], [unknown] at scale |
+| Tables per source | Tens to low hundreds; watch metric cardinality and snapshot cost. A CDC start neither enumerates the catalog nor loads schemas up front, the schema registry's cache is bounded, and each source's resident schemas are capped (a compact per-table record still grows with the tables used; see [Schema registry at scale](#schema-registry-at-scale)); an initial snapshot's discovery work and per-table metrics still grow with the catalog | registry [measured] to 1M tables; CDC restart [measured] flat from 20 to 1,000 matched tables; snapshot discovery O(tables) in pages [code-derived, structurally tested], timing [unknown] at scale |
 | Memory | Provision for channel-depth × event-size + in-flight batch bytes + the schema cache budget (default 64 MiB); **no aggregate cap exists** | [code-derived] / [unknown] |
 | Throughput | Benchmark per environment; do not assume a headline number | [measured] dev-only / [unknown] |
 
@@ -52,7 +52,7 @@ A single source transaction larger than `max_tx_events`/`max_tx_bytes` is failed
 ## Concurrency and in-flight
 
 - `max_inflight` default **1** [operator]. It bounds **pipeline batch depth**, not concurrent sink delivery: delivery is processed FIFO by a single delivery task to preserve checkpoint ordering, so raising it does **not** parallelize sinks [code-derived]. With `respect_source_tx = true` (the default), `max_inflight` **must** be 1 (startup fails otherwise) [code-derived]. So the effective default is single-in-flight.
-- Snapshot parallelism [operator]: `max_parallel_tables` **8**, `chunk_size` **10,000** rows, `intra_table_parallel` **false**, `max_parallel_chunks` **4** (only when intra-table parallel), `lock_timeout_secs` **10**. Effective table concurrency is `min(max_parallel_tables, table_count)`.
+- Snapshot parallelism [operator]: `discovery_page_size` **1,000** (catalog rows per discovery query), `max_parallel_tables` **8**, `chunk_size` **10,000** rows, `intra_table_parallel` **false**, `max_parallel_chunks` **4** (only when intra-table parallel), `lock_timeout_secs` **10**. Effective table concurrency is `min(max_parallel_tables, table_count)`.
 
 ## Queue and DLQ bytes
 
@@ -122,7 +122,7 @@ Synthetic registries: *N* tables per source × 2 sources with the same table nam
 
 ## Table and source-unit counts
 
-- **No coded limit on tables per source or pipelines per instance** [confirmed absent]. Practical limits come from: the O(tables²) table-enumeration dedup when a snapshot expands its table patterns [code-derived], per-table metric cardinality, and connection/slot math above. A CDC start does no per-table work (see below). The schema registry is no longer one of them ([measured] to 1M tables per source).
+- **No coded limit on tables per source or pipelines per instance** [confirmed absent]. Practical limits come from: per-table metric cardinality, the compact per-table plan and frontier state an initial snapshot keeps (below), and connection/slot math above. A CDC start does no per-table work (see below). The schema registry is no longer one of them ([measured] to 1M tables per source).
 - **Single-instance requirement**: run exactly one DeltaForge process against a given state store (see [Supported Deployment Envelope](deployment-support.md#topology-single-owner-per-source)) [code-derived containment].
 - **Conservative starting configuration (unvalidated, not a supported limit)**: a small number of pipelines (single digits) and tens-to-low-hundreds of tables per source is a reasonable place to start, and grow only after a soak in your environment. We have not measured enough to claim either that larger configurations are unsupported or that this range is universally safe - both directions are **[unknown]** pending benchmark.
 
@@ -135,7 +135,23 @@ Throughput is environment-dependent and is **[measured] only on a developer mach
 These are **[unknown]** and should be validated before scaling up:
 
 - Aggregate/RSS memory under sustained load (no coded cap).
-- Initial snapshot time for sources capturing many tables: pattern expansion and the snapshot's schema loads query the source catalog per captured table (a CDC restart does not; see above).
+- Initial snapshot time for sources capturing many tables: discovery reads the catalog in keyset pages (`discovery_page_size`, one query per page) and each table's schema is resolved once, from the schema registry when known or the source catalog otherwise (a CDC restart does neither; see above).
 - Per-table metric cardinality at hundreds/thousands of tables.
-- O(tables²) table-pattern expansion cost of an initial snapshot at large table counts.
+- Initial snapshots of large catalogs: discovery is paged and quadratic discovery work is removed, but snapshot execution still retains compact per-table plan and frontier state. Fully bounded execution and durable resumable work arrive in the required durable-queue PR. Until then an initial snapshot is **not** linear in the table count and is not a supported path for very large catalogs:
+  - resident compact plan and frontier state: O(tables) (about 125 bytes of plan per table);
+  - each full-vector watermark (snapshot boundary): O(tables) (about 480 KB at 10,000 tables);
+  - boundaries emitted: O(tables) (one per completed chunk and per completed table);
+  - total watermark construction and serialized bytes: O(tables²);
+  - completed-table progress (`done_tables`) rewritten in full after every table: O(tables²) cumulative bytes.
+
+  Measured once (single-row tables, defaults, in-memory checkpoint store, 12-thread laptop; evidence of this limitation, **not a supported performance target**):
+
+  | Engine | Tables | Total | Preparation | Row copy | Boundaries (bytes) | Progress writes (bytes) | Peak RSS (before) |
+  |---|---|---|---|---|---|---|---|
+  | MySQL | 1,000 | 11.6 s | 7.6 s | 3.4 s | 2,001 (92.7 MiB) | 1,002 (11.6 MiB) | 40.7 MiB (27.9) |
+  | MySQL | 10,000 | 505.0 s | 79.1 s | 420.6 s | 20,001 (9,614.7 MiB) | 10,002 (1,236.9 MiB) | 117.2 MiB (40.2) |
+  | PostgreSQL | 1,000 | 190.0 s | 110.9 s | 78.6 s | 2,001 (77.3 MiB) | 1,002 (7.7 MiB) | 40.0 MiB (27.9) |
+  | PostgreSQL | 10,000 | 1401.8 s | 691.9 s | - | - | - | 111.3 MiB (27.2) |
+
+  Discovery took 0.02-0.43 s in every run (one catalog query per 1,000 tables), with one schema resolution and one registry read per table, no worker catalog fetches, and at most 8 table tasks.
 - MySQL `mysql_async` control-pool sizing under many concurrent pipelines.

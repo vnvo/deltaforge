@@ -34,7 +34,6 @@ use deltaforge_core::{
 };
 use metrics::counter;
 use mysql_async::{Conn, Opts, Row, Value, prelude::Queryable};
-use std::collections::HashMap;
 use tokio::time::timeout;
 
 use super::mysql_identity::mysql_identity_cell;
@@ -63,22 +62,20 @@ const POSITION_GUARD_INTERVAL: std::time::Duration =
 pub struct MysqlSnapshotProgress {
     /// Serialized `MySqlCheckpoint` captured before any rows were read.
     pub start_position: String,
-    /// Tables that have been fully snapshotted ("db.table").
-    pub done_tables: Vec<String>,
+    /// Tables that have been fully snapshotted ("db.table"); a JSON array of
+    /// names, as always.
+    pub done_tables: std::collections::BTreeSet<String>,
     /// True once every table is complete.
     pub finished: bool,
 }
 
 impl MysqlSnapshotProgress {
-    fn table_done(&self, db: &str, table: &str) -> bool {
+    pub(crate) fn table_done(&self, db: &str, table: &str) -> bool {
         self.done_tables.contains(&fqn(db, table))
     }
 
     fn mark_done(&mut self, db: &str, table: &str) {
-        let key = fqn(db, table);
-        if !self.done_tables.contains(&key) {
-            self.done_tables.push(key);
-        }
+        self.done_tables.insert(fqn(db, table));
     }
 }
 
@@ -126,6 +123,9 @@ pub struct SnapshotCtx<'a> {
     pub pipeline: &'a str,
     pub tenant: &'a str,
     pub cfg: &'a SnapshotCfg,
+    /// The configured table patterns (the catalog is re-read under the
+    /// anchor's read lock to verify the plan).
+    pub table_patterns: &'a [String],
     pub schema_loader: &'a MySqlSchemaLoader,
     pub chkpt_store: Arc<dyn CheckpointStore>,
     pub tx: mpsc::Sender<SourceItem>,
@@ -134,8 +134,6 @@ pub struct SnapshotCtx<'a> {
     pub generation: u64,
     /// Frozen source lineage for snapshot identity.
     pub lineage: PersistedLineage,
-    /// `db.table` → resolved identity column names (identity order).
-    pub identity_map: HashMap<String, Vec<String>>,
 }
 
 /// Spawns a background task that polls SHOW BINARY LOGS every POSITION_GUARD_INTERVAL seconds.
@@ -222,9 +220,9 @@ fn spawn_binlog_position_guard(
 /// InnoDB guarantees every visible row was committed at or before this position.
 /// The caller must persist this as the binlog checkpoint so streaming resumes
 /// with no gaps.
-pub async fn run_snapshot(
+pub(crate) async fn run_snapshot(
     ctx: &SnapshotCtx<'_>,
-    tables: &[(String, String)],
+    tables: &[super::MyPlannedTable],
 ) -> Result<MySqlCheckpoint> {
     let t0 = Instant::now();
 
@@ -247,14 +245,22 @@ pub async fn run_snapshot(
     // cannot FLUSH TABLES WITH READ LOCK) surfaces as Permission; a bad server
     // config (non-GTID, non-InnoDB, non-ROW binlog) as Incompatible. There is no
     // silent fallback to an unsafe per-worker-snapshot anchor.
+    let names: Vec<(&str, &str)> = tables
+        .iter()
+        .map(|t| (t.qualifier.as_str(), t.table.as_str()))
+        .collect();
     let preflight = health::run_preflight_verified(
         ctx.dsn,
         ctx.expected_uuid,
-        tables,
+        &names,
         ctx.cfg.max_parallel_tables,
     )
     .await
     .context("snapshot preflight")?;
+    crate::snapshot_probe::record_fixed(
+        crate::snapshot_probe::FixedOp::Preflight,
+    );
+    drop(names);
     preflight.emit(ctx.source_id, tables.len());
     if !preflight.hard_errors.is_empty() {
         let details = preflight.hard_errors.join("; ");
@@ -273,22 +279,29 @@ pub async fn run_snapshot(
     // step 1: establish the consistent anchor under a brief global read lock.
     // Only pending (not-yet-done) tables need workers; skip completed ones on
     // resume so the lock window and connection count stay bounded.
-    let pending: Vec<(String, String)> = tables
-        .iter()
-        .filter(|(db, t)| !progress.table_done(db, t))
-        .cloned()
+    let pending: Vec<usize> = (0..tables.len())
+        .filter(|&i| {
+            !progress.table_done(&tables[i].qualifier, &tables[i].table)
+        })
         .collect();
     let num_workers =
         ctx.cfg.max_parallel_tables.min(pending.len().max(1)).max(1);
 
+    crate::snapshot_probe::before_anchor().await;
     let (worker_conns, mut position) = acquire_locked_anchor(
         ctx.dsn,
         ctx.expected_uuid,
         num_workers,
         Duration::from_secs(ctx.cfg.lock_timeout_secs.max(1)),
+        PlanCheck {
+            patterns: ctx.table_patterns,
+            page_size: ctx.cfg.discovery_page_size,
+            expected: tables,
+        },
     )
     .await
     .context("acquire locked snapshot anchor")?;
+    crate::snapshot_probe::record_fixed(crate::snapshot_probe::FixedOp::Anchor);
     position.lineage = ctx.checkpoint_lineage.clone();
 
     progress.start_position = serde_json::to_string(&position)
@@ -298,13 +311,21 @@ pub async fn run_snapshot(
     // new generation instead of reusing this one at another anchor. Later
     // progress writes (completed tables, finished) can only cause extra
     // re-reading when lost, never a skip, so they stay best effort.
+    let anchor_bytes =
+        serde_json::to_vec(&progress).context("serialize progress")?;
+    let put_started = Instant::now();
     ctx.chkpt_store
-        .put_raw(
-            &progress_key(ctx.source_id),
-            &serde_json::to_vec(&progress).context("serialize progress")?,
-        )
+        .put_raw(&progress_key(ctx.source_id), &anchor_bytes)
         .await
         .context("persist the snapshot anchor before reading any row")?;
+    crate::snapshot_probe::record_progress_write(
+        anchor_bytes.len(),
+        put_started.elapsed(),
+    );
+    crate::snapshot_probe::record_phase(
+        crate::snapshot_probe::Phase::PreflightAnchor,
+        t0.elapsed(),
+    );
 
     // spawn background position guard
     let abort_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -329,35 +350,24 @@ pub async fn run_snapshot(
     // Build the ordered-aggregation owner. Its source vector is restored from
     // the source's own progress (done_tables + finished) - NEVER from any sink's
     // HEAD, so the source is not fast-forwarded by how far one sink is durable.
-    // Resolve every table's cursor kind up front (including already-done tables,
-    // which enter the vector complete at their kind's max) so the vector's key
-    // set and cursor kinds are fixed from the first batch.
-    let mut kinds: HashMap<String, CursorKind> = HashMap::new();
-    for (db, table) in tables {
-        let loaded = ctx
-            .schema_loader
-            .load_schema(db, table)
-            .await
-            .with_context(|| {
-                format!("load schema (cursor kind) for {}", fqn(db, table))
-            })?;
-        kinds.insert(fqn(db, table), mysql_cursor_kind(&loaded.schema));
-    }
-    let all_tables: Vec<(String, CursorKind)> = tables
+    // Every table's cursor kind comes from the plan (already-done tables enter
+    // the vector complete at their kind's max), so the vector's key set and
+    // cursor kinds are fixed from the first batch.
+    let resume: Vec<(String, TableResume)> = tables
         .iter()
-        .map(|(db, table)| {
-            let k = fqn(db, table);
-            let kind = kinds.get(&k).copied().unwrap_or(CursorKind::Unsigned);
-            (k, kind)
+        .map(|t| {
+            let done = progress.finished
+                || progress.table_done(&t.qualifier, &t.table);
+            (
+                t.key(),
+                TableResume {
+                    kind: t.cursor_kind,
+                    done,
+                },
+            )
         })
         .collect();
-    let resume: Vec<(String, TableResume)> = all_tables
-        .iter()
-        .map(|(t, kind)| {
-            let done = progress.finished || progress.done_tables.contains(t);
-            (t.clone(), TableResume { kind: *kind, done })
-        })
-        .collect();
+    crate::snapshot_probe::record_frontier_tables(resume.len());
     let snapshot_checkpoint = CheckpointMeta::from_vec(
         serde_json::to_vec(&position)
             .context("serialize snapshot checkpoint")?,
@@ -378,14 +388,18 @@ pub async fn run_snapshot(
     // connection count (and the earlier lock window) by num_workers, not by the
     // table count. Table completion (durable progress + publisher boundary) is
     // recorded as each table finishes, preserving table-level crash resume.
-    let mut buckets: Vec<Vec<(String, String)>> =
+    let copy_started = Instant::now();
+    // One shared copy of the plan; buckets hold indices into it.
+    let plan: Arc<Vec<super::MyPlannedTable>> = Arc::new(tables.to_vec());
+    let mut buckets: Vec<Vec<usize>> =
         (0..num_workers).map(|_| Vec::new()).collect();
-    for (i, tbl) in pending.iter().enumerate() {
-        buckets[i % num_workers].push(tbl.clone());
+    for (n, i) in pending.into_iter().enumerate() {
+        buckets[n % num_workers].push(i);
     }
 
     let progress_shared = Arc::new(tokio::sync::Mutex::new(progress));
     let mut handles = Vec::new();
+    let fetches_before = ctx.schema_loader.live_fetch_count();
 
     for (bucket, worker_conn) in buckets.into_iter().zip(worker_conns) {
         let publisher = Arc::clone(&publisher);
@@ -393,8 +407,7 @@ pub async fn run_snapshot(
         let chkpt_store = ctx.chkpt_store.clone();
         let schema_loader = ctx.schema_loader.clone();
         let cancel = ctx.cancel.clone();
-        let identity_map = ctx.identity_map.clone();
-        let kinds = kinds.clone();
+        let plan = Arc::clone(&plan);
         let source_id = ctx.source_id.to_string();
         let pipeline = ctx.pipeline.to_string();
         let tenant = ctx.tenant.to_string();
@@ -405,17 +418,16 @@ pub async fn run_snapshot(
         let handle = tokio::spawn(async move {
             let mut conn = worker_conn;
             let mut failed: Vec<String> = Vec::new();
-            for (db, table) in bucket {
+            for i in bucket {
                 if cancel.is_cancelled() {
                     break;
                 }
-                let table_key = fqn(&db, &table);
-                let identity =
-                    identity_map.get(&table_key).cloned().unwrap_or_default();
-                let cursor_kind = kinds
-                    .get(&table_key)
-                    .copied()
-                    .unwrap_or(CursorKind::Unsigned);
+                let planned = &plan[i];
+                let (db, table) =
+                    (planned.qualifier.clone(), planned.table.clone());
+                let table_key = planned.key();
+                let identity = planned.identity.clone();
+                let cursor_kind = planned.cursor_kind;
                 let worker = TableWorker {
                     db: db.clone(),
                     table: table.clone(),
@@ -467,6 +479,7 @@ pub async fn run_snapshot(
         });
         handles.push(handle);
     }
+    crate::snapshot_probe::record_table_tasks(handles.len());
 
     // step 3: collect worker-pool results.
     let mut failed: Vec<String> = Vec::new();
@@ -479,6 +492,15 @@ pub async fn run_snapshot(
             }
         }
     }
+
+    crate::snapshot_probe::record_worker_live_fetches(
+        ctx.schema_loader.live_fetch_count() - fetches_before,
+    );
+    crate::snapshot_probe::record_phase(
+        crate::snapshot_probe::Phase::RowCopy,
+        copy_started.elapsed(),
+    );
+    let final_started = Instant::now();
 
     // guard error takes priority over generic worker failures
     if let Some(reason) = abort_reason.lock().unwrap().take() {
@@ -515,6 +537,10 @@ pub async fn run_snapshot(
     );
 
     guard_cancel.cancel();
+    crate::snapshot_probe::record_phase(
+        crate::snapshot_probe::Phase::Finalization,
+        final_started.elapsed(),
+    );
     Ok(position)
 }
 
@@ -534,11 +560,121 @@ pub async fn run_snapshot(
 /// guaranteed: the lock connection is a non-pooled `Conn`, so on any error,
 /// panic, or timeout it is dropped, closing its session and releasing the lock
 /// server-side. `UNLOCK TABLES` is only the normal success path.
+/// The plan the anchor verifies under its read lock.
+struct PlanCheck<'a> {
+    patterns: &'a [String],
+    page_size: usize,
+    expected: &'a [super::MyPlannedTable],
+}
+
+#[cfg(test)]
+impl PlanCheck<'static> {
+    /// A plan of no table, for patterns that match none.
+    fn nothing() -> Self {
+        static NONE: std::sync::LazyLock<Vec<String>> =
+            std::sync::LazyLock::new(|| {
+                vec!["df_no_such_database.df_no_such_table".to_string()]
+            });
+        Self {
+            patterns: &NONE,
+            page_size: 1_000,
+            expected: &[],
+        }
+    }
+}
+
+/// Under the read lock (no DDL can run), re-read the catalog with the same
+/// paged discovery and require exactly the planned tables, in order: a
+/// table created, dropped or renamed since discovery (between its pages, or
+/// before the anchor) fails the snapshot before any row is read. MySQL's
+/// INFORMATION_SCHEMA is not read in one consistent snapshot, so this is
+/// what makes the paged discovery a consistent view, as of the anchor.
+async fn verify_plan_under_lock(
+    conn: &mut Conn,
+    check: &PlanCheck<'_>,
+) -> Result<()> {
+    let mut discovery = crate::snapshot_discovery::Discovery::for_verification(
+        check.patterns,
+        check.page_size,
+    );
+    let mut i = 0usize;
+    while !discovery.is_done() {
+        let rows = super::mysql_schema_loader::discovery_page(
+            conn,
+            check.patterns,
+            discovery.after(),
+            discovery.page_size(),
+        )
+        .await?;
+        let page_start = i;
+        for (db, table) in discovery.accept(rows)? {
+            match check.expected.get(i) {
+                Some(p) if p.qualifier == db && p.table == table => {}
+                Some(p) => anyhow::bail!(catalog_moved(format!(
+                    "{db}.{table} is where the plan has {}",
+                    p.key()
+                ))),
+                None => {
+                    anyhow::bail!(catalog_moved(format!("{db}.{table} is new")))
+                }
+            }
+            i += 1;
+        }
+        verify_shapes(conn, &check.expected[page_start..i]).await?;
+    }
+    if let Some(p) = check.expected.get(i) {
+        anyhow::bail!(catalog_moved(format!("{} is gone", p.key())));
+    }
+    crate::snapshot_probe::record_fixed(
+        crate::snapshot_probe::FixedOp::CatalogVerification,
+    );
+    Ok(())
+}
+
+/// Under the read lock, rebuild the registered schema model of each of
+/// `planned` from INFORMATION_SCHEMA (the loader's own fetch) and require
+/// the plan's signature: a table altered since preparation stops the
+/// snapshot before any row is read.
+async fn verify_shapes(
+    conn: &mut Conn,
+    planned: &[super::MyPlannedTable],
+) -> Result<()> {
+    let keys: Vec<(&str, &str)> = planned
+        .iter()
+        .map(|p| (p.qualifier.as_str(), p.table.as_str()))
+        .collect();
+    let schemas =
+        super::mysql_schema_loader::fetch_table_schemas_on(conn, &keys)
+            .await
+            .context("verify the plan: read the planned schemas")?;
+    for p in planned {
+        let same = schemas
+            .get(&(p.qualifier.clone(), p.table.clone()))
+            .is_some_and(|s| mysql_schema_signature(s) == p.signature);
+        if !same {
+            anyhow::bail!(catalog_moved(format!(
+                "the schema of {} changed",
+                p.key()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn catalog_moved(detail: String) -> String {
+    format!(
+        "the tables the snapshot's patterns match changed between discovery \
+         and the snapshot anchor ({detail}); no row was read - restart to plan \
+         the snapshot again"
+    )
+}
+
 async fn acquire_locked_anchor(
     dsn: &str,
     expected_uuid: &str,
     num_workers: usize,
     timeout_dur: Duration,
+    check: PlanCheck<'_>,
 ) -> Result<(Vec<Conn>, MySqlCheckpoint)> {
     let opts = Opts::from_url(dsn).context("parse mysql dsn")?;
     // Each connection proves it is the verified server before it is used:
@@ -592,6 +728,7 @@ async fn acquire_locked_anchor(
         // Position captured while the lock is still held -> matches every
         // worker's read view exactly.
         let position = capture_binlog_position(&mut lock_conn).await?;
+        verify_plan_under_lock(&mut lock_conn, &check).await?;
         Result::<(Vec<Conn>, MySqlCheckpoint)>::Ok((workers, position))
     };
 
@@ -663,7 +800,12 @@ async fn save_progress(
     progress: &MysqlSnapshotProgress,
 ) {
     if let Ok(bytes) = serde_json::to_vec(progress) {
+        let started = std::time::Instant::now();
         let _ = store.put_raw(&progress_key(source_id), &bytes).await;
+        crate::snapshot_probe::record_progress_write(
+            bytes.len(),
+            started.elapsed(),
+        );
     }
 }
 
@@ -1042,11 +1184,20 @@ fn is_integer_pk(col: Option<&super::MySqlColumn>) -> bool {
     }
 }
 
+/// The plan signature of a MySQL table: its whole registered schema model.
+pub(crate) fn mysql_schema_signature(
+    schema: &super::MySqlTableSchema,
+) -> String {
+    crate::snapshot_plan::schema_signature(schema)
+}
+
 /// The snapshot cursor kind for a table: signed vs unsigned integer PK-range
 /// scan, or an unsigned row-count cursor for the full-scan fallback. Must match
 /// the worker's scan decision so the aggregator's kind agrees with the cursors it
 /// receives.
-fn mysql_cursor_kind(schema: &super::MySqlTableSchema) -> CursorKind {
+pub(crate) fn mysql_cursor_kind(
+    schema: &super::MySqlTableSchema,
+) -> CursorKind {
     let pk = &schema.primary_key;
     if pk.len() == 1 {
         if let Some(col) = schema.column(&pk[0]) {
@@ -1186,7 +1337,7 @@ mod progress_load_tests {
         let store = MemCheckpointStore::new().unwrap();
         let saved = MysqlSnapshotProgress {
             start_position: "pos".into(),
-            done_tables: vec!["db.t".into()],
+            done_tables: ["db.t".to_string()].into(),
             finished: true,
         };
         store
@@ -1195,7 +1346,13 @@ mod progress_load_tests {
             .unwrap();
         let got = load_snapshot_progress(&store, "s1").await.unwrap();
         assert!(got.finished);
-        assert_eq!(got.done_tables, vec!["db.t".to_string()]);
+        assert!(got.table_done("db", "t"));
+        // The durable form is the JSON array it always was.
+        let legacy = br#"{"start_position":"p","done_tables":["b.t","a.t"],"finished":false}"#;
+        let p: MysqlSnapshotProgress = serde_json::from_slice(legacy).unwrap();
+        assert!(p.table_done("a", "t") && p.table_done("b", "t"));
+        let v: serde_json::Value = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["done_tables"], serde_json::json!(["a.t", "b.t"]));
     }
 
     #[tokio::test]
@@ -1382,6 +1539,7 @@ mod live_anchor_tests {
             &live_uuid(&dsn).await,
             4,
             Duration::from_secs(10),
+            PlanCheck::nothing(),
         )
         .await
         .expect("acquire anchor");
@@ -1462,6 +1620,7 @@ mod live_anchor_tests {
             &live_uuid(&dsn).await,
             2,
             Duration::from_secs(10),
+            PlanCheck::nothing(),
         )
         .await
         .expect("acquire");
@@ -1560,6 +1719,7 @@ mod live_anchor_tests {
             &live_uuid(&dsn).await,
             2,
             Duration::from_secs(2),
+            PlanCheck::nothing(),
         )
         .await;
         assert!(res.is_err(), "expected timeout while FTWRL was blocked");
@@ -1576,6 +1736,7 @@ mod live_anchor_tests {
             &live_uuid(&dsn).await,
             2,
             Duration::from_secs(10),
+            PlanCheck::nothing(),
         )
         .await
         .expect("acquire after blocker released");

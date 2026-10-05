@@ -46,7 +46,20 @@ pub struct SnapshotCfg {
     /// by `max_parallel_tables` (reused; not a separate knob).
     #[serde(default = "default_lock_timeout_secs")]
     pub lock_timeout_secs: u64,
+
+    /// Tables read per catalog query while discovering the tables a snapshot
+    /// copies (keyset pages in byte order of `(schema, table)`). Bounded:
+    /// `1..=10000`; anything else is rejected when the configuration loads.
+    #[serde(
+        default = "default_discovery_page_size",
+        deserialize_with = "deserialize_discovery_page_size"
+    )]
+    pub discovery_page_size: usize,
 }
+
+/// Bounds of [`SnapshotCfg::discovery_page_size`].
+pub const DISCOVERY_PAGE_SIZE_MIN: usize = 1;
+pub const DISCOVERY_PAGE_SIZE_MAX: usize = 10_000;
 
 impl Default for SnapshotCfg {
     fn default() -> Self {
@@ -57,6 +70,7 @@ impl Default for SnapshotCfg {
             intra_table_parallel: false,
             max_parallel_chunks: default_parallel_chunks(),
             lock_timeout_secs: default_lock_timeout_secs(),
+            discovery_page_size: default_discovery_page_size(),
         }
     }
 }
@@ -72,4 +86,42 @@ fn default_parallel_chunks() -> usize {
 }
 fn default_lock_timeout_secs() -> u64 {
     10
+}
+fn default_discovery_page_size() -> usize {
+    1_000
+}
+
+fn deserialize_discovery_page_size<'de, D>(d: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let n = usize::deserialize(d)?;
+    if !(DISCOVERY_PAGE_SIZE_MIN..=DISCOVERY_PAGE_SIZE_MAX).contains(&n) {
+        return Err(serde::de::Error::custom(format!(
+            "snapshot.discovery_page_size must be between \
+             {DISCOVERY_PAGE_SIZE_MIN} and {DISCOVERY_PAGE_SIZE_MAX}, got {n}"
+        )));
+    }
+    Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovery_page_size_defaults_and_is_bounded() {
+        let cfg: SnapshotCfg = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.discovery_page_size, 1_000);
+        let cfg: SnapshotCfg =
+            serde_json::from_str(r#"{"discovery_page_size": 10000}"#).unwrap();
+        assert_eq!(cfg.discovery_page_size, 10_000);
+        for bad in ["0", "10001"] {
+            let err = serde_json::from_str::<SnapshotCfg>(&format!(
+                r#"{{"discovery_page_size": {bad}}}"#
+            ))
+            .unwrap_err();
+            assert!(err.to_string().contains("discovery_page_size"), "{err}");
+        }
+    }
 }

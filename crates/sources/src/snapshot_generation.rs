@@ -109,58 +109,107 @@ pub struct SnapshotGenerationRecord {
     pub status: SnapshotStatus,
     /// Fingerprint of the identity-relevant snapshot configuration.
     pub config_fingerprint: String,
+    /// The format of `config_fingerprint`; absent (`0`) in records written
+    /// before the format was recorded (format 1).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fingerprint_format: u32,
 }
 
-/// One table's identity-relevant configuration, hashed into the fingerprint.
-#[derive(Debug, Clone)]
-pub struct TableIdentitySpec {
-    /// Database name.
-    pub db: String,
-    /// Schema name (PostgreSQL), if any.
-    pub schema: Option<String>,
-    /// Table name.
-    pub table: String,
-    /// Effective identity columns **in declared order** (order is significant —
-    /// it changes composite-key ids, so a reorder must change the fingerprint).
-    pub identity_columns: Vec<String>,
+/// The fingerprint format this build computes ([`SnapshotFingerprintBuilder`]).
+pub const FINGERPRINT_FORMAT: u32 = 2;
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
-/// A stable fingerprint over the identity-relevant snapshot configuration
-/// (the set of tables and each table's effective identity columns). A resume
-/// may reuse a generation only when this matches the persisted one.
+/// A stable fingerprint over the snapshot-relevant configuration. A resume
+/// may reuse a generation only when this matches the persisted one; anything
+/// else (including a fingerprint of an earlier format) starts a new
+/// generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotConfigFingerprint(String);
 
 impl SnapshotConfigFingerprint {
-    /// Compute the fingerprint. Independent of the *listing order* of tables
-    /// (they are sorted), but sensitive to each table's identity and to the
-    /// **order** of its identity columns.
-    pub fn compute(tables: &[TableIdentitySpec]) -> Self {
-        let mut canon: Vec<String> = tables
-            .iter()
-            .map(|t| {
-                format!(
-                    "{}\u{1f}{}\u{1f}{}\u{1f}{}",
-                    t.db,
-                    t.schema.as_deref().unwrap_or(""),
-                    t.table,
-                    t.identity_columns.join("\u{1f}"),
-                )
-            })
-            .collect();
-        canon.sort();
-        let mut h = Sha256::new();
-        h.update(b"dfsnapfp:v1");
-        for row in &canon {
-            h.update((row.len() as u64).to_be_bytes());
-            h.update(row.as_bytes());
-        }
-        SnapshotConfigFingerprint(hex::encode(h.finalize()))
-    }
-
     /// The fingerprint as a hex string.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// Builds the fingerprint (format v2) while tables are discovered, without
+/// holding the table list: every field is length-delimited, so the encoding
+/// is canonical. It binds the format version, the engine and the configured
+/// table patterns, then, in discovery order (bytewise `(schema, table)`),
+/// each table's canonical identity, identity columns (in identity order),
+/// cursor kind and schema version, and finally the table count.
+pub struct SnapshotFingerprintBuilder {
+    h: Sha256,
+    tables: u64,
+}
+
+impl SnapshotFingerprintBuilder {
+    pub fn new(engine: &str, patterns: &[String]) -> Self {
+        let mut b = Self {
+            h: Sha256::new(),
+            tables: 0,
+        };
+        b.field(b"dfsnapfp:v2");
+        b.field(engine.as_bytes());
+        b.count(patterns.len());
+        for p in patterns {
+            b.field(p.as_bytes());
+        }
+        b
+    }
+
+    /// The next table in discovery order.
+    pub fn table(
+        &mut self,
+        db: &str,
+        schema: Option<&str>,
+        table: &str,
+        identity_columns: &[String],
+        cursor_kind: crate::durable_checkpoint::CursorKind,
+        schema_version: i32,
+    ) {
+        use crate::durable_checkpoint::CursorKind;
+        self.h.update(b"T");
+        self.field(db.as_bytes());
+        match schema {
+            Some(s) => {
+                self.h.update([1]);
+                self.field(s.as_bytes());
+            }
+            None => self.h.update([0]),
+        }
+        self.field(table.as_bytes());
+        self.count(identity_columns.len());
+        for c in identity_columns {
+            self.field(c.as_bytes());
+        }
+        self.field(match cursor_kind {
+            CursorKind::Signed => b"signed",
+            CursorKind::Unsigned => b"unsigned",
+            CursorKind::CtidBlock => b"ctid_block",
+        });
+        self.h.update(schema_version.to_be_bytes());
+        self.tables += 1;
+    }
+
+    pub fn finish(mut self) -> SnapshotConfigFingerprint {
+        self.h.update(b"N");
+        let tables = self.tables;
+        self.count(tables as usize);
+        SnapshotConfigFingerprint(hex::encode(self.h.finalize()))
+    }
+
+    fn field(&mut self, bytes: &[u8]) {
+        self.h.update((bytes.len() as u64).to_be_bytes());
+        self.h.update(bytes);
+    }
+
+    fn count(&mut self, n: usize) {
+        self.h.update((n as u64).to_be_bytes());
     }
 }
 
@@ -206,6 +255,15 @@ pub enum SnapshotGenerationError {
     /// The underlying state store failed.
     #[error("snapshot state store error: {0}")]
     Store(String),
+    /// The stored record has a fingerprint format this build does not know
+    /// (written by a newer release): never resumed, never treated as an
+    /// earlier format.
+    #[error(
+        "snapshot generation {generation} was recorded with fingerprint \
+         format {format}, which this release does not know; refusing to resume \
+         or replace it"
+    )]
+    UnsupportedFingerprintFormat { generation: u64, format: u32 },
     /// Too many concurrent writers; CAS retry budget exhausted.
     #[error("exceeded retry budget allocating snapshot generation")]
     RetryExhausted,
@@ -234,6 +292,32 @@ fn encode(
         .map_err(|e| SnapshotGenerationError::Corrupt(e.to_string()))
 }
 
+/// How a stored record's fingerprint format is treated, the same in every
+/// allocation mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordFormat {
+    /// Written before the format was recorded (format 1): never compared.
+    Legacy,
+    /// [`FINGERPRINT_FORMAT`]: compared.
+    Current,
+}
+
+/// Classify a stored record's format; any explicit format other than the
+/// current one (an unknown or newer release's) is refused, never taken for an
+/// earlier one.
+fn classify_format(
+    rec: &SnapshotGenerationRecord,
+) -> Result<RecordFormat, SnapshotGenerationError> {
+    match rec.fingerprint_format {
+        0 => Ok(RecordFormat::Legacy),
+        FINGERPRINT_FORMAT => Ok(RecordFormat::Current),
+        format => Err(SnapshotGenerationError::UnsupportedFingerprintFormat {
+            generation: rec.generation,
+            format,
+        }),
+    }
+}
+
 const MAX_RETRIES: usize = 16;
 
 /// Allocate (or resume) the snapshot generation for `key`, persisting the
@@ -258,6 +342,7 @@ pub async fn allocate_generation(
                         lineage: current_lineage.clone(),
                         status: SnapshotStatus::Allocated,
                         config_fingerprint: fingerprint.as_str().to_string(),
+                        fingerprint_format: FINGERPRINT_FORMAT,
                     };
                     match store
                         .compare_and_swap(key, None, &encode(&rec)?)
@@ -277,12 +362,60 @@ pub async fn allocate_generation(
                 }
                 Some((version, bytes)) => {
                     let rec = decode(bytes)?;
+                    let format = classify_format(&rec)?;
+                    // Neither an earlier-format record nor a current one is
+                    // taken over from another source lineage.
+                    if !rec.lineage.stable_matches(&current_lineage) {
+                        return Err(SnapshotGenerationError::ConfigChanged {
+                            generation: rec.generation,
+                        });
+                    }
+                    // A record without a format (written before formats were
+                    // recorded) cannot be compared: its snapshot is not
+                    // resumed but replaced by the next generation, by CAS
+                    // against the record read (the full snapshot runs again).
+                    // Only the recorded format decides this, never a
+                    // fingerprint mismatch, which stays a configuration
+                    // change.
+                    if format == RecordFormat::Legacy {
+                        let next = SnapshotGenerationRecord {
+                            generation: rec.generation + 1,
+                            lineage: current_lineage.clone(),
+                            status: SnapshotStatus::Allocated,
+                            config_fingerprint: fingerprint
+                                .as_str()
+                                .to_string(),
+                            fingerprint_format: FINGERPRINT_FORMAT,
+                        };
+                        match store
+                            .compare_and_swap(
+                                key,
+                                Some(*version),
+                                &encode(&next)?,
+                            )
+                            .await
+                            .map_err(map_store_err)?
+                        {
+                            CasOutcome::Committed { version } => {
+                                tracing::info!(
+                                    previous_generation = rec.generation,
+                                    previous_format = rec.fingerprint_format,
+                                    generation = next.generation,
+                                    "snapshot fingerprint format changed: \
+                                     allocated a new generation"
+                                );
+                                return Ok(AllocatedGeneration {
+                                    version,
+                                    record: next,
+                                });
+                            }
+                            CasOutcome::Mismatch { .. } => continue,
+                        }
+                    }
                     // Reuse only when both the config and the *stable* lineage
                     // match. The persisted record (incl. its original file) is
                     // returned unchanged — never recomputed from current state.
-                    if rec.config_fingerprint == fingerprint.as_str()
-                        && rec.lineage.stable_matches(&current_lineage)
-                    {
+                    if rec.config_fingerprint == fingerprint.as_str() {
                         return Ok(AllocatedGeneration {
                             version: *version,
                             record: rec,
@@ -296,7 +429,11 @@ pub async fn allocate_generation(
             AllocationMode::ForceNew => {
                 let (expected, next_gen) = match &current {
                     Some((v, bytes)) => {
-                        (Some(*v), decode(bytes)?.generation + 1)
+                        let rec = decode(bytes)?;
+                        // Not even an explicit re-snapshot replaces a record
+                        // of a format this build does not know.
+                        classify_format(&rec)?;
+                        (Some(*v), rec.generation + 1)
                     }
                     None => (None, 1),
                 };
@@ -305,6 +442,7 @@ pub async fn allocate_generation(
                     lineage: current_lineage.clone(),
                     status: SnapshotStatus::Allocated,
                     config_fingerprint: fingerprint.as_str().to_string(),
+                    fingerprint_format: FINGERPRINT_FORMAT,
                 };
                 match store
                     .compare_and_swap(key, expected, &encode(&rec)?)
@@ -375,12 +513,16 @@ mod tests {
     }
 
     fn fp(cols: &[&str]) -> SnapshotConfigFingerprint {
-        SnapshotConfigFingerprint::compute(&[TableIdentitySpec {
-            db: "shop".into(),
-            schema: Some("public".into()),
-            table: "orders".into(),
-            identity_columns: cols.iter().map(|s| s.to_string()).collect(),
-        }])
+        let mut b = SnapshotFingerprintBuilder::new("postgres", &[]);
+        b.table(
+            "public",
+            Some("public"),
+            "orders",
+            &cols.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            crate::durable_checkpoint::CursorKind::Signed,
+            1,
+        );
+        b.finish()
     }
 
     const KEY: &str = "snapshot_generation:src-1";
@@ -598,37 +740,223 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_ignores_table_order_but_tracks_identity() {
-        let a = TableIdentitySpec {
-            db: "d".into(),
-            schema: None,
-            table: "a".into(),
-            identity_columns: vec!["id".into()],
+    fn the_fingerprint_binds_everything_snapshot_relevant() {
+        use crate::durable_checkpoint::CursorKind;
+        type T<'a> = (&'a str, &'a [&'a str], CursorKind, i32);
+        let build = |patterns: &[&str], tables: &[T<'_>]| {
+            let patterns: Vec<String> =
+                patterns.iter().map(|s| s.to_string()).collect();
+            let mut b = SnapshotFingerprintBuilder::new("mysql", &patterns);
+            for (name, ids, kind, version) in tables {
+                let ids: Vec<String> =
+                    ids.iter().map(|s| s.to_string()).collect();
+                b.table("d", None, name, &ids, *kind, *version);
+            }
+            b.finish()
         };
-        let b = TableIdentitySpec {
-            db: "d".into(),
-            schema: None,
-            table: "b".into(),
-            identity_columns: vec!["k1".into(), "k2".into()],
-        };
-        let ab = SnapshotConfigFingerprint::compute(&[a.clone(), b.clone()]);
-        let ba = SnapshotConfigFingerprint::compute(&[b, a]);
-        assert_eq!(ab, ba, "listing order must not matter");
+        let base: Vec<T<'_>> = vec![
+            ("a", &["id"], CursorKind::Signed, 1),
+            ("b", &["k1", "k2"], CursorKind::CtidBlock, 3),
+        ];
+        let fp = build(&["d.*"], &base);
+        assert_eq!(fp, build(&["d.*"], &base), "deterministic");
+        let variants: Vec<(&str, SnapshotConfigFingerprint)> = vec![
+            ("patterns", build(&["d.a", "d.b"], &base)),
+            ("discovery order", build(&["d.*"], &[base[1], base[0]])),
+            (
+                "identity column order",
+                build(
+                    &["d.*"],
+                    &[base[0], ("b", &["k2", "k1"], CursorKind::CtidBlock, 3)],
+                ),
+            ),
+            (
+                "cursor kind",
+                build(
+                    &["d.*"],
+                    &[base[0], ("b", &["k1", "k2"], CursorKind::Signed, 3)],
+                ),
+            ),
+            (
+                "schema version",
+                build(
+                    &["d.*"],
+                    &[base[0], ("b", &["k1", "k2"], CursorKind::CtidBlock, 4)],
+                ),
+            ),
+            ("table count", build(&["d.*"], &base[..1])),
+        ];
+        for (what, other) in variants {
+            assert_ne!(fp, other, "{what} must change the fingerprint");
+        }
+        // Length-delimited: moving bytes between adjacent fields changes it.
+        let ab = build(&["d.*"], &[("ab", &["c"], CursorKind::Signed, 1)]);
+        let a_bc = build(&["d.*"], &[("a", &["bc"], CursorKind::Signed, 1)]);
+        assert_ne!(ab, a_bc);
+    }
 
-        // Composite-key column order is significant.
-        let k12 = SnapshotConfigFingerprint::compute(&[TableIdentitySpec {
-            db: "d".into(),
-            schema: None,
-            table: "t".into(),
-            identity_columns: vec!["k1".into(), "k2".into()],
-        }]);
-        let k21 = SnapshotConfigFingerprint::compute(&[TableIdentitySpec {
-            db: "d".into(),
-            schema: None,
-            table: "t".into(),
-            identity_columns: vec!["k2".into(), "k1".into()],
-        }]);
-        assert_ne!(k12, k21, "identity column order must matter");
+    /// A record of an earlier fingerprint format (absent field) is replaced
+    /// by a new generation on resume, whatever its status; a fingerprint
+    /// mismatch within the current format stays a configuration change.
+    #[tokio::test]
+    async fn an_earlier_fingerprint_format_starts_a_new_generation() {
+        for status in [SnapshotStatus::Running, SnapshotStatus::Completed] {
+            let store = MemCheckpointStore::new().unwrap();
+            let legacy = serde_json::json!({
+                "generation": 4,
+                "lineage": pg(1),
+                "status": status,
+                "config_fingerprint": "a-format-1-hash",
+            });
+            store
+                .compare_and_swap(
+                    KEY,
+                    None,
+                    &serde_json::to_vec(&legacy).unwrap(),
+                )
+                .await
+                .unwrap();
+            let a = allocate_generation(
+                &store,
+                KEY,
+                pg(1),
+                &fp(&["id"]),
+                AllocationMode::Resume,
+            )
+            .await
+            .unwrap();
+            assert_eq!(a.record.generation, 5, "{status:?}");
+            assert_eq!(a.record.fingerprint_format, FINGERPRINT_FORMAT);
+            assert_eq!(a.record.status, SnapshotStatus::Allocated);
+            // Resuming again reuses it.
+            let b = allocate_generation(
+                &store,
+                KEY,
+                pg(1),
+                &fp(&["id"]),
+                AllocationMode::Resume,
+            )
+            .await
+            .unwrap();
+            assert_eq!(b.record.generation, 5);
+        }
+        // A format this build does not know: refused in both modes, the
+        // record untouched.
+        for format in [1u32, 9] {
+            let store = MemCheckpointStore::new().unwrap();
+            let unknown = serde_json::json!({
+                "generation": 4,
+                "lineage": pg(1),
+                "status": "running",
+                "config_fingerprint": "an-unknown-format-hash",
+                "fingerprint_format": format,
+            });
+            let bytes = serde_json::to_vec(&unknown).unwrap();
+            store.compare_and_swap(KEY, None, &bytes).await.unwrap();
+            for mode in [AllocationMode::Resume, AllocationMode::ForceNew] {
+                let err =
+                    allocate_generation(&store, KEY, pg(1), &fp(&["id"]), mode)
+                        .await
+                        .unwrap_err();
+                assert!(
+                    matches!(
+                        err,
+                        SnapshotGenerationError::UnsupportedFingerprintFormat {
+                            format: f,
+                            ..
+                        } if f == format
+                    ),
+                    "format {format}, {mode:?}: {err}"
+                );
+                assert_eq!(
+                    store.get_versioned(KEY).await.unwrap().unwrap().1,
+                    bytes
+                );
+            }
+        }
+        // Same format, other fingerprint: a configuration change, refused.
+        let store = MemCheckpointStore::new().unwrap();
+        allocate_generation(
+            &store,
+            KEY,
+            pg(1),
+            &fp(&["id"]),
+            AllocationMode::Resume,
+        )
+        .await
+        .unwrap();
+        let err = allocate_generation(
+            &store,
+            KEY,
+            pg(1),
+            &fp(&["other"]),
+            AllocationMode::Resume,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SnapshotGenerationError::ConfigChanged { .. }));
+    }
+
+    /// An earlier-format record is replaced only within its own source
+    /// lineage; one from another PostgreSQL cluster or MySQL lineage is
+    /// refused and left byte-identical.
+    #[tokio::test]
+    async fn an_earlier_format_record_is_replaced_only_on_its_own_lineage() {
+        let gtid = |b: u8| PersistedLineage::MysqlGtid {
+            source_uuid: [b; 16],
+        };
+        let server = |id: u32, file: &str| PersistedLineage::MysqlServer {
+            server_id: id,
+            file: file.into(),
+        };
+        let cases = [
+            ("postgres", pg(1), pg(1), true),
+            ("postgres", pg(1), pg(2), false),
+            ("mysql gtid", gtid(1), gtid(1), true),
+            ("mysql gtid", gtid(1), gtid(2), false),
+            ("mysql server", server(7, "b.1"), server(7, "b.2"), true),
+            ("mysql server", server(7, "b.1"), server(8, "b.1"), false),
+            ("mysql gtid vs server", gtid(1), server(7, "b.1"), false),
+        ];
+        for (what, stored, current, same) in cases {
+            let store = MemCheckpointStore::new().unwrap();
+            let legacy = serde_json::json!({
+                "generation": 4,
+                "lineage": stored,
+                "status": "running",
+                "config_fingerprint": "a-format-1-hash",
+            });
+            let bytes = serde_json::to_vec(&legacy).unwrap();
+            store.compare_and_swap(KEY, None, &bytes).await.unwrap();
+            let got = allocate_generation(
+                &store,
+                KEY,
+                current.clone(),
+                &fp(&["id"]),
+                AllocationMode::Resume,
+            )
+            .await;
+            if same {
+                let a = got.unwrap();
+                assert_eq!(a.record.generation, 5, "{what}");
+                assert_eq!(a.record.lineage, current, "{what}");
+            } else {
+                assert!(
+                    matches!(
+                        got,
+                        Err(SnapshotGenerationError::ConfigChanged {
+                            generation: 4
+                        })
+                    ),
+                    "{what}: {got:?}"
+                );
+                assert_eq!(
+                    store.get_versioned(KEY).await.unwrap().unwrap().1,
+                    bytes,
+                    "{what}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
