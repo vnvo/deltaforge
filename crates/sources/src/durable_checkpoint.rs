@@ -43,7 +43,8 @@ pub enum SnapshotCursor {
 }
 
 /// The domain of a [`SnapshotCursor`], independent of its value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CursorKind {
     Signed,
     Unsigned,
@@ -87,6 +88,11 @@ impl SnapshotCursor {
 /// Canonical durable-watermark version. Unknown versions are `Incomparable`.
 pub const WATERMARK_VERSION: u16 = 1;
 
+/// The version of the snapshot-chain watermarks ([`WmPos::SnapshotSeq`],
+/// [`WmPos::SnapshotAdopted`]): a release that only knows version 1 refuses
+/// them (fails closed) instead of misreading them.
+pub const WATERMARK_VERSION_SNAPSHOT_CHAIN: u16 = 2;
+
 /// A durable watermark: source lineage plus a source-specific position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DurableWatermark {
@@ -124,8 +130,30 @@ pub enum WmPos {
         completed: bool,
         table_cursors: BTreeMap<String, SnapshotCursor>,
     },
+    /// Snapshot progress of one generation of a snapshot chain: `seq` is the
+    /// publish order within the generation. A generation is published by one
+    /// process run only (a restart replaces it with the next generation of
+    /// the chain), so this run-local order never repeats or resets within a
+    /// generation, and generations of one chain order by number. `completed`
+    /// marks the terminal barrier.
+    SnapshotSeq {
+        snapshot_chain: String,
+        generation: u64,
+        seq: u64,
+        completed: bool,
+    },
+    /// A sink's own adoption of its legacy (chain-less) state into a snapshot
+    /// chain: every legacy generation up to `legacy_through` is behind every
+    /// later generation of the chain. `replaced_digest` identifies the exact
+    /// state it replaced.
+    SnapshotAdopted {
+        snapshot_chain: String,
+        legacy_through: u64,
+        replaced_digest: String,
+    },
 }
-// NOTE: there is deliberately no "standalone sequence" variant. DDL, logical
+// NOTE: there is deliberately no "standalone sequence" variant (the snapshot
+// `seq` above is bound to one generation of one chain, published by one run). DDL, logical
 // messages and synthetic events inherit their real source/parent CDC coordinate
 // (PgLsn/MysqlGtid/MysqlBinlog); order is never manufactured from a sink- or
 // process-local counter that would reset on restart. An event with no durable
@@ -135,7 +163,7 @@ pub enum WmPos {
 impl DurableWatermark {
     pub fn new(lineage: PersistedLineage, pos: WmPos) -> Self {
         Self {
-            version: WATERMARK_VERSION,
+            version: version_of(&pos),
             lineage,
             pos,
         }
@@ -200,10 +228,20 @@ impl DurableWatermark {
     /// closed.
     pub fn parse(raw: &[u8]) -> Option<Self> {
         let w: DurableWatermark = serde_json::from_slice(raw).ok()?;
-        if w.version != WATERMARK_VERSION {
+        if w.version != version_of(&w.pos) {
             return None;
         }
         Some(w)
+    }
+}
+
+/// The version a watermark of this position kind carries.
+fn version_of(pos: &WmPos) -> u16 {
+    match pos {
+        WmPos::SnapshotSeq { .. } | WmPos::SnapshotAdopted { .. } => {
+            WATERMARK_VERSION_SNAPSHOT_CHAIN
+        }
+        _ => WATERMARK_VERSION,
     }
 }
 
@@ -444,6 +482,107 @@ pub fn order_positions(a: &WmPos, b: &WmPos) -> CheckpointOrder {
                 table_cursors: tb,
             },
         ) => snapshot_order(*ga, *ca, ta, *gb, *cb, tb),
+        (
+            WmPos::SnapshotSeq {
+                snapshot_chain: ca,
+                generation: ga,
+                seq: sa,
+                completed: da,
+            },
+            WmPos::SnapshotSeq {
+                snapshot_chain: cb,
+                generation: gb,
+                seq: sb,
+                completed: db,
+            },
+        ) => {
+            if ca != cb {
+                return CheckpointOrder::Incomparable;
+            }
+            match ga.cmp(gb) {
+                std::cmp::Ordering::Less => CheckpointOrder::Before,
+                std::cmp::Ordering::Greater => CheckpointOrder::After,
+                std::cmp::Ordering::Equal => match sa.cmp(sb) {
+                    std::cmp::Ordering::Equal if da == db => {
+                        CheckpointOrder::Equal
+                    }
+                    std::cmp::Ordering::Equal => CheckpointOrder::Incomparable,
+                    std::cmp::Ordering::Less => CheckpointOrder::Before,
+                    std::cmp::Ordering::Greater => CheckpointOrder::After,
+                },
+            }
+        }
+        (
+            WmPos::SnapshotAdopted {
+                snapshot_chain: ca,
+                legacy_through: ka,
+                ..
+            },
+            WmPos::SnapshotAdopted {
+                snapshot_chain: cb,
+                legacy_through: kb,
+                ..
+            },
+        ) => {
+            // One chain adopts once, with one bound.
+            if ca == cb && ka == kb {
+                CheckpointOrder::Equal
+            } else {
+                CheckpointOrder::Incomparable
+            }
+        }
+        (
+            WmPos::SnapshotAdopted {
+                snapshot_chain: ca,
+                legacy_through: k,
+                ..
+            },
+            WmPos::SnapshotSeq {
+                snapshot_chain: cb,
+                generation: g,
+                ..
+            },
+        ) => {
+            if ca == cb && g > k {
+                CheckpointOrder::Before
+            } else {
+                CheckpointOrder::Incomparable
+            }
+        }
+        (
+            WmPos::SnapshotSeq {
+                snapshot_chain: ca,
+                generation: g,
+                ..
+            },
+            WmPos::SnapshotAdopted {
+                snapshot_chain: cb,
+                legacy_through: k,
+                ..
+            },
+        ) => {
+            if ca == cb && g > k {
+                CheckpointOrder::After
+            } else {
+                CheckpointOrder::Incomparable
+            }
+        }
+        // A completed chain generation precedes CDC of its lineage; an
+        // incomplete one is never ordered against CDC.
+        (WmPos::SnapshotSeq { completed, .. }, cdc) if is_cdc(cdc) => {
+            if *completed {
+                CheckpointOrder::Before
+            } else {
+                CheckpointOrder::Incomparable
+            }
+        }
+        (cdc, WmPos::SnapshotSeq { completed, .. }) if is_cdc(cdc) => {
+            if *completed {
+                CheckpointOrder::After
+            } else {
+                CheckpointOrder::Incomparable
+            }
+        }
         // The ONLY permitted cross-variant transition: a COMPLETED snapshot of
         // lineage L precedes CDC of lineage L. The `completed` flag is the
         // explicit durable completion marker; an incomplete snapshot or a
@@ -1211,5 +1350,131 @@ mod tests {
             )
             .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_chain_watermark_tests {
+    use super::*;
+
+    fn lineage() -> PersistedLineage {
+        PersistedLineage::Postgres {
+            system_identifier: 7,
+        }
+    }
+
+    fn seq(chain: &str, generation: u64, seq: u64, completed: bool) -> WmPos {
+        WmPos::SnapshotSeq {
+            snapshot_chain: chain.into(),
+            generation,
+            seq,
+            completed,
+        }
+    }
+
+    fn adopted(chain: &str, k: u64) -> WmPos {
+        WmPos::SnapshotAdopted {
+            snapshot_chain: chain.into(),
+            legacy_through: k,
+            replaced_digest: "d".into(),
+        }
+    }
+
+    use CheckpointOrder::*;
+
+    #[test]
+    fn a_chain_orders_its_generations_and_their_publish_order() {
+        assert_eq!(
+            order_positions(&seq("c", 2, 5, false), &seq("c", 2, 9, false)),
+            Before
+        );
+        assert_eq!(
+            order_positions(&seq("c", 2, 9, false), &seq("c", 3, 0, false)),
+            Before
+        );
+        assert_eq!(
+            order_positions(&seq("c", 3, 0, false), &seq("c", 2, 99, true)),
+            After
+        );
+        assert_eq!(
+            order_positions(&seq("c", 2, 5, false), &seq("c", 2, 5, false)),
+            Equal
+        );
+        // One sequence of one generation is either terminal or not.
+        assert_eq!(
+            order_positions(&seq("c", 2, 5, false), &seq("c", 2, 5, true)),
+            Incomparable
+        );
+        // Different chains never order, whatever the generations.
+        assert_eq!(
+            order_positions(&seq("c", 2, 5, false), &seq("d", 3, 0, false)),
+            Incomparable
+        );
+    }
+
+    #[test]
+    fn an_adoption_precedes_only_the_later_generations_of_its_chain() {
+        assert_eq!(
+            order_positions(&adopted("c", 4), &seq("c", 5, 0, false)),
+            Before
+        );
+        assert_eq!(
+            order_positions(&seq("c", 5, 0, false), &adopted("c", 4)),
+            After
+        );
+        assert_eq!(
+            order_positions(&adopted("c", 4), &seq("c", 4, 0, false)),
+            Incomparable
+        );
+        assert_eq!(
+            order_positions(&adopted("c", 4), &seq("d", 5, 0, false)),
+            Incomparable
+        );
+        assert_eq!(order_positions(&adopted("c", 4), &adopted("c", 4)), Equal);
+        assert_eq!(
+            order_positions(&adopted("c", 4), &adopted("c", 5)),
+            Incomparable
+        );
+    }
+
+    #[test]
+    fn legacy_snapshot_watermarks_never_order_against_a_chain() {
+        let legacy = WmPos::Snapshot {
+            generation: 3,
+            completed: false,
+            table_cursors: BTreeMap::new(),
+        };
+        for chain in [seq("c", 4, 0, false), adopted("c", 3)] {
+            assert_eq!(order_positions(&legacy, &chain), Incomparable);
+            assert_eq!(order_positions(&chain, &legacy), Incomparable);
+        }
+    }
+
+    #[test]
+    fn only_a_completed_chain_generation_precedes_cdc() {
+        let cdc = WmPos::PgLsn {
+            lsn: 10,
+            commit_boundary: true,
+            tx_id: None,
+        };
+        assert_eq!(order_positions(&seq("c", 2, 7, true), &cdc), Before);
+        assert_eq!(order_positions(&cdc, &seq("c", 2, 7, true)), After);
+        assert_eq!(order_positions(&seq("c", 2, 7, false), &cdc), Incomparable);
+        assert_eq!(order_positions(&adopted("c", 2), &cdc), Incomparable);
+    }
+
+    #[test]
+    fn a_watermark_carries_the_version_of_its_kind() {
+        let w = DurableWatermark::new(lineage(), seq("c", 1, 0, false));
+        assert_eq!(w.version, WATERMARK_VERSION_SNAPSHOT_CHAIN);
+        assert_eq!(DurableWatermark::parse(&w.to_bytes()), Some(w.clone()));
+        // A chain position claiming version 1, or a version-1 kind claiming
+        // version 2: refused.
+        let mut v1 = w.clone();
+        v1.version = WATERMARK_VERSION;
+        assert_eq!(DurableWatermark::parse(&v1.to_bytes()), None);
+        let mut cdc = DurableWatermark::pg_commit(7, 10, None);
+        cdc.version = WATERMARK_VERSION_SNAPSHOT_CHAIN;
+        assert_eq!(DurableWatermark::parse(&cdc.to_bytes()), None);
     }
 }

@@ -26,6 +26,7 @@ pub mod snapshot_generation;
 pub mod snapshot_plan;
 pub mod snapshot_position;
 pub mod snapshot_probe;
+pub mod snapshot_queue;
 pub mod stream_probe;
 mod table_patterns;
 // Phase 2 lease-lifecycle machinery (models + durable store + pure state machine).

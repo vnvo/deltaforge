@@ -1335,67 +1335,53 @@ async fn advance_wal_feedback(
 /// another generation or anchor, or a stream position before the anchor - it
 /// is incomparable.
 pub fn compare_pg_checkpoints(a: &[u8], b: &[u8]) -> CheckpointOrder {
-    // (generation, anchor) of a snapshot position: `None` generation for a
-    // pre-format one.
-    type Snap = (Option<u64>, Lsn);
-    let snapshot = |raw: &[u8]| -> Result<Option<Snap>, ()> {
-        match crate::snapshot_position::decode::<String>(raw) {
-            Err(_) => Err(()),
-            Ok(Some((g, a))) => {
-                Lsn::parse(&a).map(|l| Some((Some(g), l))).map_err(|_| ())
+    crate::snapshot_position::order(&PgOrder, a, b)
+}
+
+/// PostgreSQL's part of the snapshot position order.
+struct PgOrder;
+
+impl crate::snapshot_position::EngineOrder for PgOrder {
+    /// The anchor LSN as text.
+    type Anchor = String;
+
+    fn stream_order(&self, a: &[u8], b: &[u8]) -> CheckpointOrder {
+        compare_pg_stream_checkpoints(a, b)
+    }
+
+    fn anchor_vs_stream(
+        &self,
+        anchor: &String,
+        stream: &[u8],
+    ) -> CheckpointOrder {
+        let (Ok(anchor), Some(lsn)) = (
+            Lsn::parse(anchor),
+            serde_json::from_slice::<PostgresCheckpoint>(stream)
+                .ok()
+                .and_then(|cp| Lsn::parse(&cp.lsn).ok()),
+        ) else {
+            return CheckpointOrder::Incomparable;
+        };
+        match u64::from(anchor).cmp(&u64::from(lsn)) {
+            std::cmp::Ordering::Less => CheckpointOrder::Before,
+            std::cmp::Ordering::Equal => CheckpointOrder::Equal,
+            std::cmp::Ordering::Greater => CheckpointOrder::After,
+        }
+    }
+
+    fn completion_mark(&self, _stream: &[u8]) -> Option<(Option<String>, u64)> {
+        None
+    }
+
+    fn bare_legacy(&self, raw: &[u8]) -> Option<String> {
+        match classify_pg_checkpoint(raw) {
+            Ok(PgResumePosition::Snapshot { anchor })
+                if !raw.starts_with(b"{") =>
+            {
+                Some(anchor.to_string())
             }
-            Ok(None) => match classify_pg_checkpoint(raw) {
-                Ok(PgResumePosition::Snapshot { anchor }) => {
-                    Ok(Some((None, anchor)))
-                }
-                _ => Ok(None),
-            },
+            _ => None,
         }
-    };
-    let stream_at_or_after = |raw: &[u8], anchor: Lsn| {
-        serde_json::from_slice::<PostgresCheckpoint>(raw)
-            .ok()
-            .and_then(|cp| Lsn::parse(&cp.lsn).ok())
-            .is_some_and(|l| u64::from(l) >= u64::from(anchor))
-    };
-    match (snapshot(a), snapshot(b)) {
-        (Err(()), _) | (_, Err(())) => {
-            tracing::warn!(
-                "incomparable checkpoints: unreadable snapshot position"
-            );
-            CheckpointOrder::Incomparable
-        }
-        (Ok(Some(x)), Ok(Some(y))) => {
-            if x == y {
-                CheckpointOrder::Equal
-            } else {
-                tracing::warn!(
-                    "incomparable checkpoints: snapshot positions of another generation or anchor"
-                );
-                CheckpointOrder::Incomparable
-            }
-        }
-        (Ok(Some((_, anchor))), Ok(None)) => {
-            if stream_at_or_after(b, anchor) {
-                CheckpointOrder::Before
-            } else {
-                tracing::warn!(
-                    "incomparable checkpoints: a stream position not after the snapshot's anchor"
-                );
-                CheckpointOrder::Incomparable
-            }
-        }
-        (Ok(None), Ok(Some((_, anchor)))) => {
-            if stream_at_or_after(a, anchor) {
-                CheckpointOrder::After
-            } else {
-                tracing::warn!(
-                    "incomparable checkpoints: a stream position not after the snapshot's anchor"
-                );
-                CheckpointOrder::Incomparable
-            }
-        }
-        (Ok(None), Ok(None)) => compare_pg_stream_checkpoints(a, b),
     }
 }
 

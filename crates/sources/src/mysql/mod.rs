@@ -1230,57 +1230,35 @@ impl MySqlSource {
 /// position - another generation or anchor, or a stream position not after
 /// the anchor - it is incomparable.
 pub fn compare_mysql_checkpoints(a: &[u8], b: &[u8]) -> CheckpointOrder {
-    type Snap = (u64, MySqlCheckpoint);
-    let snapshot = |raw: &[u8]| -> Result<Option<Snap>, ()> {
-        crate::snapshot_position::decode::<MySqlCheckpoint>(raw).map_err(|_| ())
-    };
-    let at_or_after = |anchor: &MySqlCheckpoint, raw: &[u8]| {
-        let Ok(anchor) = serde_json::to_vec(anchor) else {
-            return false;
-        };
-        matches!(
-            compare_mysql_stream_checkpoints(&anchor, raw),
-            CheckpointOrder::Before | CheckpointOrder::Equal
-        )
-    };
-    match (snapshot(a), snapshot(b)) {
-        (Err(()), _) | (_, Err(())) => {
-            tracing::warn!(
-                "incomparable checkpoints: unreadable snapshot position"
-            );
-            CheckpointOrder::Incomparable
+    crate::snapshot_position::order(&MyOrder, a, b)
+}
+
+/// MySQL's part of the snapshot position order.
+struct MyOrder;
+
+impl crate::snapshot_position::EngineOrder for MyOrder {
+    type Anchor = MySqlCheckpoint;
+
+    fn stream_order(&self, a: &[u8], b: &[u8]) -> CheckpointOrder {
+        compare_mysql_stream_checkpoints(a, b)
+    }
+
+    fn anchor_vs_stream(
+        &self,
+        anchor: &MySqlCheckpoint,
+        stream: &[u8],
+    ) -> CheckpointOrder {
+        match serde_json::to_vec(anchor) {
+            Ok(anchor) => compare_mysql_stream_checkpoints(&anchor, stream),
+            Err(_) => CheckpointOrder::Incomparable,
         }
-        (Ok(Some(x)), Ok(Some(y))) => {
-            if x == y {
-                CheckpointOrder::Equal
-            } else {
-                tracing::warn!(
-                    "incomparable checkpoints: snapshot positions of another generation or anchor"
-                );
-                CheckpointOrder::Incomparable
-            }
-        }
-        (Ok(Some((_, anchor))), Ok(None)) => {
-            if at_or_after(&anchor, b) {
-                CheckpointOrder::Before
-            } else {
-                tracing::warn!(
-                    "incomparable checkpoints: a stream position not after the snapshot's anchor"
-                );
-                CheckpointOrder::Incomparable
-            }
-        }
-        (Ok(None), Ok(Some((_, anchor)))) => {
-            if at_or_after(&anchor, a) {
-                CheckpointOrder::After
-            } else {
-                tracing::warn!(
-                    "incomparable checkpoints: a stream position not after the snapshot's anchor"
-                );
-                CheckpointOrder::Incomparable
-            }
-        }
-        (Ok(None), Ok(None)) => compare_mysql_stream_checkpoints(a, b),
+    }
+
+    fn completion_mark(&self, stream: &[u8]) -> Option<(Option<String>, u64)> {
+        serde_json::from_slice::<MySqlCheckpoint>(stream)
+            .ok()?
+            .snapshot_completed
+            .map(|g| (None, g))
     }
 }
 

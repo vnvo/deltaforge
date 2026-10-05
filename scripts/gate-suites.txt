@@ -20,6 +20,7 @@
 # PostgreSQL state-store suites (live database via DSN)
 serial-pg  storage/lib-pg                   -p storage --lib -- --include-ignored --test-threads=1 pg_
 serial-pg  runner/replay_pg_integration     -p runner --test replay_pg_integration
+serial-pg  sources/lib-pg                   -p sources --lib -- --include-ignored --test-threads=1 pg_queue_
 
 # Timing-sensitive or fixed-port suites
 serial     sources/mysql_rotation_e2e       -p sources --test mysql_rotation_e2e
