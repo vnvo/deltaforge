@@ -6,6 +6,7 @@
 **Revision 2:** replaced the chunk-resume design of revision 1. A generation is bound to one database read view and is never resumed by another process.
 **Revision 3:** adds the snapshot chain (cross-generation ordering), durable blocking for failures that require operator recovery, a frozen completion cohort, the process-wide connection cap, and the PostgreSQL completion mark. **Approved** as the implementation design (2026-10-05), with the clarification below.
 **Clarification (approval condition):** legacy adoption is verified locally by each sink, through a per-sink adoption barrier (section 5.4); no sink comparator reads source control state. The connection cap is validated as ruled (section 9).
+**Amendment 1 (2026-10-05):** the adoption barrier becomes a **per-generation start barrier**. Every generation, not only a chain's first over legacy state, starts with each frozen-cohort sink moving its own exact state to a generation-start position. One local mechanism now covers legacy entry, replacement of an incomplete generation, and a re-snapshot after CDC (sections 3.5, 4, 5.4, 10, 12-14).
 
 ## 0. Rulings this design implements
 
@@ -65,6 +66,7 @@
 14. **Approval conditions:**
     - Legacy ordering must be locally verifiable: a per-sink adoption barrier transitions each sink's exact legacy checkpoint or HEAD into the chain before any generation row.
     - The connection cap stays configuration-based. Aggregate oversubscription is allowed (a preflight warning, queued snapshots visible in status and metrics); per-source requirements are validated (section 9).
+    - **Amendment 1:** before rows of every generation, each frozen-cohort sink compare-and-swaps its exact current state to `SnapshotGenerationAdopted { snapshot_chain, generation, replaced_digest }`. The previous state may be an approved legacy position, an older generation of the same chain, or a CDC position of the same lineage. Another chain, a foreign lineage or an unexpected state is refused. Adoption is resumed idempotently after a crash, no rows flow until the whole cohort adopted, and every replacement resets adoption to pending.
 15. **Acceptance:**
     - progress plus frontier bytes 10K/1K at most 12x, and wall time at most 15x;
     - resident state bounded by page, chunk and worker counts;
@@ -146,7 +148,7 @@ GenerationControl (record_format 3)
   terminal           : { digest: hex }?      # set on entering rows_produced; binds policy.digest
   completion         : { acks: [sink id], frontier: position }?   # set by the completed CAS
   blocked            : { reason: code, incident: id, since_ms: i64 }?  # section 9.2
-  adoption           : none | pending | done   # legacy adoption into this chain (section 5.4)
+  adoption           : none | pending | done   # this generation's start barrier (section 5.4); every allocation and replacement sets pending
   replaced           : u64?           # the generation this one replaced (reclamation)
 ```
 
@@ -242,9 +244,11 @@ These rules apply only between positions of the same stable lineage; positions o
 | `W(c, g, s)` | `W(c, g, s')` | by `s` |
 | `W(c, g, ...)` | `W(c, g', ...)`, `g < g'` | Before |
 | `W(c, ...)` | `W(c', ...)` | Incomparable |
-| `L(g, A)` | any chain `c` position | Incomparable. A legacy position enters a chain only through that sink's own adoption (section 5.4), which replaces it with `D(c, k)` |
-| `D(c, k)` (adoption position: the sink adopted every legacy generation up to `k`) | any position of chain `c` with generation `> k` | Before |
-| `D(c, k)` | `D(c, k)` | Equal |
+| `L(g, A)` | any chain `c` position | Incomparable. A legacy position enters a chain only through that sink's own start barrier (section 5.4) |
+| `D(c, g)` (generation start: the sink entered generation `g` of chain `c`) | `D(c, g')` | by `g` |
+| `D(c, g)` | `I`, `C` or `W` of chain `c`, generation `g' >= g` | Before |
+| `D(c, g)` | `I`, `C` or `W` of chain `c`, generation `g' < g` | After |
+| `D(c, ...)` | any position of another chain, a legacy position, or a stream position | Incomparable (a sink's own move from such a state to `D` is a local check, not an order; mixed sinks are classified, section 6.1) |
 
 Every comparison above uses only the two positions themselves: a sink, including S3 `durable_v2` comparing its HEAD, never reads source control state. Per-sink classification (section 6.1) uses these rules.
 
@@ -280,7 +284,7 @@ Rules:
   - frontier covers the terminal: CAS to `completed`, no copy;
   - otherwise: replace with `g+1`.
 - **A start in `allocated` or `running`** replaces with `g+1`, unless blocked.
-- **No row of a chain is published while its `adoption` is `pending`** (section 5.4).
+- **No row of a generation is published while its `adoption` is `pending`** (section 5.4). Allocation and every replacement set it to `pending`.
 - **A start in a blocked generation** re-raises its incident and stops before any row or replacement. Only the recovery CLI clears it.
 - **A start in `completed`** streams CDC (section 6.3) and never copies rows.
 - A replacement deletes nothing before its CAS. Afterwards it deletes the old generation's plan items, and resets the old progress records, if legacy.
@@ -318,26 +322,46 @@ The trait default refuses (`SinkError::Unsupported`). A sink that does not imple
 - After `rows_produced`, the publisher sends one barrier with the completing position and `WmPos::SnapshotSeq { completed: true }`.
 - This replaces #131's held-back final event. The all-empty snapshot completes through the same barrier, which removes #131's empty-snapshot recopy residual.
 
-### 5.4 Adoption barrier (legacy into a chain)
+### 5.4 Generation start barrier (amendment 1)
 
-When a chain is created over legacy state (section 10), every sink's durable position must enter the chain before any row of the chain's first generation is published. Each sink verifies this locally, through a barrier of kind `Adopt { snapshot_chain, lineage, legacy_through }`:
+Every generation starts with each sink of its frozen cohort moving its own durable state into that generation, before any row of it is published. This covers a chain's first generation over legacy state, the replacement of an incomplete generation, and a re-snapshot after a completed generation's CDC (mode `always`, operator `resnapshot`). Each sink verifies the transition locally, through a barrier of kind `Start { snapshot_chain, generation, lineage, legacy_through }`:
 
-1. Before the first publish of any generation in a chain whose control record has `adoption = pending`, the source sends the adoption barrier.
+1. After the anchor and before the first publish of a generation whose control record has `adoption = pending`, the source sends the start barrier.
 2. Each sink checks its **own** durable state and acts:
-   - Empty, or a legacy position (chain-less) of `lineage` with generation at most `legacy_through`: compare-and-swap it, from exactly the state read, to the adoption position `D(c, legacy_through)`, recording the digest of the replaced state. S3 `durable_v2` does this with a HEAD CAS whose expected value is the exact legacy HEAD it read.
-   - Already at `D(c, ...)` or any later position of chain `c`: acknowledge (idempotent).
-   - Anything else (another lineage, a generation above `legacy_through`, another chain): refuse.
-3. The delivery task commits `D(c, legacy_through)` to the per-sink key of every sink that acknowledged.
-4. When **every** sink of the frozen cohort has acknowledged (adoption is not policy-weighted: a sink left on a legacy position could never accept the chain), the source sets `adoption = done` by control CAS. A refusal fails the run with `snapshot_state_invalid`, class `adoption_refused`, which blocks.
+   - **Accepted previous states.** Its state is one of these:
+     - empty;
+     - a legacy (chain-less) position of `lineage` with generation at most `legacy_through`;
+     - any position of chain `c` with a generation below `generation` (incomplete, completing, sequence watermark or start);
+     - a CDC position of `lineage`.
 
-A sink's comparator never treats a legacy position as part of a chain. After adoption, its state is `D(c, k)`, which orders before every generation of `c` above `k`, so the first `g+1` publish is accepted. Different chains stay incomparable.
+     The sink compare-and-swaps it, from exactly the state read, to `D(c, generation)`, recording the digest of the replaced state. S3 `durable_v2` does this with a HEAD CAS whose expected value is the exact HEAD it read.
+   - **Already in the generation.** `D(c, generation)` or any other position of generation `generation` of chain `c`: acknowledge (idempotent).
+   - **Anything else** refuses, including a position of a **later** generation of chain `c` (the caller's control state is stale, rewound or corrupt; acknowledging it could let `generation` publish while the sink is already past it), another chain, another lineage, or an unknown format.
+
+   | Stored state | Decision |
+   |---|---|
+   | empty | move |
+   | chain `c`, generation below `generation` | move |
+   | chain `c`, generation equal to `generation` | already (acknowledge) |
+   | chain `c`, generation above `generation` | refuse |
+   | approved legacy (up to `legacy_through`) or CDC of `lineage` | move |
+   | another chain, another lineage, unknown format | refuse |
+3. The delivery task commits `D(c, generation)` to the per-sink key of every sink that acknowledged.
+4. When **every** sink of the frozen cohort has acknowledged (not policy-weighted: a sink left behind could never accept the generation), the source sets `adoption = done` by control CAS. A refusal fails the run with `snapshot_state_invalid`, class `adoption_refused`, which blocks.
+
+**Empty state.** It is accepted for any generation, not only a chain's first (approved). A sink added to the cohort later starts empty in a later generation, and the policy-change replacement (section 6.2) would otherwise block on it forever. It has no prior checkpoint to preserve, and the full replacement snapshot supplies its baseline. External side effects it made without a checkpoint may be duplicated, which is within the at-least-once contract.
+
+**Comparators.**
+- A comparator never orders a legacy or CDC position against `D`: entering a generation is the sink's own checked transition, not an order.
+- After the transition, `D(c, g)` orders before every position of generation `g` and later in chain `c`, so the generation's first publish is accepted.
+- Different chains stay incomparable.
 
 | Crash point | State left | Next start |
 |---|---|---|
-| after the legacy CAS (`g+1 allocated`, `adoption = pending`), before the barrier | sinks all legacy | replaces `g+1` by `g+2` in the chain (still pending); sends the adoption barrier before any row |
-| after some sinks adopted | mixed legacy and `D(c, k)` | the barrier again: adopted sinks acknowledge idempotently, legacy ones adopt |
-| after every sink adopted, before `adoption = done` | all `D(c, k)` | the barrier again (all idempotent), then `done` |
-| after `done`, during a replacement | chain positions | ordinary chain ordering (section 3.5) |
+| after the allocation or replacement CAS (`adoption = pending`), before the barrier | every sink in its previous state | the generation is replaced (pending again); its start barrier runs before any row |
+| after some sinks adopted | mixed previous states and `D(c, g)` | the generation is replaced by `g+1`: sinks at `D(c, g)` move to `D(c, g+1)` (an older generation of the chain), the others move from their previous state |
+| after every sink adopted, before `adoption = done` | all `D(c, g)` | as above (every move is accepted) |
+| after `done` | ordinary generation | ordinary chain ordering (section 3.5) |
 
 ## 6. Policy frontier, completion and resume
 
@@ -439,8 +463,8 @@ These failures set `blocked` on the control record (by CAS, with the reason and 
 
 | Stored | Classification | Action |
 |---|---|---|
-| Control `record_format` below 3 (any status) **and** the policy frontier covers a completion proven by sink checkpoints | completed legacy | lineage verified; CAS in place to `record_format 3`, `completed`, in a new chain with `legacy_through = g` and `adoption = pending` (adopted at the next snapshot of the chain, if one ever runs); the completion records the current policy and acknowledging sinks; legacy progress deleted after |
-| Control below 3, anything else | incomplete legacy | lineage verified; CAS to `g+1` `allocated` in a new chain with `legacy_through = g` and `adoption = pending`; every sink adopts its own legacy position through the adoption barrier (section 5.4) before any row; one-time full recopy |
+| Control `record_format` below 3 (any status) **and** the policy frontier covers a completion proven by sink checkpoints | completed legacy | lineage verified; CAS in place to `record_format 3`, `completed`, in a new chain with `legacy_through = g` (a later generation of the chain starts through its start barrier, which accepts these legacy positions); the completion records the current policy and acknowledging sinks; legacy progress deleted after |
+| Control below 3, anything else | incomplete legacy | lineage verified; CAS to `g+1` `allocated` in a new chain with `legacy_through = g` and `adoption = pending`; every sink moves its own legacy position into the generation through the start barrier (section 5.4) before any row; one-time full recopy |
 | Unknown `record_format`, `fingerprint_format`, `item_format`, snapshot-position `format` or watermark version | unknown | refused; record untouched; incident before any row |
 | Other stable lineage | foreign | refused (`ConfigChanged`); record untouched |
 
@@ -475,7 +499,7 @@ These failures set `blocked` on the control record (by CAS, with the reason and 
 | Reclaim | plan item deletes | items of a past generation remain; deleted later (idempotent) | done |
 | Legacy replace | control CAS, then legacy progress delete | classified again | `g+1`; delete repeated |
 | Block | control CAS setting `blocked` | the next start detects the condition again and blocks | halted until recovery |
-| Adoption | per-sink CAS to `D(c, k)`, then control `adoption = done` | (section 5.4 table) | (section 5.4 table) |
+| Generation start | per-sink CAS to `D(c, g)`, then control `adoption = done` | (section 5.4 table) | (section 5.4 table) |
 | Policy drift | control CAS replacing `g` | replaced at the next start | `g+1` with the new policy |
 
 **SQLite `synchronous=NORMAL`.** A power loss drops a suffix of commits. Every write a later start depends on precedes its externally visible effect:
@@ -513,7 +537,7 @@ A lost suffix can therefore only cause a replacement (duplicates), never loss.
 - **I17** Within one snapshot chain, every position of `g` orders before every position of `g' > g`. Positions of different chains are incomparable, except legacy positions the chain adopted.
 - **I18** `completed` is decided only over the frozen cohort with the frozen policy. A configuration difference before completion replaces the generation, and after completion changes nothing about it.
 - **I19** At no time does the process hold more snapshot connections than `runtime.max_snapshot_connections`.
-- **I20** No sink comparator reads source control state. A legacy position is incomparable with every chain position until that sink's own adoption CAS replaced it, and no row of a chain is published while its adoption is pending.
+- **I20** No sink comparator reads source control state. A legacy or CDC position is never ordered against a chain's generation start, but enters a generation only through that sink's own checked compare-and-swap. No row of a generation is published while its start barrier is pending, and every allocation and replacement resets it to pending.
 
 ## 14. Test plan
 
@@ -539,7 +563,10 @@ A lost suffix can therefore only cause a replacement (duplicates), never loss.
 - PostgreSQL `wal_status = lost`, and MySQL binlog purged under the anchor;
 - plan storage bound;
 - legacy completed with proof, legacy without proof, unknown format;
-- legacy adoption against durable S3 (MinIO), starting from a genuinely legacy HEAD written by the pre-queue release format:
+- generation start after CDC: generation `g` completes, the S3 HEAD and the sink checkpoints move to CDC positions, then mode `always` or `resnapshot` allocates `g+1`, whose start barrier moves both and whose rows are accepted;
+- a partial start barrier crash across S3 `durable_v2` and an ordinary sink, then the replacement's barrier completes it;
+- another chain's state, and CDC state of a foreign lineage, still refused by the start barrier;
+- legacy entry against durable S3 (MinIO), starting from a genuinely legacy HEAD written by the pre-queue release format:
   - adopt it, with a crash at each adoption and replacement boundary of section 5.4;
   - then accept `g+1`;
   - assert that a HEAD of another chain and an unadopted legacy HEAD are still refused;
@@ -575,8 +602,8 @@ progress bytes = 0
    - snapshot position format 2 and the `WmPos::SnapshotSeq` watermark, with the chain-aware comparators;
    - the shared queue contract suite on the three backends.
 2. **Barrier:**
-   - `SourceItem::Barrier` (terminal and adoption kinds), the delivery-task operation and `Sink::barrier`;
-   - each sink's implementation and test, including adoption CAS on S3 `durable_v2`.
+   - `SourceItem::Barrier` (terminal and generation-start kinds), the delivery-task operation and `Sink::barrier`;
+   - each sink's implementation and test, including the start CAS on S3 `durable_v2`.
 3. **PostgreSQL wiring:**
    - paged plan;
    - generation-scoped view and worker retry;
