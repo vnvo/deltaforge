@@ -238,6 +238,15 @@ pub trait EngineOrder {
     }
 }
 
+/// Classify stored bytes with the engine's bare legacy form (`None`: an
+/// unknown format or malformed).
+pub fn classify_stored<E: EngineOrder>(
+    engine: &E,
+    raw: &[u8],
+) -> Option<Classified<E::Anchor>> {
+    classify_with(engine, raw).ok()
+}
+
 fn classify_with<E: EngineOrder>(
     engine: &E,
     raw: &[u8],

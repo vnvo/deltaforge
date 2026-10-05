@@ -61,6 +61,12 @@ struct Args {
     /// pipelines (secondary bound, one entry per table).
     #[arg(long, default_value_t = 50_000)]
     schema_cache_max_entries: usize,
+    /// Snapshot connections allowed at once across every pipeline of this
+    /// process (coordinator, lock, workers, intra-table readers). Snapshots
+    /// beyond it queue; each source's own share is
+    /// `snapshot.max_snapshot_connections`.
+    #[arg(long, default_value_t = sources::snapshot_permits::DEFAULT_MAX_SNAPSHOT_CONNECTIONS)]
+    max_snapshot_connections: u32,
 }
 
 #[derive(Subcommand, Debug)]
@@ -138,6 +144,9 @@ enum GateAction {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    // The process-wide snapshot connection cap, before any pipeline starts.
+    sources::snapshot_permits::configure(args.max_snapshot_connections)
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     // One-shot subcommands run before server/observability boot (no port binds).
     if let Some(Command::Preflight { config, json }) = &args.command {

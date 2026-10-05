@@ -42,6 +42,32 @@ fn incomparable_checkpoint_error(
     ))
 }
 
+/// A pipeline's commit policy and sink cohort for its source (an unset policy
+/// is `Required`, as the delivery task applies it).
+pub fn snapshot_cohort(
+    policy: Option<&deltaforge_config::CommitPolicy>,
+    sinks: &[deltaforge_core::ArcDynSink],
+) -> deltaforge_core::SnapshotCohort {
+    use deltaforge_config::CommitPolicy;
+    use deltaforge_core::CohortPolicy;
+    deltaforge_core::SnapshotCohort {
+        policy: match policy {
+            Some(CommitPolicy::All) => CohortPolicy::All,
+            Some(CommitPolicy::Required) | None => CohortPolicy::Required,
+            Some(CommitPolicy::Quorum { quorum }) => {
+                CohortPolicy::Quorum(u32::try_from(*quorum).unwrap_or(u32::MAX))
+            }
+        },
+        sinks: sinks
+            .iter()
+            .map(|s| deltaforge_core::CohortSink {
+                id: s.id().to_string(),
+                required: s.required(),
+            })
+            .collect(),
+    }
+}
+
 /// Wraps a [`CheckpointStore`] to present the **minimum** per-sink checkpoint
 /// when the source calls `get_raw(source_id)`.
 ///
@@ -952,6 +978,12 @@ impl PipelineManager {
             .with_commit_signal(commit_signal.clone()),
         );
 
+        // The cohort a snapshot generation freezes: this pipeline's commit
+        // policy and its sinks.
+        source.set_snapshot_cohort(snapshot_cohort(
+            spec.spec.commit_policy.as_ref(),
+            &sinks,
+        ));
         let src_handle = source.run(event_tx, source_ckpt).await;
 
         // Supervise the source task: the moment it exits without an explicit

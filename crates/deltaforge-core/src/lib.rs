@@ -853,6 +853,31 @@ pub enum StartDecision {
     Refuse,
 }
 
+/// The commit policy and sink cohort of a pipeline, handed to its source so a
+/// snapshot generation can freeze it (`docs/design/snapshot-durable-queue.md`,
+/// section 6.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotCohort {
+    pub policy: CohortPolicy,
+    /// Every sink of the pipeline, in any order.
+    pub sinks: Vec<CohortSink>,
+}
+
+/// The commit policy of a [`SnapshotCohort`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CohortPolicy {
+    All,
+    Required,
+    Quorum(u32),
+}
+
+/// One sink of a [`SnapshotCohort`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CohortSink {
+    pub id: String,
+    pub required: bool,
+}
+
 /// A source's decision on one sink's stored checkpoint at a generation start.
 #[derive(Debug, Clone)]
 pub enum CheckpointStart {
@@ -1055,6 +1080,11 @@ pub trait Source: Send + Sync {
     /// consumer treats `Incomparable` as a hard startup/recovery error rather
     /// than choosing a checkpoint.
     fn compare_checkpoints(&self, a: &[u8], b: &[u8]) -> CheckpointOrder;
+
+    /// The pipeline's commit policy and sink cohort, set by the runner before
+    /// [`Source::run`]. Default: ignored (a source without snapshot
+    /// generations).
+    fn set_snapshot_cohort(&self, _cohort: SnapshotCohort) {}
 
     /// The generation start barrier's local check on one sink's stored
     /// checkpoint (`prev`, `None` when empty). Default: refuse, so a source

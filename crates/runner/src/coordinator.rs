@@ -7394,3 +7394,485 @@ mod barrier_tests {
         assert_eq!(key(&r.store, "a").await, None);
     }
 }
+
+/// The generation driver end to end with the delivery task (design sections
+/// 4 to 6): start barrier, terminal barrier under each commit policy,
+/// completion, a CDC-only restart, and policy drift before and after
+/// completion.
+#[cfg(test)]
+mod generation_flow_tests {
+    use super::*;
+    use checkpoints::{CheckpointStore, MemCheckpointStore};
+    use deltaforge_config::{CommitPolicy, SnapshotMode};
+    use deltaforge_core::{
+        Barrier, BarrierKind, CheckpointStart, GenerationStart,
+        SinkBatchContext, SinkResult, SourceBoundary,
+    };
+    use sources::snapshot_driver::{
+        Allocation, StartInput, StartOutcome, await_adoption, decide_start,
+    };
+    use sources::snapshot_generation::PersistedLineage;
+    use sources::snapshot_position::EngineOrder;
+    use sources::snapshot_queue::{
+        EngineAnchor, PlanDigest, PolicySnapshot, QueueStore, State, Stored,
+    };
+
+    /// A test engine: anchors are numbers; a stream position is
+    /// `{"p": n, "mark": [chain, generation]?}`.
+    struct Te;
+
+    fn p(raw: &[u8]) -> Option<u64> {
+        serde_json::from_slice::<serde_json::Value>(raw).ok()?["p"].as_u64()
+    }
+
+    impl EngineOrder for Te {
+        type Anchor = u64;
+        fn stream_order(
+            &self,
+            a: &[u8],
+            b: &[u8],
+        ) -> deltaforge_core::CheckpointOrder {
+            use deltaforge_core::CheckpointOrder::*;
+            match (p(a), p(b)) {
+                (Some(a), Some(b)) => match a.cmp(&b) {
+                    std::cmp::Ordering::Less => Before,
+                    std::cmp::Ordering::Equal => Equal,
+                    std::cmp::Ordering::Greater => After,
+                },
+                _ => Incomparable,
+            }
+        }
+        fn anchor_vs_stream(
+            &self,
+            anchor: &u64,
+            s: &[u8],
+        ) -> deltaforge_core::CheckpointOrder {
+            self.stream_order(
+                &serde_json::to_vec(&serde_json::json!({ "p": anchor }))
+                    .unwrap(),
+                s,
+            )
+        }
+        fn completion_mark(&self, s: &[u8]) -> Option<(Option<String>, u64)> {
+            let v: serde_json::Value = serde_json::from_slice(s).ok()?;
+            let m = v.get("mark")?;
+            Some((m[0].as_str().map(str::to_string), m[1].as_u64()?))
+        }
+    }
+
+    struct TeSource;
+
+    #[async_trait::async_trait]
+    impl deltaforge_core::Source for TeSource {
+        async fn run(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<SourceItem>,
+            _chkpt: Arc<dyn CheckpointStore>,
+        ) -> deltaforge_core::SourceHandle {
+            unreachable!("not run")
+        }
+        fn compare_checkpoints(
+            &self,
+            a: &[u8],
+            b: &[u8],
+        ) -> deltaforge_core::CheckpointOrder {
+            sources::snapshot_position::order(&Te, a, b)
+        }
+        fn checkpoint_generation_start(
+            &self,
+            prev: Option<&[u8]>,
+            start: &GenerationStart,
+        ) -> CheckpointStart {
+            sources::snapshot_position::checkpoint_start(&Te, prev, None, start)
+        }
+    }
+
+    /// Refuses terminal barriers when told to; acknowledges the rest.
+    struct Sk {
+        id: String,
+        required: bool,
+        refuse_terminal: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl deltaforge_core::Sink for Sk {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn required(&self) -> bool {
+            self.required
+        }
+        async fn send(&self, _e: &Event) -> SinkResult<()> {
+            Ok(())
+        }
+        async fn barrier(
+            &self,
+            kind: &BarrierKind,
+            _ctx: &SinkBatchContext,
+        ) -> SinkResult<()> {
+            if self.refuse_terminal && *kind == BarrierKind::Terminal {
+                Err(SinkError::Fatal {
+                    details: "down".into(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    const SRC: &str = "src";
+
+    struct World {
+        store: QueueStore,
+        checkpoints: Arc<dyn CheckpointStore>,
+    }
+
+    fn world() -> World {
+        let backend: storage::ArcStorageBackend =
+            Arc::new(storage::MemoryStorageBackend::new());
+        World {
+            store: QueueStore::new(backend, SRC),
+            checkpoints: Arc::new(MemCheckpointStore::new().unwrap()),
+        }
+    }
+
+    fn sinks(spec: &[(&str, bool, bool)]) -> Vec<ArcDynSink> {
+        spec.iter()
+            .map(|(id, required, refuse)| {
+                Arc::new(Sk {
+                    id: id.to_string(),
+                    required: *required,
+                    refuse_terminal: *refuse,
+                }) as ArcDynSink
+            })
+            .collect()
+    }
+
+    /// The configured cohort, through the runner's plumbing.
+    fn policy(commit: &CommitPolicy, sinks: &[ArcDynSink]) -> PolicySnapshot {
+        PolicySnapshot::from(&crate::pipeline_manager::snapshot_cohort(
+            Some(commit),
+            sinks,
+        ))
+    }
+
+    fn anchor_of(a: &EngineAnchor) -> Option<u64> {
+        match a {
+            EngineAnchor::Postgres { lsn, .. } => lsn.parse().ok(),
+            _ => None,
+        }
+    }
+
+    fn input<'a>(
+        w: &'a World,
+        policy: PolicySnapshot,
+        mode: SnapshotMode,
+    ) -> StartInput<'a, Te> {
+        StartInput {
+            store: &w.store,
+            engine: &Te,
+            checkpoints: w.checkpoints.as_ref(),
+            source_id: SRC,
+            lineage: PersistedLineage::Postgres {
+                system_identifier: 1,
+            },
+            config_fingerprint: "fp",
+            policy,
+            mode,
+            anchor_of: &anchor_of,
+        }
+    }
+
+    /// Deliver `items` through a coordinator over `sinks` with `commit`.
+    async fn deliver(
+        w: &World,
+        commit: &CommitPolicy,
+        sinks: &[ArcDynSink],
+        items: Vec<SourceItem>,
+    ) -> Result<()> {
+        let mut builder = Coordinator::builder("flow")
+            .sinks(sinks.to_vec())
+            .commit_policy(Some(commit.clone()))
+            .batch_config(Some(BatchConfig {
+                max_events: Some(100),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .process_fn(build_batch_processor(
+                Arc::from(Vec::<deltaforge_core::ArcDynProcessor>::new()),
+                "flow".to_string(),
+            ));
+        for s in sinks {
+            let key = sources::snapshot_driver::sink_key(SRC, s.id());
+            builder = builder
+                .commit_fn(
+                    s.id(),
+                    build_commit_fn(w.checkpoints.clone(), key.clone()),
+                )
+                .barrier_fn(
+                    s.id(),
+                    build_barrier_fn(
+                        w.checkpoints.clone(),
+                        key,
+                        Arc::new(TeSource),
+                    ),
+                );
+        }
+        let coord = builder.build();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        for i in items {
+            tx.send(i).await.unwrap();
+        }
+        drop(tx);
+        let (_p, pause) = tokio::sync::watch::channel(PauseState::default());
+        coord
+            .run(rx, tokio_util::sync::CancellationToken::new(), pause)
+            .await
+    }
+
+    fn barrier(kind: BarrierKind, cp: Vec<u8>) -> SourceItem {
+        SourceItem::Barrier {
+            barrier: Barrier {
+                kind,
+                boundary: SourceBoundary {
+                    checkpoint: CheckpointMeta::from_vec(cp.clone()),
+                    durable_watermark: Some(Arc::from(cp)),
+                },
+            },
+        }
+    }
+
+    async fn current(
+        w: &World,
+    ) -> (u64, sources::snapshot_queue::GenerationControl) {
+        match w.store.read().await.unwrap().unwrap() {
+            Stored::Current { version, control } => (version, *control),
+            _ => panic!("not current"),
+        }
+    }
+
+    /// One generation to `rows_produced` with its terminal barrier delivered
+    /// under `commit`: allocate, seal and anchor at 100, start barrier and
+    /// adoption, rows produced, terminal barrier.
+    async fn produce(
+        w: &World,
+        commit: &CommitPolicy,
+        sinks: &[ArcDynSink],
+    ) -> u64 {
+        let cohort = policy(commit, sinks);
+        let StartOutcome::Snapshot { control, .. } =
+            decide_start(&input(w, cohort.clone(), SnapshotMode::Initial))
+                .await
+                .unwrap()
+        else {
+            panic!("a snapshot");
+        };
+        let g = control.generation;
+        let (v, c) = current(w).await;
+        let (v, c) = w
+            .store
+            .seal_and_run(
+                v,
+                &c,
+                PlanDigest::default().seal(),
+                EngineAnchor::Postgres {
+                    lsn: "100".into(),
+                    timeline: None,
+                    chain: None,
+                    transition: None,
+                },
+                "run",
+                0,
+            )
+            .await
+            .unwrap();
+        deliver(
+            w,
+            commit,
+            sinks,
+            vec![barrier(
+                BarrierKind::GenerationStart(GenerationStart {
+                    snapshot_chain: c.snapshot_chain.clone(),
+                    generation: g,
+                    legacy_through: None,
+                }),
+                Vec::new(),
+            )],
+        )
+        .await
+        .unwrap();
+        let _ = v;
+        let (v, c) = await_adoption(
+            &input(w, cohort, SnapshotMode::Initial),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let (_, c) = w.store.rows_produced(v, &c, "run").await.unwrap();
+        let terminal = serde_json::to_vec(
+            &serde_json::json!({ "p": 100, "mark": [c.snapshot_chain, g] }),
+        )
+        .unwrap();
+        deliver(
+            w,
+            commit,
+            sinks,
+            vec![barrier(BarrierKind::Terminal, terminal)],
+        )
+        .await
+        .unwrap();
+        g
+    }
+
+    #[tokio::test]
+    async fn a_generation_completes_under_each_policy_and_restarts_cdc_only() {
+        for (commit, spec, lagging) in [
+            (
+                CommitPolicy::All,
+                vec![("a", true, false), ("b", true, false)],
+                vec![],
+            ),
+            (
+                CommitPolicy::Required,
+                vec![("a", true, false), ("b", false, true)],
+                vec!["b"],
+            ),
+            (
+                CommitPolicy::Quorum { quorum: 2 },
+                vec![
+                    ("a", false, false),
+                    ("b", false, false),
+                    ("c", false, true),
+                ],
+                vec!["c"],
+            ),
+        ] {
+            let w = world();
+            let s = sinks(&spec);
+            let g = produce(&w, &commit, &s).await;
+            let cohort = policy(&commit, &s);
+            // The terminal was acknowledged under the policy: completed.
+            let StartOutcome::Stream {
+                lagging: l,
+                completed_now: Some(done),
+            } = decide_start(&input(&w, cohort.clone(), SnapshotMode::Initial))
+                .await
+                .unwrap()
+            else {
+                panic!("{commit:?}: not completed");
+            };
+            assert_eq!(done.state, State::Completed, "{commit:?}");
+            assert_eq!(done.generation, g);
+            assert_eq!(l, lagging, "{commit:?}");
+            // A restart is CDC only, with no new generation.
+            assert!(matches!(
+                decide_start(&input(&w, cohort, SnapshotMode::Initial))
+                    .await
+                    .unwrap(),
+                StartOutcome::Stream {
+                    completed_now: None,
+                    ..
+                }
+            ));
+            assert_eq!(current(&w).await.1.generation, g, "{commit:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_drift_replaces_before_completion_and_changes_nothing_after()
+    {
+        let commit = CommitPolicy::Required;
+        let s = sinks(&[("a", true, false)]);
+        let more = sinks(&[("a", true, false), ("d", true, false)]);
+
+        // Before completion: the cohort changed, the generation is replaced.
+        let w = world();
+        let g = produce(&w, &commit, &s).await;
+        let out = decide_start(&input(
+            &w,
+            policy(&commit, &more),
+            SnapshotMode::Initial,
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(
+            out,
+            StartOutcome::Snapshot {
+                why: Allocation::PolicyChanged,
+                ..
+            }
+        ));
+        assert_eq!(current(&w).await.1.generation, g + 1);
+
+        // After completion: the recorded cohort and completion stand; the
+        // new sink is behind it.
+        let w = world();
+        let g = produce(&w, &commit, &s).await;
+        decide_start(&input(&w, policy(&commit, &s), SnapshotMode::Initial))
+            .await
+            .unwrap();
+        let before = current(&w).await.1;
+        assert_eq!(before.state, State::Completed);
+        let out = decide_start(&input(
+            &w,
+            policy(&commit, &more),
+            SnapshotMode::Initial,
+        ))
+        .await
+        .unwrap();
+        let StartOutcome::Stream { lagging, .. } = out else {
+            panic!("not stream");
+        };
+        assert_eq!(lagging, vec!["d".to_string()]);
+        let after = current(&w).await.1;
+        assert_eq!(after, before, "the completed record is not reinterpreted");
+        assert_eq!(after.generation, g);
+    }
+
+    /// The runner hands the source its cohort; the digest is deterministic and
+    /// independent of the configured order.
+    #[test]
+    fn the_cohort_reaches_the_source_with_a_deterministic_digest() {
+        for (commit, expect) in [
+            (CommitPolicy::All, deltaforge_core::CohortPolicy::All),
+            (
+                CommitPolicy::Required,
+                deltaforge_core::CohortPolicy::Required,
+            ),
+            (
+                CommitPolicy::Quorum { quorum: 2 },
+                deltaforge_core::CohortPolicy::Quorum(2),
+            ),
+        ] {
+            let ab = sinks(&[("a", true, false), ("b", false, false)]);
+            let ba = sinks(&[("b", false, false), ("a", true, false)]);
+            let c1 =
+                crate::pipeline_manager::snapshot_cohort(Some(&commit), &ab);
+            assert_eq!(c1.policy, expect);
+            assert_eq!(
+                c1.sinks
+                    .iter()
+                    .map(|s| (s.id.as_str(), s.required))
+                    .collect::<Vec<_>>(),
+                [("a", true), ("b", false)]
+            );
+            assert_eq!(
+                policy(&commit, &ab).digest,
+                policy(&commit, &ba).digest
+            );
+        }
+        // An unset policy is Required, as the delivery task applies it.
+        let s = sinks(&[("a", true, false)]);
+        assert_eq!(
+            crate::pipeline_manager::snapshot_cohort(None, &s).policy,
+            deltaforge_core::CohortPolicy::Required
+        );
+        // Different policies, different digests.
+        assert_ne!(
+            policy(&CommitPolicy::All, &s).digest,
+            policy(&CommitPolicy::Required, &s).digest
+        );
+    }
+}

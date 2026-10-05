@@ -112,6 +112,28 @@ impl PolicySnapshot {
     }
 }
 
+impl From<&deltaforge_core::SnapshotCohort> for PolicySnapshot {
+    fn from(c: &deltaforge_core::SnapshotCohort) -> Self {
+        use deltaforge_core::CohortPolicy;
+        let (mode, quorum) = match c.policy {
+            CohortPolicy::All => (PolicyMode::All, None),
+            CohortPolicy::Required => (PolicyMode::Required, None),
+            CohortPolicy::Quorum(q) => (PolicyMode::Quorum, Some(q)),
+        };
+        Self::new(
+            mode,
+            quorum,
+            c.sinks
+                .iter()
+                .map(|s| PolicySink {
+                    id: s.id.clone(),
+                    required: s.required,
+                })
+                .collect(),
+        )
+    }
+}
+
 /// The stream position a generation's CDC starts at.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "engine", rename_all = "snake_case")]
