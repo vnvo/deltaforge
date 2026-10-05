@@ -2634,8 +2634,16 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
 /// terminal barrier's checkpoint is written as any checkpoint; a generation
 /// start reads the stored checkpoint, asks the source's local check
 /// ([`Source::checkpoint_generation_start`]) and, on `Move`, writes the start
-/// checkpoint. The read-check-write relies on the single-writer contract (one
-/// delivery task per pipeline writes these keys).
+/// checkpoint.
+///
+/// The per-sink keys live in the key-value store, which has no
+/// compare-and-swap: this read-check-write is correct only because exactly
+/// one writer touches a pipeline's per-sink keys - one process per pipeline
+/// (the store gate and the pipeline's active-source claim), one delivery task
+/// per pipeline, which runs barriers and batch commits strictly in order, and
+/// no barrier start while a replay job holds a sink out of live delivery
+/// ([`Coordinator::process_barrier`]). A failed read or write returns an
+/// error, which fails the barrier: it is never acknowledged.
 ///
 /// [`Source::checkpoint_generation_start`]: deltaforge_core::Source::checkpoint_generation_start
 pub fn build_barrier_fn(
@@ -7150,7 +7158,7 @@ mod barrier_tests {
     struct Run {
         result: Result<()>,
         log: Vec<String>,
-        store: Arc<MemCheckpointStore>,
+        store: Arc<dyn CheckpointStore>,
     }
 
     /// Run `items` through a coordinator over `sinks` (id, required,
@@ -7161,7 +7169,18 @@ mod barrier_tests {
         seed: &[(&str, &[u8])],
         items: Vec<SourceItem>,
     ) -> Run {
-        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let store: Arc<dyn CheckpointStore> =
+            Arc::new(MemCheckpointStore::new().unwrap());
+        run_on(store, respect_source_tx, sinks, seed, items).await
+    }
+
+    async fn run_on(
+        store: Arc<dyn CheckpointStore>,
+        respect_source_tx: bool,
+        sinks: &[(&str, bool, bool)],
+        seed: &[(&str, &[u8])],
+        items: Vec<SourceItem>,
+    ) -> Run {
         for (k, v) in seed {
             store.put_raw(k, v).await.unwrap();
         }
@@ -7214,7 +7233,10 @@ mod barrier_tests {
         Run { result, log, store }
     }
 
-    async fn key(store: &MemCheckpointStore, id: &str) -> Option<Vec<u8>> {
+    async fn key(
+        store: &Arc<dyn CheckpointStore>,
+        id: &str,
+    ) -> Option<Vec<u8>> {
         store.get_raw(&format!("src::sink::{id}")).await.unwrap()
     }
 
@@ -7321,6 +7343,31 @@ mod barrier_tests {
         .await;
         assert!(r.result.is_err());
         assert_eq!(key(&r.store, "a").await.as_deref(), Some(&b"bad"[..]));
+    }
+
+    /// A barrier whose checkpoint write fails is not acknowledged: the run
+    /// fails.
+    #[tokio::test]
+    async fn a_failed_barrier_write_never_acknowledges() {
+        use storage::adapters::test_util::FaultBackend;
+        let fault = Arc::new(FaultBackend::new());
+        fault
+            .fail_kv_put
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let store: Arc<dyn CheckpointStore> = Arc::new(
+            storage::adapters::BackendCheckpointStore::new(fault.clone()),
+        );
+        for kind in [BarrierKind::Terminal, start_kind()] {
+            let r = run_on(
+                store.clone(),
+                true,
+                &[("a", true, false)],
+                &[],
+                vec![barrier(kind, b"terminal")],
+            )
+            .await;
+            assert!(r.result.is_err());
+        }
     }
 
     /// A barrier inside an open source transaction is a protocol error.

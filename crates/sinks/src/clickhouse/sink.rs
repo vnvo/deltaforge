@@ -103,8 +103,11 @@ impl ClickHouseSink {
 
 #[async_trait]
 impl Sink for ClickHouseSink {
-    /// Nothing is buffered after an acknowledged batch: every INSERT of an acknowledged batch returned 2xx before `send_batch` returned, and a
-    /// barrier is delivered only after every earlier batch was acknowledged.
+    /// Nothing is buffered after an acknowledged batch: every INSERT of an
+    /// acknowledged batch returned 2xx with `wait_for_async_insert=1` (so the
+    /// rows are in the table even under `async_insert`) before `send_batch`
+    /// returned, and a barrier is delivered only after every earlier batch was
+    /// acknowledged.
     /// This sink keeps no watermark of its own.
     async fn barrier(
         &self,
