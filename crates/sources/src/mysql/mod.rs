@@ -1260,6 +1260,12 @@ impl crate::snapshot_position::EngineOrder for MyOrder {
             .snapshot_completed
             .map(|g| (None, g))
     }
+
+    fn stream_lineage(&self, stream: &[u8]) -> Option<String> {
+        serde_json::from_slice::<MySqlCheckpoint>(stream)
+            .ok()?
+            .lineage
+    }
 }
 
 /// [`compare_mysql_checkpoints`] of two stream positions.

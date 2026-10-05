@@ -169,7 +169,8 @@ pub struct Blocked {
     pub since_ms: i64,
 }
 
-/// Legacy adoption into the chain.
+/// The generation's start barrier (design section 5.4): every allocation
+/// and replacement sets it `Pending`; no row is published until it is `Done`.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize,
 )]
@@ -455,7 +456,7 @@ impl QueueStore {
             terminal: None,
             completion: None,
             blocked: None,
-            adoption: Adoption::None,
+            adoption: Adoption::Pending,
             replaced: None,
         };
         let version = self.create(&control).await?;
@@ -464,12 +465,12 @@ impl QueueStore {
 
     /// Replace the stored generation by the next one (design section 4).
     ///
-    /// - A current record: the next generation of its chain, with the
-    ///   adoption state carried over. A blocked or completed generation is
+    /// - A current record: the next generation of its chain, its start
+    ///   barrier pending. A blocked or completed generation is
     ///   refused unless `by_recovery` (the recovery CLI's `resnapshot`, or
     ///   mode `always` for a completed one).
-    /// - A legacy record: the first generation of a new chain that adopts
-    ///   every legacy generation up to the stored one (`adoption` pending).
+    /// - A legacy record: the first generation of a new chain whose start
+    ///   barrier accepts every legacy generation up to the stored one.
     ///
     /// Lineage is verified first; nothing is written on a refusal.
     pub async fn replace(
@@ -520,7 +521,7 @@ impl QueueStore {
                         terminal: None,
                         completion: None,
                         blocked: None,
-                        adoption: control.adoption,
+                        adoption: Adoption::Pending,
                         replaced: Some(control.generation),
                     },
                 )
@@ -562,8 +563,8 @@ impl QueueStore {
     }
 
     /// A legacy record whose completion the caller proved from the sink
-    /// checkpoints, upgraded in place: `completed` in a new chain that adopts
-    /// it (adopted by the sinks if the chain ever snapshots again).
+    /// checkpoints, upgraded in place: `completed` in a new chain whose later
+    /// generations' start barriers accept its legacy positions.
     pub async fn upgrade_completed_legacy(
         &self,
         stored: &Stored,
@@ -599,7 +600,7 @@ impl QueueStore {
             terminal: None,
             completion: Some(completion),
             blocked: None,
-            adoption: Adoption::Pending,
+            adoption: Adoption::None,
             replaced: None,
         };
         let version = self.cas(*version, &control).await?;
@@ -795,7 +796,7 @@ impl QueueStore {
         Ok((version, next))
     }
 
-    /// Record that every cohort sink adopted the chain.
+    /// Record that every cohort sink passed the generation's start barrier.
     pub async fn adoption_done(
         &self,
         version: u64,
@@ -979,7 +980,10 @@ pub(crate) mod contract {
         let q = QueueStore::new(backend, source);
         assert_eq!(q.read().await.unwrap(), None);
         let (v, c) = q.allocate_first(lineage(), "fp", policy()).await.unwrap();
-        assert_eq!((c.generation, c.state), (1, State::Allocated));
+        assert_eq!(
+            (c.generation, c.state, c.adoption),
+            (1, State::Allocated, Adoption::Pending)
+        );
         let summary = plan(&q, &c, &["orders", "users", "accounts"]).await;
         // Key order is discovery order.
         let (page, _) = q.items_page(1, None, 10).await.unwrap();
@@ -1132,15 +1136,20 @@ pub(crate) mod contract {
         assert_eq!(c.generation, 5);
         assert_eq!(c.legacy_through, Some(4));
         assert_eq!(c.adoption, Adoption::Pending);
-        // The chain's next generation keeps the pending adoption.
+        let Stored::Current { version, control } =
+            q.read().await.unwrap().unwrap()
+        else {
+            panic!("not current");
+        };
+        let (_, done) = q.adoption_done(version, &control).await.unwrap();
+        assert_eq!(done.adoption, Adoption::Done);
+        // Every replacement starts its generation's barrier again.
         let stored = q.read().await.unwrap().unwrap();
-        let (v, c) = q
+        let (_, c) = q
             .replace(&stored, &lineage(), "fp", policy(), false)
             .await
             .unwrap();
         assert_eq!((c.generation, c.adoption), (6, Adoption::Pending));
-        let (_, c) = q.adoption_done(v, &c).await.unwrap();
-        assert_eq!(c.adoption, Adoption::Done);
 
         // A proven-complete legacy record: upgraded in place.
         let q2 = QueueStore::new(backend.clone(), &format!("{source}-done"));
@@ -1168,7 +1177,7 @@ pub(crate) mod contract {
             .unwrap();
         assert_eq!(
             (c.generation, c.state, c.legacy_through, c.adoption),
-            (4, State::Completed, Some(4), Adoption::Pending)
+            (4, State::Completed, Some(4), Adoption::None)
         );
 
         // Unknown formats: refused, untouched.

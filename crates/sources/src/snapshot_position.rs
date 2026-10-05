@@ -15,10 +15,12 @@
 //! Format 1 (no chain) is what #131 wrote; format 2 binds the snapshot chain
 //! (see `docs/design/snapshot-durable-queue.md`, section 3.5): within one
 //! chain a later generation orders after an earlier one, different chains
-//! never order. A sink enters a chain from legacy (chain-less) state only by
-//! its own adoption, which leaves the adoption position
-//! `{"snapshot_adopted": {"format", "snapshot_chain", "legacy_through",
-//! "replaced_digest"}}`. Every order here uses only the two positions.
+//! never order. Every generation starts with each sink moving its own state
+//! into it (the generation start barrier, design section 5.4), which leaves
+//! the start position `{"snapshot_adopted": {"format", "snapshot_chain",
+//! "generation", "replaced_digest"}}`. Every order here uses only the two
+//! positions; a move into a generation is a local check
+//! ([`generation_start`]), never an order.
 
 use deltaforge_core::CheckpointOrder;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -27,7 +29,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 pub const SNAPSHOT_POSITION_FORMAT: u32 = 1;
 /// The format [`encode_chained`] writes.
 pub const SNAPSHOT_POSITION_FORMAT_CHAINED: u32 = 2;
-/// The adoption position's format.
+/// The generation start position's format.
 pub const ADOPTION_POSITION_FORMAT: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,13 +54,13 @@ struct AdoptionPosition {
     snapshot_adopted: Adopted,
 }
 
-/// A sink's adoption of its legacy state into a snapshot chain.
+/// A sink's start of a generation of a snapshot chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Adopted {
     pub format: u32,
     pub snapshot_chain: String,
-    pub legacy_through: u64,
+    pub generation: u64,
     pub replaced_digest: String,
 }
 
@@ -94,18 +96,18 @@ pub fn encode_chained<A: Serialize>(
     .expect("a snapshot position always serializes")
 }
 
-/// The adoption position of `snapshot_chain` over legacy generations up to
-/// `legacy_through`, replacing the state with digest `replaced_digest`.
+/// The start position of `generation` of `snapshot_chain`, replacing the
+/// state with digest `replaced_digest`.
 pub fn encode_adopted(
     snapshot_chain: &str,
-    legacy_through: u64,
+    generation: u64,
     replaced_digest: &str,
 ) -> Vec<u8> {
     serde_json::to_vec(&AdoptionPosition {
         snapshot_adopted: Adopted {
             format: ADOPTION_POSITION_FORMAT,
             snapshot_chain: snapshot_chain.to_string(),
-            legacy_through,
+            generation,
             replaced_digest: replaced_digest.to_string(),
         },
     })
@@ -228,6 +230,12 @@ pub trait EngineOrder {
     fn bare_legacy(&self, _raw: &[u8]) -> Option<Self::Anchor> {
         None
     }
+
+    /// The source lineage a stream position records, when the engine's
+    /// checkpoints record one (MySQL: the server lineage hash).
+    fn stream_lineage(&self, _stream: &[u8]) -> Option<String> {
+        None
+    }
 }
 
 fn classify_with<E: EngineOrder>(
@@ -275,17 +283,32 @@ pub fn order<E: EngineOrder>(
         (Stream, Stream) => engine.stream_order(a, b),
         (Incomplete(x), Incomplete(y)) => incomplete_pair(&x, &y),
         (Adopted(x), Adopted(y)) => {
-            if x.snapshot_chain == y.snapshot_chain
-                && x.legacy_through == y.legacy_through
-            {
-                Equal
+            if x.snapshot_chain == y.snapshot_chain {
+                scalar(x.generation, y.generation)
             } else {
                 Incomparable
             }
         }
-        (Adopted(d), Incomplete(i)) => adopted_vs_incomplete(&d, &i),
-        (Incomplete(i), Adopted(d)) => flip(adopted_vs_incomplete(&d, &i)),
-        (Adopted(_), Stream) | (Stream, Adopted(_)) => Incomparable,
+        (Adopted(d), Incomplete(i)) => {
+            match (&i.snapshot_chain, i.generation) {
+                (Some(c), Some(g)) => start_vs(&d, c, g),
+                _ => Incomparable,
+            }
+        }
+        (Incomplete(i), Adopted(d)) => {
+            match (&i.snapshot_chain, i.generation) {
+                (Some(c), Some(g)) => flip(start_vs(&d, c, g)),
+                _ => Incomparable,
+            }
+        }
+        (Adopted(d), Stream) => match engine.completion_mark(b) {
+            Some((Some(c), g)) => start_vs(&d, &c, g),
+            _ => Incomparable,
+        },
+        (Stream, Adopted(d)) => match engine.completion_mark(a) {
+            Some((Some(c), g)) => flip(start_vs(&d, &c, g)),
+            _ => Incomparable,
+        },
         (Incomplete(i), Stream) => incomplete_vs_stream(engine, &i, b),
         (Stream, Incomplete(i)) => flip(incomplete_vs_stream(engine, &i, a)),
     }
@@ -317,14 +340,84 @@ fn incomplete_pair<A: PartialEq>(
     }
 }
 
-fn adopted_vs_incomplete<A>(d: &Adopted, i: &Incomplete<A>) -> CheckpointOrder {
-    match (&i.snapshot_chain, i.generation) {
-        (Some(c), Some(g))
-            if *c == d.snapshot_chain && g > d.legacy_through =>
-        {
-            CheckpointOrder::Before
+fn scalar(a: u64, b: u64) -> CheckpointOrder {
+    match a.cmp(&b) {
+        std::cmp::Ordering::Less => CheckpointOrder::Before,
+        std::cmp::Ordering::Equal => CheckpointOrder::Equal,
+        std::cmp::Ordering::Greater => CheckpointOrder::After,
+    }
+}
+
+/// A generation start against a position of generation `g` of chain `c`.
+fn start_vs(d: &Adopted, c: &str, g: u64) -> CheckpointOrder {
+    if d.snapshot_chain != c {
+        CheckpointOrder::Incomparable
+    } else if g >= d.generation {
+        CheckpointOrder::Before
+    } else {
+        CheckpointOrder::After
+    }
+}
+
+pub use crate::durable_checkpoint::StartDecision;
+
+/// The generation start barrier's local check on a sink's stored checkpoint
+/// (design section 5.4): `prev` is the exact checkpoint the sink holds
+/// (`None`: empty). Accepted previous states: empty; a legacy (chain-less)
+/// snapshot position up to `legacy_through`; any position of chain `chain`
+/// below `generation`; a stream position of `lineage` (checked where the
+/// engine's checkpoints record a lineage).
+pub fn generation_start<E: EngineOrder>(
+    engine: &E,
+    prev: Option<&[u8]>,
+    lineage: Option<&str>,
+    chain: &str,
+    generation: u64,
+    legacy_through: Option<u64>,
+) -> StartDecision {
+    use StartDecision::*;
+    let Some(prev) = prev else {
+        return Move;
+    };
+    let in_chain = |c: &str, g: u64| {
+        if c != chain {
+            Refuse
+        } else if g < generation {
+            Move
+        } else {
+            Already
         }
-        _ => CheckpointOrder::Incomparable,
+    };
+    let adopted_legacy = |g: Option<u64>| match (g, legacy_through) {
+        (_, None) => Refuse,
+        (None, Some(_)) => Move,
+        (Some(g), Some(k)) if g <= k => Move,
+        _ => Refuse,
+    };
+    match classify_with(engine, prev) {
+        Err(()) => Refuse,
+        Ok(Classified::Adopted(d)) => in_chain(&d.snapshot_chain, d.generation),
+        Ok(Classified::Incomplete(i)) => {
+            match (&i.snapshot_chain, i.generation) {
+                (Some(c), Some(g)) => in_chain(c, g),
+                (Some(_), None) => Refuse,
+                (None, g) => adopted_legacy(g),
+            }
+        }
+        Ok(Classified::Stream) => {
+            if let (Some(want), Some(have)) =
+                (lineage, engine.stream_lineage(prev))
+                && want != have
+            {
+                return Refuse;
+            }
+            match engine.completion_mark(prev) {
+                Some((Some(c), g)) => in_chain(&c, g),
+                // A completion written before chains, or a plain stream
+                // position: the lineage's stream.
+                Some((None, _)) | None => Move,
+            }
+        }
     }
 }
 
@@ -456,15 +549,110 @@ mod order_tests {
     }
 
     #[test]
-    fn an_adoption_precedes_only_the_later_generations_of_its_chain() {
+    fn a_generation_start_precedes_its_generation_and_later_ones() {
         let d = encode_adopted("c", 4, "digest");
+        assert_eq!(o(&d, &encode_chained("c", 4, 10u64)), Before);
         assert_eq!(o(&d, &encode_chained("c", 5, 10u64)), Before);
-        assert_eq!(o(&d, &encode_chained("c", 4, 10u64)), Incomparable);
+        assert_eq!(o(&d, &encode_chained("c", 3, 10u64)), After);
+        assert_eq!(o(&d, &marked(10, Some("c"), 4)), Before);
+        assert_eq!(o(&d, &marked(10, Some("c"), 3)), After);
         assert_eq!(o(&d, &encode_chained("d", 5, 10u64)), Incomparable);
         assert_eq!(o(&d, &encode(5, 10u64)), Incomparable);
         assert_eq!(o(&d, &encode_adopted("c", 4, "other")), Equal);
-        assert_eq!(o(&d, &encode_adopted("c", 5, "digest")), Incomparable);
+        assert_eq!(o(&d, &encode_adopted("c", 5, "digest")), Before);
+        // Never ordered against a plain stream position or another chain's
+        // completion: entering a generation is a checked move.
         assert_eq!(o(&d, &stream(99)), Incomparable);
+        assert_eq!(o(&d, &marked(10, Some("d"), 9)), Incomparable);
+    }
+
+    fn start(
+        prev: Option<&[u8]>,
+        generation: u64,
+        legacy_through: Option<u64>,
+    ) -> StartDecision {
+        generation_start(&T, prev, None, "c", generation, legacy_through)
+    }
+
+    /// Completed `g`, then CDC, then a re-snapshot `g+1`: the sink moves from
+    /// its CDC checkpoint into `g+1`, whose positions order after the start.
+    #[test]
+    fn a_resnapshot_after_cdc_starts_from_the_cdc_checkpoint() {
+        assert_eq!(start(Some(&stream(500)), 4, None), StartDecision::Move);
+        assert_eq!(
+            start(Some(&marked(10, Some("c"), 3)), 4, None),
+            StartDecision::Move
+        );
+        let d = encode_adopted("c", 4, "digest");
+        assert_eq!(o(&d, &encode_chained("c", 4, 600u64)), Before);
+    }
+
+    #[test]
+    fn a_generation_start_is_a_checked_local_move() {
+        use StartDecision::*;
+        assert_eq!(start(None, 4, None), Move);
+        assert_eq!(start(Some(&encode_chained("c", 3, 10u64)), 4, None), Move);
+        // A partial start of 3 (a crash), then 3 replaced by 4.
+        assert_eq!(start(Some(&encode_adopted("c", 3, "d")), 4, None), Move);
+        assert_eq!(start(Some(&encode_adopted("c", 4, "d")), 4, None), Already);
+        assert_eq!(
+            start(Some(&encode_chained("c", 5, 10u64)), 4, None),
+            Already
+        );
+        assert_eq!(start(Some(&marked(10, Some("c"), 4)), 4, None), Already);
+        // Another chain, an unadopted legacy position, an unknown format.
+        assert_eq!(
+            start(Some(&encode_chained("d", 3, 10u64)), 4, None),
+            Refuse
+        );
+        assert_eq!(start(Some(&encode_adopted("d", 3, "x")), 4, None), Refuse);
+        assert_eq!(start(Some(&marked(10, Some("d"), 3)), 4, None), Refuse);
+        assert_eq!(start(Some(&encode(3, 10u64)), 4, None), Refuse);
+        assert_eq!(start(Some(&encode(3, 10u64)), 4, Some(3)), Move);
+        assert_eq!(start(Some(&encode(5, 10u64)), 6, Some(3)), Refuse);
+        let unknown = br#"{"snapshot":{"format":9,"generation":1,"anchor":1}}"#;
+        assert_eq!(start(Some(unknown), 4, None), Refuse);
+    }
+
+    /// A stream position of a foreign lineage is refused where the engine's
+    /// checkpoints record the lineage.
+    #[test]
+    fn a_foreign_lineage_stream_position_is_refused() {
+        struct WithLineage;
+        impl EngineOrder for WithLineage {
+            type Anchor = u64;
+            fn stream_order(&self, a: &[u8], b: &[u8]) -> CheckpointOrder {
+                T.stream_order(a, b)
+            }
+            fn anchor_vs_stream(&self, a: &u64, s: &[u8]) -> CheckpointOrder {
+                T.anchor_vs_stream(a, s)
+            }
+            fn completion_mark(
+                &self,
+                s: &[u8],
+            ) -> Option<(Option<String>, u64)> {
+                T.completion_mark(s)
+            }
+            fn stream_lineage(&self, s: &[u8]) -> Option<String> {
+                let v: serde_json::Value = serde_json::from_slice(s).ok()?;
+                v["lineage"].as_str().map(str::to_string)
+            }
+        }
+        let decide = |prev: &[u8]| {
+            generation_start(
+                &WithLineage,
+                Some(prev),
+                Some("mine"),
+                "c",
+                4,
+                None,
+            )
+        };
+        assert_eq!(
+            decide(br#"{"p":5,"lineage":"other"}"#),
+            StartDecision::Refuse
+        );
+        assert_eq!(decide(br#"{"p":5,"lineage":"mine"}"#), StartDecision::Move);
     }
 
     #[test]
@@ -500,7 +688,7 @@ mod order_tests {
             br#"{"snapshot":{"format":3,"generation":1,"anchor":1}}"#.to_vec(),
             br#"{"snapshot":{"format":2,"generation":1,"anchor":1}}"#.to_vec(),
             br#"{"snapshot":{"format":1,"snapshot_chain":"c","generation":1,"anchor":1}}"#.to_vec(),
-            br#"{"snapshot_adopted":{"format":2,"snapshot_chain":"c","legacy_through":1,"replaced_digest":"d"}}"#.to_vec(),
+            br#"{"snapshot_adopted":{"format":2,"snapshot_chain":"c","generation":1,"replaced_digest":"d"}}"#.to_vec(),
         ] {
             assert!(classify::<u64>(&bad).is_err());
             assert_eq!(order(&T, &i, &bad), Incomparable);
