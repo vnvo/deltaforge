@@ -989,7 +989,7 @@ pub(crate) async fn fetch_tables_on(
                 c.ordinal_position, c.column_default, c.character_maximum_length,
                 c.numeric_precision, c.numeric_scale, c.is_identity,
                 c.identity_generation, c.is_generated, a.atttypid,
-                c.table_schema::text, c.table_name::text
+                a.atttypmod, c.table_schema::text, c.table_name::text
             FROM unnest($1::text[], $2::text[]) AS k(s, t)
             JOIN information_schema.columns c
                 ON c.table_schema = k.s AND c.table_name = k.t
@@ -1008,13 +1008,13 @@ pub(crate) async fn fetch_tables_on(
         .map_err(query_error)?;
     for row in &col_rows {
         schemas
-            .entry((row.get(13), row.get(14)))
+            .entry((row.get(14), row.get(15)))
             .or_insert_with(|| PostgresTableSchema {
                 columns: Vec::new(),
                 primary_key: Vec::new(),
                 replica_identity: None,
                 oid: None,
-                schema_name: Some(row.get(13)),
+                schema_name: Some(row.get(14)),
             })
             .columns
             .push(build_column(row));
@@ -1088,6 +1088,7 @@ fn build_column(row: &tokio_postgres::Row) -> PostgresColumn {
     let identity_gen: Option<String> = row.get(10);
     let is_generated: String = row.get(11);
     let type_oid: u32 = row.get(12);
+    let type_modifier: i32 = row.get(13);
 
     let is_array = data_type == "ARRAY";
     let effective_type = if is_array {
@@ -1123,6 +1124,8 @@ fn build_column(row: &tokio_postgres::Row) -> PostgresColumn {
     }
     col.udt_name = Some(udt_name);
     col.type_oid = Some(type_oid);
+    // -1: the type takes no modifier.
+    col.type_modifier = (type_modifier >= 0).then_some(type_modifier);
 
     col
 }

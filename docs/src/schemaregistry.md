@@ -56,6 +56,8 @@ pub fn compute_fingerprint<T: Serialize>(value: &T) -> String {
 
 The fingerprint only includes structurally significant fields. For MySQL, this means columns and primary key are included, but engine and charset are excluded since they don't affect how CDC events should be interpreted.
 
+For PostgreSQL, the columns (including each column's type OID and type modifier, `pg_attribute.atttypmod`) and the primary key are included. The type modifier was added in this release: after upgrading, each PostgreSQL table with a type-modified column (for example `varchar(n)`, `numeric(p,s)` or `timestamp(p)`) registers one new schema version the first time its schema is loaded. Versions stored before the upgrade still load unchanged.
+
 ## MySQL Schema Implementation
 
 The `MySqlTableSchema` struct captures comprehensive MySQL table metadata:

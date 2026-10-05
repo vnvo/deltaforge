@@ -957,18 +957,23 @@ async fn discovery_pages_share_one_catalog_snapshot() -> Result<()> {
 
 /// The anchor compares the whole registered schema, not a reduced shape: a
 /// change that keeps every column's name, type OID and nullability (a type
-/// modifier, an identity property, the replica identity) still stops the
-/// snapshot before any row, unfinished and never completed.
+/// modifier or time precision, an identity property, the replica identity)
+/// still stops the snapshot before any row, unfinished and never completed.
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn the_anchor_compares_the_registered_schema() -> Result<()> {
-    let setup = "ALTER TABLE pgt_012 ADD COLUMN v VARCHAR(20), ADD COLUMN n INT; \
+    let setup = "ALTER TABLE pgt_012 ADD COLUMN v VARCHAR(20), ADD COLUMN n INT, \
+                 ADD COLUMN at TIMESTAMP(3); \
                  UPDATE pgt_012 SET n = 1; \
                  ALTER TABLE pgt_012 ALTER COLUMN n SET NOT NULL;";
     for (what, ddl) in [
         (
             "type modifier",
             "ALTER TABLE pgt_012 ALTER COLUMN v TYPE VARCHAR(40)",
+        ),
+        (
+            "time precision",
+            "ALTER TABLE pgt_012 ALTER COLUMN at TYPE TIMESTAMP(6)",
         ),
         (
             "identity",

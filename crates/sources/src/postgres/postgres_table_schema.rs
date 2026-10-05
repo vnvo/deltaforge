@@ -47,6 +47,11 @@ pub struct PostgresColumn {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub type_oid: Option<u32>,
 
+    /// The type modifier (`pg_attribute.atttypmod`, e.g. a length, a
+    /// precision or a time precision); absent when the type has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_modifier: Option<i32>,
+
     /// Whether NULL is allowed.
     pub nullable: bool,
 
@@ -294,6 +299,7 @@ impl PostgresColumn {
             name: name.into(),
             data_type: data_type.into(),
             type_oid: None,
+            type_modifier: None,
             nullable,
             ordinal_position: ordinal,
             default_value: None,
@@ -526,6 +532,16 @@ mod tests {
             PostgresColumn::new("n", "numeric(10,2)", true, 3).base_type(),
             "numeric"
         );
+    }
+
+    /// A schema stored before the type modifier was recorded still reads
+    /// back, without one.
+    #[test]
+    fn a_schema_stored_without_type_modifiers_still_deserializes() {
+        let stored = r#"{"columns":[{"name":"at","data_type":"timestamp without time zone","type_oid":1114,"nullable":true,"ordinal_position":1}],"primary_key":[]}"#;
+        let parsed: PostgresTableSchema = serde_json::from_str(stored).unwrap();
+        assert_eq!(parsed.columns[0].type_modifier, None);
+        assert_eq!(parsed.columns[0].type_oid, Some(1114));
     }
 
     #[test]
