@@ -320,15 +320,22 @@ pub async fn run_snapshot(
         })
         .collect();
     crate::snapshot_probe::record_frontier_tables(resume.len());
-    let snapshot_checkpoint =
-        CheckpointMeta::from_vec(anchor.to_string().into_bytes());
+    // Every boundary carries an incomplete-snapshot position, except the
+    // one completing the snapshot (`publisher.finish`): a stream position at
+    // the anchor.
+    let snapshot_checkpoint = CheckpointMeta::from_vec(
+        crate::snapshot_position::encode(ctx.generation, anchor.to_string()),
+    );
+    let completing_checkpoint =
+        super::postgres_helpers::make_checkpoint_meta(&anchor, None, "");
     let publisher = Arc::new(SnapshotPublisher::new(
         SnapshotAggregator::from_source_progress(
             ctx.generation,
             ctx.lineage.clone(),
             snapshot_checkpoint,
             &resume,
-        ),
+        )
+        .with_completing_checkpoint(completing_checkpoint),
         ctx.tx.clone(),
     ));
 
@@ -426,6 +433,13 @@ pub async fn run_snapshot(
 
     // release the exported snapshot.
     coord.batch_execute("COMMIT").await.ok();
+
+    // Every table read and every check passed: emit the completing
+    // boundary (the only stream position a snapshot commits).
+    publisher
+        .finish()
+        .await
+        .context("emit the snapshot's completing boundary")?;
 
     // mark fully done, stamped with the current (safe) anchor protocol version.
     progress.finished = true;

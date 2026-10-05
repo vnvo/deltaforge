@@ -94,6 +94,39 @@ pub struct MySqlCheckpoint {
     /// lineage was recorded; see [`compare_mysql_checkpoints`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<String>,
+    /// Set (to the generation) only on the checkpoint of the boundary that
+    /// completes a snapshot, at its anchor: proof that the sinks committed the
+    /// whole snapshot. A checkpoint at the anchor without it was written
+    /// before the proof existed and proves nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_completed: Option<u64>,
+}
+
+/// A resume position read from the checkpoint store.
+#[derive(Debug, Clone)]
+pub(crate) enum MyResumePosition {
+    /// A snapshot no sink acknowledged as complete: not a stream position.
+    Snapshot,
+    /// A stream position (CDC, or the completing snapshot boundary).
+    Stream(MySqlCheckpoint),
+}
+
+/// Classify stored checkpoint bytes; anything else fails closed.
+pub(crate) fn classify_mysql_checkpoint(
+    raw: &[u8],
+) -> Result<MyResumePosition, String> {
+    if crate::snapshot_position::decode::<MySqlCheckpoint>(raw)?.is_some() {
+        return Ok(MyResumePosition::Snapshot);
+    }
+    serde_json::from_slice::<MySqlCheckpoint>(raw)
+        .map(MyResumePosition::Stream)
+        .map_err(|e| format!("unrecognised checkpoint: {e}"))
+}
+
+/// Whether two checkpoints name the same binlog position (file, position and
+/// GTID set; lineage and the completion mark aside).
+fn same_position(a: &MySqlCheckpoint, b: &MySqlCheckpoint) -> bool {
+    a.file == b.file && a.pos == b.pos && a.gtid_set == b.gtid_set
 }
 
 #[derive(Debug, Clone)]
@@ -422,6 +455,25 @@ impl MySqlSource {
         Ok(scan.ambiguous(progress.finished))
     }
 
+    /// The resume position in the checkpoint store, classified (fails closed
+    /// on bytes that are neither a snapshot position nor a stream position).
+    async fn resume_position(
+        &self,
+        store: &Arc<dyn CheckpointStore>,
+    ) -> SourceResult<Option<MyResumePosition>> {
+        store
+            .get_raw(&self.id)
+            .await
+            .map_err(|e| SourceError::Checkpoint {
+                details: e.to_string().into(),
+            })?
+            .map(|raw| classify_mysql_checkpoint(&raw))
+            .transpose()
+            .map_err(|e| SourceError::Checkpoint {
+                details: format!("source {}: {e}", self.id).into(),
+            })
+    }
+
     /// Freeze the source lineage for snapshot identity: prefer the stable
     /// `@@server_uuid` (file-free, rotation-immune); fall back to
     /// `server_id` + the current binlog file.
@@ -556,12 +608,10 @@ impl MySqlSource {
                 .await
                 .map_err(SourceError::Other)?
         {
-            let committed = chkpt_store
-                .get::<MySqlCheckpoint>(&self.id)
-                .await
-                .map_err(|e| SourceError::Checkpoint {
-                    details: e.to_string().into(),
-                })?;
+            let committed = match self.resume_position(&chkpt_store).await? {
+                Some(MyResumePosition::Stream(cp)) => Some(cp),
+                _ => None,
+            };
             let position = match committed.and_then(|c| c.gtid_set) {
                 Some(set) => {
                     let mut conn = open_control_connection(
@@ -581,6 +631,7 @@ impl MySqlSource {
                         pos: 0,
                         gtid_set: Some(set),
                         lineage: Some(lineage_hash.clone()),
+                        snapshot_completed: None,
                     })
                 }
                 None => None,
@@ -607,25 +658,56 @@ impl MySqlSource {
         // Whether this start continues from a committed resume position: a
         // start without one (first start, or "from end") or a snapshot (a new
         // anchor) is a stream discontinuity (spec 7.5).
-        let committed_resume = chkpt_store
-            .get::<MySqlCheckpoint>(&self.id)
-            .await
-            .map_err(|e| SourceError::Checkpoint {
-                details: e.to_string().into(),
-            })?
-            .is_some();
+        let resume = self.resume_position(&chkpt_store).await?;
+        // The stream position a snapshot-free start resumes from.
+        let stream_resume = match &resume {
+            Some(MyResumePosition::Stream(cp)) => Some(cp.clone()),
+            _ => None,
+        };
+        // A finished snapshot is complete only once the sinks committed it:
+        // the resume position is its completing boundary (marked) or a
+        // stream position past its anchor. `finished` alone records that the
+        // rows were read, not delivered; a checkpoint at the anchor without
+        // the mark was written before the proof existed and proves nothing
+        // (the snapshot runs once more: duplicates, never loss).
+        let finished = snapshot_progress.as_ref().is_some_and(|p| p.finished);
+        let anchor = snapshot_progress.as_ref().and_then(|p| {
+            serde_json::from_str::<MySqlCheckpoint>(&p.start_position).ok()
+        });
+        let completion_proven = match &stream_resume {
+            Some(cp) => {
+                cp.snapshot_completed.is_some()
+                    || anchor.as_ref().is_none_or(|a| !same_position(a, cp))
+            }
+            None => false,
+        };
+        let unproven_snapshot = finished && !completion_proven;
+        if matches!(resume, Some(MyResumePosition::Snapshot))
+            && self.snapshot_cfg.mode == SnapshotMode::Never
+        {
+            return Err(SourceError::Checkpoint {
+                details: format!(
+                    "source {}: the resume checkpoint belongs to a snapshot \
+                     that never completed, and snapshot mode 'never' cannot \
+                     complete it; set mode 'initial' to snapshot again",
+                    self.id
+                )
+                .into(),
+            });
+        }
 
         let needs_snapshot = match self.snapshot_cfg.mode {
-            SnapshotMode::Initial => !snapshot_progress
-                .as_ref()
-                .map(|p| p.finished)
-                .unwrap_or(false),
+            SnapshotMode::Initial => !finished || unproven_snapshot,
             SnapshotMode::Always => true,
             SnapshotMode::Never => false,
         };
+        // Whether this start continues from a committed resume position.
+        let committed_resume = stream_resume.is_some() && !needs_snapshot;
 
         // The tables a snapshot copied: proven at its anchor below.
         let mut snapshot_tables: Vec<(String, String)> = Vec::new();
+        // The anchor a snapshot of this start leaves the stream at.
+        let mut snapshot_start: Option<MySqlCheckpoint> = None;
         if needs_snapshot {
             // An unfinished snapshot is never resumed from its progress: its
             // completed tables were read at the interrupted run's anchor,
@@ -639,9 +721,10 @@ impl MySqlSource {
             )
             .await
             .map_err(SourceError::Other)?;
-            let interrupted = !progress.finished
-                && (!progress.start_position.is_empty()
-                    || !progress.done_tables.is_empty());
+            let interrupted = unproven_snapshot
+                || (!progress.finished
+                    && (!progress.start_position.is_empty()
+                        || !progress.done_tables.is_empty()));
             if interrupted {
                 warn!(
                     source_id = %self.id,
@@ -744,10 +827,10 @@ impl MySqlSource {
                             .unwrap_or_else(SourceError::Other)
                     })?;
 
-            chkpt_store
-                .put(&self.id, snapshot_position)
-                .await
-                .map_err(|e| SourceError::Other(e.into()))?;
+            // The stream starts at the anchor. No checkpoint is written here:
+            // only the sinks' commits of the snapshot's boundaries (the last
+            // one completing it) record what was delivered.
+            snapshot_start = Some(snapshot_position);
 
             snapshot_tables = plan
                 .tables
@@ -766,7 +849,7 @@ impl MySqlSource {
                     self.dsn.expose(),
                     &server_uuid,
                     &self.id,
-                    &chkpt_store,
+                    snapshot_start.clone().or_else(|| stream_resume.clone()),
                 )
                 .await
                 {
@@ -1073,6 +1156,7 @@ impl MySqlSource {
                         file: ctx.last_file,
                         pos: ctx.last_pos,
                         gtid_set: ctx.last_gtid,
+                        snapshot_completed: None,
                     },
                 )
                 .await;
@@ -1088,7 +1172,69 @@ impl MySqlSource {
 /// An unparseable checkpoint is [`CheckpointOrder::Incomparable`] rather than
 /// silently treated as an orderable position (which could select a resume point
 /// ahead of a sink and drop its events).
+///
+/// An incomplete-snapshot position equals only the same position of the same
+/// generation and anchor, and orders before any stream position at or after
+/// its anchor (the completing boundary's, or CDC after it). Against any other
+/// position - another generation or anchor, or a stream position not after
+/// the anchor - it is incomparable.
 pub fn compare_mysql_checkpoints(a: &[u8], b: &[u8]) -> CheckpointOrder {
+    type Snap = (u64, MySqlCheckpoint);
+    let snapshot = |raw: &[u8]| -> Result<Option<Snap>, ()> {
+        crate::snapshot_position::decode::<MySqlCheckpoint>(raw).map_err(|_| ())
+    };
+    let at_or_after = |anchor: &MySqlCheckpoint, raw: &[u8]| {
+        let Ok(anchor) = serde_json::to_vec(anchor) else {
+            return false;
+        };
+        matches!(
+            compare_mysql_stream_checkpoints(&anchor, raw),
+            CheckpointOrder::Before | CheckpointOrder::Equal
+        )
+    };
+    match (snapshot(a), snapshot(b)) {
+        (Err(()), _) | (_, Err(())) => {
+            tracing::warn!(
+                "incomparable checkpoints: unreadable snapshot position"
+            );
+            CheckpointOrder::Incomparable
+        }
+        (Ok(Some(x)), Ok(Some(y))) => {
+            if x == y {
+                CheckpointOrder::Equal
+            } else {
+                tracing::warn!(
+                    "incomparable checkpoints: snapshot positions of another generation or anchor"
+                );
+                CheckpointOrder::Incomparable
+            }
+        }
+        (Ok(Some((_, anchor))), Ok(None)) => {
+            if at_or_after(&anchor, b) {
+                CheckpointOrder::Before
+            } else {
+                tracing::warn!(
+                    "incomparable checkpoints: a stream position not after the snapshot's anchor"
+                );
+                CheckpointOrder::Incomparable
+            }
+        }
+        (Ok(None), Ok(Some((_, anchor)))) => {
+            if at_or_after(&anchor, a) {
+                CheckpointOrder::After
+            } else {
+                tracing::warn!(
+                    "incomparable checkpoints: a stream position not after the snapshot's anchor"
+                );
+                CheckpointOrder::Incomparable
+            }
+        }
+        (Ok(None), Ok(None)) => compare_mysql_stream_checkpoints(a, b),
+    }
+}
+
+/// [`compare_mysql_checkpoints`] of two stream positions.
+fn compare_mysql_stream_checkpoints(a: &[u8], b: &[u8]) -> CheckpointOrder {
     // Positions of different servers are never ordered: two checkpoints that
     // both carry a lineage must carry the same one; a lineage-bearing and a
     // legacy (pre-lineage) checkpoint are Incomparable; two legacy checkpoints
@@ -1478,6 +1624,7 @@ impl RunCtx {
             pos: self.last_pos,
             gtid_set: self.last_gtid.clone(),
             lineage: None,
+            snapshot_completed: None,
         });
     }
 
@@ -2126,6 +2273,7 @@ async fn run_failover_reconciliation(
             pos: 0,
             gtid_set: Some(resume_set.clone()),
             lineage: Some(current_lineage),
+            snapshot_completed: None,
         }),
     )
     .await
@@ -2447,6 +2595,7 @@ mod compare_checkpoints_tests {
             pos,
             gtid_set: gtid.map(str::to_string),
             lineage: Some(lineage.into()),
+            snapshot_completed: None,
         })
         .unwrap()
     }

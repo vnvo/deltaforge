@@ -24,6 +24,7 @@ pub mod snapshot_event_id;
 pub mod snapshot_frontier;
 pub mod snapshot_generation;
 pub mod snapshot_plan;
+pub mod snapshot_position;
 pub mod snapshot_probe;
 pub mod stream_probe;
 mod table_patterns;

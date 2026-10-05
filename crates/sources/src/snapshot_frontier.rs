@@ -222,10 +222,21 @@ pub struct SnapshotAggregator {
     /// The frozen CDC checkpoint captured at snapshot start - constant across the
     /// snapshot (post-snapshot CDC resumes from here); only the watermark moves.
     snapshot_checkpoint: CheckpointMeta,
+    /// The checkpoint of the boundary that completes the snapshot (an
+    /// ordinary resume position at the anchor), carried only by
+    /// [`SnapshotPublisher::finish`]; every other boundary carries
+    /// `snapshot_checkpoint`, an incomplete-snapshot position.
+    completing_checkpoint: Option<CheckpointMeta>,
     tables: BTreeMap<String, TableFrontier>,
 }
 
 impl SnapshotAggregator {
+    /// The checkpoint the completing boundary carries.
+    pub fn with_completing_checkpoint(mut self, cp: CheckpointMeta) -> Self {
+        self.completing_checkpoint = Some(cp);
+        self
+    }
+
     /// Start a generation over `tables`, each `(name, cursor kind)`; every
     /// frontier begins at its kind's minimum so the vector's key set and cursor
     /// kinds are fixed from the first batch.
@@ -239,6 +250,7 @@ impl SnapshotAggregator {
             generation,
             lineage,
             snapshot_checkpoint,
+            completing_checkpoint: None,
             tables: tables
                 .iter()
                 .map(|(t, k)| (t.clone(), TableFrontier::new(k.min())))
@@ -262,6 +274,7 @@ impl SnapshotAggregator {
             generation,
             lineage,
             snapshot_checkpoint,
+            completing_checkpoint: None,
             tables: resume
                 .iter()
                 .map(|(t, r)| {
@@ -337,6 +350,16 @@ impl SnapshotAggregator {
     pub fn is_complete(&self) -> bool {
         self.fully_completed()
     }
+
+    /// The boundary completing the snapshot: the completing checkpoint and
+    /// the full vector, every table complete. `None` unless both hold.
+    fn completing_boundary(&self) -> Option<SourceBoundary> {
+        let cp = self.completing_checkpoint.clone()?;
+        self.fully_completed().then(|| SourceBoundary {
+            checkpoint: cp,
+            ..self.current_boundary()
+        })
+    }
 }
 
 /// The output channel closed (coordinator gone / shutdown).
@@ -368,6 +391,46 @@ pub struct SnapshotPublisher {
 struct PublisherInner {
     agg: SnapshotAggregator,
     tx: tokio::sync::mpsc::Sender<deltaforge_core::SourceItem>,
+    /// The last event published, held back so the boundary that completes
+    /// the snapshot can ride on it ([`SnapshotPublisher::finish`]): it is
+    /// sent before any later event, or by `finish`. A later boundary
+    /// replaces its own (every range it covers was sent before it).
+    held: Option<deltaforge_core::Event>,
+}
+
+impl PublisherInner {
+    async fn send(
+        &self,
+        item: deltaforge_core::SourceItem,
+    ) -> Result<(), SnapshotClosed> {
+        self.tx.send(item).await.map_err(|_| SnapshotClosed)
+    }
+
+    /// Send the held event, if any.
+    async fn release(&mut self) -> Result<(), SnapshotClosed> {
+        match self.held.take() {
+            Some(ev) => self.send(deltaforge_core::SourceItem::Event(ev)).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Attach `boundary` to the held event, or send it on its own when
+    /// nothing is held.
+    async fn emit(
+        &mut self,
+        boundary: SourceBoundary,
+    ) -> Result<(), SnapshotClosed> {
+        match self.held.as_mut() {
+            Some(ev) => {
+                ev.set_boundary(boundary);
+                Ok(())
+            }
+            None => {
+                self.send(deltaforge_core::SourceItem::Boundary { boundary })
+                    .await
+            }
+        }
+    }
 }
 
 impl SnapshotPublisher {
@@ -376,7 +439,11 @@ impl SnapshotPublisher {
         tx: tokio::sync::mpsc::Sender<deltaforge_core::SourceItem>,
     ) -> Self {
         Self {
-            inner: tokio::sync::Mutex::new(PublisherInner { agg, tx }),
+            inner: tokio::sync::Mutex::new(PublisherInner {
+                agg,
+                tx,
+                held: None,
+            }),
         }
     }
 
@@ -385,6 +452,8 @@ impl SnapshotPublisher {
     /// send every event - all under one lock. If the chunk did not advance the
     /// contiguous frontier (an out-of-order arrival), its events still flow but
     /// carry no boundary, so no watermark ever covers a not-yet-durable range.
+    /// The chunk's last event is held back (sent before the next chunk's events
+    /// or by [`Self::finish`]).
     pub async fn publish_chunk(
         &self,
         table: &str,
@@ -393,42 +462,77 @@ impl SnapshotPublisher {
         mut events: Vec<deltaforge_core::Event>,
     ) -> Result<(), SnapshotClosed> {
         let mut g = self.inner.lock().await;
-        if let Some(boundary) = g.agg.complete_chunk(table, start, end) {
-            if let Some(last) = events.last_mut() {
-                last.set_boundary(boundary);
+        let boundary = g.agg.complete_chunk(table, start, end);
+        let Some(mut last) = events.pop() else {
+            // Nothing to carry it: a later boundary covers this range.
+            if let Some(boundary) = boundary {
+                if g.held.is_some() {
+                    g.emit(boundary).await?;
+                }
             }
-        }
+            return Ok(());
+        };
+        g.release().await?;
         for ev in events {
-            g.tx.send(deltaforge_core::SourceItem::Event(ev))
-                .await
-                .map_err(|_| SnapshotClosed)?;
+            g.send(deltaforge_core::SourceItem::Event(ev)).await?;
         }
+        if let Some(boundary) = boundary {
+            last.set_boundary(boundary);
+        }
+        g.held = Some(last);
         Ok(())
     }
 
-    /// Mark `table`'s scan complete (all its ranges incorporated) and emit an
-    /// explicit table-complete [`deltaforge_core::SourceItem::Boundary`] carrying
-    /// the current full vector; when this completes the whole snapshot the
-    /// boundary's watermark is `completed = true`, gating snapshot->CDC once it is
-    /// durably acknowledged. The send is under the lock (ordered with
-    /// publication). Returns whether the whole snapshot is now complete.
+    /// Mark `table`'s scan complete (all its ranges incorporated) and emit a
+    /// table-complete boundary carrying the current full vector (on the held
+    /// event, or on its own). When this completes the whole snapshot nothing
+    /// is emitted: only [`Self::finish`] emits the completing boundary. The
+    /// send is under the lock (ordered with publication). Returns whether the
+    /// whole snapshot is now complete.
     pub async fn complete_table(
         &self,
         table: &str,
     ) -> Result<bool, SnapshotClosed> {
         let mut g = self.inner.lock().await;
         g.agg.complete_table(table);
+        if g.agg.is_complete() {
+            return Ok(true);
+        }
         let boundary = g.agg.current_boundary();
-        g.tx.send(deltaforge_core::SourceItem::Boundary { boundary })
-            .await
-            .map_err(|_| SnapshotClosed)?;
-        Ok(g.agg.is_complete())
+        g.emit(boundary).await?;
+        Ok(false)
+    }
+
+    /// Emit the boundary that completes the snapshot - its completing
+    /// checkpoint - on the held event (the globally last non-empty chunk's
+    /// last event), or on its own when no event is held. Call only after
+    /// every table finished successfully and every final check passed; a
+    /// snapshot that fails before this never sends a completing checkpoint.
+    pub async fn finish(&self) -> Result<(), SnapshotFinishError> {
+        let mut g = self.inner.lock().await;
+        let boundary = g
+            .agg
+            .completing_boundary()
+            .ok_or(SnapshotFinishError::Incomplete)?;
+        g.emit(boundary).await?;
+        g.release().await?;
+        Ok(())
     }
 
     /// Whether the whole snapshot is complete.
     pub async fn is_complete(&self) -> bool {
         self.inner.lock().await.agg.is_complete()
     }
+}
+
+/// Why [`SnapshotPublisher::finish`] could not complete the snapshot.
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotFinishError {
+    /// A table is not complete, or no completing checkpoint was set.
+    #[error("the snapshot is not complete")]
+    Incomplete,
+    #[error(transparent)]
+    Closed(#[from] SnapshotClosed),
 }
 
 #[cfg(test)]
@@ -748,8 +852,16 @@ mod tests {
         tokio::sync::mpsc::Receiver<SourceItem>,
     ) {
         let (tx, rx) = tokio::sync::mpsc::channel(cap);
-        let p = SnapshotPublisher::new(agg(tables), tx);
+        let p = SnapshotPublisher::new(
+            agg(tables).with_completing_checkpoint(done_checkpoint()),
+            tx,
+        );
         (std::sync::Arc::new(p), rx)
+    }
+
+    /// The completing checkpoint the test publishers carry.
+    fn done_checkpoint() -> CheckpointMeta {
+        CheckpointMeta::from_vec(b"done".to_vec())
     }
 
     /// Publisher over tables of a given cursor kind (PG: Signed or CtidBlock).
@@ -769,7 +881,8 @@ mod tests {
             lineage(),
             CheckpointMeta::from_vec(b"0/1A2B3C".to_vec()),
             &t,
-        );
+        )
+        .with_completing_checkpoint(done_checkpoint());
         (std::sync::Arc::new(SnapshotPublisher::new(a, tx)), rx)
     }
 
@@ -816,10 +929,18 @@ mod tests {
         // A single table's chunks [0,10),[10,20),[20,30) are published in the
         // adversarial order 3, 1, 2. The boundaries that reach the channel must
         // advance only 1 then 1+2+3 - chunk 3 alone must carry NO boundary.
+        // The last event published is held until the next chunk or `finish`.
         let (p, mut rx) = publisher(&["shop.orders"], 64);
 
-        // Chunk 3 out of order: events flow but carry no boundary.
+        // Chunk 3 out of order: its event (held) carries no boundary.
         p.publish_chunk("shop.orders", u(20), u(30), vec![snap_event(20)])
+            .await
+            .unwrap();
+        assert!(drain_last_cursor(&mut rx).is_none());
+
+        // Chunk 1: boundary 10 on its (held) event; chunk 3's event is sent
+        // without one.
+        p.publish_chunk("shop.orders", u(0), u(10), vec![snap_event(0)])
             .await
             .unwrap();
         assert!(
@@ -827,16 +948,19 @@ mod tests {
             "out-of-order chunk 3 must not emit a boundary"
         );
 
-        // Chunk 1: boundary advances to 10.
-        p.publish_chunk("shop.orders", u(0), u(10), vec![snap_event(0)])
+        // Chunk 2 releases chunk 1's event (boundary 10) and cascades through
+        // the buffered chunk 3 -> 30 on its own held event.
+        p.publish_chunk("shop.orders", u(10), u(20), vec![snap_event(10)])
             .await
             .unwrap();
         assert_eq!(drain_last_cursor(&mut rx).unwrap()["shop.orders"], 10);
 
-        // Chunk 2: cascades through the buffered chunk 3 -> 30.
-        p.publish_chunk("shop.orders", u(10), u(20), vec![snap_event(10)])
-            .await
-            .unwrap();
+        assert!(p.complete_table("shop.orders").await.unwrap());
+        assert!(
+            drain_last_cursor(&mut rx).is_none(),
+            "nothing before finish"
+        );
+        p.finish().await.unwrap();
         assert_eq!(drain_last_cursor(&mut rx).unwrap()["shop.orders"], 30);
     }
 
@@ -857,7 +981,7 @@ mod tests {
                 "shop.orders",
                 u(0),
                 u(10),
-                vec![snap_event(1), snap_event(2)],
+                vec![snap_event(1), snap_event(2), snap_event(4)],
             )
             .await
         });
@@ -880,18 +1004,26 @@ mod tests {
         );
 
         // Drain the channel: worker1 unblocks, finishes, releases the lock, then
-        // worker2 proceeds.
+        // worker2 proceeds (its event held until `finish`).
         let mut seen = Vec::new();
-        while seen.len() < 3 {
-            if let Some(SourceItem::Event(e)) = rx.recv().await {
-                seen.push(e);
+        let drain = async {
+            while seen.len() < 4 {
+                if let Some(SourceItem::Event(e)) = rx.recv().await {
+                    seen.push(e);
+                }
             }
-        }
-        worker1.await.unwrap().unwrap();
-        worker2.await.unwrap().unwrap();
+        };
+        let finish = async {
+            worker1.await.unwrap().unwrap();
+            worker2.await.unwrap().unwrap();
+            assert!(!p.complete_table("shop.orders").await.unwrap());
+            assert!(p.complete_table("shop.users").await.unwrap());
+            p.finish().await.unwrap();
+        };
+        tokio::join!(drain, finish);
 
         // The users boundary (cursor 5) can only have been produced after the
-        // orders chunk was fully enqueued: the users event is the LAST of the 3.
+        // orders chunk was fully enqueued: the users event is the LAST of the 4.
         let users_last = seen.last().unwrap();
         let b = users_last.boundary.as_ref().expect("users boundary");
         let c = cursors(b);
@@ -915,6 +1047,31 @@ mod tests {
         last
     }
 
+    /// The boundary on the last event drained.
+    fn drain_last_event_boundary(
+        rx: &mut tokio::sync::mpsc::Receiver<SourceItem>,
+    ) -> Option<SourceBoundary> {
+        let mut last = None;
+        while let Ok(item) = rx.try_recv() {
+            if let SourceItem::Event(e) = item {
+                last = e.boundary.clone();
+            }
+        }
+        last
+    }
+
+    fn completed(b: &SourceBoundary) -> bool {
+        matches!(
+            DurableWatermark::parse(b.durable_watermark.as_ref().unwrap())
+                .unwrap()
+                .pos,
+            WmPos::Snapshot {
+                completed: true,
+                ..
+            }
+        )
+    }
+
     #[tokio::test]
     async fn publisher_parallel_tables_reach_completion() {
         let (p, mut rx) = publisher(&["shop.orders", "shop.users"], 64);
@@ -924,36 +1081,62 @@ mod tests {
         p.publish_chunk("shop.users", u(0), u(10), vec![snap_event(2)])
             .await
             .unwrap();
-        // Completing one table emits a table-complete boundary but not `completed`.
+        // Completing one table moves the held event's boundary forward (not
+        // `completed`); nothing is sent on its own.
         assert!(!p.complete_table("shop.orders").await.unwrap());
-        let mid =
-            drain_last_boundary(&mut rx).expect("table-complete boundary");
-        let wm =
-            DurableWatermark::parse(mid.durable_watermark.as_ref().unwrap())
-                .unwrap();
-        assert!(matches!(
-            wm.pos,
-            WmPos::Snapshot {
-                completed: false,
-                ..
+        let mut items = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            items.push(item);
+        }
+        assert!(
+            !items
+                .iter()
+                .any(|i| matches!(i, SourceItem::Boundary { .. })),
+            "no boundary on its own while an event is held"
+        );
+        let first = match items.last() {
+            Some(SourceItem::Event(e)) => {
+                e.boundary.clone().expect("first chunk")
             }
-        ));
+            _ => panic!("the first chunk's event"),
+        };
+        assert!(!completed(&first));
 
-        // Completing the last table emits the `completed = true` boundary.
+        // Completing the last table sends nothing: completion waits for
+        // `finish`, which puts the completing checkpoint on the held event.
         assert!(p.complete_table("shop.users").await.unwrap());
         assert!(p.is_complete().await);
-        let done =
-            drain_last_boundary(&mut rx).expect("snapshot-complete boundary");
-        let wm =
-            DurableWatermark::parse(done.durable_watermark.as_ref().unwrap())
-                .unwrap();
+        assert!(drain_last_event_boundary(&mut rx).is_none());
+        p.finish().await.unwrap();
+        let done = drain_last_event_boundary(&mut rx).expect("completing");
+        assert!(completed(&done));
+        assert_eq!(done.checkpoint.as_bytes(), done_checkpoint().as_bytes());
+    }
+
+    /// The completing checkpoint is never sent before every table is
+    /// complete, and only by `finish`; a snapshot without any event completes
+    /// on a boundary of its own.
+    #[tokio::test]
+    async fn only_finish_sends_the_completing_checkpoint() {
+        let (p, mut rx) = publisher(&["shop.orders", "shop.users"], 64);
+        p.publish_chunk("shop.orders", u(0), u(10), vec![snap_event(1)])
+            .await
+            .unwrap();
+        assert!(!p.complete_table("shop.orders").await.unwrap());
         assert!(matches!(
-            wm.pos,
-            WmPos::Snapshot {
-                completed: true,
-                ..
-            }
+            p.finish().await,
+            Err(SnapshotFinishError::Incomplete)
         ));
+        assert!(drain_last_event_boundary(&mut rx).is_none(), "still held");
+
+        // Every table empty: no event to carry it.
+        let (p, mut rx) = publisher(&["shop.orders", "shop.users"], 64);
+        assert!(!p.complete_table("shop.orders").await.unwrap());
+        assert!(p.complete_table("shop.users").await.unwrap());
+        p.finish().await.unwrap();
+        let done = drain_last_boundary(&mut rx).expect("completing boundary");
+        assert!(completed(&done));
+        assert_eq!(done.checkpoint.as_bytes(), done_checkpoint().as_bytes());
     }
 
     // ── PostgreSQL-flavoured coverage: signed integer-PK intra-table parallelism
@@ -986,10 +1169,13 @@ mod tests {
             "sub-range B before A must not advance past the gap"
         );
 
-        // Sub-range A = [-50, 25) fills the gap and cascades into buffered B.
+        // Sub-range A = [-50, 25) fills the gap and cascades into buffered B
+        // (on A's held event, sent by `finish`).
         p.publish_chunk("pg.t", Signed(-50), Signed(25), vec![snap_event(2)])
             .await
             .unwrap();
+        assert!(p.complete_table("pg.t").await.unwrap());
+        p.finish().await.unwrap();
         assert_eq!(
             drain_last_typed(&mut rx, "pg.t"),
             Some(Signed(100)),
@@ -1010,7 +1196,7 @@ mod tests {
                 "pg.a",
                 CtidBlock(0),
                 CtidBlock(4),
-                vec![snap_event(1), snap_event(2)],
+                vec![snap_event(1), snap_event(2), snap_event(4)],
             )
             .await
         });
@@ -1030,13 +1216,21 @@ mod tests {
         assert!(!w2.is_finished(), "w2 blocked by the held publisher lock");
 
         let mut seen = Vec::new();
-        while seen.len() < 3 {
-            if let Some(SourceItem::Event(e)) = rx.recv().await {
-                seen.push(e);
+        let drain = async {
+            while seen.len() < 4 {
+                if let Some(SourceItem::Event(e)) = rx.recv().await {
+                    seen.push(e);
+                }
             }
-        }
-        w1.await.unwrap().unwrap();
-        w2.await.unwrap().unwrap();
+        };
+        let finish = async {
+            w1.await.unwrap().unwrap();
+            w2.await.unwrap().unwrap();
+            assert!(!p.complete_table("pg.a").await.unwrap());
+            assert!(p.complete_table("pg.b").await.unwrap());
+            p.finish().await.unwrap();
+        };
+        tokio::join!(drain, finish);
 
         // pg.b's boundary rides its last event, produced only after pg.a drained.
         let last = seen.last().unwrap();

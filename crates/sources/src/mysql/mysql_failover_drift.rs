@@ -712,6 +712,7 @@ mod tests {
             pos: 0,
             gtid_set: Some(format!("{A}:{set}")),
             lineage: None,
+            snapshot_completed: None,
         })
     }
 

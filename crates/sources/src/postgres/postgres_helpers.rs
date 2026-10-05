@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
-use checkpoints::{CheckpointStore, CheckpointStoreExt};
+use checkpoints::CheckpointStore;
 use common::{DsnComponents, RetryOutcome, RetryPolicy, retry_async};
 
 use deltaforge_core::incident::IncidentId;
@@ -66,13 +66,25 @@ pub(super) async fn prepare_replication_client(
     DsnComponents,
     ReplicationConfig,
     Option<PostgresCheckpoint>,
+    bool,
 )> {
     let components = parse_dsn(dsn)?;
 
-    let last_checkpoint: Option<PostgresCheckpoint> = ckpt_store
-        .get(source_id)
+    // A snapshot position is not a stream position: no checkpoint to resume
+    // from, and the snapshot it belongs to never completed.
+    let resume = ckpt_store
+        .get_raw(source_id)
         .await
-        .map_err(|e| PostgresSourceError::Checkpoint(e.to_string()))?;
+        .map_err(|e| PostgresSourceError::Checkpoint(e.to_string()))?
+        .map(|raw| super::classify_pg_checkpoint(&raw))
+        .transpose()
+        .map_err(PostgresSourceError::Checkpoint)?;
+    let incomplete_snapshot =
+        matches!(resume, Some(super::PgResumePosition::Snapshot { .. }));
+    let last_checkpoint = match resume {
+        Some(super::PgResumePosition::Stream(cp)) => Some(cp),
+        _ => None,
+    };
 
     info!(
         source_id = %source_id,
@@ -95,7 +107,7 @@ pub(super) async fn prepare_replication_client(
     let config =
         build_replication_config(&components, slot, publication, start_lsn);
 
-    Ok((components, config, last_checkpoint))
+    Ok((components, config, last_checkpoint, incomplete_snapshot))
 }
 
 /// Build a `ReplicationConfig` from parsed DSN components at a specific start
@@ -182,15 +194,32 @@ impl StreamProof {
 
     /// The durable checkpoint F, read now.
     async fn durable_checkpoint(&self) -> SourceResult<Option<Checkpoint>> {
-        let checkpoint: Option<PostgresCheckpoint> =
-            self.checkpoints.get(&self.source_id).await.map_err(|e| {
+        let raw =
+            self.checkpoints
+                .get_raw(&self.source_id)
+                .await
+                .map_err(|e| SourceError::Checkpoint {
+                    details: format!("read the durable checkpoint: {e}").into(),
+                })?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let checkpoint =
+            match super::classify_pg_checkpoint(&raw).map_err(|e| {
                 SourceError::Checkpoint {
                     details: format!("read the durable checkpoint: {e}").into(),
                 }
-            })?;
-        let Some(checkpoint) = checkpoint else {
-            return Ok(None);
-        };
+            })? {
+                // An incomplete snapshot's durable point is its anchor, on no
+                // proven chain yet.
+                super::PgResumePosition::Snapshot { anchor } => {
+                    return Ok(Some(Checkpoint {
+                        lsn: anchor,
+                        chain: None,
+                    }));
+                }
+                super::PgResumePosition::Stream(cp) => cp,
+            };
         let lsn = Lsn::parse(&checkpoint.lsn).map_err(|e| {
             SourceError::Checkpoint {
                 details: format!(

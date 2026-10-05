@@ -151,6 +151,7 @@ async fn position(port: u16, hash: &str) -> MySqlCheckpoint {
         gtid_set: s
             .get::<String, _>("Executed_Gtid_Set")
             .filter(|g| !g.is_empty()),
+        snapshot_completed: None,
     }
 }
 

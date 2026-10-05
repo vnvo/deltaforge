@@ -106,6 +106,46 @@ pub struct PostgresCheckpoint {
     pub transition: Option<u64>,
 }
 
+/// A resume position read from the checkpoint store.
+#[derive(Debug, Clone)]
+pub(crate) enum PgResumePosition {
+    /// A snapshot no sink acknowledged as complete (an incomplete-snapshot
+    /// position, or a pre-format snapshot checkpoint: the anchor LSN as
+    /// text). It is not a stream position: the snapshot runs again. `anchor`
+    /// is where that snapshot's stream started.
+    Snapshot { anchor: Lsn },
+    /// A stream position (CDC, or the completing snapshot boundary at its
+    /// anchor).
+    Stream(PostgresCheckpoint),
+}
+
+/// Classify stored checkpoint bytes; anything else fails closed.
+pub(crate) fn classify_pg_checkpoint(
+    raw: &[u8],
+) -> Result<PgResumePosition, String> {
+    let anchor = |s: &str| {
+        Lsn::parse(s).map_err(|e| format!("invalid snapshot anchor '{s}': {e}"))
+    };
+    if let Some((_, a)) = crate::snapshot_position::decode::<String>(raw)? {
+        return Ok(PgResumePosition::Snapshot {
+            anchor: anchor(&a)?,
+        });
+    }
+    if let Ok(cp) = serde_json::from_slice::<PostgresCheckpoint>(raw) {
+        return Ok(PgResumePosition::Stream(cp));
+    }
+    match std::str::from_utf8(raw) {
+        Ok(text)
+            if text.contains('/') && !text.trim_start().starts_with('{') =>
+        {
+            Ok(PgResumePosition::Snapshot {
+                anchor: anchor(text)?,
+            })
+        }
+        _ => Err("unrecognised checkpoint".to_string()),
+    }
+}
+
 // ============================================================================
 // Source Configuration
 // ============================================================================
@@ -507,17 +547,40 @@ impl PostgresSource {
         )
         .await?;
 
-        let (components, config, last_checkpoint) = prepare_replication_client(
-            self.dsn.expose(),
-            &self.id,
-            &self.slot,
-            &self.publication,
-            &chkpt_store,
-        )
-        .await?;
+        let (components, config, last_checkpoint, incomplete_snapshot) =
+            prepare_replication_client(
+                self.dsn.expose(),
+                &self.id,
+                &self.slot,
+                &self.publication,
+                &chkpt_store,
+            )
+            .await?;
 
         let mut startup_retry = RetryPolicy::default();
 
+        // A snapshot whose completion no sink acknowledged (its boundaries
+        // are incomplete-snapshot positions) runs again in full; it is never
+        // resumed as a stream, which would skip its undelivered rows.
+        if incomplete_snapshot && self.snapshot_cfg.mode == SnapshotMode::Never
+        {
+            return Err(SourceError::Checkpoint {
+                details: format!(
+                    "source {}: the resume checkpoint belongs to a snapshot \
+                     that never completed, and snapshot mode 'never' cannot \
+                     complete it; set mode 'initial' to snapshot again",
+                    self.id
+                )
+                .into(),
+            });
+        }
+        if incomplete_snapshot {
+            warn!(
+                source_id = %self.id,
+                "the snapshot was not acknowledged as complete; it runs again \
+                 in full"
+            );
+        }
         let needs_snapshot = match self.snapshot_cfg.mode {
             SnapshotMode::Initial => last_checkpoint.is_none(),
             SnapshotMode::Always => true,
@@ -625,19 +688,18 @@ impl PostgresSource {
             )
             .await?;
 
-            // An explicit re-snapshot re-scans every table: reset table-level
-            // progress so completed tables are not skipped (generation is
-            // separately bumped via ForceNew below). Fail closed if the reset
-            // does not persist - snapshotting on stale completed-table progress
-            // would skip tables and reintroduce loss.
-            if self.snapshot_cfg.mode == SnapshotMode::Always {
-                postgres_slot_owner::reset_snapshot_progress(
-                    &chkpt_store,
-                    &self.id,
-                )
-                .await
-                .map_err(SourceError::Other)?;
-            }
+            // Every snapshot scans every table: reset table-level progress so
+            // no completed table (or a stale `finished`) is skipped - nothing
+            // in it was acknowledged by the sinks (generation is separately
+            // bumped via ForceNew for mode 'always'). Fail closed if the reset
+            // does not persist - snapshotting on stale progress would skip
+            // tables and reintroduce loss.
+            postgres_slot_owner::reset_snapshot_progress(
+                &chkpt_store,
+                &self.id,
+            )
+            .await
+            .map_err(SourceError::Other)?;
 
             // Discover + validate every table, freeze lineage, allocate the
             // generation BEFORE emitting any row (keyless/unsupported tables
@@ -1265,7 +1327,80 @@ async fn advance_wal_feedback(
 /// checkpoint and with the first link (transition 0) of a chain, which was
 /// adopted from them on a single history or started fresh; never with a
 /// later transition.
+///
+/// An incomplete-snapshot position (or a pre-format snapshot checkpoint, the
+/// anchor LSN as text) equals only the same position of the same generation
+/// and anchor, and orders before any stream position at or after its anchor
+/// (the completing boundary's, or CDC after it). Against any other position -
+/// another generation or anchor, or a stream position before the anchor - it
+/// is incomparable.
 pub fn compare_pg_checkpoints(a: &[u8], b: &[u8]) -> CheckpointOrder {
+    // (generation, anchor) of a snapshot position: `None` generation for a
+    // pre-format one.
+    type Snap = (Option<u64>, Lsn);
+    let snapshot = |raw: &[u8]| -> Result<Option<Snap>, ()> {
+        match crate::snapshot_position::decode::<String>(raw) {
+            Err(_) => Err(()),
+            Ok(Some((g, a))) => {
+                Lsn::parse(&a).map(|l| Some((Some(g), l))).map_err(|_| ())
+            }
+            Ok(None) => match classify_pg_checkpoint(raw) {
+                Ok(PgResumePosition::Snapshot { anchor }) => {
+                    Ok(Some((None, anchor)))
+                }
+                _ => Ok(None),
+            },
+        }
+    };
+    let stream_at_or_after = |raw: &[u8], anchor: Lsn| {
+        serde_json::from_slice::<PostgresCheckpoint>(raw)
+            .ok()
+            .and_then(|cp| Lsn::parse(&cp.lsn).ok())
+            .is_some_and(|l| u64::from(l) >= u64::from(anchor))
+    };
+    match (snapshot(a), snapshot(b)) {
+        (Err(()), _) | (_, Err(())) => {
+            tracing::warn!(
+                "incomparable checkpoints: unreadable snapshot position"
+            );
+            CheckpointOrder::Incomparable
+        }
+        (Ok(Some(x)), Ok(Some(y))) => {
+            if x == y {
+                CheckpointOrder::Equal
+            } else {
+                tracing::warn!(
+                    "incomparable checkpoints: snapshot positions of another generation or anchor"
+                );
+                CheckpointOrder::Incomparable
+            }
+        }
+        (Ok(Some((_, anchor))), Ok(None)) => {
+            if stream_at_or_after(b, anchor) {
+                CheckpointOrder::Before
+            } else {
+                tracing::warn!(
+                    "incomparable checkpoints: a stream position not after the snapshot's anchor"
+                );
+                CheckpointOrder::Incomparable
+            }
+        }
+        (Ok(None), Ok(Some((_, anchor)))) => {
+            if stream_at_or_after(a, anchor) {
+                CheckpointOrder::After
+            } else {
+                tracing::warn!(
+                    "incomparable checkpoints: a stream position not after the snapshot's anchor"
+                );
+                CheckpointOrder::Incomparable
+            }
+        }
+        (Ok(None), Ok(None)) => compare_pg_stream_checkpoints(a, b),
+    }
+}
+
+/// [`compare_pg_checkpoints`] of two stream positions.
+fn compare_pg_stream_checkpoints(a: &[u8], b: &[u8]) -> CheckpointOrder {
     #[derive(serde::Deserialize)]
     struct Cp {
         lsn: String,
