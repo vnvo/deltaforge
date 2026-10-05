@@ -125,6 +125,11 @@ pub enum DriverError {
          ordered against each other; the snapshot cannot complete on them"
     )]
     IncomparableAcks { first: String, second: String },
+    #[error(
+        "sink {sink} holds a snapshot position, but the source has no \
+         snapshot control record: the snapshot state was lost"
+    )]
+    StateMissing { sink: String },
     #[error("legacy snapshot state is classified by the upgrade path")]
     Legacy,
     #[error("cancelled")]
@@ -180,6 +185,22 @@ pub struct StartInput<'a, E: EngineOrder> {
 }
 
 impl<E: EngineOrder> StartInput<'_, E> {
+    /// A configured sink holding a snapshot or generation start position.
+    async fn snapshot_position_without_control(
+        &self,
+    ) -> Result<Option<String>, DriverError> {
+        for sink in &self.policy.sinks {
+            let raw = self.stored(&sink.id).await?;
+            if matches!(
+                raw.as_deref().map(|r| classify_stored(self.engine, r)),
+                Some(Some(Classified::Incomplete(_) | Classified::Adopted(_)))
+            ) {
+                return Ok(Some(sink.id.clone()));
+            }
+        }
+        Ok(None)
+    }
+
     /// Whether the source's resume checkpoint is a stream position.
     async fn streams_without_snapshot(&self) -> Result<bool, DriverError> {
         let raw = self
@@ -370,6 +391,13 @@ pub async fn decide_start<E: EngineOrder>(
             // No generation was ever allocated: mode `never`, or a source
             // that has been streaming without a snapshot (mode `initial`
             // snapshots only a source with no checkpoint), keeps streaming.
+            // Snapshot positions without their control record: the
+            // snapshot state was lost; nothing proves where they stand.
+            if let Some(sink) =
+                input.snapshot_position_without_control().await?
+            {
+                return Err(DriverError::StateMissing { sink });
+            }
             if never || input.streams_without_snapshot().await? {
                 return Ok(StartOutcome::Stream {
                     lagging: Vec::new(),
@@ -771,6 +799,262 @@ mod tests {
         ));
     }
 
+    use crate::snapshot_queue::contract;
+    use checkpoints::{CheckpointStore, MemCheckpointStore};
+    use std::sync::Arc;
+
+    fn mem() -> storage::ArcStorageBackend {
+        Arc::new(storage::MemoryStorageBackend::new())
+    }
+
+    fn input<'a>(
+        q: &'a QueueStore,
+        ck: &'a MemCheckpointStore,
+    ) -> StartInput<'a, T> {
+        StartInput {
+            store: q,
+            engine: &T,
+            checkpoints: ck,
+            source_id: "src",
+            lineage: contract::lineage(),
+            config_fingerprint: "fp",
+            policy: contract::policy(),
+            mode: SnapshotMode::Initial,
+            anchor_of: &|_| Some(100),
+        }
+    }
+
+    /// Generation 1 sealed and running, owned by `run`.
+    async fn running(q: &QueueStore, run: &str) -> (u64, GenerationControl) {
+        let (v, c) = q
+            .allocate_first(contract::lineage(), "fp", contract::policy())
+            .await
+            .unwrap();
+        let mut plan = crate::snapshot_queue::PlanDigest::default();
+        plan.add("k", b"i");
+        q.seal_and_run(
+            v,
+            &c,
+            plan.seal(),
+            EngineAnchor::Postgres {
+                lsn: "100".into(),
+                timeline: None,
+                chain: None,
+                transition: None,
+            },
+            run,
+            0,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Generation g of run A is replaced and owned by run B: A's owner
+    /// check stops A, and B's control record stays byte-identical and
+    /// unblocked, also when A then tries to block its own generation.
+    #[tokio::test]
+    async fn a_stale_publisher_never_touches_the_new_owner() {
+        let backend = mem();
+        let q = QueueStore::new(backend.clone(), "src");
+        let incidents =
+            storage::adapters::incidents::IncidentStore::new(mem(), "p");
+        let (a_version, a) = running(&q, "run-a").await;
+        let stored = q.read().await.unwrap().unwrap();
+        let (v, next) = q
+            .replace(
+                &stored,
+                &contract::lineage(),
+                "fp",
+                contract::policy(),
+                false,
+            )
+            .await
+            .unwrap();
+        let mut plan = crate::snapshot_queue::PlanDigest::default();
+        plan.add("k", b"i");
+        let (_, b) = q
+            .seal_and_run(
+                v,
+                &next,
+                plan.seal(),
+                EngineAnchor::Postgres {
+                    lsn: "200".into(),
+                    timeline: None,
+                    chain: None,
+                    transition: None,
+                },
+                "run-b",
+                0,
+            )
+            .await
+            .unwrap();
+        let raw = |backend: storage::ArcStorageBackend| async move {
+            backend
+                .slot_get(
+                    crate::snapshot_queue::CONTROL_NS,
+                    &crate::snapshot_queue::control_key("src"),
+                )
+                .await
+                .unwrap()
+        };
+        let before = raw(backend.clone()).await;
+
+        let lost =
+            owner_lost(&q, &incidents, "src", a.generation, "run-a").await;
+        assert!(lost.is_some(), "A stops");
+        block_generation(
+            &q,
+            &incidents,
+            a.generation,
+            Some("run-a"),
+            a_version,
+            &incidents::blocked(
+                deltaforge_core::incident::ReasonCode::SnapshotAnchorUnavailable,
+                "src",
+                a.generation,
+                "anchor_age",
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(raw(backend.clone()).await, before, "byte-identical");
+        let Some(Stored::Current { control, .. }) = q.read().await.unwrap()
+        else {
+            panic!("current")
+        };
+        assert!(control.blocked.is_none(), "B is not blocked");
+        assert_eq!(control.run.as_deref(), Some("run-b"));
+        // The incident is A's, not blocking.
+        let open = incidents.list().await.unwrap();
+        assert!(open.iter().any(|r| {
+            r.reason_code
+                == deltaforge_core::incident::ReasonCode::SnapshotStateInvalid
+                && r.safety_state
+                    == deltaforge_core::incident::SafetyState::RunningDegraded
+        }));
+        // B is still the owner.
+        assert!(
+            owner_lost(&q, &incidents, "src", b.generation, "run-b")
+                .await
+                .is_none()
+        );
+
+        // B itself blocks only at exactly the version it holds.
+        let draft = incidents::blocked(
+            deltaforge_core::incident::ReasonCode::SnapshotAnchorUnavailable,
+            "src",
+            b.generation,
+            "anchor_age",
+        );
+        let Some(Stored::Current { version: held, .. }) =
+            q.read().await.unwrap()
+        else {
+            panic!("current")
+        };
+        block_generation(
+            &q,
+            &incidents,
+            b.generation,
+            Some("run-b"),
+            held - 1,
+            &draft,
+        )
+        .await
+        .unwrap();
+        assert_eq!(raw(backend.clone()).await, before, "a stale version");
+        block_generation(
+            &q,
+            &incidents,
+            b.generation,
+            Some("run-a"),
+            held,
+            &draft,
+        )
+        .await
+        .unwrap();
+        assert_eq!(raw(backend.clone()).await, before, "another run");
+        block_generation(
+            &q,
+            &incidents,
+            b.generation,
+            Some("run-b"),
+            held,
+            &draft,
+        )
+        .await
+        .unwrap();
+        let Some(Stored::Current { control, .. }) = q.read().await.unwrap()
+        else {
+            panic!("current")
+        };
+        assert!(control.blocked.is_some(), "its exact version");
+    }
+
+    /// Snapshot positions without a control record fail the start closed.
+    #[tokio::test]
+    async fn snapshot_positions_without_their_control_record_fail_closed() {
+        let q = QueueStore::new(mem(), "src");
+        let ck = MemCheckpointStore::new().unwrap();
+        ck.put_raw(&sink_key("src", "s3"), &stream(500))
+            .await
+            .unwrap();
+        ck.put_raw(&sink_key("src", "kafka"), &encode_chained("c", 2, 100u64))
+            .await
+            .unwrap();
+        assert!(matches!(
+            decide_start(&input(&q, &ck)).await,
+            Err(DriverError::StateMissing { sink }) if sink == "kafka"
+        ));
+        assert!(q.read().await.unwrap().is_none(), "nothing allocated");
+    }
+
+    /// The resume fold leaves a sink out only once the generation is
+    /// durably completed and the sink is behind it.
+    #[tokio::test]
+    async fn only_a_completed_generation_excludes_its_lagging_sinks() {
+        let q = QueueStore::new(mem(), "src");
+        let ck = MemCheckpointStore::new().unwrap();
+        let (v, c) = running(&q, "r").await;
+        let chain = c.snapshot_chain.clone();
+        // kafka (optional) holds an incomplete position, s3 (required) is
+        // still behind as well.
+        ck.put_raw(
+            &sink_key("src", "kafka"),
+            &encode_chained(&chain, 1, 100u64),
+        )
+        .await
+        .unwrap();
+        ck.put_raw(&sink_key("src", "s3"), &encode_chained(&chain, 1, 100u64))
+            .await
+            .unwrap();
+        assert!(resume_exclusions(&input(&q, &ck)).await.unwrap().is_empty());
+        let (v, produced) = q.rows_produced(v, &c, "r").await.unwrap();
+        assert!(
+            resume_exclusions(&input(&q, &ck)).await.unwrap().is_empty(),
+            "rows produced, the policy not covered"
+        );
+        assert!(
+            try_complete(&input(&q, &ck), v, &produced)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // The required sink reaches the terminal: completed, kafka behind.
+        ck.put_raw(&sink_key("src", "s3"), &marked(100, &chain, 1))
+            .await
+            .unwrap();
+        assert!(
+            try_complete(&input(&q, &ck), v, &produced)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            resume_exclusions(&input(&q, &ck)).await.unwrap(),
+            ["kafka"]
+        );
+    }
+
     #[test]
     fn a_sink_is_classified_against_the_generation() {
         use SinkState::*;
@@ -862,29 +1146,42 @@ pub async fn report_start(
     }
 }
 
-/// Block generation `generation` until an explicit resnapshot (design
-/// section 9.2): raise `draft`, then record `blocked` (reason and incident)
-/// by control CAS. A generation already replaced, completed or blocked is
-/// left as it is. A failure to record either is returned: the next start
+/// Block generation `generation`, owned by `run`, at control `version`,
+/// until an explicit resnapshot (design section 9.2): raise `draft`, then
+/// record `blocked` (reason and incident) by one control CAS at exactly
+/// that version. Anything else - a generation replaced, owned by another
+/// run, at another version, completed or blocked - is left as it is, and
+/// nothing is raised. A failure to record either is returned: the next start
 /// runs the detection again before any decision.
 pub async fn block_generation(
     store: &QueueStore,
     incidents: &storage::adapters::incidents::IncidentStore,
     generation: u64,
+    run: Option<&str>,
+    version: u64,
     draft: &deltaforge_core::incident::IncidentDraft,
 ) -> Result<(), DriverError> {
-    let raised = incidents.raise(draft, 1).await.map_err(|e| {
-        DriverError::Checkpoint(format!("record the incident: {e:#}"))
-    })?;
-    let Some(Stored::Current { version, control }) = store.read().await? else {
+    let Some(Stored::Current {
+        version: current,
+        control,
+    }) = store.read().await?
+    else {
         return Ok(());
     };
-    if control.generation != generation
+    // Only the caller's own generation, owned by its own run (`None` before
+    // it is sealed), at exactly the version it holds: never another owner's.
+    if current != version
+        || control.generation != generation
+        || control.run.as_deref() != run
         || control.state == State::Completed
         || control.blocked.is_some()
     {
         return Ok(());
     }
+    let raised = incidents.raise(draft, 1).await.map_err(|e| {
+        DriverError::Checkpoint(format!("record the incident: {e:#}"))
+    })?;
+    // One CAS at that version; a lost race is not retried.
     store
         .block(
             version,
@@ -897,6 +1194,63 @@ pub async fn block_generation(
         )
         .await?;
     Ok(())
+}
+
+/// After a failure of a running generation (design section 8): whether
+/// the control record still shows `generation` owned by `run`. When it
+/// does not, another process took over: this (stale) process must stop. A
+/// non-blocking `concurrent_owner` incident is raised and the control
+/// record is never written - the current owner's work goes on. `None`:
+/// still the owner.
+pub async fn owner_lost(
+    store: &QueueStore,
+    incidents: &storage::adapters::incidents::IncidentStore,
+    source_id: &str,
+    generation: u64,
+    run: &str,
+) -> Option<String> {
+    let current = match store.read().await {
+        Ok(Some(Stored::Current { control, .. })) => Some(control),
+        _ => None,
+    };
+    if let Some(c) = &current
+        && c.generation == generation
+        && c.run.as_deref() == Some(run)
+    {
+        return None;
+    }
+    let now = current.map_or_else(
+        || "no readable control record".to_string(),
+        |c| {
+            format!("generation {} of run {:?} is current", c.generation, c.run)
+        },
+    );
+    if let Err(e) = incidents
+        .raise(&incidents::concurrent_owner(source_id, generation), 1)
+        .await
+    {
+        tracing::warn!(source_id, error = %format!("{e:#}"), "could not record a snapshot incident");
+    }
+    Some(format!(
+        "snapshot generation {generation} is no longer this run's ({now}): \
+         another process owns the source's snapshot; this one stops"
+    ))
+}
+
+/// The sinks the resume fold leaves out (design section 6.3): only after
+/// the control record durably shows the current generation `completed`,
+/// the sinks of the configuration classified behind it. Nothing otherwise.
+pub async fn resume_exclusions<E: EngineOrder>(
+    input: &StartInput<'_, E>,
+) -> Result<Vec<String>, DriverError> {
+    match input.store.read().await? {
+        Some(Stored::Current { control, .. })
+            if control.state == State::Completed =>
+        {
+            lagging(input, &control).await
+        }
+        _ => Ok(Vec::new()),
+    }
 }
 
 /// The incidents the generation driver's decisions raise.
@@ -954,6 +1308,29 @@ pub mod incidents {
             e.text(K::SourceId, source_id)
                 .text(K::ExpectedGeneration, &generation.to_string())
                 .text(K::ReasonClass, class);
+        })
+        .with_actions(&[ActionCode::InspectLogs])
+    }
+
+    /// A stale process found another owner of its source's snapshot
+    /// (design section 8): it stops; the current owner continues. Not
+    /// blocking, but the deployment breaks the single-writer contract.
+    pub fn concurrent_owner(source_id: &str, generation: u64) -> IncidentDraft {
+        IncidentDraft::new(
+            ReasonCode::SnapshotStateInvalid,
+            Component::Source {
+                id: source_id.to_string(),
+            },
+            Retryability::OperatorAction,
+            SafetyState::RunningDegraded,
+            CauseCode::SourceOther,
+        )
+        .discriminate("generation", generation.to_string())
+        .discriminate("class", "concurrent_owner")
+        .with_evidence(|e| {
+            e.text(K::SourceId, source_id)
+                .text(K::ExpectedGeneration, &generation.to_string())
+                .text(K::ReasonClass, "concurrent_owner");
         })
         .with_actions(&[ActionCode::InspectLogs])
     }

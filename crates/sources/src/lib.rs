@@ -30,11 +30,19 @@ pub mod snapshot_position;
 pub mod snapshot_probe;
 pub mod snapshot_publish;
 
-/// The pipeline's commit policy and sink cohort, as the runner set it before
-/// the source runs (`Source::set_snapshot_cohort`); a snapshot generation
-/// freezes it.
-pub type SnapshotCohortSlot =
-    std::sync::Arc<std::sync::Mutex<Option<deltaforge_core::SnapshotCohort>>>;
+/// A source's snapshot state shared with the runner: the commit policy and
+/// sink cohort the runner set before the source runs
+/// (`Source::set_snapshot_cohort`), which a generation freezes, and the
+/// sinks the resume fold leaves out (`Source::resume_exclusions`).
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotShared {
+    pub cohort: Option<deltaforge_core::SnapshotCohort>,
+    /// Set only from a durably completed generation; empty otherwise.
+    pub resume_exclusions: Vec<String>,
+}
+
+/// [`SnapshotShared`], shared by a source and its clones.
+pub type SnapshotCohortSlot = std::sync::Arc<std::sync::Mutex<SnapshotShared>>;
 pub mod snapshot_queue;
 pub mod stream_probe;
 mod table_patterns;

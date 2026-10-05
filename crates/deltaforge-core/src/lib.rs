@@ -1083,12 +1083,18 @@ pub trait Source: Send + Sync {
 
     /// Whether a stored checkpoint is a snapshot position (an incomplete
     /// snapshot, or a sink's start of a generation) rather than a stream
-    /// position. Snapshot positions are classified against the source's
-    /// snapshot state; the resume fold orders only stream positions when
-    /// any sink holds one (`docs/design/snapshot-durable-queue.md`, section
-    /// 6.3). Default: none is.
+    /// position. Default: none is.
     fn checkpoint_is_snapshot(&self, _raw: &[u8]) -> bool {
         false
+    }
+
+    /// The sinks the resume fold leaves out while they hold a snapshot
+    /// position: those the source classified behind a snapshot generation
+    /// its control record durably shows completed
+    /// (`docs/design/snapshot-durable-queue.md`, section 6.3). Default:
+    /// none.
+    fn resume_exclusions(&self) -> Vec<String> {
+        Vec::new()
     }
 
     /// The pipeline's commit policy and sink cohort, set by the runner before

@@ -31,6 +31,10 @@ type CheckpointCmpFn =
 /// (`Source::checkpoint_is_snapshot`).
 type IsSnapshotFn = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
 
+/// The sinks a source leaves out of the resume fold
+/// (`Source::resume_exclusions`).
+type ExclusionsFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
 /// Startup/recovery error for two per-sink checkpoints the source cannot order.
 /// Carries the affected checkpoint keys so an operator can locate the corrupt or
 /// incompatible entries.
@@ -90,6 +94,9 @@ pub struct PerSinkCheckpointProxy {
     /// Whether a checkpoint is a snapshot position
     /// (`Source::checkpoint_is_snapshot`).
     is_snapshot: IsSnapshotFn,
+    /// The sinks left out of the fold while they hold a snapshot position
+    /// (`Source::resume_exclusions`: behind a durably completed generation).
+    exclusions: ExclusionsFn,
     /// Notified by the coordinator after each per-sink checkpoint commit, so the source
     /// advances WAL feedback change-driven (on commit) rather than by fixed polling. A
     /// long fallback still re-confirms during long idle. Defaults to an unshared handle
@@ -112,12 +119,14 @@ impl PerSinkCheckpointProxy {
         source_id: String,
         source: &Arc<dyn deltaforge_core::Source>,
     ) -> Self {
-        let (cmp, snap) = (Arc::clone(source), Arc::clone(source));
+        let (cmp, snap, excl) =
+            (Arc::clone(source), Arc::clone(source), Arc::clone(source));
         Self {
             inner,
             source_id,
             cmp_fn: Arc::new(move |a, b| cmp.compare_checkpoints(a, b)),
             is_snapshot: Arc::new(move |raw| snap.checkpoint_is_snapshot(raw)),
+            exclusions: Arc::new(move || excl.resume_exclusions()),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -167,20 +176,23 @@ impl CheckpointStore for PerSinkCheckpointProxy {
             // naming the affected keys, rather than silently skipping one and
             // resuming ahead of the sink that needs it.
             //
-            // A sink holding a snapshot position is behind a snapshot
-            // generation, which the source classifies against its snapshot
-            // state; while any sink holds a stream position, the resume
-            // position folds only stream positions, so a lagging sink never
-            // pulls the stream back into the snapshot (snapshot design,
-            // section 6.3).
+            // A sink the source proved behind a durably completed snapshot
+            // generation (`resume_exclusions`) is left out while it still
+            // holds a snapshot position, so it never pulls the stream back
+            // into that snapshot (snapshot design, section 6.3). Nothing is
+            // left out on checkpoint shape alone.
+            let excluded = (self.exclusions)();
             let mut stored = Vec::with_capacity(keys.len());
             for k in &keys {
                 if let Some(data) = self.inner.get_raw(k).await? {
+                    let sink = k.strip_prefix(&prefix).unwrap_or(k);
+                    if excluded.iter().any(|e| e == sink)
+                        && (self.is_snapshot)(&data)
+                    {
+                        continue;
+                    }
                     stored.push((k, data));
                 }
-            }
-            if stored.iter().any(|(_, d)| !(self.is_snapshot)(d)) {
-                stored.retain(|(_, d)| !(self.is_snapshot)(d));
             }
             let mut min_data: Option<Vec<u8>> = None;
             let mut min_key: Option<String> = None;
@@ -4046,6 +4058,7 @@ mod tests {
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
             is_snapshot: Arc::new(|_| false),
+            exclusions: Arc::new(Vec::new),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         assert_eq!(
@@ -4069,6 +4082,7 @@ mod tests {
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
             is_snapshot: Arc::new(|_| false),
+            exclusions: Arc::new(Vec::new),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         // No per-sink checkpoints and no legacy key - fresh start.
@@ -4086,6 +4100,7 @@ mod tests {
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
             is_snapshot: Arc::new(|_| false),
+            exclusions: Arc::new(Vec::new),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         // No per-sink keys exist, so it should fall back to the legacy key.
@@ -4117,6 +4132,7 @@ mod tests {
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
             is_snapshot: Arc::new(|_| false),
+            exclusions: Arc::new(Vec::new),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
 
@@ -4148,6 +4164,7 @@ mod tests {
                     source_id: "pg".to_string(),
                     cmp_fn: Arc::new(sources::postgres::compare_pg_checkpoints),
                     is_snapshot: Arc::new(|_| false),
+                    exclusions: Arc::new(Vec::new),
                     commit_signal: Arc::new(tokio::sync::Notify::new()),
                 }
             }
@@ -4185,6 +4202,7 @@ mod tests {
                 source_id: "src".to_string(),
                 cmp_fn: Arc::new(cmp),
                 is_snapshot: Arc::new(|_| false),
+                exclusions: Arc::new(Vec::new),
                 commit_signal: Arc::new(tokio::sync::Notify::new()),
             };
             proxy
@@ -4246,18 +4264,24 @@ mod tests {
         }
     }
 
-    /// After a completed generation, a sink still holding a snapshot
-    /// position is excluded from the resume fold while another holds a
-    /// stream position; with snapshot positions only, they fold as before.
+    /// A sink is left out of the fold only when the source declared it
+    /// behind a durably completed generation and it still holds a snapshot
+    /// position. Without that proof (no control record, a generation still
+    /// running or with its rows produced but not covered) nothing is left
+    /// out: the fold never returns a position ahead of an incomplete sink.
     #[tokio::test]
-    async fn per_sink_proxy_folds_stream_positions_past_lagging_snapshot_sinks()
-    {
-        async fn fold(entries: &[&[u8]]) -> Result<Vec<u8>, ()> {
+    async fn per_sink_proxy_excludes_only_declared_lagging_snapshot_sinks() {
+        async fn fold(
+            entries: &[&[u8]],
+            excluded: &[&str],
+        ) -> Result<Vec<u8>, ()> {
             let store =
                 Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
             for (i, v) in entries.iter().enumerate() {
                 store.put_raw(&format!("src::sink::s{i}"), v).await.unwrap();
             }
+            let excluded: Vec<String> =
+                excluded.iter().map(|s| s.to_string()).collect();
             let proxy = PerSinkCheckpointProxy {
                 inner: store,
                 source_id: "src".to_string(),
@@ -4265,6 +4289,7 @@ mod tests {
                 is_snapshot: Arc::new(
                     sources::postgres::pg_checkpoint_is_snapshot,
                 ),
+                exclusions: Arc::new(move || excluded.clone()),
                 commit_signal: Arc::new(tokio::sync::Notify::new()),
             };
             proxy
@@ -4278,15 +4303,23 @@ mod tests {
         let started = encode_adopted("c", 3, "d");
         let completing: &[u8] = br#"{"lsn":"0/300","tx_id":null,"snapshot_completed":3,"snapshot_chain":"c"}"#;
         let cdc: &[u8] = br#"{"lsn":"0/500","tx_id":null}"#;
+        let mixed: [&[u8]; 3] = [&inc, completing, cdc];
+
+        // No proof of completion: the incomplete sink is the minimum.
+        assert_eq!(fold(&mixed, &[]).await, Ok(inc.clone()));
+        // A generation start against a stream position: never ordered.
+        assert_eq!(fold(&[&started, cdc], &[]).await, Err(()));
+
+        // Durably completed, s0 declared behind it: the approved frontier.
+        assert_eq!(fold(&mixed, &["s0"]).await, Ok(completing.to_vec()));
+        assert_eq!(fold(&[&started, cdc], &["s0"]).await, Ok(cdc.to_vec()));
+        // A declared sink holding a stream position still counts.
+        assert_eq!(fold(&mixed, &["s2"]).await, Ok(inc.clone()));
         assert_eq!(
-            fold(&[&inc, completing, cdc]).await,
-            Ok(completing.to_vec())
+            fold(&[completing, cdc], &["s0"]).await,
+            Ok(completing.to_vec()),
+            "never skipped ahead of a declared sink's stream position"
         );
-        assert_eq!(fold(&[&started, cdc]).await, Ok(cdc.to_vec()));
-        assert_eq!(fold(&[&inc, &inc]).await, Ok(inc.clone()));
-        // Stream positions still fail closed among themselves.
-        let foreign: &[u8] = br#"{"lsn":"0/600","tx_id":null,"timeline":2,"chain":"x","transition":1}"#;
-        assert_eq!(fold(&[&inc, cdc, foreign]).await, Err(()));
     }
 
     #[tokio::test]
@@ -4299,6 +4332,7 @@ mod tests {
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
             is_snapshot: Arc::new(|_| false),
+            exclusions: Arc::new(Vec::new),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
 
@@ -4320,6 +4354,7 @@ mod tests {
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
             is_snapshot: Arc::new(|_| false),
+            exclusions: Arc::new(Vec::new),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
 
@@ -4398,6 +4433,7 @@ mod tests {
             source_id: "src".to_string(),
             cmp_fn: test_cmp_fn(),
             is_snapshot: Arc::new(|_| false),
+            exclusions: Arc::new(Vec::new),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         proxy
@@ -4471,6 +4507,7 @@ mod tests {
             source_id: "src".to_string(),
             cmp_fn: test_cmp_fn(),
             is_snapshot: Arc::new(|_| false),
+            exclusions: Arc::new(Vec::new),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         let got = proxy.get_raw("src").await.unwrap().unwrap();
@@ -4497,6 +4534,7 @@ mod tests {
                 sources::postgres::compare_pg_checkpoints(a, b)
             }),
             is_snapshot: Arc::new(|_| false),
+            exclusions: Arc::new(Vec::new),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         let got = proxy.get_raw("pg").await.unwrap().unwrap();
@@ -4519,6 +4557,7 @@ mod tests {
                 sources::postgres::compare_pg_checkpoints(a, b)
             }),
             is_snapshot: Arc::new(|_| false),
+            exclusions: Arc::new(Vec::new),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         let err = proxy

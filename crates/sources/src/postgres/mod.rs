@@ -525,7 +525,12 @@ impl PostgresSource {
     ) -> SourceResult<(PgStart, Option<PgGenerationInputs>)> {
         use crate::snapshot_driver::{DriverError, StartOutcome, decide_start};
         let queue = self.queue();
-        let cohort = self.snapshot_cohort.lock().expect("not poisoned").clone();
+        let cohort = self
+            .snapshot_cohort
+            .lock()
+            .expect("not poisoned")
+            .cohort
+            .clone();
         let Some(cohort) = cohort else {
             // A source run outside a pipeline: only mode `never` without
             // any generation streams; a snapshot needs the frozen cohort.
@@ -589,6 +594,22 @@ impl PostgresSource {
             completed.as_ref(),
         )
         .await;
+        // The resume fold leaves out only the sinks behind a generation the
+        // control record durably shows completed; a new generation has none.
+        let exclusions = match &outcome {
+            StartOutcome::Stream { .. } => {
+                crate::snapshot_driver::resume_exclusions(&inputs.input())
+                    .await
+                    .map_err(|e| SourceError::Checkpoint {
+                        details: format!("source {}: {e}", self.id).into(),
+                    })?
+            }
+            StartOutcome::Snapshot { .. } => Vec::new(),
+        };
+        self.snapshot_cohort
+            .lock()
+            .expect("not poisoned")
+            .resume_exclusions = exclusions;
         let start = match outcome {
             StartOutcome::Stream { .. } => PgStart::Stream {
                 completed_anchor: completed
@@ -631,6 +652,7 @@ impl PostgresSource {
     async fn plan_generation(
         &self,
         loader: &PostgresSchemaLoader,
+        version: u64,
         control: &crate::snapshot_queue::GenerationControl,
     ) -> SourceResult<crate::snapshot_queue::PlanSummary> {
         use crate::identity_resolution::{
@@ -756,6 +778,8 @@ impl PostgresSource {
                         &queue,
                         &self.incidents(),
                         control.generation,
+                        None,
+                        version,
                         &draft,
                     )
                     .await
@@ -800,53 +824,27 @@ impl PostgresSource {
         Ok(digest.seal())
     }
 
-    /// After a failure of a running generation: the control record no
-    /// longer showing this run's generation (another process took it over)
-    /// is a concurrent owner (design section 8), blocked with
-    /// `snapshot_state_invalid` until an explicit resnapshot. `None` when
-    /// this run still owns it, or it is already blocked.
+    /// After a failure of a running generation: when the control record no
+    /// longer shows this run's generation, another process took over, and
+    /// this one stops (a non-blocking `concurrent_owner` incident; the
+    /// current owner's control record is never written). `None` when this
+    /// run still owns it.
     async fn concurrent_owner(
         &self,
         queue: &crate::snapshot_queue::QueueStore,
         generation: u64,
         run: &str,
     ) -> Option<SourceError> {
-        let Ok(Some(crate::snapshot_queue::Stored::Current {
-            control, ..
-        })) = queue.read().await
-        else {
-            return None;
-        };
-        if control.blocked.is_some()
-            || (control.generation == generation
-                && control.run.as_deref() == Some(run))
-        {
-            return None;
-        }
-        let draft = crate::snapshot_driver::incidents::blocked(
-            deltaforge_core::incident::ReasonCode::SnapshotStateInvalid,
-            &self.id,
-            control.generation,
-            "concurrent_owner",
-        );
-        if let Err(e) = crate::snapshot_driver::block_generation(
+        crate::snapshot_driver::owner_lost(
             queue,
             &self.incidents(),
-            control.generation,
-            &draft,
+            &self.id,
+            generation,
+            run,
         )
         .await
-        {
-            warn!(source_id = %self.id, error = %e, "could not record the block");
-        }
-        Some(SourceError::Incompatible {
-            details: format!(
-                "source {}: snapshot generation {generation} was taken over \
-                 by another run (generation {} is current): a concurrent \
-                 owner; blocked until an explicit resnapshot",
-                self.id, control.generation
-            )
-            .into(),
+        .map(|why| SourceError::Incompatible {
+            details: format!("source {}: {why}", self.id).into(),
         })
     }
 
@@ -1003,7 +1001,7 @@ impl PostgresSource {
         let anchor = PgAnchor::new(anchor_lsn, Some(&stamp));
 
         // 3. The plan, page by page.
-        let plan = self.plan_generation(loader, &control).await?;
+        let plan = self.plan_generation(loader, version, &control).await?;
 
         // The preflight: slot and WAL settings, and the size estimate over
         // the plan, page by page.
@@ -1092,7 +1090,10 @@ impl PostgresSource {
             .map_err(|e| {
                 other(anyhow::anyhow!("seal the snapshot plan: {e}"))
             })?;
-        let _ = version;
+        // The version the guard may block at: the sealed record, then the
+        // record once the start barrier is done.
+        let guard_version =
+            Arc::new(std::sync::atomic::AtomicU64::new(version));
         info!(
             source_id = %self.id,
             generation = control.generation,
@@ -1114,6 +1115,8 @@ impl PostgresSource {
                 generation: control.generation,
                 anchored_at_ms: control.anchored_at_ms.unwrap_or_default(),
                 max_anchor_age: Duration::from_secs(cfg.max_anchor_age_secs),
+                run: run.clone(),
+                version: Arc::clone(&guard_version),
                 queue: queue.clone(),
                 incidents: self.incidents(),
                 cancel: gen_cancel.clone(),
@@ -1164,11 +1167,16 @@ impl PostgresSource {
             None if cancel.is_cancelled() => SourceError::Cancelled,
             None => other(anyhow::anyhow!("snapshot start barrier: {e}")),
         });
-        if let Err(e) = adopted {
-            return Err(self
-                .concurrent_owner(queue, control.generation, &run)
-                .await
-                .unwrap_or(e));
+        match adopted {
+            Ok((v, _)) => {
+                guard_version.store(v, std::sync::atomic::Ordering::SeqCst)
+            }
+            Err(e) => {
+                return Err(self
+                    .concurrent_owner(queue, control.generation, &run)
+                    .await
+                    .unwrap_or(e));
+            }
         }
 
         // 7. The copy.
@@ -1283,6 +1291,7 @@ impl PostgresSource {
         spawn_completion_watch(
             inputs.clone(),
             self.incidents(),
+            Arc::clone(&self.snapshot_cohort),
             cancel.clone(),
         );
         Ok(anchor_lsn)
@@ -1291,10 +1300,11 @@ impl PostgresSource {
 
 /// Record `completed` once the frozen policy's frontier covers the
 /// generation's terminal (design section 6.2), then report the sinks behind
-/// it. Ends with the source, or on anything but `rows_produced`.
+/// it and leave them out of the resume fold. Ends with the source, or on anything but `rows_produced`.
 fn spawn_completion_watch(
     inputs: PgGenerationInputs,
     incidents: IncidentStore,
+    shared: crate::SnapshotCohortSlot,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -1320,6 +1330,12 @@ fn spawn_completion_watch(
                             let behind = lagging(&input, &done)
                                 .await
                                 .unwrap_or_default();
+                            // Durably completed: the sinks behind it leave
+                            // the resume fold.
+                            shared
+                                .lock()
+                                .expect("not poisoned")
+                                .resume_exclusions = behind.clone();
                             report_start(
                                 &incidents,
                                 &inputs.source_id,
@@ -2407,7 +2423,16 @@ impl Source for PostgresSource {
     }
 
     fn set_snapshot_cohort(&self, cohort: deltaforge_core::SnapshotCohort) {
-        *self.snapshot_cohort.lock().expect("not poisoned") = Some(cohort);
+        self.snapshot_cohort.lock().expect("not poisoned").cohort =
+            Some(cohort);
+    }
+
+    fn resume_exclusions(&self) -> Vec<String> {
+        self.snapshot_cohort
+            .lock()
+            .expect("not poisoned")
+            .resume_exclusions
+            .clone()
     }
 
     async fn check_durable_snapshot_startup(

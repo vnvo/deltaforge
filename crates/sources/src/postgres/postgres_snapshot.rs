@@ -437,6 +437,11 @@ pub struct GenerationGuard {
     pub generation: u64,
     pub anchored_at_ms: i64,
     pub max_anchor_age: std::time::Duration,
+    /// The run that owns the generation: only its own generation is
+    /// blocked.
+    pub run: String,
+    /// The control version the run holds: the only one blocked at.
+    pub version: Arc<std::sync::atomic::AtomicU64>,
     pub queue: QueueStore,
     pub incidents: storage::adapters::incidents::IncidentStore,
     /// Cancelled when the generation blocks.
@@ -615,6 +620,9 @@ pub fn spawn_generation_guard(
                                 &g.queue,
                                 &g.incidents,
                                 g.generation,
+                                Some(&g.run),
+                                g.version
+                                    .load(std::sync::atomic::Ordering::SeqCst),
                                 &draft,
                             )
                             .await
