@@ -322,6 +322,7 @@ async fn mysql_an_interrupted_snapshot_restarts_in_full() -> Result<()> {
         )?,
         done_tables: [format!("{db}.table_a")].into(),
         finished: false,
+        generation: 0,
     };
     ckpt.put_raw(
         &progress_key("snap-resume"),
@@ -463,6 +464,7 @@ async fn mysql_a_failed_progress_reset_stops_the_snapshot() -> Result<()> {
         start_position: "{}".into(),
         done_tables: [format!("{db}.t")].into(),
         finished: false,
+        generation: 0,
     })?;
     store
         .put_raw(&progress_key("snap-reset-fail"), &interrupted)

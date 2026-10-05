@@ -123,6 +123,83 @@ pub(crate) fn classify_mysql_checkpoint(
         .map_err(|e| format!("unrecognised checkpoint: {e}"))
 }
 
+/// Whether `resume` proves the sinks committed the snapshot `progress`
+/// records: either its completing checkpoint (marked with that snapshot's
+/// generation, exactly at its anchor), or an unmarked stream position the
+/// comparator orders strictly after the anchor. A missing or unreadable
+/// anchor, another generation, or a position at, before or incomparable with
+/// the anchor proves nothing.
+pub(crate) fn snapshot_completion_proven(
+    progress: Option<&MysqlSnapshotProgress>,
+    resume: Option<&MySqlCheckpoint>,
+) -> bool {
+    let (Some(progress), Some(cp)) = (progress, resume) else {
+        return false;
+    };
+    let Ok(anchor) =
+        serde_json::from_str::<MySqlCheckpoint>(&progress.start_position)
+    else {
+        return false;
+    };
+    if let Some(generation) = cp.snapshot_completed {
+        return progress.generation != 0
+            && generation == progress.generation
+            && same_position(cp, &anchor)
+            && cp.lineage == anchor.lineage;
+    }
+    let (Ok(a), Ok(c)) = (serde_json::to_vec(&anchor), serde_json::to_vec(cp))
+    else {
+        return false;
+    };
+    compare_mysql_stream_checkpoints(&a, &c) == CheckpointOrder::Before
+}
+
+/// What a start must do about the initial snapshot.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SnapshotNeed {
+    /// Run the snapshot (in full).
+    pub needs_snapshot: bool,
+    /// A snapshot was recorded (an anchor taken) whose completion the sinks
+    /// have not proven: it runs again as a new generation.
+    pub unproven: bool,
+}
+
+/// Decide whether a start snapshots. A recorded snapshot counts as complete
+/// only by [`snapshot_completion_proven`]; `finished` alone records that its
+/// rows were read, not delivered. Mode `never` with an unproven snapshot, or
+/// with an incomplete-snapshot resume position, fails closed.
+pub(crate) fn snapshot_need(
+    mode: &SnapshotMode,
+    progress: Option<&MysqlSnapshotProgress>,
+    resume: Option<&MyResumePosition>,
+) -> Result<SnapshotNeed, String> {
+    let stream = match resume {
+        Some(MyResumePosition::Stream(cp)) => Some(cp),
+        _ => None,
+    };
+    let recorded = progress.is_some_and(|p| !p.start_position.is_empty());
+    let finished = progress.is_some_and(|p| p.finished);
+    let proven = snapshot_completion_proven(progress, stream);
+    let unproven = recorded && !proven;
+    if *mode == SnapshotMode::Never
+        && (unproven || matches!(resume, Some(MyResumePosition::Snapshot)))
+    {
+        return Err("a snapshot was recorded whose completion the sinks \
+                    have not proven, and snapshot mode 'never' cannot \
+                    complete it; set mode 'initial' to snapshot again"
+            .into());
+    }
+    let needs_snapshot = match mode {
+        SnapshotMode::Initial => !finished || unproven,
+        SnapshotMode::Always => true,
+        SnapshotMode::Never => false,
+    };
+    Ok(SnapshotNeed {
+        needs_snapshot,
+        unproven: finished && unproven,
+    })
+}
+
 /// Whether two checkpoints name the same binlog position (file, position and
 /// GTID set; lineage and the completion mark aside).
 fn same_position(a: &MySqlCheckpoint, b: &MySqlCheckpoint) -> bool {
@@ -664,43 +741,17 @@ impl MySqlSource {
             Some(MyResumePosition::Stream(cp)) => Some(cp.clone()),
             _ => None,
         };
-        // A finished snapshot is complete only once the sinks committed it:
-        // the resume position is its completing boundary (marked) or a
-        // stream position past its anchor. `finished` alone records that the
-        // rows were read, not delivered; a checkpoint at the anchor without
-        // the mark was written before the proof existed and proves nothing
-        // (the snapshot runs once more: duplicates, never loss).
-        let finished = snapshot_progress.as_ref().is_some_and(|p| p.finished);
-        let anchor = snapshot_progress.as_ref().and_then(|p| {
-            serde_json::from_str::<MySqlCheckpoint>(&p.start_position).ok()
-        });
-        let completion_proven = match &stream_resume {
-            Some(cp) => {
-                cp.snapshot_completed.is_some()
-                    || anchor.as_ref().is_none_or(|a| !same_position(a, cp))
-            }
-            None => false,
-        };
-        let unproven_snapshot = finished && !completion_proven;
-        if matches!(resume, Some(MyResumePosition::Snapshot))
-            && self.snapshot_cfg.mode == SnapshotMode::Never
-        {
-            return Err(SourceError::Checkpoint {
-                details: format!(
-                    "source {}: the resume checkpoint belongs to a snapshot \
-                     that never completed, and snapshot mode 'never' cannot \
-                     complete it; set mode 'initial' to snapshot again",
-                    self.id
-                )
-                .into(),
-            });
-        }
-
-        let needs_snapshot = match self.snapshot_cfg.mode {
-            SnapshotMode::Initial => !finished || unproven_snapshot,
-            SnapshotMode::Always => true,
-            SnapshotMode::Never => false,
-        };
+        let SnapshotNeed {
+            needs_snapshot,
+            unproven: unproven_snapshot,
+        } = snapshot_need(
+            &self.snapshot_cfg.mode,
+            snapshot_progress.as_ref(),
+            resume.as_ref(),
+        )
+        .map_err(|e| SourceError::Checkpoint {
+            details: format!("source {}: {e}", self.id).into(),
+        })?;
         // Whether this start continues from a committed resume position.
         let committed_resume = stream_resume.is_some() && !needs_snapshot;
 
@@ -2717,6 +2768,146 @@ mod identity_fail_closed_tests {
         assert!(
             msg.contains("refusing to stream"),
             "error should refuse to stream on unverified identity, got: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_completion_tests {
+    use super::*;
+
+    const UUID: &str = "3E11FA47-71CA-11E1-9E33-C80AA9429562";
+    const LINEAGE: &str = "0123456789abcdef0123456789abcdef";
+
+    fn at(set: &str) -> MySqlCheckpoint {
+        MySqlCheckpoint {
+            file: "mysql-bin.000003".into(),
+            pos: 100,
+            gtid_set: Some(format!("{UUID}:{set}")),
+            lineage: Some(LINEAGE.into()),
+            snapshot_completed: None,
+        }
+    }
+
+    fn marked(set: &str, generation: u64) -> MySqlCheckpoint {
+        MySqlCheckpoint {
+            snapshot_completed: Some(generation),
+            ..at(set)
+        }
+    }
+
+    /// A finished snapshot of generation 3 anchored at `1-5`.
+    fn progress(generation: u64) -> MysqlSnapshotProgress {
+        MysqlSnapshotProgress {
+            start_position: serde_json::to_string(&at("1-5")).unwrap(),
+            finished: true,
+            generation,
+            ..Default::default()
+        }
+    }
+
+    fn proven(p: &MysqlSnapshotProgress, cp: &MySqlCheckpoint) -> bool {
+        snapshot_completion_proven(Some(p), Some(cp))
+    }
+
+    #[test]
+    fn completion_is_proven_only_at_the_anchor_or_strictly_after_it() {
+        let p = progress(3);
+        // The completing checkpoint of this generation, at the anchor.
+        assert!(proven(&p, &marked("1-5", 3)));
+        // Unmarked and strictly after the anchor (CDC past it).
+        assert!(proven(&p, &at("1-9")));
+
+        // Marked for another generation, or not at the anchor.
+        assert!(!proven(&p, &marked("1-5", 2)));
+        assert!(!proven(&p, &marked("1-9", 3)));
+        // Unmarked at the anchor (what earlier releases committed), or before.
+        assert!(!proven(&p, &at("1-5")));
+        assert!(!proven(&p, &at("1-2")));
+        // Another server (lineage), or incomparable (file/pos vs GTID).
+        let foreign = MySqlCheckpoint {
+            lineage: Some("fedcba9876543210fedcba9876543210".into()),
+            ..at("1-9")
+        };
+        assert!(!proven(&p, &foreign));
+        let file_pos = MySqlCheckpoint {
+            gtid_set: None,
+            pos: 900,
+            ..at("1-9")
+        };
+        assert!(!proven(&p, &file_pos));
+        // No resume position at all.
+        assert!(!snapshot_completion_proven(Some(&p), None));
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_anchor_proves_nothing() {
+        let later = at("1-9");
+        assert!(!snapshot_completion_proven(None, Some(&later)));
+        let mut p = progress(3);
+        p.start_position = String::new();
+        assert!(!proven(&p, &later));
+        p.start_position = "not a checkpoint".into();
+        assert!(!proven(&p, &later));
+        // A record without a generation proves completion only past the
+        // anchor, never by a mark.
+        let legacy = progress(0);
+        assert!(!proven(&legacy, &marked("1-5", 0)));
+        assert!(proven(&legacy, &at("1-9")));
+    }
+
+    #[test]
+    fn an_unproven_snapshot_runs_again_and_never_mode_fails_closed() {
+        let p = progress(3);
+        let stream = |cp: MySqlCheckpoint| Some(MyResumePosition::Stream(cp));
+        let need = |mode: SnapshotMode, r: Option<MyResumePosition>| {
+            snapshot_need(&mode, Some(&p), r.as_ref())
+        };
+        // Proven: stream on, in any mode but `always`.
+        for cp in [marked("1-5", 3), at("1-9")] {
+            assert_eq!(
+                need(SnapshotMode::Initial, stream(cp.clone())),
+                Ok(SnapshotNeed {
+                    needs_snapshot: false,
+                    unproven: false
+                })
+            );
+            assert_eq!(
+                need(SnapshotMode::Never, stream(cp)),
+                Ok(SnapshotNeed {
+                    needs_snapshot: false,
+                    unproven: false
+                })
+            );
+        }
+        // Unproven: snapshot again (initial), refuse (never).
+        for r in [
+            stream(at("1-5")),
+            stream(marked("1-5", 2)),
+            stream(at("1-2")),
+            Some(MyResumePosition::Snapshot),
+            None,
+        ] {
+            assert_eq!(
+                need(SnapshotMode::Initial, r.clone()),
+                Ok(SnapshotNeed {
+                    needs_snapshot: true,
+                    unproven: true
+                })
+            );
+            assert!(need(SnapshotMode::Never, r).is_err());
+        }
+        // Never snapshotted: `never` streams from wherever it is.
+        assert_eq!(
+            snapshot_need(
+                &SnapshotMode::Never,
+                None,
+                stream(at("1-9")).as_ref()
+            ),
+            Ok(SnapshotNeed {
+                needs_snapshot: false,
+                unproven: false
+            })
         );
     }
 }

@@ -67,6 +67,14 @@ pub struct MysqlSnapshotProgress {
     pub done_tables: std::collections::BTreeSet<String>,
     /// True once every table is complete.
     pub finished: bool,
+    /// The generation whose anchor `start_position` is; absent (0) in
+    /// records written before it was recorded.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub generation: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl MysqlSnapshotProgress {
@@ -306,6 +314,7 @@ pub(crate) async fn run_snapshot(
 
     progress.start_position = serde_json::to_string(&position)
         .context("serialize binlog position")?;
+    progress.generation = ctx.generation;
     // The anchor must be durable before any row: it is what marks this run
     // as started, so an interruption after it is detected and restarts as a
     // new generation instead of reusing this one at another anchor. Later
@@ -1357,6 +1366,7 @@ mod progress_load_tests {
             start_position: "pos".into(),
             done_tables: ["db.t".to_string()].into(),
             finished: true,
+            generation: 4,
         };
         store
             .put_raw(&progress_key("s1"), &serde_json::to_vec(&saved).unwrap())
