@@ -24,6 +24,7 @@ use anyhow::Result;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
 use deltaforge_config::PipelineSpec;
 use deltaforge_core::SourceItem;
+use gate_ownership::GateOwned;
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt, core::WaitFor, runners::AsyncRunner,
 };
@@ -51,7 +52,11 @@ async fn start_vault() -> (ContainerAsync<GenericImage>, String) {
         .with_wait_for(WaitFor::message_on_stdout("Vault server started!"))
         .with_env_var("VAULT_DEV_ROOT_TOKEN_ID", ROOT_TOKEN)
         .with_env_var("VAULT_DEV_LISTEN_ADDRESS", "0.0.0.0:8200");
-    let container = image.start().await.expect("start vault dev container");
+    let container = image
+        .gate_owned()
+        .start()
+        .await
+        .expect("start vault dev container");
     let port = container
         .get_host_port_ipv4(8200)
         .await

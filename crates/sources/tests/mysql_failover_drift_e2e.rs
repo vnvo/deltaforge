@@ -19,6 +19,7 @@ use common::AllowList;
 use ctor::dtor;
 use deltaforge_config::{OnSchemaDrift, SnapshotCfg, SnapshotMode};
 use deltaforge_core::{Event, Op, Source, SourceItem, SourceResult};
+use gate_ownership::GateOwned;
 use mysql_async::prelude::Queryable;
 use serde_json::Value;
 use sources::MySqlSource;
@@ -70,6 +71,7 @@ async fn start(server_id: u32) -> Server {
             "--gtid-mode=ON".into(),
             "--enforce-gtid-consistency=ON".into(),
         ])
+        .gate_owned()
         .start()
         .await
         .expect("start mysql");

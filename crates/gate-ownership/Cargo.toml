@@ -1,0 +1,14 @@
+[package]
+name = "gate-ownership"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Labels every test container with the gate run that owns it, so the gate
+# removes exactly its own containers (scripts/gate.sh).
+[dependencies]
+testcontainers = "0.25"
+
+[dev-dependencies]
+tokio = { workspace = true }

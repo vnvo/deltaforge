@@ -28,6 +28,7 @@ use deltaforge_config::{
     SnapshotCfg, SnapshotMode, SourceCredentialsCfg,
 };
 use deltaforge_core::{Source, SourceError, SourceHandle, SourceItem};
+use gate_ownership::GateOwned;
 use mysql_async::prelude::Queryable;
 use secrets::{
     FileMode, FilePolicy, FileResolver, SecretProvider, SecretReference,
@@ -93,6 +94,7 @@ async fn start(gtid: bool, server_id: u32) -> Server {
         ))
         .with_env_var("MYSQL_ROOT_PASSWORD", ROOT_PW)
         .with_cmd(cmd)
+        .gate_owned()
         .start()
         .await
         .expect("start mysql");

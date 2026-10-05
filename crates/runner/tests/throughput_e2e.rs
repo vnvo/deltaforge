@@ -43,6 +43,7 @@ use deltaforge_config::{
     SnapshotCfg, SnapshotMode,
 };
 use deltaforge_core::{ArcDynProcessor, ArcDynSink, Source, SourceItem};
+use gate_ownership::GateOwned;
 use rdkafka::Message;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer, StreamConsumer};
@@ -117,7 +118,7 @@ async fn start_kafka() -> (ContainerAsync<GenericImage>, String) {
         .with_env_var("KAFKA_AUTO_CREATE_TOPICS_ENABLE", "true")
         .with_env_var("CLUSTER_ID", "MkU3OEVBNTcwNTJENDM2Qg")
         .with_mapped_port(kp, kp.tcp());
-    let container = image.start().await.expect("start kafka");
+    let container = image.gate_owned().start().await.expect("start kafka");
     let brokers = format!("localhost:{kp}");
     wait_for_kafka(&brokers, Duration::from_secs(60)).await;
     (container, brokers)
@@ -224,7 +225,7 @@ async fn start_pg() -> (ContainerAsync<GenericImage>, u16) {
             "-c",
             "max_wal_senders=10",
         ]);
-    let c = image.start().await.expect("start postgres");
+    let c = image.gate_owned().start().await.expect("start postgres");
     let port = c.get_host_port_ipv4(5432).await.expect("pg port");
     tokio::time::sleep(Duration::from_secs(5)).await;
     (c, port)

@@ -1264,6 +1264,7 @@ async fn ddl_pg_timestamp_mode_override() {
 //   cargo test -p sinks --test avro_encoding_tests -- --include-ignored --nocapture --test-threads=1
 
 use ctor::dtor;
+use gate_ownership::GateOwned;
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
@@ -1376,6 +1377,7 @@ async fn start_kafka() -> ContainerAsync<GenericImage> {
         .with_env_var("KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", "0")
         .with_env_var("KAFKA_AUTO_CREATE_TOPICS_ENABLE", "true")
         .with_env_var("CLUSTER_ID", "MkU3OEVBNTcwNTJENDM2Qg")
+        .gate_owned()
         .start()
         .await
         .expect("start kafka container")
@@ -1411,6 +1413,7 @@ async fn get_infra() -> &'static AvroInfra {
                     )
                     .with_env_var("SCHEMA_REGISTRY_DEBUG", "true")
                     .with_mapped_port(SR_PORT, SR_PORT.tcp())
+                    .gate_owned()
                     .start()
                     .await
                     .expect("start schema-registry container");

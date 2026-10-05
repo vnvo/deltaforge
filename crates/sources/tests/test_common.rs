@@ -9,6 +9,7 @@
 use std::sync::{Arc, Once};
 
 use anyhow::Result;
+use gate_ownership::GateOwned;
 use storage::{ArcStorageBackend, DurableSchemaRegistry, MemoryStorageBackend};
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt, core::WaitFor, runners::AsyncRunner,
@@ -89,7 +90,7 @@ async fn pg_container_and_port() -> &'static (ContainerAsync<GenericImage>, u16)
                     "max_wal_senders=10",
                 ]);
             // No fixed port — let Docker assign one to avoid conflicts.
-            let c = img.start().await.expect("start postgres");
+            let c = img.gate_owned().start().await.expect("start postgres");
             let port = c.get_host_port_ipv4(5432).await.expect("get pg port");
             sleep(Duration::from_secs(5)).await;
             pg_setup_cdc_user(port).await.expect("setup pg cdc user");
@@ -391,7 +392,11 @@ async fn mysql_container_and_port()
                     "--binlog-checksum=NONE",
                 ]);
             // Dynamic port — no fixed binding to avoid cross-binary conflicts.
-            let c = image.start().await.expect("start mysql container");
+            let c = image
+                .gate_owned()
+                .start()
+                .await
+                .expect("start mysql container");
             let port =
                 c.get_host_port_ipv4(3306).await.expect("get mysql port");
             sleep(Duration::from_secs(8)).await;

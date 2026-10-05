@@ -16,6 +16,7 @@ use checkpoints::{
     CheckpointError, CheckpointResult, CheckpointStore, MemCheckpointStore,
 };
 use deltaforge_config::load_cfg;
+use gate_ownership::GateOwned;
 use runner::preflight::check_all;
 use sources::postgres::postgres_slot_owner::{
     SLOT_OWNER_RECORD_VERSION, SlotLifecycle, SlotOwnership,
@@ -42,7 +43,7 @@ async fn start_pg() -> (ContainerAsync<GenericImage>, u16) {
             "-c",
             "max_wal_senders=10",
         ]);
-    let c = image.start().await.expect("start postgres");
+    let c = image.gate_owned().start().await.expect("start postgres");
     let port = c.get_host_port_ipv4(5432).await.expect("pg port");
     tokio::time::sleep(Duration::from_secs(5)).await;
     (c, port)

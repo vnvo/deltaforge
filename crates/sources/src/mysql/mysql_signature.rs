@@ -518,6 +518,7 @@ mod tests {
         use super::*;
         use crate::mysql::mysql_schema_loader::{Live, fetch_table_schema_on};
         use crate::mysql::mysql_session::open_replication_session;
+        use gate_ownership::GateOwned;
         use mysql_async::prelude::Queryable;
         use mysql_binlog_connector_rust::binlog_client::BinlogClient;
         use mysql_binlog_connector_rust::event::event_data::EventData;
@@ -586,6 +587,7 @@ mod tests {
                     "--log-bin=mysql-bin",
                     "--binlog-format=ROW",
                 ])
+                .gate_owned()
                 .start()
                 .await
                 .unwrap();

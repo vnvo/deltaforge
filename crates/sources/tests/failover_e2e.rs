@@ -15,6 +15,7 @@ use checkpoints::{CheckpointStore, MemCheckpointStore};
 use common::AllowList;
 use deltaforge_config::{SnapshotCfg, SnapshotMode};
 use deltaforge_core::{Event, Source, SourceError, SourceItem};
+use gate_ownership::GateOwned;
 use mysql_async::prelude::Queryable;
 use sources::failover::identity::{
     IdentityComparison, IdentityStore, ServerIdentity,
@@ -59,6 +60,7 @@ async fn start_mysql() -> (ContainerAsync<GenericImage>, u16) {
             "--enforce-gtid-consistency=ON",
             "--binlog-checksum=NONE",
         ])
+        .gate_owned()
         .start()
         .await
         .expect("start mysql");
@@ -169,6 +171,7 @@ async fn start_postgres() -> (ContainerAsync<GenericImage>, u16) {
             "-c",
             "max_wal_senders=10",
         ])
+        .gate_owned()
         .start()
         .await
         .expect("start postgres");
@@ -1500,6 +1503,7 @@ async fn start_mysql_nongtid() -> (ContainerAsync<GenericImage>, u16) {
             "--binlog-row-image=FULL",
             "--binlog-checksum=NONE",
         ])
+        .gate_owned()
         .start()
         .await
         .expect("start mysql (non-gtid)");

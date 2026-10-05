@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use ctor::dtor;
+use gate_ownership::GateOwned;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage};
@@ -48,6 +49,7 @@ pub async fn ministack() -> &'static MinistackInfra {
                 )
                     .with_wait_for(WaitFor::seconds(3))
                     .with_exposed_port(MS_PORT.tcp())
+                    .gate_owned()
                     .start()
                     .await
                     .expect("start MiniStack");

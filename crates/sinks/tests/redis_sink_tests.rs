@@ -13,6 +13,7 @@ use deltaforge_config::{EncodingCfg, EnvelopeCfg, RedisSinkCfg};
 use deltaforge_core::{
     Event, EventRouting, Op, Sink, SourceInfo, SourcePosition,
 };
+use gate_ownership::GateOwned;
 use redis::AsyncCommands;
 use serde_json::json;
 use sinks::redis::RedisSink;
@@ -66,7 +67,11 @@ async fn get_redis_container() -> &'static ContainerAsync<GenericImage> {
                 ))
                 .with_mapped_port(REDIS_PORT, 6379.tcp());
 
-            let container = image.start().await.expect("start redis container");
+            let container = image
+                .gate_owned()
+                .start()
+                .await
+                .expect("start redis container");
             info!("Redis container started: {}", container.id());
 
             // Wait for Redis to be fully ready
@@ -959,7 +964,7 @@ async fn redis_sink_recovers_after_restart() -> Result<()> {
         ))
         .with_mapped_port(restart_port, 6379.tcp());
 
-    let container = image.start().await?;
+    let container = image.gate_owned().start().await?;
     let uri = format!("redis://127.0.0.1:{}/0", restart_port);
 
     wait_for_redis(&uri, Duration::from_secs(30)).await?;

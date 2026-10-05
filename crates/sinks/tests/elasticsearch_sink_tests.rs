@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use deltaforge_config::{ElasticsearchSinkCfg, EsVersionSource};
 use deltaforge_core::{Event, Op, Sink, SourceInfo, SourcePosition};
+use gate_ownership::GateOwned;
 use serde_json::{Value, json};
 use sinks::clickhouse::types::ColDesc;
 use sinks::elasticsearch::{
@@ -206,6 +207,7 @@ async fn start_elasticsearch()
     // write times out.
     .with_env_var("cluster.routing.allocation.disk.threshold_enabled", "false")
     .with_env_var("ES_JAVA_OPTS", "-Xms512m -Xmx512m")
+    .gate_owned()
     .start()
     .await
     .expect("start elasticsearch container");

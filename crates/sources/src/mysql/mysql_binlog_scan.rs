@@ -802,6 +802,7 @@ mod tests {
     /// Live MySQL 8.4 (Docker): one GTID-mode and one file/position server.
     mod live {
         use super::*;
+        use gate_ownership::GateOwned;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU32, Ordering};
         use testcontainers::core::WaitFor;
@@ -831,6 +832,7 @@ mod tests {
                 ))
                 .with_env_var("MYSQL_ROOT_PASSWORD", "pw")
                 .with_cmd(cmd)
+                .gate_owned()
                 .start()
                 .await
                 .expect("start mysql");
