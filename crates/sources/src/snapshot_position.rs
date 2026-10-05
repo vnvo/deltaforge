@@ -379,13 +379,17 @@ pub fn generation_start<E: EngineOrder>(
     let Some(prev) = prev else {
         return Move;
     };
+    // A later generation of the chain means the caller's control state is
+    // stale, rewound or corrupt: never acknowledged.
     let in_chain = |c: &str, g: u64| {
         if c != chain {
             Refuse
-        } else if g < generation {
-            Move
         } else {
-            Already
+            match g.cmp(&generation) {
+                std::cmp::Ordering::Less => Move,
+                std::cmp::Ordering::Equal => Already,
+                std::cmp::Ordering::Greater => Refuse,
+            }
         }
     };
     let adopted_legacy = |g: Option<u64>| match (g, legacy_through) {
@@ -596,10 +600,18 @@ mod order_tests {
         assert_eq!(start(Some(&encode_adopted("c", 3, "d")), 4, None), Move);
         assert_eq!(start(Some(&encode_adopted("c", 4, "d")), 4, None), Already);
         assert_eq!(
-            start(Some(&encode_chained("c", 5, 10u64)), 4, None),
+            start(Some(&encode_chained("c", 4, 10u64)), 4, None),
             Already
         );
         assert_eq!(start(Some(&marked(10, Some("c"), 4)), 4, None), Already);
+        // A sink in a later generation than the one starting: the caller's
+        // control state went backwards; refused.
+        assert_eq!(
+            start(Some(&encode_chained("c", 5, 10u64)), 4, None),
+            Refuse
+        );
+        assert_eq!(start(Some(&encode_adopted("c", 5, "d")), 4, None), Refuse);
+        assert_eq!(start(Some(&marked(10, Some("c"), 5)), 4, None), Refuse);
         // Another chain, an unadopted legacy position, an unknown format.
         assert_eq!(
             start(Some(&encode_chained("d", 3, 10u64)), 4, None),

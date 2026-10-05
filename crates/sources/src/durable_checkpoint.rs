@@ -649,13 +649,17 @@ pub fn generation_start(
     if !prev.lineage.stable_matches(lineage) {
         return Refuse;
     }
+    // A later generation of the chain means the caller's control state is
+    // stale, rewound or corrupt: never acknowledged.
     let in_chain = |c: &str, g: u64| {
         if c != chain {
             Refuse
-        } else if g < generation {
-            Move
         } else {
-            Already
+            match g.cmp(&generation) {
+                std::cmp::Ordering::Less => Move,
+                std::cmp::Ordering::Equal => Already,
+                std::cmp::Ordering::Greater => Refuse,
+            }
         }
     };
     match &prev.pos {
@@ -1583,10 +1587,18 @@ mod snapshot_chain_watermark_tests {
         assert_eq!(decide(Some(seq("c", 3, 9, true)), 4, None), Move);
         // A partial start of 3 (a crash), then 3 replaced by 4.
         assert_eq!(decide(Some(start("c", 3)), 4, None), Move);
-        // Already in it, or later: acknowledged without a move.
+        // Already in it: acknowledged without a move.
         assert_eq!(decide(Some(start("c", 4)), 4, None), Already);
         assert_eq!(decide(Some(seq("c", 4, 2, false)), 4, None), Already);
-        assert_eq!(decide(Some(seq("c", 5, 0, false)), 4, None), Already);
+    }
+
+    /// A sink already in a later generation than the one starting: the
+    /// caller's control state went backwards; refused, never acknowledged.
+    #[test]
+    fn a_generation_never_starts_behind_a_sink() {
+        assert_eq!(decide(Some(seq("c", 5, 0, false)), 4, None), Refuse);
+        assert_eq!(decide(Some(seq("c", 5, 9, true)), 4, None), Refuse);
+        assert_eq!(decide(Some(start("c", 5)), 4, None), Refuse);
     }
 
     #[test]
