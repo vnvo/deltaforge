@@ -122,6 +122,7 @@ pub(crate) async fn establish(
         pos: ctx.last_pos,
         gtid_set: ctx.last_gtid.clone(),
         lineage: Some(lineage.clone()),
+        snapshot_completed: None,
     };
     let Some(r0) = mysql_checkpoint_position(
         &r0_cp.file,

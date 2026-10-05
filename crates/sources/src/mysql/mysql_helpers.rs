@@ -4,15 +4,10 @@ use mysql_async::{Row, prelude::Queryable};
 use mysql_binlog_connector_rust::{
     binlog_client::BinlogClient, binlog_stream::BinlogStream,
 };
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
-
-use checkpoints::{CheckpointStore, CheckpointStoreExt};
 
 use common::{
     RetryOutcome, RetryPolicy, redact_url_password as redact_password,
@@ -25,7 +20,7 @@ pub(super) async fn prepare_client(
     dsn: &str,
     expected_uuid: &str,
     source_id: &str,
-    ckpt_store: &Arc<dyn CheckpointStore>,
+    last_checkpoint: Option<MySqlCheckpoint>,
 ) -> MySqlSourceResult<(String, String, u64, BinlogClient)> {
     let url = Url::parse(dsn)
         .map_err(|e| MySqlSourceError::InvalidDsn(e.to_string()))?;
@@ -33,12 +28,6 @@ pub(super) async fn prepare_client(
     let host = url.host_str().unwrap_or("localhost").to_string();
     let default_db = url.path().trim_start_matches('/').to_string();
     let server_id = derive_server_id(source_id);
-
-    // Previous checkpoint (if any)
-    let last_checkpoint: Option<MySqlCheckpoint> = ckpt_store
-        .get(source_id)
-        .await
-        .map_err(|e| MySqlSourceError::Checkpoint(e.to_string()))?;
 
     debug!(source_id=%source_id, checkpoint=?last_checkpoint, "preparing client");
 
@@ -576,6 +565,7 @@ pub(crate) fn make_checkpoint_meta(
         pos,
         gtid_set: gtid.clone(),
         lineage,
+        snapshot_completed: None,
     };
 
     let bytes = serde_json::to_vec(&cp).unwrap_or_else(|e| {

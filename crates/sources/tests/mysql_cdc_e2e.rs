@@ -1498,6 +1498,7 @@ async fn stable_event_ids_are_replay_stable() -> Result<()> {
         gtid_set: status
             .get::<String, _>("Executed_Gtid_Set")
             .filter(|s| !s.is_empty()),
+        snapshot_completed: None,
     };
 
     // One transaction, three rows events (insert 2 / update 1 / delete 1) → one
@@ -1596,6 +1597,7 @@ async fn ddl_event_ids_are_replay_stable() -> Result<()> {
         gtid_set: status
             .get::<String, _>("Executed_Gtid_Set")
             .filter(|s| !s.is_empty()),
+        snapshot_completed: None,
     };
 
     conn.query_drop("ALTER TABLE t ADD COLUMN c INT").await?;
@@ -1682,6 +1684,7 @@ async fn derived_event_ids_are_replay_stable() -> Result<()> {
         gtid_set: status
             .get::<String, _>("Executed_Gtid_Set")
             .filter(|s| !s.is_empty()),
+        snapshot_completed: None,
     };
 
     conn.query_drop("INSERT INTO t VALUES (1,'a'),(2,'b')")

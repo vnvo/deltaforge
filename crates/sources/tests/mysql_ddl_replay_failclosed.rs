@@ -69,6 +69,7 @@ async fn current_position(
         gtid_set: status
             .get::<String, _>("Executed_Gtid_Set")
             .filter(|s| !s.is_empty()),
+        snapshot_completed: None,
     })
 }
 

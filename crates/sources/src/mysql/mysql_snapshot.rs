@@ -67,6 +67,14 @@ pub struct MysqlSnapshotProgress {
     pub done_tables: std::collections::BTreeSet<String>,
     /// True once every table is complete.
     pub finished: bool,
+    /// The generation whose anchor `start_position` is; absent (0) in
+    /// records written before it was recorded.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub generation: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl MysqlSnapshotProgress {
@@ -306,6 +314,7 @@ pub(crate) async fn run_snapshot(
 
     progress.start_position = serde_json::to_string(&position)
         .context("serialize binlog position")?;
+    progress.generation = ctx.generation;
     // The anchor must be durable before any row: it is what marks this run
     // as started, so an interruption after it is detected and restarts as a
     // new generation instead of reusing this one at another anchor. Later
@@ -368,9 +377,18 @@ pub(crate) async fn run_snapshot(
         })
         .collect();
     crate::snapshot_probe::record_frontier_tables(resume.len());
+    // Every boundary carries an incomplete-snapshot position, except the
+    // one completing the snapshot (`publisher.finish`): the anchor as a
+    // stream position, marked as the completion of this generation.
     let snapshot_checkpoint = CheckpointMeta::from_vec(
-        serde_json::to_vec(&position)
-            .context("serialize snapshot checkpoint")?,
+        crate::snapshot_position::encode(ctx.generation, &position),
+    );
+    let completing_checkpoint = CheckpointMeta::from_vec(
+        serde_json::to_vec(&MySqlCheckpoint {
+            snapshot_completed: Some(ctx.generation),
+            ..position.clone()
+        })
+        .context("serialize the completing snapshot checkpoint")?,
     );
     let publisher = Arc::new(SnapshotPublisher::new(
         SnapshotAggregator::from_source_progress(
@@ -378,7 +396,8 @@ pub(crate) async fn run_snapshot(
             ctx.lineage.clone(),
             snapshot_checkpoint,
             &resume,
-        ),
+        )
+        .with_completing_checkpoint(completing_checkpoint),
         ctx.tx.clone(),
     ));
 
@@ -519,6 +538,13 @@ pub(crate) async fn run_snapshot(
     health::verify_binlog_position(ctx.dsn, ctx.expected_uuid, &position.file)
         .await
         .context("post-snapshot binlog position verification")?;
+
+    // Every table read and every check passed: emit the completing
+    // boundary (the only stream position a snapshot commits).
+    publisher
+        .finish()
+        .await
+        .context("emit the snapshot's completing boundary")?;
 
     // only write finished=true after the position is confirmed still valid.
     // "finished" means "safe to hand off to CDC", not just "rows emitted".
@@ -791,6 +817,7 @@ async fn capture_binlog_position(
         pos: pos as u64,
         gtid_set,
         lineage: None,
+        snapshot_completed: None,
     })
 }
 
@@ -1339,6 +1366,7 @@ mod progress_load_tests {
             start_position: "pos".into(),
             done_tables: ["db.t".to_string()].into(),
             finished: true,
+            generation: 4,
         };
         store
             .put_raw(&progress_key("s1"), &serde_json::to_vec(&saved).unwrap())

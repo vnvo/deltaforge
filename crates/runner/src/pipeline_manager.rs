@@ -4100,6 +4100,85 @@ mod tests {
         );
     }
 
+    /// Mixed per-sink states during and after a snapshot: an incomplete
+    /// snapshot position is the minimum against its completing anchor
+    /// checkpoint and against later CDC positions; another generation or
+    /// anchor, or a stream position before the anchor, fails closed.
+    #[tokio::test]
+    async fn per_sink_proxy_orders_an_incomplete_snapshot_before_its_completion()
+     {
+        type Cmp = fn(&[u8], &[u8]) -> deltaforge_core::CheckpointOrder;
+        async fn fold(cmp: Cmp, entries: &[&[u8]]) -> Result<Vec<u8>, ()> {
+            let store =
+                Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+            for (i, v) in entries.iter().enumerate() {
+                store.put_raw(&format!("src::sink::s{i}"), v).await.unwrap();
+            }
+            let proxy = PerSinkCheckpointProxy {
+                inner: store,
+                source_id: "src".to_string(),
+                cmp_fn: Arc::new(cmp),
+                commit_signal: Arc::new(tokio::sync::Notify::new()),
+            };
+            proxy
+                .get_raw("src")
+                .await
+                .map(|v| v.unwrap())
+                .map_err(|_| ())
+        }
+        use sources::snapshot_position::encode;
+
+        // PostgreSQL
+        let pg: Cmp = sources::postgres::compare_pg_checkpoints;
+        let inc = encode(3, "0/300");
+        let completing: &[u8] = br#"{"lsn":"0/300","tx_id":null}"#;
+        let cdc: &[u8] = br#"{"lsn":"0/500","tx_id":null,"timeline":1,"chain":"c","transition":0}"#;
+        assert_eq!(fold(pg, &[completing, &inc]).await, Ok(inc.clone()));
+        assert_eq!(fold(pg, &[&inc, cdc]).await, Ok(inc.clone()));
+        assert_eq!(fold(pg, &[cdc, completing]).await, Ok(completing.to_vec()));
+        assert_eq!(fold(pg, &[&inc, &inc]).await, Ok(inc.clone()));
+        let other_generation = encode(4, "0/300");
+        let other_anchor = encode(3, "0/400");
+        let before_anchor: &[u8] = br#"{"lsn":"0/200","tx_id":null}"#;
+        for foreign in [&other_generation[..], &other_anchor, before_anchor] {
+            assert_eq!(fold(pg, &[&inc, foreign]).await, Err(()));
+        }
+        // A pre-format snapshot checkpoint (the anchor LSN as text) folds as
+        // an incomplete snapshot position instead of blocking the restart.
+        let bare: &[u8] = b"0/300";
+        assert_eq!(fold(pg, &[completing, bare]).await, Ok(bare.to_vec()));
+        assert_eq!(fold(pg, &[bare]).await, Ok(bare.to_vec()));
+
+        // MySQL
+        let my: Cmp = sources::mysql::compare_mysql_checkpoints;
+        let uuid = "3E11FA47-71CA-11E1-9E33-C80AA9429562";
+        let at = |set: &str, completed: Option<u64>| {
+            sources::mysql::MySqlCheckpoint {
+                file: "mysql-bin.000003".into(),
+                pos: 100,
+                gtid_set: Some(format!("{uuid}:{set}")),
+                lineage: None,
+                snapshot_completed: completed,
+            }
+        };
+        let anchor = at("1-5", None);
+        let inc = encode(3, &anchor);
+        let completing = serde_json::to_vec(&at("1-5", Some(3))).unwrap();
+        let cdc = serde_json::to_vec(&at("1-9", None)).unwrap();
+        assert_eq!(fold(my, &[&completing, &inc]).await, Ok(inc.clone()));
+        assert_eq!(fold(my, &[&cdc, &inc]).await, Ok(inc.clone()));
+        assert_eq!(
+            fold(my, &[&cdc, &completing]).await,
+            Ok(completing.clone())
+        );
+        let other_generation = encode(4, &anchor);
+        let other_anchor = encode(3, at("1-7", None));
+        let before_anchor = serde_json::to_vec(&at("1-2", None)).unwrap();
+        for foreign in [&other_generation, &other_anchor, &before_anchor] {
+            assert_eq!(fold(my, &[&inc, foreign]).await, Err(()));
+        }
+    }
+
     #[tokio::test]
     async fn per_sink_proxy_passes_through_other_keys() {
         let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());

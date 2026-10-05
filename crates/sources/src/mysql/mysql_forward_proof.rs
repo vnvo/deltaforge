@@ -73,6 +73,7 @@ pub(crate) async fn prove(
         pos: ctx.last_pos,
         gtid_set: ctx.last_gtid.clone(),
         lineage: Some(lineage.clone()),
+        snapshot_completed: None,
     };
     let Some(d) = mysql_checkpoint_position(
         &d_cp.file,

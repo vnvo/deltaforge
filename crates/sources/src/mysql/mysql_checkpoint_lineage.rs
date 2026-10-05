@@ -384,6 +384,7 @@ mod tests {
             pos,
             gtid_set: gtid.map(str::to_string),
             lineage: lineage.map(str::to_string),
+            snapshot_completed: None,
         })
         .unwrap()
     }
