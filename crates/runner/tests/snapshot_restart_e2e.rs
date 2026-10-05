@@ -559,14 +559,15 @@ async fn mysql_a_delivered_snapshot_is_not_copied_again() -> Result<()> {
     Ok(())
 }
 
-/// Upgrade: a checkpoint at the snapshot's anchor without the completion
-/// mark (what earlier releases committed, whether or not every row was
-/// delivered) proves nothing: the snapshot runs once more, then the stream
-/// continues without copying again.
+/// A durably completed generation is never reinterpreted: a sink whose
+/// checkpoint falls behind its terminal afterwards (here the completing
+/// checkpoint without its mark: at the anchor, proving nothing) is reported
+/// as lagging (`sink_snapshot_incomplete`), and the snapshot is not copied
+/// again; the stream continues.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires docker"]
-async fn mysql_an_unproven_anchor_checkpoint_snapshots_once_more() -> Result<()>
-{
+async fn mysql_a_sink_behind_a_completed_generation_is_reported_not_recopied()
+-> Result<()> {
     let (_my, port) = start_mysql().await;
     let hook = Hook::start().await;
     let (mgr, backend) = manager_with_backend().await;
@@ -578,14 +579,29 @@ async fn mysql_an_unproven_anchor_checkpoint_snapshots_once_more() -> Result<()>
             v.get("snapshot_completed").is_some()
         })
         .await;
+    // Completed once the terminal's acknowledgement is seen.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let completed = matches!(
+            sources::snapshot_queue::QueueStore::new(backend.clone(), "my-src")
+                .read()
+                .await?,
+            Some(sources::snapshot_queue::Stored::Current { control, .. })
+                if control.state == sources::snapshot_queue::State::Completed
+        );
+        if completed {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never completed");
+        sleep(Duration::from_millis(200)).await;
+    }
     PipelineController::stop(&mgr, "myold").await.unwrap();
     until_status(&mgr, "myold", "stopped").await;
 
-    // The checkpoint as an earlier release left it: the anchor, unmarked.
-    completing
-        .as_object_mut()
-        .unwrap()
-        .remove("snapshot_completed");
+    // The sink's checkpoint falls behind the terminal: the anchor, unmarked.
+    for mark in ["snapshot_completed", "snapshot_chain"] {
+        completing.as_object_mut().unwrap().remove(mark);
+    }
     backend
         .kv_put(
             "checkpoints",
@@ -596,21 +612,17 @@ async fn mysql_an_unproven_anchor_checkpoint_snapshots_once_more() -> Result<()>
 
     let reads = hook.snapshot_reads();
     mgr.resume("myold").await.unwrap();
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while hook.snapshot_reads() < reads + ROWS as usize {
-        assert!(Instant::now() < deadline, "the snapshot did not run again");
-        sleep(Duration::from_millis(200)).await;
-    }
-    until_checkpoint(&backend, "my-src::sink::hook", |v| {
-        v.get("snapshot_completed").is_some()
-    })
-    .await;
-
-    // Once proven, never again.
-    restart(&mgr, "myold").await;
-    let reads = hook.snapshot_reads();
     mysql_insert(port, ROWS + 1).await;
     hook.until_accepted(ROWS + 1).await;
     assert_eq!(hook.snapshot_reads(), reads, "no snapshot row again");
+    let incidents =
+        storage::adapters::incidents::IncidentStore::new(backend, "myold")
+            .list()
+            .await?;
+    assert!(
+        incidents.iter().any(|r| r.reason_code
+            == deltaforge_core::incident::ReasonCode::SinkSnapshotIncomplete),
+        "{incidents:?}"
+    );
     Ok(())
 }

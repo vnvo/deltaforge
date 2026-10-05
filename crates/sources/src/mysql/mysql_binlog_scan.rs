@@ -574,6 +574,7 @@ async fn read_position(
         gtid_set: gtid_mode.then(|| gtid.unwrap_or_default()),
         lineage: Some(lineage_hash.to_string()),
         snapshot_completed: None,
+        snapshot_chain: None,
     })
 }
 

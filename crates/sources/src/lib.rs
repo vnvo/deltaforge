@@ -382,6 +382,7 @@ pub async fn build_source(
                 on_schema_drift: c.on_schema_drift.clone(),
                 table_options: c.table_options.clone(),
                 rotation,
+                snapshot_cohort: Default::default(),
             }))
         }
     }

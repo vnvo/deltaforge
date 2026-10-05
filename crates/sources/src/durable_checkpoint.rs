@@ -1037,6 +1037,7 @@ mod tests {
             gtid_set: Some(set.to_string()),
             lineage: None,
             snapshot_completed: None,
+            snapshot_chain: None,
         };
         let raw = serde_json::to_vec(&cp).unwrap();
         let parsed: MySqlCheckpoint = serde_json::from_slice(&raw).unwrap();

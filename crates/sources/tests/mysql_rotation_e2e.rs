@@ -472,10 +472,12 @@ async fn start_rotation_harness(
         on_schema_drift: OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation,
+        snapshot_cohort: Default::default(),
     };
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, rx) = mpsc::channel(channel_cap);
+    let (tx, rx) =
+        test_common::acked_channel(&src, &ckpt, &src.id, channel_cap);
     let handle = src.run(tx, ckpt).await;
 
     Ok(Harness {

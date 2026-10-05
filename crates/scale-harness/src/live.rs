@@ -546,6 +546,7 @@ fn source(
             on_schema_drift: OnSchemaDrift::Adapt,
             table_options: Default::default(),
             rotation: None,
+            snapshot_cohort: Default::default(),
         }),
     }
 }

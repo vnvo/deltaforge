@@ -197,10 +197,6 @@ pub(crate) fn record_preparation(
     PREPARATION_LIVE_FETCHES.fetch_add(live_fetches, Ordering::Relaxed);
 }
 
-pub(crate) fn record_frontier_tables(n: usize) {
-    FRONTIER_TABLES.fetch_add(n as u64, Ordering::Relaxed);
-}
-
 /// One armed hold after the first discovery page: `(reached, release)`.
 static AFTER_DISCOVERY_PAGE: Mutex<Option<(Arc<Notify>, Arc<Notify>)>> =
     Mutex::new(None);
@@ -244,12 +240,6 @@ pub(crate) fn record_table_tasks(alive: usize) {
 pub(crate) fn record_phase(phase: Phase, d: std::time::Duration) {
     PHASE_MICROS[phase as usize]
         .fetch_add(d.as_micros() as u64, Ordering::Relaxed);
-}
-
-pub(crate) fn record_progress_write(bytes: usize, d: std::time::Duration) {
-    PROGRESS_WRITES.fetch_add(1, Ordering::Relaxed);
-    PROGRESS_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
-    PROGRESS_MICROS.fetch_add(d.as_micros() as u64, Ordering::Relaxed);
 }
 
 pub(crate) fn record_boundary(bytes: usize, d: std::time::Duration) {

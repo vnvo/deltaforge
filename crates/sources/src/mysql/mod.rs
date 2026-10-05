@@ -18,7 +18,6 @@ use tracing::{debug, error, info, warn};
 
 use checkpoints::{CheckpointStore, CheckpointStoreExt};
 use common::{AllowList, RetryPolicy, pause_until_resumed};
-use storage::BackendCheckpointStore;
 
 use crate::snapshot_generation::PersistedLineage;
 use deltaforge_core::incident::{CauseCode, IncidentDraft, Retryability};
@@ -100,12 +99,17 @@ pub struct MySqlCheckpoint {
     /// before the proof existed and proves nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_completed: Option<u64>,
+    /// With `snapshot_completed`: the snapshot chain of the completed
+    /// generation (absent on completions written before chains).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_chain: Option<String>,
 }
 
 /// A resume position read from the checkpoint store.
 #[derive(Debug, Clone)]
 pub(crate) enum MyResumePosition {
-    /// A snapshot no sink acknowledged as complete: not a stream position.
+    /// A snapshot no sink acknowledged as complete, or a sink's start of a
+    /// snapshot generation: not a stream position.
     Snapshot,
     /// A stream position (CDC, or the completing snapshot boundary).
     Stream(MySqlCheckpoint),
@@ -115,8 +119,12 @@ pub(crate) enum MyResumePosition {
 pub(crate) fn classify_mysql_checkpoint(
     raw: &[u8],
 ) -> Result<MyResumePosition, String> {
-    if crate::snapshot_position::decode::<MySqlCheckpoint>(raw)?.is_some() {
-        return Ok(MyResumePosition::Snapshot);
+    match crate::snapshot_position::classify::<MySqlCheckpoint>(raw)? {
+        crate::snapshot_position::Classified::Incomplete(_)
+        | crate::snapshot_position::Classified::Adopted(_) => {
+            return Ok(MyResumePosition::Snapshot);
+        }
+        crate::snapshot_position::Classified::Stream => {}
     }
     serde_json::from_slice::<MySqlCheckpoint>(raw)
         .map(MyResumePosition::Stream)
@@ -129,6 +137,9 @@ pub(crate) fn classify_mysql_checkpoint(
 /// comparator orders strictly after the anchor. A missing or unreadable
 /// anchor, another generation, or a position at, before or incomparable with
 /// the anchor proves nothing.
+// The legacy classification proves a completed pre-queue snapshot with
+// this #131 rule (design section 10).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn snapshot_completion_proven(
     progress: Option<&MysqlSnapshotProgress>,
     resume: Option<&MySqlCheckpoint>,
@@ -154,54 +165,9 @@ pub(crate) fn snapshot_completion_proven(
     compare_mysql_stream_checkpoints(&a, &c) == CheckpointOrder::Before
 }
 
-/// What a start must do about the initial snapshot.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct SnapshotNeed {
-    /// Run the snapshot (in full).
-    pub needs_snapshot: bool,
-    /// A snapshot was recorded (an anchor taken) whose completion the sinks
-    /// have not proven: it runs again as a new generation.
-    pub unproven: bool,
-}
-
-/// Decide whether a start snapshots. A recorded snapshot counts as complete
-/// only by [`snapshot_completion_proven`]; `finished` alone records that its
-/// rows were read, not delivered. Mode `never` with an unproven snapshot, or
-/// with an incomplete-snapshot resume position, fails closed.
-pub(crate) fn snapshot_need(
-    mode: &SnapshotMode,
-    progress: Option<&MysqlSnapshotProgress>,
-    resume: Option<&MyResumePosition>,
-) -> Result<SnapshotNeed, String> {
-    let stream = match resume {
-        Some(MyResumePosition::Stream(cp)) => Some(cp),
-        _ => None,
-    };
-    let recorded = progress.is_some_and(|p| !p.start_position.is_empty());
-    let finished = progress.is_some_and(|p| p.finished);
-    let proven = snapshot_completion_proven(progress, stream);
-    let unproven = recorded && !proven;
-    if *mode == SnapshotMode::Never
-        && (unproven || matches!(resume, Some(MyResumePosition::Snapshot)))
-    {
-        return Err("a snapshot was recorded whose completion the sinks \
-                    have not proven, and snapshot mode 'never' cannot \
-                    complete it; set mode 'initial' to snapshot again"
-            .into());
-    }
-    let needs_snapshot = match mode {
-        SnapshotMode::Initial => !finished || unproven,
-        SnapshotMode::Always => true,
-        SnapshotMode::Never => false,
-    };
-    Ok(SnapshotNeed {
-        needs_snapshot,
-        unproven: finished && unproven,
-    })
-}
-
 /// Whether two checkpoints name the same binlog position (file, position and
 /// GTID set; lineage and the completion mark aside).
+#[cfg_attr(not(test), allow(dead_code))]
 fn same_position(a: &MySqlCheckpoint, b: &MySqlCheckpoint) -> bool {
     a.file == b.file && a.pos == b.pos && a.gtid_set == b.gtid_set
 }
@@ -230,6 +196,9 @@ pub struct MySqlSource {
     /// Controlled credential-rotation spec, when configured and file-backed.
     /// `None` disables rotation for this source. Requires GTID mode.
     pub rotation: Option<Arc<crate::rotation_manager::RotationSpec>>,
+    /// The commit policy and sink cohort a snapshot generation freezes, set
+    /// by the runner before the source runs.
+    pub snapshot_cohort: crate::SnapshotCohortSlot,
 }
 
 pub(crate) const HEARTBEAT_INTERVAL_SECS: u64 = 15;
@@ -327,44 +296,197 @@ pub(crate) struct RunCtx {
 pub(crate) type MyPlannedTable =
     crate::snapshot_plan::PlannedTable<Vec<String>>;
 
-/// Outcome of the pre-snapshot discover/prepare/allocate flow: the frozen
-/// generation, its persisted lineage, and every table to copy (in discovery
-/// order).
-struct SnapshotPlan {
-    generation: u64,
-    lineage: PersistedLineage,
-    tables: Vec<MyPlannedTable>,
-}
-
 /// What the preparation pass needs to apply the failover drift policy.
 struct DriftCheck<'a> {
     anchor: &'a mysql_failover_drift::FailoverAnchor,
     env: mysql_failover_drift::DriftEnv<'a>,
 }
 
+/// The snapshot connections a MySQL generation cannot start without: the
+/// read-lock connection (catalog, anchor), the guard's session and one
+/// worker.
+const MY_BASE_SNAPSHOT_CONNECTIONS: u32 = 3;
+
+/// A failure as the source's error: a typed one (another server, a missing
+/// privilege, an incompatible setting) as it is, anything else with
+/// `context`.
+fn typed(e: anyhow::Error, context: &'static str) -> SourceError {
+    e.downcast::<SourceError>()
+        .unwrap_or_else(|e| SourceError::Other(e.context(context)))
+}
+
+/// A control record's anchor as a MySQL anchor.
+fn my_anchor_of(
+    a: &crate::snapshot_queue::EngineAnchor,
+) -> Option<MySqlCheckpoint> {
+    match a {
+        crate::snapshot_queue::EngineAnchor::Mysql {
+            file,
+            pos,
+            gtid_set,
+            lineage,
+        } => Some(MySqlCheckpoint {
+            file: file.clone(),
+            pos: *pos,
+            gtid_set: gtid_set.clone(),
+            lineage: lineage.clone(),
+            snapshot_completed: None,
+            snapshot_chain: None,
+        }),
+        crate::snapshot_queue::EngineAnchor::Postgres { .. } => None,
+    }
+}
+
+/// What a MySQL generation start or completion check reads.
+type MyGenerationInputs = crate::snapshot_driver::GenerationInputs<MyOrder>;
+
+/// What a start decided for the snapshot (design section 4).
+enum MyStart {
+    /// Stream; `completed_anchor` is the anchor of the completed generation
+    /// (the stream starts there when no sink holds a stream position yet).
+    Stream {
+        completed_anchor: Option<MySqlCheckpoint>,
+    },
+    /// Run this generation (allocated, its start barrier pending).
+    Generation {
+        version: u64,
+        control: Box<crate::snapshot_queue::GenerationControl>,
+    },
+}
+
+/// A generation this start ran: where the stream starts, and the plan
+/// whose tables are proven at the anchor before completion is watched.
+struct MyGenerationRun {
+    anchor: MySqlCheckpoint,
+    generation: u64,
+}
+
 impl MySqlSource {
+    fn incidents(&self) -> storage::adapters::incidents::IncidentStore {
+        storage::adapters::incidents::IncidentStore::new(
+            Arc::clone(&self.backend),
+            &self.pipeline,
+        )
+    }
+
+    fn queue(&self) -> crate::snapshot_queue::QueueStore {
+        crate::snapshot_queue::QueueStore::new(
+            Arc::clone(&self.backend),
+            &self.id,
+        )
+    }
+
+    /// The configuration part of a generation's fingerprint (format 3: the
+    /// table patterns; each table's schema is bound by its plan item).
+    fn config_fingerprint(&self) -> String {
+        crate::snapshot_generation::SnapshotFingerprintBuilder::new(
+            "mysql",
+            &self.tables,
+        )
+        .finish()
+        .as_str()
+        .to_string()
+    }
+
+    /// Decide what this start does about the snapshot (design section 4).
+    async fn decide_snapshot(
+        &self,
+        chkpt_store: &Arc<dyn CheckpointStore>,
+        lineage: PersistedLineage,
+    ) -> SourceResult<(MyStart, Option<MyGenerationInputs>)> {
+        let queue = self.queue();
+        let cohort = self
+            .snapshot_cohort
+            .lock()
+            .expect("not poisoned")
+            .cohort
+            .clone();
+        let Some(cohort) = cohort else {
+            // A source run outside a pipeline: only mode `never` without
+            // any generation streams; a snapshot needs the frozen cohort.
+            let stored = queue.read().await.map_err(|e| {
+                SourceError::Other(anyhow::anyhow!("snapshot state: {e}"))
+            })?;
+            if self.snapshot_cfg.mode == SnapshotMode::Never && stored.is_none()
+            {
+                return Ok((
+                    MyStart::Stream {
+                        completed_anchor: None,
+                    },
+                    None,
+                ));
+            }
+            return Err(SourceError::Other(anyhow::anyhow!(
+                "source {}: a snapshot generation needs the pipeline's sink \
+                 cohort, which was not set",
+                self.id
+            )));
+        };
+        let inputs = MyGenerationInputs {
+            queue,
+            checkpoints: Arc::clone(chkpt_store),
+            source_id: self.id.clone(),
+            lineage,
+            fingerprint: self.config_fingerprint(),
+            policy: crate::snapshot_queue::PolicySnapshot::from(&cohort),
+            mode: self.snapshot_cfg.mode.clone(),
+            engine: MyOrder,
+            anchor_of: my_anchor_of,
+        };
+        let decided = crate::snapshot_driver::decide(
+            &inputs,
+            &self.incidents(),
+            &self.snapshot_cohort,
+        )
+        .await
+        .map_err(|e| crate::snapshot_driver::source_error(&self.id, e))?;
+        let start = match decided {
+            crate::snapshot_driver::Decided::Stream { completed } => {
+                MyStart::Stream {
+                    completed_anchor: completed
+                        .as_ref()
+                        .and_then(|c| c.anchor.as_ref())
+                        .and_then(my_anchor_of),
+                }
+            }
+            crate::snapshot_driver::Decided::Generation {
+                version,
+                control,
+            } => {
+                // The lineage was captured at startup, not by the snapshot.
+                crate::snapshot_probe::record_fixed(
+                    crate::snapshot_probe::FixedOp::GenerationAllocation,
+                );
+                MyStart::Generation {
+                    version,
+                    control: Box::new(control),
+                }
+            }
+        };
+        Ok((start, Some(inputs)))
+    }
+
     /// Discover the tables to copy (keyset pages of the catalog, filtered by
     /// the CDC matcher) and prepare each exactly once - after a failover its
     /// drift policy first (before its schema is loaded or registered), then
     /// one schema resolution, identity resolution and type validation, cursor
-    /// kind - into a compact plan entry and the streaming generation
-    /// fingerprint, then atomically allocate (or resume) the snapshot
-    /// generation - all **before** any row is emitted. Keyless tables or
-    /// unsupported identity types fail here, before allocation.
-    async fn prepare_snapshot(
+    /// kind - and store it as an immutable plan item of `control`'s
+    /// generation, page by page: the plan is never resident in full. Keyless
+    /// tables or unsupported identity types fail here, before any row. The
+    /// plan bounds are checked as it grows (design section 9).
+    async fn plan_generation(
         &self,
         loader: &MySqlSchemaLoader,
         drift: Option<&DriftCheck<'_>>,
-        lineage: PersistedLineage,
-        force_new: bool,
-    ) -> SourceResult<SnapshotPlan> {
+        version: u64,
+        control: &crate::snapshot_queue::GenerationControl,
+    ) -> SourceResult<crate::snapshot_queue::PlanSummary> {
         use crate::identity_resolution::{
             IdentitySchemaView, resolve_identity,
         };
-        use crate::snapshot_generation::{
-            AllocationMode, SnapshotFingerprintBuilder, allocate_generation,
-        };
+        use crate::snapshot_driver::incidents as drafts;
 
+        let queue = self.queue();
         let started = std::time::Instant::now();
         let fetches_before = loader.live_fetch_count();
         let mut conn = loader.discovery_conn().await?;
@@ -375,9 +497,12 @@ impl MySqlSource {
             &self.tables,
             self.snapshot_cfg.discovery_page_size,
         );
-        let mut fingerprint =
-            SnapshotFingerprintBuilder::new("mysql", &self.tables);
-        let mut tables: Vec<MyPlannedTable> = Vec::new();
+        let mut digest = crate::snapshot_queue::PlanDigest::default();
+        let (mut items, mut bytes, mut warned) = (0u64, 0u64, false);
+        let (max_items, max_bytes) = (
+            self.snapshot_cfg.max_plan_items,
+            self.snapshot_cfg.max_plan_bytes,
+        );
         while !discovery.is_done() {
             let t = std::time::Instant::now();
             let rows = mysql_schema_loader::discovery_page(
@@ -432,23 +557,76 @@ impl MySqlSource {
                     mysql_identity_kind(col)
                         .map_err(|e| SourceError::Other(anyhow::anyhow!(e)))?;
                 }
-                let cursor_kind = mysql_snapshot::mysql_cursor_kind(schema);
-                fingerprint.table(
-                    &db,
-                    None,
-                    &table,
-                    &resolved.columns,
-                    cursor_kind,
-                    loaded.registry_version,
-                );
-                crate::snapshot_probe::record_prepared_table();
-                tables.push(MyPlannedTable {
+                let item = crate::snapshot_queue::PlanItem {
+                    item_format: crate::snapshot_queue::ITEM_FORMAT,
                     qualifier: db,
                     table,
-                    identity: resolved.columns,
-                    cursor_kind,
+                    identity: serde_json::to_value(&resolved.columns)
+                        .map_err(|e| SourceError::Other(e.into()))?,
+                    cursor_kind: mysql_snapshot::mysql_cursor_kind(schema),
+                    schema_version: loaded.registry_version as u64,
                     signature: mysql_snapshot::mysql_schema_signature(schema),
-                });
+                };
+                let (key, item_bytes) =
+                    queue.put_item(control, &item).await.map_err(|e| {
+                        SourceError::Other(anyhow::anyhow!("plan item: {e}"))
+                    })?;
+                digest.add(&key, &item_bytes);
+                items += 1;
+                bytes += item_bytes.len() as u64;
+                crate::snapshot_probe::record_prepared_table();
+                let over = if items > max_items {
+                    Some("plan_items")
+                } else if bytes > max_bytes {
+                    Some("plan_bytes")
+                } else {
+                    None
+                };
+                if let Some(class) = over {
+                    let draft = drafts::blocked(
+                        deltaforge_core::incident::ReasonCode::SnapshotBoundExceeded,
+                        &self.id,
+                        control.generation,
+                        class,
+                    );
+                    crate::snapshot_driver::block_generation(
+                        &queue,
+                        &self.incidents(),
+                        control.generation,
+                        None,
+                        version,
+                        &draft,
+                    )
+                    .await
+                    .map_err(|e| SourceError::Other(e.into()))?;
+                    return Err(SourceError::Incompatible {
+                        details: format!(
+                            "source {}: the snapshot plan exceeds its bound \
+                             ({class}: {items} items, {bytes} bytes; limits \
+                             {max_items} items, {max_bytes} bytes); the \
+                             generation is blocked until an explicit resnapshot",
+                            self.id
+                        )
+                        .into(),
+                    });
+                }
+                if !warned
+                    && (items * 5 >= max_items * 4
+                        || bytes * 5 >= max_bytes * 4)
+                {
+                    warned = true;
+                    let _ = self
+                        .incidents()
+                        .raise(
+                            &drafts::bound_warning(
+                                &self.id,
+                                control.generation,
+                                "plan_storage",
+                            ),
+                            1,
+                        )
+                        .await;
+                }
             }
         }
         drop(conn);
@@ -456,45 +634,441 @@ impl MySqlSource {
         crate::snapshot_probe::record_fixed(
             crate::snapshot_probe::FixedOp::RowImageCheck,
         );
-
-        let fingerprint = fingerprint.finish();
-        let mode = if force_new {
-            AllocationMode::ForceNew
-        } else {
-            AllocationMode::Resume
-        };
-        let store = BackendCheckpointStore::new(self.backend.clone());
-        let key = format!("snapshot_generation:{}", self.id);
-        let alloc =
-            allocate_generation(&store, &key, lineage, &fingerprint, mode)
-                .await
-                .map_err(|e| SourceError::Other(anyhow::anyhow!(e)))?;
-        crate::snapshot_probe::record_fixed(
-            crate::snapshot_probe::FixedOp::GenerationAllocation,
-        );
         crate::snapshot_probe::record_preparation(
             started.elapsed(),
-            crate::snapshot_plan::plan_bytes(&tables, |ids| {
-                ids.iter()
-                    .map(|i| std::mem::size_of::<String>() + i.len())
-                    .sum()
-            }),
+            bytes as usize,
             loader.live_fetch_count() - fetches_before,
         );
+        Ok(digest.seal())
+    }
 
-        info!(
-            source_id = %self.id,
-            generation = alloc.record.generation,
-            tables = tables.len(),
-            "snapshot generation allocated"
+    /// The preflight over the plan (design section 9): server settings, and
+    /// the size and storage engine of every planned table, page by page.
+    /// Returns the server's binlog retention, when it expires binlogs.
+    async fn preflight_plan(
+        &self,
+        server_uuid: &str,
+        generation: u64,
+        tables: u64,
+    ) -> SourceResult<Option<u64>> {
+        let mut report = mysql_health::run_preflight_verified(
+            self.dsn.expose(),
+            server_uuid,
+            &[] as &[(&str, &str)],
+            self.snapshot_cfg.max_parallel_tables,
+        )
+        .await
+        .map_err(|e| typed(e, "snapshot preflight"))?;
+        let mut conn = open_control_connection(
+            self.dsn.expose(),
+            server_uuid,
+            CONTROL_CONNECT_TIMEOUT,
+        )
+        .await
+        .map_err(|e| e.into_source_error(server_uuid))?;
+        let mut plan = mysql_snapshot::PlanPages::new(
+            self.queue(),
+            generation,
+            self.snapshot_cfg.discovery_page_size,
         );
-        Ok(SnapshotPlan {
-            generation: alloc.record.generation,
-            lineage: alloc.record.lineage,
-            tables,
+        let (mut total, mut page) = (0u64, Vec::new());
+        loop {
+            let next = plan.next().await.map_err(SourceError::Other)?;
+            if let Some(t) = &next {
+                page.push((t.qualifier.clone(), t.table.clone()));
+            }
+            if page.len() >= 1_000 || (next.is_none() && !page.is_empty()) {
+                total += mysql_health::size_and_engines(
+                    &mut conn,
+                    &page,
+                    &mut report,
+                )
+                .await;
+                page.clear();
+            }
+            if next.is_none() {
+                break;
+            }
+        }
+        conn.disconnect().await.ok();
+        report.apply_size_estimate(
+            total,
+            tables as usize,
+            self.snapshot_cfg.max_parallel_tables,
+        );
+        crate::snapshot_probe::record_fixed(
+            crate::snapshot_probe::FixedOp::Preflight,
+        );
+        report.emit(&self.id, tables as usize);
+        let retention = report.retention_secs;
+        if !report.hard_errors.is_empty() {
+            let details = report.hard_errors.join("; ");
+            return Err(if report.permission_error {
+                SourceError::Permission {
+                    details: details.into(),
+                }
+            } else {
+                SourceError::Incompatible {
+                    details: details.into(),
+                }
+            });
+        }
+        Ok(retention)
+    }
+
+    /// After a failure of a running generation: when the control record no
+    /// longer shows this run's generation, another process took over, and
+    /// this one stops (a non-blocking `concurrent_owner` incident; the
+    /// current owner's control record is never written).
+    async fn concurrent_owner(
+        &self,
+        generation: u64,
+        run: &str,
+    ) -> Option<SourceError> {
+        crate::snapshot_driver::owner_lost(
+            &self.queue(),
+            &self.incidents(),
+            &self.id,
+            generation,
+            run,
+        )
+        .await
+        .map(|why| SourceError::Incompatible {
+            details: format!("source {}: {why}", self.id).into(),
         })
     }
 
+    /// Run generation `control` (design sections 2 to 6): the snapshot
+    /// connections, the plan, the preflight, the anchor under the read lock
+    /// (every worker's consistent snapshot opened under it, the plan
+    /// verified under it), the start barrier, the copy, the final check,
+    /// `rows_produced` and the terminal barrier. Returns the anchor, where
+    /// the stream starts.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_generation(
+        &self,
+        version: u64,
+        control: crate::snapshot_queue::GenerationControl,
+        inputs: &MyGenerationInputs,
+        loader: &MySqlSchemaLoader,
+        drift: Option<&DriftCheck<'_>>,
+        server_uuid: &str,
+        tx: &mpsc::Sender<SourceItem>,
+        cancel: &CancellationToken,
+    ) -> SourceResult<MyGenerationRun> {
+        use crate::snapshot_permits::{SnapshotPermits, global_cap, validate};
+        let other = |e: anyhow::Error| SourceError::Other(e);
+        let queue = &inputs.queue;
+        let run = format!("{:032x}", rand::random::<u128>());
+        let t0 = std::time::Instant::now();
+
+        // 1. The snapshot's connections, before any catalog session, lock or
+        // anchor; cancellable while queued. Extra workers only when free now.
+        let cfg = &self.snapshot_cfg;
+        let source_cap = cfg.snapshot_connection_cap();
+        let most =
+            u32::try_from(cfg.max_parallel_tables.max(1).saturating_add(2))
+                .unwrap_or(u32::MAX);
+        validate(global_cap(), source_cap, MY_BASE_SNAPSHOT_CONNECTIONS, most)
+            .map_err(|e| SourceError::Incompatible {
+                details: format!("source {}: {e}", self.id).into(),
+            })?;
+        let permits = SnapshotPermits::acquire(
+            &self.pipeline,
+            source_cap,
+            MY_BASE_SNAPSHOT_CONNECTIONS,
+            cancel,
+        )
+        .await
+        .map_err(|_| SourceError::Cancelled)?;
+
+        // 2. The plan, page by page, and the preflight over it.
+        let plan = self
+            .plan_generation(loader, drift, version, &control)
+            .await?;
+        let retention = self
+            .preflight_plan(server_uuid, control.generation, plan.items)
+            .await?
+            .map(Duration::from_secs);
+        let mut extras = Vec::new();
+        while extras.len() + 1 < cfg.max_parallel_tables.max(1)
+            && (extras.len() as u64 + 1) < plan.items.max(1)
+        {
+            match permits.try_extra() {
+                Some(p) => extras.push(p),
+                None => break,
+            }
+        }
+        let workers = 1 + extras.len();
+
+        // 3. The anchor: every worker's consistent snapshot opened under the
+        // read lock, the position captured and the plan verified under it.
+        crate::snapshot_probe::before_anchor().await;
+        let (worker_conns, mut position) =
+            mysql_snapshot::acquire_locked_anchor(
+                self.dsn.expose(),
+                server_uuid,
+                workers,
+                Duration::from_secs(cfg.lock_timeout_secs.max(1)),
+                mysql_snapshot::PlanCheck {
+                    patterns: &self.tables,
+                    page_size: cfg.discovery_page_size,
+                    expected: mysql_snapshot::PlanPages::new(
+                        queue.clone(),
+                        control.generation,
+                        cfg.discovery_page_size,
+                    ),
+                },
+            )
+            .await
+            .map_err(|e| {
+                e.downcast::<SourceError>().unwrap_or_else(|e| {
+                    other(e.context("acquire locked snapshot anchor"))
+                })
+            })?;
+        crate::snapshot_probe::record_fixed(
+            crate::snapshot_probe::FixedOp::Anchor,
+        );
+        position.lineage = checkpoint_lineage(&self.registry_scope);
+        crate::snapshot_probe::record_phase(
+            crate::snapshot_probe::Phase::PreflightAnchor,
+            t0.elapsed(),
+        );
+
+        // 4. Seal the plan, record the anchor and this run as the owner.
+        let (version, control) = queue
+            .seal_and_run(
+                version,
+                &control,
+                plan,
+                crate::snapshot_queue::EngineAnchor::Mysql {
+                    file: position.file.clone(),
+                    pos: position.pos,
+                    gtid_set: position.gtid_set.clone(),
+                    lineage: position.lineage.clone(),
+                },
+                &run,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(|e| {
+                other(anyhow::anyhow!("seal the snapshot plan: {e}"))
+            })?;
+        info!(
+            source_id = %self.id,
+            generation = control.generation,
+            file = %position.file,
+            pos = position.pos,
+            tables = control.plan.items,
+            workers,
+            "snapshot generation running"
+        );
+
+        // The guard: the anchor's binlog, the anchor age and the binlog
+        // retention block the generation and stop the copy.
+        let guard_version =
+            Arc::new(std::sync::atomic::AtomicU64::new(version));
+        let gen_cancel = cancel.child_token();
+        let stopped: Arc<std::sync::Mutex<Option<mysql_snapshot::GuardStop>>> =
+            Default::default();
+        let guard = mysql_snapshot::spawn_generation_guard(
+            mysql_snapshot::GenerationGuard {
+                dsn: self.dsn.clone(),
+                expected_uuid: server_uuid.to_string(),
+                captured_file: position.file.clone(),
+                source_id: self.id.clone(),
+                generation: control.generation,
+                run: run.clone(),
+                version: Arc::clone(&guard_version),
+                anchored_at_ms: control.anchored_at_ms.unwrap_or_default(),
+                max_anchor_age: Duration::from_secs(cfg.max_anchor_age_secs),
+                retention,
+                queue: queue.clone(),
+                incidents: self.incidents(),
+                cancel: gen_cancel.clone(),
+                stopped: Arc::clone(&stopped),
+            },
+        );
+        let _guard = scopeguard::guard(guard, |g| g.abort());
+        let stopped_err = |stopped: &std::sync::Mutex<
+            Option<mysql_snapshot::GuardStop>,
+        >| {
+            stopped.lock().expect("not poisoned").clone().map(|why| match why {
+                    mysql_snapshot::GuardStop::WrongServer(why) => {
+                        SourceError::Lineage {
+                            details: format!("source {}: {why}", self.id).into(),
+                        }
+                    }
+                    mysql_snapshot::GuardStop::Blocked(why) => {
+                        SourceError::Incompatible {
+                            details: format!(
+                                "source {}: snapshot generation {} stopped: {why}",
+                                self.id, control.generation
+                            )
+                            .into(),
+                        }
+                    }
+                })
+        };
+
+        // 5. The start barrier: no row before the whole cohort entered the
+        // generation.
+        let publisher =
+            Arc::new(crate::snapshot_publish::GenerationPublisher::new(
+                queue.clone(),
+                tx.clone(),
+                control.clone(),
+                &run,
+                crate::snapshot_position::encode_chained(
+                    &control.snapshot_chain,
+                    control.generation,
+                    &position,
+                ),
+            ));
+        if let Err(e) = publisher.start().await {
+            return Err(self
+                .concurrent_owner(control.generation, &run)
+                .await
+                .unwrap_or_else(|| other(e.into())));
+        }
+        let adopted = crate::snapshot_driver::await_adoption(
+            &inputs.input(),
+            &gen_cancel,
+        )
+        .await;
+        match adopted {
+            Ok((v, _)) => {
+                guard_version.store(v, std::sync::atomic::Ordering::SeqCst)
+            }
+            Err(e) => {
+                let e = match stopped_err(&stopped) {
+                    Some(b) => b,
+                    None if cancel.is_cancelled() => SourceError::Cancelled,
+                    None => {
+                        other(anyhow::anyhow!("snapshot start barrier: {e}"))
+                    }
+                };
+                return Err(self
+                    .concurrent_owner(control.generation, &run)
+                    .await
+                    .unwrap_or(e));
+            }
+        }
+
+        // 6. The copy.
+        let copy_started = std::time::Instant::now();
+        let copied =
+            mysql_snapshot::copy_generation(mysql_snapshot::MyCopyCtx {
+                source_id: &self.id,
+                pipeline: &self.pipeline,
+                tenant: &self.tenant,
+                cfg,
+                schema_loader: loader,
+                cancel: gen_cancel.clone(),
+                plan: mysql_snapshot::PlanPages::new(
+                    queue.clone(),
+                    control.generation,
+                    cfg.discovery_page_size,
+                ),
+                workers: worker_conns,
+                publisher: Arc::clone(&publisher),
+                generation: control.generation,
+                lineage: control.lineage.clone(),
+            })
+            .await;
+        crate::snapshot_probe::record_phase(
+            crate::snapshot_probe::Phase::RowCopy,
+            copy_started.elapsed(),
+        );
+        if let Some(b) = stopped_err(&stopped) {
+            return Err(b);
+        }
+        // The source stopping mid-copy is a stop, not a failure: the
+        // generation is replaced at the next start.
+        if copied.is_err() && cancel.is_cancelled() {
+            return Err(SourceError::Cancelled);
+        }
+        if let Err(e) = copied {
+            return Err(self
+                .concurrent_owner(control.generation, &run)
+                .await
+                .unwrap_or_else(|| other(e)));
+        }
+        drop(extras);
+        drop(permits);
+
+        // 7. The anchor's binlog still there, then the rows are produced and
+        // the terminal barrier carries the completing position.
+        let final_started = std::time::Instant::now();
+        mysql_health::verify_binlog_position(
+            self.dsn.expose(),
+            server_uuid,
+            &position.file,
+        )
+        .await
+        .map_err(|e| typed(e, "post-snapshot binlog position verification"))?;
+        let current = match queue.read().await {
+            Ok(Some(crate::snapshot_queue::Stored::Current {
+                version,
+                control,
+            })) => (version, *control),
+            other_state => {
+                return Err(self
+                    .concurrent_owner(control.generation, &run)
+                    .await
+                    .unwrap_or_else(|| {
+                        other(anyhow::anyhow!(
+                            "the snapshot control record changed during the \
+                             copy: {other_state:?}"
+                        ))
+                    }));
+            }
+        };
+        let produced = match queue
+            .rows_produced(current.0, &current.1, &run)
+            .await
+        {
+            Ok((_, produced)) => produced,
+            Err(e) => {
+                return Err(self
+                    .concurrent_owner(control.generation, &run)
+                    .await
+                    .unwrap_or_else(|| {
+                        other(anyhow::anyhow!("record the rows produced: {e}"))
+                    }));
+            }
+        };
+        let completing = serde_json::to_vec(&MySqlCheckpoint {
+            snapshot_completed: Some(produced.generation),
+            snapshot_chain: Some(produced.snapshot_chain.clone()),
+            ..position.clone()
+        })
+        .map_err(|e| other(e.into()))?;
+        if let Err(e) = publisher.terminal(completing).await {
+            return Err(self
+                .concurrent_owner(control.generation, &run)
+                .await
+                .unwrap_or_else(|| other(e.into())));
+        }
+        crate::snapshot_probe::record_phase(
+            crate::snapshot_probe::Phase::Finalization,
+            final_started.elapsed(),
+        );
+        info!(
+            source_id = %self.id,
+            generation = produced.generation,
+            file = %position.file,
+            pos = position.pos,
+            "snapshot rows produced; the stream starts at the anchor"
+        );
+        Ok(MyGenerationRun {
+            anchor: position,
+            generation: produced.generation,
+        })
+    }
+}
+
+impl MySqlSource {
     /// Whether unfinished legacy snapshot progress is ambiguous: among the
     /// tables the configured patterns expand to now (paged discovery, the
     /// same canonical `db.table` identities the snapshot records), some are
@@ -709,6 +1283,7 @@ impl MySqlSource {
                         gtid_set: Some(set),
                         lineage: Some(lineage_hash.clone()),
                         snapshot_completed: None,
+                        snapshot_chain: None,
                     })
                 }
                 None => None,
@@ -724,171 +1299,98 @@ impl MySqlSource {
             .map_err(SourceError::Other)?;
         }
 
-        // snapshot (if configured)
-        let snapshot_progress: Option<MysqlSnapshotProgress> = chkpt_store
-            .get_raw(&mysql_snapshot::progress_key(&self.id))
-            .await
-            .ok()
-            .flatten()
-            .and_then(|b| serde_json::from_slice(&b).ok());
-
-        // Whether this start continues from a committed resume position: a
-        // start without one (first start, or "from end") or a snapshot (a new
-        // anchor) is a stream discontinuity (spec 7.5).
+        // The snapshot decision is the generation driver's (design section
+        // 4): an incomplete generation is replaced, never resumed as a
+        // stream; a completed one streams.
         let resume = self.resume_position(&chkpt_store).await?;
         // The stream position a snapshot-free start resumes from.
         let stream_resume = match &resume {
             Some(MyResumePosition::Stream(cp)) => Some(cp.clone()),
             _ => None,
         };
-        let SnapshotNeed {
-            needs_snapshot,
-            unproven: unproven_snapshot,
-        } = snapshot_need(
-            &self.snapshot_cfg.mode,
-            snapshot_progress.as_ref(),
-            resume.as_ref(),
-        )
-        .map_err(|e| SourceError::Checkpoint {
-            details: format!("source {}: {e}", self.id).into(),
-        })?;
+        let (start, generation_inputs) = self
+            .decide_snapshot(&chkpt_store, durable_lineage.clone())
+            .await?;
+        let needs_snapshot = matches!(start, MyStart::Generation { .. });
         // Whether this start continues from a committed resume position.
         let committed_resume = stream_resume.is_some() && !needs_snapshot;
 
-        // The tables a snapshot copied: proven at its anchor below.
-        let mut snapshot_tables: Vec<(String, String)> = Vec::new();
-        // The anchor a snapshot of this start leaves the stream at.
+        // The generation this start ran, if any.
+        let mut generation_run: Option<MyGenerationRun> = None;
+        // The anchor a snapshot of this start, or the completed generation,
+        // leaves the stream at.
         let mut snapshot_start: Option<MySqlCheckpoint> = None;
-        if needs_snapshot {
-            // An unfinished snapshot is never resumed from its progress: its
-            // completed tables were read at the interrupted run's anchor,
-            // while this run takes a new anchor and CDC starts there, so
-            // their changes in between would be lost. It restarts in full as
-            // a new generation (reusing the anchor needs the durable work
-            // queue). Unreadable progress fails closed.
-            let progress = mysql_snapshot::load_snapshot_progress(
-                chkpt_store.as_ref(),
-                &self.id,
-            )
-            .await
-            .map_err(SourceError::Other)?;
-            let interrupted = unproven_snapshot
-                || (!progress.finished
-                    && (!progress.start_position.is_empty()
-                        || !progress.done_tables.is_empty()));
-            if interrupted {
-                warn!(
-                    source_id = %self.id,
-                    completed_tables = progress.done_tables.len(),
-                    "an interrupted snapshot restarts in full as a new \
-                     generation (completed tables are read again)"
+        match start {
+            MyStart::Stream { completed_anchor } => {
+                if stream_resume.is_none() {
+                    snapshot_start = completed_anchor.map(|mut a| {
+                        a.lineage = checkpoint_lineage(&self.registry_scope);
+                        a
+                    });
+                }
+            }
+            MyStart::Generation { version, control } => {
+                info!(source_id = %self.id, "starting the snapshot generation");
+                let snap_schema_loader = MySqlSchemaLoader::new(
+                    self.dsn.clone(),
+                    self.registry.clone(),
+                    &self.tenant,
+                    self.registry_scope.clone(),
                 );
-            }
-            let restart =
-                interrupted || self.snapshot_cfg.mode == SnapshotMode::Always;
-            info!(source_id = %self.id, "starting mysql snapshot");
-
-            let snap_schema_loader = MySqlSchemaLoader::new(
-                self.dsn.clone(),
-                self.registry.clone(),
-                &self.tenant,
-                self.registry_scope.clone(),
-            );
-            // After a failover, each snapshotted table's drift policy
-            // applies before its schema is loaded or registered and before
-            // any snapshot row (Round 38): in the preparation pass, page by
-            // page, from the one discovery.
-            let drift_anchor = mysql_failover_drift::load_anchor(
-                &self.backend,
-                &self.tenant,
-                &self.id,
-            )
-            .await
-            .map_err(SourceError::Other)?;
-            let drift_scope = self.registry_scope.current()?;
-            let drift = match &drift_anchor {
-                Some(anchor) => Some(DriftCheck {
-                    anchor,
-                    env: mysql_failover_drift::DriftEnv {
-                        backend: &self.backend,
-                        loader: &snap_schema_loader,
-                        scope: &drift_scope,
-                        dsn: self.dsn.expose(),
-                        server_uuid: &server_uuid,
-                        source_id: &self.id,
-                        halt: self.on_schema_drift
-                            == deltaforge_config::OnSchemaDrift::Halt,
-                        lower_case_table_names: fetch_lower_case_table_names(
-                            self.dsn.expose(),
-                            &server_uuid,
-                        )
-                        .await?,
-                    },
-                }),
-                None => None,
-            };
-
-            // Discover + validate every table, freeze lineage, allocate the
-            // generation BEFORE emitting any row (keyless/unsupported tables
-            // fail here).
-            let plan = self
-                .prepare_snapshot(
-                    &snap_schema_loader,
-                    drift.as_ref(),
-                    durable_lineage.clone(),
-                    restart,
+                // After a failover, each snapshotted table's drift policy
+                // applies before its schema is loaded or registered and
+                // before any snapshot row (Round 38): in the planning pass,
+                // page by page, from the one discovery.
+                let drift_anchor = mysql_failover_drift::load_anchor(
+                    &self.backend,
+                    &self.tenant,
+                    &self.id,
                 )
-                .await?;
-            // Discard the previous progress only after the new generation is
-            // durable: a crash in between restarts again (never resumes the
-            // interrupted generation).
-            if restart {
-                let bytes =
-                    serde_json::to_vec(&MysqlSnapshotProgress::default())
-                        .map_err(|e| SourceError::Other(e.into()))?;
-                chkpt_store
-                    .put_raw(&mysql_snapshot::progress_key(&self.id), &bytes)
-                    .await
-                    .map_err(|e| SourceError::Other(e.into()))?;
+                .await
+                .map_err(SourceError::Other)?;
+                let drift_scope = self.registry_scope.current()?;
+                let drift = match &drift_anchor {
+                    Some(anchor) => Some(DriftCheck {
+                        anchor,
+                        env: mysql_failover_drift::DriftEnv {
+                            backend: &self.backend,
+                            loader: &snap_schema_loader,
+                            scope: &drift_scope,
+                            dsn: self.dsn.expose(),
+                            server_uuid: &server_uuid,
+                            source_id: &self.id,
+                            halt: self.on_schema_drift
+                                == deltaforge_config::OnSchemaDrift::Halt,
+                            lower_case_table_names:
+                                fetch_lower_case_table_names(
+                                    self.dsn.expose(),
+                                    &server_uuid,
+                                )
+                                .await?,
+                        },
+                    }),
+                    None => None,
+                };
+                let ran = self
+                    .run_generation(
+                        version,
+                        *control,
+                        generation_inputs
+                            .as_ref()
+                            .expect("a generation has its inputs"),
+                        &snap_schema_loader,
+                        drift.as_ref(),
+                        &server_uuid,
+                        &tx,
+                        &cancel,
+                    )
+                    .await?;
+                // The stream starts at the anchor. No checkpoint is written
+                // here: only the sinks' commits record what was delivered.
+                snapshot_start = Some(ran.anchor.clone());
+                generation_run = Some(ran);
+                info!(source_id = %self.id, "snapshot rows produced, starting binlog streaming");
             }
-
-            let snapshot_ctx = mysql_snapshot::SnapshotCtx {
-                checkpoint_lineage: checkpoint_lineage(&self.registry_scope),
-                dsn: self.dsn.expose(),
-                expected_uuid: &server_uuid,
-                source_id: &self.id,
-                pipeline: &self.pipeline,
-                tenant: &self.tenant,
-                cfg: &self.snapshot_cfg,
-                table_patterns: &self.tables,
-                schema_loader: &snap_schema_loader,
-                chkpt_store: chkpt_store.clone(),
-                tx: tx.clone(),
-                cancel: cancel.clone(),
-                generation: plan.generation,
-                lineage: plan.lineage,
-            };
-            let snapshot_position =
-                mysql_snapshot::run_snapshot(&snapshot_ctx, &plan.tables)
-                    .await
-                    // Preserve a typed preflight refusal (Permission/Incompatible)
-                    // if run_snapshot produced one; otherwise wrap as Other.
-                    .map_err(|e| {
-                        e.downcast::<SourceError>()
-                            .unwrap_or_else(SourceError::Other)
-                    })?;
-
-            // The stream starts at the anchor. No checkpoint is written here:
-            // only the sinks' commits of the snapshot's boundaries (the last
-            // one completing it) record what was delivered.
-            snapshot_start = Some(snapshot_position);
-
-            snapshot_tables = plan
-                .tables
-                .into_iter()
-                .map(|t| (t.qualifier, t.table))
-                .collect();
-            info!(source_id = %self.id, "snapshot complete, starting binlog streaming");
         }
 
         // binlog streaming - retry prepare_client on transient connection errors
@@ -1064,10 +1566,40 @@ impl MySqlSource {
         // needed proven by a lazy baseline, at its first rows (design spec
         // 7.21). CDC startup work is independent of the catalog.
         ctx.schema.check_binlog_row_image().await?;
-        // A snapshot already enumerated and loaded its tables: prove each at
-        // the anchor now (no gap until its first CDC rows).
-        if !snapshot_tables.is_empty() {
-            mysql_baseline::establish(&ctx, &snapshot_tables).await?;
+        // A snapshot just copied its plan's tables: prove each at the anchor
+        // now (no gap until its first CDC rows), page by page; then record
+        // completion once the frozen policy's frontier covers the terminal
+        // (completion reclaims the plan).
+        if let Some(ran) = &generation_run {
+            let mut plan = mysql_snapshot::PlanPages::new(
+                self.queue(),
+                ran.generation,
+                self.snapshot_cfg.discovery_page_size,
+            );
+            let mut page = Vec::new();
+            loop {
+                let next = plan.next().await.map_err(SourceError::Other)?;
+                if let Some(t) = next.as_ref() {
+                    page.push((t.qualifier.clone(), t.table.clone()));
+                }
+                if page.len() >= self.snapshot_cfg.discovery_page_size.max(1)
+                    || (next.is_none() && !page.is_empty())
+                {
+                    mysql_baseline::establish(&ctx, &page).await?;
+                    page.clear();
+                }
+                if next.is_none() {
+                    break;
+                }
+            }
+            crate::snapshot_driver::spawn_completion_watch(
+                generation_inputs
+                    .clone()
+                    .expect("a generation has its inputs"),
+                self.incidents(),
+                Arc::clone(&self.snapshot_cohort),
+                ctx.cancel.clone(),
+            );
         }
 
         // Controlled credential rotation (opt-in, file-backed credentials only).
@@ -1208,6 +1740,7 @@ impl MySqlSource {
                         pos: ctx.last_pos,
                         gtid_set: ctx.last_gtid,
                         snapshot_completed: None,
+                        snapshot_chain: None,
                     },
                 )
                 .await;
@@ -1234,7 +1767,8 @@ pub fn compare_mysql_checkpoints(a: &[u8], b: &[u8]) -> CheckpointOrder {
 }
 
 /// MySQL's part of the snapshot position order.
-struct MyOrder;
+#[derive(Clone, Copy)]
+pub(crate) struct MyOrder;
 
 impl crate::snapshot_position::EngineOrder for MyOrder {
     type Anchor = MySqlCheckpoint;
@@ -1255,10 +1789,8 @@ impl crate::snapshot_position::EngineOrder for MyOrder {
     }
 
     fn completion_mark(&self, stream: &[u8]) -> Option<(Option<String>, u64)> {
-        serde_json::from_slice::<MySqlCheckpoint>(stream)
-            .ok()?
-            .snapshot_completed
-            .map(|g| (None, g))
+        let cp = serde_json::from_slice::<MySqlCheckpoint>(stream).ok()?;
+        cp.snapshot_completed.map(|g| (cp.snapshot_chain, g))
     }
 
     fn stream_lineage(&self, stream: &[u8]) -> Option<String> {
@@ -1387,6 +1919,26 @@ impl Source for MySqlSource {
             lineage.as_deref(),
             start,
         )
+    }
+
+    fn checkpoint_is_snapshot(&self, raw: &[u8]) -> bool {
+        matches!(
+            classify_mysql_checkpoint(raw),
+            Ok(MyResumePosition::Snapshot)
+        )
+    }
+
+    fn set_snapshot_cohort(&self, cohort: deltaforge_core::SnapshotCohort) {
+        self.snapshot_cohort.lock().expect("not poisoned").cohort =
+            Some(cohort);
+    }
+
+    fn resume_exclusions(&self) -> Vec<String> {
+        self.snapshot_cohort
+            .lock()
+            .expect("not poisoned")
+            .resume_exclusions
+            .clone()
     }
 
     async fn check_durable_snapshot_startup(
@@ -1674,6 +2226,7 @@ impl RunCtx {
             gtid_set: self.last_gtid.clone(),
             lineage: None,
             snapshot_completed: None,
+            snapshot_chain: None,
         });
     }
 
@@ -2323,6 +2876,7 @@ async fn run_failover_reconciliation(
             gtid_set: Some(resume_set.clone()),
             lineage: Some(current_lineage),
             snapshot_completed: None,
+            snapshot_chain: None,
         }),
     )
     .await
@@ -2645,6 +3199,7 @@ mod compare_checkpoints_tests {
             gtid_set: gtid.map(str::to_string),
             lineage: Some(lineage.into()),
             snapshot_completed: None,
+            snapshot_chain: None,
         })
         .unwrap()
     }
@@ -2784,6 +3339,7 @@ mod snapshot_completion_tests {
             gtid_set: Some(format!("{UUID}:{set}")),
             lineage: Some(LINEAGE.into()),
             snapshot_completed: None,
+            snapshot_chain: None,
         }
     }
 
@@ -2853,59 +3409,50 @@ mod snapshot_completion_tests {
         assert!(!proven(&legacy, &marked("1-5", 0)));
         assert!(proven(&legacy, &at("1-9")));
     }
+}
 
+#[cfg(test)]
+mod my_completion_tests {
+    use super::{MyOrder, MySqlCheckpoint};
+    use crate::snapshot_driver::{SinkState, sink_state};
+
+    fn at(gtid: &str) -> MySqlCheckpoint {
+        MySqlCheckpoint {
+            file: "bin.000003".into(),
+            pos: 100,
+            gtid_set: Some(format!(
+                "3E11FA47-71CA-11E1-9E33-C80AA9429562:{gtid}"
+            )),
+            lineage: Some("0123456789abcdef0123456789abcdef".into()),
+            snapshot_completed: None,
+            snapshot_chain: None,
+        }
+    }
+
+    fn marked(gtid: &str, chain: &str, g: u64) -> Vec<u8> {
+        serde_json::to_vec(&MySqlCheckpoint {
+            snapshot_completed: Some(g),
+            snapshot_chain: Some(chain.into()),
+            ..at(gtid)
+        })
+        .unwrap()
+    }
+
+    /// The completing position counts only at exactly the anchor, for the
+    /// generation and chain it names.
     #[test]
-    fn an_unproven_snapshot_runs_again_and_never_mode_fails_closed() {
-        let p = progress(3);
-        let stream = |cp: MySqlCheckpoint| Some(MyResumePosition::Stream(cp));
-        let need = |mode: SnapshotMode, r: Option<MyResumePosition>| {
-            snapshot_need(&mode, Some(&p), r.as_ref())
+    fn a_completion_is_bound_to_its_chain_and_exact_anchor() {
+        let anchor = at("1-5");
+        let state = |raw: &[u8]| {
+            sink_state(&MyOrder, Some(raw), "ch", 4, Some(&anchor))
         };
-        // Proven: stream on, in any mode but `always`.
-        for cp in [marked("1-5", 3), at("1-9")] {
-            assert_eq!(
-                need(SnapshotMode::Initial, stream(cp.clone())),
-                Ok(SnapshotNeed {
-                    needs_snapshot: false,
-                    unproven: false
-                })
-            );
-            assert_eq!(
-                need(SnapshotMode::Never, stream(cp)),
-                Ok(SnapshotNeed {
-                    needs_snapshot: false,
-                    unproven: false
-                })
-            );
-        }
-        // Unproven: snapshot again (initial), refuse (never).
-        for r in [
-            stream(at("1-5")),
-            stream(marked("1-5", 2)),
-            stream(at("1-2")),
-            Some(MyResumePosition::Snapshot),
-            None,
-        ] {
-            assert_eq!(
-                need(SnapshotMode::Initial, r.clone()),
-                Ok(SnapshotNeed {
-                    needs_snapshot: true,
-                    unproven: true
-                })
-            );
-            assert!(need(SnapshotMode::Never, r).is_err());
-        }
-        // Never snapshotted: `never` streams from wherever it is.
-        assert_eq!(
-            snapshot_need(
-                &SnapshotMode::Never,
-                None,
-                stream(at("1-9")).as_ref()
-            ),
-            Ok(SnapshotNeed {
-                needs_snapshot: false,
-                unproven: false
-            })
-        );
+        assert_eq!(state(&marked("1-5", "ch", 4)), SinkState::AtOrPast);
+        assert_eq!(state(&marked("1-5", "ch", 3)), SinkState::Behind);
+        assert_eq!(state(&marked("1-5", "other", 4)), SinkState::Foreign);
+        assert_eq!(state(&marked("1-7", "ch", 4)), SinkState::Foreign);
+        let after = serde_json::to_vec(&at("1-9")).unwrap();
+        assert_eq!(state(&after), SinkState::AtOrPast);
+        let at_anchor = serde_json::to_vec(&at("1-5")).unwrap();
+        assert_eq!(state(&at_anchor), SinkState::Behind, "unmarked");
     }
 }

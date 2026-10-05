@@ -25,6 +25,7 @@ use std::collections::HashMap;
 
 use super::postgres_identity::{PgIdentityRaw, pg_identity_cell, quote_ident};
 use crate::durable_checkpoint::CursorKind;
+use crate::snapshot_driver::{GuardFinding, anchor_age_finding};
 use crate::snapshot_event_id::{OwnedIdentityValue, snapshot_row_event_id};
 use crate::snapshot_generation::PersistedLineage;
 use crate::snapshot_permits::{ExtraPermit, SnapshotPermits};
@@ -448,28 +449,6 @@ pub struct GenerationGuard {
     pub cancel: CancellationToken,
     /// Why it blocked.
     pub blocked: Arc<Mutex<Option<String>>>,
-}
-
-/// What one guard check found.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GuardFinding {
-    Ok,
-    Warn(&'static str),
-    Block(&'static str),
-}
-
-/// The anchor-age bound: a warning at 80%, the limit blocks.
-fn anchor_age_finding(
-    age: std::time::Duration,
-    max: std::time::Duration,
-) -> GuardFinding {
-    if age >= max {
-        GuardFinding::Block("anchor_age")
-    } else if age.as_millis() * 5 >= max.as_millis() * 4 {
-        GuardFinding::Warn("anchor_age")
-    } else {
-        GuardFinding::Ok
-    }
 }
 
 /// The slot's WAL retention: the slot gone or invalidated, its WAL lost or

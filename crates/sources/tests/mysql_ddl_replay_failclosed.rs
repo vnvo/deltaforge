@@ -34,7 +34,6 @@ use deltaforge_core::{Event, Op, Source, SourceItem};
 use mysql_async::prelude::Queryable;
 use sources::MySqlCheckpoint;
 use sources::mysql::MySqlSource;
-use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 
 mod test_common;
@@ -70,6 +69,7 @@ async fn current_position(
             .get::<String, _>("Executed_Gtid_Set")
             .filter(|s| !s.is_empty()),
         snapshot_completed: None,
+        snapshot_chain: None,
     })
 }
 
@@ -104,9 +104,10 @@ async fn replay(
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
+        snapshot_cohort: Default::default(),
     };
 
-    let (tx, mut rx) = mpsc::channel::<SourceItem>(128);
+    let (tx, mut rx) = test_common::acked_channel(&src, &store, &src.id, 128);
     let handle = src.run(tx, Arc::clone(&store)).await;
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut events = Vec::new();
@@ -284,8 +285,9 @@ async fn replay_without_ddl_decodes_normally() -> Result<()> {
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
+        snapshot_cohort: Default::default(),
     };
-    let (tx, mut rx) = mpsc::channel::<SourceItem>(128);
+    let (tx, mut rx) = test_common::acked_channel(&src, &store, &src.id, 128);
     let handle = src.run(tx, store).await;
     let mut rows = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(30);

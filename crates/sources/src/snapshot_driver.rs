@@ -388,9 +388,10 @@ pub async fn decide_start<E: EngineOrder>(
     let never = input.mode == SnapshotMode::Never;
     let stored = match input.store.read().await? {
         None => {
-            // No generation was ever allocated: mode `never`, or a source
-            // that has been streaming without a snapshot (mode `initial`
-            // snapshots only a source with no checkpoint), keeps streaming.
+            // No generation was ever allocated: mode `never`, or (mode
+            // `initial` snapshots only a source with no checkpoint) a source
+            // that has been streaming without a snapshot, keeps streaming;
+            // mode `always` snapshots.
             // Snapshot positions without their control record: the
             // snapshot state was lost; nothing proves where they stand.
             if let Some(sink) =
@@ -398,7 +399,10 @@ pub async fn decide_start<E: EngineOrder>(
             {
                 return Err(DriverError::StateMissing { sink });
             }
-            if never || input.streams_without_snapshot().await? {
+            if never
+                || (input.mode == SnapshotMode::Initial
+                    && input.streams_without_snapshot().await?)
+            {
                 return Ok(StartOutcome::Stream {
                     lagging: Vec::new(),
                     completed_now: None,
@@ -466,6 +470,25 @@ pub async fn decide_start<E: EngineOrder>(
                     .await;
             }
             match try_complete(input, *version, control).await? {
+                // Mode `always` snapshots at every start: the generation
+                // just completed is replaced like any completed one.
+                Some(completed) if input.mode == SnapshotMode::Always => {
+                    let Some(now) = input.store.read().await? else {
+                        return Err(DriverError::Queue(
+                            QueueError::InvalidTransition(
+                                "the control record vanished".into(),
+                            ),
+                        ));
+                    };
+                    input
+                        .replace(
+                            &now,
+                            completed.generation,
+                            true,
+                            Allocation::Always,
+                        )
+                        .await
+                }
                 Some(completed) => {
                     let lagging = lagging(input, &completed).await?;
                     Ok(StartOutcome::Stream {
@@ -990,6 +1013,55 @@ mod tests {
         assert!(control.blocked.is_some(), "its exact version");
     }
 
+    /// Mode `always`: a start that finds the rows produced and the policy
+    /// covered completes the generation and still snapshots again.
+    #[tokio::test]
+    async fn mode_always_replaces_a_generation_it_just_completed() {
+        let q = QueueStore::new(mem(), "src");
+        let ck = MemCheckpointStore::new().unwrap();
+        let (v, c) = running(&q, "r").await;
+        let (_, produced) = q.rows_produced(v, &c, "r").await.unwrap();
+        ck.put_raw(
+            &sink_key("src", "s3"),
+            &marked(100, &produced.snapshot_chain, 1),
+        )
+        .await
+        .unwrap();
+        let mut always = input(&q, &ck);
+        always.mode = SnapshotMode::Always;
+        match decide_start(&always).await.unwrap() {
+            StartOutcome::Snapshot { control, why, .. } => {
+                assert_eq!(why, Allocation::Always);
+                assert_eq!(control.generation, 2);
+                assert_eq!(control.replaced, Some(1));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Without a control record, a source streaming without a snapshot
+    /// keeps streaming in mode `initial`; mode `always` snapshots.
+    #[tokio::test]
+    async fn only_mode_initial_keeps_a_snapshot_free_stream() {
+        let q = QueueStore::new(mem(), "src");
+        let ck = MemCheckpointStore::new().unwrap();
+        ck.put_raw("src", &stream(500)).await.unwrap();
+        assert!(matches!(
+            decide_start(&input(&q, &ck)).await.unwrap(),
+            StartOutcome::Stream { .. }
+        ));
+        assert!(q.read().await.unwrap().is_none());
+        let mut always = input(&q, &ck);
+        always.mode = SnapshotMode::Always;
+        assert!(matches!(
+            decide_start(&always).await.unwrap(),
+            StartOutcome::Snapshot {
+                why: Allocation::First,
+                ..
+            }
+        ));
+    }
+
     /// Snapshot positions without a control record fail the start closed.
     #[tokio::test]
     async fn snapshot_positions_without_their_control_record_fail_closed() {
@@ -1250,6 +1322,223 @@ pub async fn resume_exclusions<E: EngineOrder>(
             lagging(input, &control).await
         }
         _ => Ok(Vec::new()),
+    }
+}
+
+/// Everything a generation start or completion check reads, owned (the
+/// completion watcher outlives the start).
+#[derive(Clone)]
+pub struct GenerationInputs<E: EngineOrder> {
+    pub queue: QueueStore,
+    pub checkpoints: std::sync::Arc<dyn CheckpointStore>,
+    pub source_id: String,
+    pub lineage: PersistedLineage,
+    pub fingerprint: String,
+    pub policy: PolicySnapshot,
+    pub mode: SnapshotMode,
+    pub engine: E,
+    /// A control record's anchor as the engine's anchor.
+    pub anchor_of: fn(&EngineAnchor) -> Option<E::Anchor>,
+}
+
+impl<E: EngineOrder> GenerationInputs<E> {
+    pub fn input(&self) -> StartInput<'_, E> {
+        StartInput {
+            store: &self.queue,
+            engine: &self.engine,
+            checkpoints: self.checkpoints.as_ref(),
+            source_id: &self.source_id,
+            lineage: self.lineage.clone(),
+            config_fingerprint: &self.fingerprint,
+            policy: self.policy.clone(),
+            mode: self.mode.clone(),
+            anchor_of: &self.anchor_of,
+        }
+    }
+}
+
+/// Record `completed` once the frozen policy's frontier covers the
+/// generation's terminal (design section 6.2), then report the sinks behind
+/// it and leave them out of the resume fold. Ends with the source, or on
+/// anything but `rows_produced`.
+pub fn spawn_completion_watch<E>(
+    inputs: GenerationInputs<E>,
+    incidents: storage::adapters::incidents::IncidentStore,
+    shared: crate::SnapshotCohortSlot,
+    cancel: tokio_util::sync::CancellationToken,
+) where
+    E: EngineOrder + Clone + Send + Sync + 'static,
+    E::Anchor: Send + Sync,
+{
+    tokio::spawn(async move {
+        loop {
+            let input = inputs.input();
+            match inputs.queue.read().await {
+                Ok(Some(Stored::Current { version, control }))
+                    if control.state == State::RowsProduced =>
+                {
+                    match try_complete(&input, version, &control).await {
+                        Ok(Some(done)) => {
+                            tracing::info!(
+                                source_id = %inputs.source_id,
+                                generation = done.generation,
+                                "snapshot generation completed"
+                            );
+                            let behind = lagging(&input, &done)
+                                .await
+                                .unwrap_or_default();
+                            // Durably completed: the sinks behind it leave
+                            // the resume fold.
+                            shared
+                                .lock()
+                                .expect("not poisoned")
+                                .resume_exclusions = behind.clone();
+                            report_start(
+                                &incidents,
+                                &inputs.source_id,
+                                &StartOutcome::Stream {
+                                    lagging: behind,
+                                    completed_now: Some(done.clone()),
+                                },
+                                Some(&done),
+                            )
+                            .await;
+                            return;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                source_id = %inputs.source_id,
+                                error = %e,
+                                "snapshot completion check failed; the next \
+                                 start decides"
+                            );
+                            return;
+                        }
+                    }
+                }
+                _ => return,
+            }
+            tokio::select! {
+                _ = inputs.checkpoints.await_checkpoint_change() => {}
+                _ = cancel.cancelled() => return,
+            }
+        }
+    });
+}
+
+/// What a start decided, as an engine acts on it.
+#[derive(Debug, Clone)]
+pub enum Decided {
+    /// Stream. `completed` is the completed generation, if any: the stream
+    /// starts at its anchor when no sink holds a stream position yet.
+    Stream {
+        completed: Option<GenerationControl>,
+    },
+    /// Run this generation (allocated, its start barrier pending).
+    Generation {
+        version: u64,
+        control: GenerationControl,
+    },
+}
+
+/// Decide a start (design section 4) and act on the decision: raise its
+/// incidents and set the resume exclusions in `shared` (only from a
+/// durably completed generation; none for a new one).
+pub async fn decide<E: EngineOrder>(
+    inputs: &GenerationInputs<E>,
+    incidents: &storage::adapters::incidents::IncidentStore,
+    shared: &crate::SnapshotCohortSlot,
+) -> Result<Decided, DriverError> {
+    let input = inputs.input();
+    let outcome = decide_start(&input).await?;
+    let completed = match &outcome {
+        StartOutcome::Stream { completed_now, .. } => match completed_now {
+            Some(c) => Some(c.clone()),
+            None => match inputs.queue.read().await? {
+                Some(Stored::Current { control, .. }) => Some(*control),
+                _ => None,
+            },
+        },
+        StartOutcome::Snapshot { .. } => None,
+    };
+    report_start(incidents, &inputs.source_id, &outcome, completed.as_ref())
+        .await;
+    let exclusions = match &outcome {
+        StartOutcome::Stream { .. } => resume_exclusions(&input).await?,
+        StartOutcome::Snapshot { .. } => Vec::new(),
+    };
+    shared.lock().expect("not poisoned").resume_exclusions = exclusions;
+    Ok(match outcome {
+        StartOutcome::Stream { .. } => Decided::Stream { completed },
+        StartOutcome::Snapshot {
+            version, control, ..
+        } => {
+            tracing::info!(
+                source_id = %inputs.source_id,
+                snapshot_chain = %control.snapshot_chain,
+                generation = control.generation,
+                "snapshot generation allocated"
+            );
+            Decided::Generation { version, control }
+        }
+    })
+}
+
+/// A driver refusal as the source's error: refusals about the stored
+/// state are checkpoint errors (the source does not start).
+pub fn source_error(
+    source_id: &str,
+    e: DriverError,
+) -> deltaforge_core::SourceError {
+    let msg = format!("source {source_id}: {e}");
+    match e {
+        DriverError::Blocked { .. }
+        | DriverError::NeverIncomplete { .. }
+        | DriverError::Foreign { .. }
+        | DriverError::IncomparableAcks { .. }
+        | DriverError::StateMissing { .. }
+        | DriverError::Legacy => deltaforge_core::SourceError::Checkpoint {
+            details: msg.into(),
+        },
+        DriverError::Cancelled => deltaforge_core::SourceError::Cancelled,
+        _ => deltaforge_core::SourceError::Other(anyhow::anyhow!(msg)),
+    }
+}
+
+/// What one guard check found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardFinding {
+    Ok,
+    Warn(&'static str),
+    Block(&'static str),
+}
+
+/// The anchor-age bound: a warning at 80%, the limit blocks.
+pub fn anchor_age_finding(
+    age: std::time::Duration,
+    max: std::time::Duration,
+) -> GuardFinding {
+    if age >= max {
+        GuardFinding::Block("anchor_age")
+    } else if age.as_millis() * 5 >= max.as_millis() * 4 {
+        GuardFinding::Warn("anchor_age")
+    } else {
+        GuardFinding::Ok
+    }
+}
+
+/// The binlog (or other source log) retention against the anchor's age: a
+/// warning once the anchor is older than 80% of the retention.
+pub fn retention_finding(
+    age: std::time::Duration,
+    retention: Option<std::time::Duration>,
+) -> GuardFinding {
+    match retention {
+        Some(r) if !r.is_zero() && age.as_millis() * 5 >= r.as_millis() * 4 => {
+            GuardFinding::Warn("log_retention")
+        }
+        _ => GuardFinding::Ok,
     }
 }
 

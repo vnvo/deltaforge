@@ -123,6 +123,7 @@ pub(crate) async fn establish(
         gtid_set: ctx.last_gtid.clone(),
         lineage: Some(lineage.clone()),
         snapshot_completed: None,
+        snapshot_chain: None,
     };
     let Some(r0) = mysql_checkpoint_position(
         &r0_cp.file,
@@ -692,6 +693,7 @@ mod tests {
                 on_schema_drift: OnSchemaDrift::Adapt,
                 table_options: Default::default(),
                 rotation: None,
+                snapshot_cohort: Default::default(),
             };
             let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
             let handle = src.run(tx, st.ckpt.clone()).await;

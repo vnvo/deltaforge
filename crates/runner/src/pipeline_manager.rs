@@ -4244,6 +4244,7 @@ mod tests {
                 gtid_set: Some(format!("{uuid}:{set}")),
                 lineage: None,
                 snapshot_completed: completed,
+                snapshot_chain: None,
             }
         };
         let anchor = at("1-5", None);

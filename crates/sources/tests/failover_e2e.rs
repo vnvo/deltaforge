@@ -254,6 +254,7 @@ async fn make_mysql_source(
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
+        snapshot_cohort: Default::default(),
     }
 }
 
@@ -574,6 +575,7 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
             on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
             table_options: Default::default(),
             rotation: None,
+            snapshot_cohort: Default::default(),
         };
         let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -629,6 +631,7 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
             on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
             table_options: Default::default(),
             rotation: None,
+            snapshot_cohort: Default::default(),
         };
         let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -708,6 +711,7 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
             on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
             table_options: Default::default(),
             rotation: None,
+            snapshot_cohort: Default::default(),
         };
         let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -760,6 +764,7 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
             on_schema_drift: deltaforge_config::OnSchemaDrift::Halt,
             table_options: Default::default(),
             rotation: None,
+            snapshot_cohort: Default::default(),
         };
         let (tx, _rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -860,6 +865,7 @@ async fn mysql_failover_schema_drift_halt_no_drift_continues() -> Result<()> {
             on_schema_drift: deltaforge_config::OnSchemaDrift::Halt,
             table_options: Default::default(),
             rotation: None,
+            snapshot_cohort: Default::default(),
         };
         let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;

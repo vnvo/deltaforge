@@ -566,6 +566,7 @@ pub(crate) fn make_checkpoint_meta(
         gtid_set: gtid.clone(),
         lineage,
         snapshot_completed: None,
+        snapshot_chain: None,
     };
 
     let bytes = serde_json::to_vec(&cp).unwrap_or_else(|e| {

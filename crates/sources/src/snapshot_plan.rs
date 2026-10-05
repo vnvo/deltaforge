@@ -29,22 +29,6 @@ impl<I> PlannedTable<I> {
     }
 }
 
-/// Approximate resident bytes of plan entries with string identities.
-pub(crate) fn plan_bytes<I>(
-    tables: &[PlannedTable<I>],
-    identity_bytes: impl Fn(&I) -> usize,
-) -> usize {
-    tables
-        .iter()
-        .map(|t| {
-            std::mem::size_of::<PlannedTable<I>>()
-                + t.qualifier.len()
-                + t.table.len()
-                + identity_bytes(&t.identity)
-        })
-        .sum()
-}
-
 /// A plan entry's schema signature: a SHA-256 over the engine's whole
 /// registered schema model (its serialized form, every field). Preparation
 /// takes it from the schema it registered and the anchor from the model the

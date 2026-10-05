@@ -28,7 +28,7 @@ use storage::{ArcStorageBackend, DurableSchemaRegistry, MemoryStorageBackend};
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt, core::WaitFor, runners::AsyncRunner,
 };
-use tokio::sync::{OnceCell, mpsc};
+use tokio::sync::OnceCell;
 use tokio::time::{Duration, sleep, timeout};
 
 mod test_common;
@@ -200,6 +200,7 @@ fn source(
         on_schema_drift: policy,
         table_options: Default::default(),
         rotation: None,
+        snapshot_cohort: Default::default(),
     }
 }
 
@@ -231,7 +232,8 @@ async fn run(
     during: &[String],
     wait: Duration,
 ) -> (Vec<SourceItem>, Option<SourceResult<()>>) {
-    let (tx, mut rx) = mpsc::channel(1024);
+    let (tx, mut rx) =
+        test_common::acked_channel(&src, &st.ckpt, &src.id, 1024);
     let handle = src.run(tx, st.ckpt.clone()).await;
     let collector = tokio::spawn(async move {
         let mut items = Vec::new();

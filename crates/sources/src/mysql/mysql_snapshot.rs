@@ -25,24 +25,22 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use checkpoints::CheckpointStore;
 use deltaforge_config::SnapshotCfg;
 use deltaforge_core::{
-    CheckpointMeta, Event, EventId, Op, SourceError, SourceInfo, SourceItem,
-    SourcePosition,
+    Event, EventId, Op, SourceInfo, SourceItem, SourcePosition,
 };
 use metrics::counter;
 use mysql_async::{Conn, Opts, Row, Value, prelude::Queryable};
 use tokio::time::timeout;
 
 use super::mysql_identity::mysql_identity_cell;
-use crate::durable_checkpoint::{CursorKind, SnapshotCursor};
+use crate::durable_checkpoint::CursorKind;
 use crate::snapshot_event_id::{OwnedIdentityValue, snapshot_row_event_id};
-use crate::snapshot_frontier::{
-    SnapshotAggregator, SnapshotPublisher, TableResume,
-};
 use crate::snapshot_generation::PersistedLineage;
+use crate::snapshot_publish::GenerationPublisher;
+use crate::snapshot_queue::{PlanItem, QueueStore};
 use scopeguard;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -81,10 +79,6 @@ impl MysqlSnapshotProgress {
     pub(crate) fn table_done(&self, db: &str, table: &str) -> bool {
         self.done_tables.contains(&fqn(db, table))
     }
-
-    fn mark_done(&mut self, db: &str, table: &str) {
-        self.done_tables.insert(fqn(db, table));
-    }
 }
 
 fn fqn(db: &str, table: &str) -> String {
@@ -100,6 +94,9 @@ pub fn progress_key(source_id: &str) -> String {
 /// treating a store error or corrupt bytes as "no progress" would restart the
 /// whole snapshot - re-exporting rows and, for a finished snapshot, discarding
 /// the saved CDC start position.
+// The legacy classification reads pre-queue progress with it (design
+// section 10).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn load_snapshot_progress(
     store: &dyn CheckpointStore,
     source_id: &str,
@@ -144,430 +141,378 @@ pub struct SnapshotCtx<'a> {
     pub lineage: PersistedLineage,
 }
 
-/// Spawns a background task that polls SHOW BINARY LOGS every POSITION_GUARD_INTERVAL seconds.
-/// On confirmed purge: sets abort_reason and fires the CancellationToken.
-/// Transient errors (connect failures, empty results) are retried - never abort.
-fn spawn_binlog_position_guard(
-    dsn: crate::credentials::ProtectedDsn,
-    expected_uuid: String,
-    captured_file: String,
-    cancel: CancellationToken,
-    abort_reason: Arc<Mutex<Option<String>>>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(POSITION_GUARD_INTERVAL);
-        interval.tick().await;
+/// The bounds a running generation is held to (design section 9): the
+/// anchor's binlog file still on the server, the anchor age, and the binlog
+/// retention against it. Approaching a limit raises a non-blocking warning;
+/// reaching it blocks the generation (`snapshot_anchor_unavailable`, only
+/// the run's own generation at the version it holds) and stops the copy.
+/// A connection to another server stops the copy (the generation is lost).
+pub(crate) struct GenerationGuard {
+    pub dsn: crate::credentials::ProtectedDsn,
+    pub expected_uuid: String,
+    pub captured_file: String,
+    pub source_id: String,
+    pub generation: u64,
+    pub run: String,
+    pub version: Arc<std::sync::atomic::AtomicU64>,
+    pub anchored_at_ms: i64,
+    pub max_anchor_age: Duration,
+    /// The server's binlog retention, when known.
+    pub retention: Option<Duration>,
+    pub queue: QueueStore,
+    pub incidents: storage::adapters::incidents::IncidentStore,
+    /// Cancelled when the generation blocks or is lost.
+    pub cancel: CancellationToken,
+    /// Why it stopped.
+    pub stopped: Arc<Mutex<Option<GuardStop>>>,
+}
 
+/// Why the guard stopped the copy.
+#[derive(Debug, Clone)]
+pub(crate) enum GuardStop {
+    /// A bound blocked the generation.
+    Blocked(String),
+    /// A guard connection reached another server than the generation's.
+    WrongServer(String),
+}
+
+/// Run the guard until the copy ends (the task is aborted) or a bound
+/// stops it.
+pub(crate) fn spawn_generation_guard(
+    g: GenerationGuard,
+) -> tokio::task::JoinHandle<()> {
+    use crate::snapshot_driver::{
+        GuardFinding, anchor_age_finding, incidents as drafts,
+        retention_finding,
+    };
+    use deltaforge_core::incident::ReasonCode;
+    let every = (g.max_anchor_age / 10)
+        .clamp(Duration::from_millis(200), POSITION_GUARD_INTERVAL);
+    tokio::spawn(async move {
+        let mut warned: std::collections::BTreeSet<&'static str> =
+            Default::default();
         loop {
             tokio::select! {
-                _ = cancel.cancelled() => return,
-                _ = interval.tick() => {}
+                _ = g.cancel.cancelled() => return,
+                _ = tokio::time::sleep(every) => {}
             }
-
-            let mut conn = match super::mysql_session::open_control_connection(
-                dsn.expose(),
-                &expected_uuid,
-                Duration::from_secs(10),
-            )
-            .await
-            {
-                Ok(c) => c,
-                Err(super::mysql_session::SessionError::Connect(e)) => {
-                    warn!(error = %e, "binlog guard: connect error, retrying");
-                    continue;
-                }
-                // Another server (or no identity): its binlog list says
-                // nothing about ours. Fail closed.
-                Err(e) => {
-                    let msg = format!(
-                        "binlog guard: connection is not server {expected_uuid}: {e:?}"
-                    );
-                    warn!("{}", msg);
-                    *abort_reason.lock().unwrap() = Some(msg);
-                    cancel.cancel();
+            let age = Duration::from_millis(
+                u64::try_from(
+                    chrono::Utc::now().timestamp_millis() - g.anchored_at_ms,
+                )
+                .unwrap_or(0),
+            );
+            let binlog = match binlog_finding(&g).await {
+                Ok(f) => f,
+                Err(lost) => {
+                    warn!(source_id = %g.source_id, "{lost}");
+                    *g.stopped.lock().expect("not poisoned") =
+                        Some(GuardStop::WrongServer(lost));
+                    g.cancel.cancel();
                     return;
                 }
             };
-
-            let rows: Vec<Row> = match conn.query("SHOW BINARY LOGS").await {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(error = %e, "binlog guard: SHOW BINARY LOGS failed, retrying");
-                    continue;
+            for finding in [
+                anchor_age_finding(age, g.max_anchor_age),
+                retention_finding(age, g.retention),
+                binlog,
+            ] {
+                match finding {
+                    GuardFinding::Ok => {}
+                    GuardFinding::Warn(class) => {
+                        if warned.insert(class) {
+                            warn!(
+                                source_id = %g.source_id, class,
+                                "snapshot generation approaching a bound"
+                            );
+                            let _ = g
+                                .incidents
+                                .raise(
+                                    &drafts::bound_warning(
+                                        &g.source_id,
+                                        g.generation,
+                                        class,
+                                    ),
+                                    1,
+                                )
+                                .await;
+                        }
+                    }
+                    GuardFinding::Block(class) => {
+                        error!(
+                            source_id = %g.source_id, class,
+                            "snapshot generation reached a bound: blocked"
+                        );
+                        let draft = drafts::blocked(
+                            ReasonCode::SnapshotAnchorUnavailable,
+                            &g.source_id,
+                            g.generation,
+                            class,
+                        );
+                        if let Err(e) =
+                            crate::snapshot_driver::block_generation(
+                                &g.queue,
+                                &g.incidents,
+                                g.generation,
+                                Some(&g.run),
+                                g.version
+                                    .load(std::sync::atomic::Ordering::SeqCst),
+                                &draft,
+                            )
+                            .await
+                        {
+                            warn!(
+                                source_id = %g.source_id,
+                                error = %e,
+                                "could not record the block; the next start \
+                                 detects it again"
+                            );
+                        }
+                        *g.stopped.lock().expect("not poisoned") =
+                            Some(GuardStop::Blocked(format!(
+                                "snapshot_anchor_unavailable ({class})"
+                            )));
+                        g.cancel.cancel();
+                        return;
+                    }
                 }
-            };
-
-            let available: Vec<String> = rows
-                .into_iter()
-                .filter_map(|mut r: Row| r.take::<String, usize>(0))
-                .collect();
-
-            if !health::binlog_file_still_present(&available, &captured_file) {
-                let msg = format!(
-                    "binlog file '{}' purged during snapshot \
-                     (available: [{}]). \
-                     Increase binlog_expire_logs_seconds or reduce \
-                     max_parallel_tables and restart.",
-                    captured_file,
-                    available.join(", ")
-                );
-                warn!("{}", msg);
-                *abort_reason.lock().unwrap() = Some(msg);
-                cancel.cancel();
-                return;
             }
-
-            debug!(file = %captured_file, "binlog guard: ok");
         }
     })
 }
 
-/// Run a consistent snapshot of `tables`.
-///
-/// Returns a `MySqlCheckpoint` captured after all worker transactions open -
-/// InnoDB guarantees every visible row was committed at or before this position.
-/// The caller must persist this as the binlog checkpoint so streaming resumes
-/// with no gaps.
-pub(crate) async fn run_snapshot(
-    ctx: &SnapshotCtx<'_>,
-    tables: &[super::MyPlannedTable],
-) -> Result<MySqlCheckpoint> {
-    let t0 = Instant::now();
-
-    // Load previous progress for crash resume. Fail closed on an unreadable or
-    // corrupt progress record; only a genuinely absent record is a fresh start.
-    let mut progress =
-        load_snapshot_progress(ctx.chkpt_store.as_ref(), ctx.source_id).await?;
-
-    if progress.finished {
-        info!(
-            ctx.source_id,
-            "mysql snapshot already complete, returning saved position"
-        );
-        return serde_json::from_str(&progress.start_position)
-            .context("parse saved snapshot position");
-    }
-
-    // preflight validation and risk estimation/guessing. Hard errors fail
-    // closed with a typed error: a missing RELOAD privilege (managed MySQL that
-    // cannot FLUSH TABLES WITH READ LOCK) surfaces as Permission; a bad server
-    // config (non-GTID, non-InnoDB, non-ROW binlog) as Incompatible. There is no
-    // silent fallback to an unsafe per-worker-snapshot anchor.
-    let names: Vec<(&str, &str)> = tables
-        .iter()
-        .map(|t| (t.qualifier.as_str(), t.table.as_str()))
-        .collect();
-    let preflight = health::run_preflight_verified(
-        ctx.dsn,
-        ctx.expected_uuid,
-        &names,
-        ctx.cfg.max_parallel_tables,
+/// One check of the anchor's binlog file on the verified server: purged
+/// blocks; a transient failure is `Ok` (retried); a connection to another
+/// server is `Err` (the generation's server is gone).
+async fn binlog_finding(
+    g: &GenerationGuard,
+) -> std::result::Result<crate::snapshot_driver::GuardFinding, String> {
+    use crate::snapshot_driver::GuardFinding;
+    let mut conn = match super::mysql_session::open_control_connection(
+        g.dsn.expose(),
+        &g.expected_uuid,
+        Duration::from_secs(10),
     )
     .await
-    .context("snapshot preflight")?;
-    crate::snapshot_probe::record_fixed(
-        crate::snapshot_probe::FixedOp::Preflight,
-    );
-    drop(names);
-    preflight.emit(ctx.source_id, tables.len());
-    if !preflight.hard_errors.is_empty() {
-        let details = preflight.hard_errors.join("; ");
-        let se = if preflight.permission_error {
-            SourceError::Permission {
-                details: details.into(),
-            }
-        } else {
-            SourceError::Incompatible {
-                details: details.into(),
-            }
-        };
-        return Err(anyhow::Error::new(se));
-    }
-
-    // step 1: establish the consistent anchor under a brief global read lock.
-    // Only pending (not-yet-done) tables need workers; skip completed ones on
-    // resume so the lock window and connection count stay bounded.
-    let pending: Vec<usize> = (0..tables.len())
-        .filter(|&i| {
-            !progress.table_done(&tables[i].qualifier, &tables[i].table)
-        })
+    {
+        Ok(c) => c,
+        Err(super::mysql_session::SessionError::Connect(e)) => {
+            warn!(error = %e, "snapshot guard: connect error, retrying");
+            return Ok(GuardFinding::Ok);
+        }
+        Err(e) => {
+            return Err(format!(
+                "snapshot guard: the connection is not server {}: {e:?}",
+                g.expected_uuid
+            ));
+        }
+    };
+    let rows: Vec<Row> = match conn.query("SHOW BINARY LOGS").await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "snapshot guard: SHOW BINARY LOGS failed, retrying");
+            return Ok(GuardFinding::Ok);
+        }
+    };
+    conn.disconnect().await.ok();
+    let available: Vec<String> = rows
+        .into_iter()
+        .filter_map(|mut r: Row| r.take::<String, usize>(0))
         .collect();
-    let num_workers =
-        ctx.cfg.max_parallel_tables.min(pending.len().max(1)).max(1);
-
-    crate::snapshot_probe::before_anchor().await;
-    let (worker_conns, mut position) = acquire_locked_anchor(
-        ctx.dsn,
-        ctx.expected_uuid,
-        num_workers,
-        Duration::from_secs(ctx.cfg.lock_timeout_secs.max(1)),
-        PlanCheck {
-            patterns: ctx.table_patterns,
-            page_size: ctx.cfg.discovery_page_size,
-            expected: tables,
+    Ok(
+        if health::binlog_file_still_present(&available, &g.captured_file) {
+            GuardFinding::Ok
+        } else {
+            GuardFinding::Block("binlog_purged")
         },
     )
-    .await
-    .context("acquire locked snapshot anchor")?;
-    crate::snapshot_probe::record_fixed(crate::snapshot_probe::FixedOp::Anchor);
-    position.lineage = ctx.checkpoint_lineage.clone();
+}
 
-    progress.start_position = serde_json::to_string(&position)
-        .context("serialize binlog position")?;
-    progress.generation = ctx.generation;
-    // The anchor must be durable before any row: it is what marks this run
-    // as started, so an interruption after it is detected and restarts as a
-    // new generation instead of reusing this one at another anchor. Later
-    // progress writes (completed tables, finished) can only cause extra
-    // re-reading when lost, never a skip, so they stay best effort.
-    let anchor_bytes =
-        serde_json::to_vec(&progress).context("serialize progress")?;
-    let put_started = Instant::now();
-    ctx.chkpt_store
-        .put_raw(&progress_key(ctx.source_id), &anchor_bytes)
-        .await
-        .context("persist the snapshot anchor before reading any row")?;
-    crate::snapshot_probe::record_progress_write(
-        anchor_bytes.len(),
-        put_started.elapsed(),
-    );
-    crate::snapshot_probe::record_phase(
-        crate::snapshot_probe::Phase::PreflightAnchor,
-        t0.elapsed(),
-    );
+/// The sealed plan's tables in key order (the discovery order), read page by
+/// page from the store: the plan is never resident in full.
+pub(crate) struct PlanPages {
+    queue: Option<QueueStore>,
+    generation: u64,
+    page: usize,
+    buf: std::collections::VecDeque<super::MyPlannedTable>,
+    after: Option<String>,
+    done: bool,
+}
 
-    // spawn background position guard
-    let abort_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let guard_cancel = ctx.cancel.child_token();
-    let _guard_stop = scopeguard::guard((), |_| guard_cancel.cancel());
-    let _position_guard = spawn_binlog_position_guard(
-        crate::credentials::ProtectedDsn::from(ctx.dsn),
-        ctx.expected_uuid.to_string(),
-        position.file.clone(),
-        guard_cancel.clone(),
-        abort_reason.clone(),
-    );
-
-    info!(
-        source_id = %ctx.source_id,
-        file = %position.file,
-        pos = position.pos,
-        tables = tables.len(),
-        "mysql snapshot started"
-    );
-
-    // Build the ordered-aggregation owner. Its source vector is restored from
-    // the source's own progress (done_tables + finished) - NEVER from any sink's
-    // HEAD, so the source is not fast-forwarded by how far one sink is durable.
-    // Every table's cursor kind comes from the plan (already-done tables enter
-    // the vector complete at their kind's max), so the vector's key set and
-    // cursor kinds are fixed from the first batch.
-    let resume: Vec<(String, TableResume)> = tables
-        .iter()
-        .map(|t| {
-            let done = progress.finished
-                || progress.table_done(&t.qualifier, &t.table);
-            (
-                t.key(),
-                TableResume {
-                    kind: t.cursor_kind,
-                    done,
-                },
-            )
-        })
-        .collect();
-    crate::snapshot_probe::record_frontier_tables(resume.len());
-    // Every boundary carries an incomplete-snapshot position, except the
-    // one completing the snapshot (`publisher.finish`): the anchor as a
-    // stream position, marked as the completion of this generation.
-    let snapshot_checkpoint = CheckpointMeta::from_vec(
-        crate::snapshot_position::encode(ctx.generation, &position),
-    );
-    let completing_checkpoint = CheckpointMeta::from_vec(
-        serde_json::to_vec(&MySqlCheckpoint {
-            snapshot_completed: Some(ctx.generation),
-            ..position.clone()
-        })
-        .context("serialize the completing snapshot checkpoint")?,
-    );
-    let publisher = Arc::new(SnapshotPublisher::new(
-        SnapshotAggregator::from_source_progress(
-            ctx.generation,
-            ctx.lineage.clone(),
-            snapshot_checkpoint,
-            &resume,
-        )
-        .with_completing_checkpoint(completing_checkpoint),
-        ctx.tx.clone(),
-    ));
-
-    // step 2: bounded worker pool. Each worker owns one consistent-snapshot
-    // connection and reads a bucket of pending tables sequentially under that
-    // single snapshot, committing once when the bucket is done. This bounds the
-    // connection count (and the earlier lock window) by num_workers, not by the
-    // table count. Table completion (durable progress + publisher boundary) is
-    // recorded as each table finishes, preserving table-level crash resume.
-    let copy_started = Instant::now();
-    // One shared copy of the plan; buckets hold indices into it.
-    let plan: Arc<Vec<super::MyPlannedTable>> = Arc::new(tables.to_vec());
-    let mut buckets: Vec<Vec<usize>> =
-        (0..num_workers).map(|_| Vec::new()).collect();
-    for (n, i) in pending.into_iter().enumerate() {
-        buckets[n % num_workers].push(i);
-    }
-
-    let progress_shared = Arc::new(tokio::sync::Mutex::new(progress));
-    let mut handles = Vec::new();
-    let fetches_before = ctx.schema_loader.live_fetch_count();
-
-    for (bucket, worker_conn) in buckets.into_iter().zip(worker_conns) {
-        let publisher = Arc::clone(&publisher);
-        let progress_shared = Arc::clone(&progress_shared);
-        let chkpt_store = ctx.chkpt_store.clone();
-        let schema_loader = ctx.schema_loader.clone();
-        let cancel = ctx.cancel.clone();
-        let plan = Arc::clone(&plan);
-        let source_id = ctx.source_id.to_string();
-        let pipeline = ctx.pipeline.to_string();
-        let tenant = ctx.tenant.to_string();
-        let cfg = ctx.cfg.clone();
-        let generation = ctx.generation;
-        let lineage = ctx.lineage.clone();
-
-        let handle = tokio::spawn(async move {
-            let mut conn = worker_conn;
-            let mut failed: Vec<String> = Vec::new();
-            for i in bucket {
-                if cancel.is_cancelled() {
-                    break;
-                }
-                let planned = &plan[i];
-                let (db, table) =
-                    (planned.qualifier.clone(), planned.table.clone());
-                let table_key = planned.key();
-                let identity = planned.identity.clone();
-                let cursor_kind = planned.cursor_kind;
-                let worker = TableWorker {
-                    db: db.clone(),
-                    table: table.clone(),
-                    conn,
-                    source_id: source_id.clone(),
-                    pipeline: pipeline.clone(),
-                    tenant: tenant.clone(),
-                    cfg: cfg.clone(),
-                    table_key: table_key.clone(),
-                    cursor_kind,
-                    publisher: Arc::clone(&publisher),
-                    schema_loader: schema_loader.clone(),
-                    cancel: cancel.clone(),
-                    generation,
-                    lineage: lineage.clone(),
-                    identity,
-                    schema: None,
-                };
-                match worker.run().await {
-                    Ok((rows, conn_back)) => {
-                        conn = conn_back;
-                        {
-                            let mut p = progress_shared.lock().await;
-                            p.mark_done(&db, &table);
-                            save_progress(&chkpt_store, &source_id, &p).await;
-                        }
-                        // Table-complete boundary (and the completed boundary on
-                        // the final table). Delivered and durably acked by the
-                        // coordinator even with no trailing data rows.
-                        if publisher.complete_table(&table_key).await.is_err() {
-                            failed
-                                .push(format!("{table_key} (channel closed)"));
-                            return failed;
-                        }
-                        info!(table = %table_key, rows, "table snapshot complete");
-                    }
-                    Err(e) => {
-                        error!(table = %table_key, error = %e, "table snapshot failed");
-                        failed.push(table_key);
-                        // conn consumed by the failed run; dropping it rolls back
-                        // this bucket's transaction.
-                        return failed;
-                    }
-                }
-            }
-            // commit the bucket's single consistent-snapshot transaction once.
-            let _ = conn.query_drop("COMMIT").await;
-            failed
-        });
-        handles.push(handle);
-    }
-    crate::snapshot_probe::record_table_tasks(handles.len());
-
-    // step 3: collect worker-pool results.
-    let mut failed: Vec<String> = Vec::new();
-    for handle in handles {
-        match handle.await {
-            Ok(mut f) => failed.append(&mut f),
-            Err(e) => {
-                error!(error = %e, "snapshot worker pool task panicked");
-                failed.push("worker pool task panicked".into());
-            }
+impl PlanPages {
+    pub(crate) fn new(queue: QueueStore, generation: u64, page: usize) -> Self {
+        Self {
+            queue: Some(queue),
+            generation,
+            page: page.max(1),
+            buf: Default::default(),
+            after: None,
+            done: false,
         }
     }
 
+    /// A plan of no table.
+    #[cfg(test)]
+    fn empty() -> Self {
+        Self {
+            queue: None,
+            generation: 0,
+            page: 1,
+            buf: Default::default(),
+            after: None,
+            done: true,
+        }
+    }
+
+    /// The next planned table.
+    pub(crate) async fn next(
+        &mut self,
+    ) -> Result<Option<super::MyPlannedTable>> {
+        if self.buf.is_empty() && !self.done {
+            let queue = self.queue.as_ref().expect("a stored plan");
+            let (items, next) = queue
+                .items_page(self.generation, self.after.as_deref(), self.page)
+                .await?;
+            for (_, item) in &items {
+                self.buf.push_back(planned(item)?);
+            }
+            self.done = next.is_none();
+            self.after = next;
+        }
+        Ok(self.buf.pop_front())
+    }
+}
+
+/// A plan item as a table to copy.
+fn planned(item: &PlanItem) -> Result<super::MyPlannedTable> {
+    let identity: Vec<String> = serde_json::from_value(item.identity.clone())
+        .with_context(|| {
+        format!(
+            "plan item {}.{}: identity columns",
+            item.qualifier, item.table
+        )
+    })?;
+    Ok(super::MyPlannedTable {
+        qualifier: item.qualifier.clone(),
+        table: item.table.clone(),
+        identity,
+        cursor_kind: item.cursor_kind,
+        signature: item.signature.clone(),
+    })
+}
+
+/// What one generation's copy needs (`docs/design/snapshot-durable-queue.md`,
+/// sections 2 and 9).
+pub(crate) struct MyCopyCtx<'a> {
+    pub source_id: &'a str,
+    pub pipeline: &'a str,
+    pub tenant: &'a str,
+    pub cfg: &'a SnapshotCfg,
+    pub schema_loader: &'a MySqlSchemaLoader,
+    pub cancel: CancellationToken,
+    pub plan: PlanPages,
+    /// The workers' consistent-snapshot connections, all opened under the
+    /// anchor's read lock: each one's read view is the generation's.
+    pub workers: Vec<Conn>,
+    pub publisher: Arc<GenerationPublisher>,
+    pub generation: u64,
+    pub lineage: PersistedLineage,
+}
+
+/// Copy every table of the generation's sealed plan. Each worker reads on
+/// its own consistent-snapshot connection and takes the plan's next table
+/// until none is left, then commits once. Losing any worker - its
+/// connection or any failure of its table - loses the generation's read
+/// view: the copy stops and fails, and the next start replaces the
+/// generation (design section 2: no later-view reads).
+pub(crate) async fn copy_generation(ctx: MyCopyCtx<'_>) -> Result<()> {
+    let plan = Arc::new(tokio::sync::Mutex::new(ctx.plan));
+    let stop = ctx.cancel.child_token();
+    let _stop = scopeguard::guard(stop.clone(), |s| s.cancel());
+    let fetches_before = ctx.schema_loader.live_fetch_count();
+    let mut running = tokio::task::JoinSet::new();
+    for conn in ctx.workers {
+        let (plan, stop) = (Arc::clone(&plan), stop.clone());
+        let shape = RowShape {
+            db: String::new(),
+            table: String::new(),
+            pipeline: ctx.pipeline.to_string(),
+            tenant: ctx.tenant.to_string(),
+            generation: ctx.generation,
+            lineage: ctx.lineage.clone(),
+            identity: Vec::new(),
+            schema: None,
+        };
+        let (cfg, schema_loader, publisher, source_id) = (
+            ctx.cfg.clone(),
+            ctx.schema_loader.clone(),
+            Arc::clone(&ctx.publisher),
+            ctx.source_id.to_string(),
+        );
+        running.spawn(async move {
+            let mut conn = conn;
+            loop {
+                if stop.is_cancelled() {
+                    bail!("snapshot cancelled");
+                }
+                let next = plan.lock().await.next().await?;
+                let Some(planned) = next else {
+                    break;
+                };
+                let key = planned.key();
+                let worker = TableWorker {
+                    conn,
+                    shape: RowShape {
+                        db: planned.qualifier.clone(),
+                        table: planned.table.clone(),
+                        identity: planned.identity.clone(),
+                        ..shape.clone()
+                    },
+                    source_id: source_id.clone(),
+                    cfg: cfg.clone(),
+                    cursor_kind: planned.cursor_kind,
+                    publisher: Arc::clone(&publisher),
+                    schema_loader: schema_loader.clone(),
+                    cancel: stop.clone(),
+                };
+                match worker.run().await {
+                    Ok((rows, back)) => {
+                        conn = back;
+                        info!(table = %key, rows, "snapshot table copied");
+                    }
+                    Err(e) => {
+                        stop.cancel();
+                        return Err(e.context(format!(
+                            "snapshot of {key}: the worker is lost, and with \
+                             it the generation's read view"
+                        )));
+                    }
+                }
+            }
+            conn.query_drop("COMMIT").await.ok();
+            Ok(())
+        });
+    }
+    crate::snapshot_probe::record_table_tasks(running.len());
+    let mut first: Option<anyhow::Error> = None;
+    while let Some(done) = running.join_next().await {
+        let r = match done {
+            Ok(r) => r,
+            Err(e) => Err(anyhow!("snapshot worker panicked: {e}")),
+        };
+        if let Err(e) = r {
+            stop.cancel();
+            error!(error = %format!("{e:#}"), "snapshot worker failed");
+            first.get_or_insert(e);
+        }
+    }
     crate::snapshot_probe::record_worker_live_fetches(
         ctx.schema_loader.live_fetch_count() - fetches_before,
     );
-    crate::snapshot_probe::record_phase(
-        crate::snapshot_probe::Phase::RowCopy,
-        copy_started.elapsed(),
-    );
-    let final_started = Instant::now();
-
-    // guard error takes priority over generic worker failures
-    if let Some(reason) = abort_reason.lock().unwrap().take() {
-        anyhow::bail!("snapshot aborted: {}", reason);
+    match first {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
-
-    if !failed.is_empty() {
-        anyhow::bail!(
-            "mysql snapshot failed for tables: {}",
-            failed.join(", ")
-        );
-    }
-
-    // final synchronous position check before marking complete
-    // this closes the 30s polling race window.
-    health::verify_binlog_position(ctx.dsn, ctx.expected_uuid, &position.file)
-        .await
-        .context("post-snapshot binlog position verification")?;
-
-    // Every table read and every check passed: emit the completing
-    // boundary (the only stream position a snapshot commits).
-    publisher
-        .finish()
-        .await
-        .context("emit the snapshot's completing boundary")?;
-
-    // only write finished=true after the position is confirmed still valid.
-    // "finished" means "safe to hand off to CDC", not just "rows emitted".
-    {
-        let mut p = progress_shared.lock().await;
-        p.finished = true;
-        save_progress(&ctx.chkpt_store, ctx.source_id, &p).await;
-    }
-
-    info!(
-        source_id = %ctx.source_id,
-        elapsed_secs = t0.elapsed().as_secs(),
-        file = %position.file,
-        pos = position.pos,
-        "mysql snapshot finished"
-    );
-
-    guard_cancel.cancel();
-    crate::snapshot_probe::record_phase(
-        crate::snapshot_probe::Phase::Finalization,
-        final_started.elapsed(),
-    );
-    Ok(position)
 }
 
 // ============================================================================
@@ -587,10 +532,11 @@ pub(crate) async fn run_snapshot(
 /// panic, or timeout it is dropped, closing its session and releasing the lock
 /// server-side. `UNLOCK TABLES` is only the normal success path.
 /// The plan the anchor verifies under its read lock.
-struct PlanCheck<'a> {
-    patterns: &'a [String],
-    page_size: usize,
-    expected: &'a [super::MyPlannedTable],
+pub(crate) struct PlanCheck<'a> {
+    pub patterns: &'a [String],
+    pub page_size: usize,
+    /// The sealed plan, page by page.
+    pub expected: PlanPages,
 }
 
 #[cfg(test)]
@@ -604,26 +550,26 @@ impl PlanCheck<'static> {
         Self {
             patterns: &NONE,
             page_size: 1_000,
-            expected: &[],
+            expected: PlanPages::empty(),
         }
     }
 }
 
 /// Under the read lock (no DDL can run), re-read the catalog with the same
-/// paged discovery and require exactly the planned tables, in order: a
-/// table created, dropped or renamed since discovery (between its pages, or
-/// before the anchor) fails the snapshot before any row is read. MySQL's
-/// INFORMATION_SCHEMA is not read in one consistent snapshot, so this is
-/// what makes the paged discovery a consistent view, as of the anchor.
+/// paged discovery and require exactly the planned tables, in order, page by
+/// page against the stored plan: a table created, dropped or renamed since
+/// discovery (between its pages, or before the anchor) fails the snapshot
+/// before any row is read. MySQL's INFORMATION_SCHEMA is not read in one
+/// consistent snapshot, so this is what makes the paged discovery a
+/// consistent view, as of the anchor.
 async fn verify_plan_under_lock(
     conn: &mut Conn,
-    check: &PlanCheck<'_>,
+    check: &mut PlanCheck<'_>,
 ) -> Result<()> {
     let mut discovery = crate::snapshot_discovery::Discovery::for_verification(
         check.patterns,
         check.page_size,
     );
-    let mut i = 0usize;
     while !discovery.is_done() {
         let rows = super::mysql_schema_loader::discovery_page(
             conn,
@@ -632,10 +578,12 @@ async fn verify_plan_under_lock(
             discovery.page_size(),
         )
         .await?;
-        let page_start = i;
+        let mut page = Vec::new();
         for (db, table) in discovery.accept(rows)? {
-            match check.expected.get(i) {
-                Some(p) if p.qualifier == db && p.table == table => {}
+            match check.expected.next().await? {
+                Some(p) if p.qualifier == db && p.table == table => {
+                    page.push(p)
+                }
                 Some(p) => anyhow::bail!(catalog_moved(format!(
                     "{db}.{table} is where the plan has {}",
                     p.key()
@@ -644,11 +592,10 @@ async fn verify_plan_under_lock(
                     anyhow::bail!(catalog_moved(format!("{db}.{table} is new")))
                 }
             }
-            i += 1;
         }
-        verify_shapes(conn, &check.expected[page_start..i]).await?;
+        verify_shapes(conn, &page).await?;
     }
-    if let Some(p) = check.expected.get(i) {
+    if let Some(p) = check.expected.next().await? {
         anyhow::bail!(catalog_moved(format!("{} is gone", p.key())));
     }
     crate::snapshot_probe::record_fixed(
@@ -695,12 +642,12 @@ fn catalog_moved(detail: String) -> String {
     )
 }
 
-async fn acquire_locked_anchor(
+pub(crate) async fn acquire_locked_anchor(
     dsn: &str,
     expected_uuid: &str,
     num_workers: usize,
     timeout_dur: Duration,
-    check: PlanCheck<'_>,
+    mut check: PlanCheck<'_>,
 ) -> Result<(Vec<Conn>, MySqlCheckpoint)> {
     let opts = Opts::from_url(dsn).context("parse mysql dsn")?;
     // Each connection proves it is the verified server before it is used:
@@ -754,7 +701,7 @@ async fn acquire_locked_anchor(
         // Position captured while the lock is still held -> matches every
         // worker's read view exactly.
         let position = capture_binlog_position(&mut lock_conn).await?;
-        verify_plan_under_lock(&mut lock_conn, &check).await?;
+        verify_plan_under_lock(&mut lock_conn, &mut check).await?;
         Result::<(Vec<Conn>, MySqlCheckpoint)>::Ok((workers, position))
     };
 
@@ -818,22 +765,8 @@ async fn capture_binlog_position(
         gtid_set,
         lineage: None,
         snapshot_completed: None,
+        snapshot_chain: None,
     })
-}
-
-async fn save_progress(
-    store: &Arc<dyn CheckpointStore>,
-    source_id: &str,
-    progress: &MysqlSnapshotProgress,
-) {
-    if let Ok(bytes) = serde_json::to_vec(progress) {
-        let started = std::time::Instant::now();
-        let _ = store.put_raw(&progress_key(source_id), &bytes).await;
-        crate::snapshot_probe::record_progress_write(
-            bytes.len(),
-            started.elapsed(),
-        );
-    }
 }
 
 // ============================================================================
@@ -841,22 +774,27 @@ async fn save_progress(
 // ============================================================================
 
 struct TableWorker {
-    db: String,
-    table: String,
     /// Already-started consistent-snapshot transaction connection.
     conn: mysql_async::Conn,
+    /// What every row of the table becomes an event with.
+    shape: RowShape,
     source_id: String,
-    pipeline: String,
-    tenant: String,
     cfg: SnapshotCfg,
-    /// Fully-qualified `db.table`, the aggregator's key for this table.
-    table_key: String,
-    /// Cursor kind for this table (matches the aggregator's frontier kind).
+    /// Cursor kind for this table (signed or unsigned PK, or a full scan).
     cursor_kind: CursorKind,
-    /// Shared aggregation owner: serializes boundary-advance + channel send.
-    publisher: Arc<SnapshotPublisher>,
+    publisher: Arc<GenerationPublisher>,
     schema_loader: MySqlSchemaLoader,
     cancel: CancellationToken,
+}
+
+/// The table a worker reads and what its rows become events with (apart
+/// from the connection, so rows stream while events are built).
+#[derive(Clone)]
+struct RowShape {
+    db: String,
+    table: String,
+    pipeline: String,
+    tenant: String,
     /// Durable snapshot generation for stable-id derivation.
     generation: u64,
     /// Frozen source lineage.
@@ -873,17 +811,17 @@ impl TableWorker {
     /// snapshot transaction for the next table in its bucket. The caller commits
     /// once when the bucket is done.
     async fn run(mut self) -> Result<(u64, mysql_async::Conn)> {
-        info!(pipeline=%self.pipeline, source_id=%self.source_id, db=%self.db, table=%self.table, "snapshot worker starting");
-        let table_fqn = fqn(&self.db, &self.table);
+        info!(pipeline=%self.shape.pipeline, source_id=%self.source_id, db=%self.shape.db, table=%self.shape.table, "snapshot worker starting");
+        let table_fqn = fqn(&self.shape.db, &self.shape.table);
         let t0 = Instant::now();
 
         let loaded = self
             .schema_loader
-            .load_schema(&self.db, &self.table)
+            .load_schema(&self.shape.db, &self.shape.table)
             .await
             .with_context(|| format!("load schema for {table_fqn}"))?;
         // Retain the schema for schema-directed native identity extraction.
-        self.schema = Some(loaded.schema.clone());
+        self.shape.schema = Some(loaded.schema.clone());
 
         let pk = loaded.schema.primary_key.clone();
         let rows_sent = if pk.len() == 1
@@ -903,7 +841,7 @@ impl TableWorker {
         // consistent-snapshot transaction once, after its last table.
         counter!(
             "deltaforge_snapshot_rows_total",
-            "pipeline" => self.pipeline.clone(),
+            "pipeline" => self.shape.pipeline.clone(),
             "table" => table_fqn.clone()
         )
         .increment(rows_sent);
@@ -930,27 +868,14 @@ impl TableWorker {
         }
     }
 
-    /// Build snapshot events for a scanned chunk's rows.
-    fn rows_to_events(&self, rows: Vec<Row>) -> Result<Vec<Event>> {
-        let mut events = Vec::with_capacity(rows.len());
-        for row in rows {
-            // Derive identity from NATIVE values before the lossy JSON
-            // conversion, then build the event.
-            let id = self.provisional_id(&row)?;
-            let json = row_to_json(row)?;
-            events.push(self.make_event(json, id));
-        }
-        Ok(events)
-    }
-
     async fn by_pk_signed(&mut self, pk_col: &str) -> Result<u64> {
-        let table_fqn = fqn(&self.db, &self.table);
+        let table_fqn = fqn(&self.shape.db, &self.shape.table);
 
         let bounds_row: Option<Row> = self
             .conn
             .query_first(format!(
                 "SELECT MIN(`{pk_col}`), MAX(`{pk_col}`) FROM `{}`.`{}`",
-                self.db, self.table
+                self.shape.db, self.shape.table
             ))
             .await
             .with_context(|| format!("PK bounds for {table_fqn}"))?;
@@ -972,10 +897,6 @@ impl TableWorker {
         let chunk = self.cfg.chunk_size as i64;
         let mut cursor = min_pk;
         let mut total_sent = 0u64;
-        // Half-open frontier cursor, starting at the kind's minimum so the first
-        // chunk covers everything below min_pk (vacuously durable). Signed PKs
-        // keep their true (possibly negative) order via the typed cursor.
-        let mut published_end: SnapshotCursor = self.cursor_kind.min();
 
         while cursor <= max_pk {
             if self.cancel.is_cancelled() {
@@ -987,7 +908,7 @@ impl TableWorker {
                 .conn
                 .query(format!(
                     "SELECT * FROM `{}`.`{}` WHERE `{pk_col}` >= {cursor} AND `{pk_col}` < {end}",
-                    self.db, self.table
+                    self.shape.db, self.shape.table
                 ))
                 .await
                 .with_context(|| {
@@ -995,18 +916,11 @@ impl TableWorker {
                 })?;
 
             total_sent += rows.len() as u64;
-            let events = self.rows_to_events(rows)?;
-            let chunk_end = mysql_signed_cursor(end);
+            let events = self.shape.rows_to_events(rows)?;
             self.publisher
-                .publish_chunk(
-                    &self.table_key,
-                    published_end,
-                    chunk_end,
-                    events,
-                )
+                .publish_chunk(events)
                 .await
-                .map_err(|_| anyhow!("event channel closed"))?;
-            published_end = chunk_end;
+                .map_err(|e| anyhow!(e))?;
             cursor = end;
         }
 
@@ -1017,13 +931,13 @@ impl TableWorker {
     /// `u64` (never cast through `i64`), and chunk arithmetic is overflow-safe so
     /// a range crossing `i64::MAX` and ending at `u64::MAX` scans correctly.
     async fn by_pk_unsigned(&mut self, pk_col: &str) -> Result<u64> {
-        let table_fqn = fqn(&self.db, &self.table);
+        let table_fqn = fqn(&self.shape.db, &self.shape.table);
 
         let bounds_row: Option<Row> = self
             .conn
             .query_first(format!(
                 "SELECT MIN(`{pk_col}`), MAX(`{pk_col}`) FROM `{}`.`{}`",
-                self.db, self.table
+                self.shape.db, self.shape.table
             ))
             .await
             .with_context(|| format!("PK bounds for {table_fqn}"))?;
@@ -1045,7 +959,6 @@ impl TableWorker {
         let chunk = self.cfg.chunk_size as u64;
         let mut cursor = min_pk;
         let mut total_sent = 0u64;
-        let mut published_end: SnapshotCursor = self.cursor_kind.min();
 
         loop {
             if self.cancel.is_cancelled() {
@@ -1058,7 +971,7 @@ impl TableWorker {
                 .conn
                 .query(format!(
                     "SELECT * FROM `{}`.`{}` WHERE `{pk_col}` >= {cursor} AND `{pk_col}` {op} {}",
-                    self.db, self.table, cb.upper
+                    self.shape.db, self.shape.table, cb.upper
                 ))
                 .await
                 .with_context(|| {
@@ -1066,18 +979,11 @@ impl TableWorker {
                 })?;
 
             total_sent += rows.len() as u64;
-            let events = self.rows_to_events(rows)?;
-            let chunk_end = SnapshotCursor::Unsigned(cb.frontier_end);
+            let events = self.shape.rows_to_events(rows)?;
             self.publisher
-                .publish_chunk(
-                    &self.table_key,
-                    published_end,
-                    chunk_end,
-                    events,
-                )
+                .publish_chunk(events)
                 .await
-                .map_err(|_| anyhow!("event channel closed"))?;
-            published_end = chunk_end;
+                .map_err(|e| anyhow!(e))?;
 
             if cb.inclusive {
                 break;
@@ -1090,39 +996,63 @@ impl TableWorker {
 
     // ── Full scan (composite/non-integer/no PK) ───────────────────────────────
 
+    /// A table without an integer key is read by one streaming scan, in
+    /// chunks of `chunk_size` rows: at most one chunk is held at a time.
     async fn full_scan(&mut self) -> Result<u64> {
-        let table_fqn = fqn(&self.db, &self.table);
-
-        if self.cancel.is_cancelled() {
-            anyhow::bail!("snapshot cancelled");
-        }
-
-        let rows: Vec<Row> = self
+        let table_fqn = fqn(&self.shape.db, &self.shape.table);
+        let chunk = self.cfg.chunk_size.max(1);
+        let mut result = self
             .conn
-            .query(format!("SELECT * FROM `{}`.`{}`", self.db, self.table))
+            .query_iter(format!(
+                "SELECT * FROM `{}`.`{}`",
+                self.shape.db, self.shape.table
+            ))
             .await
             .with_context(|| format!("full scan of {table_fqn}"))?;
+        let mut n = 0u64;
+        let mut rows = Vec::with_capacity(chunk);
+        loop {
+            if self.cancel.is_cancelled() {
+                anyhow::bail!("snapshot cancelled");
+            }
+            let row = result
+                .next()
+                .await
+                .with_context(|| format!("full scan of {table_fqn}"))?;
+            let end = row.is_none();
+            if let Some(row) = row {
+                rows.push(row);
+            }
+            if rows.len() >= chunk || (end && !rows.is_empty()) {
+                n += rows.len() as u64;
+                let events =
+                    self.shape.rows_to_events(std::mem::take(&mut rows))?;
+                self.publisher
+                    .publish_chunk(events)
+                    .await
+                    .map_err(|e| anyhow!(e))?;
+            }
+            if end {
+                break;
+            }
+        }
+        drop(result);
+        Ok(n)
+    }
+}
 
-        let n = rows.len() as u64;
+impl RowShape {
+    /// Build snapshot events for a scanned chunk's rows.
+    fn rows_to_events(&self, rows: Vec<Row>) -> Result<Vec<Event>> {
         let mut events = Vec::with_capacity(rows.len());
         for row in rows {
+            // Derive identity from NATIVE values before the lossy JSON
+            // conversion, then build the event.
             let id = self.provisional_id(&row)?;
             let json = row_to_json(row)?;
             events.push(self.make_event(json, id));
         }
-
-        // No PK cursor: the whole table is one chunk [min, n) over an unsigned
-        // row-count cursor. The frontier advances to n and the boundary lands on
-        // the last row; resume for a full-scan table is table-level (rescan),
-        // matching the durable progress model.
-        let start = self.cursor_kind.min();
-        let end = SnapshotCursor::Unsigned(n.max(1));
-        self.publisher
-            .publish_chunk(&self.table_key, start, end, events)
-            .await
-            .map_err(|_| anyhow!("event channel closed"))?;
-
-        Ok(n)
+        Ok(events)
     }
 
     /// Compute the provisional snapshot [`EventId`] from the row's **native**
@@ -1239,11 +1169,6 @@ pub(crate) fn mysql_cursor_kind(
     }
     // Full scan: a monotone row-count cursor.
     CursorKind::Unsigned
-}
-
-/// Build a signed cursor from a scan value (MySQL signed PK path).
-fn mysql_signed_cursor(v: i64) -> SnapshotCursor {
-    SnapshotCursor::Signed(v)
 }
 
 /// One unsigned PK chunk's bounds, overflow-safe near `u64::MAX`.

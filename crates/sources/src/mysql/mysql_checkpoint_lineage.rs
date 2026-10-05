@@ -25,6 +25,9 @@
 //!   older predecessors), a predecessor file/pos checkpoint, an unavailable or
 //!   unverifiable GTID set.
 //!
+//! Snapshot and generation start positions are not stream positions: they
+//! are left as they are (the snapshot driver classifies them).
+//!
 //! All validation completes before the first rewrite. A rewrite inserts only
 //! the `lineage` field into the stored JSON object, so every position field is
 //! preserved. Rewriting is idempotent; a crash part-way leaves checkpoints of
@@ -203,6 +206,15 @@ pub(crate) async fn reconcile_checkpoint_lineage(
         else {
             continue;
         };
+        // A snapshot or generation start position is no stream position: it
+        // is classified against the snapshot's control record (its anchor
+        // carries its own lineage), never rewritten here.
+        if matches!(
+            super::classify_mysql_checkpoint(&raw),
+            Ok(super::MyResumePosition::Snapshot)
+        ) {
+            continue;
+        }
         let (Ok(cp), Ok(serde_json::Value::Object(obj))) = (
             serde_json::from_slice::<MySqlCheckpoint>(&raw),
             serde_json::from_slice::<serde_json::Value>(&raw),
@@ -385,6 +397,7 @@ mod tests {
             gtid_set: gtid.map(str::to_string),
             lineage: lineage.map(str::to_string),
             snapshot_completed: None,
+            snapshot_chain: None,
         })
         .unwrap()
     }
@@ -502,6 +515,48 @@ mod tests {
         assert_eq!(
             run(store.as_ref(), &backend, l, &g).await.unwrap(),
             Reconciled::NothingToDo
+        );
+    }
+
+    /// Snapshot and generation start positions are no stream positions:
+    /// they are left as they are while stream positions are adopted.
+    #[tokio::test]
+    async fn snapshot_positions_are_left_as_they_are() {
+        let (store, backend, h) = setup(&[UUID_A]).await;
+        let l = &h[0];
+        let anchor = MySqlCheckpoint {
+            file: "bin.000001".into(),
+            pos: 4,
+            gtid_set: None,
+            lineage: None,
+            snapshot_completed: None,
+            snapshot_chain: None,
+        };
+        let incomplete =
+            crate::snapshot_position::encode_chained("c", 2, &anchor);
+        let started = crate::snapshot_position::encode_adopted("c", 3, "d");
+        store
+            .put_raw("orders::sink::kafka", &cp("bin.000002", 9, None, None))
+            .await
+            .unwrap();
+        store
+            .put_raw("orders::sink::s3", &incomplete)
+            .await
+            .unwrap();
+        store.put_raw("orders::sink::http", &started).await.unwrap();
+        assert_eq!(
+            run(store.as_ref(), &backend, l, &FakeGtid::ok())
+                .await
+                .unwrap(),
+            Reconciled::Adopted(1)
+        );
+        assert_eq!(
+            store.get_raw("orders::sink::s3").await.unwrap(),
+            Some(incomplete)
+        );
+        assert_eq!(
+            store.get_raw("orders::sink::http").await.unwrap(),
+            Some(started)
         );
     }
 

@@ -208,6 +208,7 @@ async fn mysql_snapshot_scale() -> Result<()> {
             on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
             table_options: Default::default(),
             rotation: None,
+            snapshot_cohort: Default::default(),
         };
         let id = src.id.clone();
         measure("mysql", src, &id, n).await;

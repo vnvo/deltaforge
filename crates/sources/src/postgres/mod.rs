@@ -448,34 +448,8 @@ enum PgStart {
     },
 }
 
-/// Everything a generation start or completion check reads, owned (the
-/// completion watcher outlives the start).
-#[derive(Clone)]
-struct PgGenerationInputs {
-    queue: crate::snapshot_queue::QueueStore,
-    checkpoints: Arc<dyn CheckpointStore>,
-    source_id: String,
-    lineage: PersistedLineage,
-    fingerprint: String,
-    policy: crate::snapshot_queue::PolicySnapshot,
-    mode: SnapshotMode,
-}
-
-impl PgGenerationInputs {
-    fn input(&self) -> crate::snapshot_driver::StartInput<'_, PgOrder> {
-        crate::snapshot_driver::StartInput {
-            store: &self.queue,
-            engine: &PgOrder,
-            checkpoints: self.checkpoints.as_ref(),
-            source_id: &self.source_id,
-            lineage: self.lineage.clone(),
-            config_fingerprint: &self.fingerprint,
-            policy: self.policy.clone(),
-            mode: self.mode.clone(),
-            anchor_of: &pg_anchor_of,
-        }
-    }
-}
+/// What a PostgreSQL generation start or completion check reads.
+type PgGenerationInputs = crate::snapshot_driver::GenerationInputs<PgOrder>;
 
 impl PostgresSource {
     fn incidents(&self) -> IncidentStore {
@@ -523,7 +497,6 @@ impl PostgresSource {
         &self,
         chkpt_store: &Arc<dyn CheckpointStore>,
     ) -> SourceResult<(PgStart, Option<PgGenerationInputs>)> {
-        use crate::snapshot_driver::{DriverError, StartOutcome, decide_start};
         let queue = self.queue();
         let cohort = self
             .snapshot_cohort
@@ -560,78 +533,35 @@ impl PostgresSource {
             fingerprint: self.config_fingerprint(),
             policy: crate::snapshot_queue::PolicySnapshot::from(&cohort),
             mode: self.snapshot_cfg.mode.clone(),
+            engine: PgOrder,
+            anchor_of: pg_anchor_of,
         };
-        let outcome = decide_start(&inputs.input()).await.map_err(|e| {
-            let msg = format!("source {}: {e}", self.id);
-            match e {
-                DriverError::Blocked { .. }
-                | DriverError::NeverIncomplete { .. }
-                | DriverError::Foreign { .. }
-                | DriverError::IncomparableAcks { .. }
-                | DriverError::Legacy => SourceError::Checkpoint {
-                    details: msg.into(),
-                },
-                _ => SourceError::Other(anyhow::anyhow!(msg)),
-            }
-        })?;
-        let completed = match &outcome {
-            StartOutcome::Stream { completed_now, .. } => match completed_now {
-                Some(c) => Some(c.clone()),
-                None => match inputs.queue.read().await {
-                    Ok(Some(crate::snapshot_queue::Stored::Current {
-                        control,
-                        ..
-                    })) => Some(*control),
-                    _ => None,
-                },
-            },
-            StartOutcome::Snapshot { .. } => None,
-        };
-        crate::snapshot_driver::report_start(
+        let decided = crate::snapshot_driver::decide(
+            &inputs,
             &self.incidents(),
-            &self.id,
-            &outcome,
-            completed.as_ref(),
+            &self.snapshot_cohort,
         )
-        .await;
-        // The resume fold leaves out only the sinks behind a generation the
-        // control record durably shows completed; a new generation has none.
-        let exclusions = match &outcome {
-            StartOutcome::Stream { .. } => {
-                crate::snapshot_driver::resume_exclusions(&inputs.input())
-                    .await
-                    .map_err(|e| SourceError::Checkpoint {
-                        details: format!("source {}: {e}", self.id).into(),
-                    })?
+        .await
+        .map_err(|e| crate::snapshot_driver::source_error(&self.id, e))?;
+        let start = match decided {
+            crate::snapshot_driver::Decided::Stream { completed } => {
+                PgStart::Stream {
+                    completed_anchor: completed
+                        .as_ref()
+                        .and_then(|c| c.anchor.as_ref())
+                        .and_then(pg_anchor_of)
+                        .and_then(|a| Lsn::parse(&a.lsn).ok()),
+                }
             }
-            StartOutcome::Snapshot { .. } => Vec::new(),
-        };
-        self.snapshot_cohort
-            .lock()
-            .expect("not poisoned")
-            .resume_exclusions = exclusions;
-        let start = match outcome {
-            StartOutcome::Stream { .. } => PgStart::Stream {
-                completed_anchor: completed
-                    .as_ref()
-                    .and_then(|c| c.anchor.as_ref())
-                    .and_then(pg_anchor_of)
-                    .and_then(|a| Lsn::parse(&a.lsn).ok()),
-            },
-            StartOutcome::Snapshot {
-                version, control, ..
+            crate::snapshot_driver::Decided::Generation {
+                version,
+                control,
             } => {
                 crate::snapshot_probe::record_fixed(
                     crate::snapshot_probe::FixedOp::LineageCapture,
                 );
                 crate::snapshot_probe::record_fixed(
                     crate::snapshot_probe::FixedOp::GenerationAllocation,
-                );
-                info!(
-                    source_id = %self.id,
-                    snapshot_chain = %control.snapshot_chain,
-                    generation = control.generation,
-                    "snapshot generation allocated"
                 );
                 PgStart::Generation {
                     version,
@@ -1288,7 +1218,7 @@ impl PostgresSource {
 
         // 9. Completion, in the background, once the frozen policy's
         // frontier covers the terminal.
-        spawn_completion_watch(
+        crate::snapshot_driver::spawn_completion_watch(
             inputs.clone(),
             self.incidents(),
             Arc::clone(&self.snapshot_cohort),
@@ -1296,78 +1226,6 @@ impl PostgresSource {
         );
         Ok(anchor_lsn)
     }
-}
-
-/// Record `completed` once the frozen policy's frontier covers the
-/// generation's terminal (design section 6.2), then report the sinks behind
-/// it and leave them out of the resume fold. Ends with the source, or on anything but `rows_produced`.
-fn spawn_completion_watch(
-    inputs: PgGenerationInputs,
-    incidents: IncidentStore,
-    shared: crate::SnapshotCohortSlot,
-    cancel: CancellationToken,
-) {
-    tokio::spawn(async move {
-        use crate::snapshot_driver::{
-            StartOutcome, lagging, report_start, try_complete,
-        };
-        loop {
-            let input = inputs.input();
-            match inputs.queue.read().await {
-                Ok(Some(crate::snapshot_queue::Stored::Current {
-                    version,
-                    control,
-                })) if control.state
-                    == crate::snapshot_queue::State::RowsProduced =>
-                {
-                    match try_complete(&input, version, &control).await {
-                        Ok(Some(done)) => {
-                            info!(
-                                source_id = %inputs.source_id,
-                                generation = done.generation,
-                                "snapshot generation completed"
-                            );
-                            let behind = lagging(&input, &done)
-                                .await
-                                .unwrap_or_default();
-                            // Durably completed: the sinks behind it leave
-                            // the resume fold.
-                            shared
-                                .lock()
-                                .expect("not poisoned")
-                                .resume_exclusions = behind.clone();
-                            report_start(
-                                &incidents,
-                                &inputs.source_id,
-                                &StartOutcome::Stream {
-                                    lagging: behind,
-                                    completed_now: Some(done.clone()),
-                                },
-                                Some(&done),
-                            )
-                            .await;
-                            return;
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            warn!(
-                                source_id = %inputs.source_id,
-                                error = %e,
-                                "snapshot completion check failed; the next \
-                                 start decides"
-                            );
-                            return;
-                        }
-                    }
-                }
-                _ => return,
-            }
-            tokio::select! {
-                _ = inputs.checkpoints.await_checkpoint_change() => {}
-                _ = cancel.cancelled() => return,
-            }
-        }
-    });
 }
 
 impl PostgresSource {
@@ -2228,7 +2086,8 @@ pub fn pg_checkpoint_is_snapshot(raw: &[u8]) -> bool {
 }
 
 /// PostgreSQL's part of the snapshot position order.
-struct PgOrder;
+#[derive(Clone, Copy)]
+pub(crate) struct PgOrder;
 
 impl crate::snapshot_position::EngineOrder for PgOrder {
     type Anchor = PgAnchor;
