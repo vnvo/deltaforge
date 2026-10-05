@@ -109,6 +109,17 @@ pub struct SnapshotGenerationRecord {
     pub status: SnapshotStatus,
     /// Fingerprint of the identity-relevant snapshot configuration.
     pub config_fingerprint: String,
+    /// The format of `config_fingerprint`; absent (`0`) in records written
+    /// before the format was recorded (format 1).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fingerprint_format: u32,
+}
+
+/// The fingerprint format this build computes ([`SnapshotFingerprintBuilder`]).
+pub const FINGERPRINT_FORMAT: u32 = 2;
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// A stable fingerprint over the snapshot-relevant configuration. A resume
@@ -244,6 +255,15 @@ pub enum SnapshotGenerationError {
     /// The underlying state store failed.
     #[error("snapshot state store error: {0}")]
     Store(String),
+    /// The stored record has a fingerprint format this build does not know
+    /// (written by a newer release): never resumed, never treated as an
+    /// earlier format.
+    #[error(
+        "snapshot generation {generation} was recorded with fingerprint \
+         format {format}, which this release does not know; refusing to resume \
+         or replace it"
+    )]
+    UnsupportedFingerprintFormat { generation: u64, format: u32 },
     /// Too many concurrent writers; CAS retry budget exhausted.
     #[error("exceeded retry budget allocating snapshot generation")]
     RetryExhausted,
@@ -296,6 +316,7 @@ pub async fn allocate_generation(
                         lineage: current_lineage.clone(),
                         status: SnapshotStatus::Allocated,
                         config_fingerprint: fingerprint.as_str().to_string(),
+                        fingerprint_format: FINGERPRINT_FORMAT,
                     };
                     match store
                         .compare_and_swap(key, None, &encode(&rec)?)
@@ -315,6 +336,60 @@ pub async fn allocate_generation(
                 }
                 Some((version, bytes)) => {
                     let rec = decode(bytes)?;
+                    // A record of a format this build does not know (a newer
+                    // release) is refused, never taken for an earlier one.
+                    if rec.fingerprint_format != 0
+                        && rec.fingerprint_format != FINGERPRINT_FORMAT
+                    {
+                        return Err(
+                            SnapshotGenerationError::UnsupportedFingerprintFormat {
+                                generation: rec.generation,
+                                format: rec.fingerprint_format,
+                            },
+                        );
+                    }
+                    // A record without a format (written before formats were
+                    // recorded) cannot be compared: its snapshot is not
+                    // resumed but replaced by the next generation, by CAS
+                    // against the record read (the full snapshot runs again).
+                    // Only the recorded format decides this, never a
+                    // fingerprint mismatch, which stays a configuration
+                    // change.
+                    if rec.fingerprint_format == 0 {
+                        let next = SnapshotGenerationRecord {
+                            generation: rec.generation + 1,
+                            lineage: current_lineage.clone(),
+                            status: SnapshotStatus::Allocated,
+                            config_fingerprint: fingerprint
+                                .as_str()
+                                .to_string(),
+                            fingerprint_format: FINGERPRINT_FORMAT,
+                        };
+                        match store
+                            .compare_and_swap(
+                                key,
+                                Some(*version),
+                                &encode(&next)?,
+                            )
+                            .await
+                            .map_err(map_store_err)?
+                        {
+                            CasOutcome::Committed { version } => {
+                                tracing::info!(
+                                    previous_generation = rec.generation,
+                                    previous_format = rec.fingerprint_format,
+                                    generation = next.generation,
+                                    "snapshot fingerprint format changed: \
+                                     allocated a new generation"
+                                );
+                                return Ok(AllocatedGeneration {
+                                    version,
+                                    record: next,
+                                });
+                            }
+                            CasOutcome::Mismatch { .. } => continue,
+                        }
+                    }
                     // Reuse only when both the config and the *stable* lineage
                     // match. The persisted record (incl. its original file) is
                     // returned unchanged — never recomputed from current state.
@@ -334,7 +409,18 @@ pub async fn allocate_generation(
             AllocationMode::ForceNew => {
                 let (expected, next_gen) = match &current {
                     Some((v, bytes)) => {
-                        (Some(*v), decode(bytes)?.generation + 1)
+                        let rec = decode(bytes)?;
+                        // Not even an explicit re-snapshot replaces a record
+                        // of a format this build does not know.
+                        if rec.fingerprint_format > FINGERPRINT_FORMAT {
+                            return Err(
+                                SnapshotGenerationError::UnsupportedFingerprintFormat {
+                                    generation: rec.generation,
+                                    format: rec.fingerprint_format,
+                                },
+                            );
+                        }
+                        (Some(*v), rec.generation + 1)
                     }
                     None => (None, 1),
                 };
@@ -343,6 +429,7 @@ pub async fn allocate_generation(
                     lineage: current_lineage.clone(),
                     status: SnapshotStatus::Allocated,
                     config_fingerprint: fingerprint.as_str().to_string(),
+                    fingerprint_format: FINGERPRINT_FORMAT,
                 };
                 match store
                     .compare_and_swap(key, expected, &encode(&rec)?)
@@ -693,6 +780,119 @@ mod tests {
         let ab = build(&["d.*"], &[("ab", &["c"], CursorKind::Signed, 1)]);
         let a_bc = build(&["d.*"], &[("a", &["bc"], CursorKind::Signed, 1)]);
         assert_ne!(ab, a_bc);
+    }
+
+    /// A record of an earlier fingerprint format (absent field) is replaced
+    /// by a new generation on resume, whatever its status; a fingerprint
+    /// mismatch within the current format stays a configuration change.
+    #[tokio::test]
+    async fn an_earlier_fingerprint_format_starts_a_new_generation() {
+        for status in [SnapshotStatus::Running, SnapshotStatus::Completed] {
+            let store = MemCheckpointStore::new().unwrap();
+            let legacy = serde_json::json!({
+                "generation": 4,
+                "lineage": pg(1),
+                "status": status,
+                "config_fingerprint": "a-format-1-hash",
+            });
+            store
+                .compare_and_swap(
+                    KEY,
+                    None,
+                    &serde_json::to_vec(&legacy).unwrap(),
+                )
+                .await
+                .unwrap();
+            let a = allocate_generation(
+                &store,
+                KEY,
+                pg(1),
+                &fp(&["id"]),
+                AllocationMode::Resume,
+            )
+            .await
+            .unwrap();
+            assert_eq!(a.record.generation, 5, "{status:?}");
+            assert_eq!(a.record.fingerprint_format, FINGERPRINT_FORMAT);
+            assert_eq!(a.record.status, SnapshotStatus::Allocated);
+            // Resuming again reuses it.
+            let b = allocate_generation(
+                &store,
+                KEY,
+                pg(1),
+                &fp(&["id"]),
+                AllocationMode::Resume,
+            )
+            .await
+            .unwrap();
+            assert_eq!(b.record.generation, 5);
+        }
+        // A format this build does not know: refused, the record untouched.
+        let store = MemCheckpointStore::new().unwrap();
+        let future = serde_json::json!({
+            "generation": 4,
+            "lineage": pg(1),
+            "status": "running",
+            "config_fingerprint": "a-format-9-hash",
+            "fingerprint_format": 9,
+        });
+        let bytes = serde_json::to_vec(&future).unwrap();
+        store.compare_and_swap(KEY, None, &bytes).await.unwrap();
+        let err = allocate_generation(
+            &store,
+            KEY,
+            pg(1),
+            &fp(&["id"]),
+            AllocationMode::Resume,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SnapshotGenerationError::UnsupportedFingerprintFormat {
+                format: 9,
+                ..
+            }
+        ));
+        assert_eq!(store.get_versioned(KEY).await.unwrap().unwrap().1, bytes);
+        let err = allocate_generation(
+            &store,
+            KEY,
+            pg(1),
+            &fp(&["id"]),
+            AllocationMode::ForceNew,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SnapshotGenerationError::UnsupportedFingerprintFormat {
+                format: 9,
+                ..
+            }
+        ));
+        assert_eq!(store.get_versioned(KEY).await.unwrap().unwrap().1, bytes);
+        // Same format, other fingerprint: a configuration change, refused.
+        let store = MemCheckpointStore::new().unwrap();
+        allocate_generation(
+            &store,
+            KEY,
+            pg(1),
+            &fp(&["id"]),
+            AllocationMode::Resume,
+        )
+        .await
+        .unwrap();
+        let err = allocate_generation(
+            &store,
+            KEY,
+            pg(1),
+            &fp(&["other"]),
+            AllocationMode::Resume,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SnapshotGenerationError::ConfigChanged { .. }));
     }
 
     #[tokio::test]
