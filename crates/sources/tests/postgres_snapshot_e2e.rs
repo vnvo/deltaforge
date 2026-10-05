@@ -21,7 +21,7 @@ use ctor::dtor;
 
 use sources::postgres::postgres_slot_owner::prepare_snapshot_slot_anchor;
 use sources::postgres::postgres_snapshot::{
-    self, SnapshotProgress, progress_key, run_snapshot,
+    self, SnapshotProgress, plan_table, progress_key, run_snapshot,
 };
 use sources::snapshot_generation::PersistedLineage;
 
@@ -112,12 +112,11 @@ async fn pg_snapshot_captures_all_rows_integer_pk() -> Result<()> {
         lineage: PersistedLineage::Postgres {
             system_identifier: 0,
         },
-        identity_map: Default::default(),
     };
 
     run_snapshot(
         &snapshot_ctx,
-        &[("public".into(), "orders".into())],
+        &[plan_table(&schema_loader, "public", "orders", vec![]).await?],
         Lsn::from(0u64),
     )
     .await?;
@@ -188,15 +187,14 @@ async fn pg_snapshot_parallel_tables() -> Result<()> {
         lineage: PersistedLineage::Postgres {
             system_identifier: 0,
         },
-        identity_map: Default::default(),
     };
 
     run_snapshot(
         &snapshot_ctx,
         &[
-            ("public".into(), "users".into()),
-            ("public".into(), "products".into()),
-            ("public".into(), "orders".into()),
+            plan_table(&schema_loader, "public", "users", vec![]).await?,
+            plan_table(&schema_loader, "public", "products", vec![]).await?,
+            plan_table(&schema_loader, "public", "orders", vec![]).await?,
         ],
         Lsn::from(0u64),
     )
@@ -255,7 +253,7 @@ async fn pg_snapshot_resumes_after_partial_completion() -> Result<()> {
 
     let fake = SnapshotProgress {
         start_lsn: lsn,
-        done_tables: vec!["public.t1".into()],
+        done_tables: ["public.t1".to_string()].into(),
         finished: false,
         anchor_version: 0,
     };
@@ -280,14 +278,13 @@ async fn pg_snapshot_resumes_after_partial_completion() -> Result<()> {
         lineage: PersistedLineage::Postgres {
             system_identifier: 0,
         },
-        identity_map: Default::default(),
     };
 
     run_snapshot(
         &snapshot_ctx,
         &[
-            ("public".into(), "t1".into()),
-            ("public".into(), "t2".into()),
+            plan_table(&schema_loader, "public", "t1", vec![]).await?,
+            plan_table(&schema_loader, "public", "t2", vec![]).await?,
         ],
         Lsn::from(0u64),
     )
@@ -343,12 +340,11 @@ async fn pg_snapshot_ctid_fallback_for_uuid_pk() -> Result<()> {
         lineage: PersistedLineage::Postgres {
             system_identifier: 0,
         },
-        identity_map: Default::default(),
     };
 
     run_snapshot(
         &snapshot_ctx,
-        &[("public".into(), "events".into())],
+        &[plan_table(&schema_loader, "public", "events", vec![]).await?],
         Lsn::from(0u64),
     )
     .await?;
@@ -395,12 +391,11 @@ async fn pg_snapshot_persists_lsn_and_marks_finished() -> Result<()> {
         lineage: PersistedLineage::Postgres {
             system_identifier: 0,
         },
-        identity_map: Default::default(),
     };
 
     let returned_lsn = run_snapshot(
         &snapshot_ctx,
-        &[("public".into(), "items".into())],
+        &[plan_table(&schema_loader, "public", "items", vec![]).await?],
         Lsn::from(0u64),
     )
     .await?;
@@ -451,13 +446,12 @@ async fn pg_snapshot_already_finished_returns_saved_lsn() -> Result<()> {
             lineage: PersistedLineage::Postgres {
                 system_identifier: 0,
             },
-            identity_map: Default::default(),
         };
 
     let (tx1, mut rx1) = mpsc::channel(64);
     let lsn1 = run_snapshot(
         &make_ctx(tx1),
-        &[("public".into(), "t".into())],
+        &[plan_table(&schema_loader, "public", "t", vec![]).await?],
         Lsn::from(0u64),
     )
     .await?;
@@ -468,7 +462,7 @@ async fn pg_snapshot_already_finished_returns_saved_lsn() -> Result<()> {
     let (tx2, mut rx2) = mpsc::channel(64);
     let lsn2 = run_snapshot(
         &make_ctx(tx2),
-        &[("public".into(), "t".into())],
+        &[plan_table(&schema_loader, "public", "t", vec![]).await?],
         Lsn::from(0u64),
     )
     .await?;
@@ -537,12 +531,14 @@ async fn pg_snapshot_anchor_zero_loss_bounded_overlap() -> Result<()> {
         lineage: PersistedLineage::Postgres {
             system_identifier: 0,
         },
-        identity_map: Default::default(),
     };
 
-    let returned =
-        run_snapshot(&snapshot_ctx, &[("public".into(), "orders".into())], c)
-            .await?;
+    let returned = run_snapshot(
+        &snapshot_ctx,
+        &[plan_table(&schema_loader, "public", "orders", vec![]).await?],
+        c,
+    )
+    .await?;
     assert_eq!(
         returned.to_string(),
         c.to_string(),
@@ -599,5 +595,230 @@ async fn pg_snapshot_anchor_zero_loss_bounded_overlap() -> Result<()> {
         .await
         .ok();
     pg_drop_db(&db).await;
+    Ok(())
+}
+
+// ============================================================================
+// Paged discovery and preparation: structural shape
+// ============================================================================
+
+/// One snapshot start over `n` tables matching `public.pgt*` (plus tables
+/// it does not match), with discovery pages of 10 and 3 parallel tables;
+/// returns its structural shape.
+async fn snapshot_shape(
+    n: usize,
+) -> Result<sources::snapshot_probe::SnapshotShape> {
+    let (shape, reads, _) = snapshot_with_ddl(n, None).await?;
+    assert_eq!(reads, n, "every matched table's row was snapshotted");
+    Ok(shape)
+}
+
+/// Like [`snapshot_shape`], optionally running `ddl` (an admin statement)
+/// after the first discovery page; returns the shape, the rows read and
+/// the run's outcome.
+async fn snapshot_with_ddl(
+    n: usize,
+    ddl: Option<&str>,
+) -> Result<(
+    sources::snapshot_probe::SnapshotShape,
+    usize,
+    Option<String>,
+)> {
+    use sources::postgres::PostgresSource;
+    use sources::snapshot_probe;
+    let (db, client) = pg_setup(&format!("shape{n}")).await?;
+    for i in 0..n {
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE pgt_{i:03} (id INT PRIMARY KEY); \
+                 INSERT INTO pgt_{i:03} VALUES (1);"
+            ))
+            .await?;
+    }
+    client
+        .batch_execute(
+            "CREATE TABLE other_a (id INT PRIMARY KEY); \
+             CREATE TABLE zz_other (id INT PRIMARY KEY); \
+             CREATE PUBLICATION pub_shape FOR ALL TABLES;",
+        )
+        .await?;
+    let slot = format!("slot_shape{n}");
+    let src = PostgresSource {
+        id: format!("shape{n}"),
+        dsn: pg_admin_dsn(&db).await.into(),
+        slot: slot.clone(),
+        publication: "pub_shape".into(),
+        tables: vec!["public.pgt*".into()],
+        tenant: "acme".into(),
+        pipeline: "test".into(),
+        registry: test_common::make_registry().await,
+        registry_scope: sources::registry_scope::SharedRegistryScope::default(),
+        backend: test_common::make_storage_backend().await,
+        outbox_prefixes: common::AllowList::default(),
+        snapshot_cfg: SnapshotCfg {
+            max_parallel_tables: 3,
+            discovery_page_size: 10,
+            ..initial_cfg()
+        },
+        on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
+        table_options: Default::default(),
+        rotation: None,
+    };
+    let chkpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let (tx, mut rx) = mpsc::channel(4096);
+    snapshot_probe::reset();
+    let hold = ddl.map(|_| snapshot_probe::hold_after_discovery_page());
+    let handle = deltaforge_core::Source::run(&src, tx, chkpt).await;
+    if let (Some((reached, release)), Some(ddl)) = (&hold, ddl) {
+        reached.notified().await;
+        client.batch_execute(ddl).await?;
+        release.notify_one();
+    }
+    let mut reads = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    while reads < n {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(SourceItem::Event(ev))) if ev.op == Op::Read => reads += 1,
+            Ok(Some(_)) => continue,
+            _ => break,
+        }
+    }
+    let shape = snapshot_probe::shape();
+    handle.stop();
+    let err = handle.join().await.err().map(|e| format!("{e:#}"));
+    client
+        .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .await
+        .ok();
+    pg_drop_db(&db).await;
+    Ok((shape, reads, err))
+}
+
+/// Discovery reads the catalog in pages and each table is prepared once:
+/// catalog queries are `floor(selected rows / page size) + 1`, every matched
+/// table is discovered and prepared exactly once, a page never exceeds the
+/// page size, workers make no live catalog schema fetch, and at most
+/// `max_parallel_tables` table tasks are alive. Doubling the tables changes
+/// only the per-page and per-table counters.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn discovery_is_paged_and_each_table_prepared_once() -> Result<()> {
+    let s25 = snapshot_shape(25).await?;
+    let s50 = snapshot_shape(50).await?;
+    for (n, s) in [(25u64, s25), (50, s50)] {
+        assert_eq!(s.discovery_queries, n / 10 + 1, "pages for {n}: {s:?}");
+        assert_eq!(s.discovered_tables, n, "{s:?}");
+        assert_eq!(s.prepared_tables, n, "{s:?}");
+        assert_eq!(s.max_discovery_page, 10, "{s:?}");
+        assert_eq!(s.worker_live_fetches, 0, "{s:?}");
+        assert_eq!(s.max_table_tasks, 3, "{s:?}");
+    }
+    // Fixed operations: identical, once each.
+    assert_eq!(s25.fixed, s50.fixed);
+    assert_eq!(s25.fixed, [1, 1, 1, 1, 1, 0, 0], "{s25:?}");
+    assert_eq!(s25.registry_reads, 25, "one registry read per table");
+    assert_eq!(s25.frontier_tables, 25);
+    // Doubling: only the per-page and per-table counters move.
+    assert_eq!(s50.discovery_queries - s25.discovery_queries, 3);
+    assert_eq!(s50.prepared_tables, 2 * s25.prepared_tables);
+    assert_eq!(
+        (
+            s25.max_discovery_page,
+            s25.worker_live_fetches,
+            s25.max_table_tasks
+        ),
+        (
+            s50.max_discovery_page,
+            s50.worker_live_fetches,
+            s50.max_table_tasks
+        )
+    );
+    Ok(())
+}
+
+/// Interrupted legacy progress under a wildcard pattern is recognized: the
+/// check compares the tables the patterns expand to (not the pattern
+/// strings) with the completed tables.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn wildcard_legacy_progress_ambiguity_is_detected() -> Result<()> {
+    use deltaforge_core::Source;
+    use sources::postgres::PostgresSource;
+    let (db, client) = pg_setup("ambig").await?;
+    client
+        .batch_execute(
+            "CREATE TABLE amb_a (id INT PRIMARY KEY); \
+             CREATE TABLE amb_b (id INT PRIMARY KEY);",
+        )
+        .await?;
+    let src = PostgresSource {
+        id: "ambig".into(),
+        dsn: pg_admin_dsn(&db).await.into(),
+        slot: "slot_ambig".into(),
+        publication: "pub_ambig".into(),
+        tables: vec!["public.amb*".into()],
+        tenant: "acme".into(),
+        pipeline: "test".into(),
+        registry: test_common::make_registry().await,
+        registry_scope: sources::registry_scope::SharedRegistryScope::default(),
+        backend: test_common::make_storage_backend().await,
+        outbox_prefixes: common::AllowList::default(),
+        snapshot_cfg: initial_cfg(),
+        on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
+        table_options: Default::default(),
+        rotation: None,
+    };
+    let store = MemCheckpointStore::new()?;
+    let put = |done: &[&str], finished: bool| {
+        serde_json::to_vec(&serde_json::json!({
+            "start_lsn": "0/1", "done_tables": done, "finished": finished
+        }))
+        .unwrap()
+    };
+    store
+        .put_raw(&progress_key("ambig"), &put(&["public.amb_a"], false))
+        .await?;
+    assert!(
+        src.check_durable_snapshot_startup(&store).await.is_err(),
+        "one of the expanded tables done, one pending"
+    );
+    for (done, finished) in [
+        (&["public.amb_a", "public.amb_b"][..], false),
+        (&["public.amb_a"][..], true),
+        (&[][..], false),
+    ] {
+        store
+            .put_raw(&progress_key("ambig"), &put(done, finished))
+            .await?;
+        assert!(
+            src.check_durable_snapshot_startup(&store).await.is_ok(),
+            "{done:?} finished={finished}"
+        );
+    }
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+/// Every discovery page reads one catalog snapshot: a table created after
+/// the first page (sorting into a later page) is not discovered, so the
+/// snapshot copies exactly the tables that existed together; a table
+/// dropped after the first page is still in that snapshot, its schema can
+/// no longer be loaded, and the snapshot stops before any row.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn discovery_pages_share_one_catalog_snapshot() -> Result<()> {
+    let (shape, reads, _) = snapshot_with_ddl(
+        25,
+        Some("CREATE TABLE pgt_999 (id INT PRIMARY KEY); INSERT INTO pgt_999 VALUES (1);"),
+    )
+    .await?;
+    assert_eq!(shape.discovered_tables, 25, "{shape:?}");
+    assert_eq!(reads, 25, "the table created mid-discovery is not copied");
+
+    let (_, reads, err) =
+        snapshot_with_ddl(25, Some("DROP TABLE pgt_020")).await?;
+    let err = err.expect("the snapshot stops");
+    assert!(err.contains("pgt_020"), "{err}");
+    assert_eq!(reads, 0, "before any row");
     Ok(())
 }
