@@ -53,6 +53,8 @@ struct Hook {
     release: Arc<Notify>,
     /// The `id` of every row a 200 answer accepted.
     accepted: Arc<Mutex<BTreeSet<i64>>>,
+    /// How many snapshot rows (`op` "r") a 200 answer accepted.
+    snapshot_reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Hook {
@@ -60,11 +62,18 @@ impl Hook {
         let answer = Arc::new(Mutex::new(Answer::Accept));
         let release = Arc::new(Notify::new());
         let accepted = Arc::new(Mutex::new(BTreeSet::new()));
-        let (a, r, acc) = (answer.clone(), release.clone(), accepted.clone());
+        let snapshot_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (a, r, acc, reads) = (
+            answer.clone(),
+            release.clone(),
+            accepted.clone(),
+            snapshot_reads.clone(),
+        );
         let app = axum::Router::new().route(
             "/",
             axum::routing::post(move |body: axum::body::Bytes| {
-                let (a, r, acc) = (a.clone(), r.clone(), acc.clone());
+                let (a, r, acc, reads) =
+                    (a.clone(), r.clone(), acc.clone(), reads.clone());
                 async move {
                     let ok = {
                         let mut a = a.lock().unwrap();
@@ -88,9 +97,15 @@ impl Hook {
                     if !ok {
                         return axum::http::StatusCode::INTERNAL_SERVER_ERROR;
                     }
-                    if let Some(id) = serde_json::from_slice::<Value>(&body)
-                        .ok()
-                        .and_then(|v| v["after"]["id"].as_i64())
+                    let v = serde_json::from_slice::<Value>(&body)
+                        .unwrap_or_default();
+                    if v["op"] == "r" {
+                        reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    // MySQL snapshot rows carry integers as strings.
+                    let id = &v["after"]["id"];
+                    if let Some(id) =
+                        id.as_i64().or_else(|| id.as_str()?.parse().ok())
                     {
                         acc.lock().unwrap().insert(id);
                     }
@@ -108,6 +123,7 @@ impl Hook {
             answer,
             release,
             accepted,
+            snapshot_reads,
         }
     }
 
@@ -118,6 +134,19 @@ impl Hook {
 
     fn accepted(&self) -> BTreeSet<i64> {
         self.accepted.lock().unwrap().clone()
+    }
+
+    fn snapshot_reads(&self) -> usize {
+        self.snapshot_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn until_accepted(&self, id: i64) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !self.accepted().contains(&id) {
+            assert!(Instant::now() < deadline, "row {id} never delivered");
+            sleep(Duration::from_millis(200)).await;
+        }
     }
 }
 
@@ -144,8 +173,44 @@ fn sink_yaml(url: &str) -> String {
 // ---- pipeline -----------------------------------------------------------------
 
 async fn manager() -> PipelineManager {
+    manager_with_backend().await.0
+}
+
+async fn manager_with_backend() -> (PipelineManager, ArcStorageBackend) {
     let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
-    PipelineManager::with_backend(backend).await.unwrap()
+    let mgr = PipelineManager::with_backend(Arc::clone(&backend))
+        .await
+        .unwrap();
+    (mgr, backend)
+}
+
+/// The sink's committed checkpoint, once `done` holds on it.
+async fn until_checkpoint(
+    backend: &ArcStorageBackend,
+    key: &str,
+    done: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if let Some(v) = backend
+            .kv_get("checkpoints", key)
+            .await
+            .unwrap()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            && done(&v)
+        {
+            return v;
+        }
+        assert!(Instant::now() < deadline, "{key} never reached");
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Stop the pipeline, then start it again.
+async fn restart(mgr: &PipelineManager, name: &str) {
+    PipelineController::stop(mgr, name).await.unwrap();
+    until_status(mgr, name, "stopped").await;
+    mgr.resume(name).await.unwrap();
 }
 
 async fn status(mgr: &PipelineManager, name: &str) -> String {
@@ -216,6 +281,26 @@ async fn start_postgres() -> (ContainerAsync<GenericImage>, u16) {
     .await
     .unwrap();
     (c, port)
+}
+
+async fn pg_insert(port: u16, id: i64) {
+    let (pg, conn) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={port} user=postgres password={PASS} dbname=postgres"
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        conn.await.ok();
+    });
+    pg.execute(
+        "INSERT INTO orders VALUES ($1, 'new')",
+        &[&i32::try_from(id).unwrap()],
+    )
+    .await
+    .unwrap();
 }
 
 fn pg_spec(
@@ -291,6 +376,31 @@ async fn postgres_restart_after_the_snapshot_was_read_but_not_committed()
     assert!(hook.accepted().is_empty(), "nothing was committed");
     mgr.resume("pgheld").await.unwrap();
     every_row_arrives(&mgr, "pgheld", &hook).await;
+    Ok(())
+}
+
+/// A delivered snapshot's completing checkpoint is committed (it rides the
+/// last event): a restart streams on without copying the snapshot again.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn postgres_a_delivered_snapshot_is_not_copied_again() -> Result<()> {
+    let (_pg, port) = start_postgres().await;
+    let hook = Hook::start().await;
+    let (mgr, backend) = manager_with_backend().await;
+    mgr.start_pipeline(pg_spec("pgdone", port, &hook.url))
+        .await?;
+    every_row_arrives(&mgr, "pgdone", &hook).await;
+    // The completing checkpoint: a stream position, not a snapshot one.
+    until_checkpoint(&backend, "pg-src::sink::hook", |v| {
+        v.get("lsn").is_some()
+    })
+    .await;
+
+    restart(&mgr, "pgdone").await;
+    let reads = hook.snapshot_reads();
+    pg_insert(port, ROWS + 1).await;
+    hook.until_accepted(ROWS + 1).await;
+    assert_eq!(hook.snapshot_reads(), reads, "no snapshot row again");
     Ok(())
 }
 
@@ -412,5 +522,95 @@ async fn mysql_restart_after_the_snapshot_was_read_but_not_committed()
     assert!(hook.accepted().is_empty(), "nothing was committed");
     mgr.resume("myheld").await.unwrap();
     every_row_arrives(&mgr, "myheld", &hook).await;
+    Ok(())
+}
+
+async fn mysql_insert(port: u16, id: i64) {
+    let mut root =
+        mysql_conn(&format!("mysql://root:rootpw@127.0.0.1:{port}/"))
+            .await
+            .unwrap();
+    root.query_drop(format!("INSERT INTO shop.orders VALUES ({id}, 'new')"))
+        .await
+        .unwrap();
+}
+
+/// A delivered snapshot's completing checkpoint is committed (it rides the
+/// last event): a restart streams on without copying the snapshot again.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn mysql_a_delivered_snapshot_is_not_copied_again() -> Result<()> {
+    let (_my, port) = start_mysql().await;
+    let hook = Hook::start().await;
+    let (mgr, backend) = manager_with_backend().await;
+    mgr.start_pipeline(mysql_spec("mydone", port, &hook.url))
+        .await?;
+    every_row_arrives(&mgr, "mydone", &hook).await;
+    until_checkpoint(&backend, "my-src::sink::hook", |v| {
+        v.get("snapshot_completed").is_some()
+    })
+    .await;
+
+    restart(&mgr, "mydone").await;
+    let reads = hook.snapshot_reads();
+    mysql_insert(port, ROWS + 1).await;
+    hook.until_accepted(ROWS + 1).await;
+    assert_eq!(hook.snapshot_reads(), reads, "no snapshot row again");
+    Ok(())
+}
+
+/// Upgrade: a checkpoint at the snapshot's anchor without the completion
+/// mark (what earlier releases committed, whether or not every row was
+/// delivered) proves nothing: the snapshot runs once more, then the stream
+/// continues without copying again.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn mysql_an_unproven_anchor_checkpoint_snapshots_once_more() -> Result<()>
+{
+    let (_my, port) = start_mysql().await;
+    let hook = Hook::start().await;
+    let (mgr, backend) = manager_with_backend().await;
+    mgr.start_pipeline(mysql_spec("myold", port, &hook.url))
+        .await?;
+    every_row_arrives(&mgr, "myold", &hook).await;
+    let mut completing =
+        until_checkpoint(&backend, "my-src::sink::hook", |v| {
+            v.get("snapshot_completed").is_some()
+        })
+        .await;
+    PipelineController::stop(&mgr, "myold").await.unwrap();
+    until_status(&mgr, "myold", "stopped").await;
+
+    // The checkpoint as an earlier release left it: the anchor, unmarked.
+    completing
+        .as_object_mut()
+        .unwrap()
+        .remove("snapshot_completed");
+    backend
+        .kv_put(
+            "checkpoints",
+            "my-src::sink::hook",
+            &serde_json::to_vec(&completing)?,
+        )
+        .await?;
+
+    let reads = hook.snapshot_reads();
+    mgr.resume("myold").await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while hook.snapshot_reads() < reads + ROWS as usize {
+        assert!(Instant::now() < deadline, "the snapshot did not run again");
+        sleep(Duration::from_millis(200)).await;
+    }
+    until_checkpoint(&backend, "my-src::sink::hook", |v| {
+        v.get("snapshot_completed").is_some()
+    })
+    .await;
+
+    // Once proven, never again.
+    restart(&mgr, "myold").await;
+    let reads = hook.snapshot_reads();
+    mysql_insert(port, ROWS + 1).await;
+    hook.until_accepted(ROWS + 1).await;
+    assert_eq!(hook.snapshot_reads(), reads, "no snapshot row again");
     Ok(())
 }
