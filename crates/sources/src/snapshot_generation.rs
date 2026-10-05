@@ -292,6 +292,32 @@ fn encode(
         .map_err(|e| SnapshotGenerationError::Corrupt(e.to_string()))
 }
 
+/// How a stored record's fingerprint format is treated, the same in every
+/// allocation mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordFormat {
+    /// Written before the format was recorded (format 1): never compared.
+    Legacy,
+    /// [`FINGERPRINT_FORMAT`]: compared.
+    Current,
+}
+
+/// Classify a stored record's format; any explicit format other than the
+/// current one (an unknown or newer release's) is refused, never taken for an
+/// earlier one.
+fn classify_format(
+    rec: &SnapshotGenerationRecord,
+) -> Result<RecordFormat, SnapshotGenerationError> {
+    match rec.fingerprint_format {
+        0 => Ok(RecordFormat::Legacy),
+        FINGERPRINT_FORMAT => Ok(RecordFormat::Current),
+        format => Err(SnapshotGenerationError::UnsupportedFingerprintFormat {
+            generation: rec.generation,
+            format,
+        }),
+    }
+}
+
 const MAX_RETRIES: usize = 16;
 
 /// Allocate (or resume) the snapshot generation for `key`, persisting the
@@ -336,17 +362,13 @@ pub async fn allocate_generation(
                 }
                 Some((version, bytes)) => {
                     let rec = decode(bytes)?;
-                    // A record of a format this build does not know (a newer
-                    // release) is refused, never taken for an earlier one.
-                    if rec.fingerprint_format != 0
-                        && rec.fingerprint_format != FINGERPRINT_FORMAT
-                    {
-                        return Err(
-                            SnapshotGenerationError::UnsupportedFingerprintFormat {
-                                generation: rec.generation,
-                                format: rec.fingerprint_format,
-                            },
-                        );
+                    let format = classify_format(&rec)?;
+                    // Neither an earlier-format record nor a current one is
+                    // taken over from another source lineage.
+                    if !rec.lineage.stable_matches(&current_lineage) {
+                        return Err(SnapshotGenerationError::ConfigChanged {
+                            generation: rec.generation,
+                        });
                     }
                     // A record without a format (written before formats were
                     // recorded) cannot be compared: its snapshot is not
@@ -355,7 +377,7 @@ pub async fn allocate_generation(
                     // Only the recorded format decides this, never a
                     // fingerprint mismatch, which stays a configuration
                     // change.
-                    if rec.fingerprint_format == 0 {
+                    if format == RecordFormat::Legacy {
                         let next = SnapshotGenerationRecord {
                             generation: rec.generation + 1,
                             lineage: current_lineage.clone(),
@@ -393,9 +415,7 @@ pub async fn allocate_generation(
                     // Reuse only when both the config and the *stable* lineage
                     // match. The persisted record (incl. its original file) is
                     // returned unchanged — never recomputed from current state.
-                    if rec.config_fingerprint == fingerprint.as_str()
-                        && rec.lineage.stable_matches(&current_lineage)
-                    {
+                    if rec.config_fingerprint == fingerprint.as_str() {
                         return Ok(AllocatedGeneration {
                             version: *version,
                             record: rec,
@@ -412,14 +432,7 @@ pub async fn allocate_generation(
                         let rec = decode(bytes)?;
                         // Not even an explicit re-snapshot replaces a record
                         // of a format this build does not know.
-                        if rec.fingerprint_format > FINGERPRINT_FORMAT {
-                            return Err(
-                                SnapshotGenerationError::UnsupportedFingerprintFormat {
-                                    generation: rec.generation,
-                                    format: rec.fingerprint_format,
-                                },
-                            );
-                        }
+                        classify_format(&rec)?;
                         (Some(*v), rec.generation + 1)
                     }
                     None => (None, 1),
@@ -827,51 +840,40 @@ mod tests {
             .unwrap();
             assert_eq!(b.record.generation, 5);
         }
-        // A format this build does not know: refused, the record untouched.
-        let store = MemCheckpointStore::new().unwrap();
-        let future = serde_json::json!({
-            "generation": 4,
-            "lineage": pg(1),
-            "status": "running",
-            "config_fingerprint": "a-format-9-hash",
-            "fingerprint_format": 9,
-        });
-        let bytes = serde_json::to_vec(&future).unwrap();
-        store.compare_and_swap(KEY, None, &bytes).await.unwrap();
-        let err = allocate_generation(
-            &store,
-            KEY,
-            pg(1),
-            &fp(&["id"]),
-            AllocationMode::Resume,
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            SnapshotGenerationError::UnsupportedFingerprintFormat {
-                format: 9,
-                ..
+        // A format this build does not know: refused in both modes, the
+        // record untouched.
+        for format in [1u32, 9] {
+            let store = MemCheckpointStore::new().unwrap();
+            let unknown = serde_json::json!({
+                "generation": 4,
+                "lineage": pg(1),
+                "status": "running",
+                "config_fingerprint": "an-unknown-format-hash",
+                "fingerprint_format": format,
+            });
+            let bytes = serde_json::to_vec(&unknown).unwrap();
+            store.compare_and_swap(KEY, None, &bytes).await.unwrap();
+            for mode in [AllocationMode::Resume, AllocationMode::ForceNew] {
+                let err =
+                    allocate_generation(&store, KEY, pg(1), &fp(&["id"]), mode)
+                        .await
+                        .unwrap_err();
+                assert!(
+                    matches!(
+                        err,
+                        SnapshotGenerationError::UnsupportedFingerprintFormat {
+                            format: f,
+                            ..
+                        } if f == format
+                    ),
+                    "format {format}, {mode:?}: {err}"
+                );
+                assert_eq!(
+                    store.get_versioned(KEY).await.unwrap().unwrap().1,
+                    bytes
+                );
             }
-        ));
-        assert_eq!(store.get_versioned(KEY).await.unwrap().unwrap().1, bytes);
-        let err = allocate_generation(
-            &store,
-            KEY,
-            pg(1),
-            &fp(&["id"]),
-            AllocationMode::ForceNew,
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            SnapshotGenerationError::UnsupportedFingerprintFormat {
-                format: 9,
-                ..
-            }
-        ));
-        assert_eq!(store.get_versioned(KEY).await.unwrap().unwrap().1, bytes);
+        }
         // Same format, other fingerprint: a configuration change, refused.
         let store = MemCheckpointStore::new().unwrap();
         allocate_generation(
@@ -893,6 +895,68 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, SnapshotGenerationError::ConfigChanged { .. }));
+    }
+
+    /// An earlier-format record is replaced only within its own source
+    /// lineage; one from another PostgreSQL cluster or MySQL lineage is
+    /// refused and left byte-identical.
+    #[tokio::test]
+    async fn an_earlier_format_record_is_replaced_only_on_its_own_lineage() {
+        let gtid = |b: u8| PersistedLineage::MysqlGtid {
+            source_uuid: [b; 16],
+        };
+        let server = |id: u32, file: &str| PersistedLineage::MysqlServer {
+            server_id: id,
+            file: file.into(),
+        };
+        let cases = [
+            ("postgres", pg(1), pg(1), true),
+            ("postgres", pg(1), pg(2), false),
+            ("mysql gtid", gtid(1), gtid(1), true),
+            ("mysql gtid", gtid(1), gtid(2), false),
+            ("mysql server", server(7, "b.1"), server(7, "b.2"), true),
+            ("mysql server", server(7, "b.1"), server(8, "b.1"), false),
+            ("mysql gtid vs server", gtid(1), server(7, "b.1"), false),
+        ];
+        for (what, stored, current, same) in cases {
+            let store = MemCheckpointStore::new().unwrap();
+            let legacy = serde_json::json!({
+                "generation": 4,
+                "lineage": stored,
+                "status": "running",
+                "config_fingerprint": "a-format-1-hash",
+            });
+            let bytes = serde_json::to_vec(&legacy).unwrap();
+            store.compare_and_swap(KEY, None, &bytes).await.unwrap();
+            let got = allocate_generation(
+                &store,
+                KEY,
+                current.clone(),
+                &fp(&["id"]),
+                AllocationMode::Resume,
+            )
+            .await;
+            if same {
+                let a = got.unwrap();
+                assert_eq!(a.record.generation, 5, "{what}");
+                assert_eq!(a.record.lineage, current, "{what}");
+            } else {
+                assert!(
+                    matches!(
+                        got,
+                        Err(SnapshotGenerationError::ConfigChanged {
+                            generation: 4
+                        })
+                    ),
+                    "{what}: {got:?}"
+                );
+                assert_eq!(
+                    store.get_versioned(KEY).await.unwrap().unwrap().1,
+                    bytes,
+                    "{what}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
