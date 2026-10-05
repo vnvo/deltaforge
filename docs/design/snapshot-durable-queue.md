@@ -1,9 +1,10 @@
-# Durable Snapshot Queue - Design (revision 2)
+# Durable Snapshot Queue - Design (revision 3)
 
 **Status:** DRAFT for review. Design only: no production code, schema migration or test harness change accompanies this document.
 **Date:** 2026-10-05
 **Scope:** rc.1 item 3, after `snapshot-paging` (#128), gate reliability (#129) and the snapshot restart fixes (#131).
-**Revision 2:** replaces the chunk-resume design of revision 1. A generation is bound to one database read view and is never resumed by another process.
+**Revision 2:** replaced the chunk-resume design of revision 1. A generation is bound to one database read view and is never resumed by another process.
+**Revision 3:** adds the snapshot chain (cross-generation ordering), durable blocking for failures that require operator recovery, a frozen completion cohort, the process-wide connection cap, and the PostgreSQL completion mark.
 
 ## 0. Rulings this design implements
 
@@ -52,7 +53,15 @@
 12. **Backends:**
     - the queue state-machine and corruption contract runs on both SQLite and PostgreSQL;
     - full engine interruption scenarios run as PostgreSQL source on SQLite, and MySQL source on the PostgreSQL backend.
-13. **Acceptance:**
+13. **Revision 3 decisions:**
+    - Lagging sinks are excluded after completion, with `sink_snapshot_incomplete`. Completion durably freezes the sink cohort, the policy parameters and the acknowledgements that justified it; later configuration never reinterprets an old terminal.
+    - S3 `legacy_rolling` closes and uploads its current file at the barrier. For an empty snapshot it acknowledges without an object.
+    - Bounds: 24 h; 256 MiB or 1,000,000 items, whichever is reached first; warning at 80%. The connection cap is process-wide.
+    - PostgreSQL completing checkpoints carry `snapshot_completed: g`, bound to the exact anchor and continuity lineage. #131's unmarked structured completion at the exact anchor stays accepted; a bare LSN stays incomplete.
+    - A durable random snapshot chain id orders a proven replacement `g < g+1`; different chains are incomparable.
+    - Failures that require operator recovery stay halted across restarts until that recovery runs. Ordinary read-view or process loss replaces the generation automatically.
+    - The terminal is bound to a policy snapshot. Configuration drift before completion explicitly replaces the generation.
+14. **Acceptance:**
     - progress plus frontier bytes 10K/1K at most 12x, and wall time at most 15x;
     - resident state bounded by page, chunk and worker counts;
     - durable operation counts given by a structurally linear formula;
@@ -94,7 +103,9 @@
 - **Within a process,** a failed chunk read may be retried only inside the same view:
   - PostgreSQL: a worker may reconnect and import the exported snapshot again while the coordinator transaction that exported it is open; once that transaction ends, the generation is lost;
   - MySQL: each worker's consistent-snapshot connection is its view; losing one loses the generation.
-- **Losing the view** (any of the above, or the process ending) **replaces the generation**: the next run allocates `g+1`, plans and anchors again, and copies every table. The single exception is a generation whose terminal barrier the policy frontier already covers: it is completed, not copied again (section 6).
+- **Losing the view** (any of the above, or the process ending) **replaces the generation**: the next run allocates `g+1` in the same snapshot chain, plans and anchors again, and copies every table. Exceptions:
+  - a generation whose terminal barrier its frozen policy frontier already covers is completed, not copied again (section 6);
+  - a **blocked** generation is never replaced automatically. It stays halted, start after start, until an explicit proof-bound operator recovery (section 9.2).
 - The durable records exist for four things:
   - bounded memory (the plan is paged from storage, never resident in full);
   - O(1) bookkeeping per boundary;
@@ -116,6 +127,8 @@ The existing `snapshot_generation:{source}` record, upgraded in place (`Snapshot
 
 ```text
 GenerationControl (record_format 3)
+  snapshot_chain     : ulid           # random; created with the source's first record, kept by every replacement
+  legacy_through     : u64?           # pre-chain generations of this lineage adopted into the chain (section 10)
   generation         : u64
   lineage            : PersistedLineage
   fingerprint_format : 3              # configuration only; schema is bound per plan item
@@ -125,13 +138,17 @@ GenerationControl (record_format 3)
   plan               : { sealed: bool, items: u64, bytes: u64, digest: hex }
   anchor             : EngineAnchor?  # set on entering running, never changed
   anchored_at_ms     : i64?           # wall time of the anchor (anchor-age bound)
-  terminal           : { digest: hex }?      # set on entering rows_produced
-  completed_policy   : All | Required | Quorum(q)?   # the policy that completed it
+  policy             : PolicySnapshot # frozen at allocation (section 6.2)
+  terminal           : { digest: hex }?      # set on entering rows_produced; binds policy.digest
+  completion         : { acks: [sink id], frontier: position }?   # set by the completed CAS
+  blocked            : { reason: code, incident: id, since_ms: i64 }?  # section 9.2
   replaced           : u64?           # the generation this one replaced (reclamation)
 ```
 
+`PolicySnapshot` is `{ mode: All | Required | Quorum, quorum: u32?, sinks: [{ id, required }], digest: hex }`, frozen from the pipeline configuration when the generation is allocated.
+
 `EngineAnchor` is one of:
-- `postgres { lsn }`
+- `postgres { lsn, timeline?, chain?, transition? }` (the continuity stamp of #127 at the anchor, when proven)
 - `mysql { file, pos, gtid_set, lineage }`
 
 ### 3.2 Plan items: the durable per-table state that remains
@@ -178,14 +195,18 @@ They are read only to classify legacy state (section 10), and deleted after the 
 
 ### 3.4 Positions and watermarks
 
-**Snapshot positions in sink checkpoints.** Unchanged from #131:
-- incomplete: `{"snapshot":{"format":1,"generation","anchor"}}`;
-- completing: an ordinary stream position at the anchor, marked `snapshot_completed: g` on MySQL and carrying a `snapshot_completed: g` member on PostgreSQL too, so both engines prove completion the same way.
+**Snapshot positions in sink checkpoints:**
+- incomplete: `{"snapshot":{"format":2,"snapshot_chain","generation","anchor"}}`. Format 1 (#131, no chain) stays readable as a legacy position.
+- completing: an ordinary stream position at the anchor, marked `snapshot_completed: g` and `snapshot_chain` on both engines:
+  - PostgreSQL: the mark is valid only with `lsn` equal to the anchor and the anchor's continuity stamp (timeline, chain, transition) when one was proven, compared exactly;
+  - MySQL: as #131 (exact anchor position, same lineage).
+
+  Older forms keep their #131 meaning: an unmarked structured PostgreSQL checkpoint exactly at the recorded anchor proves completion; a bare LSN is an incomplete position.
 
 **Watermark.** For `durable_v2` sinks, O(1):
 
 ```text
-WmPos::SnapshotSeq { generation, seq, completed }   # WATERMARK_VERSION 2
+WmPos::SnapshotSeq { snapshot_chain, generation, seq, completed }   # WATERMARK_VERSION 2
 ```
 
 - `seq` is an in-memory publish counter: strictly increasing in publish order within one run, never persisted. A generation is published by one run only.
@@ -193,23 +214,44 @@ WmPos::SnapshotSeq { generation, seq, completed }   # WATERMARK_VERSION 2
 
 ### 3.5 Snapshot-to-CDC ordering (precise)
 
-These rules apply only between positions of the same stable lineage; positions of different lineages are always incomparable. `I(g, A)` is an incomplete position, `C(g, A)` the completing position, and `S(p)` a stream position at `p`.
+These rules apply only between positions of the same stable lineage; positions of different lineages are always incomparable.
+
+**Notation:**
+- `I(c, g, A)`: an incomplete position of chain `c`, generation `g`, anchor `A`;
+- `C(c, g, A)`: the completing position;
+- `S(p)`: a stream position at `p`;
+- `W(c, g, s)`: a `SnapshotSeq` watermark;
+- `L(g, A)`: a legacy position with no chain (#131 format 1, a bare LSN, the legacy vector watermark).
 
 | a | b | order |
 |---|---|---|
-| `I(g, A)` | `I(g, A)` | Equal |
-| `I(g, A)` | `I(g', A')`, `g != g'` or `A != A'` | Incomparable |
-| `I(g, A)` | `C(g, A)` | Before |
-| `I(g, A)` | `S(p)`, `p` strictly after `A` | Before |
-| `I(g, A)` | `S(p)`, `p` at, before or incomparable with `A` | Incomparable |
-| `I(g, A)` | `C(g', A')`, another generation | Incomparable |
-| `C(g, A)` | `S(p)` | by stream order (`C` is the stream position `A`) |
-| `C(g, A)` | `C(g', A')` | by stream order of `A`, `A'` |
-| `WmPos::SnapshotSeq(g, s)` | `(g, s')` | by `s` |
-| `WmPos::SnapshotSeq(g, ...)` | any other generation | Incomparable, unless the earlier one is `completed` and the other is later |
+| `I(c, g, A)` | `I(c, g, A)` | Equal |
+| `I(c, g, A)` | `I(c, g', A')`, `g < g'` | Before (a replacement within the chain is proven by its control record) |
+| `I(c, g, A)` | `I(c, g, A')`, `A != A'` | Incomparable (one generation has one anchor) |
+| `I(c, ...)` | `I(c', ...)`, `c != c'` | Incomparable |
+| `I(c, g, A)` | `C(c, g, A)`, or `S(p)` with `p` strictly after `A` | Before |
+| `I(c, g, A)` | `C(c, g', ...)` or a stream position of `g' > g` | Before |
+| `I(c, g, A)` | `S(p)`, `p` at, before or incomparable with `A`, not attributable to a later generation | Incomparable |
+| `C(c, g, A)` | `S(p)` | by stream order (`C` is the stream position `A`) |
+| `C(c, g, A)` | `C(c, g', A')` | by `g`, then stream order |
+| `W(c, g, s)` | `W(c, g, s')` | by `s` |
+| `W(c, g, ...)` | `W(c, g', ...)`, `g < g'` | Before |
+| `W(c, ...)` | `W(c', ...)` | Incomparable |
+| `L(g, A)` | any chain `c` position | Before, if `c`'s control record adopted it (`legacy_through >= g`, same lineage); otherwise Incomparable |
 
-- Generations are never compared through incomplete positions: a source decides from its control record, not from cross-generation ordering.
-- In mixed per-sink states, the resume and frontier computations of section 6 classify each sink separately instead of folding incomparable pairs into an error, where the classification is decidable.
+Stream positions after `A` and positions of a later generation are compared by the control record, never by guessing. Per-sink classification (section 6.1) uses these rules.
+
+**Mixed sinks during a replacement.** Sink X still holds `I(c, g, A)`, or an S3 `durable_v2` HEAD with `W(c, g, s)`, while sink Y has already committed `I(c, g+1, A')` or `W(c, g+1, s')`:
+- the fold orders X before Y, so the resume classification sees X as behind;
+- the next start replaces again within the chain, or completes if the frozen policy is covered;
+- X's HEAD accepts `W(c, g+1, ...)` as later than `W(c, g, ...)`;
+- nothing is incomparable and nothing blocks.
+
+| Crash point during replacement | State left | Next start |
+|---|---|---|
+| before the replacement CAS | control at `g`, all sinks at `g` positions | replaces `g` (same decision again) |
+| after the CAS, before any `g+1` publish | control at `g+1` `allocated`, sinks at `g` | `g+1` `allocated` is itself replaced by `g+2`; sinks at `g` order before both |
+| after some sinks committed `g+1` positions | mixed `g` and `g+1` | as above; a `durable_v2` HEAD at `g+1` accepts `g+2` |
 
 ## 4. State machine
 
@@ -220,15 +262,18 @@ These rules apply only between positions of the same stable lineage; positions o
 | `allocated g` | `running g` | control CAS: `plan` sealed, `anchor`, `anchored_at_ms`, `run` | discovery complete in this run; anchor taken; plan verified at the anchor |
 | `running g` | `rows_produced g` | control CAS: `terminal` | every item read in this run's view; every worker joined successfully; every final check passed |
 | `rows_produced g` | `completed g` | control CAS verifying `terminal` | the policy frontier covers the terminal barrier (6.2) |
-| `allocated`, `running` or `rows_produced` `g` | `allocated g+1` (`replaced = g`) | control CAS from the read version | process start finds `g` not `completed` and not coverable; or this run lost its read view; or operator `resnapshot`; or a bound's hard limit (section 9) |
+| `allocated`, `running` or `rows_produced` `g`, not blocked | `allocated g+1` (`replaced = g`, same chain) | control CAS from the read version | process start finds `g` not `completed` and not coverable; or this run lost its read view; or the policy snapshot no longer matches the configuration (section 6.2) |
+| any non-completed `g` | (same) with `blocked` set | control CAS | a failure that requires operator recovery (section 9.2) |
+| blocked `g` | `allocated g+1` | control CAS by the recovery CLI | operator `resnapshot` with its proof |
 | `completed g` | `allocated g+1` | control CAS | operator `resnapshot`, or mode `always` |
 
 Rules:
 - No row of `g` is published unless the control record is `running`, `g` is current and `run` is this run.
-- **A start in `rows_produced`** first computes the policy frontier:
+- **A start in `rows_produced`** first computes the frozen policy frontier:
   - frontier covers the terminal: CAS to `completed`, no copy;
   - otherwise: replace with `g+1`.
-- **A start in `allocated` or `running`** always replaces with `g+1`.
+- **A start in `allocated` or `running`** replaces with `g+1`, unless blocked.
+- **A start in a blocked generation** re-raises its incident and stops before any row or replacement. Only the recovery CLI clears it.
 - **A start in `completed`** streams CDC (section 6.3) and never copies rows.
 - A replacement deletes nothing before its CAS. Afterwards it deletes the old generation's plan items, and resets the old progress records, if legacy.
 
@@ -256,7 +301,7 @@ A barrier carries no events and is never merged into a batch.
 | Kafka | flush the producer and await every outstanding delivery report; then acknowledge |
 | HTTP, Redis, NATS, ClickHouse, Elasticsearch | `send_batch` already returns only after the sink acknowledged the batch: acknowledge once earlier sends are complete (explicit no-op with a test that a pending earlier send is awaited) |
 | S3 `durable_v2` | a manifest entry with no data object, carrying the barrier's watermark, committed by HEAD CAS; acknowledge after the CAS |
-| S3 `legacy_rolling` | close and upload the current file; acknowledge (still non-durable, as that mode declares) |
+| S3 `legacy_rolling` | close and upload the current file, then acknowledge (still the weaker durability that mode declares); with nothing buffered (an empty snapshot) acknowledge without an object, the checkpoint store recording the boundary |
 
 The trait default refuses (`SinkError::Unsupported`). A sink that does not implement the barrier therefore cannot complete a snapshot: the policy decides whether that blocks completion. It is never silently treated as acknowledged.
 
@@ -276,9 +321,21 @@ Every per-sink checkpoint of the source is classified against the control record
 
 Foreign fails closed (`snapshot_state_invalid`).
 
-### 6.2 Policy frontier
+### 6.2 Frozen policy and frontier
 
-The frontier covers the terminal when:
+**Freezing.** When `g` is allocated, the control record freezes the pipeline's commit policy as a `PolicySnapshot`:
+- the mode;
+- the quorum, if any;
+- every sink id with its `required` flag;
+- a digest over them.
+
+The terminal digest binds it: `sha256(snapshot_chain, g, plan.digest, policy.digest)`.
+
+**Drift.** At every start and before the `completed` CAS, the current configuration's policy digest is compared with the frozen one:
+- **Before completion, a difference** (a sink added, removed, made required or optional, a changed mode or quorum) **explicitly replaces the generation**. It raises a non-blocking `snapshot_replaced` incident with class `policy_changed`, because the terminal of one cohort must not be judged by another.
+- **After completion, configuration changes never reinterpret the terminal.** The `completion` record keeps the acknowledging sink ids and the frontier. A sink added later is outside that cohort: it is behind, gets `sink_snapshot_incomplete`, and needs a re-bootstrap.
+
+**Coverage.** Evaluated only over the frozen cohort, the frontier covers the terminal when:
 
 | Policy | Covered when |
 |---|---|
@@ -286,7 +343,7 @@ The frontier covers the terminal when:
 | `Required` | every `required: true` sink is |
 | `Quorum(q)` | at least `q` sinks are |
 
-The `rows_produced` to `completed` CAS records the policy it used (`completed_policy`).
+The `rows_produced` to `completed` CAS records `completion = { acks, frontier }`: the cohort sinks whose checkpoints were at or past the terminal, and the frontier position that satisfied the policy.
 
 ### 6.3 Resume after completion
 
@@ -315,26 +372,42 @@ The added cost is one read per chunk, which is linear.
 
 | Bound | Resource | Configuration (proposed defaults) | Warning | Hard |
 |---|---|---|---|---|
-| Snapshot connections | source DB | `snapshot.max_snapshot_connections` (default `max_parallel_tables x max_parallel_chunks + 2`), one shared semaphore over coordinator, lock, workers and intra-table readers | none (it queues) | never exceeded |
+| Snapshot connections | source DBs, whole process | process-wide `runtime.max_snapshot_connections` (default 64), one semaphore shared by every pipeline in the process; per source, `snapshot.max_snapshot_connections` (default `max_parallel_tables x max_parallel_chunks + 2`) caps its share | none (it queues) | never exceeded |
 | Anchor age | source DB view held open, source log retained | `snapshot.max_anchor_age` (default 24 h) | 80%: `snapshot_bound_warning` (non-blocking) | stop, replace nothing automatically, `snapshot_anchor_unavailable` |
 | Plan storage | DeltaForge store | `snapshot.max_plan_bytes` (default 256 MiB) and `snapshot.max_plan_items` (default 1,000,000), checked during discovery | 80%: warning | discovery stops before sealing; the generation fails with `snapshot_bound_exceeded` |
 | PostgreSQL WAL retention | source WAL | from the slot: `safe_wal_size` and `wal_status` of the snapshot's slot | `safe_wal_size` below 20% of `max_slot_wal_keep_size`, or `wal_status = unreserved`: warning | `wal_status = lost`, or `safe_wal_size <= 0`: stop with `snapshot_anchor_unavailable` |
 | MySQL binlog retention | source binlog | the existing purge guard: the anchor's file and GTID set still on the server; retention age against the anchor age | anchor age above 80% of `binlog_expire_logs_seconds`: warning | anchor file purged or GTID set no longer covered: stop with `snapshot_anchor_unavailable` |
 
+- **Connection acquisition never deadlocks.** A snapshot acquires its base permits (coordinator, plus the lock connection on MySQL, plus one worker) atomically, as one acquisition of that many permits, before it starts. Workers above the first, and intra-table readers, take one permit each and release it when done. No snapshot waits for a permit while holding a partial base.
+- A snapshot whose base exceeds the process cap fails its configuration check at start.
 - Queue storage (plan) and source-log retention are separate resources, with separate names and incidents.
-- A hard stop never replaces the generation automatically. Recovery is an explicit, proof-bound `resnapshot` (the recovery CLI).
+
+### 9.2 Blocking: failures that require operator recovery
+
+These failures set `blocked` on the control record (by CAS, with the reason and incident id) and stop:
+
+| Reason | Cause |
+|---|---|
+| `snapshot_anchor_unavailable` | retention lost or about to be lost (PostgreSQL WAL, MySQL binlog), anchor-age hard bound |
+| `snapshot_bound_exceeded` | plan storage hard bound |
+| `snapshot_state_invalid` | corruption, unknown format, version-reuse probe, concurrent owner |
+
+- **A blocked generation stays halted across restarts:** every start re-raises the incident and stops before any row or replacement.
+- **Recovery** is the recovery CLI's proof-bound `resnapshot`, which replaces it by `g+1` (clearing `blocked`), with actor and reason audited.
+- **If the `blocked` CAS itself fails** (a store failure, a crash before it), the next start re-runs the detection: the retention, anchor-age and storage checks run at every start before any decision, and corruption is found again on read. It sets `blocked` then.
+- **Ordinary loss is not blocking:** a process restart, a lost read view or a policy change replaces the generation automatically.
 
 ## 10. Legacy state and unknown formats
 
 | Stored | Classification | Action |
 |---|---|---|
-| Control `record_format` below 3 (any status) **and** the policy frontier covers a completion proven by sink checkpoints | completed legacy | lineage verified; CAS in place to `record_format 3`, `completed`; legacy progress deleted after |
-| Control below 3, anything else | incomplete legacy | lineage verified; CAS to `g+1` `allocated` (`replaced = g`); one-time full recopy |
+| Control `record_format` below 3 (any status) **and** the policy frontier covers a completion proven by sink checkpoints | completed legacy | lineage verified; CAS in place to `record_format 3`, `completed`, in a new chain with `legacy_through = g`; the completion records the current policy and acknowledging sinks; legacy progress deleted after |
+| Control below 3, anything else | incomplete legacy | lineage verified; CAS to `g+1` `allocated` in a new chain with `legacy_through = g`, so every chain-less position of this lineage up to `g` orders before the chain (section 3.5); one-time full recopy |
 | Unknown `record_format`, `fingerprint_format`, `item_format`, snapshot-position `format` or watermark version | unknown | refused; record untouched; incident before any row |
 | Other stable lineage | foreign | refused (`ConfigChanged`); record untouched |
 
 **Proof of a legacy completion comes from the sink checkpoints only**, using the #131 rules:
-- PostgreSQL: a stream position at or after the legacy progress anchor (`start_lsn`) for every sink the policy requires, where the anchor is readable; a bare-LSN or incomplete position is not proof.
+- PostgreSQL: an unmarked structured stream position exactly at the legacy progress anchor (`start_lsn`), or strictly after it, for every sink the policy requires, where the anchor is readable; a bare LSN or an incomplete position is not proof.
 - MySQL: a `snapshot_completed` mark of the recorded generation at the anchor, or a stream position strictly after the recorded anchor.
 
 `finished = true` and the never-advanced generation status prove nothing.
@@ -363,6 +436,8 @@ The added cost is one read per chunk, which is linear.
 | Completed | control CAS verifying `terminal` | as above | CDC only |
 | Reclaim | plan item deletes | items of a past generation remain; deleted later (idempotent) | done |
 | Legacy replace | control CAS, then legacy progress delete | classified again | `g+1`; delete repeated |
+| Block | control CAS setting `blocked` | the next start detects the condition again and blocks | halted until recovery |
+| Policy drift | control CAS replacing `g` | replaced at the next start | `g+1` with the new policy |
 
 **SQLite `synchronous=NORMAL`.** A power loss drops a suffix of commits. Every write a later start depends on precedes its externally visible effect:
 - the control state precedes rows;
@@ -378,7 +453,7 @@ A lost suffix can therefore only cause a replacement (duplicates), never loss.
 - **I2** No plan item of `g` is created after `g` is sealed, and none is deleted before the control record has moved past `g`.
 - **I3** A start that finds `allocated` or `running` publishes no row of that generation: it replaces it first.
 - **I14** A PostgreSQL worker retry inside a generation happens only while the exporting transaction is open. A MySQL worker connection loss replaces the generation.
-- **I15** Every snapshot connection is taken from the shared semaphore, and the count never exceeds `max_snapshot_connections`.
+- **I15** Every snapshot connection is taken from the process-wide semaphore. A source's share never exceeds its `snapshot.max_snapshot_connections`, and base permits are acquired atomically.
 
 **Completion and after**
 - **I4** `completed` is reached only by a CAS from `rows_produced` with the identical terminal, and only when the policy frontier covers the terminal barrier.
@@ -394,7 +469,11 @@ A lost suffix can therefore only cause a replacement (duplicates), never loss.
 
 **Sizes and bounds**
 - **I12** Bytes per boundary checkpoint and watermark are independent of the table count, and resident plan state at 10K tables is within a constant of 1K.
-- **I13** Each bound's hard limit stops the run before the resource is lost, with its incident, and replaces nothing automatically.
+- **I13** Each bound's hard limit stops the run before the resource is lost, with its incident, and blocks the generation.
+- **I16** A blocked generation publishes no row and is not replaced, on any start, until the recovery CLI's `resnapshot`.
+- **I17** Within one snapshot chain, every position of `g` orders before every position of `g' > g`. Positions of different chains are incomparable, except legacy positions the chain adopted.
+- **I18** `completed` is decided only over the frozen cohort with the frozen policy. A configuration difference before completion replaces the generation, and after completion changes nothing about it.
+- **I19** At no time does the process hold more snapshot connections than `runtime.max_snapshot_connections`.
 
 ## 14. Test plan
 
@@ -419,7 +498,11 @@ A lost suffix can therefore only cause a replacement (duplicates), never loss.
 - anchor-age hard bound;
 - PostgreSQL `wal_status = lost`, and MySQL binlog purged under the anchor;
 - plan storage bound;
-- legacy completed with proof, legacy without proof, unknown format.
+- legacy completed with proof, legacy without proof, unknown format;
+- replacement with mixed sinks: crash after the replacement CAS and after a partial `g+1` commit, against durable S3 (MinIO HEAD watermarks in two generations of one chain) and an ordinary sink; then completion;
+- each blocking reason, across two restarts (still halted), then the recovery `resnapshot`;
+- policy drift before completion (replacement) and after (no reinterpretation, `sink_snapshot_incomplete` for the new sink);
+- two pipelines sharing the process-wide connection cap without deadlock.
 
 **Sinks:** one barrier test per sink (Kafka, HTTP, Redis, NATS, ClickHouse, Elasticsearch, S3 `durable_v2`, S3 `legacy_rolling`), each with a pending earlier delivery and an all-empty snapshot.
 
@@ -443,9 +526,9 @@ progress bytes = 0
 ## 16. Implementation commit sequence (one PR)
 
 1. **Formats and storage:**
-   - control record format 3 and plan items in the `snapshot_plan` namespace;
+   - control record format 3 (snapshot chain, frozen policy, completion, blocked) and plan items in the `snapshot_plan` namespace;
    - classification, allocation, replacement and reclamation;
-   - the `WmPos::SnapshotSeq` watermark and its comparator;
+   - snapshot position format 2 and the `WmPos::SnapshotSeq` watermark, with the chain-aware comparators;
    - the shared queue contract suite on the three backends.
 2. **Barrier:**
    - `SourceItem::Barrier`, the delivery-task operation and `Sink::barrier`;
@@ -454,7 +537,7 @@ progress bytes = 0
    - paged plan;
    - generation-scoped view and worker retry;
    - barrier completion;
-   - the connection semaphore;
+   - the process-wide connection semaphore;
    - the WAL and anchor-age bounds.
 4. **MySQL wiring:**
    - the same;
@@ -462,7 +545,8 @@ progress bytes = 0
    - worker-loss replacement;
    - keyless tables chunked by a bounded scan.
 5. **Completion and resume:**
-   - per-sink classification and the policy frontier;
+   - per-sink classification, the frozen policy frontier and drift replacement;
+   - blocking and its start-time checks;
    - the `rows_produced` start rule;
    - `sink_snapshot_incomplete`;
    - legacy classification with sink proof.
@@ -485,18 +569,23 @@ progress bytes = 0
 | Schema change of a pending table | replan that item | never: a sealed plan is immutable; the generation is replaced |
 | Interrupted discovery | continue from the last page | replace the generation |
 | `rows_produced` at restart, terminal not acknowledged | revert to `running`, resume | replace the generation |
-| Completion | per-sink minimum over all sinks covers the terminal | policy frontier (`All`/`Required`/`Quorum`) covers the terminal barrier |
+| Completion | per-sink minimum over all sinks covers the terminal | the policy frontier, over a cohort frozen at allocation, covers the terminal barrier; acknowledgements recorded |
+| Cross-generation ordering | incomparable | ordered within one snapshot chain (`g < g+1`); chains incomparable; legacy adopted explicitly |
+| Retention, corruption, hard bounds | stop; the next start replaced the generation | `blocked`: halted across restarts until the recovery CLI |
+| Connection cap | per source | process-wide semaphore, atomic base permits |
 | Lagging optional sink | holds completion | non-blocking `sink_snapshot_incomplete`, excluded from the resume position |
 | Terminal | data-less boundary batch | first-class barrier, implemented by every sink |
 | Bounds | retention bytes only (PostgreSQL) | connection semaphore, anchor age, plan storage, engine WAL and binlog checks |
 | Ownership check | at control CASes and journal writes | before every publish |
 | Legacy completion | `finished = true` | sink-checkpoint proof |
 
-States: revision 1 had `allocated` (discovery resumable), then `running`, then `rows_produced` (could revert to `running`), then `completed`. Revision 2 has `allocated`, then `running`, then `rows_produced`, then `completed`, with **replacement by `g+1`** from any non-completed state whenever the read view is lost, and **no transition back**.
+States:
+- **Revision 1:** `allocated` (discovery resumable), then `running`, then `rows_produced` (could revert to `running`), then `completed`.
+- **Revision 3:** `allocated`, then `running`, then `rows_produced`, then `completed`, with:
+  - **replacement by `g+1` in the same chain** from any non-completed, non-blocked state when the read view is lost or the policy changed;
+  - **`blocked`** (orthogonal, on any non-completed state) for failures that require operator recovery, cleared only by `resnapshot`;
+  - **no transition back.**
 
 ## 18. Questions for the reviewer
 
-- **Q1. Resume position after completion** (section 6.3). Exclude lagging sinks from the minimum, with a `sink_snapshot_incomplete` incident? The alternative is to keep folding them in. That would pull the stream back to the anchor for every sink, which the replacement model cannot satisfy (no snapshot copy of a completed generation runs again).
-- **Q2. S3 `legacy_rolling` barrier.** Close and upload the current file (proposed), or decline the barrier so that mode cannot complete a snapshot?
-- **Q3. Default bounds** (section 9): anchor age 24 h, plan 256 MiB / 1,000,000 items, warning at 80%.
-- **Q4. PostgreSQL completion mark.** Add `snapshot_completed: g` to the PostgreSQL completing checkpoint, as MySQL has, so legacy and current proof use one rule on both engines.
+- **Q5.** The process-wide cap default of 64. Set it from configuration only, or also derive a floor from the configured pipelines at startup (rejecting a configuration whose base permits cannot all fit)?
