@@ -9,7 +9,6 @@
 use metrics::counter;
 use mysql_async::{Pool, Row, prelude::Queryable};
 use schema_registry::SourceSchema;
-#[cfg(test)]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -921,11 +920,43 @@ pub(crate) async fn fetch_table_schema_on(
         return Ok(Live::OtherLineage(format!("{live_uuid:?}")));
     }
 
+    let mut found = fetch_table_schemas_on(conn, &[(db, table)]).await?;
+    match found.remove(&(db.to_string(), table.to_string())) {
+        Some(schema) => Ok(Live::Found(schema)),
+        None => Err(SourceError::Other(anyhow::anyhow!(
+            "table {}.{} not found or has no columns",
+            db,
+            table
+        ))),
+    }
+}
+
+/// The registered schema model of each of `tables` that exists, read from
+/// INFORMATION_SCHEMA on `conn` in one batch (no lineage proof: the caller's
+/// connection is already proven). The one definition of a MySQL table's
+/// schema: the loader registers it and the snapshot anchor compares it.
+pub(crate) async fn fetch_table_schemas_on(
+    conn: &mut mysql_async::Conn,
+    tables: &[(&str, &str)],
+) -> SourceResult<HashMap<(String, String), MySqlTableSchema>> {
+    let mut schemas = HashMap::new();
+    if tables.is_empty() {
+        return Ok(schemas);
+    }
+    let pairs = vec!["(?, ?)"; tables.len()].join(", ");
+    let params: Vec<mysql_async::Value> = tables
+        .iter()
+        .flat_map(|(db, table)| [(*db).into(), (*table).into()])
+        .collect();
+
     // Fetch columns
     let col_rows: Vec<Row> = conn
         .exec(
-            r#"
+            format!(
+                r#"
             SELECT
+                TABLE_SCHEMA,
+                TABLE_NAME,
                 COLUMN_NAME,
                 COLUMN_TYPE,
                 DATA_TYPE,
@@ -942,25 +973,21 @@ pub(crate) async fn fetch_table_schema_on(
                 (SELECT co.ID FROM INFORMATION_SCHEMA.COLLATIONS co
                  WHERE co.COLLATION_NAME = c.COLLATION_NAME) AS COLLATION_ID
             FROM INFORMATION_SCHEMA.COLUMNS c
-            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-            ORDER BY ORDINAL_POSITION
-            "#,
-            (db, table),
+            WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({pairs})
+            ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
+            "#
+            ),
+            params.clone(),
         )
         .await
         .map_err(query_error)?;
 
-    if col_rows.is_empty() {
-        return Err(SourceError::Other(anyhow::anyhow!(
-            "table {}.{} not found or has no columns",
-            db,
-            table
-        )));
-    }
-
-    let columns: Vec<MySqlColumn> = col_rows
-        .into_iter()
-        .map(|mut row| MySqlColumn {
+    for mut row in col_rows {
+        let key: (String, String) = (
+            row.take("TABLE_SCHEMA").unwrap(),
+            row.take("TABLE_NAME").unwrap(),
+        );
+        let column = MySqlColumn {
             name: row.take("COLUMN_NAME").unwrap(),
             column_type: row.take("COLUMN_TYPE").unwrap(),
             data_type: row.take("DATA_TYPE").unwrap(),
@@ -987,76 +1014,102 @@ pub(crate) async fn fetch_table_schema_on(
                 .take::<Option<i64>, _>("DATETIME_PRECISION")
                 .unwrap(),
             primary_key_prefix: None,
-        })
-        .collect();
+        };
+        schemas
+            .entry(key)
+            .or_insert_with(|| MySqlTableSchema {
+                columns: Vec::new(),
+                primary_key: Vec::new(),
+                engine: None,
+                charset: None,
+                collation: None,
+            })
+            .columns
+            .push(column);
+    }
 
     // Fetch primary key
     let pk_rows: Vec<Row> = conn
         .exec(
-            r#"
-            SELECT COLUMN_NAME
+            format!(
+                r#"
+            SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME
             FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY'
-            ORDER BY ORDINAL_POSITION
-            "#,
-            (db, table),
+            WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({pairs})
+              AND CONSTRAINT_NAME = 'PRIMARY'
+            ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
+            "#
+            ),
+            params.clone(),
         )
         .await
         .map_err(query_error)?;
-
-    let primary_key: Vec<String> = pk_rows
-        .into_iter()
-        .map(|mut row| row.take("COLUMN_NAME").unwrap())
-        .collect();
+    for mut row in pk_rows {
+        let key: (String, String) = (
+            row.take("TABLE_SCHEMA").unwrap(),
+            row.take("TABLE_NAME").unwrap(),
+        );
+        if let Some(s) = schemas.get_mut(&key) {
+            s.primary_key.push(row.take("COLUMN_NAME").unwrap());
+        }
+    }
 
     // Primary-key prefix lengths (a prefixed key part, e.g. a BLOB prefix).
     let prefix_rows: Vec<Row> = conn
         .exec(
-            r#"
-            SELECT COLUMN_NAME, SUB_PART
+            format!(
+                r#"
+            SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, SUB_PART
             FROM INFORMATION_SCHEMA.STATISTICS
-            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = 'PRIMARY'
-              AND SUB_PART IS NOT NULL
-            "#,
-            (db, table),
+            WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({pairs})
+              AND INDEX_NAME = 'PRIMARY' AND SUB_PART IS NOT NULL
+            "#
+            ),
+            params.clone(),
         )
         .await
         .map_err(query_error)?;
-    let mut columns = columns;
     for mut row in prefix_rows {
+        let key: (String, String) = (
+            row.take("TABLE_SCHEMA").unwrap(),
+            row.take("TABLE_NAME").unwrap(),
+        );
         let name: String = row.take("COLUMN_NAME").unwrap();
         let sub_part: Option<i64> = row.take("SUB_PART").unwrap();
-        if let Some(c) = columns.iter_mut().find(|c| c.name == name) {
+        if let Some(c) = schemas
+            .get_mut(&key)
+            .and_then(|s| s.columns.iter_mut().find(|c| c.name == name))
+        {
             c.primary_key_prefix = sub_part;
         }
     }
 
     // Fetch table metadata
-    let table_row: Option<Row> = conn
-        .exec_first(
-            r#"
-            SELECT ENGINE, TABLE_COLLATION
+    let table_rows: Vec<Row> = conn
+        .exec(
+            format!(
+                r#"
+            SELECT TABLE_SCHEMA, TABLE_NAME, ENGINE, TABLE_COLLATION
             FROM INFORMATION_SCHEMA.TABLES
-            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-            "#,
-            (db, table),
+            WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({pairs})
+            "#
+            ),
+            params,
         )
         .await
         .map_err(query_error)?;
+    for mut row in table_rows {
+        let key: (String, String) = (
+            row.take("TABLE_SCHEMA").unwrap(),
+            row.take("TABLE_NAME").unwrap(),
+        );
+        if let Some(s) = schemas.get_mut(&key) {
+            s.engine = row.take("ENGINE");
+            s.collation = row.take("TABLE_COLLATION");
+        }
+    }
 
-    let (engine, collation) = if let Some(mut row) = table_row {
-        (row.take("ENGINE"), row.take("TABLE_COLLATION"))
-    } else {
-        (None, None)
-    };
-
-    Ok(Live::Found(MySqlTableSchema {
-        columns,
-        primary_key,
-        engine,
-        charset: None,
-        collation,
-    }))
+    Ok(schemas)
 }
 
 #[cfg(test)]

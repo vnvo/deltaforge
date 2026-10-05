@@ -76,6 +76,7 @@ fn initial_cfg() -> SnapshotCfg {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn pg_snapshot_captures_all_rows_integer_pk() -> Result<()> {
+    let _probe = PROBED_RUN.read().await;
     let (db, client) = pg_setup("snap_basic").await?;
 
     client
@@ -141,6 +142,7 @@ async fn pg_snapshot_captures_all_rows_integer_pk() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn pg_snapshot_parallel_tables() -> Result<()> {
+    let _probe = PROBED_RUN.read().await;
     let (db, client) = pg_setup("snap_parallel").await?;
 
     for table in ["users", "products", "orders"] {
@@ -213,6 +215,7 @@ async fn pg_snapshot_parallel_tables() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn pg_snapshot_resumes_after_partial_completion() -> Result<()> {
+    let _probe = PROBED_RUN.read().await;
     let (db, client) = pg_setup("snap_resume").await?;
 
     for table in ["t1", "t2"] {
@@ -304,6 +307,7 @@ async fn pg_snapshot_resumes_after_partial_completion() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn pg_snapshot_ctid_fallback_for_uuid_pk() -> Result<()> {
+    let _probe = PROBED_RUN.read().await;
     let (db, client) = pg_setup("snap_ctid").await?;
 
     client
@@ -362,6 +366,7 @@ async fn pg_snapshot_ctid_fallback_for_uuid_pk() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn pg_snapshot_persists_lsn_and_marks_finished() -> Result<()> {
+    let _probe = PROBED_RUN.read().await;
     let (db, client) = pg_setup("snap_lsn").await?;
 
     client
@@ -418,6 +423,7 @@ async fn pg_snapshot_persists_lsn_and_marks_finished() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn pg_snapshot_already_finished_returns_saved_lsn() -> Result<()> {
+    let _probe = PROBED_RUN.read().await;
     let (db, client) = pg_setup("snap_idempotent").await?;
     client
         .execute("CREATE TABLE t (id BIGSERIAL PRIMARY KEY)", &[])
@@ -621,8 +627,23 @@ async fn snapshot_with_ddl(
     n: usize,
     ddl: Option<(Hold, &str)>,
 ) -> Result<SnapRun> {
+    snapshot_with_setup(n, "", ddl).await
+}
+
+/// The snapshot probe is process-global: a probed run holds this
+/// exclusively, every other snapshot test shared, so no other run's
+/// operations reach the probe while it counts.
+static PROBED_RUN: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+/// [`snapshot_with_ddl`] after running `setup` once the tables exist.
+async fn snapshot_with_setup(
+    n: usize,
+    setup: &str,
+    ddl: Option<(Hold, &str)>,
+) -> Result<SnapRun> {
     use sources::postgres::PostgresSource;
     use sources::snapshot_probe;
+    let _probe = PROBED_RUN.write().await;
     let (db, client) = pg_setup(&format!("shape{n}")).await?;
     for i in 0..n {
         client
@@ -639,6 +660,7 @@ async fn snapshot_with_ddl(
              CREATE PUBLICATION pub_shape FOR ALL TABLES;",
         )
         .await?;
+    client.batch_execute(setup).await?;
     let slot = format!("slot_shape{n}");
     let src = PostgresSource {
         id: format!("shape{n}"),
@@ -802,6 +824,7 @@ async fn discovery_is_paged_and_each_table_prepared_once() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn wildcard_legacy_progress_ambiguity_is_detected() -> Result<()> {
+    let _probe = PROBED_RUN.read().await;
     use deltaforge_core::Source;
     use sources::postgres::PostgresSource;
     let (db, client) = pg_setup("ambig").await?;
@@ -932,6 +955,49 @@ async fn discovery_pages_share_one_catalog_snapshot() -> Result<()> {
     Ok(())
 }
 
+/// The anchor compares the whole registered schema, not a reduced shape: a
+/// change that keeps every column's name, type OID and nullability (a type
+/// modifier, an identity property, the replica identity) still stops the
+/// snapshot before any row, unfinished and never completed.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn the_anchor_compares_the_registered_schema() -> Result<()> {
+    let setup = "ALTER TABLE pgt_012 ADD COLUMN v VARCHAR(20), ADD COLUMN n INT; \
+                 UPDATE pgt_012 SET n = 1; \
+                 ALTER TABLE pgt_012 ALTER COLUMN n SET NOT NULL;";
+    for (what, ddl) in [
+        (
+            "type modifier",
+            "ALTER TABLE pgt_012 ALTER COLUMN v TYPE VARCHAR(40)",
+        ),
+        (
+            "identity",
+            "ALTER TABLE pgt_012 ALTER COLUMN n ADD GENERATED ALWAYS AS IDENTITY",
+        ),
+        (
+            "replica identity",
+            "ALTER TABLE pgt_012 REPLICA IDENTITY FULL",
+        ),
+    ] {
+        let run =
+            snapshot_with_setup(25, setup, Some((Hold::BeforeAnchor, ddl)))
+                .await?;
+        let err = run.err.unwrap_or_else(|| panic!("{what}: not stopped"));
+        assert!(
+            err.contains("pgt_012") && err.contains("schema changed"),
+            "{what}: {err}"
+        );
+        assert_eq!(run.reads, 0, "{what}: before any row");
+        assert!(!run.finished, "{what}: never finished");
+        assert_ne!(
+            run.generation_status.as_deref(),
+            Some("completed"),
+            "{what}"
+        );
+    }
+    Ok(())
+}
+
 /// Upgrade: a snapshot generation recorded by an earlier release (no
 /// fingerprint format) whose snapshot never completed is not resumed - its
 /// fingerprint cannot be compared - and is not refused as a configuration
@@ -939,6 +1005,7 @@ async fn discovery_pages_share_one_catalog_snapshot() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn an_earlier_format_generation_restarts_as_the_next_one() -> Result<()> {
+    let _probe = PROBED_RUN.read().await;
     use checkpoints::SnapshotStateStore;
     use sources::postgres::PostgresSource;
     let (db, client) = pg_setup("fpupgrade").await?;
@@ -949,9 +1016,15 @@ async fn an_earlier_format_generation_restarts_as_the_next_one() -> Result<()> {
         )
         .await?;
     let backend = test_common::make_storage_backend().await;
+    // The source's own lineage: an earlier-format record is replaced only
+    // within it.
+    let sysid: i64 = client
+        .query_one("SELECT system_identifier FROM pg_control_system()", &[])
+        .await?
+        .get(0);
     let legacy = serde_json::json!({
         "generation": 3,
-        "lineage": PersistedLineage::Postgres { system_identifier: 0 },
+        "lineage": PersistedLineage::Postgres { system_identifier: sysid as u64 },
         "status": "running",
         "config_fingerprint": "a-format-1-fingerprint",
     });

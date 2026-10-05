@@ -6,6 +6,7 @@
 //! - Schema registry integration with fingerprinting
 //! - On-demand reload capability
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -790,103 +791,16 @@ impl PostgresSchemaLoader {
             return Ok(Live::OtherLineage(format!("{live:?}")));
         }
 
-        // `a.atttypid` is the column's pgoutput type OID; it is joined in so the
-        // persisted schema carries the same (name, type_oid) signature the
-        // logical-replication Relation message sends, enabling drift detection at
-        // first resolution with no extra catalog query.
-        let col_rows = client
-            .query(
-                r#"
-                SELECT
-                    c.column_name, c.data_type, c.udt_name, c.is_nullable,
-                    c.ordinal_position, c.column_default, c.character_maximum_length,
-                    c.numeric_precision, c.numeric_scale, c.is_identity,
-                    c.identity_generation, c.is_generated, a.atttypid
-                FROM information_schema.columns c
-                JOIN pg_catalog.pg_namespace nsp
-                    ON nsp.nspname = c.table_schema
-                JOIN pg_catalog.pg_class cl
-                    ON cl.relname = c.table_name AND cl.relnamespace = nsp.oid
-                JOIN pg_catalog.pg_attribute a
-                    ON a.attrelid = cl.oid AND a.attname = c.column_name
-                    AND a.attnum > 0 AND NOT a.attisdropped
-                WHERE c.table_schema = $1 AND c.table_name = $2
-                ORDER BY c.ordinal_position
-                "#,
-                &[&schema_name, &table_name],
-            )
-            .await
-            .map_err(query_error)?;
-
-        if col_rows.is_empty() {
-            return Ok(Live::Missing);
-        }
-
-        let columns: Vec<PostgresColumn> =
-            col_rows.iter().map(build_column).collect();
-
-        let pk_rows = client
-            .query(
-                r#"
-                SELECT a.attname
-                FROM pg_index i
-                JOIN pg_class c ON c.oid = i.indrelid
-                JOIN pg_namespace n ON n.oid = c.relnamespace
-                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-                WHERE n.nspname = $1 AND c.relname = $2 AND i.indisprimary
-                ORDER BY array_position(i.indkey, a.attnum)
-                "#,
-                &[&schema_name, &table_name],
-            )
-            .await
-            .map_err(query_error)?;
-
-        let primary_key: Vec<String> =
-            pk_rows.iter().map(|r| r.get(0)).collect();
-
-        let identity_row = client
-            .query_opt(
-                r#"
-                SELECT relreplident FROM pg_class c
-                JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE n.nspname = $1 AND c.relname = $2
-                "#,
-                &[&schema_name, &table_name],
-            )
-            .await
-            .map_err(query_error)?;
-
-        let replica_identity = identity_row.map(|r| {
-            match r.get::<_, i8>(0) as u8 as char {
-                'd' => "default",
-                'n' => "nothing",
-                'f' => "full",
-                'i' => "index",
-                _ => "unknown",
-            }
-            .to_string()
-        });
-
-        let oid = client
-            .query_opt(
-                // Catalog joins, not a `::regclass` cast: a cast resolves
-                // against the latest catalog, not the session's snapshot.
-                "SELECT c.oid FROM pg_class c \
-                 JOIN pg_namespace n ON n.oid = c.relnamespace \
-                 WHERE n.nspname = $1 AND c.relname = $2",
-                &[&schema_name, &table_name],
-            )
-            .await
-            .map_err(query_error)?
-            .map(|r| r.get::<_, u32>(0));
-
-        Ok(Live::Found(PostgresTableSchema {
-            columns,
-            primary_key,
-            replica_identity,
-            oid,
-            schema_name: Some(schema_name.to_string()),
-        }))
+        let mut found =
+            fetch_tables_on(client, &[(schema_name, table_name)]).await?;
+        Ok(
+            match found
+                .remove(&(schema_name.to_string(), table_name.to_string()))
+            {
+                Some(schema) => Live::Found(schema),
+                None => Live::Missing,
+            },
+        )
     }
 
     /// Get column names only (for backward compatibility).
@@ -1046,6 +960,120 @@ fn no_match(seen_any: bool, table: String, relation: String) -> RegistryError {
 }
 
 /// Build PostgresColumn from query row.
+/// The registered schema model of each of `tables` that exists, read on
+/// `client` in one batch and in that session's catalog snapshot (no lineage
+/// proof: the caller's session is already proven). The one definition of a
+/// PostgreSQL table's schema: the loader registers it and the snapshot
+/// anchor compares it.
+pub(crate) async fn fetch_tables_on(
+    client: &tokio_postgres::Client,
+    tables: &[(&str, &str)],
+) -> SourceResult<HashMap<(String, String), PostgresTableSchema>> {
+    let mut schemas: HashMap<(String, String), PostgresTableSchema> =
+        HashMap::new();
+    if tables.is_empty() {
+        return Ok(schemas);
+    }
+    let names: Vec<&str> = tables.iter().map(|(s, _)| *s).collect();
+    let rels: Vec<&str> = tables.iter().map(|(_, t)| *t).collect();
+
+    // `a.atttypid` is the column's pgoutput type OID; it is joined in so the
+    // persisted schema carries the same (name, type_oid) signature the
+    // logical-replication Relation message sends, enabling drift detection at
+    // first resolution with no extra catalog query.
+    let col_rows = client
+        .query(
+            r#"
+            SELECT
+                c.column_name, c.data_type, c.udt_name, c.is_nullable,
+                c.ordinal_position, c.column_default, c.character_maximum_length,
+                c.numeric_precision, c.numeric_scale, c.is_identity,
+                c.identity_generation, c.is_generated, a.atttypid,
+                c.table_schema::text, c.table_name::text
+            FROM unnest($1::text[], $2::text[]) AS k(s, t)
+            JOIN information_schema.columns c
+                ON c.table_schema = k.s AND c.table_name = k.t
+            JOIN pg_catalog.pg_namespace nsp
+                ON nsp.nspname = c.table_schema
+            JOIN pg_catalog.pg_class cl
+                ON cl.relname = c.table_name AND cl.relnamespace = nsp.oid
+            JOIN pg_catalog.pg_attribute a
+                ON a.attrelid = cl.oid AND a.attname = c.column_name
+                AND a.attnum > 0 AND NOT a.attisdropped
+            ORDER BY c.table_schema, c.table_name, c.ordinal_position
+            "#,
+            &[&names, &rels],
+        )
+        .await
+        .map_err(query_error)?;
+    for row in &col_rows {
+        schemas
+            .entry((row.get(13), row.get(14)))
+            .or_insert_with(|| PostgresTableSchema {
+                columns: Vec::new(),
+                primary_key: Vec::new(),
+                replica_identity: None,
+                oid: None,
+                schema_name: Some(row.get(13)),
+            })
+            .columns
+            .push(build_column(row));
+    }
+
+    let pk_rows = client
+        .query(
+            r#"
+            SELECT k.s, k.t, a.attname
+            FROM unnest($1::text[], $2::text[]) AS k(s, t)
+            JOIN pg_namespace n ON n.nspname = k.s
+            JOIN pg_class c ON c.relname = k.t AND c.relnamespace = n.oid
+            JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary
+            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+            ORDER BY k.s, k.t, array_position(i.indkey, a.attnum)
+            "#,
+            &[&names, &rels],
+        )
+        .await
+        .map_err(query_error)?;
+    for row in pk_rows {
+        if let Some(s) = schemas.get_mut(&(row.get(0), row.get(1))) {
+            s.primary_key.push(row.get(2));
+        }
+    }
+
+    // Catalog joins, not a `::regclass` cast: a cast resolves against the
+    // latest catalog, not the session's snapshot.
+    let rel_rows = client
+        .query(
+            r#"
+            SELECT k.s, k.t, c.oid, c.relreplident
+            FROM unnest($1::text[], $2::text[]) AS k(s, t)
+            JOIN pg_namespace n ON n.nspname = k.s
+            JOIN pg_class c ON c.relname = k.t AND c.relnamespace = n.oid
+            "#,
+            &[&names, &rels],
+        )
+        .await
+        .map_err(query_error)?;
+    for row in rel_rows {
+        if let Some(s) = schemas.get_mut(&(row.get(0), row.get(1))) {
+            s.oid = Some(row.get::<_, u32>(2));
+            s.replica_identity = Some(
+                match row.get::<_, i8>(3) as u8 as char {
+                    'd' => "default",
+                    'n' => "nothing",
+                    'f' => "full",
+                    'i' => "index",
+                    _ => "unknown",
+                }
+                .to_string(),
+            );
+        }
+    }
+
+    Ok(schemas)
+}
+
 fn build_column(row: &tokio_postgres::Row) -> PostgresColumn {
     let name: String = row.get(0);
     let data_type: String = row.get(1);

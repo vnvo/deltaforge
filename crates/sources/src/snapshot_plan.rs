@@ -17,8 +17,8 @@ pub struct PlannedTable<I> {
     pub table: String,
     pub identity: I,
     pub cursor_kind: CursorKind,
-    /// The schema shape the plan was prepared from (engine-specific
-    /// signature); verified against the catalog at the snapshot anchor.
+    /// [`schema_signature`] of the schema the plan was prepared from;
+    /// verified against the catalog at the snapshot anchor.
     pub signature: String,
 }
 
@@ -45,35 +45,14 @@ pub(crate) fn plan_bytes<I>(
         .sum()
 }
 
-/// A canonical, length-delimited SHA-256 over a table's schema shape. Each
-/// engine feeds the same fields from its loaded schema and from the catalog
-/// rows it reads at the anchor, so equal signatures mean the plan describes
-/// the catalog the rows are read from.
-pub(crate) struct ShapeSignature(sha2::Sha256);
-
-impl ShapeSignature {
-    pub(crate) fn new(engine: &str) -> Self {
-        use sha2::Digest;
-        let mut s = Self(sha2::Sha256::new());
-        s.text(engine);
-        s
-    }
-
-    pub(crate) fn text(&mut self, v: &str) -> &mut Self {
-        use sha2::Digest;
-        self.0.update((v.len() as u64).to_be_bytes());
-        self.0.update(v.as_bytes());
-        self
-    }
-
-    pub(crate) fn num(&mut self, v: i64) -> &mut Self {
-        use sha2::Digest;
-        self.0.update(v.to_be_bytes());
-        self
-    }
-
-    pub(crate) fn finish(self) -> String {
-        use sha2::Digest;
-        hex::encode(self.0.finalize())
-    }
+/// A plan entry's schema signature: a SHA-256 over the engine's whole
+/// registered schema model (its serialized form, every field). Preparation
+/// takes it from the schema it registered and the anchor from the model the
+/// same fetch builds there, so the two never compare different schema
+/// semantics.
+pub(crate) fn schema_signature<S: serde::Serialize>(model: &S) -> String {
+    use sha2::Digest;
+    let bytes =
+        serde_json::to_vec(model).expect("a schema model always serializes");
+    hex::encode(sha2::Sha256::digest(bytes))
 }

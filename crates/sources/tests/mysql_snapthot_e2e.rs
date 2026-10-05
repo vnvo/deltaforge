@@ -104,6 +104,7 @@ fn has_id(e: &Event, id: i64) -> bool {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_snapshot_captures_existing_rows() -> Result<()> {
+    let _probe = PROBED_RUN.read().await;
     let (db, pool, _dsn) = mysql_setup("snap_basic").await?;
     let mut conn = pool.get_conn().await?;
 
@@ -180,6 +181,7 @@ async fn mysql_snapshot_captures_existing_rows() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_snapshot_never_skips_existing_rows() -> Result<()> {
+    let _probe = PROBED_RUN.read().await;
     let (db, pool, _dsn) = mysql_setup("snap_never").await?;
     let mut conn = pool.get_conn().await?;
 
@@ -216,7 +218,9 @@ async fn mysql_snapshot_never_skips_existing_rows() -> Result<()> {
         collect_until(&mut rx, Duration::from_secs(3), |_| false)
             .await
             .into_iter()
-            .filter(|e| matches!(e.op, Op::Read))
+            // Rows of this table only: DDL events of other tests' databases
+            // on the shared server also arrive as reads.
+            .filter(|e| matches!(e.op, Op::Read) && e.source.table == "orders")
             .collect();
     assert!(snapshot_events.is_empty(), "No::Never should skip snapshot");
     info!("✓ SnapshotMode::Never skips existing rows");
@@ -246,6 +250,7 @@ async fn mysql_snapshot_never_skips_existing_rows() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_an_interrupted_snapshot_restarts_in_full() -> Result<()> {
+    let _probe = PROBED_RUN.read().await;
     use sources::mysql::MysqlSnapshotProgress;
     use sources::mysql::mysql_snapshot::progress_key;
 
@@ -425,6 +430,7 @@ impl CheckpointStore for RefusesProgressReset {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_a_failed_progress_reset_stops_the_snapshot() -> Result<()> {
+    let _probe = PROBED_RUN.read().await;
     use sources::mysql::MysqlSnapshotProgress;
     use sources::mysql::mysql_snapshot::progress_key;
 
@@ -505,6 +511,7 @@ async fn mysql_a_failed_progress_reset_stops_the_snapshot() -> Result<()> {
 #[ignore = "requires docker"]
 async fn mysql_an_unpersisted_snapshot_anchor_stops_before_any_row()
 -> Result<()> {
+    let _probe = PROBED_RUN.read().await;
     use sources::mysql::MysqlSnapshotProgress;
 
     let (db, pool, _dsn) = mysql_setup("snap_anchor_fail").await?;
@@ -561,6 +568,7 @@ async fn mysql_an_unpersisted_snapshot_anchor_stops_before_any_row()
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_snapshot_parallel_tables() -> Result<()> {
+    let _probe = PROBED_RUN.read().await;
     let (db, pool, _dsn) = mysql_setup("snap_parallel").await?;
     let mut conn = pool.get_conn().await?;
     conn.query_drop(format!("USE {db}")).await?;
@@ -627,6 +635,7 @@ async fn mysql_snapshot_parallel_tables() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_snapshot_always_reruns() -> Result<()> {
+    let _probe = PROBED_RUN.read().await;
     let (db, pool, _dsn) = mysql_setup("snap_always").await?;
     let mut conn = pool.get_conn().await?;
     conn.query_drop(format!("USE {db}")).await?;
@@ -750,6 +759,7 @@ fn snapshot_ids(events: &[Event]) -> Vec<EventId> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_snapshot_rows_carry_generation_and_stable_ids() -> Result<()> {
+    let _probe = PROBED_RUN.read().await;
     let (db, pool, _dsn) = mysql_setup("snap_ids").await?;
     let mut conn = pool.get_conn().await?;
     conn.query_drop(format!("USE {db}")).await?;
@@ -817,6 +827,7 @@ async fn mysql_snapshot_rows_carry_generation_and_stable_ids() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_resnapshot_allocates_new_generation() -> Result<()> {
+    let _probe = PROBED_RUN.read().await;
     let (db, pool, _dsn) = mysql_setup("snap_resnap").await?;
     let mut conn = pool.get_conn().await?;
     conn.query_drop(format!("USE {db}")).await?;
@@ -963,7 +974,22 @@ async fn snapshot_with_ddl(
     n: usize,
     ddl: Option<(Hold, &str)>,
 ) -> Result<SnapRun> {
+    snapshot_with_setup(n, "", ddl).await
+}
+
+/// The snapshot probe is process-global: a probed run holds this
+/// exclusively, every other snapshot test shared, so no other run's
+/// operations reach the probe while it counts.
+static PROBED_RUN: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+/// [`snapshot_with_ddl`] after running `setup` once the tables exist.
+async fn snapshot_with_setup(
+    n: usize,
+    setup: &str,
+    ddl: Option<(Hold, &str)>,
+) -> Result<SnapRun> {
     use sources::snapshot_probe;
+    let _probe = PROBED_RUN.write().await;
     let (db, pool, _dsn) = mysql_setup(&format!("shape{n}")).await?;
     let mut conn = pool.get_conn().await?;
     conn.query_drop(format!("USE {db}")).await?;
@@ -979,6 +1005,9 @@ async fn snapshot_with_ddl(
          CREATE TABLE zz_other (id INT PRIMARY KEY);",
     )
     .await?;
+    if !setup.is_empty() {
+        conn.query_drop(setup).await?;
+    }
     conn.query_drop(format!(
         "GRANT SELECT ON {db}.* TO '{MYSQL_CDC_USER}'@'%'"
     ))
@@ -1125,6 +1154,7 @@ async fn mysql_discovery_is_paged_and_each_table_prepared_once() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_wildcard_legacy_progress_ambiguity_is_detected() -> Result<()> {
+    let _probe = PROBED_RUN.read().await;
     let (db, pool, _dsn) = mysql_setup("ambig").await?;
     let mut conn = pool.get_conn().await?;
     conn.query_drop(format!("USE {db}")).await?;
@@ -1232,6 +1262,47 @@ async fn mysql_a_table_altered_before_the_anchor_stops_the_snapshot()
     Ok(())
 }
 
+/// The anchor compares the whole registered schema, not a reduced shape: a
+/// change that keeps every column's name, `COLUMN_TYPE` and nullability (a
+/// collation, a primary-key prefix length) still stops the snapshot before
+/// any row, unfinished and never completed.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_the_anchor_compares_the_registered_schema() -> Result<()> {
+    let setup = "ALTER TABLE myt_007 \
+                 ADD COLUMN v VARCHAR(20) NOT NULL DEFAULT 'a' \
+                 COLLATE utf8mb4_0900_ai_ci, \
+                 DROP PRIMARY KEY, ADD PRIMARY KEY (id, v(10))";
+    for (what, ddl) in [
+        (
+            "collation",
+            "ALTER TABLE myt_007 MODIFY v VARCHAR(20) NOT NULL DEFAULT 'a' \
+             COLLATE utf8mb4_bin",
+        ),
+        (
+            "primary-key prefix",
+            "ALTER TABLE myt_007 DROP PRIMARY KEY, ADD PRIMARY KEY (id, v(12))",
+        ),
+    ] {
+        let run =
+            snapshot_with_setup(25, setup, Some((Hold::BeforeAnchor, ddl)))
+                .await?;
+        let err = run.err.unwrap_or_else(|| panic!("{what}: not stopped"));
+        assert!(
+            err.contains("the schema of") && err.contains("myt_007"),
+            "{what}: {err}"
+        );
+        assert_eq!(run.reads, 0, "{what}: before any row");
+        assert!(!run.finished, "{what}: never finished");
+        assert_ne!(
+            run.generation_status.as_deref(),
+            Some("completed"),
+            "{what}"
+        );
+    }
+    Ok(())
+}
+
 /// Upgrade: a snapshot generation recorded by an earlier release (no
 /// fingerprint format) whose snapshot never completed is replaced by the
 /// next generation, not refused as a configuration change.
@@ -1239,6 +1310,7 @@ async fn mysql_a_table_altered_before_the_anchor_stops_the_snapshot()
 #[ignore = "requires docker"]
 async fn mysql_an_earlier_format_generation_restarts_as_the_next_one()
 -> Result<()> {
+    let _probe = PROBED_RUN.read().await;
     use checkpoints::SnapshotStateStore;
     let (db, pool, _dsn) = mysql_setup("fpupgrade").await?;
     let mut conn = pool.get_conn().await?;
@@ -1261,10 +1333,16 @@ async fn mysql_an_earlier_format_generation_restarts_as_the_next_one()
         },
     )
     .await;
-    // Any lineage: a record of another format is replaced before the
-    // lineage is compared.
+    // The source's own lineage: an earlier-format record is replaced only
+    // within it.
+    let server_uuid: String = conn
+        .query_first("SELECT @@global.server_uuid")
+        .await?
+        .expect("server_uuid");
     let lineage = sources::snapshot_generation::PersistedLineage::MysqlGtid {
-        source_uuid: [0; 16],
+        source_uuid: hex::decode(server_uuid.replace('-', ""))?
+            .try_into()
+            .expect("a 16-byte uuid"),
     };
     let legacy = serde_json::json!({
         "generation": 3,
