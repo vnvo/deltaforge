@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::time::Instant;
 use storage::adapters::incidents::IncidentStore;
 use storage::{ArcStorageBackend, MemoryStorageBackend};
-use testcontainers::core::{ExecCommand, WaitFor};
+use testcontainers::core::{CmdWaitFor, ExecCommand, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::sync::mpsc;
@@ -93,16 +93,35 @@ async fn start_topology(version: &str) -> Topology {
     // The image's entrypoint restarts the server once after init: wait for
     // the final one.
     wait_ready(primary_port).await;
+    // `exec` returns once the command starts unless told to wait: the reload
+    // below must not run before the rule is in the file.
     primary
-        .exec(ExecCommand::new([
-            "sh",
-            "-c",
-            "echo 'host replication all all scram-sha-256' \
-             >> /var/lib/postgresql/data/pg_hba.conf",
-        ]))
+        .exec(
+            ExecCommand::new([
+                "sh",
+                "-c",
+                "echo 'host replication all all scram-sha-256' \
+                 >> /var/lib/postgresql/data/pg_hba.conf",
+            ])
+            .with_cmd_ready_condition(CmdWaitFor::exit_code(0)),
+        )
         .await
         .expect("allow physical replication");
     let root = admin(primary_port, "postgres").await;
+    let rules: i64 = root
+        .query_one(
+            "SELECT count(*) FROM pg_hba_file_rules \
+             WHERE type = 'host' AND 'replication' = ANY(database) \
+             AND address = 'all' AND error IS NULL",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        rules, 1,
+        "phase primary-hba: the replication rule is not in pg_hba.conf"
+    );
     root.execute("SELECT pg_reload_conf()", &[]).await.unwrap();
     // The standby's physical slot, created once here: a pg_basebackup retry
     // that also created it would fail forever on "already exists".
@@ -123,25 +142,39 @@ async fn start_topology(version: &str) -> Topology {
     if version.parse::<u32>().unwrap_or(0) >= 17 {
         args.push_str(" -c sync_replication_slots=on");
     }
+    // Bounded clone attempts, each marked: a refusal ends the container with
+    // its reason in the log instead of looping until the startup timeout.
     let script = format!(
         "set -e; D=/tmp/standby; mkdir -p $D; chown postgres $D; chmod 700 $D; \
-         until gosu postgres pg_basebackup -d '{conninfo}' -D $D -R -X stream \
-           -S standby_slot; do rm -rf $D/*; sleep 1; done; \
+         n=0; until gosu postgres pg_basebackup -d '{conninfo}' -D $D -R \
+           -X stream -S standby_slot; do n=$((n+1)); \
+           echo \"phase standby-basebackup: attempt $n failed\" >&2; \
+           [ $n -lt 60 ] || {{ echo 'phase standby-basebackup: gave up' >&2; \
+             exit 1; }}; rm -rf $D/*; sleep 1; done; \
+         echo 'phase standby-start' >&2; \
          exec gosu postgres postgres -D $D {args}"
     );
+    let standby_name = format!("df-pgtopo-standby-{tag}");
     let standby = GenericImage::new("postgres", version)
         .with_wait_for(WaitFor::message_on_stderr(
             "ready to accept read-only connections",
         ))
         .with_entrypoint("bash")
         .with_network(network)
-        .with_container_name(format!("df-pgtopo-standby-{tag}"))
+        .with_container_name(standby_name.clone())
         .with_cmd(["-c".to_string(), script])
         .with_startup_timeout(Duration::from_secs(180))
         .gate_owned()
         .start()
         .await
-        .expect("start the standby");
+        .unwrap_or_else(|e| {
+            panic!(
+                "start the standby: {e:?}\n--- primary log tail ---\n{}\n\
+                 --- standby log tail ---\n{}",
+                log_tail(&primary_name),
+                log_tail(&standby_name)
+            )
+        });
     let standby_port = standby.get_host_port_ipv4(5432).await.unwrap();
     wait_ready(standby_port).await;
     Topology {
@@ -149,6 +182,21 @@ async fn start_topology(version: &str) -> Topology {
         standby,
         primary_port,
         standby_port,
+    }
+}
+
+/// The last lines of a container's log, for a setup failure's message.
+fn log_tail(container: &str) -> String {
+    match std::process::Command::new("docker")
+        .args(["logs", "--tail", "40", container])
+        .output()
+    {
+        Ok(out) => format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        Err(e) => format!("(docker logs failed: {e})"),
     }
 }
 
