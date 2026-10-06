@@ -55,6 +55,7 @@ async fn readyz(State(st): State<AppState>) -> impl IntoResponse {
         .filter(|p| {
             p.status == "failed"
                 || p.incidents.as_ref().is_some_and(|i| i.blocks_readiness())
+                || p.recovery.is_some()
         })
         .map(|p| {
             let i = p.incidents.clone().unwrap_or_default();
@@ -71,6 +72,7 @@ async fn readyz(State(st): State<AppState>) -> impl IntoResponse {
                     "durable": b.get("durable"),
                 })).collect::<Vec<_>>(),
                 "overflow_blocking": i.overflow_blocking,
+                "recovery": p.recovery,
             })
         })
         .collect();

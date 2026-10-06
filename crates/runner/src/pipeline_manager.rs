@@ -588,6 +588,37 @@ pub(crate) struct PipelineRuntime {
     pub(crate) started_at: std::time::Instant,
 }
 
+impl PipelineRuntime {
+    /// A registered, stopped runtime with no task: a pipeline held by an
+    /// unfinished recovery operation (`crate::recovery`). It is quiescent
+    /// by construction and never starts until the operation completes.
+    pub(crate) fn held(
+        spec: PipelineSpec,
+        incidents: crate::incidents::IncidentStore,
+    ) -> Self {
+        let (pause_tx, _pr) = watch::channel(PauseState::default());
+        Self {
+            spec,
+            status: PipelineStatus::Stopped,
+            health: crate::incidents::PipelineHealth::new_unprepared(incidents),
+            cancel: CancellationToken::new(),
+            pause: pause_tx,
+            sources: vec![],
+            join: None,
+            schema_loader: None,
+            registry_scope:
+                sources::registry_scope::SharedRegistryScope::default(),
+            table_patterns: vec![],
+            sensor_state: None,
+            dlq_writer: None,
+            retention_task: None,
+            replay_ctx: None,
+            replay_controller: None,
+            started_at: std::time::Instant::now(),
+        }
+    }
+}
+
 impl Drop for PipelineRuntime {
     fn drop(&mut self) {
         if let Some(task) = self.retention_task.take() {
@@ -702,6 +733,7 @@ impl PipelineRuntime {
             spec: self.spec.clone(),
             ops: None,       // populated async by controller.get()
             incidents: None, // populated async by the controller
+            recovery: None,  // populated async by the controller
         }
     }
 }
@@ -753,6 +785,11 @@ pub struct PipelineManager {
     /// the deployment constraint in the pilot support envelope); two processes
     /// sharing storage are not protected by this lock.
     pub(crate) lifecycle: Arc<tokio::sync::Mutex<()>>,
+    /// Pipelines a recovery operation is being applied to: inserted and
+    /// checked under `lifecycle`, so start, resume, patch, pause and delete
+    /// never interleave with an apply (`crate::recovery`).
+    pub(crate) recovering:
+        Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl PipelineManager {
@@ -805,6 +842,7 @@ impl PipelineManager {
             registry,
             backend,
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+            recovering: Default::default(),
         })
     }
 
@@ -824,6 +862,7 @@ impl PipelineManager {
             registry,
             backend,
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+            recovering: Default::default(),
         }
     }
 
@@ -1489,6 +1528,14 @@ impl PipelineManager {
             return Err(PipelineAPIError::AlreadyExists(name));
         }
 
+        // A pipeline with an unfinished recovery operation is registered
+        // stopped and never started (`docs/design/recovery-cli.md`).
+        if let Some(held) = self.held_for_recovery(&spec).await? {
+            let info = held.info();
+            self.pipelines.write().insert(name, held);
+            return Ok(info);
+        }
+
         // Reject impossible commit-policy configurations up front (e.g. a
         // quorum larger than the sink count) so the operator gets an actionable
         // error instead of a pipeline that can never commit a checkpoint.
@@ -2112,6 +2159,7 @@ impl PipelineController for PipelineManager {
         let mut out = Vec::with_capacity(infos.len());
         for mut info in infos {
             info.incidents = self.incident_status(&info.name).await;
+            info.recovery = self.recovery_status(&info.name).await;
             out.push(info);
         }
         out
@@ -2141,6 +2189,7 @@ impl PipelineController for PipelineManager {
             checkpoints,
         });
         info.incidents = self.incident_status(name).await;
+        info.recovery = self.recovery_status(name).await;
 
         Ok(info)
     }
@@ -2259,6 +2308,7 @@ impl PipelineController for PipelineManager {
         // Serialize the whole reconfigure (read -> merge -> stop -> start) against
         // other lifecycle operations.
         let _lifecycle = self.lifecycle.lock().await;
+        self.refuse_while_recovering(name).await?;
 
         let old_spec = {
             let guard = self.pipelines.read();
@@ -2300,6 +2350,8 @@ impl PipelineController for PipelineManager {
     }
 
     async fn pause(&self, name: &str) -> Result<PipeInfo, PipelineAPIError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        self.refuse_while_recovering(name).await?;
         let mut guard = self.pipelines.write();
         let runtime = guard
             .get_mut(name)
@@ -2315,6 +2367,7 @@ impl PipelineController for PipelineManager {
         // re-spawns and replaces the runtime, which must not interleave with a
         // concurrent delete/start of the same pipeline.
         let _lifecycle = self.lifecycle.lock().await;
+        self.refuse_while_recovering(name).await?;
 
         let (status, failed) = {
             let guard = self.pipelines.read();
@@ -2455,6 +2508,7 @@ impl PipelineController for PipelineManager {
         // a replacement pipeline cannot start (and claim the freed source id) while
         // this one is still stopping or being cleaned up.
         let _lifecycle = self.lifecycle.lock().await;
+        self.refuse_while_recovering(name).await?;
 
         // The source id is needed for checkpoint cleanup and claim release. Read it
         // from the still-registered runtime; the runtime is only removed at the very
@@ -3022,6 +3076,7 @@ mod tests {
             registry,
             backend,
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+            recovering: Default::default(),
         }
     }
 
@@ -5211,5 +5266,369 @@ mod tests {
         assert_eq!(first["config"]["client_conf"]["linger.ms"], "20");
         // Second sink should be untouched.
         assert_eq!(base["sinks"][1]["type"], "redis");
+    }
+
+    // ── Recovery operations: lock, quiescence, restart ──────────────────
+    mod recovery_ops {
+        use super::*;
+        use crate::recovery::{
+            OperationContext, Planned, RecoveryOperation, RecoveryService,
+        };
+        use rest_api::recovery::{
+            ApplyRequest, Caller, PlanRequest, RecoveryApiError,
+            RecoveryController,
+        };
+        use std::collections::BTreeMap;
+        use storage::adapters::incidents::{IncidentRecord, IncidentStore};
+        use storage::adapters::recovery::{
+            CanonicalPlan, PlanStep, RecordState, RecoveryStore, StepExecutor,
+            digest_bytes,
+        };
+
+        const NS: &str = "test_op";
+
+        /// Writes `done` to one slot; its write waits for `gate` permits.
+        struct TestOp {
+            gate: Arc<tokio::sync::Semaphore>,
+            entered: Arc<tokio::sync::Notify>,
+        }
+
+        struct Exec {
+            backend: ArcStorageBackend,
+            pipeline: String,
+            gate: Arc<tokio::sync::Semaphore>,
+            entered: Arc<tokio::sync::Notify>,
+        }
+
+        async fn state(b: &ArcStorageBackend, p: &str) -> String {
+            match b.slot_get(NS, p).await.unwrap() {
+                Some((_, v)) => digest_bytes(&v),
+                None => "absent".into(),
+            }
+        }
+
+        #[async_trait]
+        impl StepExecutor for Exec {
+            async fn observe(&self, _s: &PlanStep) -> anyhow::Result<String> {
+                Ok(state(&self.backend, &self.pipeline).await)
+            }
+            async fn perform(
+                &self,
+                _s: &PlanStep,
+            ) -> anyhow::Result<BTreeMap<String, String>> {
+                self.entered.notify_one();
+                self.gate.acquire().await.unwrap().forget();
+                self.backend
+                    .slot_upsert(NS, &self.pipeline, b"done")
+                    .await?;
+                Ok(BTreeMap::from([("written".into(), "done".into())]))
+            }
+        }
+
+        #[async_trait]
+        impl RecoveryOperation for TestOp {
+            fn name(&self) -> &'static str {
+                "test-op"
+            }
+            fn applies_to(&self, _i: &IncidentRecord) -> bool {
+                false
+            }
+            async fn plan(
+                &self,
+                ctx: &OperationContext,
+            ) -> Result<Planned, RecoveryApiError> {
+                let cur = state(&ctx.backend, &ctx.pipeline).await;
+                let steps = vec![PlanStep {
+                    name: "write".into(),
+                    pre: cur,
+                    post: digest_bytes(b"done"),
+                    detail: BTreeMap::new(),
+                }];
+                Ok(Planned {
+                    plan: CanonicalPlan::new(
+                        "test-op",
+                        &ctx.pipeline,
+                        ctx.source_id(),
+                        ctx.base_bindings().await?,
+                        steps,
+                        vec![],
+                    ),
+                    resolves: vec![],
+                    observed: BTreeMap::new(),
+                })
+            }
+            async fn executor(
+                &self,
+                ctx: &OperationContext,
+                _plan: &CanonicalPlan,
+            ) -> Result<Box<dyn StepExecutor>, RecoveryApiError> {
+                Ok(Box::new(Exec {
+                    backend: ctx.backend.clone(),
+                    pipeline: ctx.pipeline.clone(),
+                    gate: Arc::clone(&self.gate),
+                    entered: Arc::clone(&self.entered),
+                }))
+            }
+        }
+
+        struct Fixture {
+            manager: Arc<PipelineManager>,
+            service: Arc<RecoveryService>,
+            gate: Arc<tokio::sync::Semaphore>,
+            entered: Arc<tokio::sync::Notify>,
+            backend: ArcStorageBackend,
+        }
+
+        async fn fixture(
+            backend: ArcStorageBackend,
+            permits: usize,
+        ) -> Fixture {
+            let manager = Arc::new(
+                PipelineManager::with_backend(backend.clone())
+                    .await
+                    .unwrap(),
+            );
+            let gate = Arc::new(tokio::sync::Semaphore::new(permits));
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let service = Arc::new(
+                RecoveryService::new(Arc::clone(&manager)).with_operation(
+                    Arc::new(TestOp {
+                        gate: Arc::clone(&gate),
+                        entered: Arc::clone(&entered),
+                    }),
+                ),
+            );
+            Fixture {
+                manager,
+                service,
+                gate,
+                entered,
+                backend,
+            }
+        }
+
+        fn register_stopped(f: &Fixture, name: &str) {
+            f.manager.pipelines.write().insert(
+                name.into(),
+                PipelineRuntime::held(
+                    sample_spec(name),
+                    IncidentStore::new(f.backend.clone(), name),
+                ),
+            );
+        }
+
+        fn plan_req() -> PlanRequest {
+            PlanRequest {
+                operation: "test-op".into(),
+                incident: None,
+                args: BTreeMap::new(),
+            }
+        }
+
+        async fn proof(f: &Fixture, name: &str) -> String {
+            f.service.plan(name, plan_req()).await.unwrap()["proof"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+
+        fn apply_req(proof: &str) -> ApplyRequest {
+            ApplyRequest {
+                plan: plan_req(),
+                expect_proof: proof.into(),
+                actor: "alice".into(),
+                reason: "test".into(),
+            }
+        }
+
+        fn caller() -> Caller {
+            Caller {
+                origin: "127.0.0.1:1".into(),
+                credential: "token",
+            }
+        }
+
+        fn code(e: &PipelineAPIError) -> String {
+            e.to_string()
+        }
+
+        #[tokio::test]
+        async fn lifecycle_changes_and_a_second_apply_wait_for_an_apply() {
+            let f = fixture(Arc::new(MemoryStorageBackend::new()), 0).await;
+            register_stopped(&f, "p");
+            let p = proof(&f, "p").await;
+            let svc = Arc::clone(&f.service);
+            let first = {
+                let p = p.clone();
+                tokio::spawn(async move {
+                    svc.apply("p", apply_req(&p), caller()).await
+                })
+            };
+            f.entered.notified().await;
+            // In flight: every lifecycle change and another apply refuse.
+            let m = &f.manager;
+            for (what, r) in [
+                (
+                    "resume",
+                    PipelineController::resume(m.as_ref(), "p").await.err(),
+                ),
+                (
+                    "pause",
+                    PipelineController::pause(m.as_ref(), "p").await.err(),
+                ),
+                (
+                    "delete",
+                    PipelineController::delete(m.as_ref(), "p").await.err(),
+                ),
+                (
+                    "patch",
+                    PipelineController::patch(
+                        m.as_ref(),
+                        "p",
+                        serde_json::json!({}),
+                    )
+                    .await
+                    .err(),
+                ),
+            ] {
+                let e = r.unwrap_or_else(|| panic!("{what} was allowed"));
+                assert!(
+                    code(&e).contains("recovery_in_progress"),
+                    "{what}: {e}"
+                );
+            }
+            let second = f
+                .service
+                .apply("p", apply_req(&p), caller())
+                .await
+                .unwrap_err();
+            assert_eq!(second.code, "recovery_in_progress");
+            let planned = f.service.plan("p", plan_req()).await.unwrap();
+            assert_eq!(planned["apply"]["possible"], false);
+            assert_eq!(planned["apply"]["blocked_by"], "recovery_in_progress");
+            f.gate.add_permits(1);
+            let done = first.await.unwrap().unwrap();
+            assert_eq!(done["state"], "completed");
+            // Released: the lifecycle check passes again.
+            let _l = m.lifecycle.lock().await;
+            m.refuse_while_recovering("p").await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn apply_needs_a_quiescent_pipeline_before_anything_is_read() {
+            let f = fixture(Arc::new(MemoryStorageBackend::new()), 1).await;
+            f.manager
+                .pipelines
+                .write()
+                .insert("p".into(), bare_runtime(sample_spec("p"), None));
+            // Even an unreadable recovery record is not reached.
+            f.backend
+                .slot_create(
+                    storage::adapters::recovery::RECOVERY_NS,
+                    "p",
+                    b"{}",
+                )
+                .await
+                .unwrap();
+            let e = f
+                .service
+                .apply("p", apply_req("x"), caller())
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, "pipeline_not_quiescent");
+            let planned = f.service.plan("p", plan_req()).await.unwrap();
+            assert_eq!(
+                planned["apply"]["blocked_by"],
+                "pipeline_not_quiescent"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_changed_state_refuses_the_proof() {
+            let f = fixture(Arc::new(MemoryStorageBackend::new()), 1).await;
+            register_stopped(&f, "p");
+            let p = proof(&f, "p").await;
+            f.backend.slot_upsert(NS, "p", b"moved").await.unwrap();
+            let e = f
+                .service
+                .apply("p", apply_req(&p), caller())
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, "proof_mismatch");
+            assert_ne!(e.detail.unwrap()["proof"], serde_json::json!(p));
+            assert!(
+                RecoveryStore::new(f.backend.clone(), "p")
+                    .read()
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unfinished_operation_holds_the_pipeline_across_a_restart() {
+            let backend: ArcStorageBackend =
+                Arc::new(MemoryStorageBackend::new());
+            // The first server crashed inside the write.
+            {
+                let f = fixture(backend.clone(), 0).await;
+                register_stopped(&f, "p");
+                let p = proof(&f, "p").await;
+                let svc = Arc::clone(&f.service);
+                let task = tokio::spawn(async move {
+                    svc.apply("p", apply_req(&p), caller()).await
+                });
+                f.entered.notified().await;
+                task.abort();
+                let _ = task.await;
+            }
+            let (_, rec) = RecoveryStore::new(backend.clone(), "p")
+                .read()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(rec.state, RecordState::Applying);
+            // The restarted server registers it stopped and never starts it.
+            let f = fixture(backend.clone(), 1).await;
+            let info =
+                f.manager.start_pipeline(sample_spec("p")).await.unwrap();
+            assert_eq!(info.status, "stopped");
+            let got = PipelineController::get(f.manager.as_ref(), "p")
+                .await
+                .unwrap();
+            let held = got.recovery.unwrap();
+            assert_eq!(held.state, "recovery_pending");
+            assert_eq!(held.proof.as_deref(), Some(rec.proof.as_str()));
+            let Err(e) =
+                PipelineController::resume(f.manager.as_ref(), "p").await
+            else {
+                panic!("resume was allowed")
+            };
+            assert!(code(&e).contains("recovery_pending"), "{e}");
+            // Only the same proof resumes it, from the stored plan.
+            let other = f
+                .service
+                .apply("p", apply_req("other"), caller())
+                .await
+                .unwrap_err();
+            assert_eq!(other.code, "recovery_pending");
+            let diag = f.service.diagnose("p").await.unwrap();
+            assert_eq!(diag["recovery"]["state"], "applying");
+            assert!(
+                diag["recovery"]["remediation"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&rec.proof)
+            );
+            let done = f
+                .service
+                .apply("p", apply_req(&rec.proof), caller())
+                .await
+                .unwrap();
+            assert_eq!(done["state"], "completed");
+            assert!(f.manager.recovery_status("p").await.is_none());
+            let _l = f.manager.lifecycle.lock().await;
+            f.manager.refuse_while_recovering("p").await.unwrap();
+        }
     }
 }

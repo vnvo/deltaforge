@@ -67,6 +67,14 @@ struct Args {
     /// `snapshot.max_snapshot_connections`.
     #[arg(long, default_value_t = sources::snapshot_permits::DEFAULT_MAX_SNAPSHOT_CONNECTIONS)]
     max_snapshot_connections: u32,
+    /// Recovery admin listener (`deltaforge recover`). Loopback only; use an
+    /// SSH tunnel for remote administration.
+    #[arg(long, default_value = "127.0.0.1:9091")]
+    admin_addr: String,
+    /// File holding the admin bearer token (mode 600, at least 32 bytes).
+    /// Without it the recovery admin listener does not start.
+    #[arg(long)]
+    admin_token_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -336,6 +344,22 @@ async fn serve(
         .context("build pipeline manager")?,
     );
     *manager_slot = Some(manager.clone());
+    // The recovery admin listener: loopback only, a token always.
+    let admin = match &args.admin_token_file {
+        Some(path) => {
+            let addr = runner::recovery::admin_addr(&args.admin_addr)?;
+            let token = runner::recovery::load_admin_token(path)?;
+            let listener = TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("bind --admin-addr {addr}"))?;
+            info!(%addr, "recovery admin listening");
+            Some((listener, token))
+        }
+        None => {
+            info!("recovery admin listener disabled (no --admin-token-file)");
+            None
+        }
+    };
     let schema_api = Arc::new(SchemaApi::new(manager.clone()));
     let sensing_api = Arc::new(SensingApi::new(manager.clone()));
 
@@ -371,7 +395,7 @@ async fn serve(
     // ── HTTP server ───────────────────────────────────────────────────────────
     let app: Router = router_full(
         AppState {
-            controller: manager,
+            controller: manager.clone(),
         },
         SchemaState {
             controller: schema_api,
@@ -381,6 +405,28 @@ async fn serve(
         },
     );
     let app = app.merge(o11y::df_metrics::router_with_metrics());
+
+    if let Some((listener, token)) = admin {
+        let admin_app =
+            rest_api::recovery::router(rest_api::recovery::RecoveryState {
+                controller: Arc::new(runner::recovery::RecoveryService::new(
+                    manager.clone(),
+                )),
+                token,
+            });
+        let stop = shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(
+                listener,
+                admin_app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(stop.cancelled_owned())
+            .await
+            {
+                tracing::error!(error = %e, "recovery admin listener stopped");
+            }
+        });
+    }
 
     let addr = parse_listen_addr("api-addr", &args.api_addr)?;
     info!(%addr, "api listening");
