@@ -85,8 +85,13 @@ pub enum Resolution {
     /// A verified check passed (for `unclassified_failure`:
     /// `pipeline_recovered`, which does not claim the cause was understood).
     VerifiedRecovery { check: String },
-    /// A recovery operation changed what it was about (e.g. the source epoch).
-    RecoveryOperation { operation: String },
+    /// An audited, proof-bound recovery operation changed what it was about
+    /// (`docs/design/recovery-cli.md`).
+    RecoveryOperation {
+        operation: String,
+        #[serde(default)]
+        proof: String,
+    },
     /// The operation it was retrying was stopped on purpose (the pipeline was
     /// stopped while it retried automatically): not a failure.
     OperationCancelled,
@@ -228,6 +233,13 @@ pub enum Transition {
     Resolved {
         by: Resolution,
     },
+    /// Resolved by a recovery operation: the operator's audit fields and the
+    /// resolution in one transition, so a resumed operation never records
+    /// it twice.
+    ResolvedByRecovery {
+        by: Resolution,
+        applied: RecoveryAudit,
+    },
     /// A non-blocking incident displaced by a blocking one at the limit; it
     /// is counted in the overflow incident from now on.
     Displaced,
@@ -238,6 +250,21 @@ pub enum Transition {
         retryability: Retryability,
         safety_state: SafetyState,
     },
+}
+
+/// Who applied a recovery operation, and why (`docs/design/recovery-cli.md`,
+/// section 6). The actor is asserted by the caller, never verified: the
+/// admin credential proves possession, not identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryAudit {
+    pub operation: String,
+    pub proof: String,
+    pub asserted_actor: String,
+    pub actor_verified: bool,
+    /// How the request was authenticated (`token`).
+    pub credential: String,
+    pub origin: Option<String>,
+    pub reason: String,
 }
 
 /// Why an acknowledgement or resolution did not apply.
@@ -325,13 +352,13 @@ pub fn bind_epoch(draft: IncidentDraft, epoch: u64) -> IncidentDraft {
     }
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
 /// Percent-encode `/` and `%` so a pipeline name is one unambiguous key
 /// segment (`a/b` and `a` never share a prefix).
-fn segment(s: &str) -> String {
+pub(crate) fn segment(s: &str) -> String {
     s.replace('%', "%25").replace('/', "%2F")
 }
 
@@ -920,6 +947,53 @@ impl IncidentStore {
         }
     }
 
+    /// Open/Acknowledged -> Resolved by a recovery operation, with its audit
+    /// fields in the same transition. Resolving a resolved incident is a
+    /// no-op (a resumed operation repeats this step).
+    pub async fn resolve_by_recovery(
+        &self,
+        id: &IncidentId,
+        applied: &RecoveryAudit,
+    ) -> Result<std::result::Result<IncidentRecord, LifecycleError>> {
+        let applied = RecoveryAudit {
+            asserted_actor: bounded(&applied.asserted_actor),
+            origin: applied.origin.as_deref().map(bounded),
+            reason: bounded(&applied.reason),
+            ..applied.clone()
+        };
+        let by = Resolution::RecoveryOperation {
+            operation: applied.operation.clone(),
+            proof: applied.proof.clone(),
+        };
+        let rec = self
+            .transition(id, |r| {
+                if r.status.is_resolved() {
+                    return None;
+                }
+                let mut next = r.clone();
+                next.status = IncidentStatus::Resolved {
+                    by: by.clone(),
+                    at_ms: now_ms(),
+                };
+                Some((
+                    next,
+                    Transition::ResolvedByRecovery {
+                        by: by.clone(),
+                        applied: applied.clone(),
+                    },
+                ))
+            })
+            .await?;
+        match rec {
+            None => Ok(Err(LifecycleError::NotFound(id.0.clone()))),
+            Some(r) => {
+                self.prune_resolved().await?;
+                self.refresh_metrics().await;
+                Ok(Ok(r))
+            }
+        }
+    }
+
     async fn prune_resolved(&self) -> Result<()> {
         let mut resolved: Vec<(i64, IncidentId)> = self
             .list()
@@ -1265,6 +1339,7 @@ mod tests {
                 Transition::Reopened => "reopened",
                 Transition::Acknowledged { .. } => "acknowledged",
                 Transition::Resolved { .. } => "resolved",
+                Transition::ResolvedByRecovery { .. } => "resolved_by_recovery",
                 Transition::Displaced => "displaced",
                 Transition::Reclassified { .. } => "reclassified",
             })

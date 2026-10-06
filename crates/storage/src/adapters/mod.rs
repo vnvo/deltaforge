@@ -1,5 +1,6 @@
 pub mod checkpoint;
 pub mod incidents;
+pub mod recovery;
 pub mod schema_key;
 pub mod schema_migration;
 pub mod schema_registry;

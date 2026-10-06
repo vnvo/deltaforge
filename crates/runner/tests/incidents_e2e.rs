@@ -279,6 +279,7 @@ fn transitions(
             Transition::Reopened => "reopened",
             Transition::Acknowledged { .. } => "acknowledged",
             Transition::Resolved { .. } => "resolved",
+            Transition::ResolvedByRecovery { .. } => "resolved_by_recovery",
             Transition::Displaced => "displaced",
             Transition::Reclassified { .. } => "reclassified",
         })
