@@ -626,3 +626,537 @@ async fn mysql_a_sink_behind_a_completed_generation_is_reported_not_recopied()
     );
     Ok(())
 }
+
+// ---- Durable snapshot queue evidence -----------------------------------------
+//
+// `docs/design/snapshot-durable-queue.md`, sections 2, 6, 9 and 14: crash and
+// restart on both durable backends and both engines, the policy outcomes,
+// blocking across restarts, and the anchor-age and source-log bounds.
+
+/// Log to the test output (`RUST_LOG`, default info).
+fn trace() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
+        .with_test_writer()
+        .try_init();
+}
+
+/// A pipeline manager over `backend`.
+async fn manager_over(backend: ArcStorageBackend) -> PipelineManager {
+    PipelineManager::with_backend(backend).await.unwrap()
+}
+
+/// A SQLite state store in a fresh directory.
+fn sqlite() -> (tempfile::TempDir, ArcStorageBackend) {
+    let dir = tempfile::tempdir().unwrap();
+    let backend =
+        storage::SqliteStorageBackend::open(dir.path().join("state.db"))
+            .unwrap();
+    (dir, backend)
+}
+
+/// A PostgreSQL state store in its own container.
+async fn postgres_store() -> (ContainerAsync<GenericImage>, ArcStorageBackend) {
+    let c = GenericImage::new("postgres", "17")
+        .with_wait_for(WaitFor::message_on_stderr("database system is ready"))
+        .with_env_var("POSTGRES_PASSWORD", PASS)
+        .gate_owned()
+        .start()
+        .await
+        .expect("start the state store");
+    let port = c.get_host_port_ipv4(5432).await.expect("store port");
+    sleep(Duration::from_secs(3)).await;
+    let backend = storage::PostgresStorageBackend::connect(&format!(
+        "host=127.0.0.1 port={port} user=postgres password={PASS} dbname=postgres"
+    ))
+    .await
+    .unwrap();
+    (c, backend)
+}
+
+/// The source's snapshot control record.
+async fn control(
+    backend: &ArcStorageBackend,
+    source: &str,
+) -> Option<sources::snapshot_queue::GenerationControl> {
+    match sources::snapshot_queue::QueueStore::new(backend.clone(), source)
+        .read()
+        .await
+        .unwrap()
+    {
+        Some(sources::snapshot_queue::Stored::Current { control, .. }) => {
+            Some(*control)
+        }
+        _ => None,
+    }
+}
+
+async fn until_control(
+    backend: &ArcStorageBackend,
+    source: &str,
+    done: impl Fn(&sources::snapshot_queue::GenerationControl) -> bool,
+) -> sources::snapshot_queue::GenerationControl {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if let Some(c) = control(backend, source).await
+            && done(&c)
+        {
+            return c;
+        }
+        assert!(Instant::now() < deadline, "{source}: control never reached");
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+fn completed(c: &sources::snapshot_queue::GenerationControl) -> bool {
+    c.state == sources::snapshot_queue::State::Completed
+}
+
+/// The incidents' `(reason, class)` (the class evidence as its JSON).
+async fn incidents(
+    backend: &ArcStorageBackend,
+    pipeline: &str,
+) -> Vec<(String, String)> {
+    storage::adapters::incidents::IncidentStore::new(backend.clone(), pipeline)
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            let v = serde_json::to_value(&r).unwrap();
+            (
+                v["reason_code"].as_str().unwrap_or_default().to_string(),
+                v["evidence"]["reason_class"].to_string(),
+            )
+        })
+        .collect()
+}
+
+/// HTTP sinks `(id, url, required)`.
+fn hooks_yaml(hooks: &[(&str, &str, bool)]) -> String {
+    let mut y = String::from("  sinks:\n");
+    for (id, url, required) in hooks {
+        y.push_str(&format!(
+            "    - type: http\n      config:\n        id: {id}\n        url: \"{url}\"\n        required: {required}\n        send_timeout_secs: 2\n        batch_timeout_secs: 2\n        connect_timeout_secs: 2\n"
+        ));
+    }
+    y.push_str(
+        "  batch:\n    max_events: 10\n    max_ms: 50\n    respect_source_tx: false\n",
+    );
+    y
+}
+
+/// A PostgreSQL pipeline with `snapshot` settings appended to the defaults,
+/// `sinks` and an optional commit policy.
+fn pg_spec_with(
+    name: &str,
+    port: u16,
+    snapshot: &str,
+    sinks: &str,
+    commit: &str,
+) -> deltaforge_config::PipelineSpec {
+    let yaml = format!(
+        r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: {name}
+  tenant: acme
+spec:
+  source:
+    type: postgres
+    config:
+      id: pg-src
+      dsn: "host=127.0.0.1 port={port} user=postgres password={PASS} dbname=postgres"
+      slot: snap_slot
+      publication: snap_pub
+      tables: [public.orders]
+      snapshot:
+        mode: initial
+        chunk_size: 10
+        max_parallel_tables: 1
+{snapshot}
+  processors: []
+{commit}{sinks}"#
+    );
+    serde_yaml::from_str(&yaml).expect("pipeline spec")
+}
+
+fn mysql_spec_with(
+    name: &str,
+    port: u16,
+    snapshot: &str,
+    sinks: &str,
+) -> deltaforge_config::PipelineSpec {
+    let yaml = format!(
+        r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: {name}
+  tenant: acme
+spec:
+  source:
+    type: mysql
+    config:
+      id: my-src
+      dsn: "mysql://df:dfpw@127.0.0.1:{port}/shop"
+      tables: [shop.orders]
+      snapshot:
+        mode: initial
+        chunk_size: 10
+        max_parallel_tables: 1
+{snapshot}
+  processors: []
+{sinks}"#
+    );
+    serde_yaml::from_str(&yaml).expect("pipeline spec")
+}
+
+/// PostgreSQL source over a SQLite store: an interrupted generation is
+/// replaced by the next one of its chain and copied in full, completes only
+/// through its terminal barrier, and a later restart streams without copying.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn postgres_on_sqlite_an_interrupted_generation_is_replaced() -> Result<()>
+{
+    let (_pg, port) = start_postgres().await;
+    let (_dir, backend) = sqlite();
+    let hook = Hook::start().await;
+    let mgr = manager_over(backend.clone()).await;
+    hook.answer(Answer::AcceptThenFail(3));
+    mgr.start_pipeline(pg_spec_with(
+        "pgsqlite",
+        port,
+        "",
+        &hooks_yaml(&[("hook", &hook.url, true)]),
+        "",
+    ))
+    .await?;
+    until_status(&mgr, "pgsqlite", "failed").await;
+    let first = control(&backend, "pg-src").await.expect("a generation");
+    assert!(!completed(&first), "interrupted");
+
+    hook.answer(Answer::Accept);
+    mgr.resume("pgsqlite").await.unwrap();
+    every_row_arrives(&mgr, "pgsqlite", &hook).await;
+    let done = until_control(&backend, "pg-src", completed).await;
+    assert_eq!(done.snapshot_chain, first.snapshot_chain, "one chain");
+    assert_eq!(done.generation, first.generation + 1, "replaced");
+    assert_eq!(done.replaced, Some(first.generation));
+
+    restart(&mgr, "pgsqlite").await;
+    let reads = hook.snapshot_reads();
+    pg_insert(port, ROWS + 1).await;
+    hook.until_accepted(ROWS + 1).await;
+    assert_eq!(hook.snapshot_reads(), reads, "no snapshot row again");
+    assert_eq!(control(&backend, "pg-src").await, Some(done));
+    Ok(())
+}
+
+/// MySQL source over a PostgreSQL store: the same.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn mysql_on_postgres_store_an_interrupted_generation_is_replaced()
+-> Result<()> {
+    let (_my, port) = start_mysql().await;
+    let (_store, backend) = postgres_store().await;
+    let hook = Hook::start().await;
+    let mgr = manager_over(backend.clone()).await;
+    hook.answer(Answer::AcceptThenFail(3));
+    mgr.start_pipeline(mysql_spec_with(
+        "mypg",
+        port,
+        "",
+        &hooks_yaml(&[("hook", &hook.url, true)]),
+    ))
+    .await?;
+    until_status(&mgr, "mypg", "failed").await;
+    let first = control(&backend, "my-src").await.expect("a generation");
+    assert!(!completed(&first), "interrupted");
+
+    hook.answer(Answer::Accept);
+    mgr.resume("mypg").await.unwrap();
+    every_row_arrives(&mgr, "mypg", &hook).await;
+    let done = until_control(&backend, "my-src", completed).await;
+    assert_eq!(done.snapshot_chain, first.snapshot_chain, "one chain");
+    assert_eq!(done.generation, first.generation + 1, "replaced");
+
+    restart(&mgr, "mypg").await;
+    let reads = hook.snapshot_reads();
+    mysql_insert(port, ROWS + 1).await;
+    hook.until_accepted(ROWS + 1).await;
+    assert_eq!(hook.snapshot_reads(), reads, "no snapshot row again");
+    Ok(())
+}
+
+/// The frozen policy decides completion (design section 6.2): `Required`
+/// and `Quorum(1)` complete without a failing optional sink, which is then
+/// reported lagging (`sink_snapshot_incomplete`); `All` does not complete
+/// while one sink fails, and the generation is replaced and completed by
+/// both once it recovers.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn completion_follows_the_frozen_policy() -> Result<()> {
+    trace();
+    for (name, commit, b_required) in [
+        ("polreq", "", false),
+        (
+            "polquorum",
+            "  commit_policy:\n    mode: quorum\n    quorum: 1\n",
+            false,
+        ),
+    ] {
+        let (_pg, port) = start_postgres().await;
+        let (a, b) = (Hook::start().await, Hook::start().await);
+        b.answer(Answer::AcceptThenFail(0));
+        let (mgr, backend) = manager_with_backend().await;
+        mgr.start_pipeline(pg_spec_with(
+            name,
+            port,
+            "",
+            &hooks_yaml(&[("a", &a.url, true), ("b", &b.url, b_required)]),
+            commit,
+        ))
+        .await?;
+        every_row_arrives(&mgr, name, &a).await;
+        let done = until_control(&backend, "pg-src", completed).await;
+        assert_eq!(done.completion.unwrap().acks, ["a"], "{name}");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !incidents(&backend, name)
+            .await
+            .iter()
+            .any(|(r, _)| r == "sink_snapshot_incomplete")
+        {
+            assert!(Instant::now() < deadline, "{name}: no lagging incident");
+            sleep(Duration::from_millis(200)).await;
+        }
+        pg_insert(port, ROWS + 1).await;
+        a.until_accepted(ROWS + 1).await;
+    }
+
+    // All: one sink failing holds completion - the pipeline fails on it.
+    let (_pg, port) = start_postgres().await;
+    let (a, b) = (Hook::start().await, Hook::start().await);
+    b.answer(Answer::AcceptThenFail(0));
+    let (mgr, backend) = manager_with_backend().await;
+    mgr.start_pipeline(pg_spec_with(
+        "polall",
+        port,
+        "",
+        &hooks_yaml(&[("a", &a.url, true), ("b", &b.url, true)]),
+        "  commit_policy:\n    mode: all\n",
+    ))
+    .await?;
+    until_status(&mgr, "polall", "failed").await;
+    let held = control(&backend, "pg-src").await.expect("a generation");
+    assert!(!completed(&held), "All: not completed while b fails");
+    b.answer(Answer::Accept);
+    mgr.resume("polall").await.unwrap();
+    every_row_arrives(&mgr, "polall", &b).await;
+    let done = until_control(&backend, "pg-src", completed).await;
+    assert!(done.generation > held.generation, "replaced");
+    let mut acks = done.completion.unwrap().acks;
+    acks.sort();
+    assert_eq!(acks, ["a", "b"]);
+    Ok(())
+}
+
+/// A blocked generation stays halted across restarts (design section 9.2):
+/// a plan above its bound blocks with `snapshot_bound_exceeded`; two
+/// restarts copy nothing and keep it blocked; only the proof-bound
+/// replacement (the recovery CLI's `resnapshot`, here its queue operation)
+/// clears it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn a_blocked_generation_survives_restarts() -> Result<()> {
+    trace();
+    let (_pg, port) = start_postgres().await;
+    let (_dir, backend) = sqlite();
+    let hook = Hook::start().await;
+    let sinks = hooks_yaml(&[("hook", &hook.url, true)]);
+    let mgr = manager_over(backend.clone()).await;
+    mgr.start_pipeline(pg_spec_with(
+        "pgblocked",
+        port,
+        "        max_plan_items: 0",
+        &sinks,
+        "",
+    ))
+    .await?;
+    until_status(&mgr, "pgblocked", "failed").await;
+    let blocked = control(&backend, "pg-src").await.expect("a generation");
+    assert_eq!(
+        blocked.blocked.as_ref().map(|b| b.reason.as_str()),
+        Some("snapshot_bound_exceeded")
+    );
+    for _ in 0..2 {
+        mgr.resume("pgblocked").await.unwrap();
+        until_status(&mgr, "pgblocked", "failed").await;
+        assert_eq!(control(&backend, "pg-src").await, Some(blocked.clone()));
+        assert!(hook.accepted().is_empty(), "no row");
+    }
+    assert!(incidents(&backend, "pgblocked").await.iter().any(|(r, c)| r
+        == "snapshot_bound_exceeded"
+        && c.contains("plan_items")));
+
+    // The recovery: the bound raised, a proof-bound replacement.
+    PipelineController::delete(&mgr, "pgblocked").await.ok();
+    let q = sources::snapshot_queue::QueueStore::new(backend.clone(), "pg-src");
+    let stored = q.read().await?.unwrap();
+    q.replace(
+        &stored,
+        &blocked.lineage,
+        &blocked.config_fingerprint,
+        blocked.policy.clone(),
+        true,
+    )
+    .await?;
+    mgr.start_pipeline(pg_spec_with("pgblocked", port, "", &sinks, ""))
+        .await?;
+    every_row_arrives(&mgr, "pgblocked", &hook).await;
+    // The recovery allocated the next generation; the start replaced that
+    // allocated one in turn (a start never continues an allocated plan).
+    let done = until_control(&backend, "pg-src", completed).await;
+    assert!(done.generation > blocked.generation);
+    assert_eq!(done.snapshot_chain, blocked.snapshot_chain);
+    Ok(())
+}
+
+/// The anchor-age bound (design section 9): a generation held longer than
+/// `max_anchor_age_secs` blocks with `snapshot_anchor_unavailable` (class
+/// `anchor_age`), and stays blocked at the next start.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn the_anchor_age_bound_blocks_the_generation() -> Result<()> {
+    trace();
+    let (_pg, port) = start_postgres().await;
+    let hook = Hook::start().await;
+    let (mgr, backend) = manager_with_backend().await;
+    let (_reached, release) = sources::snapshot_probe::hold_during_copy();
+    mgr.start_pipeline(pg_spec_with(
+        "pgage",
+        port,
+        "        max_anchor_age_secs: 2",
+        &hooks_yaml(&[("hook", &hook.url, true)]),
+        "",
+    ))
+    .await?;
+    let blocked =
+        until_control(&backend, "pg-src", |c| c.blocked.is_some()).await;
+    assert_eq!(
+        blocked.blocked.as_ref().map(|b| b.reason.as_str()),
+        Some("snapshot_anchor_unavailable")
+    );
+    assert!(
+        incidents(&backend, "pgage")
+            .await
+            .iter()
+            .any(|(r, c)| r == "snapshot_anchor_unavailable"
+                && c.contains("anchor_age"))
+    );
+    release.notify_one();
+    until_status(&mgr, "pgage", "failed").await;
+    mgr.resume("pgage").await.unwrap();
+    until_status(&mgr, "pgage", "failed").await;
+    assert_eq!(control(&backend, "pg-src").await, Some(blocked));
+    Ok(())
+}
+
+/// PostgreSQL WAL retention (design section 9): the generation's slot lost
+/// while it runs blocks it with `snapshot_anchor_unavailable` (class
+/// `slot_missing`) before any later row.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn a_lost_slot_blocks_the_generation() -> Result<()> {
+    trace();
+    let (_pg, port) = start_postgres().await;
+    let hook = Hook::start().await;
+    let (mgr, backend) = manager_with_backend().await;
+    let (reached, release) = sources::snapshot_probe::hold_during_copy();
+    mgr.start_pipeline(pg_spec_with(
+        "pgslot",
+        port,
+        "        max_anchor_age_secs: 300",
+        &hooks_yaml(&[("hook", &hook.url, true)]),
+        "",
+    ))
+    .await?;
+    reached.notified().await;
+    let (pg, conn) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={port} user=postgres password={PASS} dbname=postgres"
+        ),
+        NoTls,
+    )
+    .await?;
+    tokio::spawn(async move {
+        conn.await.ok();
+    });
+    pg.execute("SELECT pg_drop_replication_slot('snap_slot')", &[])
+        .await?;
+    let blocked =
+        until_control(&backend, "pg-src", |c| c.blocked.is_some()).await;
+    assert_eq!(
+        blocked.blocked.as_ref().map(|b| b.reason.as_str()),
+        Some("snapshot_anchor_unavailable")
+    );
+    assert!(
+        incidents(&backend, "pgslot")
+            .await
+            .iter()
+            .any(|(r, c)| r == "snapshot_anchor_unavailable"
+                && c.contains("slot_missing"))
+    );
+    release.notify_one();
+    Ok(())
+}
+
+/// MySQL binlog retention (design section 9): the anchor's binlog file
+/// purged while the generation runs blocks it with
+/// `snapshot_anchor_unavailable` (class `binlog_purged`).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn a_purged_anchor_binlog_blocks_the_generation() -> Result<()> {
+    trace();
+    let (_my, port) = start_mysql().await;
+    let hook = Hook::start().await;
+    let (mgr, backend) = manager_with_backend().await;
+    let (reached, release) = sources::snapshot_probe::hold_during_copy();
+    mgr.start_pipeline(mysql_spec_with(
+        "mypurge",
+        port,
+        "        max_anchor_age_secs: 300",
+        &hooks_yaml(&[("hook", &hook.url, true)]),
+    ))
+    .await?;
+    reached.notified().await;
+    let mut root =
+        mysql_conn(&format!("mysql://root:rootpw@127.0.0.1:{port}/")).await?;
+    root.query_drop("FLUSH BINARY LOGS").await?;
+    let current: String = root
+        .query_first::<mysql_async::Row, _>("SHOW BINARY LOG STATUS")
+        .await?
+        .and_then(|mut r| r.take(0))
+        .expect("the current binlog");
+    root.query_drop(format!("PURGE BINARY LOGS TO '{current}'"))
+        .await?;
+    let blocked =
+        until_control(&backend, "my-src", |c| c.blocked.is_some()).await;
+    assert_eq!(
+        blocked.blocked.as_ref().map(|b| b.reason.as_str()),
+        Some("snapshot_anchor_unavailable")
+    );
+    assert!(
+        incidents(&backend, "mypurge")
+            .await
+            .iter()
+            .any(|(r, c)| r == "snapshot_anchor_unavailable"
+                && c.contains("binlog_purged"))
+    );
+    release.notify_one();
+    Ok(())
+}

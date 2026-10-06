@@ -89,6 +89,7 @@ impl GenerationPublisher {
 
     /// The control record must show this run's generation in `state`.
     async fn check_owner(&self, state: State) -> Result<(), PublishError> {
+        crate::snapshot_probe::record_owner_check();
         let not_owner = |why: String| PublishError::NotOwner {
             generation: self.control.generation,
             why,
@@ -186,7 +187,10 @@ impl GenerationPublisher {
         for ev in events {
             self.send(SourceItem::Event(ev)).await?;
         }
-        self.send(SourceItem::Event(last)).await
+        self.send(SourceItem::Event(last)).await?;
+        drop(seq);
+        crate::snapshot_probe::during_copy().await;
+        Ok(())
     }
 
     /// The terminal barrier (design section 5.3), after `rows_produced`:

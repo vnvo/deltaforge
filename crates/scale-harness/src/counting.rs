@@ -59,6 +59,8 @@ pub struct CountingBackend {
     /// Keys whose `kv_get` / prefixes whose `kv_list` are not counted
     /// (time-driven reads).
     uncounted: Mutex<Vec<(String, String)>>,
+    /// Slot primitive calls per namespace.
+    slots: Mutex<BTreeMap<(&'static str, String), u64>>,
 }
 
 impl CountingBackend {
@@ -70,7 +72,22 @@ impl CountingBackend {
             normalize: AtomicBool::new(false),
             reads: Mutex::new(Vec::new()),
             uncounted: Mutex::new(Vec::new()),
+            slots: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Slot primitive calls per `(primitive, namespace)`.
+    pub fn slot_ops(&self) -> BTreeMap<(&'static str, String), u64> {
+        self.slots.lock().unwrap().clone()
+    }
+
+    fn slot(&self, primitive: &'static str, ns: &str) {
+        *self
+            .slots
+            .lock()
+            .unwrap()
+            .entry((primitive, ns.to_string()))
+            .or_default() += 1;
     }
 
     /// Stop counting `kv_get` of `ns`/`key` and `kv_list` of `ns` with prefix
@@ -87,6 +104,7 @@ impl CountingBackend {
     pub fn reset(&self) {
         self.ops.lock().unwrap().clear();
         self.reads.lock().unwrap().clear();
+        self.slots.lock().unwrap().clear();
     }
 
     /// Record the key of every read from now on (off by default: a large run
@@ -333,6 +351,7 @@ impl StorageBackend for CountingBackend {
         key: &str,
         state: &[u8],
     ) -> Result<u64> {
+        self.slot("slot_upsert", ns);
         self.count("slot_upsert", 0, state.len());
         self.inner.slot_upsert(ns, key, state).await
     }
@@ -341,6 +360,7 @@ impl StorageBackend for CountingBackend {
         ns: &str,
         key: &str,
     ) -> Result<Option<(u64, Vec<u8>)>> {
+        self.slot("slot_get", ns);
         self.read("slot_get", ns, key);
         let r = self.inner.slot_get(ns, key).await?;
         let (raw, norm) = self.records(r.iter().map(|(_, b)| b.as_slice()));
@@ -354,6 +374,7 @@ impl StorageBackend for CountingBackend {
         expected_version: u64,
         state: &[u8],
     ) -> Result<bool> {
+        self.slot("slot_cas", ns);
         self.count("slot_cas", 0, state.len());
         self.inner.slot_cas(ns, key, expected_version, state).await
     }
@@ -363,10 +384,12 @@ impl StorageBackend for CountingBackend {
         key: &str,
         state: &[u8],
     ) -> Result<Option<u64>> {
+        self.slot("slot_create", ns);
         self.count("slot_create", 0, state.len());
         self.inner.slot_create(ns, key, state).await
     }
     async fn slot_delete(&self, ns: &str, key: &str) -> Result<bool> {
+        self.slot("slot_delete", ns);
         self.count("slot_delete", 0, 0);
         self.inner.slot_delete(ns, key).await
     }
@@ -377,6 +400,7 @@ impl StorageBackend for CountingBackend {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<SlotPage> {
+        self.slot("slot_list", ns);
         self.read("slot_list", ns, prefix.unwrap_or(""));
         let r = self.inner.slot_list(ns, prefix, cursor, limit).await?;
         let (raw, norm) =

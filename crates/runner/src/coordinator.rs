@@ -984,6 +984,11 @@ pub struct Coordinator<Tok> {
     /// The pipeline's incident store: a run starts by settling its sinks'
     /// open acknowledgement-uncertainty incidents, each by its own boundary.
     incidents: Option<storage::adapters::incidents::IncidentStore>,
+    /// Sinks that missed a batch since they last entered a snapshot
+    /// generation (its start barrier): such a sink did not durably receive
+    /// every row before a terminal barrier, so it never acknowledges one
+    /// (design section 5.1).
+    snapshot_gaps: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 pub struct CoordinatorBuilder<Tok> {
@@ -1136,6 +1141,7 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
         );
 
         Coordinator {
+            snapshot_gaps: Default::default(),
             pipeline_name: self.pipeline_name.into(),
             sinks: self.sinks,
             batch_cfg_eff,
@@ -2366,6 +2372,19 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
             )
             .set(if *succeeded { 1.0 } else { 0.0 });
         }
+        // A live sink that did not deliver this batch has a gap: it cannot
+        // acknowledge a later terminal barrier of its generation.
+        {
+            let mut gaps = self.snapshot_gaps.lock().expect("not poisoned");
+            for sink in &live_sinks {
+                let delivered = sink_results
+                    .iter()
+                    .any(|(id, _, ok)| *ok && id == sink.id());
+                if !delivered {
+                    gaps.insert(sink.id().to_string());
+                }
+            }
+        }
 
         // Policy gate - check BEFORE committing any checkpoints so that a
         // failed required sink never leaves optional sinks with advanced
@@ -2555,6 +2574,32 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         }))
         .await;
 
+        // A generation start clears a sink's gap (it enters the generation
+        // from its start); a terminal barrier is refused to a sink with one.
+        let outcomes: Vec<_> = {
+            let mut gaps = self.snapshot_gaps.lock().expect("not poisoned");
+            outcomes
+                .into_iter()
+                .map(|(sink_id, required, result)| {
+                    let result = match result {
+                        Ok(()) if start => {
+                            gaps.remove(&sink_id);
+                            Ok(())
+                        }
+                        Ok(()) if gaps.contains(&sink_id) => {
+                            Err(SinkError::Fatal {
+                                details: "the sink missed a batch of this \
+                                          snapshot generation: it cannot \
+                                          acknowledge its terminal barrier"
+                                    .into(),
+                            })
+                        }
+                        other => other,
+                    };
+                    (sink_id, required, result)
+                })
+                .collect()
+        };
         let (mut required_acks, mut total_acks) = (0usize, 0usize);
         let mut acked: Vec<String> = Vec::new();
         let mut first_failure: Option<SinkDeliveryError> = None;
@@ -7044,6 +7089,12 @@ mod barrier_tests {
                 self.id,
                 events.len()
             ));
+            // A "lossy" sink fails every batch (its barriers still answer).
+            if self.id.starts_with("lossy") {
+                return Err(SinkError::Fatal {
+                    details: "lost".into(),
+                });
+            }
             Ok(deltaforge_core::BatchResult::ok())
         }
         async fn barrier(
@@ -7305,6 +7356,55 @@ mod barrier_tests {
         assert!(r.result.is_err());
         assert_eq!(key(&r.store, "req").await, None);
         assert_eq!(key(&r.store, "opt").await, None);
+    }
+
+    /// A sink that missed a batch of the generation never acknowledges its
+    /// terminal barrier, whatever its own barrier answers (design section
+    /// 5.1): under `Required` the required sink completes, and the optional
+    /// one keeps its start position. A later generation start clears it.
+    #[tokio::test]
+    async fn a_sink_with_a_missed_batch_never_acknowledges_the_terminal() {
+        let r = run(
+            true,
+            &[("req", true, false), ("lossy", false, false)],
+            &[],
+            vec![
+                barrier(start_kind(), b"start-barrier"),
+                SourceItem::Event(row(1, Some(b"rows"))),
+                barrier(BarrierKind::Terminal, b"terminal"),
+                barrier(start_kind(), b"start-barrier"),
+                barrier(BarrierKind::Terminal, b"terminal"),
+            ],
+        )
+        .await;
+        r.result.unwrap();
+        assert_eq!(
+            key(&r.store, "req").await.as_deref(),
+            Some(&b"terminal"[..])
+        );
+        // The first terminal was refused to it; after the next start (no
+        // batch missed since) the second terminal is its own.
+        assert_eq!(
+            key(&r.store, "lossy").await.as_deref(),
+            Some(&b"terminal"[..])
+        );
+        let r = run(
+            true,
+            &[("req", true, false), ("lossy", false, false)],
+            &[],
+            vec![
+                barrier(start_kind(), b"start-barrier"),
+                SourceItem::Event(row(1, Some(b"rows"))),
+                barrier(BarrierKind::Terminal, b"terminal"),
+            ],
+        )
+        .await;
+        r.result.unwrap();
+        assert_eq!(
+            key(&r.store, "lossy").await.as_deref(),
+            Some(&b"start"[..]),
+            "the start position, never the terminal"
+        );
     }
 
     /// A generation start needs every sink, optional ones included, and moves

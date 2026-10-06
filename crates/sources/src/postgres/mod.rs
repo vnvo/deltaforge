@@ -1332,6 +1332,7 @@ impl PostgresSource {
             anchor = %anchor.lsn,
             "snapshot rows produced; the stream starts at the anchor"
         );
+        crate::snapshot_probe::after_terminal().await;
 
         // 9. Completion, in the background, once the frozen policy's
         // frontier covers the terminal.

@@ -475,6 +475,88 @@ async fn a_restart_after_completion_streams_without_copying() -> Result<()> {
     Ok(())
 }
 
+/// A crash at the earliest point a generation can complete - right after the
+/// sink acknowledged its terminal barrier, before this process recorded
+/// anything more: the restart completes it without copying again and
+/// streams on.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn a_crash_after_the_terminal_acknowledgement_completes_without_copying()
+-> Result<()> {
+    use sources::snapshot_probe;
+    let _probe = PROBED_RUN.write().await;
+    let (db, client) = pg_setup("snap_term").await?;
+    client
+        .execute("CREATE TABLE t (id BIGSERIAL PRIMARY KEY, v INT)", &[])
+        .await?;
+    for _ in 1..=5i64 {
+        client.execute("INSERT INTO t (v) VALUES (1)", &[]).await?;
+    }
+    let backend = test_common::make_storage_backend().await;
+    let src = pg_source(
+        &db,
+        &client,
+        "snap_term",
+        &["public.t"],
+        initial_cfg(),
+        backend.clone(),
+    )
+    .await?;
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let (reached, _release) = snapshot_probe::hold_after_terminal();
+    let (tx, _rx) = acked_channel(&src, &ckpt, &src.id, 256);
+    let handle = src.run(tx, Arc::clone(&ckpt)).await;
+    tokio::time::timeout(Duration::from_secs(120), reached.notified())
+        .await
+        .expect("the terminal barrier is sent");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !ckpt
+        .get_raw(&format!("{}::sink::{TEST_SINK}", src.id))
+        .await?
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .is_some_and(|v| v.get("snapshot_completed").is_some())
+    {
+        assert!(tokio::time::Instant::now() < deadline, "never acknowledged");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    handle.join.abort();
+    let _ = handle.join.await;
+    assert_eq!(
+        snapshot_state(&backend, &src.id).await,
+        Some(("rows_produced".into(), 1))
+    );
+
+    let (tx, mut rx) = acked_channel(&src, &ckpt, &src.id, 256);
+    let handle = src.run(tx, Arc::clone(&ckpt)).await;
+    tokio::time::timeout(Duration::from_secs(60), handle.ready.wait())
+        .await
+        .expect("streaming");
+    client.execute("INSERT INTO t (v) VALUES (2)", &[]).await?;
+    let mut events = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !events.iter().any(|e: &Event| e.op == Op::Create) {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(SourceItem::Event(ev))) => events.push(ev),
+            Ok(Some(_)) => continue,
+            _ => break,
+        }
+    }
+    handle.stop();
+    let _ = handle.join().await;
+    assert!(
+        events.iter().all(|e| e.op != Op::Read),
+        "nothing copied again"
+    );
+    assert!(events.iter().any(|e| e.op == Op::Create), "streams");
+    assert_eq!(
+        snapshot_state(&backend, &src.id).await,
+        Some(("completed".into(), 1))
+    );
+    drop_slot(&client, &src).await;
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
 /// PG-A-lite seam: the generation anchors at the slot's consistent point C,
 /// so no pre-anchor row is lost, and rows committed in (C, snapshot-export]
 /// appear in BOTH the snapshot and the stream from C - a bounded

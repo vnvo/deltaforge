@@ -5941,6 +5941,7 @@ dependencies = [
  "rand 0.9.4",
  "reqwest",
  "runner",
+ "scale-harness",
  "schema-registry",
  "scopeguard",
  "secrets",
