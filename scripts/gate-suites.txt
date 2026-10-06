@@ -32,7 +32,8 @@ serial     scale-harness/ci_tier            -p scale-harness --test ci_tier
 serial     scale-harness/live_ttfce         -p scale-harness --test live_ttfce
 
 # Live suites, run concurrently
-parallel   sources/lib                      -p sources --lib
+# The PostgreSQL queue contract needs the serial-pg lane's DSN.
+parallel   sources/lib                      -p sources --lib -- --include-ignored --test-threads=1 --skip pg_queue_
 parallel   sources/failover_e2e             -p sources --test failover_e2e
 parallel   sources/pg_failover_topology_e2e -p sources --test pg_failover_topology_e2e
 parallel   sources/mysql_activation_e2e     -p sources --test mysql_activation_e2e

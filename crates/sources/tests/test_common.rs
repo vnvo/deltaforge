@@ -79,13 +79,30 @@ pub fn acked_channel<S>(
 where
     S: deltaforge_core::Source + Clone + 'static,
 {
+    let source: deltaforge_core::ArcDynSource =
+        std::sync::Arc::new(source.clone());
+    acked_channel_dyn(&source, ckpt, source_id, cap)
+}
+
+/// [`acked_channel`] for a source already built behind `Arc<dyn Source>`
+/// (as `build_source` returns it).
+#[allow(dead_code)]
+pub fn acked_channel_dyn(
+    source: &deltaforge_core::ArcDynSource,
+    ckpt: &std::sync::Arc<dyn checkpoints::CheckpointStore>,
+    source_id: &str,
+    cap: usize,
+) -> (
+    tokio::sync::mpsc::Sender<deltaforge_core::SourceItem>,
+    tokio::sync::mpsc::Receiver<deltaforge_core::SourceItem>,
+) {
     use deltaforge_core::{BarrierKind, SourceItem};
     use runner::coordinator::{BarrierCommit, build_barrier_fn};
     source.set_snapshot_cohort(test_cohort());
     let commit = build_barrier_fn(
         std::sync::Arc::clone(ckpt),
         format!("{source_id}::sink::{TEST_SINK}"),
-        std::sync::Arc::new(source.clone()),
+        std::sync::Arc::clone(source),
     );
     let (tx_in, mut rx_in) = tokio::sync::mpsc::channel(cap);
     let (tx_out, rx_out) = tokio::sync::mpsc::channel(cap);
