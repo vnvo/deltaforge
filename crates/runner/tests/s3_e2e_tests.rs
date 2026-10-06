@@ -3,7 +3,7 @@
 //! These tests exercise the full runner-side wiring of:
 //!   `Event` → legacy rolling `S3Sink` (`durability: legacy_rolling`, built
 //!   by `build_s3_sink`) → `WriterPool`
-//!   → `ParquetFileWriter` → MinIO → Parquet read-back.
+//!   → `ParquetFileWriter` → S3 test server (`s3_test_server`) → Parquet read-back.
 //!
 //! The schema resolver is built via `runner::schema_provider::build_arrow_schema_resolver`
 //! with a fake `SchemaProvider` so we don't need a live source. This isolates
@@ -13,7 +13,6 @@
 //! Run with: `cargo test -p runner --test s3_e2e_tests -- --ignored --test-threads=1`
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Result;
 use arrow_array::{
@@ -28,7 +27,6 @@ use deltaforge_core::encoding::avro_types::TypeConversionOpts;
 use deltaforge_core::{
     BatchResult, Event, Op, Sink, SourceInfo, SourcePosition, Transaction,
 };
-use gate_ownership::GateOwned;
 use object_store::path::Path;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_reader::ParquetObjectReader;
@@ -38,89 +36,32 @@ use runner::{
 };
 use serde_json::json;
 use sinks::s3::{ObjectStoreParams, build_object_store, build_s3_sink};
-use testcontainers::core::{IntoContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
 // =============================================================================
-// MinIO testcontainer (shared across tests in this file)
+// S3 test server (shared across tests in this file)
 // =============================================================================
 
-const MINIO_PORT: u16 = 9000;
-const MINIO_KEY: &str = "minioadmin";
-const MINIO_SECRET: &str = "minioadmin";
 const BUCKET: &str = "deltaforge-e2e";
 
-struct MinioInfra {
-    #[allow(dead_code)]
-    container: ContainerAsync<GenericImage>,
-    endpoint: String,
-}
-
-static MINIO: OnceCell<MinioInfra> = OnceCell::const_new();
-
 #[dtor]
-fn cleanup_minio() {
-    if let Some(infra) = MINIO.get() {
-        std::process::Command::new("docker")
-            .args(["rm", "-f", infra.container.id()])
-            .output()
-            .ok();
-    }
+fn cleanup_server() {
+    s3_test_server::remove_shared();
 }
 
-async fn minio() -> &'static MinioInfra {
-    MINIO
+async fn server() -> &'static s3_test_server::S3Server {
+    static BUCKET_READY: OnceCell<()> = OnceCell::const_new();
+    let server = s3_test_server::shared().await;
+    BUCKET_READY
         .get_or_init(|| async {
-            let container = GenericImage::new("minio/minio", "latest")
-                .with_wait_for(WaitFor::seconds(2))
-                .with_exposed_port(MINIO_PORT.tcp())
-                .with_entrypoint("/bin/sh")
-                .with_env_var("MINIO_ROOT_USER", MINIO_KEY)
-                .with_env_var("MINIO_ROOT_PASSWORD", MINIO_SECRET)
-                .with_cmd(vec![
-                    "-c".to_string(),
-                    format!("mkdir -p /data/{BUCKET} && minio server /data"),
-                ])
-                .gate_owned()
-                .start()
+            server
+                .create_bucket(BUCKET)
                 .await
-                .expect("start MinIO");
-            let host = container.get_host().await.expect("minio host");
-            let port = container
-                .get_host_port_ipv4(MINIO_PORT)
-                .await
-                .expect("minio port");
-            let endpoint = format!("http://{host}:{port}");
-            wait_for_minio_ready(&endpoint, Duration::from_secs(30))
-                .await
-                .expect("MinIO ready");
-            MinioInfra {
-                container,
-                endpoint,
-            }
+                .expect("create the test bucket")
         })
-        .await
-}
-
-async fn wait_for_minio_ready(endpoint: &str, timeout: Duration) -> Result<()> {
-    let client = reqwest::Client::new();
-    let deadline = tokio::time::Instant::now() + timeout;
-    while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client
-            .get(format!("{endpoint}/minio/health/live"))
-            .timeout(Duration::from_secs(2))
-            .send()
-            .await
-            && resp.status().is_success()
-        {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
-    anyhow::bail!("MinIO never became ready at {endpoint}")
+        .await;
+    server
 }
 
 // =============================================================================
@@ -283,8 +224,8 @@ fn s3_cfg(format: S3FileFormat, prefix: &str, max_events: u64) -> S3SinkCfg {
         prefix: prefix.into(),
         region: Some("us-east-1".into()),
         endpoint: None, // overridden below
-        access_key_id: Some(MINIO_KEY.into()),
-        secret_access_key: Some(MINIO_SECRET.into()),
+        access_key_id: Some(s3_test_server::ACCESS_KEY.into()),
+        secret_access_key: Some(s3_test_server::SECRET_KEY.into()),
         session_token: None,
         access_key_id_ref: None,
         secret_access_key_ref: None,
@@ -348,11 +289,11 @@ fn schema_resolver_for_test() -> sinks::s3::SchemaResolver {
 }
 
 fn store_for(endpoint: &str) -> Arc<dyn object_store::ObjectStore> {
-    build_object_store(&ObjectStoreParams::s3_minio(
+    build_object_store(&ObjectStoreParams::s3_compatible(
         BUCKET,
         endpoint,
-        MINIO_KEY,
-        MINIO_SECRET,
+        s3_test_server::ACCESS_KEY,
+        s3_test_server::SECRET_KEY,
     ))
     .unwrap()
 }
@@ -363,8 +304,8 @@ fn store_for(endpoint: &str) -> Arc<dyn object_store::ObjectStore> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn e2e_parquet_with_ddl_schema_minio() -> Result<()> {
-    let infra = minio().await;
+async fn e2e_parquet_with_ddl_schema_s3_server() -> Result<()> {
+    let infra = server().await;
     let SinkCfg::S3(cfg) = cfg_for_endpoint(
         s3_cfg(S3FileFormat::Parquet, "e2e/parquet", 5),
         &infra.endpoint,
@@ -475,8 +416,8 @@ async fn e2e_parquet_with_ddl_schema_minio() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn e2e_jsonl_gzip_with_ddl_schema_minio() -> Result<()> {
-    let infra = minio().await;
+async fn e2e_jsonl_gzip_with_ddl_schema_s3_server() -> Result<()> {
+    let infra = server().await;
     let SinkCfg::S3(cfg) = cfg_for_endpoint(
         s3_cfg(S3FileFormat::Jsonl, "e2e/jsonl", 3),
         &infra.endpoint,
@@ -528,7 +469,7 @@ async fn e2e_jsonl_gzip_with_ddl_schema_minio() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn e2e_multi_day_partitions_produce_separate_files() -> Result<()> {
-    let infra = minio().await;
+    let infra = server().await;
     let SinkCfg::S3(cfg) = cfg_for_endpoint(
         s3_cfg(S3FileFormat::Parquet, "e2e/multiday", 1_000_000),
         &infra.endpoint,
@@ -576,7 +517,7 @@ async fn e2e_multi_day_partitions_produce_separate_files() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn e2e_envelope_only_fallback_when_no_resolver() -> Result<()> {
-    let infra = minio().await;
+    let infra = server().await;
     let SinkCfg::S3(cfg) = cfg_for_endpoint(
         s3_cfg(S3FileFormat::Parquet, "e2e/envonly", 2),
         &infra.endpoint,

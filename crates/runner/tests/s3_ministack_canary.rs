@@ -215,7 +215,7 @@ async fn ministack_canary_parquet_roundtrip() -> Result<()> {
     sink.send_batch(&events).await?;
 
     // Verify via the same object_store path the sink used.
-    let store = build_object_store(&ObjectStoreParams::s3_minio(
+    let store = build_object_store(&ObjectStoreParams::s3_compatible(
         BUCKET,
         &infra.endpoint,
         MS_KEY,

@@ -22,14 +22,14 @@ mod head;
 mod jsonl_writer;
 mod keys;
 mod manifest;
-#[cfg(test)]
-mod minio_it;
 mod object_writer;
 mod parquet_writer;
 mod reconcile;
 mod rolling;
 mod rollup;
 mod router;
+#[cfg(test)]
+mod s3_server_it;
 mod sink;
 mod store_cond;
 mod writer_pool;

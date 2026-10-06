@@ -32,14 +32,14 @@ sinks:
    startup BEFORE acquiring the HEAD; a provider that silently ignores these
    conditions fails the probe and the sink refuses to start in durable mode. Do not
    force durable_v2 onto an unverified provider.
-2. Stage first against MinIO or a staging bucket and run the live integration
-   matrix:
+2. Stage first against a staging bucket on the target provider and run the live
+   integration matrix:
    ```text
-   export DELTAFORGE_IT_S3_ENDPOINT=http://localhost:9000
+   export DELTAFORGE_IT_S3_ENDPOINT=<provider endpoint>
    export DELTAFORGE_IT_S3_BUCKET=deltaforge-it
-   export DELTAFORGE_IT_S3_ACCESS_KEY=minioadmin
-   export DELTAFORGE_IT_S3_SECRET_KEY=minioadmin
-   cargo test -p sinks --lib -- --ignored minio
+   export DELTAFORGE_IT_S3_ACCESS_KEY=<access key>
+   export DELTAFORGE_IT_S3_SECRET_KEY=<secret key>
+   cargo test -p sinks --lib -- --ignored s3_server_it
    ```
    These tests are `#[ignore]`d and require the environment above; run explicitly
    they exercise the real backend or fail loudly. They cover the probe, publish/ack
