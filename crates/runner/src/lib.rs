@@ -6,6 +6,7 @@ pub mod pipeline_manager;
 pub mod preflight;
 pub mod recover_cli;
 pub mod recovery;
+pub mod recovery_resnapshot;
 pub mod replay_controller;
 pub mod replay_gate;
 pub mod replay_job;

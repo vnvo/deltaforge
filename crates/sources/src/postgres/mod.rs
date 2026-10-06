@@ -35,7 +35,7 @@ use postgres_errors::LoopControl;
 pub use postgres_errors::{PostgresSourceError, PostgresSourceResult};
 
 mod postgres_checkpoint_chain;
-mod postgres_continuity;
+pub(crate) mod postgres_continuity;
 mod postgres_helpers;
 use postgres_helpers::{
     connect_replication_with_retries, ensure_publication_exists,

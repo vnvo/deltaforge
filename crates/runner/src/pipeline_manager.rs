@@ -76,6 +76,25 @@ pub fn snapshot_cohort(
     }
 }
 
+/// [`snapshot_cohort`] of a pipeline spec: its commit policy and its sinks
+/// as configured. The cohort a running pipeline freezes and the one a
+/// recovery plan binds come from here.
+pub fn snapshot_cohort_of(
+    spec: &deltaforge_config::PipelineSpec,
+) -> deltaforge_core::SnapshotCohort {
+    let mut cohort = snapshot_cohort(spec.spec.commit_policy.as_ref(), &[]);
+    cohort.sinks = spec
+        .spec
+        .sinks
+        .iter()
+        .map(|s| deltaforge_core::CohortSink {
+            id: s.sink_id().to_string(),
+            required: s.required(),
+        })
+        .collect();
+    cohort
+}
+
 /// Wraps a [`CheckpointStore`] to present the **minimum** per-sink checkpoint
 /// when the source calls `get_raw(source_id)`.
 ///
@@ -1052,10 +1071,11 @@ impl PipelineManager {
 
         // The cohort a snapshot generation freezes: this pipeline's commit
         // policy and its sinks.
-        source.set_snapshot_cohort(snapshot_cohort(
-            spec.spec.commit_policy.as_ref(),
-            &sinks,
-        ));
+        debug_assert_eq!(
+            snapshot_cohort_of(&spec),
+            snapshot_cohort(spec.spec.commit_policy.as_ref(), &sinks)
+        );
+        source.set_snapshot_cohort(snapshot_cohort_of(&spec));
         let src_handle = source.run(event_tx, source_ckpt).await;
 
         // Supervise the source task: the moment it exits without an explicit

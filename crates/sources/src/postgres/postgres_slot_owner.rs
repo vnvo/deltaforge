@@ -410,6 +410,142 @@ pub async fn prepare_snapshot_slot_anchor(
     }
 }
 
+/// The configured replication slot as the recovery operation `resnapshot`
+/// sees it (`docs/design/recovery-cli.md`, section 5.1): observed on one
+/// connection, with the durable ownership proof startup uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SlotObservation {
+    pub slot: String,
+    pub system_identifier: String,
+    pub database: String,
+    pub database_oid: i64,
+    /// The ownership record's bytes digest, or `absent`.
+    pub owner_record: String,
+    /// `None`: no slot by that name.
+    pub present: Option<SlotPresent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SlotPresent {
+    pub active: bool,
+    pub wal_status: Option<String>,
+    pub invalidation: Option<String>,
+    /// Ownership proven under the startup rules (finalized record of this
+    /// source, pipeline, server, database, slot and plugin).
+    pub owned: bool,
+}
+
+impl SlotObservation {
+    /// The slot exists but its retention is lost or it was invalidated.
+    pub fn lost(&self) -> bool {
+        self.present.as_ref().is_some_and(|p| {
+            p.wal_status.as_deref() == Some("lost") || p.invalidation.is_some()
+        })
+    }
+
+    pub fn digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(self).expect("an observation serializes"),
+        ))
+    }
+}
+
+async fn observe_on(
+    client: &tokio_postgres::Client,
+    slot: &str,
+    pipeline: &str,
+    source_id: &str,
+    chkpt: &Arc<dyn CheckpointStore>,
+) -> Result<SlotObservation> {
+    let id = fetch_identity(client).await?;
+    let raw = chkpt
+        .get_raw(&owner_key(source_id))
+        .await
+        .map_err(|e| anyhow::anyhow!("read the slot ownership record: {e}"))?;
+    let owner_record = match &raw {
+        None => "absent".to_string(),
+        Some(b) => {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(b))
+        }
+    };
+    let row = client
+        .query_opt(
+            &format!(
+                "SELECT active, wal_status::text, {} \
+                 FROM pg_replication_slots s WHERE slot_name = $1",
+                super::postgres_health::INVALIDATION
+            ),
+            &[&slot],
+        )
+        .await
+        .context("query the replication slot")?;
+    let present = row.map(|r| {
+        let owned = raw
+            .as_deref()
+            .and_then(|b| serde_json::from_slice::<SlotOwnership>(b).ok())
+            .is_some_and(|rec| {
+                ownership_proven(&rec, source_id, pipeline, slot, &id)
+            });
+        SlotPresent {
+            active: r.get(0),
+            wal_status: r.get(1),
+            invalidation: r.get(2),
+            owned,
+        }
+    });
+    Ok(SlotObservation {
+        slot: slot.to_string(),
+        system_identifier: id.system_identifier,
+        database: id.database,
+        database_oid: id.database_oid,
+        owner_record,
+        present,
+    })
+}
+
+/// Observe the configured slot (see [`SlotObservation`]).
+pub async fn observe_slot(
+    dsn: &str,
+    slot: &str,
+    pipeline: &str,
+    source_id: &str,
+    chkpt: &Arc<dyn CheckpointStore>,
+) -> Result<SlotObservation> {
+    let client = connect(dsn).await?;
+    observe_on(&client, slot, pipeline, source_id, chkpt).await
+}
+
+/// Drop the configured slot, only when, observed on the same connection, it
+/// is exactly `expected` (the planned observation) and that is an owned,
+/// inactive, lost slot. The next start creates the new slot through the
+/// ownership-recording path.
+pub async fn drop_lost_owned_slot(
+    dsn: &str,
+    slot: &str,
+    pipeline: &str,
+    source_id: &str,
+    chkpt: &Arc<dyn CheckpointStore>,
+    expected: &str,
+) -> Result<()> {
+    let client = connect(dsn).await?;
+    let now = observe_on(&client, slot, pipeline, source_id, chkpt).await?;
+    let droppable = now.present.as_ref().is_some_and(|p| p.owned && !p.active)
+        && now.lost();
+    anyhow::ensure!(
+        now.digest() == expected && droppable,
+        "replication slot '{slot}' is not the owned, inactive, lost slot the \
+         plan observed; nothing was dropped"
+    );
+    drop_slot(&client, slot).await?;
+    warn!(
+        source_id,
+        slot, "dropped the owned lost replication slot for resnapshot"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

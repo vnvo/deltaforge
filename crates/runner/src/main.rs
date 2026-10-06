@@ -528,9 +528,12 @@ async fn serve(
     if let Some((listener, token)) = admin {
         let admin_app =
             rest_api::recovery::router(rest_api::recovery::RecoveryState {
-                controller: Arc::new(runner::recovery::RecoveryService::new(
-                    manager.clone(),
-                )),
+                controller: Arc::new(
+                    runner::recovery::RecoveryService::new(manager.clone())
+                        .with_operation(Arc::new(
+                            runner::recovery_resnapshot::Resnapshot,
+                        )),
+                ),
                 token,
             });
         let stop = shutdown.clone();

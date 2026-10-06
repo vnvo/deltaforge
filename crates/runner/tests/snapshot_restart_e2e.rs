@@ -1160,3 +1160,416 @@ async fn a_purged_anchor_binlog_blocks_the_generation() -> Result<()> {
     release.notify_one();
     Ok(())
 }
+
+// ---- Recovery: resnapshot (docs/design/recovery-cli.md, section 5.1) ------
+
+async fn pg_admin(port: u16) -> tokio_postgres::Client {
+    let (pg, conn) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={port} user=postgres password={PASS} dbname=postgres"
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        conn.await.ok();
+    });
+    pg
+}
+
+fn recovery(mgr: &Arc<PipelineManager>) -> runner::recovery::RecoveryService {
+    runner::recovery::RecoveryService::new(Arc::clone(mgr))
+        .with_operation(Arc::new(runner::recovery_resnapshot::Resnapshot))
+}
+
+fn plan_req(incident: Option<String>) -> rest_api::recovery::PlanRequest {
+    rest_api::recovery::PlanRequest {
+        operation: "resnapshot".into(),
+        incident,
+        args: Default::default(),
+    }
+}
+
+/// The open incident diagnose offers `resnapshot` for.
+async fn resnapshot_incident(
+    svc: &runner::recovery::RecoveryService,
+    name: &str,
+) -> String {
+    use rest_api::recovery::RecoveryController;
+    let diag = svc.diagnose(name).await.unwrap();
+    diag["incidents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| {
+            i["operations"]
+                .as_array()
+                .is_some_and(|o| o.iter().any(|x| x == "resnapshot"))
+        })
+        .unwrap_or_else(|| panic!("no resnapshot incident: {diag}"))["incident_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+async fn plan_and_apply(
+    svc: &runner::recovery::RecoveryService,
+    name: &str,
+    incident: Option<String>,
+) -> (Value, Value) {
+    use rest_api::recovery::{ApplyRequest, Caller, RecoveryController};
+    let planned = svc.plan(name, plan_req(incident.clone())).await.unwrap();
+    let applied = svc
+        .apply(
+            name,
+            ApplyRequest {
+                plan: plan_req(incident),
+                expect_proof: planned["proof"].as_str().unwrap().into(),
+                actor: "alice".into(),
+                reason: "test".into(),
+            },
+            Caller {
+                origin: "127.0.0.1:1".into(),
+                credential: "token",
+            },
+        )
+        .await
+        .unwrap();
+    (planned, applied)
+}
+
+async fn sink_checkpoints(
+    backend: &ArcStorageBackend,
+    source: &str,
+) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    use checkpoints::CheckpointStore;
+    for key in storage::BackendCheckpointStore::new(backend.clone())
+        .list_with_prefix(&format!("{source}::sink::"))
+        .await
+        .unwrap()
+    {
+        out.push((
+            key.clone(),
+            backend.kv_get("checkpoints", &key).await.unwrap().unwrap(),
+        ));
+    }
+    out
+}
+
+fn step_names(planned: &Value) -> Vec<String> {
+    planned["plan"]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// A completed snapshot, then generation 2 blocked by its plan bound; the
+/// bound raised; still blocked.
+async fn blocked_after_a_completed_snapshot(
+    mgr: &Arc<PipelineManager>,
+    backend: &ArcStorageBackend,
+    name: &str,
+    source: &str,
+    hook: &Hook,
+) -> sources::snapshot_queue::GenerationControl {
+    every_row_arrives(mgr, name, hook).await;
+    let first = until_control(backend, source, completed).await;
+    let snapshot = |extra: Value| serde_json::json!({ "spec": { "source": { "config": { "snapshot": extra } } } });
+    PipelineController::patch(
+        mgr.as_ref(),
+        name,
+        snapshot(serde_json::json!({ "mode": "always", "max_plan_items": 0 })),
+    )
+    .await
+    .unwrap();
+    until_status(mgr, name, "failed").await;
+    let blocked = until_control(backend, source, |c| c.blocked.is_some()).await;
+    assert_eq!(blocked.generation, first.generation + 1);
+    PipelineController::patch(
+        mgr.as_ref(),
+        name,
+        snapshot(serde_json::json!({ "mode": "initial", "max_plan_items": 1_000_000 })),
+    )
+    .await
+    .unwrap();
+    until_status(mgr, name, "failed").await;
+    assert_eq!(
+        control(backend, source).await.unwrap().generation,
+        blocked.generation
+    );
+    blocked
+}
+
+/// The recovery allocation runs at the next explicit resume, in place,
+/// copying the whole snapshot again; nothing before that resume moved.
+async fn recovers_by_resume(
+    mgr: &Arc<PipelineManager>,
+    backend: &ArcStorageBackend,
+    name: &str,
+    source: &str,
+    hook: &Hook,
+    blocked: &sources::snapshot_queue::GenerationControl,
+    before: &[(String, Vec<u8>)],
+) {
+    let next = control(backend, source).await.unwrap();
+    assert_eq!(next.generation, blocked.generation + 1);
+    assert_eq!(next.snapshot_chain, blocked.snapshot_chain);
+    assert_eq!(
+        next.allocation,
+        Some(sources::snapshot_queue::AllocationMark::Recovery)
+    );
+    assert_eq!(next.blocked, None);
+    assert_eq!(next.adoption, sources::snapshot_queue::Adoption::Pending);
+    // Not started; no checkpoint moved.
+    sleep(Duration::from_secs(1)).await;
+    assert_ne!(status(mgr, name).await, "running");
+    assert_eq!(sink_checkpoints(backend, source).await, before);
+    let reads = hook.snapshot_reads();
+    mgr.resume(name).await.unwrap();
+    let done = until_control(backend, source, completed).await;
+    assert_eq!(
+        done.generation, next.generation,
+        "run in place, no further generation"
+    );
+    assert_eq!(done.adoption, sources::snapshot_queue::Adoption::Done);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while hook.snapshot_reads() < reads + ROWS as usize {
+        assert!(
+            Instant::now() < deadline,
+            "the snapshot was not copied again"
+        );
+        sleep(Duration::from_millis(200)).await;
+    }
+    assert_ne!(
+        sink_checkpoints(backend, source).await,
+        before,
+        "moved by the generation"
+    );
+}
+
+/// PostgreSQL: a blocked generation and a lost (dropped) slot recover
+/// through `resnapshot` without advancing any checkpoint; the explicit
+/// resume runs the recovery allocation and the next start creates the slot.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn postgres_resnapshot_recovers_a_blocked_generation_and_a_lost_slot()
+-> Result<()> {
+    trace();
+    let (_pg, port) = start_postgres().await;
+    let (_dir, backend) = sqlite();
+    let hook = Hook::start().await;
+    let mgr = Arc::new(manager_over(backend.clone()).await);
+    let sinks = hooks_yaml(&[("hook", &hook.url, true)]);
+    mgr.start_pipeline(pg_spec_with("pgrec", port, "", &sinks, ""))
+        .await?;
+    let blocked = blocked_after_a_completed_snapshot(
+        &mgr, &backend, "pgrec", "pg-src", &hook,
+    )
+    .await;
+    pg_admin(port)
+        .await
+        .execute("SELECT pg_drop_replication_slot('snap_slot')", &[])
+        .await?;
+    let before = sink_checkpoints(&backend, "pg-src").await;
+    assert!(!before.is_empty());
+    let svc = recovery(&mgr);
+    let incident = resnapshot_incident(&svc, "pgrec").await;
+    let (planned, applied) =
+        plan_and_apply(&svc, "pgrec", Some(incident.clone())).await;
+    assert_eq!(step_names(&planned), ["replace_generation", "reclaim_plan"]);
+    assert!(
+        planned["observed"]["slot.next_start"]
+            .as_str()
+            .unwrap()
+            .contains("absent")
+    );
+    assert_eq!(applied["state"], "completed");
+    recovers_by_resume(
+        &mgr, &backend, "pgrec", "pg-src", &hook, &blocked, &before,
+    )
+    .await;
+    // A completed same-proof re-apply (on the stopped pipeline) stays a
+    // no-op: nothing recomputed or written.
+    use rest_api::recovery::{ApplyRequest, Caller, RecoveryController};
+    PipelineController::stop(mgr.as_ref(), "pgrec").await?;
+    let after = control(&backend, "pg-src").await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let again = loop {
+        match svc
+            .apply(
+                "pgrec",
+                ApplyRequest {
+                    plan: plan_req(Some(incident.clone())),
+                    expect_proof: planned["proof"].as_str().unwrap().into(),
+                    actor: "alice".into(),
+                    reason: "again".into(),
+                },
+                Caller {
+                    origin: "127.0.0.1:1".into(),
+                    credential: "token",
+                },
+            )
+            .await
+        {
+            Ok(v) => break v,
+            // The stopped tasks are still finishing.
+            Err(e)
+                if e.code == "pipeline_not_quiescent"
+                    && Instant::now() < deadline =>
+            {
+                sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    };
+    assert_eq!(again["already_completed"], true);
+    assert_eq!(control(&backend, "pg-src").await, after);
+    Ok(())
+}
+
+/// MySQL: a blocked generation whose anchor binlog was purged recovers the
+/// same way.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn mysql_resnapshot_recovers_a_blocked_generation_and_a_purged_binlog()
+-> Result<()> {
+    trace();
+    let (_my, port) = start_mysql().await;
+    let (_dir, backend) = sqlite();
+    let hook = Hook::start().await;
+    let mgr = Arc::new(manager_over(backend.clone()).await);
+    let sinks = hooks_yaml(&[("hook", &hook.url, true)]);
+    mgr.start_pipeline(mysql_spec_with("myrec", port, "", &sinks))
+        .await?;
+    let blocked = blocked_after_a_completed_snapshot(
+        &mgr, &backend, "myrec", "my-src", &hook,
+    )
+    .await;
+    let mut root =
+        mysql_conn(&format!("mysql://root:rootpw@127.0.0.1:{port}/")).await?;
+    root.query_drop("FLUSH BINARY LOGS").await?;
+    let current: String = root
+        .query_first::<mysql_async::Row, _>("SHOW BINARY LOG STATUS")
+        .await?
+        .and_then(|r| r.get(0))
+        .unwrap();
+    root.query_drop(format!("PURGE BINARY LOGS TO '{current}'"))
+        .await?;
+    let before = sink_checkpoints(&backend, "my-src").await;
+    assert!(!before.is_empty());
+    let svc = recovery(&mgr);
+    let incident = resnapshot_incident(&svc, "myrec").await;
+    let (planned, applied) =
+        plan_and_apply(&svc, "myrec", Some(incident)).await;
+    assert_eq!(step_names(&planned), ["replace_generation", "reclaim_plan"]);
+    assert_eq!(applied["state"], "completed");
+    recovers_by_resume(
+        &mgr, &backend, "myrec", "my-src", &hook, &blocked, &before,
+    )
+    .await;
+    Ok(())
+}
+
+async fn slot_exists(a: &tokio_postgres::Client) -> bool {
+    a.query_opt(
+        "SELECT 1 FROM pg_replication_slots WHERE slot_name = 'snap_slot'",
+        &[],
+    )
+    .await
+    .unwrap()
+    .is_some()
+}
+
+/// PostgreSQL: an owned slot whose retention was lost is dropped only as
+/// the plan's explicit step; a slot whose ownership cannot be proven
+/// refuses the plan and stays untouched.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn postgres_resnapshot_drops_only_a_provably_owned_lost_slot()
+-> Result<()> {
+    trace();
+    let (_pg, port) = start_postgres().await;
+    let (_dir, backend) = sqlite();
+    let hook = Hook::start().await;
+    let mgr = Arc::new(manager_over(backend.clone()).await);
+    let sinks = hooks_yaml(&[("hook", &hook.url, true)]);
+    mgr.start_pipeline(pg_spec_with("pgslot", port, "", &sinks, ""))
+        .await?;
+    let blocked = blocked_after_a_completed_snapshot(
+        &mgr, &backend, "pgslot", "pg-src", &hook,
+    )
+    .await;
+    let admin = pg_admin(port).await;
+    // Lose the owned, inactive slot's retention.
+    for sql in [
+        "ALTER SYSTEM SET max_slot_wal_keep_size = '1MB'",
+        "SELECT pg_reload_conf()",
+        "CREATE TABLE IF NOT EXISTS filler (x text)",
+    ] {
+        admin.batch_execute(sql).await?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        admin
+            .batch_execute(
+                "INSERT INTO filler SELECT repeat('x', 1000) FROM generate_series(1, 5000); \
+                 SELECT pg_switch_wal(); CHECKPOINT;",
+            )
+            .await?;
+        let status: Option<String> = admin
+            .query_one(
+                "SELECT wal_status::text FROM pg_replication_slots WHERE slot_name = 'snap_slot'",
+                &[],
+            )
+            .await?
+            .get(0);
+        if status.as_deref() == Some("lost") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the slot never lost its retention"
+        );
+    }
+    admin
+        .batch_execute("ALTER SYSTEM RESET max_slot_wal_keep_size")
+        .await?;
+    admin.batch_execute("SELECT pg_reload_conf()").await?;
+    let svc = recovery(&mgr);
+    // Without the ownership record the slot is not provably ours: refused,
+    // untouched.
+    let owner = backend
+        .kv_get("checkpoints", "slot_owner:pg-src")
+        .await?
+        .unwrap();
+    backend
+        .kv_delete("checkpoints", "slot_owner:pg-src")
+        .await?;
+    {
+        use rest_api::recovery::RecoveryController;
+        let e = svc.plan("pgslot", plan_req(None)).await.unwrap_err();
+        assert_eq!(e.code, "manual_repair", "{e:?}");
+    }
+    assert!(slot_exists(&admin).await, "an unprovable slot stays");
+    backend
+        .kv_put("checkpoints", "slot_owner:pg-src", &owner)
+        .await?;
+    // Proven: dropped as the plan's explicit step.
+    let before = sink_checkpoints(&backend, "pg-src").await;
+    let (planned, applied) = plan_and_apply(&svc, "pgslot", None).await;
+    assert_eq!(
+        step_names(&planned),
+        ["replace_generation", "reclaim_plan", "drop_lost_slot"]
+    );
+    assert_eq!(applied["outcomes"]["slot"], "dropped_owned_lost_slot");
+    assert!(!slot_exists(&admin).await);
+    recovers_by_resume(
+        &mgr, &backend, "pgslot", "pg-src", &hook, &blocked, &before,
+    )
+    .await;
+    Ok(())
+}

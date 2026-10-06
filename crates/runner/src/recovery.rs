@@ -582,10 +582,9 @@ impl RecoveryController for RecoveryService {
         let backend = self.manager.backend.clone();
         let store = RecoveryStore::new(backend.clone(), pipeline);
         let incidents = IncidentStore::new(backend.clone(), pipeline);
-        let ctx = self.context(pipeline, &req.plan).await?;
         // 2. The record: an unfinished operation is resumed from its stored
         // plan, with the same proof only.
-        let (version, rec) = match store
+        let (version, rec, ctx) = match store
             .read()
             .await
             .map_err(|e| state_error("the recovery record", &e))?
@@ -601,13 +600,14 @@ impl RecoveryController for RecoveryService {
                         "operation": rec.operation, "proof": rec.proof,
                     })));
                 }
-                (v, rec)
+                (v, rec, None)
             }
             // The operation of this proof already completed (an abandoned
             // or timed-out request): nothing to do, nothing written.
             Some((_, rec))
                 if rec.state == RecordState::Completed
-                    && rec.proof == req.expect_proof =>
+                    && rec.proof == req.expect_proof
+                    && rec.operation == op.name() =>
             {
                 return Ok(json!({
                     "state": "completed",
@@ -618,6 +618,7 @@ impl RecoveryController for RecoveryService {
             }
             _ => {
                 // 3. Recompute and verify the proof under the lock.
+                let ctx = self.context(pipeline, &req.plan).await?;
                 let planned = op.plan(&ctx).await?;
                 let proof = planned.plan.proof();
                 if proof != req.expect_proof {
@@ -648,7 +649,7 @@ impl RecoveryController for RecoveryService {
                     .await
                     .map_err(|e| state_error("the recovery record", &e))?
                 {
-                    Claim::Claimed(v) => (v, rec),
+                    Claim::Claimed(v) => (v, rec, Some(ctx)),
                     Claim::Pending(other) => {
                         return Err(conflict(
                             "recovery_pending",
@@ -661,7 +662,16 @@ impl RecoveryController for RecoveryService {
                 }
             }
         };
-        // 5. Only now any write.
+        // 5. Only now any write. A resume runs its stored plan: the named
+        // incident may be resolved by now, so it is not looked up again.
+        let ctx = match ctx {
+            Some(c) => c,
+            None => {
+                let mut plain = req.plan.clone();
+                plain.incident = None;
+                self.context(pipeline, &plain).await?
+            }
+        };
         let exec = op.executor(&ctx, &rec.plan).await?;
         let proof = rec.proof.clone();
         match store.drive(version, rec, exec.as_ref(), &incidents).await {

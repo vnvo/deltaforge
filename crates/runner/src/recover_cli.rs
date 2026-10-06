@@ -329,14 +329,14 @@ fn classify(status: StatusCode, v: &Value) -> CliError {
     };
     let exit_code = match code {
         "bad_request" | "unknown_operation" | "unauthorized"
-        | "loopback_only" | "not_found" => exit::VALIDATION,
+        | "loopback_only" | "not_found" | "not_applicable" => exit::VALIDATION,
         "proof_mismatch" => exit::PROOF_MISMATCH,
         "pipeline_not_quiescent"
         | "pipeline_deleting"
         | "recovery_in_progress"
         | "incident_resolved" => exit::PIPELINE_STATE,
         "recovery_pending" | "recovery_diverged" | "apply_stopped"
-        | "state_unreadable" => exit::RECOVERY,
+        | "state_unreadable" | "manual_repair" => exit::RECOVERY,
         _ if status.is_server_error() => exit::TRANSPORT,
         _ => return unexpected(),
     };
