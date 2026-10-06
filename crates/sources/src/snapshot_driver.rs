@@ -1108,7 +1108,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let next = recovery_successor(&c);
+            let next = recovery_successor(&c, "fp", contract::policy());
             q.write_recovery(Some(v), &next).await.unwrap();
             (q, next)
         };
@@ -1161,7 +1161,7 @@ mod tests {
         // Recovery writes only a recovery allocation.
         let q = QueueStore::new(mem(), "src");
         let (v, c) = running(&q, "a").await;
-        let mut plain = recovery_successor(&c);
+        let mut plain = recovery_successor(&c, "fp", contract::policy());
         plain.allocation = None;
         assert!(q.write_recovery(Some(v), &plain).await.is_err());
     }

@@ -22,11 +22,14 @@ use sources::snapshot_queue::{
     control_digest, recovery_first, recovery_successor,
 };
 use sources::snapshot_recovery::{
-    CheckpointKind, Engine, classify_checkpoint, config_fingerprint,
-    lineage_matches, persisted_lineage, recovery_chain,
+    CheckpointKind, Engine, SlotRecreation, classify_checkpoint,
+    config_fingerprint, lineage_matches, persisted_lineage,
+    read_slot_recreation, write_slot_recreation,
 };
 use storage::adapters::incidents::IncidentRecord;
-use storage::adapters::recovery::{CanonicalPlan, PlanStep, StepExecutor};
+use storage::adapters::recovery::{
+    CanonicalPlan, PLANNED_ID, PlanStep, StepExecutor, derived_id, plan_seed,
+};
 
 use crate::recovery::{
     OperationContext, Planned, RecoveryOperation, state_error,
@@ -38,6 +41,8 @@ const REPLACE: &str = "replace_generation";
 const ALLOCATE: &str = "allocate_generation";
 const RECLAIM: &str = "reclaim_plan";
 const DROP_SLOT: &str = "drop_lost_slot";
+const AUTHORIZE_SLOT: &str = "authorize_slot_recreation";
+const AUTHORIZATION_ABSENT: &str = "authorization:absent";
 
 const ABSENT: &str = "absent";
 const UNREADABLE: &str = "unreadable";
@@ -201,8 +206,17 @@ impl RecoveryOperation for Resnapshot {
             }
         }
 
+        // What the recovery generation freezes: the configuration now.
+        let configured_policy = PolicySnapshot::from(
+            &crate::pipeline_manager::snapshot_cohort_of(&ctx.spec),
+        );
+        configured_policy.validate().map_err(not_applicable)?;
+        let configured_fp = config_fingerprint(view.engine, &view.tables);
+        bindings.insert("config.fingerprint".into(), configured_fp.clone());
+
         let queue = QueueStore::new(ctx.backend.clone(), &source);
         let mut steps = Vec::new();
+        let next_generation;
         match queue.read().await.map_err(queue_error)? {
             Some(Stored::Legacy { .. }) => {
                 return Err(not_applicable(
@@ -235,7 +249,12 @@ impl RecoveryOperation for Resnapshot {
                          completes it or replaces it; resume the pipeline",
                     ));
                 }
-                let next = recovery_successor(&control);
+                let next = recovery_successor(
+                    &control,
+                    &configured_fp,
+                    configured_policy.clone(),
+                );
+                next_generation = next.generation;
                 bindings.insert("control.version".into(), version.to_string());
                 bindings.insert(
                     "control.generation".into(),
@@ -325,19 +344,16 @@ impl RecoveryOperation for Resnapshot {
                 let persisted = persisted_lineage(recorded).ok_or_else(|| {
                     manual("the source's recorded lineage cannot seed a snapshot chain")
                 })?;
-                let policy = PolicySnapshot::from(
-                    &crate::pipeline_manager::snapshot_cohort_of(&ctx.spec),
+                // The chain is derived from the plan seed (see
+                // `finalize_chain`); while seeding the plan carries
+                // `PLANNED_ID` in its place.
+                let first = recovery_first(
+                    PLANNED_ID.into(),
+                    persisted,
+                    &configured_fp,
+                    configured_policy.clone(),
                 );
-                policy.validate().map_err(not_applicable)?;
-                let fingerprint = config_fingerprint(view.engine, &view.tables);
-                let digests = ctx.checkpoint_digests().await?;
-                let chain = recovery_chain(
-                    &source,
-                    &lineage.current.lineage_hash,
-                    &serde_json::to_string(&digests).unwrap_or_default(),
-                );
-                let first =
-                    recovery_first(chain, persisted, &fingerprint, policy);
+                next_generation = 1;
                 bindings.insert("control".into(), ABSENT.into());
                 bindings.insert("next.generation".into(), "1".into());
                 steps.push(step(
@@ -345,10 +361,7 @@ impl RecoveryOperation for Resnapshot {
                     ABSENT.into(),
                     control_digest(&first),
                     &first,
-                    [
-                        ("next_generation", "1".to_string()),
-                        ("snapshot_chain", first.snapshot_chain.clone()),
-                    ],
+                    [("next_generation", "1".to_string())],
                 ));
             }
         }
@@ -371,12 +384,48 @@ impl RecoveryOperation for Resnapshot {
                 "slot".into(),
                 serde_json::to_string(&obs).unwrap_or_default(),
             );
+            let authorization =
+                match read_slot_recreation(&ctx.backend, &source).await {
+                    Ok(None) => AUTHORIZATION_ABSENT.to_string(),
+                    Ok(Some((_, a))) => a.digest(),
+                    Err(e) => {
+                        return Err(state_error(
+                            "the slot recreation authorization",
+                            &e,
+                        ));
+                    }
+                };
+            bindings.insert("slot.authorization".into(), authorization.clone());
+            // The single-use authorization for the recovery generation's
+            // start to recreate the slot this source owned.
+            let authorize = |steps: &mut Vec<PlanStep>| {
+                steps.push(PlanStep {
+                    name: AUTHORIZE_SLOT.into(),
+                    pre: authorization.clone(),
+                    post: SlotRecreation::authorized(
+                        &source,
+                        &ctx.pipeline,
+                        slot,
+                        next_generation,
+                        &obs.owner_record,
+                    )
+                    .digest(),
+                    detail: BTreeMap::from([
+                        ("slot".into(), slot.clone()),
+                        ("generation".into(), next_generation.to_string()),
+                        ("owner_record".into(), obs.owner_record.clone()),
+                    ]),
+                });
+            };
             match &obs.present {
+                None if obs.owner_proven => authorize(&mut steps),
                 None => {
-                    observed.insert(
-                        "slot.next_start".into(),
-                        "absent: the next start creates and owns it".into(),
-                    );
+                    return Err(manual(format!(
+                        "replication slot '{slot}' is absent and the ownership \
+                         record does not prove this source created it (missing, \
+                         partial, foreign or changed); recovery never \
+                         authorizes recreating it"
+                    )));
                 }
                 Some(p) if !p.owned || p.active => {
                     return Err(manual(format!(
@@ -396,6 +445,7 @@ impl RecoveryOperation for Resnapshot {
                         post: SLOT_ABSENT.into(),
                         detail: BTreeMap::from([("slot".into(), slot.clone())]),
                     });
+                    authorize(&mut steps);
                 }
                 Some(_) => {
                     observed.insert(
@@ -428,15 +478,16 @@ impl RecoveryOperation for Resnapshot {
             .as_ref()
             .map(|i| vec![i.incident_id.clone()])
             .unwrap_or_default();
+        let plan = finalize_chain(CanonicalPlan::new(
+            NAME,
+            &ctx.pipeline,
+            &source,
+            bindings,
+            steps,
+            consequences,
+        ));
         Ok(Planned {
-            plan: CanonicalPlan::new(
-                NAME,
-                &ctx.pipeline,
-                &source,
-                bindings,
-                steps,
-                consequences,
-            ),
+            plan,
             resolves,
             observed,
         })
@@ -454,6 +505,8 @@ impl RecoveryOperation for Resnapshot {
             None
         };
         Ok(Box::new(Exec {
+            proof: plan.proof(),
+            backend: ctx.backend.clone(),
             queue: QueueStore::new(ctx.backend.clone(), ctx.source_id()),
             ckpt: Arc::clone(&ctx.ckpt_store),
             pipeline: ctx.pipeline.clone(),
@@ -462,6 +515,30 @@ impl RecoveryOperation for Resnapshot {
             dsn,
         }))
     }
+}
+
+/// A first recovery allocation's chain: derived from the seed of the plan
+/// that carries `PLANNED_ID` in its place, then put into the final plan
+/// (its control record, post-state and detail). Other plans are returned
+/// unchanged.
+fn finalize_chain(seeded: CanonicalPlan) -> CanonicalPlan {
+    let Some(i) = seeded.steps.iter().position(|s| s.name == ALLOCATE) else {
+        return seeded;
+    };
+    let chain = derived_id(&plan_seed(&seeded), "snapshot_chain");
+    let mut plan = seeded;
+    let step = &mut plan.steps[i];
+    let mut first: GenerationControl =
+        serde_json::from_str(&step.detail["control"])
+            .expect("a planned control record");
+    first.snapshot_chain = chain.clone();
+    step.post = control_digest(&first);
+    step.detail.insert(
+        "control".into(),
+        serde_json::to_string(&first).expect("a control record serializes"),
+    );
+    step.detail.insert("snapshot_chain".into(), chain);
+    plan
 }
 
 fn step<const N: usize>(
@@ -488,6 +565,8 @@ fn step<const N: usize>(
 }
 
 struct Exec {
+    proof: String,
+    backend: storage::ArcStorageBackend,
     queue: QueueStore,
     ckpt: Arc<dyn CheckpointStore>,
     pipeline: String,
@@ -538,6 +617,19 @@ impl StepExecutor for Exec {
                 }
                 Ok(Some(Stored::Legacy { .. })) | Err(_) => UNREADABLE.into(),
             }),
+            AUTHORIZE_SLOT => Ok(
+                match read_slot_recreation(&self.backend, &self.source).await {
+                    Ok(None) => AUTHORIZATION_ABSENT.into(),
+                    Ok(Some((_, mut a))) => {
+                        // The proof is observed as the plan's empty one.
+                        if a.proof == self.proof {
+                            a.proof = String::new();
+                        }
+                        a.digest()
+                    }
+                    Err(_) => UNREADABLE.into(),
+                },
+            ),
             RECLAIM => {
                 let g = Self::generation(step)?;
                 Ok(if self.queue.has_items(g).await? {
@@ -593,7 +685,47 @@ impl StepExecutor for Exec {
             ALLOCATE => {
                 let first = Self::planned_control(step)?;
                 self.queue.write_recovery(None, &first).await?;
-                Ok(BTreeMap::from([("generation".into(), "1".into())]))
+                Ok(BTreeMap::from([
+                    ("generation".into(), "1".into()),
+                    ("snapshot_chain".into(), first.snapshot_chain),
+                ]))
+            }
+            AUTHORIZE_SLOT => {
+                let get = |k: &str| {
+                    step.detail
+                        .get(k)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("step names no {k}"))
+                };
+                let (slot, generation, owner) = (
+                    get("slot")?,
+                    get("generation")?.parse::<u64>()?,
+                    get("owner_record")?,
+                );
+                let mut auth = SlotRecreation::authorized(
+                    &self.source,
+                    &self.pipeline,
+                    &slot,
+                    generation,
+                    &owner,
+                );
+                anyhow::ensure!(
+                    auth.digest() == step.post,
+                    "the authorization is not the planned one"
+                );
+                auth.proof = self.proof.clone();
+                let current =
+                    read_slot_recreation(&self.backend, &self.source).await?;
+                write_slot_recreation(
+                    &self.backend,
+                    current.map(|(v, _)| v),
+                    &auth,
+                )
+                .await?;
+                Ok(BTreeMap::from([(
+                    "slot_recreation".into(),
+                    format!("authorized for generation {generation}"),
+                )]))
             }
             RECLAIM => {
                 let n = self.queue.reclaim(Self::generation(step)?).await?;
@@ -891,6 +1023,38 @@ mod tests {
         assert_eq!(incidents.audit_trail(50).await.unwrap().len(), trail);
     }
 
+    /// The recovery generation freezes the configuration of now, not the
+    /// blocked generation's: a policy changed since is frozen (so the next
+    /// start runs it in place), and bound by the plan.
+    #[tokio::test]
+    async fn the_recovery_generation_freezes_the_configured_policy() {
+        let f = fixture(SnapshotMode::Initial).await;
+        let id = blocked(&f).await;
+        let frozen = control(&f).await.1.policy;
+        f.manager
+            .pipelines
+            .write()
+            .get_mut("p")
+            .unwrap()
+            .spec
+            .spec
+            .commit_policy = Some(deltaforge_config::CommitPolicy::All);
+        let configured = policy(&f);
+        assert_ne!(frozen, configured);
+        let planned = plan(&f, Some(&id)).await.unwrap();
+        assert_eq!(
+            planned["plan"]["bindings"]["policy.configured"],
+            configured.digest.as_str()
+        );
+        apply(&f, Some(&id), &proof(&planned)).await.unwrap();
+        let (_, c) = control(&f).await;
+        assert_eq!(c.policy, configured);
+        assert_eq!(
+            c.config_fingerprint,
+            config_fingerprint(Engine::Mysql, &["shop.*".to_string()])
+        );
+    }
+
     #[tokio::test]
     async fn a_crash_before_or_after_the_replacement_resumes_once() {
         for after in [false, true] {
@@ -921,7 +1085,17 @@ mod tests {
             if after {
                 let (v, c) = control(&f).await;
                 f.queue
-                    .write_recovery(Some(v), &recovery_successor(&c))
+                    .write_recovery(
+                        Some(v),
+                        &recovery_successor(
+                            &c,
+                            &config_fingerprint(
+                                Engine::Mysql,
+                                &["shop.*".to_string()],
+                            ),
+                            policy(&f),
+                        ),
+                    )
                     .await
                     .unwrap();
             }
@@ -1154,9 +1328,14 @@ mod tests {
         assert_eq!(c.generation, 1);
         assert_eq!(c.allocation, Some(AllocationMark::Recovery));
         assert_eq!(c.policy, policy(&f));
+        // The chain is derived from the plan seed and is in the plan.
+        assert_ne!(c.snapshot_chain, PLANNED_ID);
+        assert_eq!(c.snapshot_chain.len(), 32);
+        let allocate = &a["plan"]["steps"][0];
         assert_eq!(
-            f.manager.ckpt_store.get_raw(SINK_KEY).await.unwrap(),
-            Some(cp)
+            allocate["detail"]["snapshot_chain"],
+            c.snapshot_chain.as_str()
         );
+        assert_eq!(allocate["post"], control_digest(&c).as_str());
     }
 }

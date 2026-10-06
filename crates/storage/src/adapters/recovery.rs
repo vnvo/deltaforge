@@ -100,6 +100,39 @@ impl CanonicalPlan {
     }
 }
 
+/// The placeholder of an identifier a plan creates (for example a new
+/// snapshot or continuity chain), in the plan its [`plan_seed`] is taken
+/// over.
+pub const PLANNED_ID: &str = "planned-identifier";
+
+/// The seed of the identifiers a plan creates: the digest, under its own
+/// domain, of the canonical plan in which each such identifier is
+/// [`PLANNED_ID`]. The identifiers are then derived from it
+/// ([`derived_id`]) and put into the final plan, whose digest is the proof.
+/// So the identifiers depend on every bound observation and input, and a
+/// recomputed plan yields the same identifiers and the same proof; the
+/// proof is never an input to what it proves.
+pub fn plan_seed(seeded: &CanonicalPlan) -> String {
+    let mut h = Sha256::new();
+    h.update(b"DeltaForge.Recovery.PlanSeed.v1");
+    h.update(serde_json::to_vec(seeded).expect("a canonical plan serializes"));
+    hex::encode(h.finalize())
+}
+
+/// A 128-bit identifier for `purpose`, derived from a [`plan_seed`].
+pub fn derived_id(seed: &str, purpose: &str) -> String {
+    let mut h = Sha256::new();
+    for part in [
+        b"DeltaForge.Recovery.DerivedId.v1".as_slice(),
+        purpose.as_bytes(),
+        seed.as_bytes(),
+    ] {
+        h.update((part.len() as u64).to_be_bytes());
+        h.update(part);
+    }
+    hex::encode(&h.finalize()[..16])
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordState {
@@ -193,9 +226,17 @@ impl RecoveryRecord {
     }
 }
 
+fn applied_event() -> String {
+    "applied".into()
+}
+
 /// One entry of the recovery audit trail.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryAuditEntry {
+    /// `applied` (the operation), or a later effect of it (for example
+    /// `slot_recreated`, recorded by the start it authorized).
+    #[serde(default = "applied_event")]
+    pub event: String,
     pub at_ms: i64,
     pub pipeline: String,
     pub source: String,
@@ -415,6 +456,7 @@ impl RecoveryStore {
         incidents: &IncidentStore,
     ) -> Result<()> {
         let entry = RecoveryAuditEntry {
+            event: applied_event(),
             at_ms: rec.audit_at_ms.unwrap_or(rec.started_at_ms),
             pipeline: rec.pipeline.clone(),
             source: rec.source.clone(),
@@ -439,6 +481,54 @@ impl RecoveryStore {
                 Err(e) => bail!("resolve incident {}: {e}", id.0),
             }
         }
+        Ok(())
+    }
+
+    /// Record a later effect `event` of the operation applied with `proof`
+    /// (once per proof and event), with the operation's audit fields when
+    /// its record is still the current one.
+    pub async fn append_event(
+        &self,
+        proof: &str,
+        event: &str,
+        outcomes: BTreeMap<String, String>,
+    ) -> Result<()> {
+        let (applied, resolves, source) = match self.read().await? {
+            Some((_, rec)) if rec.proof == proof => {
+                (rec.applied, rec.resolves, rec.source)
+            }
+            _ => (
+                RecoveryAudit {
+                    operation: String::new(),
+                    proof: proof.to_string(),
+                    asserted_actor: String::new(),
+                    actor_verified: false,
+                    credential: String::new(),
+                    origin: None,
+                    reason: String::new(),
+                },
+                Vec::new(),
+                String::new(),
+            ),
+        };
+        let entry = RecoveryAuditEntry {
+            event: event.to_string(),
+            at_ms: now_ms(),
+            pipeline: self.pipeline.clone(),
+            source,
+            applied,
+            resolves,
+            outcomes,
+        };
+        self.backend
+            .log_append_if_absent(
+                RECOVERY_AUDIT_NS,
+                &self.key(),
+                &format!("{proof}:{event}"),
+                &serde_json::to_vec(&entry)?,
+            )
+            .await
+            .context("append the recovery audit event")?;
         Ok(())
     }
 
@@ -828,6 +918,36 @@ mod tests {
     use super::*;
     use crate::MemoryStorageBackend;
     use std::sync::Arc;
+
+    #[test]
+    fn derived_identifiers_come_from_the_seeded_plan() {
+        let plan = |source: &str, binding: &str| {
+            CanonicalPlan::new(
+                "op",
+                "p",
+                source,
+                BTreeMap::from([("b".to_string(), binding.to_string())]),
+                vec![PlanStep {
+                    name: "s".into(),
+                    pre: "a".into(),
+                    post: PLANNED_ID.into(),
+                    detail: BTreeMap::new(),
+                }],
+                vec![],
+            )
+        };
+        let seed = plan_seed(&plan("src", "1"));
+        assert_eq!(seed, plan_seed(&plan("src", "1")), "deterministic");
+        assert_ne!(seed, plan_seed(&plan("src", "2")), "binds observations");
+        assert_ne!(seed, plan_seed(&plan("other", "1")), "binds the source");
+        let id = derived_id(&seed, "snapshot_chain");
+        assert_eq!(id.len(), 32, "128 bits");
+        assert_eq!(id, derived_id(&seed, "snapshot_chain"));
+        // Domain separation: another purpose, and the plan digest itself.
+        assert_ne!(id, derived_id(&seed, "continuity_chain"));
+        assert_ne!(seed, plan("src", "1").proof());
+        assert!(!plan("src", "1").proof().starts_with(&id));
+    }
 
     #[tokio::test]
     async fn recovery_contract_holds_in_memory() {

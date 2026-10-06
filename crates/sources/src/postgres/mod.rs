@@ -1008,6 +1008,8 @@ impl PostgresSource {
             &self.pipeline,
             &self.id,
             chkpt_store,
+            &self.backend,
+            control.generation,
         )
         .await?;
         let after = facts("snapshot anchor").await?;

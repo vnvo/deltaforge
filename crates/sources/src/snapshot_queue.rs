@@ -314,23 +314,28 @@ pub fn control_digest(control: &GenerationControl) -> String {
 }
 
 /// The generation `resnapshot` replaces `control` with: the next one of its
-/// chain, with its frozen lineage, configuration and policy, its block
-/// cleared and its start barrier pending. Pure, so a plan can bind it.
-pub fn recovery_successor(control: &GenerationControl) -> GenerationControl {
+/// chain, of its (verified) lineage, freezing the currently configured
+/// table fingerprint and policy, its block cleared and its start barrier
+/// pending. Pure, so a plan can bind it.
+pub fn recovery_successor(
+    control: &GenerationControl,
+    config_fingerprint: &str,
+    policy: PolicySnapshot,
+) -> GenerationControl {
     GenerationControl {
         record_format: RECORD_FORMAT,
         snapshot_chain: control.snapshot_chain.clone(),
         legacy_through: control.legacy_through,
         generation: control.generation + 1,
         lineage: control.lineage.clone(),
-        fingerprint_format: control.fingerprint_format,
-        config_fingerprint: control.config_fingerprint.clone(),
+        fingerprint_format: CONFIG_FINGERPRINT_FORMAT,
+        config_fingerprint: config_fingerprint.to_string(),
         state: State::Allocated,
         run: None,
         plan: PlanSummary::default(),
         anchor: None,
         anchored_at_ms: None,
-        policy: control.policy.clone(),
+        policy,
         terminal: None,
         completion: None,
         blocked: None,

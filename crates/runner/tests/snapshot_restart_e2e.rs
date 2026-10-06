@@ -1380,16 +1380,24 @@ async fn postgres_resnapshot_recovers_a_blocked_generation_and_a_lost_slot()
     let incident = resnapshot_incident(&svc, "pgrec").await;
     let (planned, applied) =
         plan_and_apply(&svc, "pgrec", Some(incident.clone())).await;
-    assert_eq!(step_names(&planned), ["replace_generation", "reclaim_plan"]);
-    assert!(
-        planned["observed"]["slot.next_start"]
-            .as_str()
-            .unwrap()
-            .contains("absent")
+    assert_eq!(
+        step_names(&planned),
+        [
+            "replace_generation",
+            "reclaim_plan",
+            "authorize_slot_recreation"
+        ]
     );
     assert_eq!(applied["state"], "completed");
     recovers_by_resume(
         &mgr, &backend, "pgrec", "pg-src", &hook, &blocked, &before,
+    )
+    .await;
+    slot_recreation_consumed(
+        &backend,
+        "pgrec",
+        "pg-src",
+        blocked.generation + 1,
     )
     .await;
     // A completed same-proof re-apply (on the stopped pipeline) stays a
@@ -1472,6 +1480,47 @@ async fn mysql_resnapshot_recovers_a_blocked_generation_and_a_purged_binlog()
     )
     .await;
     Ok(())
+}
+
+/// The authorization was consumed by exactly the recovery generation, and
+/// the recovery audit shows both the authorization and the recreation.
+async fn slot_recreation_consumed(
+    backend: &ArcStorageBackend,
+    pipeline: &str,
+    source: &str,
+    generation: u64,
+) {
+    let (_, auth) =
+        sources::snapshot_recovery::read_slot_recreation(backend, source)
+            .await
+            .unwrap()
+            .expect("an authorization");
+    assert_eq!(
+        auth.state,
+        sources::snapshot_recovery::SlotRecreationState::Consumed
+    );
+    assert_eq!(auth.generation, generation);
+    let trail = storage::adapters::recovery::RecoveryStore::new(
+        backend.clone(),
+        pipeline,
+    )
+    .audit_trail(50)
+    .await
+    .unwrap();
+    let applied = trail
+        .iter()
+        .find(|e| e.event == "applied" && e.applied.proof == auth.proof)
+        .unwrap();
+    assert!(
+        applied.outcomes["slot_recreation"].contains("authorized"),
+        "{applied:?}"
+    );
+    let recreated = trail
+        .iter()
+        .find(|e| e.event == "slot_recreated" && e.applied.proof == auth.proof)
+        .expect("the recreation is audited");
+    assert_eq!(recreated.outcomes["generation"], generation.to_string());
+    assert_eq!(recreated.applied.asserted_actor, "alice");
 }
 
 async fn slot_exists(a: &tokio_postgres::Client) -> bool {
@@ -1563,7 +1612,12 @@ async fn postgres_resnapshot_drops_only_a_provably_owned_lost_slot()
     let (planned, applied) = plan_and_apply(&svc, "pgslot", None).await;
     assert_eq!(
         step_names(&planned),
-        ["replace_generation", "reclaim_plan", "drop_lost_slot"]
+        [
+            "replace_generation",
+            "reclaim_plan",
+            "drop_lost_slot",
+            "authorize_slot_recreation"
+        ]
     );
     assert_eq!(applied["outcomes"]["slot"], "dropped_owned_lost_slot");
     assert!(!slot_exists(&admin).await);
@@ -1571,5 +1625,78 @@ async fn postgres_resnapshot_drops_only_a_provably_owned_lost_slot()
         &mgr, &backend, "pgslot", "pg-src", &hook, &blocked, &before,
     )
     .await;
+    slot_recreation_consumed(
+        &backend,
+        "pgslot",
+        "pg-src",
+        blocked.generation + 1,
+    )
+    .await;
+    Ok(())
+}
+
+/// A slot this source created and lost is never recreated implicitly: a
+/// start that needs it fails closed without an authorization, and an absent
+/// slot whose ownership record is missing is a manual repair.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn postgres_a_lost_slot_is_never_recreated_implicitly() -> Result<()> {
+    trace();
+    let (_pg, port) = start_postgres().await;
+    let (_dir, backend) = sqlite();
+    let hook = Hook::start().await;
+    let mgr = Arc::new(manager_over(backend.clone()).await);
+    let sinks = hooks_yaml(&[("hook", &hook.url, true)]);
+    mgr.start_pipeline(pg_spec_with("pglost", port, "", &sinks, ""))
+        .await?;
+    every_row_arrives(&mgr, "pglost", &hook).await;
+    until_control(&backend, "pg-src", completed).await;
+    PipelineController::stop(mgr.as_ref(), "pglost").await?;
+    until_status(&mgr, "pglost", "stopped").await;
+    let admin = pg_admin(port).await;
+    // The stopped source's walsender may still hold the slot briefly.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while admin
+        .execute("SELECT pg_drop_replication_slot('snap_slot')", &[])
+        .await
+        .is_err()
+    {
+        assert!(Instant::now() < deadline, "the slot was never dropped");
+        sleep(Duration::from_millis(200)).await;
+    }
+    // A re-snapshot start needs the slot: refused, nothing created.
+    PipelineController::patch(
+        mgr.as_ref(),
+        "pglost",
+        serde_json::json!({ "spec": { "source": { "config": {
+            "snapshot": { "mode": "always" } } } } }),
+    )
+    .await?;
+    until_status(&mgr, "pglost", "failed").await;
+    assert!(!slot_exists(&admin).await, "never recreated implicitly");
+    assert!(
+        sources::snapshot_recovery::read_slot_recreation(&backend, "pg-src")
+            .await?
+            .is_none()
+    );
+    // Without the ownership record nothing can be authorized.
+    let owner = backend
+        .kv_get("checkpoints", "slot_owner:pg-src")
+        .await?
+        .unwrap();
+    backend
+        .kv_delete("checkpoints", "slot_owner:pg-src")
+        .await?;
+    {
+        use rest_api::recovery::RecoveryController;
+        let e = recovery(&mgr)
+            .plan("pglost", plan_req(None))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, "manual_repair", "{e:?}");
+    }
+    backend
+        .kv_put("checkpoints", "slot_owner:pg-src", &owner)
+        .await?;
     Ok(())
 }

@@ -5,6 +5,7 @@
 //! recovery allocation, all without a running source.
 
 use deltaforge_core::CheckpointOrder;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use storage::adapters::LineageDescriptor;
 
@@ -152,24 +153,150 @@ pub fn config_fingerprint(engine: Engine, tables: &[String]) -> String {
         .to_string()
 }
 
-/// The chain of a first recovery allocation: derived from what the plan
-/// binds, so recomputing the plan yields the same chain.
-pub fn recovery_chain(
-    source_id: &str,
-    lineage_hash: &str,
-    bound: &str,
-) -> String {
-    let mut h = Sha256::new();
-    for part in [
-        b"dfsnaprecoverychain:v1".as_slice(),
-        source_id.as_bytes(),
-        lineage_hash.as_bytes(),
-        bound.as_bytes(),
-    ] {
-        h.update((part.len() as u64).to_be_bytes());
-        h.update(part);
+/// Namespace of single-use recovery authorizations.
+pub const AUTHORIZATION_NS: &str = "recovery.authorization";
+
+fn slot_authorization_key(source_id: &str) -> String {
+    format!("pg_slot_recreation:{source_id}")
+}
+
+/// A single-use authorization to recreate a PostgreSQL slot this source
+/// created and lost (`docs/design/recovery-cli.md`, section 5.1): written
+/// by `resnapshot`, consumed by the start of exactly its generation before
+/// the slot is created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SlotRecreation {
+    pub format: u32,
+    pub source: String,
+    pub pipeline: String,
+    pub slot: String,
+    /// The recovery generation whose start may recreate the slot.
+    pub generation: u64,
+    /// The digest of the ownership record that proved the slot was this
+    /// source's; a changed record voids the authorization.
+    pub owner_record: String,
+    /// The recovery proof that authorized it (empty in the plan: the proof
+    /// cannot be part of what it proves).
+    pub proof: String,
+    pub state: SlotRecreationState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotRecreationState {
+    Authorized,
+    /// Taken by the start of its generation, before the slot was created.
+    Consumed,
+}
+
+impl SlotRecreation {
+    pub fn authorized(
+        source: &str,
+        pipeline: &str,
+        slot: &str,
+        generation: u64,
+        owner_record: &str,
+    ) -> Self {
+        Self {
+            format: 1,
+            source: source.into(),
+            pipeline: pipeline.into(),
+            slot: slot.into(),
+            generation,
+            owner_record: owner_record.into(),
+            proof: String::new(),
+            state: SlotRecreationState::Authorized,
+        }
     }
-    hex::encode(&h.finalize()[..16])
+
+    pub fn digest(&self) -> String {
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(self).expect("an authorization serializes"),
+        ))
+    }
+}
+
+/// The stored slot recreation authorization of `source_id` and its
+/// version. An unreadable one is an error (never overwritten).
+pub async fn read_slot_recreation(
+    backend: &storage::ArcStorageBackend,
+    source_id: &str,
+) -> anyhow::Result<Option<(u64, SlotRecreation)>> {
+    let Some((v, bytes)) = backend
+        .slot_get(AUTHORIZATION_NS, &slot_authorization_key(source_id))
+        .await?
+    else {
+        return Ok(None);
+    };
+    let rec: SlotRecreation = serde_json::from_slice(&bytes).map_err(|e| {
+        anyhow::Error::new(storage::adapters::CorruptRecord(format!(
+            "slot recreation authorization of {source_id}: {e}"
+        )))
+    })?;
+    anyhow::ensure!(
+        rec.format == 1,
+        storage::adapters::CorruptRecord(format!(
+            "slot recreation authorization of {source_id}: format {}",
+            rec.format
+        ))
+    );
+    Ok(Some((v, rec)))
+}
+
+/// Write `rec` over exactly the stored version `expected` (or create it).
+pub async fn write_slot_recreation(
+    backend: &storage::ArcStorageBackend,
+    expected: Option<u64>,
+    rec: &SlotRecreation,
+) -> anyhow::Result<()> {
+    let key = slot_authorization_key(&rec.source);
+    let bytes = serde_json::to_vec(rec)?;
+    let written = match expected {
+        None => backend
+            .slot_create(AUTHORIZATION_NS, &key, &bytes)
+            .await?
+            .is_some(),
+        Some(v) => backend.slot_cas(AUTHORIZATION_NS, &key, v, &bytes).await?,
+    };
+    anyhow::ensure!(
+        written,
+        "the slot recreation authorization of {} changed concurrently",
+        rec.source
+    );
+    Ok(())
+}
+
+/// Consume the authorization to recreate `slot` at the start of
+/// `generation`: only an `authorized` record of exactly this source,
+/// pipeline, slot, generation and ownership record, by one CAS. Returns
+/// the consumed authorization, or `None` when there is none to consume.
+pub async fn consume_slot_recreation(
+    backend: &storage::ArcStorageBackend,
+    source_id: &str,
+    pipeline: &str,
+    slot: &str,
+    generation: u64,
+    owner_record: &str,
+) -> anyhow::Result<Option<SlotRecreation>> {
+    let Some((v, rec)) = read_slot_recreation(backend, source_id).await? else {
+        return Ok(None);
+    };
+    let matches = rec.state == SlotRecreationState::Authorized
+        && rec.source == source_id
+        && rec.pipeline == pipeline
+        && rec.slot == slot
+        && rec.generation == generation
+        && rec.owner_record == owner_record;
+    if !matches {
+        return Ok(None);
+    }
+    let consumed = SlotRecreation {
+        state: SlotRecreationState::Consumed,
+        ..rec
+    };
+    write_slot_recreation(backend, Some(v), &consumed).await?;
+    Ok(Some(consumed))
 }
 
 #[cfg(test)]
@@ -256,11 +383,42 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_recovery_chain_is_deterministic() {
-        let a = recovery_chain("s", "l", "b");
-        assert_eq!(a, recovery_chain("s", "l", "b"));
-        assert_eq!(a.len(), 32);
-        assert_ne!(a, recovery_chain("s", "l", "c"));
+    #[tokio::test]
+    async fn a_slot_recreation_is_consumed_once_by_its_generation() {
+        let b: storage::ArcStorageBackend =
+            std::sync::Arc::new(storage::MemoryStorageBackend::new());
+        let auth = SlotRecreation::authorized("src", "p", "slot", 3, "owner");
+        write_slot_recreation(&b, None, &auth).await.unwrap();
+        // Another generation, slot, pipeline or ownership record: nothing.
+        for (p, s, g, o) in [
+            ("p", "slot", 2, "owner"),
+            ("p", "other", 3, "owner"),
+            ("q", "slot", 3, "owner"),
+            ("p", "slot", 3, "changed"),
+        ] {
+            assert!(
+                consume_slot_recreation(&b, "src", p, s, g, o)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let taken = consume_slot_recreation(&b, "src", "p", "slot", 3, "owner")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken.state, SlotRecreationState::Consumed);
+        // Single use.
+        assert!(
+            consume_slot_recreation(&b, "src", "p", "slot", 3, "owner")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // An unreadable record is an error, never consumed or replaced.
+        b.slot_upsert(AUTHORIZATION_NS, "pg_slot_recreation:bad", b"{")
+            .await
+            .unwrap();
+        assert!(read_slot_recreation(&b, "bad").await.is_err());
     }
 }

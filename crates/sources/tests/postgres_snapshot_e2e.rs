@@ -1068,6 +1068,8 @@ async fn legacy_completed(
             &src.pipeline,
             id,
             &ckpt,
+            &src.backend,
+            3,
         )
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;

@@ -60,6 +60,8 @@ impl OperationContext {
         &self,
     ) -> Result<BTreeMap<String, String>, RecoveryApiError> {
         let mut b = BTreeMap::new();
+        b.insert("source.tenant".into(), self.spec.metadata.tenant.clone());
+        b.insert("source.id".into(), self.source_id().to_string());
         if let Some(i) = &self.incident {
             b.insert("incident".into(), i.incident_id.0.clone());
             b.insert(
