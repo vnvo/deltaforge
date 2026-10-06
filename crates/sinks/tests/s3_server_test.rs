@@ -1,18 +1,17 @@
-//! Phase 1a smoke test for S3 + Parquet against a MinIO testcontainer.
+//! S3 sink writers (Parquet, JSON Lines) against the S3-compatible test
+//! server (`s3-test-server`: RustFS, pinned).
 //!
 //! Run with:
-//!   cargo test -p sinks --test s3_minio_test -- --ignored
+//!   cargo test -p sinks --test s3_server_test -- --ignored
 //!
 //! These tests require Docker. They are gated behind `#[ignore]` so the
 //! default `cargo test` run stays fast and dependency-free.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arrow_array::RecordBatch;
 use ctor::dtor;
-use gate_ownership::GateOwned;
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
@@ -21,101 +20,37 @@ use sinks::s3::{
     Compression, JsonLinesFormat, ObjectStoreParams, ParquetFormat,
     ParquetSinkWriter, SimpleRow, build_object_store,
 };
-use testcontainers::core::{IntoContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::sync::OnceCell;
 
-const MINIO_PORT: u16 = 9000;
-const MINIO_ACCESS_KEY: &str = "minioadmin";
-const MINIO_SECRET_KEY: &str = "minioadmin";
 const TEST_BUCKET: &str = "deltaforge-test";
 
-struct MinioInfra {
-    #[allow(dead_code)]
-    container: ContainerAsync<GenericImage>,
-    endpoint: String,
-}
-
-static MINIO: OnceCell<MinioInfra> = OnceCell::const_new();
-
 #[dtor]
-fn cleanup_minio() {
-    if let Some(infra) = MINIO.get() {
-        std::process::Command::new("docker")
-            .args(["rm", "-f", infra.container.id()])
-            .output()
-            .ok();
-    }
+fn cleanup_server() {
+    s3_test_server::remove_shared();
 }
 
-async fn minio() -> &'static MinioInfra {
-    MINIO
+/// The binary's shared S3 test server (`s3-test-server`), with the test
+/// bucket created.
+async fn server() -> &'static s3_test_server::S3Server {
+    static BUCKET: OnceCell<()> = OnceCell::const_new();
+    let server = s3_test_server::shared().await;
+    BUCKET
         .get_or_init(|| async {
-            // MinIO in filesystem mode treats top-level dirs under /data as
-            // buckets, so we pre-create `/data/{TEST_BUCKET}` and skip the
-            // need for SigV4-signed CreateBucket requests in this test.
-            let container = GenericImage::new("minio/minio", "latest")
-                .with_wait_for(WaitFor::seconds(2))
-                .with_exposed_port(MINIO_PORT.tcp())
-                .with_entrypoint("/bin/sh")
-                .with_env_var("MINIO_ROOT_USER", MINIO_ACCESS_KEY)
-                .with_env_var("MINIO_ROOT_PASSWORD", MINIO_SECRET_KEY)
-                .with_cmd(vec![
-                    "-c".to_string(),
-                    format!(
-                        "mkdir -p /data/{TEST_BUCKET} && \
-                         minio server /data"
-                    ),
-                ])
-                .gate_owned()
-                .start()
+            server
+                .create_bucket(TEST_BUCKET)
                 .await
-                .expect("start MinIO container");
-            let host = container.get_host().await.expect("minio host");
-            let port = container
-                .get_host_port_ipv4(MINIO_PORT)
-                .await
-                .expect("minio host port");
-            let endpoint = format!("http://{host}:{port}");
-
-            // Wait for MinIO's HTTP listener to be reachable.
-            wait_for_http(&endpoint, Duration::from_secs(30))
-                .await
-                .expect("MinIO HTTP ready");
-
-            MinioInfra {
-                container,
-                endpoint,
-            }
+                .expect("create the test bucket")
         })
-        .await
-}
-
-async fn wait_for_http(endpoint: &str, timeout: Duration) -> Result<()> {
-    let client = reqwest::Client::new();
-    let deadline = tokio::time::Instant::now() + timeout;
-    while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client
-            .get(format!("{endpoint}/minio/health/live"))
-            .timeout(Duration::from_secs(2))
-            .send()
-            .await
-            && resp.status().is_success()
-        {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
-    anyhow::bail!("MinIO never became ready at {endpoint}")
+        .await;
+    server
 }
 
 fn params_for(endpoint: &str) -> ObjectStoreParams {
-    ObjectStoreParams::s3_minio(
+    ObjectStoreParams::s3_compatible(
         TEST_BUCKET,
         endpoint,
-        MINIO_ACCESS_KEY,
-        MINIO_SECRET_KEY,
+        s3_test_server::ACCESS_KEY,
+        s3_test_server::SECRET_KEY,
     )
 }
 
@@ -148,12 +83,12 @@ fn sample_rows(n: usize) -> Vec<SimpleRow> {
 
 #[tokio::test]
 #[ignore]
-async fn phase1a_writes_parquet_to_minio() -> Result<()> {
-    let infra = minio().await;
+async fn phase1a_writes_parquet_to_s3_server() -> Result<()> {
+    let infra = server().await;
     let store = build_object_store(&params_for(&infra.endpoint))?;
     let writer = ParquetSinkWriter::new(store.clone());
 
-    let path = Path::from("phase1a/minio_smoke.parquet");
+    let path = Path::from("phase1a/server_smoke.parquet");
     let rows = sample_rows(5000);
     let written = writer.write_rows(&path, &rows).await?;
     assert_eq!(written, 5000);
@@ -166,11 +101,11 @@ async fn phase1a_writes_parquet_to_minio() -> Result<()> {
 #[tokio::test]
 #[ignore]
 async fn phase1a_writes_large_file_via_multipart() -> Result<()> {
-    let infra = minio().await;
+    let infra = server().await;
     let store = build_object_store(&params_for(&infra.endpoint))?;
     let writer = ParquetSinkWriter::new(store.clone());
 
-    let path = Path::from("phase1a/minio_large.parquet");
+    let path = Path::from("phase1a/server_large.parquet");
     // 200K rows ≈ ~10 MiB before compression; ends up well into multipart
     // territory after Parquet+snappy, validating object_store's multipart path.
     let rows = sample_rows(200_000);
@@ -184,8 +119,8 @@ async fn phase1a_writes_large_file_via_multipart() -> Result<()> {
 
 #[tokio::test]
 #[ignore]
-async fn phase1b_writes_jsonl_gzip_to_minio() -> Result<()> {
-    let infra = minio().await;
+async fn phase1b_writes_jsonl_gzip_to_s3_server() -> Result<()> {
+    let infra = server().await;
     let store = build_object_store(&params_for(&infra.endpoint))?;
     let format = JsonLinesFormat::new(Compression::Gzip);
 
@@ -206,8 +141,8 @@ async fn phase1b_writes_jsonl_gzip_to_minio() -> Result<()> {
 
 #[tokio::test]
 #[ignore]
-async fn phase1b_writes_jsonl_plain_to_minio() -> Result<()> {
-    let infra = minio().await;
+async fn phase1b_writes_jsonl_plain_to_s3_server() -> Result<()> {
+    let infra = server().await;
     let store = build_object_store(&params_for(&infra.endpoint))?;
     let format = JsonLinesFormat::new(Compression::None);
 
@@ -245,7 +180,7 @@ async fn phase1e_abandoned_writer_produces_no_visible_object() -> Result<()> {
     };
     use std::sync::Arc;
 
-    let infra = minio().await;
+    let infra = server().await;
     let store = build_object_store(&params_for(&infra.endpoint))?;
 
     let cols = vec![ColumnDesc {
@@ -336,7 +271,7 @@ async fn phase1e_abandoned_writer_produces_no_visible_object() -> Result<()> {
         "abandoned writer leaked a visible object: {} entries",
         listed.len()
     );
-    // The orphan multipart still exists on MinIO until lifecycle expires
+    // The orphan multipart still exists on the server until lifecycle expires
     // it — that's the operational requirement, not a test failure.
     Ok(())
 }
@@ -344,13 +279,13 @@ async fn phase1e_abandoned_writer_produces_no_visible_object() -> Result<()> {
 #[tokio::test]
 #[ignore]
 async fn phase1b_parquet_via_format_trait() -> Result<()> {
-    let infra = minio().await;
+    let infra = server().await;
     let store = build_object_store(&params_for(&infra.endpoint))?;
     let _format = ParquetFormat::default();
 
     // The incremental ParquetFormat::open_writer flow is exercised by the
     // Phase 1d e2e tests against local FS. Here we just smoke-check that
-    // a ParquetSinkWriter (the facade) writes successfully to MinIO.
+    // a ParquetSinkWriter (the facade) writes successfully to the server.
     let writer = ParquetSinkWriter::new(store.clone());
     let path = Path::from("phase1b/via_trait.parquet");
     let rows = sample_rows(5000);

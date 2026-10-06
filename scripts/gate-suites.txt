@@ -34,6 +34,11 @@ serial     scale-harness/live_ttfce         -p scale-harness --test live_ttfce
 # Live suites, run concurrently
 # The PostgreSQL queue contract needs the serial-pg lane's DSN.
 parallel   sources/lib                      -p sources --lib -- --include-ignored --test-threads=1 --skip pg_queue_
+# The S3 behavior DeltaForge depends on, against the pinned S3 test server.
+parallel   sinks/lib-s3-server              -p sinks --lib -- --include-ignored --test-threads=1 s3_server_contract
+# The durable_v2 sink's live matrix (publish/recover, fencing, rollup fallback,
+# GC, orphan reconciliation) against the same pinned server.
+parallel   sinks/lib-s3-server-it           -p sinks --lib -- --include-ignored --test-threads=1 s3_server_it
 parallel   sources/failover_e2e             -p sources --test failover_e2e
 parallel   sources/pg_failover_topology_e2e -p sources --test pg_failover_topology_e2e
 parallel   sources/mysql_activation_e2e     -p sources --test mysql_activation_e2e
@@ -88,7 +93,7 @@ release    sinks/nats_sink_tests            -p sinks --test nats_sink_tests
 release    sinks/redis_sink_tests           -p sinks --test redis_sink_tests
 release    sinks/elasticsearch_sink_tests   -p sinks --test elasticsearch_sink_tests
 release    sinks/clickhouse_sink_tests      -p sinks --test clickhouse_sink_tests
-release    sinks/s3_minio_test              -p sinks --test s3_minio_test
+release    sinks/s3_server_test             -p sinks --test s3_server_test
 release    sinks/avro_encoding_tests        -p sinks --test avro_encoding_tests
 release    runner/avro_e2e_tests            -p runner --test avro_e2e_tests
 release    runner/s3_ministack_canary       -p runner --test s3_ministack_canary

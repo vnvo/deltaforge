@@ -39,7 +39,7 @@ pub struct ObjectStoreParams {
 }
 
 impl ObjectStoreParams {
-    pub fn s3_minio(
+    pub fn s3_compatible(
         bucket: impl Into<String>,
         endpoint: impl Into<String>,
         access_key_id: impl Into<String>,

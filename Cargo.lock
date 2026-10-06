@@ -5050,6 +5050,7 @@ dependencies = [
  "rdkafka",
  "reqwest",
  "rest-api",
+ "s3-test-server",
  "schema-registry",
  "schema-sensing",
  "secrets",
@@ -5256,6 +5257,22 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "s3-test-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "gate-ownership",
+ "hex",
+ "hmac 0.12.1",
+ "reqwest",
+ "sha2 0.10.9",
+ "testcontainers",
+ "tokio",
+ "url",
+]
 
 [[package]]
 name = "same-file"
@@ -5827,6 +5844,7 @@ dependencies = [
  "rdkafka",
  "redis",
  "reqwest",
+ "s3-test-server",
  "secrets",
  "serde",
  "serde_json",

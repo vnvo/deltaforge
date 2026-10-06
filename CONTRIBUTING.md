@@ -8,7 +8,7 @@ engine; this guide covers the local workflow and the checks a change must pass.
 - **Rust** — the project builds and is tested on the current `stable` toolchain
   (the release images use Rust 1.91). `rust-toolchain.toml` pins `stable`.
 - **Docker** — required for the integration and chaos test suites (databases,
-  Kafka, MinIO, Elasticsearch, etc.).
+  Kafka, S3 servers, Elasticsearch, etc.).
 
 ## Build & checks
 

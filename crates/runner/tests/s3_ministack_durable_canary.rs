@@ -126,7 +126,7 @@ fn row(id: u64) -> Event {
 }
 
 fn raw_store(endpoint: &str) -> Result<Arc<dyn ObjectStore>> {
-    build_object_store(&ObjectStoreParams::s3_minio(
+    build_object_store(&ObjectStoreParams::s3_compatible(
         BUCKET, endpoint, MS_KEY, MS_SECRET,
     ))
 }

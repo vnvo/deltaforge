@@ -1,11 +1,11 @@
-//! Live MinIO / S3 integration tests for the durable S3 path (P0.4, Commit 11).
+//! Live S3-server integration tests for the durable S3 path.
 //!
 //! These are `#[ignore]`d, so they never run in a normal `cargo test`. When run
-//! EXPLICITLY (the command below), they REQUIRE a real S3-compatible backend and
-//! fail loudly if it is not configured: a missing env var or a store that will not
-//! construct panics rather than passing vacuously. A selected live test therefore
-//! either exercises the provider or fails - it can never report a green run while
-//! testing nothing, and it cannot hide invalid credentials or a malformed endpoint.
+//! EXPLICITLY they always exercise a real S3 server: with no `DELTAFORGE_IT_S3_*`
+//! variable set they start the pinned S3 test server (`s3-test-server`, the core
+//! gate lane `sinks/lib-s3-server-it`); with the full set they use that external
+//! server. A partial set, or a store that will not construct, panics rather than
+//! passing vacuously or silently switching servers.
 //!
 //! They exercise ACTUAL provider behavior - conditional writes, ETag CAS, listing
 //! timestamps, deletes - which the in-memory `FaultStore` suite cannot prove:
@@ -14,13 +14,19 @@
 //! reconciliation, and end-to-end recoverability after combined compaction + entry
 //! expiry + original deletion + restart.
 //!
-//! Run (with MinIO up and a bucket created):
+//! Run against the pinned server:
 //! ```text
-//! export DELTAFORGE_IT_S3_ENDPOINT=http://localhost:9000
-//! export DELTAFORGE_IT_S3_BUCKET=deltaforge-it
-//! export DELTAFORGE_IT_S3_ACCESS_KEY=minioadmin
-//! export DELTAFORGE_IT_S3_SECRET_KEY=minioadmin
-//! cargo test -p sinks --lib -- --ignored minio
+//! cargo test -p sinks --lib -- --include-ignored --test-threads=1 s3_server_it
+//! ```
+//! or against an external server with a bucket created (see
+//! `docs/src/sinks/s3-test-backends.md`):
+//! ```text
+//! export DELTAFORGE_IT_S3_ENDPOINT=<endpoint>
+//! export DELTAFORGE_IT_S3_BUCKET=<bucket>
+//! export DELTAFORGE_IT_S3_ACCESS_KEY=<access key>
+//! export DELTAFORGE_IT_S3_SECRET_KEY=<secret key>
+//! export DELTAFORGE_IT_S3_REGION=<region>   # optional, default us-east-1
+//! cargo test -p sinks --lib -- --include-ignored --test-threads=1 s3_server_it
 //! ```
 //! Lost/ambiguous provider responses cannot be forced deterministically against a real
 //! backend; that boundary is covered by the injected in-memory fault matrix.
@@ -97,41 +103,127 @@ fn tobj_jsonl(table: &str, rows: &[u32]) -> TableObject {
     }
 }
 
-/// A required env var, or a loud panic naming it. Because these tests are
-/// `#[ignore]`d, reaching here means the operator asked to run them explicitly, so a
-/// missing variable is a configuration error, never a reason to pass vacuously.
-fn require_env(name: &str) -> String {
-    match std::env::var(name) {
-        Ok(v) if !v.is_empty() => v,
-        _ => panic!(
-            "live MinIO/S3 test requires env var {name} to be set to a non-empty \
-             value. These tests are #[ignore]d; running them explicitly must \
-             exercise a real backend. See this module's docs for the full set."
-        ),
-    }
+/// The external-server variables. All four required ones set: run against
+/// that server. None set: start the pinned S3 test server. Anything in
+/// between is refused, so a typo can never silently redirect the run.
+const IT_REQUIRED: [&str; 4] = [
+    "DELTAFORGE_IT_S3_ENDPOINT",
+    "DELTAFORGE_IT_S3_BUCKET",
+    "DELTAFORGE_IT_S3_ACCESS_KEY",
+    "DELTAFORGE_IT_S3_SECRET_KEY",
+];
+const IT_REGION: &str = "DELTAFORGE_IT_S3_REGION";
+const PINNED_BUCKET: &str = "deltaforge-it";
+
+#[ctor::dtor]
+fn cleanup_server() {
+    s3_test_server::remove_shared();
 }
 
-/// Build a `ConditionalStore` over the configured MinIO/S3 backend. Panics loudly if
-/// any required variable is missing or the store cannot be constructed - a selected
-/// live test must exercise the provider or fail, never pass without testing anything.
-fn it_store() -> Arc<ObjectStoreConditional> {
-    let params = ObjectStoreParams {
-        bucket: require_env("DELTAFORGE_IT_S3_BUCKET"),
-        endpoint: Some(require_env("DELTAFORGE_IT_S3_ENDPOINT")),
-        region: Some(
-            std::env::var("DELTAFORGE_IT_S3_REGION")
-                .unwrap_or_else(|_| "us-east-1".into()),
-        ),
-        access_key_id: Some(require_env("DELTAFORGE_IT_S3_ACCESS_KEY")),
-        secret_access_key: Some(require_env("DELTAFORGE_IT_S3_SECRET_KEY")),
+/// Where the live tests run, from the `DELTAFORGE_IT_S3_*` variables
+/// (`None` = the pinned server).
+fn it_target(
+    var: impl Fn(&str) -> Option<String>,
+) -> Result<Option<ObjectStoreParams>, String> {
+    let var = |name: &str| var(name).filter(|v| !v.is_empty());
+    let set: Vec<_> = IT_REQUIRED.iter().filter(|n| var(n).is_some()).collect();
+    if set.is_empty() && var(IT_REGION).is_none() {
+        return Ok(None);
+    }
+    if set.len() < IT_REQUIRED.len() {
+        let missing: Vec<_> =
+            IT_REQUIRED.iter().filter(|n| var(n).is_none()).collect();
+        return Err(format!(
+            "partial DELTAFORGE_IT_S3_* configuration: missing {missing:?}. Set \
+             all of {IT_REQUIRED:?} for an external server, or none to use the \
+             pinned S3 test server"
+        ));
+    }
+    let get = |name: &str| var(name).expect("checked above");
+    Ok(Some(ObjectStoreParams {
+        bucket: get("DELTAFORGE_IT_S3_BUCKET"),
+        endpoint: Some(get("DELTAFORGE_IT_S3_ENDPOINT")),
+        region: Some(var(IT_REGION).unwrap_or_else(|| "us-east-1".into())),
+        access_key_id: Some(get("DELTAFORGE_IT_S3_ACCESS_KEY")),
+        secret_access_key: Some(get("DELTAFORGE_IT_S3_SECRET_KEY")),
         session_token: None,
         virtual_hosted_style: false,
         local: false,
+    }))
+}
+
+/// A `ConditionalStore` over the configured external server, or over the
+/// pinned S3 test server when none is configured. Panics on a partial
+/// configuration or a store that cannot be built: a selected live test must
+/// exercise a real server or fail, never pass without testing anything.
+async fn it_store() -> Arc<ObjectStoreConditional> {
+    let params = match it_target(|n| std::env::var(n).ok()) {
+        Ok(Some(params)) => params,
+        Ok(None) => {
+            static BUCKET_READY: tokio::sync::OnceCell<()> =
+                tokio::sync::OnceCell::const_new();
+            let server = s3_test_server::shared().await;
+            BUCKET_READY
+                .get_or_init(|| async {
+                    server.create_bucket(PINNED_BUCKET).await.expect(
+                        "create the bucket on the pinned S3 test server",
+                    )
+                })
+                .await;
+            ObjectStoreParams::s3_compatible(
+                PINNED_BUCKET,
+                server.endpoint.clone(),
+                s3_test_server::ACCESS_KEY,
+                s3_test_server::SECRET_KEY,
+            )
+        }
+        Err(e) => panic!("{e}"),
     };
-    let store = build_object_store(&params).expect(
-        "construct live S3/MinIO object store from DELTAFORGE_IT_S3_* env vars",
-    );
+    let store = build_object_store(&params)
+        .expect("construct the live S3 object store");
     Arc::new(ObjectStoreConditional::new(store))
+}
+
+#[test]
+fn it_target_is_all_or_nothing() {
+    use std::collections::HashMap;
+    let env = |pairs: &[(&str, &str)]| {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name: &str| map.get(name).cloned()
+    };
+    assert!(matches!(it_target(env(&[])), Ok(None)));
+    let full = [
+        ("DELTAFORGE_IT_S3_ENDPOINT", "http://s3:9000"),
+        ("DELTAFORGE_IT_S3_BUCKET", "b"),
+        ("DELTAFORGE_IT_S3_ACCESS_KEY", "k"),
+        ("DELTAFORGE_IT_S3_SECRET_KEY", "s"),
+    ];
+    let params = it_target(env(&full)).unwrap().expect("external server");
+    assert_eq!(params.endpoint.as_deref(), Some("http://s3:9000"));
+    assert_eq!(params.bucket, "b");
+    for skip in 0..full.len() {
+        let partial: Vec<_> = full
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != skip)
+            .map(|(_, kv)| *kv)
+            .collect();
+        let err = it_target(env(&partial)).unwrap_err();
+        assert!(err.contains(full[skip].0), "{err}");
+    }
+    let mut blank = full.to_vec();
+    blank[1].1 = "";
+    assert!(
+        it_target(env(&blank)).is_err(),
+        "an empty value counts as unset"
+    );
+    assert!(
+        it_target(env(&[(IT_REGION, "eu-west-1")])).is_err(),
+        "a region alone is a partial configuration"
+    );
 }
 
 /// A fresh unique prefix per test, so runs never collide on a shared bucket.
@@ -186,20 +278,20 @@ fn now_ms() -> u64 {
 }
 
 #[tokio::test]
-#[ignore = "requires a live MinIO/S3 backend (DELTAFORGE_IT_S3_*)"]
-async fn minio_conditional_write_probe_passes() {
-    let store = it_store();
+#[ignore = "live S3 server: the pinned one, or DELTAFORGE_IT_S3_*"]
+async fn s3_server_conditional_write_probe_passes() {
+    let store = it_store().await;
     let prefix = unique_prefix();
     // Real conditional-write + ETag capability parity on the live backend.
     probe_conditional_writes(store.as_ref(), &prefix)
         .await
-        .expect("MinIO/S3 honors create-only + CAS conditions");
+        .expect("the S3 server honors create-only + CAS conditions");
 }
 
 #[tokio::test]
-#[ignore = "requires a live MinIO/S3 backend (DELTAFORGE_IT_S3_*)"]
-async fn minio_publish_ack_and_recover() {
-    let store = it_store();
+#[ignore = "live S3 server: the pinned one, or DELTAFORGE_IT_S3_*"]
+async fn s3_server_publish_ack_and_recover() {
+    let store = it_store().await;
     let prefix = unique_prefix();
     let w = acquire(Arc::clone(&store), &prefix).await.unwrap();
     w.publish(&wm(1), vec![tobj_jsonl("orders", &[1])], 1)
@@ -220,9 +312,9 @@ async fn minio_publish_ack_and_recover() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live MinIO/S3 backend (DELTAFORGE_IT_S3_*)"]
-async fn minio_concurrent_writers_fence() {
-    let store = it_store();
+#[ignore = "live S3 server: the pinned one, or DELTAFORGE_IT_S3_*"]
+async fn s3_server_concurrent_writers_fence() {
+    let store = it_store().await;
     let prefix = unique_prefix();
     let a = acquire(Arc::clone(&store), &prefix).await.unwrap();
     let b = acquire(Arc::clone(&store), &prefix).await.unwrap();
@@ -239,9 +331,9 @@ async fn minio_concurrent_writers_fence() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live MinIO/S3 backend (DELTAFORGE_IT_S3_*)"]
-async fn minio_rollup_fallback_after_gc() {
-    let store = it_store();
+#[ignore = "live S3 server: the pinned one, or DELTAFORGE_IT_S3_*"]
+async fn s3_server_rollup_fallback_after_gc() {
+    let store = it_store().await;
     let prefix = unique_prefix();
     let w = acquire(Arc::clone(&store), &prefix).await.unwrap();
     w.publish(&wm(1), vec![tobj_jsonl("orders", &[1])], 1)
@@ -274,9 +366,9 @@ async fn minio_rollup_fallback_after_gc() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live MinIO/S3 backend (DELTAFORGE_IT_S3_*)"]
-async fn minio_full_lifecycle_recoverable_after_combined_gc() {
-    let store = it_store();
+#[ignore = "live S3 server: the pinned one, or DELTAFORGE_IT_S3_*"]
+async fn s3_server_full_lifecycle_recoverable_after_combined_gc() {
+    let store = it_store().await;
     let prefix = unique_prefix();
     let w = acquire(Arc::clone(&store), &prefix).await.unwrap();
     w.publish(&wm(1), vec![tobj_jsonl("orders", &[1])], 1)
@@ -314,9 +406,9 @@ async fn minio_full_lifecycle_recoverable_after_combined_gc() {
 }
 
 #[tokio::test]
-#[ignore = "requires a live MinIO/S3 backend (DELTAFORGE_IT_S3_*)"]
-async fn minio_reconcile_deletes_orphan_after_grace() {
-    let store = it_store();
+#[ignore = "live S3 server: the pinned one, or DELTAFORGE_IT_S3_*"]
+async fn s3_server_reconcile_deletes_orphan_after_grace() {
+    let store = it_store().await;
     let prefix = unique_prefix();
     let w = acquire(Arc::clone(&store), &prefix).await.unwrap();
     w.publish(&wm(1), vec![tobj_jsonl("orders", &[1])], 1)
