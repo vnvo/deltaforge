@@ -60,7 +60,7 @@ die() {
 # workspace step would silently skip it).
 check_manifest() {
   local ok=0 f name listed
-  listed=$(grep -Ev '^\s*(#|$)' "$MANIFEST" | awk '{print $2}' | grep -Ev '/lib(-pg)?$' | sort)
+  listed=$(grep -Ev '^\s*(#|$)' "$MANIFEST" | awk '{print $2}' | grep -Ev '/lib(-[a-z0-9-]+)?$' | sort)
   for f in crates/*/tests/*.rs; do
     name="$(basename "$(dirname "$(dirname "$f")")")/$(basename "$f" .rs)"
     case $(grep -cx "$name" <<<"$listed") in

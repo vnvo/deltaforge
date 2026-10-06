@@ -29,6 +29,8 @@ mod rolling;
 mod rollup;
 mod router;
 #[cfg(test)]
+mod s3_server_contract;
+#[cfg(test)]
 mod s3_server_it;
 mod sink;
 mod store_cond;
