@@ -50,6 +50,8 @@ pub use canonical_json::canonical_json_bytes;
 
 pub mod replay;
 
+pub mod table_metrics;
+
 // ============================================================================
 // Operation Type
 // ============================================================================

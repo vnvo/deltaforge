@@ -946,6 +946,7 @@ impl PipelineManager {
     ) -> Result<PipelineRuntime> {
         let pipeline_name = spec.metadata.name.clone();
         counter!("deltaforge_pipelines_total").increment(1);
+        crate::pipeline_metrics::register(&spec);
 
         // Create cancellation token early so it can be shared with sinks
         let cancel = CancellationToken::new();
@@ -1564,6 +1565,11 @@ impl PipelineManager {
             spec.spec.sinks.len(),
         )
         .map_err(|e| PipelineAPIError::Failed(anyhow::anyhow!(e)))?;
+        spec.spec
+            .metrics
+            .per_table
+            .validate()
+            .map_err(|e| PipelineAPIError::Failed(anyhow::anyhow!(e)))?;
 
         // Claim the source id before spawning so two pipelines can never share a
         // source id and corrupt each other's checkpoints. A restart of the same
@@ -2618,6 +2624,7 @@ impl PipelineController for PipelineManager {
 
         // Everything durable is cleaned; now drop the in-memory runtime.
         self.pipelines.write().remove(name);
+        crate::pipeline_metrics::forget(name);
         Ok(())
     }
 
@@ -2969,6 +2976,7 @@ mod tests {
                 annotations: Default::default(),
             },
             spec: Spec {
+                metrics: Default::default(),
                 sharding: None,
                 source: SourceCfg::Mysql(MysqlSrcCfg {
                     id: "mysql".to_string(),

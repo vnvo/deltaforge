@@ -3,6 +3,7 @@ pub mod dlq;
 pub mod drift_detector;
 pub mod incidents;
 pub mod pipeline_manager;
+pub mod pipeline_metrics;
 pub mod preflight;
 pub mod recover_cli;
 pub mod recovery;
