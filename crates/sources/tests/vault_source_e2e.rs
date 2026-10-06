@@ -267,7 +267,8 @@ async fn vault_kv_rotation_reconnects_postgres_and_continues_cdc() -> Result<()>
     .await?;
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel(256);
+    let (tx, mut rx) =
+        test_common::acked_channel_dyn(&source, &ckpt, "pg-vault-rot", 256);
     let handle = source.run(tx, ckpt).await;
 
     let pid_before =

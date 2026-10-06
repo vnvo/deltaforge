@@ -25,7 +25,6 @@ use deltaforge_core::{
     CheckpointOrder, Source, SourceError, SourceHandle, SourceItem,
     SourceResult,
 };
-use storage::BackendCheckpointStore;
 use storage::adapters::incidents::IncidentStore;
 
 use crate::snapshot_generation::PersistedLineage;
@@ -91,7 +90,7 @@ use storage::adapters::LineageDescriptor;
 // Checkpoint
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PostgresCheckpoint {
     pub lsn: String,
     pub tx_id: Option<u32>,
@@ -104,6 +103,130 @@ pub struct PostgresCheckpoint {
     pub chain: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transition: Option<u64>,
+    /// On the position completing a snapshot generation (its anchor, with the
+    /// anchor's continuity stamp): the generation and its snapshot chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_completed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_chain: Option<String>,
+}
+
+/// A snapshot generation's anchor: the slot's consistent point and the
+/// continuity stamp of the server history it was taken on, when one was
+/// recorded (all three members or none). A format-1 snapshot position
+/// records the bare LSN text, read as an anchor without a stamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PgAnchor {
+    pub lsn: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeline: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transition: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for PgAnchor {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Stamped {
+            lsn: String,
+            #[serde(default)]
+            timeline: Option<u32>,
+            #[serde(default)]
+            chain: Option<String>,
+            #[serde(default)]
+            transition: Option<u64>,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Bare(String),
+            Stamped(Stamped),
+        }
+        Ok(match Repr::deserialize(d)? {
+            Repr::Bare(lsn) => PgAnchor {
+                lsn,
+                timeline: None,
+                chain: None,
+                transition: None,
+            },
+            Repr::Stamped(a) => PgAnchor {
+                lsn: a.lsn,
+                timeline: a.timeline,
+                chain: a.chain,
+                transition: a.transition,
+            },
+        })
+    }
+}
+
+impl PgAnchor {
+    pub(crate) fn new(
+        lsn: Lsn,
+        stamp: Option<&postgres_continuity::Stamp>,
+    ) -> Self {
+        Self {
+            lsn: lsn.to_string(),
+            timeline: stamp.map(|s| s.timeline),
+            chain: stamp.map(|s| s.chain_id.clone()),
+            transition: stamp.map(|s| s.transition),
+        }
+    }
+
+    /// The anchor as a stream checkpoint (its LSN and stamp), for ordering
+    /// against stream positions with the continuity rules.
+    pub(crate) fn as_checkpoint(&self) -> Vec<u8> {
+        serde_json::to_vec(&PostgresCheckpoint {
+            lsn: self.lsn.clone(),
+            tx_id: None,
+            timeline: self.timeline,
+            chain: self.chain.clone(),
+            transition: self.transition,
+            ..Default::default()
+        })
+        .expect("a checkpoint always serializes")
+    }
+
+    /// The completing position of `generation` of `snapshot_chain`: the
+    /// anchor with its stamp, marked.
+    pub(crate) fn completing(
+        &self,
+        snapshot_chain: &str,
+        generation: u64,
+    ) -> Vec<u8> {
+        serde_json::to_vec(&PostgresCheckpoint {
+            lsn: self.lsn.clone(),
+            tx_id: None,
+            timeline: self.timeline,
+            chain: self.chain.clone(),
+            transition: self.transition,
+            snapshot_completed: Some(generation),
+            snapshot_chain: Some(snapshot_chain.to_string()),
+        })
+        .expect("a checkpoint always serializes")
+    }
+
+    /// The anchor's continuity position (`Err`: a partial stamp).
+    fn chain_position(
+        &self,
+    ) -> Result<Option<postgres_continuity::ChainPosition>, String> {
+        match (&self.chain, self.transition, self.timeline) {
+            (Some(c), Some(t), Some(tl)) => {
+                Ok(Some(postgres_continuity::ChainPosition {
+                    chain_id: c.clone(),
+                    transition: t,
+                    timeline: tl,
+                }))
+            }
+            (None, None, None) => Ok(None),
+            _ => Err("a snapshot anchor carries a partial continuity stamp"
+                .to_string()),
+        }
+    }
 }
 
 /// A resume position read from the checkpoint store.
@@ -111,9 +234,14 @@ pub struct PostgresCheckpoint {
 pub(crate) enum PgResumePosition {
     /// A snapshot no sink acknowledged as complete (an incomplete-snapshot
     /// position, or a pre-format snapshot checkpoint: the anchor LSN as
-    /// text). It is not a stream position: the snapshot runs again. `anchor`
-    /// is where that snapshot's stream started.
-    Snapshot { anchor: Lsn },
+    /// text). It is not a stream position. `anchor` is where that
+    /// snapshot's stream starts, `stamp` the history it belongs to.
+    Snapshot {
+        anchor: Lsn,
+        stamp: Option<postgres_continuity::ChainPosition>,
+    },
+    /// A sink's start of a snapshot generation: no position at all.
+    Started,
     /// A stream position (CDC, or the completing snapshot boundary at its
     /// anchor).
     Stream(PostgresCheckpoint),
@@ -126,10 +254,17 @@ pub(crate) fn classify_pg_checkpoint(
     let anchor = |s: &str| {
         Lsn::parse(s).map_err(|e| format!("invalid snapshot anchor '{s}': {e}"))
     };
-    if let Some((_, a)) = crate::snapshot_position::decode::<String>(raw)? {
-        return Ok(PgResumePosition::Snapshot {
-            anchor: anchor(&a)?,
-        });
+    match crate::snapshot_position::classify::<PgAnchor>(raw)? {
+        crate::snapshot_position::Classified::Incomplete(i) => {
+            return Ok(PgResumePosition::Snapshot {
+                anchor: anchor(&i.anchor.lsn)?,
+                stamp: i.anchor.chain_position()?,
+            });
+        }
+        crate::snapshot_position::Classified::Adopted(_) => {
+            return Ok(PgResumePosition::Started);
+        }
+        crate::snapshot_position::Classified::Stream => {}
     }
     if let Ok(cp) = serde_json::from_slice::<PostgresCheckpoint>(raw) {
         return Ok(PgResumePosition::Stream(cp));
@@ -140,6 +275,7 @@ pub(crate) fn classify_pg_checkpoint(
         {
             Ok(PgResumePosition::Snapshot {
                 anchor: anchor(text)?,
+                stamp: None,
             })
         }
         _ => Err("unrecognised checkpoint".to_string()),
@@ -176,6 +312,9 @@ pub struct PostgresSource {
     /// Controlled credential-rotation spec, when configured and file-backed.
     /// `None` disables rotation for this source.
     pub rotation: Option<Arc<crate::rotation_manager::RotationSpec>>,
+    /// The commit policy and sink cohort a snapshot generation freezes, set
+    /// by the runner before the source runs.
+    pub snapshot_cohort: crate::SnapshotCohortSlot,
 }
 
 // ============================================================================
@@ -274,42 +413,193 @@ const MAX_STARTUP_BACKOFF_SECS: u64 = 60;
 /// A table of the snapshot plan: its identity columns with their kinds.
 pub type PgPlannedTable = crate::snapshot_plan::PlannedTable<Vec<IdentitySpec>>;
 
-/// Outcome of the pre-snapshot discover/prepare/allocate flow.
-struct SnapshotPlan {
-    generation: u64,
-    lineage: PersistedLineage,
-    /// Every table to copy, in discovery order.
-    tables: Vec<PgPlannedTable>,
+/// The snapshot connections a PostgreSQL generation cannot start without:
+/// the coordinator (catalog, slot and exported view), the WAL guard's
+/// session and one table worker.
+const PG_BASE_SNAPSHOT_CONNECTIONS: u32 = 3;
+
+/// A control record's anchor as a PostgreSQL anchor.
+fn pg_anchor_of(a: &crate::snapshot_queue::EngineAnchor) -> Option<PgAnchor> {
+    match a {
+        crate::snapshot_queue::EngineAnchor::Postgres {
+            lsn,
+            timeline,
+            chain,
+            transition,
+        } => Some(PgAnchor {
+            lsn: lsn.clone(),
+            timeline: *timeline,
+            chain: chain.clone(),
+            transition: *transition,
+        }),
+        crate::snapshot_queue::EngineAnchor::Mysql { .. } => None,
+    }
 }
 
+/// What a start decided for the snapshot (design section 4).
+enum PgStart {
+    /// Stream; `completed_anchor` is the anchor of the completed generation
+    /// (the stream starts there when no sink holds a stream position yet).
+    Stream { completed_anchor: Option<Lsn> },
+    /// Run this generation (allocated, its start barrier pending).
+    Generation {
+        version: u64,
+        control: Box<crate::snapshot_queue::GenerationControl>,
+    },
+}
+
+/// What a PostgreSQL generation start or completion check reads.
+type PgGenerationInputs = crate::snapshot_driver::GenerationInputs<PgOrder>;
+
 impl PostgresSource {
-    /// Discover the tables to copy (keyset pages of the catalog, filtered
-    /// by the CDC matcher), prepare each exactly once - one schema
-    /// resolution, identity resolution and type validation, cursor kind -
-    /// into a compact plan entry and the streaming generation fingerprint,
-    /// freeze the cluster lineage and atomically allocate (or resume) the
-    /// snapshot generation - all **before** any row is emitted. Keyless
-    /// tables or unsupported identity types fail here, before allocation.
-    async fn prepare_snapshot(
+    fn incidents(&self) -> IncidentStore {
+        IncidentStore::new(Arc::clone(&self.backend), &self.pipeline)
+    }
+
+    fn queue(&self) -> crate::snapshot_queue::QueueStore {
+        crate::snapshot_queue::QueueStore::new(
+            Arc::clone(&self.backend),
+            &self.id,
+        )
+    }
+
+    /// The configuration part of a generation's fingerprint (format 3: the
+    /// table patterns; each table's schema is bound by its plan item).
+    fn config_fingerprint(&self) -> String {
+        crate::snapshot_generation::SnapshotFingerprintBuilder::new(
+            "postgres",
+            &self.tables,
+        )
+        .finish()
+        .as_str()
+        .to_string()
+    }
+
+    /// The source lineage snapshot ids are minted from.
+    async fn snapshot_lineage(&self) -> SourceResult<PersistedLineage> {
+        let (client, conn) =
+            tokio_postgres::connect(self.dsn.expose(), tokio_postgres::NoTls)
+                .await
+                .map_err(|e| SourceError::Connect {
+                    details: format!("read the snapshot lineage: {e}").into(),
+                })?;
+        let conn_task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let lineage = self.capture_snapshot_lineage(&client).await;
+        conn_task.abort();
+        lineage
+    }
+
+    /// Decide what this start does about the snapshot (design section 4),
+    /// raising what it decided as incidents.
+    async fn decide_snapshot(
+        &self,
+        chkpt_store: &Arc<dyn CheckpointStore>,
+    ) -> SourceResult<(PgStart, Option<PgGenerationInputs>)> {
+        let queue = self.queue();
+        let cohort = self
+            .snapshot_cohort
+            .lock()
+            .expect("not poisoned")
+            .cohort
+            .clone();
+        let Some(cohort) = cohort else {
+            // A source run outside a pipeline: only mode `never` without
+            // any generation streams; a snapshot needs the frozen cohort.
+            let stored = queue.read().await.map_err(|e| {
+                SourceError::Other(anyhow::anyhow!("snapshot state: {e}"))
+            })?;
+            if self.snapshot_cfg.mode == SnapshotMode::Never && stored.is_none()
+            {
+                return Ok((
+                    PgStart::Stream {
+                        completed_anchor: None,
+                    },
+                    None,
+                ));
+            }
+            return Err(SourceError::Other(anyhow::anyhow!(
+                "source {}: a snapshot generation needs the pipeline's sink \
+                 cohort, which was not set",
+                self.id
+            )));
+        };
+        let inputs = PgGenerationInputs {
+            queue,
+            checkpoints: Arc::clone(chkpt_store),
+            source_id: self.id.clone(),
+            lineage: self.snapshot_lineage().await?,
+            fingerprint: self.config_fingerprint(),
+            policy: crate::snapshot_queue::PolicySnapshot::from(&cohort),
+            mode: self.snapshot_cfg.mode.clone(),
+            engine: PgOrder,
+            anchor_of: pg_anchor_of,
+            legacy: self.legacy_proof(chkpt_store).await?,
+        };
+        let decided = crate::snapshot_driver::decide(
+            &inputs,
+            &self.incidents(),
+            &self.snapshot_cohort,
+        )
+        .await
+        .map_err(|e| crate::snapshot_driver::source_error(&self.id, e))?;
+        self.retire_legacy_progress(chkpt_store).await?;
+        let start = match decided {
+            crate::snapshot_driver::Decided::Stream { completed } => {
+                PgStart::Stream {
+                    completed_anchor: completed
+                        .as_ref()
+                        .and_then(|c| c.anchor.as_ref())
+                        .and_then(pg_anchor_of)
+                        .and_then(|a| Lsn::parse(&a.lsn).ok()),
+                }
+            }
+            crate::snapshot_driver::Decided::Generation {
+                version,
+                control,
+            } => {
+                crate::snapshot_probe::record_fixed(
+                    crate::snapshot_probe::FixedOp::LineageCapture,
+                );
+                crate::snapshot_probe::record_fixed(
+                    crate::snapshot_probe::FixedOp::GenerationAllocation,
+                );
+                PgStart::Generation {
+                    version,
+                    control: Box::new(control),
+                }
+            }
+        };
+        Ok((start, Some(inputs)))
+    }
+
+    /// Discover the tables to copy (keyset pages of the catalog, filtered by
+    /// the CDC matcher) in one catalog snapshot, prepare each exactly once
+    /// (schema, identity columns and their types, cursor kind) and store it
+    /// as an immutable plan item of `control`'s generation, page by page:
+    /// the plan is never resident in full. Keyless tables or unsupported
+    /// identity types fail here, before any row. The plan bounds are checked
+    /// as it grows (design section 9).
+    async fn plan_generation(
         &self,
         loader: &PostgresSchemaLoader,
-    ) -> SourceResult<SnapshotPlan> {
+        version: u64,
+        control: &crate::snapshot_queue::GenerationControl,
+    ) -> SourceResult<crate::snapshot_queue::PlanSummary> {
         use crate::identity_resolution::{
             IdentitySchemaView, resolve_identity,
         };
-        use crate::snapshot_generation::{
-            AllocationMode, SnapshotFingerprintBuilder, allocate_generation,
-        };
+        use crate::snapshot_driver::incidents as drafts;
         use tokio_postgres::NoTls;
 
+        let queue = self.queue();
         let started = std::time::Instant::now();
         let fetches_before = loader.live_fetch_count();
-        // One catalog session: discovery, identity kinds and lineage, all in
-        // one repeatable-read transaction, so every discovery page (and every
-        // catalog read of the preparation) sees the same catalog snapshot:
-        // a concurrent CREATE, DROP or RENAME cannot change the table set
-        // between pages. Discovery runs after the slot anchor, so a table
-        // created after this snapshot is the CDC stream's.
+        // One catalog session: discovery and identity kinds in one
+        // repeatable-read transaction, so every discovery page sees the
+        // same catalog snapshot. Discovery runs after the slot anchor, so a
+        // table created after this snapshot is the CDC stream's.
         let (client, conn) = tokio_postgres::connect(self.dsn.expose(), NoTls)
             .await
             .map_err(|e| SourceError::Other(e.into()))?;
@@ -328,9 +618,12 @@ impl PostgresSource {
             &self.tables,
             self.snapshot_cfg.discovery_page_size,
         );
-        let mut fingerprint =
-            SnapshotFingerprintBuilder::new("postgres", &self.tables);
-        let mut tables: Vec<PgPlannedTable> = Vec::new();
+        let mut digest = crate::snapshot_queue::PlanDigest::default();
+        let (mut items, mut bytes, mut warned) = (0u64, 0u64, false);
+        let (max_items, max_bytes) = (
+            self.snapshot_cfg.max_plan_items,
+            self.snapshot_cfg.max_plan_bytes,
+        );
         while !discovery.is_done() {
             let t = std::time::Instant::now();
             let rows = postgres_schema_loader::discovery_page(
@@ -344,9 +637,6 @@ impl PostgresSource {
             let page = discovery.accept(rows)?;
             crate::snapshot_probe::after_discovery_page().await;
             for (schema, table) in page {
-                // On the preparation session: the schema is the one this
-                // catalog snapshot shows, like the table set and the
-                // identity kinds below.
                 let loaded =
                     loader.load_schema_on(&client, &schema, &table).await?;
                 let s = &loaded.schema;
@@ -369,9 +659,8 @@ impl PostgresSource {
                     opts.map(|o| o.assume_unique).unwrap_or(false),
                 )
                 .map_err(|e| SourceError::Other(anyhow::anyhow!(e)))?;
-
                 // Resolve + validate the identity column types from the
-                // catalog (rejects unsupported types before allocation).
+                // catalog (rejects unsupported types before any row).
                 let kinds = resolve_identity_kinds(
                     &client,
                     &schema,
@@ -380,75 +669,684 @@ impl PostgresSource {
                 )
                 .await
                 .map_err(SourceError::Other)?;
-                let cursor_kind = postgres_snapshot::pg_cursor_kind(s);
-                fingerprint.table(
-                    &schema,
-                    Some(&schema),
-                    &table,
-                    &resolved.columns,
-                    cursor_kind,
-                    loaded.registry_version,
-                );
-                crate::snapshot_probe::record_prepared_table();
-                tables.push(PgPlannedTable {
+                let identity: Vec<IdentitySpec> = kinds
+                    .into_iter()
+                    .map(|(name, kind)| IdentitySpec { name, kind })
+                    .collect();
+                let item = crate::snapshot_queue::PlanItem {
+                    item_format: crate::snapshot_queue::ITEM_FORMAT,
                     qualifier: schema,
                     table,
-                    identity: kinds
-                        .into_iter()
-                        .map(|(name, kind)| IdentitySpec { name, kind })
-                        .collect(),
-                    cursor_kind,
+                    identity: serde_json::to_value(&identity)
+                        .map_err(|e| SourceError::Other(e.into()))?,
+                    cursor_kind: postgres_snapshot::pg_cursor_kind(s),
+                    schema_version: loaded.registry_version as u64,
                     signature: postgres_snapshot::pg_schema_signature(s),
-                });
+                };
+                let (key, item_bytes) =
+                    queue.put_item(control, &item).await.map_err(|e| {
+                        SourceError::Other(anyhow::anyhow!("plan item: {e}"))
+                    })?;
+                digest.add(&key, &item_bytes);
+                items += 1;
+                bytes += item_bytes.len() as u64;
+                crate::snapshot_probe::record_prepared_table();
+                let over = if items > max_items {
+                    Some("plan_items")
+                } else if bytes > max_bytes {
+                    Some("plan_bytes")
+                } else {
+                    None
+                };
+                if let Some(class) = over {
+                    conn_task.abort();
+                    let draft = drafts::blocked(
+                        deltaforge_core::incident::ReasonCode::SnapshotBoundExceeded,
+                        &self.id,
+                        control.generation,
+                        class,
+                    );
+                    crate::snapshot_driver::block_generation(
+                        &queue,
+                        &self.incidents(),
+                        control.generation,
+                        None,
+                        version,
+                        &draft,
+                    )
+                    .await
+                    .map_err(|e| SourceError::Other(e.into()))?;
+                    return Err(SourceError::Incompatible {
+                        details: format!(
+                            "source {}: the snapshot plan exceeds its bound \
+                             ({class}: {items} items, {bytes} bytes; limits \
+                             {max_items} items, {max_bytes} bytes); the \
+                             generation is blocked until an explicit resnapshot",
+                            self.id
+                        )
+                        .into(),
+                    });
+                }
+                if !warned
+                    && (items * 5 >= max_items * 4
+                        || bytes * 5 >= max_bytes * 4)
+                {
+                    warned = true;
+                    let _ = self
+                        .incidents()
+                        .raise(
+                            &drafts::bound_warning(
+                                &self.id,
+                                control.generation,
+                                "plan_storage",
+                            ),
+                            1,
+                        )
+                        .await;
+                }
             }
         }
-
-        // Freeze lineage from the existing system_identifier authority.
-        let lineage = self.capture_snapshot_lineage(&client).await?;
-        crate::snapshot_probe::record_fixed(
-            crate::snapshot_probe::FixedOp::LineageCapture,
-        );
         client.batch_execute("COMMIT").await.ok();
         conn_task.abort();
-
-        let fingerprint = fingerprint.finish();
-        let mode = if self.snapshot_cfg.mode == SnapshotMode::Always {
-            AllocationMode::ForceNew
-        } else {
-            AllocationMode::Resume
-        };
-        let store = BackendCheckpointStore::new(self.backend.clone());
-        let key = format!("snapshot_generation:{}", self.id);
-        let alloc =
-            allocate_generation(&store, &key, lineage, &fingerprint, mode)
-                .await
-                .map_err(|e| SourceError::Other(anyhow::anyhow!(e)))?;
-        crate::snapshot_probe::record_fixed(
-            crate::snapshot_probe::FixedOp::GenerationAllocation,
-        );
         crate::snapshot_probe::record_preparation(
             started.elapsed(),
-            crate::snapshot_plan::plan_bytes(&tables, |ids| {
-                ids.iter()
-                    .map(|i| std::mem::size_of::<IdentitySpec>() + i.name.len())
-                    .sum()
-            }),
+            bytes as usize,
             loader.live_fetch_count() - fetches_before,
         );
+        Ok(digest.seal())
+    }
 
-        info!(
-            source_id = %self.id,
-            generation = alloc.record.generation,
-            tables = tables.len(),
-            "snapshot generation allocated"
-        );
-        Ok(SnapshotPlan {
-            generation: alloc.record.generation,
-            lineage: alloc.record.lineage,
-            tables,
+    /// After a failure of a running generation: when the control record no
+    /// longer shows this run's generation, another process took over, and
+    /// this one stops (a non-blocking `concurrent_owner` incident; the
+    /// current owner's control record is never written). `None` when this
+    /// run still owns it.
+    async fn concurrent_owner(
+        &self,
+        queue: &crate::snapshot_queue::QueueStore,
+        generation: u64,
+        run: &str,
+    ) -> Option<SourceError> {
+        crate::snapshot_driver::owner_lost(
+            queue,
+            &self.incidents(),
+            &self.id,
+            generation,
+            run,
+        )
+        .await
+        .map(|why| SourceError::Incompatible {
+            details: format!("source {}: {why}", self.id).into(),
         })
     }
 
+    /// The on-disk size of the plan's tables, read page by page.
+    async fn plan_size_bytes(
+        &self,
+        queue: &crate::snapshot_queue::QueueStore,
+        generation: u64,
+    ) -> SourceResult<i64> {
+        let (client, conn) =
+            tokio_postgres::connect(self.dsn.expose(), tokio_postgres::NoTls)
+                .await
+                .map_err(|e| SourceError::Connect {
+                    details: format!("size the snapshot plan: {e}").into(),
+                })?;
+        let task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let page = self.snapshot_cfg.discovery_page_size.max(1);
+        let (mut total, mut after) = (0i64, None::<String>);
+        loop {
+            let (items, next) = queue
+                .items_page(generation, after.as_deref(), page)
+                .await
+                .map_err(|e| SourceError::Other(anyhow::anyhow!("{e}")))?;
+            let names: Vec<(&str, &str)> = items
+                .iter()
+                .map(|(_, i)| (i.qualifier.as_str(), i.table.as_str()))
+                .collect();
+            total +=
+                postgres_health::table_size_bytes(&client, &names, page).await;
+            match next {
+                Some(n) => after = Some(n),
+                None => break,
+            }
+        }
+        task.abort();
+        Ok(total)
+    }
+
+    /// What this source's legacy snapshot progress proves (design section
+    /// 10), read only when the control record is a legacy one. A snapshot
+    /// taken under the pre-hardening anchor (anchor version 0) is never
+    /// proven, whatever its sinks committed: rows committed at the
+    /// snapshot-to-stream seam may be missing, so it is copied once more.
+    /// A malformed anchor proves nothing; an unknown anchor version or a
+    /// corrupt record is refused, untouched.
+    async fn legacy_proof(
+        &self,
+        chkpt_store: &Arc<dyn CheckpointStore>,
+    ) -> SourceResult<Option<crate::snapshot_driver::LegacyProof<PgAnchor>>>
+    {
+        use crate::snapshot_driver::LegacyProof;
+        let legacy = matches!(
+            self.queue().read().await,
+            Ok(Some(crate::snapshot_queue::Stored::Legacy { .. }))
+        );
+        if !legacy {
+            return Ok(None);
+        }
+        let unproven = |why: &str| LegacyProof {
+            unproven: Some(why.to_string()),
+            ..Default::default()
+        };
+        let refused = |why: String| LegacyProof {
+            refused: Some(why),
+            ..Default::default()
+        };
+        let raw = chkpt_store
+            .get_raw(&postgres_snapshot::progress_key(&self.id))
+            .await
+            .map_err(|e| SourceError::Checkpoint {
+                details: format!("read the legacy snapshot progress: {e}")
+                    .into(),
+            })?;
+        let Some(raw) = raw else {
+            return Ok(Some(unproven(
+                "no snapshot progress records its anchor",
+            )));
+        };
+        let progress: SnapshotProgress = match serde_json::from_slice(&raw) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(Some(refused(format!(
+                    "the legacy snapshot progress is corrupt: {e}"
+                ))));
+            }
+        };
+        let proof = match progress.anchor_version {
+            v if v > postgres_snapshot::SNAPSHOT_ANCHOR_VERSION => {
+                refused(format!(
+                    "the legacy snapshot progress has anchor version {v}, which \
+                 this release does not know"
+                ))
+            }
+            0 => unproven(
+                "it was taken under the pre-hardening anchor (anchor version \
+                 0), which can lose rows committed at the snapshot-to-stream \
+                 seam",
+            ),
+            _ if progress.start_lsn.is_empty() => {
+                unproven("its progress records no anchor")
+            }
+            _ => match Lsn::parse(&progress.start_lsn) {
+                Ok(lsn) => {
+                    let anchor = PgAnchor::new(lsn, None);
+                    LegacyProof {
+                        anchor: Some((
+                            anchor.clone(),
+                            crate::snapshot_queue::EngineAnchor::Postgres {
+                                lsn: anchor.lsn,
+                                timeline: None,
+                                chain: None,
+                                transition: None,
+                            },
+                        )),
+                        ..Default::default()
+                    }
+                }
+                Err(e) => LegacyProof {
+                    unproven: Some(format!(
+                        "its recorded anchor {:?} is malformed: {e}",
+                        progress.start_lsn
+                    )),
+                    ..Default::default()
+                },
+            },
+        };
+        Ok(Some(proof))
+    }
+
+    /// Once the control record is this release's, the legacy progress record
+    /// is no longer read: delete it (idempotent; design section 3.3).
+    async fn retire_legacy_progress(
+        &self,
+        chkpt_store: &Arc<dyn CheckpointStore>,
+    ) -> SourceResult<()> {
+        let current = matches!(
+            self.queue().read().await,
+            Ok(Some(crate::snapshot_queue::Stored::Current { .. }))
+        );
+        if current {
+            chkpt_store
+                .delete(&postgres_snapshot::progress_key(&self.id))
+                .await
+                .map_err(|e| SourceError::Checkpoint {
+                    details: format!(
+                        "retire the legacy snapshot progress: {e}"
+                    )
+                    .into(),
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Run generation `control` (design sections 2 to 6): the snapshot
+    /// connections, the slot anchor and its continuity stamp, the paged
+    /// plan, the exported read view and the plan verified in it, the start
+    /// barrier, the copy, the final checks, `rows_produced` and the
+    /// terminal barrier. Returns the anchor, where the stream starts.
+    /// Completion is then recorded in the background, once the frozen
+    /// policy's frontier covers the terminal.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_generation(
+        &self,
+        version: u64,
+        control: crate::snapshot_queue::GenerationControl,
+        inputs: &PgGenerationInputs,
+        loader: &PostgresSchemaLoader,
+        chkpt_store: &Arc<dyn CheckpointStore>,
+        tx: &mpsc::Sender<SourceItem>,
+        cancel: &CancellationToken,
+    ) -> SourceResult<Lsn> {
+        use crate::snapshot_permits::{SnapshotPermits, global_cap, validate};
+        let other = |e: anyhow::Error| SourceError::Other(e);
+        let queue = &inputs.queue;
+        let run = format!("{:032x}", rand::random::<u128>());
+
+        // 1. The snapshot's connections, before any catalog session or
+        // anchor; cancellable while queued.
+        let cfg = &self.snapshot_cfg;
+        let source_cap = cfg.snapshot_connection_cap();
+        let per_table = if cfg.intra_table_parallel {
+            cfg.max_parallel_chunks.max(1)
+        } else {
+            1
+        };
+        let most = u32::try_from(
+            (cfg.max_parallel_tables.max(1) * per_table).saturating_add(2),
+        )
+        .unwrap_or(u32::MAX);
+        validate(global_cap(), source_cap, PG_BASE_SNAPSHOT_CONNECTIONS, most)
+            .map_err(|e| SourceError::Incompatible {
+                details: format!("source {}: {e}", self.id).into(),
+            })?;
+        let permits = Arc::new(
+            SnapshotPermits::acquire(
+                &self.pipeline,
+                source_cap,
+                PG_BASE_SNAPSHOT_CONNECTIONS,
+                cancel,
+            )
+            .await
+            .map_err(|_| SourceError::Cancelled)?,
+        );
+
+        // 2. The slot anchor, on one timeline of this server, with the
+        // continuity stamp of that history.
+        let facts = |what: &'static str| async move {
+            let (client, conn) = tokio_postgres::connect(
+                self.dsn.expose(),
+                tokio_postgres::NoTls,
+            )
+            .await
+            .map_err(|e| SourceError::Connect {
+                details: format!("{what}: {e}").into(),
+            })?;
+            let task = tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            let facts = postgres_continuity::anchor_facts(&client).await;
+            task.abort();
+            facts.map_err(SourceError::Other)
+        };
+        let before = facts("snapshot anchor").await?;
+        let anchor_lsn = prepare_snapshot_slot_anchor(
+            self.dsn.expose(),
+            &self.slot,
+            &self.pipeline,
+            &self.id,
+            chkpt_store,
+        )
+        .await?;
+        let after = facts("snapshot anchor").await?;
+        let record = postgres_continuity::load_record(&self.backend, &self.id)
+            .await
+            .map_err(other)?;
+        let stream_position = match chkpt_store.get_raw(&self.id).await {
+            Ok(Some(raw)) => match classify_pg_checkpoint(&raw) {
+                Ok(PgResumePosition::Stream(cp)) => Some(cp.chain.is_some()),
+                _ => None,
+            },
+            Ok(None) => None,
+            Err(e) => {
+                return Err(SourceError::Checkpoint {
+                    details: format!("read the resume checkpoint: {e}").into(),
+                });
+            }
+        };
+        let (stamp, new_record) = postgres_continuity::anchor_stamp(
+            record.as_ref(),
+            before,
+            after,
+            stream_position,
+            &postgres_continuity::new_chain_id(),
+        )
+        .map_err(|why| SourceError::Incompatible {
+            details: format!(
+                "source {}: the snapshot anchor's continuity: {why}",
+                self.id
+            )
+            .into(),
+        })?;
+        if let Some(r) = &new_record {
+            postgres_continuity::store_record(&self.backend, &self.id, r)
+                .await
+                .map_err(other)?;
+        }
+        let anchor = PgAnchor::new(anchor_lsn, Some(&stamp));
+
+        // 3. The plan, page by page.
+        let plan = self.plan_generation(loader, version, &control).await?;
+
+        // The preflight: slot and WAL settings, and the size estimate over
+        // the plan, page by page.
+        let mut preflight = postgres_health::run_preflight(
+            self.dsn.expose(),
+            Some(&self.slot),
+            postgres_health::SlotPresence::CreatedByDeltaforge,
+            "",
+            &[] as &[(&str, &str)],
+            cfg.max_parallel_tables,
+            cfg.discovery_page_size,
+        )
+        .await
+        .map_err(|e| other(e.context("postgres snapshot preflight")))?;
+        let total_bytes =
+            self.plan_size_bytes(queue, control.generation).await?;
+        preflight.apply_size_estimate(
+            total_bytes,
+            plan.items as usize,
+            cfg.max_parallel_tables,
+        );
+        crate::snapshot_probe::record_fixed(
+            crate::snapshot_probe::FixedOp::Preflight,
+        );
+        preflight
+            .emit_and_check(&self.id, plan.items as usize)
+            .map_err(other)?;
+
+        // 4. The read view: the coordinator exports it and keeps it open;
+        // the plan is verified in it, page by page.
+        crate::snapshot_probe::before_anchor().await;
+        let anchor_started = std::time::Instant::now();
+        let (coord, coord_conn) =
+            tokio_postgres::connect(self.dsn.expose(), tokio_postgres::NoTls)
+                .await
+                .map_err(|e| SourceError::Connect {
+                    details: format!("snapshot coordinator: {e}").into(),
+                })?;
+        let coord_task = tokio::spawn(async move {
+            if let Err(e) = coord_conn.await {
+                error!(error = %e, "snapshot coordinator connection dropped");
+            }
+        });
+        let _coord_task = scopeguard::guard(coord_task, |t| t.abort());
+        coord
+            .batch_execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .await
+            .map_err(|e| other(e.into()))?;
+        let snapshot_id: String = coord
+            .query_one("SELECT pg_export_snapshot()", &[])
+            .await
+            .map_err(|e| other(e.into()))?
+            .get(0);
+        crate::snapshot_probe::record_fixed(
+            crate::snapshot_probe::FixedOp::Anchor,
+        );
+        postgres_snapshot::verify_plan_in_snapshot(
+            &coord,
+            queue,
+            control.generation,
+            cfg.discovery_page_size,
+        )
+        .await
+        .map_err(other)?;
+        crate::snapshot_probe::record_phase(
+            crate::snapshot_probe::Phase::PreflightAnchor,
+            anchor_started.elapsed(),
+        );
+
+        // 5. Seal the plan, record the anchor and this run as the owner.
+        let (version, control) = queue
+            .seal_and_run(
+                version,
+                &control,
+                plan,
+                crate::snapshot_queue::EngineAnchor::Postgres {
+                    lsn: anchor.lsn.clone(),
+                    timeline: anchor.timeline,
+                    chain: anchor.chain.clone(),
+                    transition: anchor.transition,
+                },
+                &run,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(|e| {
+                other(anyhow::anyhow!("seal the snapshot plan: {e}"))
+            })?;
+        // The version the guard may block at: the sealed record, then the
+        // record once the start barrier is done.
+        let guard_version =
+            Arc::new(std::sync::atomic::AtomicU64::new(version));
+        info!(
+            source_id = %self.id,
+            generation = control.generation,
+            snapshot_id = %snapshot_id,
+            anchor = %anchor.lsn,
+            tables = control.plan.items,
+            "snapshot generation running"
+        );
+
+        // The guard: slot WAL retention and the anchor-age bound block the
+        // generation and stop the copy.
+        let gen_cancel = cancel.child_token();
+        let blocked: Arc<std::sync::Mutex<Option<String>>> = Default::default();
+        let guard = postgres_snapshot::spawn_generation_guard(
+            postgres_snapshot::GenerationGuard {
+                dsn: self.dsn.clone(),
+                slot: self.slot.clone(),
+                source_id: self.id.clone(),
+                generation: control.generation,
+                anchored_at_ms: control.anchored_at_ms.unwrap_or_default(),
+                max_anchor_age: Duration::from_secs(cfg.max_anchor_age_secs),
+                run: run.clone(),
+                version: Arc::clone(&guard_version),
+                queue: queue.clone(),
+                incidents: self.incidents(),
+                cancel: gen_cancel.clone(),
+                blocked: Arc::clone(&blocked),
+            },
+        );
+        let _guard = scopeguard::guard(guard, |g| g.abort());
+        let blocked_err = |blocked: &std::sync::Mutex<Option<String>>| {
+            blocked.lock().expect("not poisoned").clone().map(|why| {
+                SourceError::Incompatible {
+                    details: format!(
+                        "source {}: snapshot generation {} blocked: {why}",
+                        self.id, control.generation
+                    )
+                    .into(),
+                }
+            })
+        };
+
+        // 6. The start barrier: no row before the whole cohort entered
+        // the generation.
+        let incomplete = crate::snapshot_position::encode_chained(
+            &control.snapshot_chain,
+            control.generation,
+            &anchor,
+        );
+        let publisher =
+            Arc::new(crate::snapshot_publish::GenerationPublisher::new(
+                queue.clone(),
+                tx.clone(),
+                control.clone(),
+                &run,
+                incomplete,
+            ));
+        if let Err(e) = publisher.start().await {
+            return Err(self
+                .concurrent_owner(queue, control.generation, &run)
+                .await
+                .unwrap_or_else(|| other(e.into())));
+        }
+        let adopted = crate::snapshot_driver::await_adoption(
+            &inputs.input(),
+            &gen_cancel,
+        )
+        .await
+        .map_err(|e| match blocked_err(&blocked) {
+            Some(b) => b,
+            None if cancel.is_cancelled() => SourceError::Cancelled,
+            None => other(anyhow::anyhow!("snapshot start barrier: {e}")),
+        });
+        match adopted {
+            Ok((v, _)) => {
+                guard_version.store(v, std::sync::atomic::Ordering::SeqCst)
+            }
+            Err(e) => {
+                return Err(self
+                    .concurrent_owner(queue, control.generation, &run)
+                    .await
+                    .unwrap_or(e));
+            }
+        }
+
+        // 7. The copy.
+        let copy_started = std::time::Instant::now();
+        let copied =
+            postgres_snapshot::copy_generation(&postgres_snapshot::PgCopyCtx {
+                dsn: self.dsn.expose(),
+                source_id: &self.id,
+                pipeline: &self.pipeline,
+                tenant: &self.tenant,
+                cfg,
+                schema_loader: loader,
+                cancel: gen_cancel.clone(),
+                queue,
+                publisher: Arc::clone(&publisher),
+                permits: Arc::clone(&permits),
+                coord: &coord,
+                snapshot_id: &snapshot_id,
+                generation: control.generation,
+                lineage: control.lineage.clone(),
+            })
+            .await;
+        crate::snapshot_probe::record_phase(
+            crate::snapshot_probe::Phase::RowCopy,
+            copy_started.elapsed(),
+        );
+        if let Some(b) = blocked_err(&blocked) {
+            return Err(b);
+        }
+        // The source stopping mid-copy is a stop, not a failure: the
+        // generation is replaced at the next start.
+        if copied.is_err() && cancel.is_cancelled() {
+            return Err(SourceError::Cancelled);
+        }
+        if let Err(e) = copied {
+            return Err(self
+                .concurrent_owner(queue, control.generation, &run)
+                .await
+                .unwrap_or_else(|| other(e)));
+        }
+
+        // 8. Final checks, then the rows are produced and the terminal
+        // barrier carries the completing position.
+        let final_started = std::time::Instant::now();
+        postgres_health::verify_slot_still_healthy(
+            self.dsn.expose(),
+            &self.slot,
+        )
+        .await
+        .map_err(|e| other(e.context("post-snapshot slot verification")))?;
+        if let Some(b) = blocked_err(&blocked) {
+            return Err(b);
+        }
+        coord.batch_execute("COMMIT").await.ok();
+        drop(permits);
+        let current = match queue.read().await {
+            Ok(Some(crate::snapshot_queue::Stored::Current {
+                version,
+                control,
+            })) => (version, *control),
+            other_state => {
+                return Err(self
+                    .concurrent_owner(queue, control.generation, &run)
+                    .await
+                    .unwrap_or_else(|| {
+                        other(anyhow::anyhow!(
+                            "the snapshot control record changed during the \
+                             copy: {other_state:?}"
+                        ))
+                    }));
+            }
+        };
+        let produced = match queue
+            .rows_produced(current.0, &current.1, &run)
+            .await
+        {
+            Ok((_, produced)) => produced,
+            Err(e) => {
+                return Err(self
+                    .concurrent_owner(queue, control.generation, &run)
+                    .await
+                    .unwrap_or_else(|| {
+                        other(anyhow::anyhow!("record the rows produced: {e}"))
+                    }));
+            }
+        };
+        if let Err(e) = publisher
+            .terminal(
+                anchor
+                    .completing(&produced.snapshot_chain, produced.generation),
+            )
+            .await
+        {
+            return Err(self
+                .concurrent_owner(queue, control.generation, &run)
+                .await
+                .unwrap_or_else(|| other(e.into())));
+        }
+        crate::snapshot_probe::record_phase(
+            crate::snapshot_probe::Phase::Finalization,
+            final_started.elapsed(),
+        );
+        info!(
+            source_id = %self.id,
+            generation = produced.generation,
+            anchor = %anchor.lsn,
+            "snapshot rows produced; the stream starts at the anchor"
+        );
+        crate::snapshot_probe::after_terminal().await;
+
+        // 9. Completion, in the background, once the frozen policy's
+        // frontier covers the terminal.
+        crate::snapshot_driver::spawn_completion_watch(
+            inputs.clone(),
+            self.incidents(),
+            Arc::clone(&self.snapshot_cohort),
+            cancel.clone(),
+        );
+        Ok(anchor_lsn)
+    }
+}
+
+impl PostgresSource {
     /// Whether unfinished legacy snapshot progress is ambiguous: among the
     /// tables the configured patterns expand to now (paged discovery, the
     /// same canonical `schema.table` identities the snapshot records), some
@@ -547,7 +1445,7 @@ impl PostgresSource {
         )
         .await?;
 
-        let (components, config, last_checkpoint, incomplete_snapshot) =
+        let (components, config, last_checkpoint, _) =
             prepare_replication_client(
                 self.dsn.expose(),
                 &self.id,
@@ -557,37 +1455,38 @@ impl PostgresSource {
             )
             .await?;
 
+        // The snapshot decision is the generation driver's (design section
+        // 4): an incomplete generation is replaced, never resumed as a
+        // stream; a completed one streams.
+        let (start, generation_inputs) =
+            self.decide_snapshot(&chkpt_store).await?;
         let mut startup_retry = RetryPolicy::default();
-
-        // A snapshot whose completion no sink acknowledged (its boundaries
-        // are incomplete-snapshot positions) runs again in full; it is never
-        // resumed as a stream, which would skip its undelivered rows.
-        if incomplete_snapshot && self.snapshot_cfg.mode == SnapshotMode::Never
-        {
-            return Err(SourceError::Checkpoint {
-                details: format!(
-                    "source {}: the resume checkpoint belongs to a snapshot \
-                     that never completed, and snapshot mode 'never' cannot \
-                     complete it; set mode 'initial' to snapshot again",
-                    self.id
-                )
-                .into(),
-            });
-        }
-        if incomplete_snapshot {
-            warn!(
-                source_id = %self.id,
-                "the snapshot was not acknowledged as complete; it runs again \
-                 in full"
-            );
-        }
-        let needs_snapshot = match self.snapshot_cfg.mode {
-            SnapshotMode::Initial => last_checkpoint.is_none(),
-            SnapshotMode::Always => true,
-            SnapshotMode::Never => false,
+        let needs_snapshot = matches!(start, PgStart::Generation { .. });
+        let resume = match &start {
+            PgStart::Generation { .. } => None,
+            PgStart::Stream { completed_anchor } => last_checkpoint
+                .as_ref()
+                .map(|_| config.start_lsn)
+                .or(*completed_anchor),
         };
 
-        let start_lsn = if last_checkpoint.is_none() {
+        let start_lsn = if let Some(resume) = resume {
+            // Resuming from a checkpoint: the saved LSN is trusted only once
+            // the slot is verified to hold it. Fails closed: replication never
+            // opens while that is unknown; a plausibly transient cause is
+            // retried (cancellably, for a bounded time), anything else stops.
+            verify_resume_position(
+                self.dsn.expose(),
+                &self.id,
+                &self.slot,
+                &resume.to_string(),
+                &cancel,
+                REACHABILITY_RETRY_WINDOW,
+                &IncidentStore::new(Arc::clone(&self.backend), &self.pipeline),
+            )
+            .await?;
+            resume
+        } else {
             loop {
                 let ensure_result = if needs_snapshot {
                     // The slot anchor is established by
@@ -642,22 +1541,6 @@ impl PostgresSource {
                     Err(LoopControl::SchemaDrift(_)) => continue,
                 }
             }
-        } else {
-            // Resuming from a checkpoint: the saved LSN is trusted only once
-            // the slot is verified to hold it. Fails closed: replication never
-            // opens while that is unknown; a plausibly transient cause is
-            // retried (cancellably, for a bounded time), anything else stops.
-            verify_resume_position(
-                self.dsn.expose(),
-                &self.id,
-                &self.slot,
-                &config.start_lsn.to_string(),
-                &cancel,
-                REACHABILITY_RETRY_WINDOW,
-                &IncidentStore::new(Arc::clone(&self.backend), &self.pipeline),
-            )
-            .await?;
-            config.start_lsn
         };
 
         let schema_loader = PostgresSchemaLoader::new(
@@ -672,59 +1555,23 @@ impl PostgresSource {
         // per-Relation replica-identity warning covers what the startup loop
         // used to report.
 
-        let start_lsn = if needs_snapshot {
-            info!(source_id = %self.id, "starting initial snapshot");
-
-            // Establish the CDC anchor at the replication slot's consistent point
-            // (PG-A-lite): create the slot, or safely re-anchor an owned inactive
-            // slot (full re-snapshot), or fail closed. This replaces the removed
-            // pg_current_wal_lsn anchor and closes the snapshot->CDC seam.
-            let anchor = prepare_snapshot_slot_anchor(
-                self.dsn.expose(),
-                &self.slot,
-                &self.pipeline,
-                &self.id,
-                &chkpt_store,
-            )
-            .await?;
-
-            // Every snapshot scans every table: reset table-level progress so
-            // no completed table (or a stale `finished`) is skipped - nothing
-            // in it was acknowledged by the sinks (generation is separately
-            // bumped via ForceNew for mode 'always'). Fail closed if the reset
-            // does not persist - snapshotting on stale progress would skip
-            // tables and reintroduce loss.
-            postgres_slot_owner::reset_snapshot_progress(
-                &chkpt_store,
-                &self.id,
-            )
-            .await
-            .map_err(SourceError::Other)?;
-
-            // Discover + validate every table, freeze lineage, allocate the
-            // generation BEFORE emitting any row (keyless/unsupported tables
-            // fail here).
-            let plan = self.prepare_snapshot(&schema_loader).await?;
-
-            let snapshot_ctx = postgres_snapshot::PgSnapshotCtx {
-                dsn: self.dsn.expose(),
-                source_id: &self.id,
-                pipeline: &self.pipeline,
-                tenant: &self.tenant,
-                cfg: &self.snapshot_cfg,
-                schema_loader: &schema_loader,
-                chkpt_store: chkpt_store.clone(),
-                tx: tx.clone(),
-                cancel: cancel.clone(),
-                slot_name: Some(&self.slot),
-                generation: plan.generation,
-                lineage: plan.lineage,
-            };
-            postgres_snapshot::run_snapshot(&snapshot_ctx, &plan.tables, anchor)
-                .await
-                .map_err(SourceError::Other)?
-        } else {
-            start_lsn
+        let start_lsn = match start {
+            PgStart::Generation { version, control } => {
+                info!(source_id = %self.id, "starting the snapshot generation");
+                self.run_generation(
+                    version,
+                    *control,
+                    generation_inputs
+                        .as_ref()
+                        .expect("a generation has its inputs"),
+                    &schema_loader,
+                    &chkpt_store,
+                    &tx,
+                    &cancel,
+                )
+                .await?
+            }
+            PgStart::Stream { .. } => start_lsn,
         };
 
         // Flag a completed snapshot taken under the legacy (pre-hardening) anchor,
@@ -1144,6 +1991,7 @@ impl PostgresSource {
                         timeline: ctx.active_stamp().map(|s| s.timeline),
                         chain: ctx.active_stamp().map(|s| s.chain_id),
                         transition: ctx.active_stamp().map(|s| s.transition),
+                        ..Default::default()
                     },
                 )
                 .await;
@@ -1211,6 +2059,14 @@ async fn classify_durable_frontier(
         Ok(None) => return FeedbackOutcome::Hold, // nothing durable yet
         Err(e) => return classify_store_error(&e),
     };
+    // A snapshot still being delivered (its sinks hold snapshot or start
+    // positions): nothing durable to release yet.
+    if matches!(
+        classify_pg_checkpoint(&bytes),
+        Ok(PgResumePosition::Snapshot { .. } | PgResumePosition::Started)
+    ) {
+        return FeedbackOutcome::Hold;
+    }
     match serde_json::from_slice::<PostgresCheckpoint>(&bytes)
         .ok()
         .and_then(|cp| Lsn::parse(&cp.lsn).ok())
@@ -1335,67 +2191,58 @@ async fn advance_wal_feedback(
 /// another generation or anchor, or a stream position before the anchor - it
 /// is incomparable.
 pub fn compare_pg_checkpoints(a: &[u8], b: &[u8]) -> CheckpointOrder {
-    // (generation, anchor) of a snapshot position: `None` generation for a
-    // pre-format one.
-    type Snap = (Option<u64>, Lsn);
-    let snapshot = |raw: &[u8]| -> Result<Option<Snap>, ()> {
-        match crate::snapshot_position::decode::<String>(raw) {
-            Err(_) => Err(()),
-            Ok(Some((g, a))) => {
-                Lsn::parse(&a).map(|l| Some((Some(g), l))).map_err(|_| ())
+    crate::snapshot_position::order(&PgOrder, a, b)
+}
+
+/// Whether stored bytes are a PostgreSQL snapshot position (incomplete, a
+/// bare legacy anchor, or a generation start), not a stream position.
+pub fn pg_checkpoint_is_snapshot(raw: &[u8]) -> bool {
+    matches!(
+        classify_pg_checkpoint(raw),
+        Ok(PgResumePosition::Snapshot { .. } | PgResumePosition::Started)
+    )
+}
+
+/// PostgreSQL's part of the snapshot position order.
+#[derive(Clone, Copy)]
+pub(crate) struct PgOrder;
+
+impl crate::snapshot_position::EngineOrder for PgOrder {
+    type Anchor = PgAnchor;
+
+    fn stream_order(&self, a: &[u8], b: &[u8]) -> CheckpointOrder {
+        compare_pg_stream_checkpoints(a, b)
+    }
+
+    /// The anchor as a stream position (its LSN and continuity stamp)
+    /// against a stream position, by the stream order: an anchor and a
+    /// position of different continuity are incomparable.
+    fn anchor_vs_stream(
+        &self,
+        anchor: &PgAnchor,
+        stream: &[u8],
+    ) -> CheckpointOrder {
+        compare_pg_stream_checkpoints(&anchor.as_checkpoint(), stream)
+    }
+
+    fn completion_mark(&self, stream: &[u8]) -> Option<(Option<String>, u64)> {
+        let cp = serde_json::from_slice::<PostgresCheckpoint>(stream).ok()?;
+        cp.snapshot_completed.map(|g| (cp.snapshot_chain, g))
+    }
+
+    fn unmarked_completion_at_anchor(&self) -> bool {
+        true
+    }
+
+    fn bare_legacy(&self, raw: &[u8]) -> Option<PgAnchor> {
+        match classify_pg_checkpoint(raw) {
+            Ok(PgResumePosition::Snapshot { anchor, .. })
+                if !raw.starts_with(b"{") =>
+            {
+                Some(PgAnchor::new(anchor, None))
             }
-            Ok(None) => match classify_pg_checkpoint(raw) {
-                Ok(PgResumePosition::Snapshot { anchor }) => {
-                    Ok(Some((None, anchor)))
-                }
-                _ => Ok(None),
-            },
+            _ => None,
         }
-    };
-    let stream_at_or_after = |raw: &[u8], anchor: Lsn| {
-        serde_json::from_slice::<PostgresCheckpoint>(raw)
-            .ok()
-            .and_then(|cp| Lsn::parse(&cp.lsn).ok())
-            .is_some_and(|l| u64::from(l) >= u64::from(anchor))
-    };
-    match (snapshot(a), snapshot(b)) {
-        (Err(()), _) | (_, Err(())) => {
-            tracing::warn!(
-                "incomparable checkpoints: unreadable snapshot position"
-            );
-            CheckpointOrder::Incomparable
-        }
-        (Ok(Some(x)), Ok(Some(y))) => {
-            if x == y {
-                CheckpointOrder::Equal
-            } else {
-                tracing::warn!(
-                    "incomparable checkpoints: snapshot positions of another generation or anchor"
-                );
-                CheckpointOrder::Incomparable
-            }
-        }
-        (Ok(Some((_, anchor))), Ok(None)) => {
-            if stream_at_or_after(b, anchor) {
-                CheckpointOrder::Before
-            } else {
-                tracing::warn!(
-                    "incomparable checkpoints: a stream position not after the snapshot's anchor"
-                );
-                CheckpointOrder::Incomparable
-            }
-        }
-        (Ok(None), Ok(Some((_, anchor)))) => {
-            if stream_at_or_after(a, anchor) {
-                CheckpointOrder::After
-            } else {
-                tracing::warn!(
-                    "incomparable checkpoints: a stream position not after the snapshot's anchor"
-                );
-                CheckpointOrder::Incomparable
-            }
-        }
-        (Ok(None), Ok(None)) => compare_pg_stream_checkpoints(a, b),
     }
 }
 
@@ -1542,6 +2389,31 @@ impl Source for PostgresSource {
 
     fn compare_checkpoints(&self, a: &[u8], b: &[u8]) -> CheckpointOrder {
         compare_pg_checkpoints(a, b)
+    }
+
+    fn checkpoint_generation_start(
+        &self,
+        prev: Option<&[u8]>,
+        start: &deltaforge_core::GenerationStart,
+    ) -> deltaforge_core::CheckpointStart {
+        crate::snapshot_position::checkpoint_start(&PgOrder, prev, None, start)
+    }
+
+    fn checkpoint_is_snapshot(&self, raw: &[u8]) -> bool {
+        pg_checkpoint_is_snapshot(raw)
+    }
+
+    fn set_snapshot_cohort(&self, cohort: deltaforge_core::SnapshotCohort) {
+        self.snapshot_cohort.lock().expect("not poisoned").cohort =
+            Some(cohort);
+    }
+
+    fn resume_exclusions(&self) -> Vec<String> {
+        self.snapshot_cohort
+            .lock()
+            .expect("not poisoned")
+            .resume_exclusions
+            .clone()
     }
 
     async fn check_durable_snapshot_startup(
@@ -2586,6 +3458,27 @@ mod wal_feedback_tests {
         ));
     }
 
+    /// A snapshot still being delivered holds the frontier: its sinks
+    /// hold snapshot or generation start positions, nothing to release.
+    #[tokio::test]
+    async fn a_snapshot_being_delivered_holds() {
+        let anchor = super::PgAnchor::new(Lsn::parse("0/200").unwrap(), None);
+        for raw in [
+            crate::snapshot_position::encode_chained("c", 2, &anchor),
+            crate::snapshot_position::encode_adopted("c", 2, "d"),
+        ] {
+            let store: Arc<dyn CheckpointStore> =
+                Arc::new(MemCheckpointStore::new().unwrap());
+            store.put_raw("s", &raw).await.unwrap();
+            assert_eq!(
+                classify_durable_frontier(&store, "s", None).await,
+                FeedbackOutcome::Hold,
+                "{}",
+                String::from_utf8_lossy(&raw)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn corrupt_checkpoint_bytes_fail_closed() {
         // A malformed durable checkpoint is terminal, not a silent hold.
@@ -3429,5 +4322,85 @@ mod identity_fail_closed_tests {
             result.is_err(),
             "a failed identity persist must propagate, not be swallowed"
         );
+    }
+}
+
+#[cfg(test)]
+mod pg_anchor_tests {
+    use super::{Lsn, PgAnchor, PgOrder, postgres_continuity::Stamp};
+    use crate::snapshot_driver::{SinkState, sink_state};
+
+    fn stamp(transition: u64, timeline: u32) -> Stamp {
+        Stamp {
+            chain_id: "k".into(),
+            transition,
+            timeline,
+        }
+    }
+
+    fn at(lsn: &str, s: Option<&Stamp>) -> PgAnchor {
+        PgAnchor::new(Lsn::parse(lsn).unwrap(), s)
+    }
+
+    fn cdc(lsn: &str, s: &Stamp) -> Vec<u8> {
+        format!(
+            r#"{{"lsn":"{lsn}","tx_id":null{}}}"#,
+            s.checkpoint_members()
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn an_anchor_reads_bare_or_stamped() {
+        let bare: PgAnchor = serde_json::from_str(r#""0/500""#).unwrap();
+        assert_eq!(bare, at("0/500", None));
+        let stamped = at("0/500", Some(&stamp(1, 2)));
+        let back: PgAnchor =
+            serde_json::from_slice(&serde_json::to_vec(&stamped).unwrap())
+                .unwrap();
+        assert_eq!(back, stamped);
+        assert!(
+            serde_json::from_str::<PgAnchor>(r#"{"lsn":"0/1","x":1}"#).is_err()
+        );
+    }
+
+    /// The completing position counts only at exactly the anchor's LSN and
+    /// continuity stamp; a stream position counts only on that history.
+    #[test]
+    fn a_completion_is_bound_to_the_exact_anchor_and_stamp() {
+        let s = stamp(1, 2);
+        let a = at("0/500", Some(&s));
+        let state =
+            |raw: &[u8]| sink_state(&PgOrder, Some(raw), "ch", 4, Some(&a));
+        assert_eq!(state(&a.completing("ch", 4)), SinkState::AtOrPast);
+        assert_eq!(state(&a.completing("ch", 3)), SinkState::Behind);
+        assert_eq!(state(&a.completing("other", 4)), SinkState::Foreign);
+        assert_eq!(
+            state(&at("0/501", Some(&s)).completing("ch", 4)),
+            SinkState::Foreign,
+            "another LSN"
+        );
+        assert_eq!(
+            state(&at("0/500", Some(&stamp(2, 3))).completing("ch", 4)),
+            SinkState::Foreign,
+            "another continuity stamp"
+        );
+        assert_eq!(
+            state(&at("0/500", None).completing("ch", 4)),
+            SinkState::Foreign,
+            "the stamp dropped"
+        );
+        assert_eq!(state(&cdc("0/600", &s)), SinkState::AtOrPast);
+        assert_eq!(
+            state(&cdc("0/700", &stamp(2, 3))),
+            SinkState::AtOrPast,
+            "a later proven transition of the chain"
+        );
+        let mut foreign = stamp(1, 2);
+        foreign.chain_id = "other".into();
+        assert_eq!(state(&cdc("0/600", &foreign)), SinkState::Foreign);
+        assert_eq!(state(&cdc("0/400", &s)), SinkState::Behind);
+        // #131: an unmarked position exactly at the anchor completed it.
+        assert_eq!(state(&cdc("0/500", &s)), SinkState::AtOrPast);
     }
 }

@@ -30,6 +30,15 @@ impl Sink for FilteredSink {
         self.inner.id()
     }
 
+    /// A barrier carries no event: never filtered, always the inner sink's.
+    async fn barrier(
+        &self,
+        kind: &deltaforge_core::BarrierKind,
+        ctx: &deltaforge_core::SinkBatchContext,
+    ) -> SinkResult<()> {
+        self.inner.barrier(kind, ctx).await
+    }
+
     async fn settle_uncertain(
         &self,
         evidence: &deltaforge_core::incident::Evidence,
@@ -180,6 +189,18 @@ mod tests {
         ) -> deltaforge_core::BoundaryOutcome {
             deltaforge_core::BoundaryOutcome::Committed
         }
+        async fn barrier(
+            &self,
+            _: &deltaforge_core::BarrierKind,
+            ctx: &SinkBatchContext,
+        ) -> SinkResult<()> {
+            self.ctx
+                .calls
+                .lock()
+                .unwrap()
+                .push((usize::MAX, ctx.durable_watermark.is_some()));
+            Ok(())
+        }
     }
 
     fn ctx_with_wm() -> SinkBatchContext {
@@ -233,6 +254,22 @@ mod tests {
             sink.settle_uncertain(&Default::default()).await,
             deltaforge_core::BoundaryOutcome::Committed
         );
+    }
+
+    /// A barrier carries no event: a filter that drops everything still
+    /// passes it to the wrapped sink.
+    #[tokio::test]
+    async fn a_barrier_always_reaches_the_wrapped_sink() {
+        let (inner, _, ctx) = CountingSink::new_recording("sink");
+        let filter = SinkFilter {
+            synthetic_only: true,
+            ..Default::default()
+        };
+        let sink = FilteredSink::wrap(inner, filter);
+        sink.barrier(&deltaforge_core::BarrierKind::Terminal, &ctx_with_wm())
+            .await
+            .unwrap();
+        assert_eq!(*ctx.calls.lock().unwrap(), vec![(usize::MAX, true)]);
     }
 
     #[tokio::test]

@@ -21,8 +21,6 @@ use serde::{Deserialize, Serialize};
 use tokio_postgres::NoTls;
 use tracing::{info, warn};
 
-use super::postgres_snapshot::{SnapshotProgress, progress_key};
-
 /// Schema version of the persisted ownership record.
 pub const SLOT_OWNER_RECORD_VERSION: u32 = 1;
 const PLUGIN: &str = "pgoutput";
@@ -332,23 +330,6 @@ async fn create_owned_slot(
     Ok(c)
 }
 
-/// Reset snapshot progress to empty. Fallible and must be awaited with `?`: if the
-/// reset does not persist, `run_snapshot` could reload stale completed-table state
-/// and skip tables under the new anchor, reintroducing loss - so the caller fails
-/// closed rather than snapshotting on unreset progress.
-pub(super) async fn reset_snapshot_progress(
-    chkpt: &Arc<dyn CheckpointStore>,
-    source_id: &str,
-) -> Result<()> {
-    let bytes = serde_json::to_vec(&SnapshotProgress::default())
-        .context("serialize reset snapshot progress")?;
-    chkpt
-        .put_raw(&progress_key(source_id), &bytes)
-        .await
-        .context("persist reset snapshot progress")?;
-    Ok(())
-}
-
 fn fail_closed(msg: String) -> SourceError {
     SourceError::Incompatible {
         details: msg.into(),
@@ -360,8 +341,8 @@ fn fail_closed(msg: String) -> SourceError {
 ///
 /// - Slot missing: create it (intent -> finalize) and return its consistent point.
 /// - Slot exists, ownership proven, and slot **inactive**: re-anchor (drop +
-///   recreate), reset snapshot progress for a full re-snapshot, and return the
-///   new consistent point.
+///   recreate) for the new snapshot generation, and return the new consistent
+///   point.
 /// - Otherwise (no/partial/mismatched record, or an **active** slot): fail closed
 ///   with remediation. Never drop an active or ambiguously owned slot.
 pub async fn prepare_snapshot_slot_anchor(
@@ -407,12 +388,6 @@ pub async fn prepare_snapshot_slot_anchor(
                 )
                 .await
                 .map_err(SourceError::Other)?;
-                // Full re-snapshot: discard table-level progress. Fail closed if
-                // this does not persist - snapshotting on stale progress would
-                // skip tables under the new anchor and reintroduce loss.
-                reset_snapshot_progress(chkpt, source_id)
-                    .await
-                    .map_err(SourceError::Other)?;
                 warn!(source_id, slot, consistent_lsn = %c, "re-anchored owned inactive slot; performing a full re-snapshot");
                 Ok(c)
             } else {
@@ -440,44 +415,6 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use checkpoints::{CheckpointError, CheckpointResult};
-
-    /// A checkpoint store whose `put_raw` always fails - to prove the snapshot
-    /// progress reset propagates persistence failures (fail closed).
-    struct FailingPutStore;
-
-    #[async_trait]
-    impl CheckpointStore for FailingPutStore {
-        async fn get_raw(
-            &self,
-            _source_id: &str,
-        ) -> CheckpointResult<Option<Vec<u8>>> {
-            Ok(None)
-        }
-        async fn put_raw(
-            &self,
-            _source_id: &str,
-            _bytes: &[u8],
-        ) -> CheckpointResult<()> {
-            Err(CheckpointError::Database("injected put_raw failure".into()))
-        }
-        async fn delete(&self, _source_id: &str) -> CheckpointResult<bool> {
-            Ok(false)
-        }
-        async fn list(&self) -> CheckpointResult<Vec<String>> {
-            Ok(vec![])
-        }
-    }
-
-    #[tokio::test]
-    async fn reset_snapshot_progress_fails_closed_on_persist_error() {
-        let store: Arc<dyn CheckpointStore> = Arc::new(FailingPutStore);
-        let res = reset_snapshot_progress(&store, "src1").await;
-        assert!(
-            res.is_err(),
-            "reset must propagate a persistence failure so the caller fails \
-             closed instead of snapshotting on stale progress"
-        );
-    }
 
     /// A store whose `get_raw` always errors - to prove a transient authority
     /// outage is classified as retryable, not a permanent identity failure.

@@ -31,7 +31,6 @@ use sources::MySqlCheckpoint;
 use sources::mysql::MySqlSource;
 use storage::ArcStorageBackend;
 use storage::adapters::{LineageDescriptor, source_lineage};
-use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 
 mod test_common;
@@ -90,6 +89,7 @@ fn checkpoint(
         gtid_set: gtid.map(str::to_string),
         lineage: lineage.map(str::to_string),
         snapshot_completed: None,
+        snapshot_chain: None,
     })
     .unwrap()
 }
@@ -126,8 +126,9 @@ async fn start(
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
+        snapshot_cohort: Default::default(),
     };
-    let (tx, mut rx) = mpsc::channel::<SourceItem>(128);
+    let (tx, mut rx) = test_common::acked_channel(&src, &store, &src.id, 128);
     let handle = src.run(tx, store).await;
     let started = Instant::now();
     let deadline = started + window;

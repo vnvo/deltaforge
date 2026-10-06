@@ -350,6 +350,19 @@ async fn kafka_sink_sends_batch() -> Result<()> {
     // Send a batch of 100 events
     let events: Vec<Event> = (0..100).map(make_test_event).collect();
     sink.send_batch(&events).await?;
+    // Nothing stays buffered behind an acknowledged batch: the checkpoint
+    // barrier acknowledges.
+    sink.barrier(
+        &deltaforge_core::BarrierKind::Terminal,
+        &deltaforge_core::SinkBatchContext {
+            checkpoint: deltaforge_core::CheckpointMeta::from_vec(
+                b"cp".to_vec(),
+            ),
+            durable_watermark: None,
+            batch_id: None,
+        },
+    )
+    .await?;
 
     // Consume all messages
     let consumer = create_consumer(&brokers, &topic, "test-batch-consumer")?;

@@ -56,6 +56,7 @@ static PROGRESS_WRITES: AtomicU64 = AtomicU64::new(0);
 static PROGRESS_BYTES: AtomicU64 = AtomicU64::new(0);
 static PROGRESS_MICROS: AtomicU64 = AtomicU64::new(0);
 static BOUNDARIES: AtomicU64 = AtomicU64::new(0);
+static OWNER_CHECKS: AtomicU64 = AtomicU64::new(0);
 static BOUNDARY_BYTES: AtomicU64 = AtomicU64::new(0);
 static BOUNDARY_MICROS: AtomicU64 = AtomicU64::new(0);
 
@@ -109,6 +110,9 @@ pub struct SnapshotShape {
     pub boundaries: u64,
     pub boundary_bytes: u64,
     pub boundary_micros: u64,
+    /// Control-record reads checking the publishing run still owns its
+    /// generation (one before every publish: each chunk and each barrier).
+    pub owner_checks: u64,
 }
 
 /// The counters since the last [`reset`].
@@ -138,6 +142,7 @@ pub fn shape() -> SnapshotShape {
         boundaries: BOUNDARIES.load(Ordering::Relaxed),
         boundary_bytes: BOUNDARY_BYTES.load(Ordering::Relaxed),
         boundary_micros: BOUNDARY_MICROS.load(Ordering::Relaxed),
+        owner_checks: OWNER_CHECKS.load(Ordering::Relaxed),
     }
 }
 
@@ -163,6 +168,7 @@ pub fn reset() {
         &BOUNDARIES,
         &BOUNDARY_BYTES,
         &BOUNDARY_MICROS,
+        &OWNER_CHECKS,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -195,10 +201,6 @@ pub(crate) fn record_preparation(
     PREPARATION_MICROS.fetch_add(d.as_micros() as u64, Ordering::Relaxed);
     PLAN_BYTES.fetch_add(plan_bytes as u64, Ordering::Relaxed);
     PREPARATION_LIVE_FETCHES.fetch_add(live_fetches, Ordering::Relaxed);
-}
-
-pub(crate) fn record_frontier_tables(n: usize) {
-    FRONTIER_TABLES.fetch_add(n as u64, Ordering::Relaxed);
 }
 
 /// One armed hold after the first discovery page: `(reached, release)`.
@@ -246,16 +248,54 @@ pub(crate) fn record_phase(phase: Phase, d: std::time::Duration) {
         .fetch_add(d.as_micros() as u64, Ordering::Relaxed);
 }
 
-pub(crate) fn record_progress_write(bytes: usize, d: std::time::Duration) {
-    PROGRESS_WRITES.fetch_add(1, Ordering::Relaxed);
-    PROGRESS_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
-    PROGRESS_MICROS.fetch_add(d.as_micros() as u64, Ordering::Relaxed);
+pub(crate) fn record_owner_check() {
+    OWNER_CHECKS.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn record_boundary(bytes: usize, d: std::time::Duration) {
     BOUNDARIES.fetch_add(1, Ordering::Relaxed);
     BOUNDARY_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
     BOUNDARY_MICROS.fetch_add(d.as_micros() as u64, Ordering::Relaxed);
+}
+
+/// One armed hold right after the first chunk a generation published.
+static DURING_COPY: Mutex<Option<(Arc<Notify>, Arc<Notify>)>> =
+    Mutex::new(None);
+
+/// Arm a hold right after the next generation's first published chunk: the
+/// copy pauses there (its guard keeps running) until released.
+pub fn hold_during_copy() -> (Arc<Notify>, Arc<Notify>) {
+    let pair = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    *DURING_COPY.lock().expect("not poisoned") = Some(pair.clone());
+    pair
+}
+
+pub(crate) async fn during_copy() {
+    let armed = DURING_COPY.lock().expect("not poisoned").take();
+    if let Some((reached, release)) = armed {
+        reached.notify_one();
+        release.notified().await;
+    }
+}
+
+/// One armed hold right after a generation's terminal barrier was sent.
+static AFTER_TERMINAL: Mutex<Option<(Arc<Notify>, Arc<Notify>)>> =
+    Mutex::new(None);
+
+/// Arm a hold right after the next terminal barrier is sent: the first
+/// notify fires when it is reached, the second releases it.
+pub fn hold_after_terminal() -> (Arc<Notify>, Arc<Notify>) {
+    let pair = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    *AFTER_TERMINAL.lock().expect("not poisoned") = Some(pair.clone());
+    pair
+}
+
+pub(crate) async fn after_terminal() {
+    let armed = AFTER_TERMINAL.lock().expect("not poisoned").take();
+    if let Some((reached, release)) = armed {
+        reached.notify_one();
+        release.notified().await;
+    }
 }
 
 /// One armed hold after preparation, right before the snapshot anchor.

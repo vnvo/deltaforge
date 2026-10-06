@@ -210,13 +210,55 @@ impl StreamProof {
                     details: format!("read the durable checkpoint: {e}").into(),
                 }
             })? {
-                // An incomplete snapshot's durable point is its anchor, on no
-                // proven chain yet.
-                super::PgResumePosition::Snapshot { anchor } => {
+                // An incomplete snapshot's durable point is its anchor, on
+                // the history the anchor was taken on.
+                super::PgResumePosition::Snapshot { anchor, stamp } => {
                     return Ok(Some(Checkpoint {
                         lsn: anchor,
-                        chain: None,
+                        chain: stamp,
                     }));
+                }
+                // A sink entered the current generation and committed
+                // nothing since: the generation's anchor (with its stamp),
+                // where its stream starts, is the durable point.
+                super::PgResumePosition::Started => {
+                    let anchor = match crate::snapshot_queue::QueueStore::new(
+                        self.backend.clone(),
+                        &self.source_id,
+                    )
+                    .read()
+                    .await
+                    {
+                        Ok(Some(crate::snapshot_queue::Stored::Current {
+                            control,
+                            ..
+                        })) => control
+                            .anchor
+                            .as_ref()
+                            .and_then(super::pg_anchor_of),
+                        _ => None,
+                    };
+                    let Some(anchor) = anchor else {
+                        return Err(SourceError::Checkpoint {
+                            details: "the durable checkpoint is a snapshot \
+                                      generation's start, and the generation \
+                                      records no anchor"
+                                .into(),
+                        });
+                    };
+                    let lsn = Lsn::parse(&anchor.lsn).map_err(|e| {
+                        SourceError::Checkpoint {
+                            details: format!(
+                                "invalid snapshot anchor '{}': {e}",
+                                anchor.lsn
+                            )
+                            .into(),
+                        }
+                    })?;
+                    let chain = anchor.chain_position().map_err(|e| {
+                        SourceError::Checkpoint { details: e.into() }
+                    })?;
+                    return Ok(Some(Checkpoint { lsn, chain }));
                 }
                 super::PgResumePosition::Stream(cp) => cp,
             };

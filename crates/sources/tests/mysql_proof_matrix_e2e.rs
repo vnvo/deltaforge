@@ -152,6 +152,7 @@ async fn position(port: u16, hash: &str) -> MySqlCheckpoint {
             .get::<String, _>("Executed_Gtid_Set")
             .filter(|g| !g.is_empty()),
         snapshot_completed: None,
+        snapshot_chain: None,
     }
 }
 
@@ -287,6 +288,7 @@ fn source(
         on_schema_drift: OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
+        snapshot_cohort: Default::default(),
     }
 }
 
@@ -296,7 +298,7 @@ struct Run {
 }
 
 async fn run(src: MySqlSource, st: &State) -> Run {
-    let (tx, rx) = mpsc::channel(1024);
+    let (tx, rx) = test_common::acked_channel(&src, &st.ckpt, &src.id, 1024);
     let handle = src.run(tx, st.ckpt.clone()).await;
     // Let startup finish (barriers, baselines, preload) before writes.
     sleep(Duration::from_secs(3)).await;

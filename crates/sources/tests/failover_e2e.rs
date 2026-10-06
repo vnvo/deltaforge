@@ -254,6 +254,7 @@ async fn make_mysql_source(
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
+        snapshot_cohort: Default::default(),
     }
 }
 
@@ -280,6 +281,7 @@ async fn make_pg_source(
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
+        snapshot_cohort: Default::default(),
     }
 }
 
@@ -371,7 +373,7 @@ async fn mysql_failover_streaming_resumes_after_identity_change() -> Result<()>
             Arc::clone(&backend),
         )
         .await;
-        let (tx, mut rx) = mpsc::channel(64);
+        let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
         sleep(Duration::from_secs(4)).await;
 
@@ -414,7 +416,7 @@ async fn mysql_failover_streaming_resumes_after_identity_change() -> Result<()>
             Arc::clone(&backend),
         )
         .await;
-        let (tx, mut rx) = mpsc::channel(64);
+        let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
         sleep(Duration::from_secs(5)).await;
 
@@ -482,7 +484,7 @@ async fn mysql_failover_position_lost_stops_source() -> Result<()> {
             Arc::clone(&backend),
         )
         .await;
-        let (tx, mut rx) = mpsc::channel(64);
+        let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
         sleep(Duration::from_secs(4)).await;
 
@@ -514,7 +516,7 @@ async fn mysql_failover_position_lost_stops_source() -> Result<()> {
             Arc::clone(&backend),
         )
         .await;
-        let (tx, _rx) = mpsc::channel(64);
+        let (tx, _rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
 
         match timeout(Duration::from_secs(20), handle.join()).await {
@@ -573,8 +575,9 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
             on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
             table_options: Default::default(),
             rotation: None,
+            snapshot_cohort: Default::default(),
         };
-        let (tx, mut rx) = mpsc::channel(64);
+        let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
         sleep(Duration::from_secs(4)).await;
 
@@ -628,8 +631,9 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
             on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
             table_options: Default::default(),
             rotation: None,
+            snapshot_cohort: Default::default(),
         };
-        let (tx, mut rx) = mpsc::channel(64);
+        let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
         sleep(Duration::from_secs(6)).await;
 
@@ -707,8 +711,9 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
             on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
             table_options: Default::default(),
             rotation: None,
+            snapshot_cohort: Default::default(),
         };
-        let (tx, mut rx) = mpsc::channel(64);
+        let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
         sleep(Duration::from_secs(4)).await;
 
@@ -759,8 +764,9 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
             on_schema_drift: deltaforge_config::OnSchemaDrift::Halt,
             table_options: Default::default(),
             rotation: None,
+            snapshot_cohort: Default::default(),
         };
-        let (tx, _rx) = mpsc::channel(64);
+        let (tx, _rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
 
         match timeout(Duration::from_secs(20), handle.join()).await {
@@ -811,7 +817,7 @@ async fn mysql_failover_schema_drift_halt_no_drift_continues() -> Result<()> {
             Arc::clone(&backend),
         )
         .await;
-        let (tx, mut rx) = mpsc::channel(64);
+        let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
         sleep(Duration::from_secs(4)).await;
 
@@ -859,8 +865,9 @@ async fn mysql_failover_schema_drift_halt_no_drift_continues() -> Result<()> {
             on_schema_drift: deltaforge_config::OnSchemaDrift::Halt,
             table_options: Default::default(),
             rotation: None,
+            snapshot_cohort: Default::default(),
         };
-        let (tx, mut rx) = mpsc::channel(64);
+        let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
         sleep(Duration::from_secs(5)).await;
 
@@ -1072,7 +1079,7 @@ async fn postgres_another_cluster_is_refused_before_anything() -> Result<()> {
             Arc::clone(&backend),
         )
         .await;
-        let (tx, mut rx) = mpsc::channel(64);
+        let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
         sleep(Duration::from_secs(4)).await;
         pg_admin_client(port_a, DB)
@@ -1113,7 +1120,7 @@ async fn postgres_another_cluster_is_refused_before_anything() -> Result<()> {
             Arc::clone(&backend),
         )
         .await;
-        let (tx, mut rx) = mpsc::channel(64);
+        let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         refused(src.run(tx, Arc::clone(&ckpt)).await).await;
         no_events(&mut rx).await;
     }
@@ -1131,7 +1138,8 @@ async fn postgres_another_cluster_is_refused_before_anything() -> Result<()> {
         )
         .await;
         src.snapshot_cfg.mode = SnapshotMode::Initial;
-        let (tx, mut rx) = mpsc::channel(64);
+        let (tx, mut rx) =
+            test_common::acked_channel(&src, &fresh, &src.id, 64);
         refused(src.run(tx, Arc::clone(&fresh)).await).await;
         no_events(&mut rx).await;
     }
@@ -1227,7 +1235,7 @@ async fn postgres_a_reconnect_to_another_cluster_is_refused() -> Result<()> {
         Arc::clone(&backend),
     )
     .await;
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
     let handle = src.run(tx, Arc::clone(&ckpt)).await;
     sleep(Duration::from_secs(4)).await;
     pg_admin_client(port_a, DB)
@@ -1530,7 +1538,7 @@ async fn postgres_startup_identity_persist_failure_opens_no_stream()
 
     let src =
         make_pg_source("no_open", &pg_dsn(port, DB), SLOT, PUB, backend).await;
-    let (tx, _rx) = mpsc::channel(64);
+    let (tx, _rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
     reset_streams_opened();
     let handle = src.run(tx, ckpt).await;
 
@@ -1576,7 +1584,7 @@ async fn mysql_startup_identity_persist_failure_opens_no_stream() -> Result<()>
     let src =
         make_mysql_source("no_open", &mysql_cdc_dsn(port, DB), DB, backend)
             .await;
-    let (tx, _rx) = mpsc::channel(64);
+    let (tx, _rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
     reset_streams_opened();
     let handle = src.run(tx, ckpt).await;
 
@@ -1621,7 +1629,7 @@ async fn mysql_nongtid_startup_identity_persist_failure_opens_no_stream()
     let src =
         make_mysql_source("no_open", &mysql_cdc_dsn(port, DB), DB, backend)
             .await;
-    let (tx, _rx) = mpsc::channel(64);
+    let (tx, _rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
     reset_streams_opened();
     let handle = src.run(tx, ckpt).await;
 
@@ -1704,6 +1712,7 @@ async fn recv_until(
             }
             SourceItem::TxAbort { tx_id } => r.seen.push(Seen::Abort(tx_id)),
             SourceItem::Boundary { .. } => {}
+            SourceItem::Barrier { .. } => {}
         }
     }
 }
@@ -1802,7 +1811,7 @@ async fn stream_closed_at(cut: Cut) -> Result<()> {
     .await;
     // One slot: the source hands on one item at a time, so the cut lands
     // where the test stops reading.
-    let (tx, mut rx) = mpsc::channel(1);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 1);
     let handle = src.run(tx, Arc::clone(&ckpt)).await;
     sleep(Duration::from_secs(4)).await;
 
@@ -1903,7 +1912,7 @@ async fn postgres_a_reconnect_outlasts_an_outage_and_stops_on_cancel()
         Arc::clone(&backend),
     )
     .await;
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
     let handle = src.run(tx, Arc::clone(&ckpt)).await;
     sleep(Duration::from_secs(4)).await;
     let admin = pg_admin_client(port, DB).await;
@@ -1968,7 +1977,7 @@ async fn postgres_a_stop_inside_a_transaction_aborts_nothing() -> Result<()> {
         Arc::clone(&backend),
     )
     .await;
-    let (tx, mut rx) = mpsc::channel(1);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 1);
     let handle = src.run(tx, Arc::clone(&ckpt)).await;
     sleep(Duration::from_secs(4)).await;
     pg_admin_client(port, DB)
@@ -2038,7 +2047,7 @@ async fn postgres_a_dropped_slot_is_a_continuity_incident() -> Result<()> {
         Arc::clone(&backend),
     )
     .await;
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
     let handle = src.run(tx, Arc::clone(&ckpt)).await;
     sleep(Duration::from_secs(4)).await;
     pg_admin_client(port, DB_LOST)
@@ -2065,7 +2074,7 @@ async fn postgres_a_dropped_slot_is_a_continuity_incident() -> Result<()> {
         Arc::clone(&backend),
     )
     .await;
-    let (tx, _rx) = mpsc::channel(64);
+    let (tx, _rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
     reset_streams_opened();
     let e = timeout(Duration::from_secs(60), src.run(tx, ckpt).await.join())
         .await
@@ -2105,7 +2114,7 @@ async fn run_until_row_then_stop(
         Arc::clone(backend),
     )
     .await;
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = test_common::acked_channel(&src, ckpt, &src.id, 64);
     let handle = src.run(tx, Arc::clone(ckpt)).await;
     sleep(Duration::from_secs(4)).await;
     pg_admin_client(port, db)
@@ -2161,7 +2170,7 @@ async fn postgres_a_slot_beyond_the_checkpoint_stops_before_streaming()
         Arc::clone(&backend),
     )
     .await;
-    let (tx, _rx) = mpsc::channel(64);
+    let (tx, _rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
     reset_streams_opened();
     let e = timeout(
         Duration::from_secs(60),
@@ -2213,7 +2222,7 @@ async fn postgres_a_slot_advanced_after_the_proof_is_refused_once_held()
     )
     .await;
     let (proved, release) = hold_after_slot_proof();
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
     reset_streams_opened();
     let handle = src.run(tx, Arc::clone(&ckpt)).await;
 
@@ -2287,7 +2296,7 @@ async fn postgres_a_reconnect_never_acknowledges_past_the_checkpoint()
         Arc::clone(&backend),
     )
     .await;
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
     let handle = src.run(tx, Arc::clone(&ckpt)).await;
     sleep(Duration::from_secs(4)).await;
     let admin = pg_admin_client(port, DB).await;
@@ -2359,7 +2368,7 @@ async fn mysql_purged_binlogs_are_a_gtid_position_incident() -> Result<()> {
         Arc::clone(&backend),
     )
     .await;
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
     let handle = src.run(tx, Arc::clone(&ckpt)).await;
     sleep(Duration::from_secs(4)).await;
     let pool = mysql_root_pool(port).await;
@@ -2395,7 +2404,7 @@ async fn mysql_purged_binlogs_are_a_gtid_position_incident() -> Result<()> {
         Arc::clone(&backend),
     )
     .await;
-    let (tx, _rx) = mpsc::channel(64);
+    let (tx, _rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
     let e = timeout(Duration::from_secs(90), src.run(tx, ckpt).await.join())
         .await
         .expect("stops")

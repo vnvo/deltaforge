@@ -42,6 +42,7 @@ mysql_common = { version = "0.35", features = ["binlog"] }
 bytes.workspace = true
 rand = "0.9.2"
 hex = "0.4"
+uuid.workspace = true
 sha2 = "0.10"
 pgwire-replication = "0.4.0"
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
@@ -68,6 +69,9 @@ processors ={ path = "../processors"}
 # This is a dev-dependency cycle (runner depends on sources), which Cargo allows
 # because dev-dependencies are excluded from the normal build graph.
 runner = { path = "../runner" }
+# Dev-only, the same kind of cycle: the counting storage backend for the
+# snapshot's structural operation counts.
+scale-harness = { path = "../scale-harness" }
 
 [lints]
 workspace = true

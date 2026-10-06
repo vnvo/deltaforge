@@ -417,3 +417,202 @@ async fn a_lost_head_response_is_settled_as_committed_not_republished()
     assert_eq!(entry_count(&raw, &prefix).await, 1, "no duplicate entry");
     Ok(())
 }
+
+// =============================================================================
+// Snapshot generation starts across real HEADs (design section 5.4)
+// =============================================================================
+
+fn wm(pos: sources::durable_checkpoint::WmPos) -> Vec<u8> {
+    DurableWatermark::new(
+        sources::snapshot_generation::PersistedLineage::Postgres {
+            system_identifier: 42,
+        },
+        pos,
+    )
+    .to_bytes()
+}
+
+fn wm_ctx(bytes: Vec<u8>) -> SinkBatchContext {
+    SinkBatchContext {
+        checkpoint: CheckpointMeta::from_vec(bytes.clone()),
+        durable_watermark: Some(bytes),
+        batch_id: None,
+    }
+}
+
+/// The HEAD watermark a pre-queue release published for a completed
+/// snapshot of `generation`: the per-table cursor vector (version 1).
+fn legacy(generation: u64) -> SinkBatchContext {
+    use sources::durable_checkpoint::{SnapshotCursor, WmPos};
+    wm_ctx(wm(WmPos::Snapshot {
+        generation,
+        completed: true,
+        table_cursors: [(
+            "public.orders".to_string(),
+            SnapshotCursor::Signed(9),
+        )]
+        .into(),
+    }))
+}
+
+/// A generation start barrier of `generation` of `chain`.
+async fn start(
+    sink: &DurableS3Sink,
+    chain: &str,
+    generation: u64,
+    legacy_through: Option<u64>,
+) -> deltaforge_core::SinkResult<()> {
+    use sources::durable_checkpoint::WmPos;
+    let ctx = wm_ctx(wm(WmPos::SnapshotGenerationAdopted {
+        snapshot_chain: chain.into(),
+        generation,
+        replaced_digest: String::new(),
+        legacy_through,
+    }));
+    sink.barrier(
+        &deltaforge_core::BarrierKind::GenerationStart(
+            deltaforge_core::GenerationStart {
+                snapshot_chain: chain.into(),
+                generation,
+                legacy_through,
+            },
+        ),
+        &ctx,
+    )
+    .await
+}
+
+/// Rows of `generation` of `chain` at sequence `seq`.
+async fn rows(
+    sink: &DurableS3Sink,
+    chain: &str,
+    generation: u64,
+    seq: u64,
+) -> deltaforge_core::SinkResult<()> {
+    use sources::durable_checkpoint::WmPos;
+    let ctx = wm_ctx(wm(WmPos::SnapshotSeq {
+        snapshot_chain: chain.into(),
+        generation,
+        seq,
+        completed: false,
+    }));
+    sink.send_batch_with_context(&[row(seq)], &ctx)
+        .await
+        .map(|_| ())
+}
+
+/// The HEAD's watermark position, decoded.
+async fn head_pos(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &str,
+) -> sources::durable_checkpoint::WmPos {
+    let head = read_json(store, head_key(prefix).as_ref()).await.unwrap();
+    let hex = head["watermark_hex"].as_str().expect("a HEAD watermark");
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect();
+    DurableWatermark::parse(&bytes).expect("a watermark").pos
+}
+
+/// A genuine pre-queue HEAD (a completed generation-3 snapshot vector) is
+/// adopted into a chain by generation 4's start, through crashes (a fresh
+/// sink with verified recovery) before and after the adoption; the
+/// generation's rows and terminal follow; a replacement by generation 5
+/// starts from the generation-4 HEAD, also through a crash. Another chain,
+/// and an unadopted legacy HEAD above `legacy_through`, are refused.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn generation_starts_adopt_real_heads_through_crashes() -> Result<()> {
+    use sources::durable_checkpoint::WmPos;
+    let infra = ministack().await;
+    let prefix = unique_prefix("genstart");
+    let cfg = sink_cfg(&prefix, &infra.endpoint);
+    let store = raw_store(&infra.endpoint)?;
+
+    // The pre-queue release's HEAD.
+    let sink = production_sink(&cfg).await?;
+    sink.send_batch_with_context(&[row(1)], &legacy(3)).await?;
+    assert!(matches!(
+        head_pos(&store, &prefix).await,
+        WmPos::Snapshot { generation: 3, .. }
+    ));
+
+    // Crash before the adoption: a fresh sink recovers the legacy HEAD.
+    drop(sink);
+    let sink = production_sink(&cfg).await?;
+    start(&sink, "c", 4, Some(3)).await?;
+    assert!(matches!(
+        head_pos(&store, &prefix).await,
+        WmPos::SnapshotGenerationAdopted { ref snapshot_chain, generation: 4, .. }
+            if snapshot_chain == "c"
+    ));
+    let adopted = entry_count(&store, &prefix).await;
+
+    // Crash after the adoption: the recovered chain verifies through the
+    // start entry, and the start again is idempotent (no new entry).
+    drop(sink);
+    let sink = production_sink(&cfg).await?;
+    start(&sink, "c", 4, Some(3)).await?;
+    assert_eq!(entry_count(&store, &prefix).await, adopted, "idempotent");
+
+    // The generation's rows and terminal.
+    rows(&sink, "c", 4, 1).await?;
+    rows(&sink, "c", 4, 2).await?;
+    sink.barrier(
+        &deltaforge_core::BarrierKind::Terminal,
+        &wm_ctx(wm(WmPos::SnapshotSeq {
+            snapshot_chain: "c".into(),
+            generation: 4,
+            seq: 3,
+            completed: true,
+        })),
+    )
+    .await?;
+
+    // Replacement by generation 5 of the chain, through a crash after its
+    // start; its rows follow.
+    start(&sink, "c", 5, Some(3)).await?;
+    drop(sink);
+    let sink = production_sink(&cfg).await?;
+    start(&sink, "c", 5, Some(3)).await?;
+    rows(&sink, "c", 5, 1).await?;
+    assert!(matches!(
+        head_pos(&store, &prefix).await,
+        WmPos::SnapshotSeq {
+            generation: 5,
+            seq: 1,
+            ..
+        }
+    ));
+
+    // Refused: another chain, and an earlier generation of this one.
+    let before = entry_count(&store, &prefix).await;
+    assert!(
+        start(&sink, "other", 1, None).await.is_err(),
+        "another chain"
+    );
+    assert!(start(&sink, "c", 4, Some(3)).await.is_err(), "rewound");
+    assert_eq!(
+        entry_count(&store, &prefix).await,
+        before,
+        "nothing written"
+    );
+
+    // An unadopted legacy HEAD above `legacy_through` is refused.
+    let prefix = unique_prefix("genstart-unadopted");
+    let cfg = sink_cfg(&prefix, &infra.endpoint);
+    let sink = production_sink(&cfg).await?;
+    sink.send_batch_with_context(&[row(1)], &legacy(3)).await?;
+    let before = entry_count(&store, &prefix).await;
+    assert!(
+        start(&sink, "c", 4, Some(2)).await.is_err(),
+        "a legacy generation above legacy_through"
+    );
+    assert_eq!(
+        entry_count(&store, &prefix).await,
+        before,
+        "nothing written"
+    );
+    Ok(())
+}

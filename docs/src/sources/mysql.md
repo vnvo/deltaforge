@@ -171,26 +171,29 @@ source:
 | `max_parallel_tables` | `8` | Tables snapshotted concurrently; also bounds the worker connections opened under the read lock |
 | `lock_timeout_secs` | `10` | Upper bound on acquiring the consistent-anchor lock; the snapshot fails closed if exceeded |
 | `chunk_size` | `10000` | Rows per range chunk (integer single-column PK tables only; others do a full scan) |
+| `discovery_page_size` | `1000` | Tables read per catalog query during discovery; also the most plan entries held in memory |
+| `max_snapshot_connections` | `max_parallel_tables x max_parallel_chunks + 2` | This source's share of the process-wide snapshot connection cap (`--max-snapshot-connections`, default 64) |
+| `max_anchor_age_secs` | `86400` | How long a generation may hold its anchor; blocks at the limit |
+| `max_plan_bytes` / `max_plan_items` | 256 MiB / `1000000` | Bounds of the durable plan; blocks before sealing at either limit |
 
 ### Snapshot events
 
 Snapshot rows are emitted as `Op::Read` events (Debezium `op: "r"`), distinguishable
 from live CDC `Op::Create` events. The binlog position captured at snapshot time becomes
-the CDC resume point, so no rows are missed or duplicated.
+the CDC resume point, so no rows are missed. A snapshot copied again after a
+restart delivers its rows again (at-least-once).
 
 ### Resume after interruption
 
-An interrupted snapshot is **copied again in full** on the next restart, as a new
-snapshot generation with a new anchor; it is never resumed table by table.
+An interrupted snapshot is **copied again in full** on the next restart, as a
+new [snapshot generation](../snapshots.md#generations) with a new anchor; it is
+never resumed table by table. Losing any worker's consistent-snapshot connection
+loses the generation's read view and replaces it the same way.
 
-A snapshot counts as complete only once the sinks have committed it. While it is
-in progress, its checkpoints are snapshot positions, which a restart never
-resumes as a binlog position. Only the last row of the snapshot, sent after every
-table was read and the binlog position was verified, carries the anchor as a
-binlog position, marked as the snapshot's completion. A restart before every
-sink has committed that row copies the snapshot again (duplicates, never loss).
-If every table is empty, no row can carry it, so such a snapshot is copied again
-on each restart until the first change is committed.
+A snapshot counts as complete only once its terminal barrier is committed by the
+sinks the commit policy requires; a restart after that completes it without
+copying. Completion, lagging sinks, bounds and blocking are described in
+[Initial Snapshots](../snapshots.md).
 
 ### Binlog retention safety
 
@@ -209,9 +212,10 @@ position was purged.
 - Cancels the snapshot immediately if the captured file is purged
 
 **After all tables complete:**
-- Synchronous final check before writing `finished=true`
-- `finished=true` means the position is confirmed valid for CDC resume,
-  not just that rows were emitted
+- Synchronous final check before the generation records its rows as produced:
+  a snapshot whose anchor binlog file was purged never completes, and blocks
+  with `snapshot_anchor_unavailable` (see
+  [Bounds and blocking](../snapshots.md#bounds-and-blocking))
 
 If you see retention risk warnings, the recommended actions are:
 1. Increase `binlog_expire_logs_seconds` to cover the estimated snapshot duration

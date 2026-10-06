@@ -74,6 +74,7 @@ pub(crate) async fn prove(
         gtid_set: ctx.last_gtid.clone(),
         lineage: Some(lineage.clone()),
         snapshot_completed: None,
+        snapshot_chain: None,
     };
     let Some(d) = mysql_checkpoint_position(
         &d_cp.file,
@@ -367,6 +368,7 @@ mod tests {
                 on_schema_drift: OnSchemaDrift::Adapt,
                 table_options: Default::default(),
                 rotation: None,
+                snapshot_cohort: Default::default(),
             };
             let (tx, rx) = mpsc::channel(4096);
             let handle = src.run(tx, st.ckpt.clone()).await;

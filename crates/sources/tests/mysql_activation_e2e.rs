@@ -213,6 +213,7 @@ fn source(
         on_schema_drift: OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
+        snapshot_cohort: Default::default(),
     }
 }
 
@@ -222,7 +223,7 @@ struct Run {
 }
 
 async fn run(src: MySqlSource, st: &State) -> Run {
-    let (tx, rx) = mpsc::channel(1024);
+    let (tx, rx) = test_common::acked_channel(&src, &st.ckpt, &src.id, 1024);
     let handle = src.run(tx, st.ckpt.clone()).await;
     // Let startup finish (barriers, preload) before the test writes.
     sleep(Duration::from_secs(3)).await;

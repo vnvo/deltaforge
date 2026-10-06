@@ -17,7 +17,6 @@ use deltaforge_core::Source;
 use sources::mysql::MySqlSource;
 use sources::stream_probe::{reset_streams_opened, streams_opened};
 use storage::{ArcStorageBackend, MemoryStorageBackend};
-use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 mod test_common;
@@ -42,12 +41,13 @@ async fn unverified_lineage_prevents_stream_opening() {
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
+        snapshot_cohort: Default::default(),
     };
 
     reset_streams_opened();
-    let (tx, _rx) = mpsc::channel(64);
     let ckpt: Arc<dyn CheckpointStore> =
         Arc::new(MemCheckpointStore::new().unwrap());
+    let (tx, _rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
     let handle = src.run(tx, ckpt).await;
 
     match timeout(Duration::from_secs(15), handle.join()).await {

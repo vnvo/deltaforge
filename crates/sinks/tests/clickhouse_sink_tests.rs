@@ -219,6 +219,20 @@ async fn upsert_mode_auto_creates_and_reflects_current_state() {
         ),
     ];
     let res = sink.send_batch(&batch).await.unwrap();
+    // Nothing stays buffered behind an acknowledged batch: the checkpoint
+    // barrier acknowledges.
+    sink.barrier(
+        &deltaforge_core::BarrierKind::Terminal,
+        &deltaforge_core::SinkBatchContext {
+            checkpoint: deltaforge_core::CheckpointMeta::from_vec(
+                b"cp".to_vec(),
+            ),
+            durable_watermark: None,
+            batch_id: None,
+        },
+    )
+    .await
+    .unwrap();
     assert!(
         res.dlq_failures.is_empty(),
         "no per-row failures: {:?}",

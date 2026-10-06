@@ -407,3 +407,35 @@ async fn http_sink_connection_refused_retries() -> Result<()> {
 
     Ok(())
 }
+
+/// Nothing is buffered after an acknowledged batch: the barrier acknowledges.
+#[tokio::test]
+async fn http_sink_acknowledges_a_barrier_after_a_batch() -> Result<()> {
+    init_test_tracing();
+    let server = TestServer::new();
+    let app = Router::new()
+        .route("/events", post(handle_event))
+        .with_state(server.clone());
+    let (port, _handle) = start_test_server(app).await;
+    let cfg = make_http_cfg(
+        "test-barrier",
+        &format!("http://127.0.0.1:{port}/events"),
+    );
+    let sink = HttpSink::new(
+        &cfg,
+        CancellationToken::new(),
+        "test",
+        None,
+        &sinks::ResolvedSinkCreds::default(),
+    )?;
+    sink.send_batch(&[make_test_event(1)]).await?;
+    let ctx = deltaforge_core::SinkBatchContext {
+        checkpoint: deltaforge_core::CheckpointMeta::from_vec(b"cp".to_vec()),
+        durable_watermark: None,
+        batch_id: None,
+    };
+    sink.barrier(&deltaforge_core::BarrierKind::Terminal, &ctx)
+        .await?;
+    assert_eq!(server.received_events().await.len(), 1);
+    Ok(())
+}

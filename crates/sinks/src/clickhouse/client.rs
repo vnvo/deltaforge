@@ -136,6 +136,21 @@ impl ClickHouseClient {
     }
 }
 
+/// The settings every insert carries. `wait_for_async_insert=1` makes a 2xx
+/// mean the rows are written to the table even when the server or user
+/// profile enables `async_insert` (otherwise a 2xx only means "queued in the
+/// server's buffer", which an acknowledged batch and a checkpoint barrier
+/// must never mean). A server whose constraints forbid the setting rejects
+/// the insert: it fails, never acknowledging less.
+pub(crate) fn insert_settings(
+    dedup_token: &str,
+) -> [(&'static str, String); 2] {
+    [
+        ("insert_deduplication_token", dedup_token.to_string()),
+        ("wait_for_async_insert", "1".to_string()),
+    ]
+}
+
 #[async_trait]
 impl ChTransport for ClickHouseClient {
     async fn insert_rowbinary(
@@ -146,7 +161,7 @@ impl ChTransport for ClickHouseClient {
     ) -> Result<(), SinkError> {
         self.post(
             self.insert_query(table),
-            &[("insert_deduplication_token", dedup_token.to_string())],
+            &insert_settings(dedup_token),
             body,
         )
         .await
@@ -181,6 +196,16 @@ mod tests {
             required: Some(true),
             auto_create: true,
         }
+    }
+
+    #[test]
+    fn every_insert_waits_for_an_async_insert() {
+        let settings = insert_settings("tok");
+        assert!(settings.contains(&("wait_for_async_insert", "1".to_string())));
+        assert!(
+            settings
+                .contains(&("insert_deduplication_token", "tok".to_string()))
+        );
     }
 
     #[test]

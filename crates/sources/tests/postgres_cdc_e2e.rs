@@ -255,6 +255,7 @@ async fn make_source(
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
+        snapshot_cohort: Default::default(),
     }
 }
 
@@ -264,7 +265,7 @@ async fn start_source(
     src: PostgresSource,
 ) -> Result<(mpsc::Receiver<SourceItem>, SourceHandle)> {
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, rx) = mpsc::channel(128);
+    let (tx, rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
     let handle = src.run(tx, ckpt).await;
     wait_ready(&handle, Duration::from_secs(10)).await?;
     sleep(Duration::from_secs(2)).await;
@@ -741,7 +742,8 @@ async fn pg_schema_drift_adapt_delivers_post_drift_and_advances_checkpoint()
             backend.clone(),
         )
         .await;
-        let (tx, mut rx) = mpsc::channel(128);
+        let (tx, mut rx) =
+            test_common::acked_channel(&src, &ckpt, &src.id, 128);
         let h = src.run(tx, ckpt.clone()).await;
         wait_ready(&h, Duration::from_secs(3)).await?;
         client
@@ -777,7 +779,8 @@ async fn pg_schema_drift_adapt_delivers_post_drift_and_advances_checkpoint()
             backend.clone(),
         )
         .await;
-        let (tx, mut rx) = mpsc::channel(128);
+        let (tx, mut rx) =
+            test_common::acked_channel(&src, &ckpt, &src.id, 128);
         let h = src.run(tx, ckpt.clone()).await;
         wait_ready(&h, Duration::from_secs(3)).await?;
         let ev = collect_until(&mut rx, Duration::from_secs(15), |e| {
@@ -843,7 +846,8 @@ async fn pg_schema_drift_halt_fails_closed_and_does_not_skip() -> Result<()> {
             backend.clone(),
         )
         .await;
-        let (tx, mut rx) = mpsc::channel(128);
+        let (tx, mut rx) =
+            test_common::acked_channel(&src, &ckpt, &src.id, 128);
         let h = src.run(tx, ckpt.clone()).await;
         wait_ready(&h, Duration::from_secs(3)).await?;
         client
@@ -883,7 +887,8 @@ async fn pg_schema_drift_halt_fails_closed_and_does_not_skip() -> Result<()> {
             backend.clone(),
         )
         .await;
-        let (tx, mut rx) = mpsc::channel(128);
+        let (tx, mut rx) =
+            test_common::acked_channel(&src, &ckpt, &src.id, 128);
         let h = src.run(tx, ckpt.clone()).await;
         // The source must die (never become ready) once it hits the drift.
         let ready = wait_ready(&h, Duration::from_secs(10)).await;
@@ -1027,8 +1032,10 @@ async fn pg_first_resolution_drift_is_caught_with_a_cold_cache() -> Result<()> {
 
     // Run 1: the table's schema is registered by its first row.
     {
-        let (tx, mut rx) = mpsc::channel(128);
-        let h = source().await.run(tx, ckpt.clone()).await;
+        let src_run = source().await;
+        let (tx, mut rx) =
+            test_common::acked_channel(&src_run, &ckpt, &src_run.id, 128);
+        let h = src_run.run(tx, ckpt.clone()).await;
         wait_ready(&h, Duration::from_secs(3)).await?;
         client
             .execute("INSERT INTO orders VALUES (300, 'pre')", &[])
@@ -1054,6 +1061,7 @@ async fn pg_first_resolution_drift_is_caught_with_a_cold_cache() -> Result<()> {
             timeline: None,
             chain: None,
             transition: None,
+            ..Default::default()
         })?,
     )
     .await?;
@@ -1065,8 +1073,10 @@ async fn pg_first_resolution_drift_is_caught_with_a_cold_cache() -> Result<()> {
         .await?;
 
     // Run 2: cold loader cache; the drifted Relation is the table's first.
-    let (tx, mut rx) = mpsc::channel(128);
-    let h = source().await.run(tx, ckpt.clone()).await;
+    let src_run = source().await;
+    let (tx, mut rx) =
+        test_common::acked_channel(&src_run, &ckpt, &src_run.id, 128);
+    let h = src_run.run(tx, ckpt.clone()).await;
     let ready = wait_ready(&h, Duration::from_secs(10)).await;
     let items = drain_items(&mut rx, Duration::from_secs(2)).await;
     h.stop();
@@ -1135,7 +1145,8 @@ async fn pg_dropped_table_retained_wal_recovers_via_durable_schema()
             backend.clone(),
         )
         .await;
-        let (tx, mut rx) = mpsc::channel(128);
+        let (tx, mut rx) =
+            test_common::acked_channel(&src, &ckpt, &src.id, 128);
         let h = src.run(tx, ckpt.clone()).await;
         wait_ready(&h, Duration::from_secs(3)).await?;
         client
@@ -1174,7 +1185,7 @@ async fn pg_dropped_table_retained_wal_recovers_via_durable_schema()
         backend.clone(),
     )
     .await;
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
     let h = src.run(tx, ckpt.clone()).await;
     let ready = wait_ready(&h, Duration::from_secs(10)).await;
     let items = drain_items(&mut rx, Duration::from_secs(5)).await;
@@ -1252,7 +1263,8 @@ async fn pg_dropped_table_schema_mismatch_fails_closed() -> Result<()> {
             backend.clone(),
         )
         .await;
-        let (tx, mut rx) = mpsc::channel(128);
+        let (tx, mut rx) =
+            test_common::acked_channel(&src, &ckpt, &src.id, 128);
         let h = src.run(tx, ckpt.clone()).await;
         wait_ready(&h, Duration::from_secs(3)).await?;
         client
@@ -1289,7 +1301,7 @@ async fn pg_dropped_table_schema_mismatch_fails_closed() -> Result<()> {
         backend.clone(),
     )
     .await;
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
     let h = src.run(tx, ckpt.clone()).await;
     let ready = wait_ready(&h, Duration::from_secs(10)).await;
     let items = drain_items(&mut rx, Duration::from_secs(3)).await;
@@ -1368,7 +1380,8 @@ async fn pg_dropped_table_recreated_uses_historical_not_recreated() -> Result<()
             backend.clone(),
         )
         .await;
-        let (tx, mut rx) = mpsc::channel(128);
+        let (tx, mut rx) =
+            test_common::acked_channel(&src, &ckpt, &src.id, 128);
         let h = src.run(tx, ckpt.clone()).await;
         wait_ready(&h, Duration::from_secs(3)).await?;
         client
@@ -1419,7 +1432,7 @@ async fn pg_dropped_table_recreated_uses_historical_not_recreated() -> Result<()
         backend.clone(),
     )
     .await;
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
     let h = src.run(tx, ckpt.clone()).await;
     let ready = wait_ready(&h, Duration::from_secs(10)).await;
     let items = drain_items(&mut rx, Duration::from_secs(5)).await;
@@ -1488,7 +1501,7 @@ async fn pg_schema_drift_halt_instream_fails_before_post_drift_row()
         backend.clone(),
     )
     .await;
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
     let h = src.run(tx, ckpt.clone()).await;
     wait_ready(&h, Duration::from_secs(3)).await?;
 
@@ -1578,7 +1591,6 @@ async fn postgres_cdc_checkpoint_resume() -> Result<()> {
 
     // First run
     {
-        let (tx, mut rx) = mpsc::channel(128);
         let src = make_source(
             "ckpt",
             &db,
@@ -1592,6 +1604,8 @@ async fn postgres_cdc_checkpoint_resume() -> Result<()> {
             backend: backend.clone(),
             ..src
         };
+        let (tx, mut rx) =
+            test_common::acked_channel(&src, &ckpt, &src.id, 128);
         let handle = src.run(tx, ckpt.clone()).await;
         wait_ready(&handle, Duration::from_secs(10)).await?;
         sleep(Duration::from_secs(2)).await;
@@ -1616,7 +1630,6 @@ async fn postgres_cdc_checkpoint_resume() -> Result<()> {
 
     // Second run
     {
-        let (tx, mut rx) = mpsc::channel(128);
         let src = make_source(
             "ckpt",
             &db,
@@ -1630,6 +1643,8 @@ async fn postgres_cdc_checkpoint_resume() -> Result<()> {
             backend: backend.clone(),
             ..src
         };
+        let (tx, mut rx) =
+            test_common::acked_channel(&src, &ckpt, &src.id, 128);
         let handle = src.run(tx, ckpt.clone()).await;
         wait_ready(&handle, Duration::from_secs(10)).await?;
 
@@ -1705,6 +1720,7 @@ async fn pg_two_sink_restart_resumes_from_slowest_sink() -> Result<()> {
             timeline: None,
             chain: None,
             transition: None,
+            ..Default::default()
         })
         .unwrap()
     };
@@ -2096,7 +2112,7 @@ async fn postgres_cdc_auth_failure() -> Result<()> {
     .await;
     src.dsn = bad_dsn.into();
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, _rx) = mpsc::channel(128);
+    let (tx, _rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
     let handle = src.run(tx, ckpt).await;
 
     // Wait for task to fail - auth errors should cause quick exit, not infinite retry
@@ -2162,7 +2178,7 @@ async fn postgres_cdc_slot_auto_created() -> Result<()> {
     )
     .await;
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
     let handle = src.run(tx, ckpt).await;
 
     sleep(Duration::from_secs(2)).await;
@@ -2241,7 +2257,7 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
     )
     .await;
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
     let handle = src.run(tx, ckpt).await;
 
     sleep(Duration::from_secs(3)).await;
@@ -2306,7 +2322,7 @@ async fn postgres_cdc_invalid_dsn() -> Result<()> {
     .await;
     src.dsn = "not-a-valid-dsn-at-all".into();
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, _rx) = mpsc::channel(128);
+    let (tx, _rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
     let handle = src.run(tx, ckpt).await;
 
     let result = timeout(Duration::from_secs(10), handle.join()).await;
@@ -2344,7 +2360,7 @@ async fn postgres_cdc_connection_refused() -> Result<()> {
     .await;
     src.dsn = bad_dsn.into();
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, _rx) = mpsc::channel(128);
+    let (tx, _rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
     let handle = src.run(tx, ckpt).await;
 
     let result = timeout(Duration::from_secs(10), handle.join()).await;
@@ -3267,6 +3283,7 @@ async fn make_snap_source(
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options,
         rotation: None,
+        snapshot_cohort: Default::default(),
     }
 }
 
@@ -3323,7 +3340,7 @@ async fn pg_uuid_pk_snapshot_ids_are_stable() -> Result<()> {
     .await;
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
     let handle = src.run(tx, ckpt).await;
     let events = collect_until(&mut rx, Duration::from_secs(30), |e| {
         e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 3
@@ -3390,7 +3407,8 @@ async fn pg_resnapshot_allocates_new_generation() -> Result<()> {
             .await;
             let ckpt: Arc<dyn CheckpointStore> =
                 Arc::new(MemCheckpointStore::new().unwrap());
-            let (tx, mut rx) = mpsc::channel(128);
+            let (tx, mut rx) =
+                test_common::acked_channel(&src, &ckpt, &src.id, 128);
             let handle = src.run(tx, ckpt).await;
             let events = collect_until(&mut rx, Duration::from_secs(30), |e| {
                 e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 3
@@ -3469,7 +3487,7 @@ async fn pg_keyless_table_rejected_before_rows() -> Result<()> {
     .await;
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
     let handle = src.run(tx, ckpt).await;
     let events =
         collect_until(&mut rx, Duration::from_secs(8), |_| false).await;
@@ -3485,15 +3503,16 @@ async fn pg_keyless_table_rejected_before_rows() -> Result<()> {
     Ok(())
 }
 
-/// Restart after an interrupted snapshot re-anchors the owned inactive slot and
-/// re-scans with the SAME generation, so the rows emitted before the interruption
-/// keep identical ids afterward. (The interrupted snapshot is fully re-scanned
-/// under the new anchor rather than resumed from partial progress - a full
-/// re-scan is required for safety when the anchor moves - but the ids are
-/// deterministic from the primary key plus the generation, so they are stable.)
+/// Restart after an interrupted snapshot re-anchors the owned inactive slot
+/// and replaces the generation: the next generation of the same chain
+/// re-scans every row (a generation is never resumed in another read view),
+/// and its rows carry ids of that generation - deterministic from the
+/// primary key plus the generation, so every row's id is the same function
+/// of the new generation.
 #[tokio::test]
 #[ignore = "requires docker"]
-async fn pg_snapshot_resumes_midway_with_stable_ids() -> Result<()> {
+async fn pg_interrupted_snapshot_is_replaced_by_the_next_generation()
+-> Result<()> {
     let (db, client) = pg_setup("pg_snap_resume").await?;
     client
         .batch_execute(
@@ -3535,7 +3554,8 @@ async fn pg_snapshot_resumes_midway_with_stable_ids() -> Result<()> {
         Default::default(),
     )
     .await;
-    let (tx1, mut rx1) = mpsc::channel(128);
+    let (tx1, mut rx1) =
+        test_common::acked_channel(&src1, &ckpt, &src1.id, 128);
     let h1 = src1.run(tx1, ckpt.clone()).await;
     let partial = collect_until(&mut rx1, Duration::from_secs(30), |e| {
         e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 3
@@ -3564,7 +3584,8 @@ async fn pg_snapshot_resumes_midway_with_stable_ids() -> Result<()> {
         Default::default(),
     )
     .await;
-    let (tx2, mut rx2) = mpsc::channel(256);
+    let (tx2, mut rx2) =
+        test_common::acked_channel(&src2, &ckpt, &src2.id, 256);
     let h2 = src2.run(tx2, ckpt.clone()).await;
     let full = collect_until(&mut rx2, Duration::from_secs(45), |e| {
         e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 40
@@ -3573,22 +3594,28 @@ async fn pg_snapshot_resumes_midway_with_stable_ids() -> Result<()> {
     h2.stop();
     h2.join().await.ok();
 
-    // Same generation across the interruption, and every pre-interruption row
-    // has an identical id in the resumed run.
-    for e in snap_reads(&partial).iter().chain(snap_reads(&full).iter()) {
+    // The interrupted generation was 1; the replacing one is 2 and copies
+    // every row again.
+    for e in snap_reads(&partial) {
         assert_eq!(e.source.position.snapshot_generation, Some(1));
     }
-    for e in snap_reads(&full) {
+    let replaced = snap_reads(&full);
+    assert_eq!(replaced.len(), 40, "every row again");
+    for e in &replaced {
+        assert_eq!(e.source.position.snapshot_generation, Some(2));
+    }
+    // A row's id is bound to its generation: the replacing generation's
+    // ids are all new.
+    for e in &replaced {
         if let (Some(id), Some(new_id)) = (
             e.after
                 .as_ref()
                 .and_then(|v| v.get("id"))
                 .and_then(|v| v.as_i64()),
             e.event_id,
-        ) {
-            if let Some(old_id) = before.get(&id) {
-                assert_eq!(*old_id, new_id, "row {id} id changed after resume");
-            }
+        ) && let Some(old_id) = before.get(&id)
+        {
+            assert_ne!(*old_id, new_id, "row {id}: a new generation's id");
         }
     }
 
@@ -3621,16 +3648,16 @@ async fn pg_temporal_ids_are_datestyle_timezone_invariant() -> Result<()> {
     )
     .await?;
 
-    // Both runs use Initial with a fresh checkpoint store (so each re-scans and
-    // establishes its own owned slot) but a SHARED backend, so the generation is
-    // reused (Resume) and stays 1. The slot is dropped between runs so the second
+    // Both runs use Initial with a fresh checkpoint store and state store, so
+    // each re-scans as generation 1 and establishes its own owned slot. The slot is dropped between runs so the second
     // run creates a fresh owned slot instead of failing closed on an unowned one.
     // The only variable across the two runs is the session DateStyle/TimeZone.
-    let backend = make_storage_backend().await;
     let run = || {
-        let backend = backend.clone();
         let db = db.clone();
         async move {
+            // A fresh state store per run: each run is generation 1 of
+            // its own chain, so the ids are comparable.
+            let backend = make_storage_backend().await;
             let src = make_snap_source(
                 "pg-snap-temporal",
                 &db,
@@ -3647,7 +3674,8 @@ async fn pg_temporal_ids_are_datestyle_timezone_invariant() -> Result<()> {
             .await;
             let ckpt: Arc<dyn CheckpointStore> =
                 Arc::new(MemCheckpointStore::new().unwrap());
-            let (tx, mut rx) = mpsc::channel(128);
+            let (tx, mut rx) =
+                test_common::acked_channel(&src, &ckpt, &src.id, 128);
             let handle = src.run(tx, ckpt).await;
             let events = collect_until(&mut rx, Duration::from_secs(30), |e| {
                 e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 2
@@ -3712,11 +3740,12 @@ async fn pg_parallel_and_sequential_pk_produce_identical_ids() -> Result<()> {
     )
     .await?;
 
-    let backend = make_storage_backend().await;
     let run = |mode, parallel| {
-        let backend = backend.clone();
         let db = db.clone();
         async move {
+            // A fresh state store per run: each run is generation 1 of
+            // its own chain, so the ids are comparable.
+            let backend = make_storage_backend().await;
             let src = make_snap_source(
                 "pg-snap-parallel",
                 &db,
@@ -3735,7 +3764,8 @@ async fn pg_parallel_and_sequential_pk_produce_identical_ids() -> Result<()> {
             .await;
             let ckpt: Arc<dyn CheckpointStore> =
                 Arc::new(MemCheckpointStore::new().unwrap());
-            let (tx, mut rx) = mpsc::channel(256);
+            let (tx, mut rx) =
+                test_common::acked_channel(&src, &ckpt, &src.id, 256);
             let handle = src.run(tx, ckpt).await;
             let events = collect_until(&mut rx, Duration::from_secs(45), |e| {
                 e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 50
@@ -3754,9 +3784,8 @@ async fn pg_parallel_and_sequential_pk_produce_identical_ids() -> Result<()> {
         }
     };
 
-    // Fresh checkpoint store each run (so each re-scans the whole table and
-    // establishes its own owned slot) but a shared backend (so the generation is
-    // reused at 1). The slot is dropped between runs so the second run creates a
+    // Fresh checkpoint and state stores each run (so each re-scans the whole
+    // table as generation 1 and establishes its own owned slot). The slot is dropped between runs so the second run creates a
     // fresh owned slot instead of failing closed on an unowned one. The only
     // difference between the runs is the scan path.
     let sequential = run(SnapshotMode::Initial, false).await;
@@ -3819,7 +3848,7 @@ async fn pg_enum_and_domain_identities_work() -> Result<()> {
     .await;
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
     let handle = src.run(tx, ckpt).await;
     let events = collect_until(&mut rx, Duration::from_secs(30), |e| {
         e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 5

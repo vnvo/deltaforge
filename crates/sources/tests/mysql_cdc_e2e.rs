@@ -69,6 +69,7 @@ where
             Ok(Some(SourceItem::TxBegin { .. })) => continue,
             Ok(Some(SourceItem::TxCommit { .. })) => continue,
             Ok(Some(SourceItem::Boundary { .. })) => continue,
+            Ok(Some(SourceItem::Barrier { .. })) => continue,
             Ok(Some(SourceItem::TxAbort { .. })) => continue,
             Ok(None) | Err(_) => break,
         }
@@ -139,6 +140,7 @@ async fn make_source(
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
+        snapshot_cohort: Default::default(),
     }
 }
 
@@ -149,7 +151,7 @@ async fn start_source(
 ) -> Result<(mpsc::Receiver<SourceItem>, SourceHandle)> {
     let ckpt_store: Arc<dyn CheckpointStore> =
         Arc::new(MemCheckpointStore::new()?);
-    let (tx, rx) = mpsc::channel::<SourceItem>(128);
+    let (tx, rx) = test_common::acked_channel(&src, &ckpt_store, &src.id, 128);
     let handle = src.run(tx, ckpt_store).await;
     wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
     sleep(Duration::from_secs(3)).await;
@@ -525,6 +527,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
+        snapshot_cohort: Default::default(),
     };
     let (mut rx, handle) = start_source(src).await?;
 
@@ -655,6 +658,7 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
+        snapshot_cohort: Default::default(),
     };
     let (mut rx, handle) = start_source(src).await?;
 
@@ -754,7 +758,6 @@ async fn mysql_cdc_checkpoint_resume() -> Result<()> {
     // First run
     info!("--- First run ---");
     {
-        let (tx, mut rx) = mpsc::channel::<SourceItem>(128);
         let src = make_source(
             "ckpt-test",
             &dsn,
@@ -763,6 +766,8 @@ async fn mysql_cdc_checkpoint_resume() -> Result<()> {
         )
         .await;
 
+        let (tx, mut rx) =
+            test_common::acked_channel(&src, &ckpt_store, &src.id, 128);
         let handle = src.run(tx, ckpt_store.clone()).await;
         sleep(Duration::from_secs(3)).await;
 
@@ -796,7 +801,6 @@ async fn mysql_cdc_checkpoint_resume() -> Result<()> {
     // Second run - should resume from checkpoint
     info!("--- Second run ---");
     {
-        let (tx, mut rx) = mpsc::channel::<SourceItem>(128);
         let src = make_source(
             "ckpt-test",
             &dsn,
@@ -805,6 +809,8 @@ async fn mysql_cdc_checkpoint_resume() -> Result<()> {
         )
         .await;
 
+        let (tx, mut rx) =
+            test_common::acked_channel(&src, &ckpt_store, &src.id, 128);
         let handle = src.run(tx, ckpt_store.clone()).await;
 
         let events =
@@ -850,10 +856,11 @@ async fn mysql_cdc_compressed_transaction() -> Result<()> {
     let ckpt_store: Arc<dyn CheckpointStore> =
         Arc::new(MemCheckpointStore::new()?);
 
-    let (tx, mut rx) = mpsc::channel::<SourceItem>(128);
     let src =
         make_source("compressed", &dsn, tables.clone(), AllowList::default())
             .await;
+    let (tx, mut rx) =
+        test_common::acked_channel(&src, &ckpt_store, &src.id, 128);
     let handle = src.run(tx, ckpt_store.clone()).await;
     wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
     sleep(Duration::from_secs(3)).await;
@@ -917,9 +924,10 @@ async fn mysql_cdc_compressed_transaction() -> Result<()> {
 
     // Resume from that boundary: nothing repeated, the next row delivered.
     ckpt_store.put("compressed", commit).await?;
-    let (tx, mut rx) = mpsc::channel::<SourceItem>(128);
     let src =
         make_source("compressed", &dsn, tables, AllowList::default()).await;
+    let (tx, mut rx) =
+        test_common::acked_channel(&src, &ckpt_store, &src.id, 128);
     let handle = src.run(tx, ckpt_store.clone()).await;
     wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
     sleep(Duration::from_secs(3)).await;
@@ -1453,7 +1461,7 @@ async fn replay_stable_ids(
     // Resume from the pre-write checkpoint so each run re-reads the same events.
     store.put(&src.id, checkpoint).await?;
 
-    let (tx, mut rx) = mpsc::channel::<SourceItem>(128);
+    let (tx, mut rx) = test_common::acked_channel(&src, &store, &src.id, 128);
     let handle = src.run(tx, store).await;
     wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
     let events =
@@ -1499,6 +1507,7 @@ async fn stable_event_ids_are_replay_stable() -> Result<()> {
             .get::<String, _>("Executed_Gtid_Set")
             .filter(|s| !s.is_empty()),
         snapshot_completed: None,
+        snapshot_chain: None,
     };
 
     // One transaction, three rows events (insert 2 / update 1 / delete 1) → one
@@ -1557,7 +1566,7 @@ async fn replay_ddl_id(
     )
     .await;
     store.put(&src.id, checkpoint).await?;
-    let (tx, mut rx) = mpsc::channel::<SourceItem>(128);
+    let (tx, mut rx) = test_common::acked_channel(&src, &store, &src.id, 128);
     let handle = src.run(tx, store).await;
     wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
     let events =
@@ -1598,6 +1607,7 @@ async fn ddl_event_ids_are_replay_stable() -> Result<()> {
             .get::<String, _>("Executed_Gtid_Set")
             .filter(|s| !s.is_empty()),
         snapshot_completed: None,
+        snapshot_chain: None,
     };
 
     conn.query_drop("ALTER TABLE t ADD COLUMN c INT").await?;
@@ -1631,7 +1641,7 @@ async fn replay_derived_ids(
     )
     .await;
     store.put(&src.id, checkpoint).await?;
-    let (tx, mut rx) = mpsc::channel::<SourceItem>(128);
+    let (tx, mut rx) = test_common::acked_channel(&src, &store, &src.id, 128);
     let handle = src.run(tx, store).await;
     wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
     let events =
@@ -1685,6 +1695,7 @@ async fn derived_event_ids_are_replay_stable() -> Result<()> {
             .get::<String, _>("Executed_Gtid_Set")
             .filter(|s| !s.is_empty()),
         snapshot_completed: None,
+        snapshot_chain: None,
     };
 
     conn.query_drop("INSERT INTO t VALUES (1,'a'),(2,'b')")

@@ -219,6 +219,10 @@ source:
 | `mode` | `never` | `initial`: run once if no checkpoint exists; `always`: re-snapshot on every restart; `never`: skip |
 | `max_parallel_tables` | `8` | Tables snapshotted concurrently |
 | `chunk_size` | `10000` | Rows per range chunk (integer PK tables only; others use ctid chunking) |
+| `discovery_page_size` | `1000` | Tables read per catalog query during discovery; also the most plan entries held in memory |
+| `max_snapshot_connections` | `max_parallel_tables x max_parallel_chunks + 2` | This source's share of the process-wide snapshot connection cap (`--max-snapshot-connections`, default 64) |
+| `max_anchor_age_secs` | `86400` | How long a generation may hold its anchor; blocks at the limit |
+| `max_plan_bytes` / `max_plan_items` | 256 MiB / `1000000` | Bounds of the durable plan; blocks before sealing at either limit |
 
 ### Snapshot events
 
@@ -251,19 +255,15 @@ Re-snapshotting under this version records the safe anchor and resets the gauge 
 
 ### Resume after interruption
 
-An interrupted snapshot is **copied again in full** on the next restart; it is
+An interrupted snapshot is **copied again in full** on the next restart, as a
+new [snapshot generation](../snapshots.md#generations) with a new anchor; it is
 never resumed table by table. When DeltaForge can prove it owns the now-inactive
-slot, it **re-anchors** (drops and recreates its slot for a fresh `C`) and every
-table is read again.
+slot, it **re-anchors** (drops and recreates its slot for a fresh `C`).
 
-A snapshot counts as complete only once the sinks have committed it. While it is
-in progress, its checkpoints are snapshot positions, which a restart never
-resumes as a stream position. Only the last row of the snapshot, sent after every
-table was read and every final check passed, carries a stream position at the
-anchor. A restart before every sink has committed that row copies the snapshot
-again (duplicates, never loss). If every table is empty, no row can carry it, so
-such a snapshot is copied again on each restart until the first change is
-committed.
+A snapshot counts as complete only once its terminal barrier is committed by the
+sinks the commit policy requires; a restart after that completes it without
+copying. Completion, lagging sinks, bounds and blocking are described in
+[Initial Snapshots](../snapshots.md).
 
 ### WAL slot retention safety
 
@@ -284,9 +284,10 @@ a long snapshot, which would make the captured LSN unreachable for CDC resume.
 - Warns but continues on `wal_status=unreserved`
 
 **After all tables complete:**
-- Synchronous final check before writing `finished=true`
-- `finished=true` means the position is confirmed valid for CDC resume,
-  not just that rows were emitted
+- Synchronous final check before the generation records its rows as produced:
+  a snapshot whose slot is lost, invalidated or missing never completes, and
+  blocks with `snapshot_anchor_unavailable` (see
+  [Bounds and blocking](../snapshots.md#bounds-and-blocking))
 
 If you see WAL retention risk warnings:
 ```sql

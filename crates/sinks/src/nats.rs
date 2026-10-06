@@ -585,6 +585,17 @@ async fn connect_nats(
 
 #[async_trait]
 impl Sink for NatsSink {
+    /// Nothing is buffered after an acknowledged batch: every message of an acknowledged batch had its JetStream PubAck before `send_batch` returned, and a
+    /// barrier is delivered only after every earlier batch was acknowledged.
+    /// This sink keeps no watermark of its own.
+    async fn barrier(
+        &self,
+        _kind: &deltaforge_core::BarrierKind,
+        _ctx: &deltaforge_core::SinkBatchContext,
+    ) -> SinkResult<()> {
+        Ok(())
+    }
+
     fn id(&self) -> &str {
         &self.id
     }

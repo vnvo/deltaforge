@@ -806,6 +806,87 @@ pub enum SourceItem {
     /// empty batch carrying it, so the boundary (e.g. the `completed = true`
     /// snapshot watermark) is durably acknowledged before it takes effect.
     Boundary { boundary: SourceBoundary },
+    /// A checkpoint barrier (see [`Barrier`]): delivered after everything
+    /// before it, to every sink, never merged into a batch.
+    Barrier { barrier: Barrier },
+}
+
+/// A checkpoint barrier (`docs/design/snapshot-durable-queue.md`, section
+/// 5): every event published before it is durably delivered, its checkpoint
+/// is durably recorded per sink, and each sink acknowledges it.
+#[derive(Debug, Clone)]
+pub struct Barrier {
+    pub kind: BarrierKind,
+    /// The barrier's checkpoint and durable watermark. For a generation
+    /// start, the watermark is the start position whose `replaced_digest`
+    /// each sink fills from the state it replaces.
+    pub boundary: SourceBoundary,
+}
+
+/// What a barrier does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BarrierKind {
+    /// A snapshot generation's start: each sink moves its own state into the
+    /// generation, after a local check of that state (section 5.4).
+    GenerationStart(GenerationStart),
+    /// A snapshot generation's terminal barrier (section 5.3).
+    Terminal,
+}
+
+/// The generation a start barrier moves the sinks into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationStart {
+    pub snapshot_chain: String,
+    pub generation: u64,
+    /// The legacy generations the chain accepts states of.
+    pub legacy_through: Option<u64>,
+}
+
+/// What a sink does with its own state at a generation start (section 5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartDecision {
+    /// Compare-and-swap the state read to the generation start.
+    Move,
+    /// Already in this generation: acknowledge.
+    Already,
+    /// Not a state this generation may start from.
+    Refuse,
+}
+
+/// The commit policy and sink cohort of a pipeline, handed to its source so a
+/// snapshot generation can freeze it (`docs/design/snapshot-durable-queue.md`,
+/// section 6.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotCohort {
+    pub policy: CohortPolicy,
+    /// Every sink of the pipeline, in any order.
+    pub sinks: Vec<CohortSink>,
+}
+
+/// The commit policy of a [`SnapshotCohort`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CohortPolicy {
+    All,
+    Required,
+    Quorum(u32),
+}
+
+/// One sink of a [`SnapshotCohort`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CohortSink {
+    pub id: String,
+    pub required: bool,
+}
+
+/// A source's decision on one sink's stored checkpoint at a generation start.
+#[derive(Debug, Clone)]
+pub enum CheckpointStart {
+    /// Replace it with this start checkpoint.
+    Move(CheckpointMeta),
+    /// Already in the generation.
+    Already,
+    /// Refused (another chain or lineage, a later generation, unknown).
+    Refuse,
 }
 
 /// A legal checkpoint boundary emitted by a source: the resume `checkpoint`
@@ -950,6 +1031,26 @@ pub trait CheckpointComparator: Send + Sync {
     /// semantics. Returns [`CheckpointOrder::Incomparable`] when the two cannot
     /// be meaningfully ordered.
     fn order(&self, proposed: &[u8], reference: &[u8]) -> CheckpointOrder;
+
+    /// The generation start barrier's local check on a durable watermark
+    /// (`prev`, `None` when empty) against the barrier's start watermark
+    /// `start`: the decision and, on `Move`, the start watermark to record,
+    /// binding the digest of `prev`. Default: refuse.
+    fn generation_start(
+        &self,
+        _prev: Option<&[u8]>,
+        _start: &[u8],
+    ) -> (StartDecision, Option<Vec<u8>>) {
+        (StartDecision::Refuse, None)
+    }
+
+    /// Whether `next` may follow `prev` in a durable chain without being
+    /// ordered after it: a generation start whose own content (generation,
+    /// legacy bound, digest of `prev`) proves the move was allowed. Default:
+    /// never.
+    fn start_follows(&self, _prev: Option<&[u8]>, _next: &[u8]) -> bool {
+        false
+    }
 }
 
 // ============================================================================
@@ -979,6 +1080,38 @@ pub trait Source: Send + Sync {
     /// consumer treats `Incomparable` as a hard startup/recovery error rather
     /// than choosing a checkpoint.
     fn compare_checkpoints(&self, a: &[u8], b: &[u8]) -> CheckpointOrder;
+
+    /// Whether a stored checkpoint is a snapshot position (an incomplete
+    /// snapshot, or a sink's start of a generation) rather than a stream
+    /// position. Default: none is.
+    fn checkpoint_is_snapshot(&self, _raw: &[u8]) -> bool {
+        false
+    }
+
+    /// The sinks the resume fold leaves out while they hold a snapshot
+    /// position: those the source classified behind a snapshot generation
+    /// its control record durably shows completed
+    /// (`docs/design/snapshot-durable-queue.md`, section 6.3). Default:
+    /// none.
+    fn resume_exclusions(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The pipeline's commit policy and sink cohort, set by the runner before
+    /// [`Source::run`]. Default: ignored (a source without snapshot
+    /// generations).
+    fn set_snapshot_cohort(&self, _cohort: SnapshotCohort) {}
+
+    /// The generation start barrier's local check on one sink's stored
+    /// checkpoint (`prev`, `None` when empty). Default: refuse, so a source
+    /// that does not implement snapshot generations never moves a checkpoint.
+    fn checkpoint_generation_start(
+        &self,
+        _prev: Option<&[u8]>,
+        _start: &GenerationStart,
+    ) -> CheckpointStart {
+        CheckpointStart::Refuse
+    }
 
     /// Called at startup when a durable sink is active, BEFORE any source
     /// emission. The source inspects its own snapshot progress and returns an
@@ -1080,6 +1213,25 @@ pub trait Sink: Send + Sync {
     /// incident with `evidence`) by an authoritative read of exactly that
     /// boundary. The default proves nothing: the incident stays open. A read
     /// that cannot decide is `Unknown`, never an error.
+    /// A checkpoint barrier (see [`Barrier`]): called after every earlier
+    /// batch was acknowledged by this sink. `Ok` means everything sent before
+    /// it is durably delivered, and the barrier's watermark is recorded where
+    /// this sink keeps one. Default: refused, never silently acknowledged.
+    async fn barrier(
+        &self,
+        kind: &BarrierKind,
+        _ctx: &SinkBatchContext,
+    ) -> SinkResult<()> {
+        Err(SinkError::Fatal {
+            details: format!(
+                "sink {} does not implement the checkpoint barrier ({:?})",
+                self.id(),
+                kind
+            )
+            .into(),
+        })
+    }
+
     async fn settle_uncertain(
         &self,
         _evidence: &incident::Evidence,

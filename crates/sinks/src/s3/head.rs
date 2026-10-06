@@ -495,6 +495,9 @@ async fn walk_retained_entries<S: ConditionalStore + ?Sized>(
             if let Some(lw) = &later_wm {
                 match comparator.order(lw, &cur_wm) {
                     CheckpointOrder::After => {}
+                    // A generation start entry follows its predecessor by a
+                    // checked move, not by order.
+                    _ if comparator.start_follows(Some(&cur_wm), lw) => {}
                     other => {
                         return Err(HeadError::Integrity(format!(
                             "non-monotonic watermark at {cur_key}: later is \
@@ -1486,8 +1489,52 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                         "HEAD watermark is not valid hex".into(),
                     )
                 })?;
-                Ok(Some(self.comparator.order(proposed, &head_wm)))
+                Ok(Some(match self.comparator.order(proposed, &head_wm) {
+                    // A generation start bound to exactly this HEAD's state
+                    // follows it by a checked move.
+                    CheckpointOrder::Incomparable
+                        if self
+                            .comparator
+                            .start_follows(Some(&head_wm), proposed) =>
+                    {
+                        CheckpointOrder::After
+                    }
+                    other => other,
+                }))
             }
+        }
+    }
+
+    /// The generation start barrier on this sink's HEAD (design section
+    /// 5.4): check the current HEAD watermark locally against the barrier's
+    /// start watermark; on `Move`, publish a zero-object entry carrying the
+    /// start (bound to the digest of exactly that HEAD watermark, so a HEAD
+    /// that changed meanwhile fails it); `Already` acknowledges; anything
+    /// else is refused.
+    pub async fn publish_start(&self, start: &[u8]) -> Result<(), HeadError> {
+        let (decision, recorded) = {
+            let st = self.state.lock().await;
+            let head_wm = match &st.verified.head.watermark_hex {
+                None => None,
+                Some(h) => Some(unhex(h).ok_or_else(|| {
+                    HeadError::Integrity(
+                        "HEAD watermark is not valid hex".into(),
+                    )
+                })?),
+            };
+            self.comparator.generation_start(head_wm.as_deref(), start)
+        };
+        match (decision, recorded) {
+            (deltaforge_core::StartDecision::Move, Some(wm)) => {
+                self.publish(&wm, Vec::new(), 0).await
+            }
+            (deltaforge_core::StartDecision::Already, _) => Ok(()),
+            _ => Err(HeadError::Integrity(format!(
+                "pipeline {}: the HEAD cannot start this snapshot generation \
+                 (another chain or lineage, a later generation, or an \
+                 unexpected state)",
+                self.pipeline
+            ))),
         }
     }
 
@@ -1526,7 +1573,9 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                 let cw = unhex(&cur_entry.watermark_hex).ok_or_else(|| {
                     HeadError::Integrity("adopted watermark not hex".into())
                 })?;
-                if self.comparator.order(&cw, &ow) != CheckpointOrder::After {
+                if self.comparator.order(&cw, &ow) != CheckpointOrder::After
+                    && !self.comparator.start_follows(Some(&ow), &cw)
+                {
                     return Err(HeadError::Integrity(
                         "adopted HEAD watermark does not advance".into(),
                     ));
@@ -4752,5 +4801,171 @@ mod tests {
             matches!(err, HeadError::Integrity(ref m) if m.contains("publication")),
             "got {err:?}"
         );
+    }
+}
+
+/// The generation start barrier on a durable HEAD, with the real source
+/// watermark comparator (design section 5.4).
+#[cfg(test)]
+mod generation_start_tests {
+    use super::*;
+    use crate::s3::store_cond::ObjectStoreConditional;
+    use object_store::memory::InMemory;
+    use sources::durable_checkpoint::{
+        DurableWatermark, SourceCheckpointComparator, WmPos,
+    };
+    use sources::snapshot_generation::PersistedLineage;
+
+    fn store() -> Arc<ObjectStoreConditional> {
+        Arc::new(ObjectStoreConditional::new(Arc::new(InMemory::new())))
+    }
+
+    async fn writer(
+        s: Arc<ObjectStoreConditional>,
+        pipeline: &str,
+    ) -> Result<DurableWriter<ObjectStoreConditional>, HeadError> {
+        DurableWriter::acquire(
+            s,
+            "pfx",
+            pipeline,
+            "src",
+            "sink",
+            Arc::new(SourceCheckpointComparator),
+        )
+        .await
+    }
+
+    fn lineage(id: u64) -> PersistedLineage {
+        PersistedLineage::Postgres {
+            system_identifier: id,
+        }
+    }
+
+    fn cdc(id: u64, lsn: u64) -> Vec<u8> {
+        DurableWatermark::pg_commit(id, lsn, None).to_bytes()
+    }
+
+    fn seq(chain: &str, generation: u64, s: u64, completed: bool) -> Vec<u8> {
+        DurableWatermark::new(
+            lineage(7),
+            WmPos::SnapshotSeq {
+                snapshot_chain: chain.into(),
+                generation,
+                seq: s,
+                completed,
+            },
+        )
+        .to_bytes()
+    }
+
+    /// The barrier's start watermark (its digest is filled by the sink).
+    fn start(chain: &str, generation: u64) -> Vec<u8> {
+        DurableWatermark::new(
+            lineage(7),
+            WmPos::SnapshotGenerationAdopted {
+                snapshot_chain: chain.into(),
+                generation,
+                replaced_digest: String::new(),
+                legacy_through: None,
+            },
+        )
+        .to_bytes()
+    }
+
+    async fn head_seq(w: &DurableWriter<ObjectStoreConditional>) -> u64 {
+        w.state.lock().await.verified.head.seq
+    }
+
+    /// Completed generation 3, then CDC, then a re-snapshot: the HEAD moves
+    /// from its CDC watermark into generation 4, whose rows are accepted, and
+    /// a restarted writer verifies the chain through the start entry.
+    #[tokio::test]
+    async fn a_resnapshot_after_cdc_starts_from_the_cdc_head() {
+        let s = store();
+        let w = writer(s.clone(), "p").await.unwrap();
+        w.publish(&seq("c", 3, 9, true), Vec::new(), 0)
+            .await
+            .unwrap();
+        w.publish(&cdc(7, 100), Vec::new(), 0).await.unwrap();
+        w.publish(&cdc(7, 200), Vec::new(), 0).await.unwrap();
+        // An incomplete generation-4 row alone is refused (incomparable).
+        assert!(
+            w.publish(&seq("c", 4, 0, false), Vec::new(), 0)
+                .await
+                .is_err()
+        );
+
+        w.publish_start(&start("c", 4)).await.unwrap();
+        let after_start = head_seq(&w).await;
+        // Idempotent: already in generation 4.
+        w.publish_start(&start("c", 4)).await.unwrap();
+        assert_eq!(head_seq(&w).await, after_start);
+        w.publish(&seq("c", 4, 0, false), Vec::new(), 0)
+            .await
+            .unwrap();
+        w.publish(&seq("c", 4, 1, true), Vec::new(), 0)
+            .await
+            .unwrap();
+
+        // Recovery verifies the whole chain, start entry included.
+        drop(w);
+        writer(s, "p").await.expect("the chain verifies");
+    }
+
+    /// A start that crashed after some sinks moved: the replacing generation
+    /// moves both the started HEAD and the one still at CDC.
+    #[tokio::test]
+    async fn a_partial_start_is_completed_by_the_replacing_generation() {
+        let s = store();
+        let moved = writer(s.clone(), "moved").await.unwrap();
+        let behind = writer(s.clone(), "behind").await.unwrap();
+        for w in [&moved, &behind] {
+            w.publish(&cdc(7, 100), Vec::new(), 0).await.unwrap();
+        }
+        moved.publish_start(&start("c", 4)).await.unwrap();
+        // The crash: `behind` never received the barrier. Generation 5
+        // replaces 4.
+        for w in [&moved, &behind] {
+            w.publish_start(&start("c", 5)).await.unwrap();
+            w.publish(&seq("c", 5, 0, false), Vec::new(), 0)
+                .await
+                .unwrap();
+        }
+        drop((moved, behind));
+        writer(s.clone(), "moved").await.unwrap();
+        writer(s, "behind").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_start_is_refused_from_another_chain_lineage_or_a_later_generation()
+     {
+        let s = store();
+        let later = writer(s.clone(), "later").await.unwrap();
+        later
+            .publish(&seq("c", 5, 0, false), Vec::new(), 0)
+            .await
+            .unwrap();
+        assert!(later.publish_start(&start("c", 4)).await.is_err());
+
+        let other_chain = writer(s.clone(), "chain").await.unwrap();
+        other_chain
+            .publish(&seq("d", 3, 0, true), Vec::new(), 0)
+            .await
+            .unwrap();
+        assert!(other_chain.publish_start(&start("c", 4)).await.is_err());
+
+        let foreign = writer(s, "foreign").await.unwrap();
+        foreign.publish(&cdc(8, 100), Vec::new(), 0).await.unwrap();
+        assert!(foreign.publish_start(&start("c", 4)).await.is_err());
+    }
+
+    /// An empty HEAD (a sink new to the cohort) starts any generation.
+    #[tokio::test]
+    async fn an_empty_head_starts_any_generation() {
+        let w = writer(store(), "new").await.unwrap();
+        w.publish_start(&start("c", 9)).await.unwrap();
+        w.publish(&seq("c", 9, 0, false), Vec::new(), 0)
+            .await
+            .unwrap();
     }
 }

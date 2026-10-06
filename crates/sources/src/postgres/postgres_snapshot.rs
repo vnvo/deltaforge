@@ -17,32 +17,27 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
-use checkpoints::CheckpointStore;
-use common::redact_url_password;
 use deltaforge_config::SnapshotCfg;
 use deltaforge_core::{
-    CheckpointMeta, Event, EventId, IdentityKind, Op, SourceInfo, SourceItem,
-    SourcePosition,
+    Event, EventId, IdentityKind, Op, SourceInfo, SourcePosition,
 };
 use std::collections::HashMap;
 
 use super::postgres_identity::{PgIdentityRaw, pg_identity_cell, quote_ident};
-use crate::durable_checkpoint::{CursorKind, SnapshotCursor};
+use crate::durable_checkpoint::CursorKind;
+use crate::snapshot_driver::{GuardFinding, anchor_age_finding};
 use crate::snapshot_event_id::{OwnedIdentityValue, snapshot_row_event_id};
-use crate::snapshot_frontier::{
-    SnapshotAggregator, SnapshotPublisher, TableResume,
-};
 use crate::snapshot_generation::PersistedLineage;
+use crate::snapshot_permits::{ExtraPermit, SnapshotPermits};
+use crate::snapshot_publish::GenerationPublisher;
+use crate::snapshot_queue::{PlanItem, QueueStore};
 use metrics::counter;
-use pgwire_replication::Lsn;
 use scopeguard;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Semaphore, mpsc};
 use tokio_postgres::NoTls;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use super::postgres_health as health;
 use super::postgres_schema_loader::PostgresSchemaLoader;
 
 // ============================================================================
@@ -92,7 +87,7 @@ pub fn progress_key(source_id: &str) -> String {
 // ============================================================================
 
 /// One identity column: its name and the canonical kind (for null-tagging).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentitySpec {
     pub name: String,
     pub kind: IdentityKind,
@@ -154,341 +149,261 @@ fn provisional_snapshot_id(
     ))
 }
 
-pub struct PgSnapshotCtx<'a> {
+/// What one generation's copy needs (`docs/design/snapshot-durable-queue.md`,
+/// sections 2 and 9). The copy runs inside the read view the coordinator
+/// exported (`snapshot_id`): every worker imports it, and a failed table is
+/// copied again only while that view lives.
+pub struct PgCopyCtx<'a> {
     pub dsn: &'a str,
     pub source_id: &'a str,
     pub pipeline: &'a str,
     pub tenant: &'a str,
     pub cfg: &'a SnapshotCfg,
     pub schema_loader: &'a PostgresSchemaLoader,
-    pub chkpt_store: Arc<dyn CheckpointStore>,
-    pub tx: mpsc::Sender<SourceItem>,
     pub cancel: CancellationToken,
-    pub slot_name: Option<&'a str>,
-    /// Durable snapshot generation (allocated before any row).
+    pub queue: &'a QueueStore,
+    pub publisher: Arc<GenerationPublisher>,
+    pub permits: Arc<SnapshotPermits>,
+    /// The coordinator session holding the exported view open.
+    pub coord: &'a tokio_postgres::Client,
+    pub snapshot_id: &'a str,
     pub generation: u64,
-    /// Frozen source lineage for snapshot identity.
     pub lineage: PersistedLineage,
 }
 
-/// Run a consistent snapshot of `tables`.
-///
-/// Returns the anchor LSN (the slot's consistent point) - pass this to the
-/// replication client as `start_lsn` so streaming resumes from the anchor with
-/// **no gaps** (no committed row is lost). Note this is at-least-once at the
-/// boundary: rows committed in `(anchor, snapshot-export]` are delivered by both
-/// the snapshot and CDC (a bounded overlap), so **duplicate events are possible**
-/// and expected - it is not exactly-once (PG-A-lite).
-pub async fn run_snapshot(
-    ctx: &PgSnapshotCtx<'_>,
-    tables: &[super::PgPlannedTable],
-    // The anchor LSN: the replication slot's consistent point, established by
-    // prepare_snapshot_slot_anchor. CDC resumes from here; rows committed in
-    // (anchor, snapshot-export] are re-delivered by CDC (bounded at-least-once
-    // overlap), never lost. NOT pg_current_wal_lsn.
-    anchor: Lsn,
-) -> Result<Lsn> {
-    let t0 = Instant::now();
+/// How often a table whose worker failed is copied again while the
+/// exported view lives.
+const TABLE_RETRIES: u32 = 2;
 
-    // load any previous progress so we can skip already-completed tables.
-    let mut progress: SnapshotProgress = ctx
-        .chkpt_store
-        .get_raw(&progress_key(ctx.source_id))
-        .await
-        .ok()
-        .flatten()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-
-    if progress.finished {
-        info!(
-            ctx.source_id,
-            "snapshot already complete, returning saved LSN"
-        );
-        return Lsn::parse(&progress.start_lsn)
-            .context("parse saved snapshot LSN");
-    }
-
-    // preflight
-    let names: Vec<(&str, &str)> = tables
-        .iter()
-        .map(|t| (t.qualifier.as_str(), t.table.as_str()))
-        .collect();
-    let preflight = health::run_preflight(
-        ctx.dsn,
-        ctx.slot_name,
-        // DeltaForge creates and owns the slot as part of the snapshot anchor, so
-        // an absent slot here is expected, not a hard error.
-        health::SlotPresence::CreatedByDeltaforge,
-        // publication name not on ctx - pass empty string; publication check
-        // is already done in ensure_slot_and_publication before we get here.
-        // Pass slot_name here only for slot health checks.
-        "",
-        &names,
-        ctx.cfg.max_parallel_tables,
-        ctx.cfg.discovery_page_size,
-    )
-    .await
-    .context("postgres snapshot preflight")?;
-    crate::snapshot_probe::record_fixed(
-        crate::snapshot_probe::FixedOp::Preflight,
-    );
-    drop(names);
-    preflight.emit_and_check(ctx.source_id, tables.len())?;
-
-    crate::snapshot_probe::before_anchor().await;
-    // step 1: coordinator connection - export snapshot + capture LSN
-    let (coord, coord_conn) = tokio_postgres::connect(ctx.dsn, NoTls)
-        .await
-        .context("snapshot coordinator connect")?;
-
-    tokio::spawn(async move {
-        if let Err(e) = coord_conn.await {
-            error!(error = %e, "snapshot coordinator connection dropped");
-        }
-    });
-
-    coord
-        .batch_execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-        .await
-        .context("begin coordinator transaction")?;
-
-    // Export the MVCC snapshot for worker mutual consistency only. The CDC
-    // start position is the slot's consistent point (`anchor`), NOT
-    // pg_current_wal_lsn - that decoupling is exactly the pre-hardening seam
-    // bug (PG-A-lite).
-    let row = coord
-        .query_one("SELECT pg_export_snapshot()", &[])
-        .await
-        .context("export snapshot")?;
-
-    let snapshot_id: String = row.get(0);
-    crate::snapshot_probe::record_fixed(crate::snapshot_probe::FixedOp::Anchor);
-    // The rows are read in this exported snapshot: every planned table must
-    // have, in it, exactly the shape the plan was prepared from.
-    verify_plan_in_snapshot(&coord, tables, ctx.cfg.discovery_page_size)
-        .await?;
-    let start_lsn = anchor;
-
-    // Save start_lsn immediately - if we crash before finishing, we know
-    // where to resume streaming from.
-    progress.start_lsn = anchor.to_string();
-    save_progress(&ctx.chkpt_store, ctx.source_id, &progress).await;
-    crate::snapshot_probe::record_phase(
-        crate::snapshot_probe::Phase::PreflightAnchor,
-        t0.elapsed(),
-    );
-
-    let abort_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let guard_cancel = ctx.cancel.child_token();
-    let _guard_stop = scopeguard::guard((), |_| guard_cancel.cancel());
-    let _slot_guard = ctx.slot_name.map(|slot| {
-        health::spawn_wal_slot_guard(
-            crate::credentials::ProtectedDsn::from(ctx.dsn),
-            slot.to_string(),
-            guard_cancel.clone(),
-            abort_reason.clone(),
-        )
-    });
-
-    info!(
-        source_id = %ctx.source_id,
-        snapshot_id = %snapshot_id,
-        lsn = %start_lsn,
-        tables = tables.len(),
-        "snapshot started"
-    );
-
-    // Build the aggregation owner. Its source vector is restored from the
-    // source's own progress (done_tables + finished) - NEVER from any sink's
-    // HEAD. Every table's cursor kind (integer-PK signed range or ctid
-    // page-block) comes from the plan; already-done tables enter the vector
-    // complete at their kind's max, so the key set and cursor kinds are fixed
-    // from the first batch.
-    let resume: Vec<(String, TableResume)> = tables
-        .iter()
-        .map(|t| {
-            let done = progress.finished
-                || progress.table_done(&t.qualifier, &t.table);
-            (
-                t.key(),
-                TableResume {
-                    kind: t.cursor_kind,
-                    done,
-                },
+/// A plan item as a table to copy.
+fn planned(item: &PlanItem) -> Result<super::PgPlannedTable> {
+    let identity: Vec<IdentitySpec> =
+        serde_json::from_value(item.identity.clone()).with_context(|| {
+            format!(
+                "plan item {}.{}: identity columns",
+                item.qualifier, item.table
             )
-        })
-        .collect();
-    crate::snapshot_probe::record_frontier_tables(resume.len());
-    // Every boundary carries an incomplete-snapshot position, except the
-    // one completing the snapshot (`publisher.finish`): a stream position at
-    // the anchor.
-    let snapshot_checkpoint = CheckpointMeta::from_vec(
-        crate::snapshot_position::encode(ctx.generation, anchor.to_string()),
-    );
-    let completing_checkpoint =
-        super::postgres_helpers::make_checkpoint_meta(&anchor, None, "");
-    let publisher = Arc::new(SnapshotPublisher::new(
-        SnapshotAggregator::from_source_progress(
-            ctx.generation,
-            ctx.lineage.clone(),
-            snapshot_checkpoint,
-            &resume,
-        )
-        .with_completing_checkpoint(completing_checkpoint),
-        ctx.tx.clone(),
-    ));
+        })?;
+    Ok(super::PgPlannedTable {
+        qualifier: item.qualifier.clone(),
+        table: item.table.clone(),
+        identity,
+        cursor_kind: item.cursor_kind,
+        signature: item.signature.clone(),
+    })
+}
 
-    let copy_started = Instant::now();
-    // step 2: table workers, at most `max_parallel_tables` alive at once;
-    // each result is recorded as it completes.
+/// Copy every table of the generation's sealed plan, read page by page from
+/// the store. At most `max_parallel_tables` tables run at once: the first
+/// on the snapshot's base permit, every other one only on an extra permit,
+/// taken while the running tables keep going (never waited for before work
+/// starts). A table whose worker failed is copied again (its rows may be
+/// published twice: at-least-once) while the exported view lives, at most
+/// [`TABLE_RETRIES`] times; otherwise the copy fails and the generation is
+/// lost.
+pub async fn copy_generation(ctx: &PgCopyCtx<'_>) -> Result<()> {
     let max_parallel = ctx.cfg.max_parallel_tables.max(1);
+    let page = ctx.cfg.discovery_page_size.max(1);
+    let workers_cancel = ctx.cancel.child_token();
+    let _stop_workers =
+        scopeguard::guard(workers_cancel.clone(), |c| c.cancel());
     let fetches_before = ctx.schema_loader.live_fetch_count();
+
     let mut running: tokio::task::JoinSet<Result<u64>> =
         tokio::task::JoinSet::new();
-    // The table of each running task (at most `max_parallel` entries).
-    let mut names: HashMap<tokio::task::Id, String> = HashMap::new();
-    let mut failed = Vec::new();
+    // Per running task: its table, attempt and extra permit (`None`: the
+    // base permit).
+    let mut tasks: HashMap<
+        tokio::task::Id,
+        (super::PgPlannedTable, u32, Option<ExtraPermit>),
+    > = HashMap::new();
+    let mut base_free = true;
+    let mut queue: std::collections::VecDeque<(super::PgPlannedTable, u32)> =
+        std::collections::VecDeque::new();
+    let mut after: Option<String> = None;
+    let mut pages_done = false;
 
-    for planned in tables {
-        let (schema, table) = (&planned.qualifier, &planned.table);
-        if progress.table_done(schema, table) {
-            info!(table = %planned.key(), "already complete, skipping");
-            continue;
-        }
-        while running.len() >= max_parallel {
-            let done =
-                running.join_next_with_id().await.expect("a running table");
-            record_table_result(
-                ctx,
-                &publisher,
-                &mut progress,
-                &mut failed,
-                &mut names,
-                done,
-            )
-            .await?;
-        }
-
+    let spawn = |running: &mut tokio::task::JoinSet<Result<u64>>,
+                 tasks: &mut HashMap<_, _>,
+                 table: super::PgPlannedTable,
+                 attempt: u32,
+                 permit: Option<ExtraPermit>| {
         let worker = TableWorker {
             dsn: crate::credentials::ProtectedDsn::from(ctx.dsn),
-            schema: schema.clone(),
-            table: table.clone(),
-            snapshot_id: snapshot_id.clone(),
+            schema: table.qualifier.clone(),
+            table: table.table.clone(),
+            snapshot_id: ctx.snapshot_id.to_string(),
             source_id: ctx.source_id.to_string(),
             pipeline: ctx.pipeline.to_string(),
             tenant: ctx.tenant.to_string(),
             cfg: ctx.cfg.clone(),
             schema_loader: ctx.schema_loader.clone(),
-            chkpt_store: ctx.chkpt_store.clone(),
-            cancel: ctx.cancel.clone(),
+            cancel: workers_cancel.clone(),
             generation: ctx.generation,
             lineage: ctx.lineage.clone(),
-            identity: planned.identity.clone(),
-            table_key: planned.key(),
-            cursor_kind: planned.cursor_kind,
-            publisher: Arc::clone(&publisher),
+            identity: table.identity.clone(),
+            publisher: Arc::clone(&ctx.publisher),
+            permits: Arc::clone(&ctx.permits),
         };
         let task = running.spawn(worker.run());
-        names.insert(task.id(), planned.key());
+        tasks.insert(task.id(), (table, attempt, permit));
         crate::snapshot_probe::record_table_tasks(running.len());
-    }
+    };
 
-    // step 3: the remaining results
-    while let Some(done) = running.join_next_with_id().await {
-        record_table_result(
-            ctx,
-            &publisher,
-            &mut progress,
-            &mut failed,
-            &mut names,
-            done,
-        )
-        .await?;
+    loop {
+        if queue.is_empty() && !pages_done {
+            let (items, next) = ctx
+                .queue
+                .items_page(ctx.generation, after.as_deref(), page)
+                .await?;
+            for (_, item) in &items {
+                queue.push_back((planned(item)?, 0));
+            }
+            pages_done = next.is_none();
+            after = next;
+        }
+        let Some((table, attempt)) = queue.pop_front() else {
+            if running.is_empty() {
+                break;
+            }
+            let done = running.join_next_with_id().await.expect("running");
+            finish_table(ctx, done, &mut tasks, &mut base_free, &mut queue)
+                .await?;
+            continue;
+        };
+        if base_free {
+            base_free = false;
+            spawn(&mut running, &mut tasks, table, attempt, None);
+            continue;
+        }
+        if running.len() >= max_parallel {
+            queue.push_front((table, attempt));
+            let done = running.join_next_with_id().await.expect("running");
+            finish_table(ctx, done, &mut tasks, &mut base_free, &mut queue)
+                .await?;
+            continue;
+        }
+        // Another table only on an extra permit, while the running ones
+        // continue; a table finishing first frees its permit instead.
+        tokio::select! {
+            biased;
+            done = running.join_next_with_id() => {
+                queue.push_front((table, attempt));
+                finish_table(
+                    ctx,
+                    done.expect("running"),
+                    &mut tasks,
+                    &mut base_free,
+                    &mut queue,
+                )
+                .await?;
+            }
+            permit = ctx.permits.extra(&ctx.cancel) => {
+                let permit = permit.map_err(|e| anyhow!(e))?;
+                spawn(&mut running, &mut tasks, table, attempt, Some(permit));
+            }
+        }
     }
     crate::snapshot_probe::record_worker_live_fetches(
         ctx.schema_loader.live_fetch_count() - fetches_before,
     );
-    crate::snapshot_probe::record_phase(
-        crate::snapshot_probe::Phase::RowCopy,
-        copy_started.elapsed(),
-    );
-    let final_started = Instant::now();
+    Ok(())
+}
 
-    // guard check takes priority
-    if let Some(reason) = abort_reason.lock().unwrap().take() {
-        anyhow::bail!("snapshot aborted: {}", reason);
+/// Record one finished table task: a failed table is queued again while
+/// the exported view lives and it has attempts left; otherwise the copy
+/// fails.
+async fn finish_table(
+    ctx: &PgCopyCtx<'_>,
+    done: std::result::Result<
+        (tokio::task::Id, Result<u64>),
+        tokio::task::JoinError,
+    >,
+    tasks: &mut HashMap<
+        tokio::task::Id,
+        (super::PgPlannedTable, u32, Option<ExtraPermit>),
+    >,
+    base_free: &mut bool,
+    queue: &mut std::collections::VecDeque<(super::PgPlannedTable, u32)>,
+) -> Result<()> {
+    let id = match &done {
+        Ok((id, _)) => *id,
+        Err(e) => e.id(),
+    };
+    let (table, attempt, permit) =
+        tasks.remove(&id).expect("every task is recorded");
+    if permit.is_none() {
+        *base_free = true;
     }
-
-    if !failed.is_empty() {
-        anyhow::bail!("snapshot failed for: {}", failed.join(", "));
+    drop(permit);
+    let failure = match done {
+        Ok((_, Ok(rows))) => {
+            info!(table = %table.key(), rows, "snapshot table copied");
+            return Ok(());
+        }
+        Ok((_, Err(e))) => format!("{e:#}"),
+        Err(e) => format!("worker panicked: {e}"),
+    };
+    if ctx.cancel.is_cancelled() {
+        bail!("snapshot cancelled");
     }
-
-    // final slot health check before marking complete
-    if let Some(slot) = ctx.slot_name {
-        health::verify_slot_still_healthy(ctx.dsn, slot)
-            .await
-            .context("post-snapshot slot verification")?;
+    if attempt < TABLE_RETRIES && view_alive(ctx.coord).await {
+        warn!(
+            table = %table.key(), attempt, error = %failure,
+            "snapshot table failed; copying it again in the same read view"
+        );
+        queue.push_front((table, attempt + 1));
+        return Ok(());
     }
+    error!(table = %table.key(), error = %failure, "snapshot table failed");
+    bail!("snapshot failed for {}: {failure}", table.key())
+}
 
-    // release the exported snapshot.
-    coord.batch_execute("COMMIT").await.ok();
-
-    // Every table read and every check passed: emit the completing
-    // boundary (the only stream position a snapshot commits).
-    publisher
-        .finish()
-        .await
-        .context("emit the snapshot's completing boundary")?;
-
-    // mark fully done, stamped with the current (safe) anchor protocol version.
-    progress.finished = true;
-    progress.anchor_version = SNAPSHOT_ANCHOR_VERSION;
-    save_progress(&ctx.chkpt_store, ctx.source_id, &progress).await;
-
-    info!(
-        source_id = %ctx.source_id,
-        elapsed_secs = t0.elapsed().as_secs(),
-        start_lsn = %start_lsn,
-        "snapshot finished - streaming will start from this LSN"
-    );
-
-    guard_cancel.cancel();
-    crate::snapshot_probe::record_phase(
-        crate::snapshot_probe::Phase::Finalization,
-        final_started.elapsed(),
-    );
-    Ok(start_lsn)
+/// Whether the coordinator transaction that exported the read view is
+/// still open (a worker may import the view again only then).
+async fn view_alive(coord: &tokio_postgres::Client) -> bool {
+    coord.simple_query("SELECT 1").await.is_ok()
 }
 
 /// In the exported snapshot the rows are read from, rebuild every planned
-/// table's registered schema model (the loader's own fetch, batched by
-/// `batch`) and require the plan's signature: a table altered, dropped or
-/// replaced since preparation stops the snapshot before any row is read.
-async fn verify_plan_in_snapshot(
+/// table's registered schema model (the loader's own fetch), one plan page
+/// at a time, and require the plan's signature: a table altered, dropped or
+/// replaced since the plan was made stops the generation before any row is
+/// read.
+pub async fn verify_plan_in_snapshot(
     coord: &tokio_postgres::Client,
-    tables: &[super::PgPlannedTable],
-    batch: usize,
+    queue: &QueueStore,
+    generation: u64,
+    page: usize,
 ) -> Result<()> {
-    for chunk in tables.chunks(batch.max(1)) {
-        let keys: Vec<(&str, &str)> = chunk
+    let mut after: Option<String> = None;
+    loop {
+        let (items, next) = queue
+            .items_page(generation, after.as_deref(), page.max(1))
+            .await?;
+        let keys: Vec<(&str, &str)> = items
             .iter()
-            .map(|t| (t.qualifier.as_str(), t.table.as_str()))
+            .map(|(_, t)| (t.qualifier.as_str(), t.table.as_str()))
             .collect();
         let schemas =
             super::postgres_schema_loader::fetch_tables_on(coord, &keys)
                 .await
                 .context("verify the plan: read the planned schemas")?;
-        for planned in chunk {
-            let key = (planned.qualifier.clone(), planned.table.clone());
+        for (_, item) in &items {
+            let name = format!("{}.{}", item.qualifier, item.table);
+            let key = (item.qualifier.clone(), item.table.clone());
             let Some(schema) = schemas.get(&key) else {
-                bail!(plan_moved(&planned.key(), "it no longer exists"));
+                bail!(plan_moved(&name, "it no longer exists"));
             };
-            if pg_schema_signature(schema) != planned.signature {
-                bail!(plan_moved(&planned.key(), "its schema changed"));
+            if pg_schema_signature(schema) != item.signature {
+                bail!(plan_moved(&name, "its schema changed"));
             }
         }
         crate::snapshot_probe::record_verification_page();
+        match next {
+            Some(n) => after = Some(n),
+            None => break,
+        }
     }
     crate::snapshot_probe::record_fixed(
         crate::snapshot_probe::FixedOp::CatalogVerification,
@@ -498,8 +413,8 @@ async fn verify_plan_in_snapshot(
 
 fn plan_moved(table: &str, what: &str) -> String {
     format!(
-        "{table} changed between snapshot preparation and the snapshot \
-         anchor ({what}); no row was read - restart to plan the snapshot again"
+        "{table} changed between planning and the snapshot anchor ({what}); \
+         no row was read - the next start plans a new generation"
     )
 }
 
@@ -511,85 +426,203 @@ pub(crate) fn pg_schema_signature(
     crate::snapshot_plan::schema_signature(schema)
 }
 
-/// The plan entry of `schema.table` with `identity`, its cursor kind from
-/// the schema `loader` resolves (as the preparation pass derives it). For
-/// driving [`run_snapshot`] directly.
-pub async fn plan_table(
-    loader: &PostgresSchemaLoader,
-    schema: &str,
-    table: &str,
-    identity: Vec<IdentitySpec>,
-) -> Result<super::PgPlannedTable> {
-    let loaded = loader.load_schema(schema, table).await?;
-    Ok(super::PgPlannedTable {
-        qualifier: schema.to_string(),
-        table: table.to_string(),
-        identity,
-        cursor_kind: pg_cursor_kind(&loaded.schema),
-        signature: pg_schema_signature(&loaded.schema),
+/// The bounds a running generation is held to (design section 9): its
+/// slot's WAL retention and the anchor age. Approaching a limit raises a
+/// non-blocking warning; reaching it blocks the generation
+/// (`snapshot_anchor_unavailable`) and stops the copy, before the retained
+/// log is lost.
+pub struct GenerationGuard {
+    pub dsn: crate::credentials::ProtectedDsn,
+    pub slot: String,
+    pub source_id: String,
+    pub generation: u64,
+    pub anchored_at_ms: i64,
+    pub max_anchor_age: std::time::Duration,
+    /// The run that owns the generation: only its own generation is
+    /// blocked.
+    pub run: String,
+    /// The control version the run holds: the only one blocked at.
+    pub version: Arc<std::sync::atomic::AtomicU64>,
+    pub queue: QueueStore,
+    pub incidents: storage::adapters::incidents::IncidentStore,
+    /// Cancelled when the generation blocks.
+    pub cancel: CancellationToken,
+    /// Why it blocked.
+    pub blocked: Arc<Mutex<Option<String>>>,
+}
+
+/// The slot's WAL retention: the slot gone or invalidated, its WAL lost or
+/// no safe WAL left blocks; `unreserved`, or less than 20% of
+/// `max_slot_wal_keep_size` left, warns.
+fn wal_finding(
+    exists: bool,
+    invalidation: Option<&str>,
+    wal_status: Option<&str>,
+    safe_wal_size: Option<i64>,
+    keep_mb: Option<i64>,
+) -> GuardFinding {
+    if !exists {
+        return GuardFinding::Block("slot_missing");
+    }
+    if invalidation.is_some() {
+        return GuardFinding::Block("slot_invalidated");
+    }
+    if wal_status == Some("lost") || safe_wal_size.is_some_and(|n| n <= 0) {
+        return GuardFinding::Block("wal_lost");
+    }
+    let low = match (safe_wal_size, keep_mb) {
+        (Some(safe), Some(mb)) if mb > 0 => safe * 5 < mb * 1024 * 1024,
+        _ => false,
+    };
+    if wal_status == Some("unreserved") || low {
+        return GuardFinding::Warn("wal_retention");
+    }
+    GuardFinding::Ok
+}
+
+/// One read of the slot's WAL retention.
+async fn check_slot(
+    dsn: &crate::credentials::ProtectedDsn,
+    slot: &str,
+) -> Result<GuardFinding> {
+    let (client, conn) = tokio_postgres::connect(dsn.expose(), NoTls).await?;
+    let task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let _task = scopeguard::guard(task, |t| t.abort());
+    let row = client
+        .query_opt(
+            &format!(
+                "SELECT wal_status, safe_wal_size, {} \
+                 FROM pg_replication_slots s WHERE slot_name = $1",
+                super::postgres_health::INVALIDATION
+            ),
+            &[&slot],
+        )
+        .await?;
+    let keep: Option<i64> = client
+        .query_opt(
+            "SELECT setting::bigint FROM pg_settings \
+             WHERE name = 'max_slot_wal_keep_size'",
+            &[],
+        )
+        .await?
+        .map(|r| r.get(0));
+    Ok(match row {
+        None => wal_finding(false, None, None, None, keep),
+        Some(r) => {
+            let status: Option<String> = r.get(0);
+            let safe: Option<i64> = r.get(1);
+            let invalidation: Option<String> = r.get(2);
+            wal_finding(
+                true,
+                invalidation.as_deref(),
+                status.as_deref(),
+                safe,
+                keep,
+            )
+        }
     })
 }
 
-/// Record one finished table task: a completed table is marked done,
-/// persisted and completed in the aggregator; a failure is collected.
-async fn record_table_result(
-    ctx: &PgSnapshotCtx<'_>,
-    publisher: &SnapshotPublisher,
-    progress: &mut SnapshotProgress,
-    failed: &mut Vec<String>,
-    names: &mut HashMap<tokio::task::Id, String>,
-    done: std::result::Result<
-        (tokio::task::Id, Result<u64>),
-        tokio::task::JoinError,
-    >,
-) -> Result<()> {
-    let id = match &done {
-        Ok((id, _)) => *id,
-        Err(e) => e.id(),
-    };
-    let name = names.remove(&id).unwrap_or_default();
-    match done {
-        Ok((_, Ok(_rows))) => {
-            if let Some((schema, table)) = name.split_once('.') {
-                progress.mark_done(schema, table);
-                save_progress(&ctx.chkpt_store, ctx.source_id, progress).await;
+/// Run the guard until the generation's copy ends (the task is aborted) or
+/// a bound blocks it.
+pub fn spawn_generation_guard(
+    g: GenerationGuard,
+) -> tokio::task::JoinHandle<()> {
+    use crate::snapshot_driver::incidents as drafts;
+    use deltaforge_core::incident::ReasonCode;
+    let every = (g.max_anchor_age / 10).clamp(
+        std::time::Duration::from_millis(200),
+        std::time::Duration::from_secs(30),
+    );
+    tokio::spawn(async move {
+        let mut warned: std::collections::BTreeSet<&'static str> =
+            Default::default();
+        loop {
+            tokio::select! {
+                _ = g.cancel.cancelled() => return,
+                _ = tokio::time::sleep(every) => {}
             }
-            // Explicit table completion: emits a table-complete boundary, and
-            // the `completed = true` snapshot boundary once every scanned
-            // table is done (delivered and durably acked with no trailing
-            // data rows).
-            if publisher.complete_table(&name).await.is_err() {
-                bail!("event channel closed at table completion");
+            let age = std::time::Duration::from_millis(
+                u64::try_from(
+                    chrono::Utc::now().timestamp_millis() - g.anchored_at_ms,
+                )
+                .unwrap_or(0),
+            );
+            let slot = match check_slot(&g.dsn, &g.slot).await {
+                Ok(f) => f,
+                Err(e) => {
+                    warn!(
+                        source_id = %g.source_id, slot = %g.slot,
+                        error = %format!("{e:#}"),
+                        "snapshot guard: slot check failed; retrying"
+                    );
+                    GuardFinding::Ok
+                }
+            };
+            for finding in [anchor_age_finding(age, g.max_anchor_age), slot] {
+                match finding {
+                    GuardFinding::Ok => {}
+                    GuardFinding::Warn(class) => {
+                        if warned.insert(class) {
+                            warn!(
+                                source_id = %g.source_id, class,
+                                "snapshot generation approaching a bound"
+                            );
+                            let _ = g
+                                .incidents
+                                .raise(
+                                    &drafts::bound_warning(
+                                        &g.source_id,
+                                        g.generation,
+                                        class,
+                                    ),
+                                    1,
+                                )
+                                .await;
+                        }
+                    }
+                    GuardFinding::Block(class) => {
+                        error!(
+                            source_id = %g.source_id, class,
+                            "snapshot generation reached a bound: blocked"
+                        );
+                        let draft = drafts::blocked(
+                            ReasonCode::SnapshotAnchorUnavailable,
+                            &g.source_id,
+                            g.generation,
+                            class,
+                        );
+                        if let Err(e) =
+                            crate::snapshot_driver::block_generation(
+                                &g.queue,
+                                &g.incidents,
+                                g.generation,
+                                Some(&g.run),
+                                g.version
+                                    .load(std::sync::atomic::Ordering::SeqCst),
+                                &draft,
+                            )
+                            .await
+                        {
+                            warn!(
+                                source_id = %g.source_id,
+                                error = %e,
+                                "could not record the block; the next start \
+                                 detects it again"
+                            );
+                        }
+                        *g.blocked.lock().expect("not poisoned") = Some(
+                            format!("snapshot_anchor_unavailable ({class})"),
+                        );
+                        g.cancel.cancel();
+                        return;
+                    }
+                }
             }
-            info!(table = %name, "snapshot complete");
         }
-        Ok((_, Err(e))) => {
-            // Preserve the full anyhow cause chain, not just the outer message.
-            let chain = format!("{e:#}");
-            error!(table = %name, error = %chain, "table snapshot failed");
-            failed.push(name);
-        }
-        Err(e) => {
-            error!(table = %name, error = %e, "snapshot worker panicked");
-            failed.push(name);
-        }
-    }
-    Ok(())
-}
-
-async fn save_progress(
-    store: &Arc<dyn CheckpointStore>,
-    source_id: &str,
-    progress: &SnapshotProgress,
-) {
-    if let Ok(bytes) = serde_json::to_vec(progress) {
-        let started = std::time::Instant::now();
-        let _ = store.put_raw(&progress_key(source_id), &bytes).await;
-        crate::snapshot_probe::record_progress_write(
-            bytes.len(),
-            started.elapsed(),
-        );
-    }
+    })
 }
 
 // ============================================================================
@@ -606,8 +639,6 @@ struct TableWorker {
     tenant: String,
     cfg: SnapshotCfg,
     schema_loader: PostgresSchemaLoader,
-    #[allow(unused)]
-    chkpt_store: Arc<dyn CheckpointStore>,
     cancel: CancellationToken,
     /// Durable snapshot generation for stable-id derivation.
     generation: u64,
@@ -615,12 +646,33 @@ struct TableWorker {
     lineage: PersistedLineage,
     /// Resolved identity columns (name + kind, identity order).
     identity: Vec<IdentitySpec>,
-    /// Fully-qualified `schema.table`, the aggregator's key for this table.
-    table_key: String,
-    /// Cursor kind for this table (matches the aggregator's frontier kind).
-    cursor_kind: CursorKind,
-    /// Shared aggregation owner: serializes boundary-advance + channel send.
-    publisher: Arc<SnapshotPublisher>,
+    publisher: Arc<GenerationPublisher>,
+    /// For intra-table readers, each on an extra permit.
+    permits: Arc<SnapshotPermits>,
+}
+
+/// Open a connection that reads in the exported view `snapshot_id`.
+async fn import_view(
+    dsn: &crate::credentials::ProtectedDsn,
+    snapshot_id: &str,
+    what: &str,
+) -> Result<tokio_postgres::Client> {
+    let (client, conn) = tokio_postgres::connect(dsn.expose(), NoTls)
+        .await
+        .with_context(|| format!("connect for {what}"))?;
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            warn!(error = %e, "snapshot reader connection dropped");
+        }
+    });
+    client
+        .batch_execute(&format!(
+            "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ; \
+             SET TRANSACTION SNAPSHOT '{snapshot_id}'"
+        ))
+        .await
+        .with_context(|| format!("import the snapshot for {what}"))?;
+    Ok(client)
 }
 
 impl TableWorker {
@@ -629,25 +681,8 @@ impl TableWorker {
         let fqn = fqn(&self.schema, &self.table);
         let t0 = Instant::now();
 
-        let (client, conn) = tokio_postgres::connect(self.dsn.expose(), NoTls)
-            .await
-            .with_context(|| format!("connect for {fqn}"))?;
-
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                warn!(error = %e, "snapshot worker connection dropped");
-            }
-        });
-
-        // Import the shared snapshot - all workers see the same DB state.
-        client
-            .batch_execute(&format!(
-                "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ; \
-                 SET TRANSACTION SNAPSHOT '{}'",
-                self.snapshot_id
-            ))
-            .await
-            .with_context(|| format!("import snapshot for {fqn}"))?;
+        // Every worker reads in the shared exported view.
+        let client = import_view(&self.dsn, &self.snapshot_id, &fqn).await?;
 
         // Determine chunking strategy from the schema.
         let loaded = self
@@ -726,7 +761,7 @@ impl TableWorker {
             }
         };
 
-        // Decide parallelism: multiple concurrent chunks for large tables
+        // Decide parallelism: multiple concurrent readers for large tables
         // when intra_table_parallel is enabled.
         let use_parallel = self.cfg.intra_table_parallel
             && total > self.cfg.chunk_size as u64 * 4;
@@ -745,35 +780,27 @@ impl TableWorker {
         min_pk: i64,
         max_pk: i64,
     ) -> Result<u64> {
-        let fqn = fqn(&self.schema, &self.table);
         let chunk = self.cfg.chunk_size as i64;
         let mut cursor = min_pk;
         let mut total_sent = 0u64;
-        // Half-open frontier cursor reported to the aggregator, starting at the
-        // signed minimum so the first chunk abuts the frontier (rows below min_pk
-        // do not exist and are vacuously durable). PG integer PKs are signed.
-        let mut published: SnapshotCursor = self.cursor_kind.min();
-
         while cursor <= max_pk {
             if self.cancel.is_cancelled() {
                 anyhow::bail!("snapshot cancelled");
             }
-            let next = cursor + chunk;
-            let events = self
-                .read_pk_events(client, pk_col, cursor, next, &fqn)
+            let next = cursor.saturating_add(chunk);
+            total_sent += self
+                .reader()
+                .read_and_publish_pk_range(client, pk_col, cursor, next)
                 .await?;
-            total_sent += events.len() as u64;
-            let end = SnapshotCursor::Signed(next);
-            self.publisher
-                .publish_chunk(&self.table_key, published, end, events)
-                .await
-                .map_err(|_| anyhow!("event channel closed"))?;
-            published = end;
             cursor = next;
         }
         Ok(total_sent)
     }
 
+    /// Divide the PK space into `max_parallel_chunks` sub-ranges, read in
+    /// chunks from one shared queue: by this worker's own connection, and
+    /// by up to `max_parallel_chunks - 1` more readers, each on an extra
+    /// permit free right now (never waited for: this worker reads on).
     async fn by_pk_parallel(
         &self,
         client: &tokio_postgres::Client,
@@ -781,144 +808,60 @@ impl TableWorker {
         min_pk: i64,
         max_pk: i64,
     ) -> Result<u64> {
-        // Divide the PK space into N equal sub-ranges; each sub-range is read
-        // sequentially by a dedicated connection that imports the same snapshot.
-        let n_chunks = self.cfg.max_parallel_chunks;
-        let range = max_pk - min_pk + 1;
-        let per_chunk = (range / n_chunks as i64).max(1);
-
-        // Cover the vacuous prefix below min_pk once, so every real chunk (from
-        // any concurrent sub-range) abuts the contiguous frontier at min_pk.
-        // Empty events: this only advances the frontier, emitting no boundary.
-        self.publisher
-            .publish_chunk(
-                &self.table_key,
-                self.cursor_kind.min(),
-                SnapshotCursor::Signed(min_pk),
-                Vec::new(),
-            )
-            .await
-            .map_err(|_| anyhow!("event channel closed"))?;
-
-        let semaphore = Arc::new(Semaphore::new(n_chunks));
-        let mut handles = Vec::new();
-
-        let mut chunk_start = min_pk;
-        while chunk_start <= max_pk {
-            let chunk_end = (chunk_start + per_chunk).min(max_pk + 1);
-            let permit = semaphore.clone().acquire_owned().await?;
-
-            // Each intra-table chunk needs its own connection with the
-            // snapshot imported.
-            let (sub_client, sub_conn) =
-                tokio_postgres::connect(self.dsn.expose(), NoTls)
-                    .await
-                    .context("intra-table chunk connect")?;
-
-            let snapshot_id = self.snapshot_id.clone();
-            tokio::spawn(async move {
-                if let Err(e) = sub_conn.await {
-                    warn!(error = %e, "intra-table chunk connection dropped");
-                }
-            });
-
-            sub_client
-                .batch_execute(&format!(
-                    "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ; \
-                     SET TRANSACTION SNAPSHOT '{snapshot_id}'"
-                ))
-                .await
-                .context("import snapshot for intra-table chunk")?;
-
-            let worker_self = self.clone_for_chunk();
-            let pk = pk_col.to_string();
-            let fqn = fqn(&self.schema, &self.table);
-            let step = self.cfg.chunk_size as i64;
-            let cancel = self.cancel.clone();
-
-            let handle = tokio::spawn(async move {
-                let mut cursor = chunk_start;
-                let mut sent = 0u64;
-                while cursor < chunk_end {
-                    if cancel.is_cancelled() {
-                        return Err(anyhow::anyhow!("cancelled"));
-                    }
-                    let next = (cursor + step).min(chunk_end);
-                    // Concurrent sub-ranges publish their real chunks
-                    // [Signed(cursor), Signed(next)); the aggregator buffers
-                    // out-of-order arrivals and advances the frontier only through
-                    // contiguous ranges.
-                    sent += worker_self
-                        .read_and_publish_pk_range(
-                            &sub_client,
-                            &pk,
-                            cursor,
-                            next,
-                            &fqn,
-                        )
-                        .await?;
-                    cursor = next;
-                }
-                sub_client.batch_execute("COMMIT").await.ok();
-                drop(permit);
-                Ok(sent)
-            });
-            handles.push(handle);
-            chunk_start = chunk_end;
+        let step = self.cfg.chunk_size.max(1) as i64;
+        let mut ranges = std::collections::VecDeque::new();
+        let mut cursor = min_pk;
+        while cursor <= max_pk {
+            let next =
+                cursor.saturating_add(step).min(max_pk.saturating_add(1));
+            ranges.push_back((cursor, next));
+            if next <= cursor {
+                break;
+            }
+            cursor = next;
         }
+        let ranges = Arc::new(Mutex::new(ranges));
 
-        // read_pk_range also uses the main client for the sub-ranges not spawned
-        // (shouldn't reach here if chunking is correct, but be safe)
-        let _ = client;
-
-        let mut total = 0u64;
-        for h in handles {
-            total += h.await.context("chunk task panicked")??;
+        let mut helpers = Vec::new();
+        for _ in 1..self.cfg.max_parallel_chunks.max(1) {
+            let Some(permit) = self.permits.try_extra() else {
+                break;
+            };
+            let (reader, ranges, pk) =
+                (self.reader(), Arc::clone(&ranges), pk_col.to_string());
+            let (dsn, snapshot_id) =
+                (self.dsn.clone(), self.snapshot_id.clone());
+            let what = format!(
+                "{} (intra-table reader)",
+                fqn(&self.schema, &self.table)
+            );
+            helpers.push(tokio::spawn(async move {
+                let _permit = permit;
+                let client = import_view(&dsn, &snapshot_id, &what).await?;
+                let sent = reader.drain(&client, &pk, &ranges).await;
+                client.batch_execute("COMMIT").await.ok();
+                sent
+            }));
+        }
+        let mut total = self.reader().drain(client, pk_col, &ranges).await?;
+        for h in helpers {
+            total += h.await.context("intra-table reader panicked")??;
         }
         Ok(total)
     }
 
-    /// Read one PK range `[from, to)` and build its snapshot events (no send);
-    /// the caller publishes the chunk through the aggregation owner.
-    async fn read_pk_events(
-        &self,
-        client: &tokio_postgres::Client,
-        pk_col: &str,
-        from: i64,
-        to: i64,
-        fqn: &str,
-    ) -> Result<Vec<Event>> {
-        // row_to_json (column 0) is the payload; native identity columns follow
-        // and are the ONLY identity input (schema-directed, never the JSON).
-        let sql = format!(
-            r#"SELECT row_to_json(t)::text{}
-               FROM (SELECT * FROM "{}"."{}"
-                     WHERE "{pk_col}" >= $1::bigint AND "{pk_col}" < $2::bigint
-                     ORDER BY "{pk_col}") t"#,
-            identity_select_suffix(&self.identity),
-            self.schema,
-            self.table
-        );
-
-        let rows = client
-            .query(&sql, &[&from, &to])
-            .await
-            .with_context(|| format!("read chunk [{from},{to}) from {fqn}"))?;
-
-        let mut events = Vec::with_capacity(rows.len());
-        for row in rows {
-            events.push(build_pg_snapshot_event(
-                &row,
-                &self.identity,
-                &self.lineage,
-                self.generation,
-                &self.schema,
-                &self.table,
-                &self.pipeline,
-                &self.tenant,
-            )?);
+    fn reader(&self) -> RangeReader {
+        RangeReader {
+            schema: self.schema.clone(),
+            table: self.table.clone(),
+            pipeline: self.pipeline.clone(),
+            tenant: self.tenant.clone(),
+            generation: self.generation,
+            lineage: self.lineage.clone(),
+            identity: self.identity.clone(),
+            publisher: Arc::clone(&self.publisher),
+            cancel: self.cancel.clone(),
         }
-        Ok(events)
     }
 
     // ctid-range chunking (fallback for non-integer-PK tables)
@@ -951,8 +894,6 @@ impl TableWorker {
         let pages_per_chunk = ((self.cfg.chunk_size / 100) as i32).max(1);
         let mut page = 0i32;
         let mut total_sent = 0u64;
-        // ctid page-block frontier, starting at block 0 (the kind's minimum).
-        let mut published: SnapshotCursor = self.cursor_kind.min();
 
         while page < total_pages {
             if self.cancel.is_cancelled() {
@@ -990,74 +931,64 @@ impl TableWorker {
             }
 
             total_sent += events.len() as u64;
-            let end = SnapshotCursor::CtidBlock(end_page as u64);
             self.publisher
-                .publish_chunk(&self.table_key, published, end, events)
+                .publish_chunk(events)
                 .await
-                .map_err(|_| anyhow!("event channel closed"))?;
-            published = end;
+                .map_err(|e| anyhow!(e))?;
             page = end_page;
         }
 
         Ok(total_sent)
     }
-
-    /// Shallow clone for intra-table parallel workers.
-    fn clone_for_chunk(&self) -> ChunkWorkerCtx {
-        ChunkWorkerCtx {
-            schema: self.schema.clone(),
-            table: self.table.clone(),
-            pipeline: self.pipeline.clone(),
-            tenant: self.tenant.clone(),
-            dsn: self.dsn.clone(),
-            snapshot_id: self.snapshot_id.clone(),
-            chunk_size: self.cfg.chunk_size,
-            generation: self.generation,
-            lineage: self.lineage.clone(),
-            identity: self.identity.clone(),
-            table_key: self.table_key.clone(),
-            publisher: Arc::clone(&self.publisher),
-        }
-    }
 }
 
-/// Minimal context passed into spawned intra-table chunk tasks.
-struct ChunkWorkerCtx {
+/// Reads PK ranges of one table and publishes each as a chunk.
+struct RangeReader {
     schema: String,
     table: String,
     pipeline: String,
     tenant: String,
-    dsn: crate::credentials::ProtectedDsn,
-    snapshot_id: String,
-    chunk_size: usize,
     generation: u64,
     lineage: PersistedLineage,
     identity: Vec<IdentitySpec>,
-    table_key: String,
-    publisher: Arc<SnapshotPublisher>,
+    publisher: Arc<GenerationPublisher>,
+    cancel: CancellationToken,
 }
 
-impl ChunkWorkerCtx {
-    /// Read one PK sub-range `[from, to)` and publish it as the half-open chunk
-    /// `[Signed(from), Signed(to))` through the shared aggregation owner.
-    /// Concurrent sub-ranges publish out of order; the aggregator buffers them and
-    /// advances the contiguous frontier only through abutting ranges.
+impl RangeReader {
+    /// Read ranges from the shared queue until it is empty.
+    async fn drain(
+        &self,
+        client: &tokio_postgres::Client,
+        pk_col: &str,
+        ranges: &Mutex<std::collections::VecDeque<(i64, i64)>>,
+    ) -> Result<u64> {
+        let mut sent = 0;
+        loop {
+            if self.cancel.is_cancelled() {
+                bail!("snapshot cancelled");
+            }
+            let next = ranges.lock().expect("not poisoned").pop_front();
+            let Some((from, to)) = next else {
+                return Ok(sent);
+            };
+            sent += self
+                .read_and_publish_pk_range(client, pk_col, from, to)
+                .await?;
+        }
+    }
+
+    /// Read one PK range `[from, to)` and publish it as one chunk.
     async fn read_and_publish_pk_range(
         &self,
         client: &tokio_postgres::Client,
         pk_col: &str,
         from: i64,
         to: i64,
-        fqn: &str,
     ) -> Result<u64> {
-        debug!(
-            pipeline=%self.pipeline,
-            dsn=%redact_url_password(self.dsn.expose()),
-            snapshot_id=%self.snapshot_id,
-            chunk_size=%self.chunk_size,
-            "reading PK range"
-        );
-
+        let fqn = fqn(&self.schema, &self.table);
+        // row_to_json (column 0) is the payload; native identity columns follow
+        // and are the ONLY identity input (schema-directed, never the JSON).
         let sql = format!(
             r#"SELECT row_to_json(t)::text{}
                FROM (SELECT * FROM "{}"."{}"
@@ -1088,14 +1019,9 @@ impl ChunkWorkerCtx {
         }
         let n = events.len() as u64;
         self.publisher
-            .publish_chunk(
-                &self.table_key,
-                SnapshotCursor::Signed(from),
-                SnapshotCursor::Signed(to),
-                events,
-            )
+            .publish_chunk(events)
             .await
-            .map_err(|_| anyhow!("event channel closed"))?;
+            .map_err(|e| anyhow!(e))?;
         Ok(n)
     }
 }
@@ -1196,5 +1122,64 @@ async fn estimate_rows(
     match row {
         Ok(Some(r)) => r.get::<_, i64>(0).max(0) as u64,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn the_anchor_age_warns_at_80_percent_and_blocks_at_the_limit() {
+        let max = Duration::from_secs(100);
+        let at = |s| anchor_age_finding(Duration::from_secs(s), max);
+        assert_eq!(at(79), GuardFinding::Ok);
+        assert_eq!(at(80), GuardFinding::Warn("anchor_age"));
+        assert_eq!(at(100), GuardFinding::Block("anchor_age"));
+    }
+
+    #[test]
+    fn wal_retention_blocks_before_the_log_is_lost() {
+        const MB: i64 = 1024 * 1024;
+        assert_eq!(
+            wal_finding(false, None, None, None, None),
+            GuardFinding::Block("slot_missing")
+        );
+        assert_eq!(
+            wal_finding(true, Some("wal_removed"), Some("lost"), None, None),
+            GuardFinding::Block("slot_invalidated")
+        );
+        assert_eq!(
+            wal_finding(true, None, Some("lost"), None, None),
+            GuardFinding::Block("wal_lost")
+        );
+        assert_eq!(
+            wal_finding(true, None, Some("unreserved"), Some(0), Some(100)),
+            GuardFinding::Block("wal_lost")
+        );
+        assert_eq!(
+            wal_finding(
+                true,
+                None,
+                Some("unreserved"),
+                Some(50 * MB),
+                Some(100)
+            ),
+            GuardFinding::Warn("wal_retention")
+        );
+        assert_eq!(
+            wal_finding(true, None, Some("reserved"), Some(19 * MB), Some(100)),
+            GuardFinding::Warn("wal_retention")
+        );
+        assert_eq!(
+            wal_finding(true, None, Some("reserved"), Some(21 * MB), Some(100)),
+            GuardFinding::Ok
+        );
+        assert_eq!(
+            wal_finding(true, None, Some("reserved"), None, Some(-1)),
+            GuardFinding::Ok,
+            "unlimited retention"
+        );
     }
 }

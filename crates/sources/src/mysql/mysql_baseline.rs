@@ -123,6 +123,7 @@ pub(crate) async fn establish(
         gtid_set: ctx.last_gtid.clone(),
         lineage: Some(lineage.clone()),
         snapshot_completed: None,
+        snapshot_chain: None,
     };
     let Some(r0) = mysql_checkpoint_position(
         &r0_cp.file,
@@ -568,7 +569,9 @@ mod tests {
 
     /// Live MySQL 8.4 (Docker): startup establishes nothing; a table's first
     /// unproven rows get a lazy baseline at their evaluation position, which
-    /// selection over the stored records then proves.
+    /// selection over the stored records then proves. They share one server
+    /// and pace phases by time: run them serially
+    /// (`-- --include-ignored --test-threads=1 mysql_baseline`).
     mod live {
         use super::*;
         use crate::mysql::MySqlSource;
@@ -692,16 +695,47 @@ mod tests {
                 on_schema_drift: OnSchemaDrift::Adapt,
                 table_options: Default::default(),
                 rotation: None,
+                snapshot_cohort: Default::default(),
             };
+            // One required sink; its barriers commit through the runner's
+            // own barrier commit, so a generation can start and complete.
+            src.set_snapshot_cohort(deltaforge_core::SnapshotCohort {
+                policy: deltaforge_core::CohortPolicy::Required,
+                sinks: vec![deltaforge_core::CohortSink {
+                    id: "sink".into(),
+                    required: true,
+                }],
+            });
+            let commit = runner::coordinator::build_barrier_fn(
+                st.ckpt.clone(),
+                format!("{id}::sink::sink"),
+                Arc::new(src.clone()),
+            );
             let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
             let handle = src.run(tx, st.ckpt.clone()).await;
             let rows = tokio::spawn(async move {
+                use deltaforge_core::{BarrierKind, SourceItem};
+                use runner::coordinator::BarrierCommit;
                 let mut rows = Vec::new();
                 while let Some(item) = rx.recv().await {
-                    if let deltaforge_core::SourceItem::Event(e) = item
-                        && e.ddl.is_none()
-                    {
-                        rows.push(e);
+                    match item {
+                        SourceItem::Barrier { barrier } => {
+                            let c = match barrier.kind {
+                                BarrierKind::GenerationStart(s) => {
+                                    BarrierCommit::Start(s)
+                                }
+                                BarrierKind::Terminal => {
+                                    BarrierCommit::Checkpoint(
+                                        barrier.boundary.checkpoint,
+                                    )
+                                }
+                            };
+                            if commit(c).await.is_err() {
+                                break;
+                            }
+                        }
+                        SourceItem::Event(e) if e.ddl.is_none() => rows.push(e),
+                        _ => {}
                     }
                 }
                 rows

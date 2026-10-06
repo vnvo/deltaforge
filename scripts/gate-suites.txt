@@ -20,6 +20,7 @@
 # PostgreSQL state-store suites (live database via DSN)
 serial-pg  storage/lib-pg                   -p storage --lib -- --include-ignored --test-threads=1 pg_
 serial-pg  runner/replay_pg_integration     -p runner --test replay_pg_integration
+serial-pg  sources/lib-pg                   -p sources --lib -- --include-ignored --test-threads=1 pg_queue_
 
 # Timing-sensitive or fixed-port suites
 serial     sources/mysql_rotation_e2e       -p sources --test mysql_rotation_e2e
@@ -31,7 +32,8 @@ serial     scale-harness/ci_tier            -p scale-harness --test ci_tier
 serial     scale-harness/live_ttfce         -p scale-harness --test live_ttfce
 
 # Live suites, run concurrently
-parallel   sources/lib                      -p sources --lib
+# The PostgreSQL queue contract needs the serial-pg lane's DSN.
+parallel   sources/lib                      -p sources --lib -- --include-ignored --test-threads=1 --skip pg_queue_
 parallel   sources/failover_e2e             -p sources --test failover_e2e
 parallel   sources/pg_failover_topology_e2e -p sources --test pg_failover_topology_e2e
 parallel   sources/mysql_activation_e2e     -p sources --test mysql_activation_e2e
@@ -45,6 +47,8 @@ parallel   sources/mysql_proof_matrix_e2e   -p sources --test mysql_proof_matrix
 parallel   sources/mysql_snapthot_e2e       -p sources --test mysql_snapthot_e2e
 parallel   sources/postgres_cdc_e2e         -p sources --test postgres_cdc_e2e
 parallel   sources/postgres_snapshot_e2e    -p sources --test postgres_snapshot_e2e
+parallel   sources/snapshot_connection_cap_e2e -p sources --test snapshot_connection_cap_e2e
+parallel   sources/snapshot_structure_e2e   -p sources --test snapshot_structure_e2e
 parallel   sources/source_credentials       -p sources --test source_credentials
 parallel   sources/txn_coordinator_e2e      -p sources --test txn_coordinator_e2e
 parallel   runner/incidents_e2e             -p runner --test incidents_e2e
@@ -91,5 +95,5 @@ release    runner/s3_ministack_canary       -p runner --test s3_ministack_canary
 release    runner/s3_ministack_durable_canary -p runner --test s3_ministack_durable_canary
 
 # Manual measurements, never run by a tier
-excluded   sources/snapshot_scale_measure   manual measurement: 1K/10K-table snapshot timing and RSS, recorded per change, never enforced
+excluded   sources/snapshot_scale_measure   1K/10K acceptance measurement (about 20 min, asserts the scale gates): run once on the final candidate, not per gate
 excluded   gate-ownership/gate_probe        the gate self-test probe: run inside a real gate by scripts/gate-selftest.sh, fails or hangs on purpose

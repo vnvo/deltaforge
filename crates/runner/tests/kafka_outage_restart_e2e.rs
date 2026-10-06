@@ -218,6 +218,7 @@ async fn run_pipeline(
         on_schema_drift: OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
+        snapshot_cohort: Default::default(),
     };
     let src: Arc<dyn Source> = Arc::new(src);
     // Change-driven feedback: the coordinator signals this on each per-sink commit.

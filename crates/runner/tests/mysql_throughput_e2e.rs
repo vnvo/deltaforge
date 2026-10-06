@@ -309,6 +309,7 @@ async fn spawn_pipeline(
         on_schema_drift: OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
+        snapshot_cohort: Default::default(),
     };
     let src: Arc<dyn Source> = Arc::new(src);
     let commit_signal = Arc::new(tokio::sync::Notify::new());

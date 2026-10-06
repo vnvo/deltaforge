@@ -13,8 +13,10 @@
 //! So while the chain is at transition 0, every activation of a stream first
 //! adopts the source's checkpoint candidates into it: the `{source_id}::sink::*`
 //! keys, or the exact aggregate key when there is none (never snapshot
-//! progress or any other key). Every candidate is classified before anything
-//! is written:
+//! progress or any other key). Snapshot and generation start positions are
+//! not stream positions and are left as they are (their anchor carries its
+//! own stamp). Every other candidate is classified before anything is
+//! written:
 //! - stamped by this chain at transition 0 on its timeline: nothing to do;
 //! - unstamped: adopted (the chain was created on the history they belong
 //!   to: a fresh source, or a server that never switched timeline);
@@ -93,6 +95,16 @@ pub(crate) async fn adopt_into_chain(
         else {
             continue;
         };
+        // A snapshot or generation start position is no stream position: it
+        // carries its anchor's own stamp and is classified against the
+        // snapshot's control record, never ordered across transitions.
+        if matches!(
+            super::classify_pg_checkpoint(&raw),
+            Ok(super::PgResumePosition::Snapshot { .. }
+                | super::PgResumePosition::Started)
+        ) {
+            continue;
+        }
         let (Ok(cp), Ok(serde_json::Value::Object(obj))) = (
             serde_json::from_slice::<PostgresCheckpoint>(&raw),
             serde_json::from_slice::<serde_json::Value>(&raw),
@@ -346,6 +358,43 @@ mod tests {
                 stamped(l, "c", 0)
             );
         }
+    }
+
+    /// Snapshot and generation start positions are no stream positions:
+    /// they are left as they are while stream positions join the chain.
+    #[tokio::test]
+    async fn snapshot_positions_are_left_as_they_are() {
+        let store = MemCheckpointStore::new().unwrap();
+        let anchor =
+            super::super::PgAnchor::new(Lsn::parse("0/100").unwrap(), None);
+        let incomplete =
+            crate::snapshot_position::encode_chained("g", 2, &anchor);
+        let started = crate::snapshot_position::encode_adopted("g", 3, "d");
+        store
+            .put_raw("orders::sink::a", &legacy("0/200"))
+            .await
+            .unwrap();
+        store.put_raw("orders::sink::b", &incomplete).await.unwrap();
+        store.put_raw("orders::sink::c", &started).await.unwrap();
+        assert_eq!(
+            adopt_into_chain(&store, "orders", &record(0))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(json(&store, "orders::sink::a").await, {
+            let mut v = stamped("0/200", "c", 0);
+            v["tx_id"] = 42.into();
+            v
+        });
+        assert_eq!(
+            store.get_raw("orders::sink::b").await.unwrap(),
+            Some(incomplete)
+        );
+        assert_eq!(
+            store.get_raw("orders::sink::c").await.unwrap(),
+            Some(started)
+        );
     }
 
     #[tokio::test]

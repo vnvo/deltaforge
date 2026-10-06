@@ -248,6 +248,20 @@ async fn upsert_delete_and_typed_mapping() {
         mk_event(Op::Delete, json!(null), json!({"id": 2}), 3),
     ];
     let res = sink.send_batch(&batch).await.unwrap();
+    // Nothing stays buffered behind an acknowledged batch: the checkpoint
+    // barrier acknowledges.
+    sink.barrier(
+        &deltaforge_core::BarrierKind::Terminal,
+        &deltaforge_core::SinkBatchContext {
+            checkpoint: deltaforge_core::CheckpointMeta::from_vec(
+                b"cp".to_vec(),
+            ),
+            durable_watermark: None,
+            batch_id: None,
+        },
+    )
+    .await
+    .unwrap();
     assert!(res.dlq_failures.is_empty(), "{:?}", res.dlq_failures);
     refresh(&base, index).await;
 

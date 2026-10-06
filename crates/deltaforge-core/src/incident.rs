@@ -51,11 +51,27 @@ pub enum ReasonCode {
     /// The pipeline's open-incident limit was reached; this record counts the
     /// incidents not kept individually.
     IncidentOverflow,
+    /// A sink is behind a completed snapshot generation (outside the policy
+    /// that completed it, or added later): it will not receive that
+    /// generation's remaining rows.
+    SinkSnapshotIncomplete,
+    /// An incomplete snapshot generation was replaced by the next one (for
+    /// example its commit policy or sink cohort changed).
+    SnapshotReplaced,
+    /// A snapshot's anchor is no longer, or soon not, retained by the source.
+    SnapshotAnchorUnavailable,
+    /// Snapshot state is unreadable, of an unknown format, or written by
+    /// another owner.
+    SnapshotStateInvalid,
+    /// A snapshot exceeded a hard resource bound.
+    SnapshotBoundExceeded,
+    /// A snapshot is approaching a resource bound.
+    SnapshotBoundWarning,
 }
 
 impl ReasonCode {
     /// Every reason (bounded metric label values).
-    pub const ALL: [ReasonCode; 8] = [
+    pub const ALL: [ReasonCode; 14] = [
         Self::PgDifferentCluster,
         Self::PgContinuityUnproven,
         Self::PgFailoverSlotUnavailable,
@@ -64,6 +80,12 @@ impl ReasonCode {
         Self::SinkAckUncertain,
         Self::UnclassifiedFailure,
         Self::IncidentOverflow,
+        Self::SinkSnapshotIncomplete,
+        Self::SnapshotReplaced,
+        Self::SnapshotAnchorUnavailable,
+        Self::SnapshotStateInvalid,
+        Self::SnapshotBoundExceeded,
+        Self::SnapshotBoundWarning,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -78,6 +100,12 @@ impl ReasonCode {
             Self::SinkAckUncertain => "sink_ack_uncertain",
             Self::UnclassifiedFailure => "unclassified_failure",
             Self::IncidentOverflow => "incident_overflow",
+            Self::SinkSnapshotIncomplete => "sink_snapshot_incomplete",
+            Self::SnapshotReplaced => "snapshot_replaced",
+            Self::SnapshotAnchorUnavailable => "snapshot_anchor_unavailable",
+            Self::SnapshotStateInvalid => "snapshot_state_invalid",
+            Self::SnapshotBoundExceeded => "snapshot_bound_exceeded",
+            Self::SnapshotBoundWarning => "snapshot_bound_warning",
         }
     }
 }
@@ -180,6 +208,9 @@ pub enum ActionCode {
     VerifySinkState,
     InspectLogs,
     EnableFailoverSlot,
+    /// Give a sink a fresh baseline (a re-snapshot reaching it, or a
+    /// re-bootstrap from another sink).
+    RebootstrapSink,
 }
 
 /// The pipeline part that raised it.
@@ -336,6 +367,7 @@ pub enum EvidenceKey {
     CheckpointTransition,
     RecordedChain,
     RecordedTransition,
+    SnapshotChain,
 }
 
 impl EvidenceKey {
@@ -373,6 +405,7 @@ impl EvidenceKey {
             Self::CheckpointTransition => "checkpoint_transition",
             Self::RecordedChain => "recorded_chain",
             Self::RecordedTransition => "recorded_transition",
+            Self::SnapshotChain => "snapshot_chain",
         }
     }
 }
@@ -694,6 +727,45 @@ pub fn explain(
                 ),
                 None => String::new(),
             },
+        ),
+        ReasonCode::SinkSnapshotIncomplete => format!(
+            "{component} is behind completed snapshot generation {} of chain \
+             {}: it was outside the policy that completed it (or added later) \
+             and will not receive that generation's remaining rows. It keeps \
+             receiving changes; give it a fresh baseline.",
+            ev.show(K::ExpectedGeneration),
+            ev.show(K::SnapshotChain),
+        ),
+        ReasonCode::SnapshotReplaced => format!(
+            "{component} replaced incomplete snapshot generation {} ({}): \
+             the whole snapshot is copied again.",
+            ev.show(K::ExpectedGeneration),
+            ev.show(K::ReasonClass),
+        ),
+        ReasonCode::SnapshotAnchorUnavailable => format!(
+            "{component} stopped snapshot generation {} before its anchor \
+             could be lost ({}). Nothing is copied again automatically: \
+             resnapshot explicitly.",
+            ev.show(K::ExpectedGeneration),
+            ev.show(K::ReasonClass),
+        ),
+        ReasonCode::SnapshotStateInvalid => format!(
+            "{component} stopped: its snapshot state is not usable ({}). \
+             Nothing is changed automatically: resnapshot explicitly.",
+            ev.show(K::ReasonClass),
+        ),
+        ReasonCode::SnapshotBoundExceeded => format!(
+            "{component} stopped snapshot generation {}: it exceeded a \
+             resource bound ({}). Resnapshot explicitly after raising the \
+             bound or narrowing the tables.",
+            ev.show(K::ExpectedGeneration),
+            ev.show(K::ReasonClass),
+        ),
+        ReasonCode::SnapshotBoundWarning => format!(
+            "{component} snapshot generation {} is approaching a resource \
+             bound ({}); it keeps running.",
+            ev.show(K::ExpectedGeneration),
+            ev.show(K::ReasonClass),
         ),
         ReasonCode::IncidentOverflow => format!(
             "{component} reached its open-incident limit; {} further \

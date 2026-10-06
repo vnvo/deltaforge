@@ -21,7 +21,7 @@ const THROUGHPUT_PER_WORKER_BYTES: u64 = 20 * 1024 * 1024; // 20 MB/s
 /// not: `invalidation_reason` on PostgreSQL 17+, `conflicting` before it
 /// (read through `to_jsonb`, so a column the server lacks is NULL rather than
 /// an error).
-const INVALIDATION: &str = "COALESCE(to_jsonb(s)->>'invalidation_reason', \
+pub(crate) const INVALIDATION: &str = "COALESCE(to_jsonb(s)->>'invalidation_reason', \
      CASE WHEN (to_jsonb(s)->>'conflicting')::boolean THEN 'conflicting' END)";
 
 /// WAL slot health from pg_replication_slots.
@@ -236,75 +236,99 @@ pub async fn run_preflight<S: AsRef<str>>(
     report.wal_keep_bytes = wal_keep.map(|v| if v <= 0 { -1 } else { v });
 
     // 4. table size estimation
-
     if !tables.is_empty() {
-        // One parameterized query per batch (identifiers quoted by
-        // `format('%I.%I')`), so no statement grows with the table count.
-        let mut total_bytes: i64 = 0;
-        for batch in tables.chunks(batch_size.max(1)) {
-            let schemas: Vec<&str> =
-                batch.iter().map(|(s, _)| s.as_ref()).collect();
-            let names: Vec<&str> =
-                batch.iter().map(|(_, t)| t.as_ref()).collect();
-            total_bytes += client
-                .query_one(
-                    "SELECT COALESCE(SUM(pg_total_relation_size(\
-                       format('%I.%I', s, t)::regclass)), 0)::bigint \
-                     FROM unnest($1::text[], $2::text[]) AS x(s, t)",
-                    &[&schemas, &names],
-                )
-                .await
-                .map(|r| r.get::<_, i64>(0))
-                .unwrap_or(0);
-        }
+        let total_bytes = table_size_bytes(&client, tables, batch_size).await;
+        report.apply_size_estimate(
+            total_bytes,
+            tables.len(),
+            max_parallel_tables,
+        );
+    }
 
+    Ok(report)
+}
+
+/// The total on-disk size of `tables`, one parameterized query per batch of
+/// `batch_size` (identifiers quoted by `format('%I.%I')`, so no statement
+/// grows with the table count). A batch that cannot be sized counts 0.
+pub async fn table_size_bytes<S: AsRef<str>>(
+    client: &tokio_postgres::Client,
+    tables: &[(S, S)],
+    batch_size: usize,
+) -> i64 {
+    let mut total_bytes: i64 = 0;
+    for batch in tables.chunks(batch_size.max(1)) {
+        let schemas: Vec<&str> =
+            batch.iter().map(|(s, _)| s.as_ref()).collect();
+        let names: Vec<&str> = batch.iter().map(|(_, t)| t.as_ref()).collect();
+        total_bytes += client
+            .query_one(
+                "SELECT COALESCE(SUM(pg_total_relation_size(\
+                   format('%I.%I', s, t)::regclass)), 0)::bigint \
+                 FROM unnest($1::text[], $2::text[]) AS x(s, t)",
+                &[&schemas, &names],
+            )
+            .await
+            .map(|r| r.get::<_, i64>(0))
+            .unwrap_or(0);
+    }
+    total_bytes
+}
+
+impl PreflightReport {
+    /// Record the snapshot's size and duration estimate over `table_count`
+    /// tables of `total_bytes`, and the WAL retention risk it implies.
+    pub fn apply_size_estimate(
+        &mut self,
+        total_bytes: i64,
+        table_count: usize,
+        max_parallel_tables: usize,
+    ) {
         if total_bytes > 0 {
             let total_bytes = total_bytes as u64;
-            report.estimated_size_bytes = Some(total_bytes);
+            self.estimated_size_bytes = Some(total_bytes);
 
             let effective_parallel =
-                max_parallel_tables.min(tables.len()).max(1) as u64;
+                max_parallel_tables.min(table_count).max(1) as u64;
             let throughput = THROUGHPUT_PER_WORKER_BYTES * effective_parallel;
             let estimated_secs = total_bytes / throughput;
-            report.estimated_duration_secs = Some(estimated_secs);
+            self.estimated_duration_secs = Some(estimated_secs);
 
             // 5. WAL retention risk
 
-            if let Some(keep_bytes) = report.wal_keep_bytes {
+            if let Some(keep_bytes) = self.wal_keep_bytes {
                 if keep_bytes > 0 {
                     // Rough WAL bytes generated ≈ 2x data bytes (row images + overhead)
                     let wal_estimate = total_bytes * 2;
                     let pct = (wal_estimate * 100) / keep_bytes as u64;
 
                     if pct >= 80 {
-                        report.warnings.push(format!(
-                            "HIGH WAL RETENTION RISK: estimated WAL generated during \
-                             snapshot (~{:.1} GB) is {}% of max_slot_wal_keep_size \
-                             ({:.1} GB). \
-                             The replication slot may be invalidated before the snapshot \
-                             completes. Recommended: increase max_slot_wal_keep_size to \
-                             at least {}MB, or reduce max_parallel_tables.",
-                            wal_estimate as f64 / 1_073_741_824.0,
-                            pct,
-                            keep_bytes as f64 / 1_073_741_824.0,
-                            (wal_estimate * 2) / (1024 * 1024),
-                        ));
+                        self.warnings.push(format!(
+                        "HIGH WAL RETENTION RISK: estimated WAL generated during \
+                         snapshot (~{:.1} GB) is {}% of max_slot_wal_keep_size \
+                         ({:.1} GB). \
+                         The replication slot may be invalidated before the snapshot \
+                         completes. Recommended: increase max_slot_wal_keep_size to \
+                         at least {}MB, or reduce max_parallel_tables.",
+                        wal_estimate as f64 / 1_073_741_824.0,
+                        pct,
+                        keep_bytes as f64 / 1_073_741_824.0,
+                        (wal_estimate * 2) / (1024 * 1024),
+                    ));
                     } else if pct >= 50 {
-                        report.warnings.push(format!(
-                            "WAL RETENTION WARNING: estimated WAL during snapshot \
-                             (~{:.1} GB) is {}% of max_slot_wal_keep_size \
-                             ({:.1} GB).",
-                            wal_estimate as f64 / 1_073_741_824.0,
-                            pct,
-                            keep_bytes as f64 / 1_073_741_824.0,
-                        ));
+                        self.warnings.push(format!(
+                        "WAL RETENTION WARNING: estimated WAL during snapshot \
+                         (~{:.1} GB) is {}% of max_slot_wal_keep_size \
+                         ({:.1} GB).",
+                        wal_estimate as f64 / 1_073_741_824.0,
+                        pct,
+                        keep_bytes as f64 / 1_073_741_824.0,
+                    ));
                     }
                 }
             }
         }
     }
-
-    Ok(report)
 }
 
 /// Check slot wal_status (PostgreSQL 13+). Returns Unknown on older versions.

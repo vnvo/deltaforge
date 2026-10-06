@@ -29,6 +29,24 @@ use crate::schema_provider::{ArcSchemaProvider, TableSchemaInfo};
 pub type CommitCpFn<Tok> =
     Box<dyn Fn(Tok) -> BoxFuture<'static, Result<()>> + Send + Sync + 'static>;
 
+/// What a sink's barrier commit records (see [`build_barrier_fn`]).
+#[derive(Debug, Clone)]
+pub enum BarrierCommit {
+    /// The barrier's checkpoint, as any committed checkpoint.
+    Checkpoint(CheckpointMeta),
+    /// A generation start: the sink's stored checkpoint moves into the
+    /// generation after the source's local check of it.
+    Start(deltaforge_core::GenerationStart),
+}
+
+/// A per-sink barrier commit function.
+pub type BarrierCpFn = Box<
+    dyn Fn(BarrierCommit) -> BoxFuture<'static, Result<()>>
+        + Send
+        + Sync
+        + 'static,
+>;
+
 pub struct ProcessedBatch<Tok> {
     pub events: Vec<Event>,
     pub last_checkpoint: Option<Tok>,
@@ -307,6 +325,8 @@ fn finalize_batch(
 struct DeliveryItem {
     batch: BuildingBatch,
     reason: &'static str,
+    /// A checkpoint barrier, delivered instead of the (empty) batch.
+    barrier: Option<deltaforge_core::Barrier>,
 }
 
 /// After processing, freeze as Arc<[Event]> for zero-copy sharing.
@@ -554,7 +574,42 @@ async fn send_to_delivery(
     // Count the item as in-flight before it enters the channel; the delivery task
     // decrements once it has processed it. The quiesce barrier waits for this to reach 0.
     inflight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    if tx.send(DeliveryItem { batch, reason }).await.is_err() {
+    if tx
+        .send(DeliveryItem {
+            batch,
+            reason,
+            barrier: None,
+        })
+        .await
+        .is_err()
+    {
+        inflight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        return Err(anyhow::anyhow!("delivery task stopped unexpectedly"));
+    }
+    Ok(())
+}
+
+/// Deliver a checkpoint barrier: first the pending batch (if it carries
+/// anything), then the barrier itself, in order behind every earlier batch.
+async fn send_barrier_to_delivery(
+    tx: &tokio::sync::mpsc::Sender<DeliveryItem>,
+    inflight: &std::sync::atomic::AtomicUsize,
+    pending: BuildingBatch,
+    barrier: deltaforge_core::Barrier,
+) -> Result<()> {
+    if !pending.raw.is_empty() || pending.boundary.is_some() {
+        send_to_delivery(tx, inflight, pending, "barrier").await?;
+    }
+    inflight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if tx
+        .send(DeliveryItem {
+            batch: BuildingBatch::with_capacity(0),
+            reason: "barrier",
+            barrier: Some(barrier),
+        })
+        .await
+        .is_err()
+    {
         inflight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         return Err(anyhow::anyhow!("delivery task stopped unexpectedly"));
     }
@@ -900,6 +955,9 @@ pub struct Coordinator<Tok> {
     /// Each sink that successfully delivers a batch gets its own checkpoint
     /// committed independently.
     commit_cp_per_sink: HashMap<String, CommitCpFn<Tok>>,
+    /// Per-sink barrier commit functions, keyed by sink ID. A sink without
+    /// one cannot pass a checkpoint barrier.
+    barrier_cp_per_sink: HashMap<String, BarrierCpFn>,
     process_batch: ProcessBatchFn<Tok>,
     /// Optional schema sensing
     schema_sensor: Option<Arc<SchemaSensorState>>,
@@ -926,6 +984,11 @@ pub struct Coordinator<Tok> {
     /// The pipeline's incident store: a run starts by settling its sinks'
     /// open acknowledgement-uncertainty incidents, each by its own boundary.
     incidents: Option<storage::adapters::incidents::IncidentStore>,
+    /// Sinks that missed a batch since they last entered a snapshot
+    /// generation (its start barrier): such a sink did not durably receive
+    /// every row before a terminal barrier, so it never acknowledges one
+    /// (design section 5.1).
+    snapshot_gaps: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 pub struct CoordinatorBuilder<Tok> {
@@ -935,6 +998,7 @@ pub struct CoordinatorBuilder<Tok> {
     commit_policy: Option<CommitPolicy>,
     sink_batch_deadline: Option<std::time::Duration>,
     commit_fns: HashMap<String, CommitCpFn<Tok>>,
+    barrier_fns: HashMap<String, BarrierCpFn>,
     process_fn: Option<ProcessBatchFn<Tok>>,
     schema_sensor: Option<Arc<SchemaSensorState>>,
     schema_provider: Option<ArcSchemaProvider>,
@@ -955,6 +1019,7 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             commit_policy: None,
             sink_batch_deadline: None,
             commit_fns: HashMap::new(),
+            barrier_fns: HashMap::new(),
             process_fn: None,
             schema_sensor: None,
             schema_provider: None,
@@ -1020,6 +1085,16 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
         self
     }
 
+    /// Register a per-sink barrier commit function.
+    pub fn barrier_fn(
+        mut self,
+        sink_id: impl Into<String>,
+        f: BarrierCpFn,
+    ) -> Self {
+        self.barrier_fns.insert(sink_id.into(), f);
+        self
+    }
+
     pub fn process_fn(mut self, f: ProcessBatchFn<Tok>) -> Self {
         self.process_fn = Some(f);
         self
@@ -1066,12 +1141,14 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
         );
 
         Coordinator {
+            snapshot_gaps: Default::default(),
             pipeline_name: self.pipeline_name.into(),
             sinks: self.sinks,
             batch_cfg_eff,
             commit_policy: self.commit_policy,
             sink_batch_deadline: self.sink_batch_deadline,
             commit_cp_per_sink: self.commit_fns,
+            barrier_cp_per_sink: self.barrier_fns,
             process_batch: self.process_fn.expect("process_fn is required"),
             schema_sensor: self.schema_sensor,
             schema_provider: self.schema_provider,
@@ -1425,9 +1502,17 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         let d_drained = Arc::clone(&drained);
         let delivery_handle = tokio::spawn(async move {
             while let Some(item) = deliver_rx.recv().await {
-                let outcome = d_coord
-                    .process_deliver_and_maybe_commit(item.batch, item.reason)
-                    .await;
+                let outcome = match item.barrier {
+                    Some(barrier) => d_coord.process_barrier(barrier).await,
+                    None => {
+                        d_coord
+                            .process_deliver_and_maybe_commit(
+                                item.batch,
+                                item.reason,
+                            )
+                            .await
+                    }
+                };
                 // Decrement + notify AFTER processing (success or failure) so the quiesce
                 // barrier only observes drain once the batch is truly done.
                 d_inflight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -1746,6 +1831,32 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                         )
                                         .increment(1);
                                     }
+                                    SourceItem::Barrier { barrier } => {
+                                        // Barriers arrive between rows (snapshot
+                                        // starts and ends), never inside a
+                                        // source transaction.
+                                        if b.mid_tx() {
+                                            return Err(anyhow::anyhow!(
+                                                "a checkpoint barrier arrived inside a \
+                                                 source transaction"
+                                            ));
+                                        }
+                                        coord
+                                            .close_capture_unit(
+                                                &mut capture_accum,
+                                                &barrier.boundary,
+                                                &mut last_captured_boundary,
+                                            )
+                                            .await?;
+                                        let pending = std::mem::replace(
+                                            &mut b,
+                                            BuildingBatch::with_capacity(max_events),
+                                        );
+                                        send_barrier_to_delivery(
+                                            &deliver_tx, &inflight, pending, barrier,
+                                        )
+                                        .await?;
+                                    }
                                     SourceItem::Boundary { boundary } => {
                                         // A data-less boundary (snapshot table /
                                         // full completion). Apply it to the pending
@@ -1792,6 +1903,17 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                         "outcome" => "may_duplicate",
                                     )
                                     .increment(1);
+                                }
+                                if let SourceItem::Barrier { barrier } = item {
+                                    let pending = std::mem::replace(
+                                        &mut b,
+                                        BuildingBatch::with_capacity(max_events),
+                                    );
+                                    send_barrier_to_delivery(
+                                        &deliver_tx, &inflight, pending, barrier,
+                                    )
+                                    .await?;
+                                    continue;
                                 }
                                 let SourceItem::Event(ev) = item else { continue; };
                                 if let Some(full) = check_and_split(&mut b, ev, max_events, max_bytes) {
@@ -2250,6 +2372,19 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
             )
             .set(if *succeeded { 1.0 } else { 0.0 });
         }
+        // A live sink that did not deliver this batch has a gap: it cannot
+        // acknowledge a later terminal barrier of its generation.
+        {
+            let mut gaps = self.snapshot_gaps.lock().expect("not poisoned");
+            for sink in &live_sinks {
+                let delivered = sink_results
+                    .iter()
+                    .any(|(id, _, ok)| *ok && id == sink.id());
+                if !delivered {
+                    gaps.insert(sink.id().to_string());
+                }
+            }
+        }
 
         // Policy gate - check BEFORE committing any checkpoints so that a
         // failed required sink never leaves optional sinks with advanced
@@ -2379,6 +2514,220 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
 
         Ok(())
     }
+
+    /// Deliver a checkpoint barrier (`docs/design/snapshot-durable-queue.md`,
+    /// section 5) once every earlier batch was committed (FIFO): every live
+    /// sink's `barrier` concurrently, then the policy - every sink for a
+    /// generation start (a sink left behind could never accept the
+    /// generation), the commit policy for a terminal barrier - then each
+    /// acknowledging sink's barrier commit.
+    async fn process_barrier(
+        &self,
+        barrier: deltaforge_core::Barrier,
+    ) -> Result<()> {
+        use deltaforge_core::BarrierKind;
+        let start = matches!(barrier.kind, BarrierKind::GenerationStart(_));
+        let live_sinks: Vec<ArcDynSink> = self
+            .sinks
+            .iter()
+            .filter(|s| !self.is_sink_excluded(s.id()))
+            .cloned()
+            .collect();
+        if start && live_sinks.len() != self.sinks.len() {
+            return Err(anyhow::anyhow!(
+                "a snapshot generation cannot start while a replay job holds a \
+                 sink out of live delivery"
+            ));
+        }
+        let required_total =
+            live_sinks.iter().filter(|s| is_sink_required(s)).count();
+        let ctx = deltaforge_core::SinkBatchContext {
+            checkpoint: barrier.boundary.checkpoint.clone(),
+            durable_watermark: barrier
+                .boundary
+                .durable_watermark
+                .as_ref()
+                .map(|w| w.to_vec()),
+            batch_id: None,
+        };
+        let deadline = self.sink_batch_deadline;
+        let outcomes = join_all(live_sinks.iter().map(|sink| {
+            let (ctx, kind) = (&ctx, &barrier.kind);
+            async move {
+                let result = match deadline {
+                    Some(d) => tokio::time::timeout(d, sink.barrier(kind, ctx))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(SinkError::Backpressure {
+                                details: format!(
+                                    "sink exceeded coordinator deadline of {}s \
+                                     at a checkpoint barrier",
+                                    d.as_secs()
+                                )
+                                .into(),
+                            })
+                        }),
+                    None => sink.barrier(kind, ctx).await,
+                };
+                (sink.id().to_string(), is_sink_required(sink), result)
+            }
+        }))
+        .await;
+
+        // A generation start clears a sink's gap (it enters the generation
+        // from its start); a terminal barrier is refused to a sink with one.
+        let outcomes: Vec<_> = {
+            let mut gaps = self.snapshot_gaps.lock().expect("not poisoned");
+            outcomes
+                .into_iter()
+                .map(|(sink_id, required, result)| {
+                    let result = match result {
+                        Ok(()) if start => {
+                            gaps.remove(&sink_id);
+                            Ok(())
+                        }
+                        Ok(()) if gaps.contains(&sink_id) => {
+                            Err(SinkError::Fatal {
+                                details: "the sink missed a batch of this \
+                                          snapshot generation: it cannot \
+                                          acknowledge its terminal barrier"
+                                    .into(),
+                            })
+                        }
+                        other => other,
+                    };
+                    (sink_id, required, result)
+                })
+                .collect()
+        };
+        let (mut required_acks, mut total_acks) = (0usize, 0usize);
+        let mut acked: Vec<String> = Vec::new();
+        let mut first_failure: Option<SinkDeliveryError> = None;
+        for (sink_id, required, result) in outcomes {
+            match result {
+                Ok(()) => {
+                    total_acks += 1;
+                    if required {
+                        required_acks += 1;
+                    }
+                    acked.push(sink_id);
+                }
+                Err(e) => {
+                    warn!(
+                        pipeline = %self.pipeline_name,
+                        sink = %sink_id,
+                        error = %e,
+                        "sink refused or failed a checkpoint barrier"
+                    );
+                    if first_failure.is_none() {
+                        first_failure =
+                            Some(SinkDeliveryError { sink_id, error: e });
+                    }
+                }
+            }
+        }
+        let satisfied = if start {
+            total_acks == live_sinks.len()
+        } else {
+            policy_satisfied(
+                &self.commit_policy,
+                live_sinks.len(),
+                required_total,
+                required_acks,
+                total_acks,
+            )
+        };
+        if !satisfied {
+            let msg = format!(
+                "checkpoint barrier not acknowledged: required \
+                 {required_acks}/{required_total}, total {total_acks}/{}",
+                live_sinks.len()
+            );
+            return Err(match first_failure {
+                Some(f) => anyhow::Error::new(f).context(msg),
+                None => anyhow::anyhow!(msg),
+            });
+        }
+
+        let commit = match &barrier.kind {
+            BarrierKind::GenerationStart(g) => BarrierCommit::Start(g.clone()),
+            BarrierKind::Terminal => {
+                BarrierCommit::Checkpoint(barrier.boundary.checkpoint.clone())
+            }
+        };
+        let mut commits = Vec::with_capacity(acked.len());
+        for sink_id in &acked {
+            let Some(f) = self.barrier_cp_per_sink.get(sink_id.as_str()) else {
+                return Err(anyhow::anyhow!(
+                    "sink {sink_id} acknowledged a checkpoint barrier but has no \
+                     barrier commit function"
+                ));
+            };
+            commits.push(f(commit.clone()));
+        }
+        for result in join_all(commits).await {
+            result.context("commit a checkpoint barrier")?;
+        }
+        if let Some(n) = &self.commit_notify {
+            n.notify_one();
+        }
+        Ok(())
+    }
+}
+
+/// Build a sink's barrier commit function over its checkpoint key: a
+/// terminal barrier's checkpoint is written as any checkpoint; a generation
+/// start reads the stored checkpoint, asks the source's local check
+/// ([`Source::checkpoint_generation_start`]) and, on `Move`, writes the start
+/// checkpoint.
+///
+/// The per-sink keys live in the key-value store, which has no
+/// compare-and-swap: this read-check-write is correct only because exactly
+/// one writer touches a pipeline's per-sink keys - one process per pipeline
+/// (the store gate and the pipeline's active-source claim), one delivery task
+/// per pipeline, which runs barriers and batch commits strictly in order, and
+/// no barrier start while a replay job holds a sink out of live delivery
+/// ([`Coordinator::process_barrier`]). A failed read or write returns an
+/// error, which fails the barrier: it is never acknowledged.
+///
+/// [`Source::checkpoint_generation_start`]: deltaforge_core::Source::checkpoint_generation_start
+pub fn build_barrier_fn(
+    store: Arc<dyn CheckpointStore>,
+    key: String,
+    source: Arc<dyn deltaforge_core::Source>,
+) -> BarrierCpFn {
+    use futures::FutureExt;
+    Box::new(move |commit: BarrierCommit| {
+        let (store, key, source) =
+            (Arc::clone(&store), key.clone(), Arc::clone(&source));
+        async move {
+            match commit {
+                BarrierCommit::Checkpoint(cp) => {
+                    store.put_raw(&key, cp.as_bytes()).await?;
+                }
+                BarrierCommit::Start(start) => {
+                    let prev = store.get_raw(&key).await?;
+                    match source.checkpoint_generation_start(prev.as_deref(), &start) {
+                        deltaforge_core::CheckpointStart::Move(cp) => {
+                            store.put_raw(&key, cp.as_bytes()).await?;
+                        }
+                        deltaforge_core::CheckpointStart::Already => {}
+                        deltaforge_core::CheckpointStart::Refuse => {
+                            return Err(anyhow::anyhow!(
+                                "checkpoint {key} cannot start snapshot generation \
+                                 {} of chain {}: it is in another chain or lineage, \
+                                 a later generation, or unreadable",
+                                start.generation,
+                                start.snapshot_chain
+                            ));
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        .boxed()
+    })
 }
 
 /// Build the commit function for checkpoints.
@@ -6696,6 +7045,935 @@ mod tests {
             sink.delivery_count(),
             1,
             "the sink acknowledged the batch before the persist failure"
+        );
+    }
+}
+
+/// Checkpoint barriers through the delivery task (design section 5).
+#[cfg(test)]
+mod barrier_tests {
+    use super::*;
+    use checkpoints::{CheckpointStore, MemCheckpointStore};
+    use deltaforge_core::SinkResult;
+    use deltaforge_core::{
+        Barrier, BarrierKind, CheckpointStart, GenerationStart,
+        SinkBatchContext, SourceBoundary,
+    };
+
+    /// Logs what reaches it; refuses barriers when told to.
+    struct LogSink {
+        id: String,
+        required: bool,
+        refuse: bool,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl deltaforge_core::Sink for LogSink {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn required(&self) -> bool {
+            self.required
+        }
+        async fn send(&self, _e: &Event) -> SinkResult<()> {
+            Ok(())
+        }
+        async fn send_batch_with_context(
+            &self,
+            events: &[Event],
+            _ctx: &SinkBatchContext,
+        ) -> SinkResult<deltaforge_core::BatchResult> {
+            self.log.lock().unwrap().push(format!(
+                "{}:batch:{}",
+                self.id,
+                events.len()
+            ));
+            // A "lossy" sink fails every batch (its barriers still answer).
+            if self.id.starts_with("lossy") {
+                return Err(SinkError::Fatal {
+                    details: "lost".into(),
+                });
+            }
+            Ok(deltaforge_core::BatchResult::ok())
+        }
+        async fn barrier(
+            &self,
+            kind: &BarrierKind,
+            _ctx: &SinkBatchContext,
+        ) -> SinkResult<()> {
+            let k = match kind {
+                BarrierKind::Terminal => "terminal",
+                BarrierKind::GenerationStart(_) => "start",
+            };
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:barrier:{k}", self.id));
+            if self.refuse {
+                Err(SinkError::Fatal {
+                    details: "refused".into(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// A source whose start check is: empty or anything but "bad" moves to
+    /// "start"; "start" is already there; "bad" is refused.
+    struct StartSource;
+
+    #[async_trait::async_trait]
+    impl deltaforge_core::Source for StartSource {
+        async fn run(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<SourceItem>,
+            _chkpt: Arc<dyn CheckpointStore>,
+        ) -> deltaforge_core::SourceHandle {
+            unreachable!("not run")
+        }
+        fn compare_checkpoints(
+            &self,
+            _a: &[u8],
+            _b: &[u8],
+        ) -> deltaforge_core::CheckpointOrder {
+            deltaforge_core::CheckpointOrder::Incomparable
+        }
+        fn checkpoint_generation_start(
+            &self,
+            prev: Option<&[u8]>,
+            _start: &GenerationStart,
+        ) -> CheckpointStart {
+            match prev {
+                Some(b"bad") => CheckpointStart::Refuse,
+                Some(b"start") => CheckpointStart::Already,
+                _ => CheckpointStart::Move(CheckpointMeta::from_vec(
+                    b"start".to_vec(),
+                )),
+            }
+        }
+    }
+
+    fn row(i: i64, boundary: Option<&[u8]>) -> Event {
+        let source = deltaforge_core::SourceInfo {
+            version: "t".into(),
+            connector: "mysql".into(),
+            name: "t".into(),
+            db: "db".into(),
+            schema: None,
+            table: "t".into(),
+            ts_ms: 0,
+            snapshot: None,
+            position: deltaforge_core::SourcePosition::default(),
+        };
+        let mut ev = Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, i as u32),
+            source,
+            deltaforge_core::Op::Create,
+            None,
+            Some(serde_json::json!({ "id": i })),
+            0,
+            0,
+        );
+        ev.transaction = None;
+        if let Some(cp) = boundary {
+            ev.set_boundary(SourceBoundary {
+                checkpoint: CheckpointMeta::from_vec(cp.to_vec()),
+                durable_watermark: Some(Arc::from(cp.to_vec())),
+            });
+        }
+        ev
+    }
+
+    fn barrier(kind: BarrierKind, cp: &[u8]) -> SourceItem {
+        SourceItem::Barrier {
+            barrier: Barrier {
+                kind,
+                boundary: SourceBoundary {
+                    checkpoint: CheckpointMeta::from_vec(cp.to_vec()),
+                    durable_watermark: Some(Arc::from(cp.to_vec())),
+                },
+            },
+        }
+    }
+
+    fn start_kind() -> BarrierKind {
+        BarrierKind::GenerationStart(GenerationStart {
+            snapshot_chain: "c".into(),
+            generation: 4,
+            legacy_through: None,
+        })
+    }
+
+    struct Run {
+        result: Result<()>,
+        log: Vec<String>,
+        store: Arc<dyn CheckpointStore>,
+    }
+
+    /// Run `items` through a coordinator over `sinks` (id, required,
+    /// refuses barriers), the store pre-seeded with `seed`.
+    async fn run(
+        respect_source_tx: bool,
+        sinks: &[(&str, bool, bool)],
+        seed: &[(&str, &[u8])],
+        items: Vec<SourceItem>,
+    ) -> Run {
+        let store: Arc<dyn CheckpointStore> =
+            Arc::new(MemCheckpointStore::new().unwrap());
+        run_on(store, respect_source_tx, sinks, seed, items).await
+    }
+
+    async fn run_on(
+        store: Arc<dyn CheckpointStore>,
+        respect_source_tx: bool,
+        sinks: &[(&str, bool, bool)],
+        seed: &[(&str, &[u8])],
+        items: Vec<SourceItem>,
+    ) -> Run {
+        for (k, v) in seed {
+            store.put_raw(k, v).await.unwrap();
+        }
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut builder = Coordinator::builder("barrier")
+            .sinks(
+                sinks
+                    .iter()
+                    .map(|(id, required, refuse)| {
+                        Arc::new(LogSink {
+                            id: id.to_string(),
+                            required: *required,
+                            refuse: *refuse,
+                            log: Arc::clone(&log),
+                        }) as ArcDynSink
+                    })
+                    .collect(),
+            )
+            .batch_config(Some(BatchConfig {
+                max_events: Some(100),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(respect_source_tx),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .process_fn(build_batch_processor(
+                Arc::from(Vec::<deltaforge_core::ArcDynProcessor>::new()),
+                "test".to_string(),
+            ));
+        for (id, _, _) in sinks {
+            let key = format!("src::sink::{id}");
+            builder = builder
+                .commit_fn(*id, build_commit_fn(store.clone(), key.clone()))
+                .barrier_fn(
+                    *id,
+                    build_barrier_fn(store.clone(), key, Arc::new(StartSource)),
+                );
+        }
+        let coord = builder.build();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        for item in items {
+            tx.send(item).await.unwrap();
+        }
+        drop(tx);
+        let (_p, pause_rx) = tokio::sync::watch::channel(PauseState::default());
+        let result = coord
+            .run(rx, tokio_util::sync::CancellationToken::new(), pause_rx)
+            .await;
+        let log = log.lock().unwrap().clone();
+        Run { result, log, store }
+    }
+
+    async fn key(
+        store: &Arc<dyn CheckpointStore>,
+        id: &str,
+    ) -> Option<Vec<u8>> {
+        store.get_raw(&format!("src::sink::{id}")).await.unwrap()
+    }
+
+    /// A terminal barrier reaches every sink after the batch before it (in
+    /// both accumulation paths) and commits its checkpoint after the batch's.
+    #[tokio::test]
+    async fn a_terminal_barrier_follows_every_earlier_batch() {
+        for aligned in [true, false] {
+            let r = run(
+                aligned,
+                &[("a", true, false), ("b", true, false)],
+                &[],
+                vec![
+                    SourceItem::Event(row(1, None)),
+                    SourceItem::Event(row(2, Some(b"rows"))),
+                    barrier(BarrierKind::Terminal, b"terminal"),
+                ],
+            )
+            .await;
+            r.result.unwrap();
+            for id in ["a", "b"] {
+                let mine: Vec<&String> =
+                    r.log.iter().filter(|l| l.starts_with(id)).collect();
+                assert_eq!(
+                    mine,
+                    [
+                        &format!("{id}:batch:2"),
+                        &format!("{id}:barrier:terminal")
+                    ],
+                    "aligned={aligned}"
+                );
+                assert_eq!(
+                    key(&r.store, id).await.as_deref(),
+                    Some(&b"terminal"[..])
+                );
+            }
+        }
+    }
+
+    /// A terminal barrier follows the commit policy: a refusing optional sink
+    /// does not hold it (its checkpoint stays); a refusing required sink fails
+    /// it and nothing is committed.
+    #[tokio::test]
+    async fn a_terminal_barrier_follows_the_commit_policy() {
+        let r = run(
+            true,
+            &[("req", true, false), ("opt", false, true)],
+            &[("src::sink::opt", b"old")],
+            vec![barrier(BarrierKind::Terminal, b"terminal")],
+        )
+        .await;
+        r.result.unwrap();
+        assert_eq!(
+            key(&r.store, "req").await.as_deref(),
+            Some(&b"terminal"[..])
+        );
+        assert_eq!(key(&r.store, "opt").await.as_deref(), Some(&b"old"[..]));
+
+        let r = run(
+            true,
+            &[("req", true, true), ("opt", false, false)],
+            &[],
+            vec![barrier(BarrierKind::Terminal, b"terminal")],
+        )
+        .await;
+        assert!(r.result.is_err());
+        assert_eq!(key(&r.store, "req").await, None);
+        assert_eq!(key(&r.store, "opt").await, None);
+    }
+
+    /// A sink that missed a batch of the generation never acknowledges its
+    /// terminal barrier, whatever its own barrier answers (design section
+    /// 5.1): under `Required` the required sink completes, and the optional
+    /// one keeps its start position. A later generation start clears it.
+    #[tokio::test]
+    async fn a_sink_with_a_missed_batch_never_acknowledges_the_terminal() {
+        let r = run(
+            true,
+            &[("req", true, false), ("lossy", false, false)],
+            &[],
+            vec![
+                barrier(start_kind(), b"start-barrier"),
+                SourceItem::Event(row(1, Some(b"rows"))),
+                barrier(BarrierKind::Terminal, b"terminal"),
+                barrier(start_kind(), b"start-barrier"),
+                barrier(BarrierKind::Terminal, b"terminal"),
+            ],
+        )
+        .await;
+        r.result.unwrap();
+        assert_eq!(
+            key(&r.store, "req").await.as_deref(),
+            Some(&b"terminal"[..])
+        );
+        // The first terminal was refused to it; after the next start (no
+        // batch missed since) the second terminal is its own.
+        assert_eq!(
+            key(&r.store, "lossy").await.as_deref(),
+            Some(&b"terminal"[..])
+        );
+        let r = run(
+            true,
+            &[("req", true, false), ("lossy", false, false)],
+            &[],
+            vec![
+                barrier(start_kind(), b"start-barrier"),
+                SourceItem::Event(row(1, Some(b"rows"))),
+                barrier(BarrierKind::Terminal, b"terminal"),
+            ],
+        )
+        .await;
+        r.result.unwrap();
+        assert_eq!(
+            key(&r.store, "lossy").await.as_deref(),
+            Some(&b"start"[..]),
+            "the start position, never the terminal"
+        );
+    }
+
+    /// A generation start needs every sink, optional ones included, and moves
+    /// each stored checkpoint by the source's local check.
+    #[tokio::test]
+    async fn a_generation_start_needs_every_sink_and_the_source_check() {
+        let r = run(
+            true,
+            &[("a", true, false), ("b", false, false)],
+            &[("src::sink::b", b"cdc")],
+            vec![barrier(start_kind(), b"")],
+        )
+        .await;
+        r.result.unwrap();
+        assert_eq!(key(&r.store, "a").await.as_deref(), Some(&b"start"[..]));
+        assert_eq!(key(&r.store, "b").await.as_deref(), Some(&b"start"[..]));
+
+        // An optional sink refusing still fails a start.
+        let r = run(
+            true,
+            &[("a", true, false), ("b", false, true)],
+            &[],
+            vec![barrier(start_kind(), b"")],
+        )
+        .await;
+        assert!(r.result.is_err());
+        assert_eq!(key(&r.store, "a").await, None);
+
+        // A checkpoint the source refuses fails the start.
+        let r = run(
+            true,
+            &[("a", true, false)],
+            &[("src::sink::a", b"bad")],
+            vec![barrier(start_kind(), b"")],
+        )
+        .await;
+        assert!(r.result.is_err());
+        assert_eq!(key(&r.store, "a").await.as_deref(), Some(&b"bad"[..]));
+    }
+
+    /// A barrier whose checkpoint write fails is not acknowledged: the run
+    /// fails.
+    #[tokio::test]
+    async fn a_failed_barrier_write_never_acknowledges() {
+        use storage::adapters::test_util::FaultBackend;
+        let fault = Arc::new(FaultBackend::new());
+        fault
+            .fail_kv_put
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let store: Arc<dyn CheckpointStore> = Arc::new(
+            storage::adapters::BackendCheckpointStore::new(fault.clone()),
+        );
+        for kind in [BarrierKind::Terminal, start_kind()] {
+            let r = run_on(
+                store.clone(),
+                true,
+                &[("a", true, false)],
+                &[],
+                vec![barrier(kind, b"terminal")],
+            )
+            .await;
+            assert!(r.result.is_err());
+        }
+    }
+
+    /// A barrier inside an open source transaction is a protocol error.
+    #[tokio::test]
+    async fn a_barrier_inside_a_transaction_is_refused() {
+        let mut ev = row(1, None);
+        ev.transaction = Some(deltaforge_core::Transaction {
+            id: "t1".into(),
+            total_order: None,
+            data_collection_order: None,
+        });
+        let r = run(
+            true,
+            &[("a", true, false)],
+            &[],
+            vec![
+                SourceItem::TxBegin { tx_id: "t1".into() },
+                SourceItem::Event(ev),
+                barrier(BarrierKind::Terminal, b"terminal"),
+            ],
+        )
+        .await;
+        assert!(r.result.is_err());
+        assert_eq!(key(&r.store, "a").await, None);
+    }
+}
+
+/// The generation driver end to end with the delivery task (design sections
+/// 4 to 6): start barrier, terminal barrier under each commit policy,
+/// completion, a CDC-only restart, and policy drift before and after
+/// completion.
+#[cfg(test)]
+mod generation_flow_tests {
+    use super::*;
+    use checkpoints::{CheckpointStore, MemCheckpointStore};
+    use deltaforge_config::{CommitPolicy, SnapshotMode};
+    use deltaforge_core::{
+        Barrier, BarrierKind, CheckpointStart, GenerationStart,
+        SinkBatchContext, SinkResult, SourceBoundary,
+    };
+    use sources::snapshot_driver::{
+        Allocation, StartInput, StartOutcome, await_adoption, decide_start,
+    };
+    use sources::snapshot_generation::PersistedLineage;
+    use sources::snapshot_position::EngineOrder;
+    use sources::snapshot_queue::{
+        EngineAnchor, PlanDigest, PolicySnapshot, QueueStore, State, Stored,
+    };
+
+    /// A test engine: anchors are numbers; a stream position is
+    /// `{"p": n, "mark": [chain, generation]?}`.
+    struct Te;
+
+    fn p(raw: &[u8]) -> Option<u64> {
+        serde_json::from_slice::<serde_json::Value>(raw).ok()?["p"].as_u64()
+    }
+
+    impl EngineOrder for Te {
+        type Anchor = u64;
+        fn stream_order(
+            &self,
+            a: &[u8],
+            b: &[u8],
+        ) -> deltaforge_core::CheckpointOrder {
+            use deltaforge_core::CheckpointOrder::*;
+            match (p(a), p(b)) {
+                (Some(a), Some(b)) => match a.cmp(&b) {
+                    std::cmp::Ordering::Less => Before,
+                    std::cmp::Ordering::Equal => Equal,
+                    std::cmp::Ordering::Greater => After,
+                },
+                _ => Incomparable,
+            }
+        }
+        fn anchor_vs_stream(
+            &self,
+            anchor: &u64,
+            s: &[u8],
+        ) -> deltaforge_core::CheckpointOrder {
+            self.stream_order(
+                &serde_json::to_vec(&serde_json::json!({ "p": anchor }))
+                    .unwrap(),
+                s,
+            )
+        }
+        fn completion_mark(&self, s: &[u8]) -> Option<(Option<String>, u64)> {
+            let v: serde_json::Value = serde_json::from_slice(s).ok()?;
+            let m = v.get("mark")?;
+            Some((m[0].as_str().map(str::to_string), m[1].as_u64()?))
+        }
+    }
+
+    struct TeSource;
+
+    #[async_trait::async_trait]
+    impl deltaforge_core::Source for TeSource {
+        async fn run(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<SourceItem>,
+            _chkpt: Arc<dyn CheckpointStore>,
+        ) -> deltaforge_core::SourceHandle {
+            unreachable!("not run")
+        }
+        fn compare_checkpoints(
+            &self,
+            a: &[u8],
+            b: &[u8],
+        ) -> deltaforge_core::CheckpointOrder {
+            sources::snapshot_position::order(&Te, a, b)
+        }
+        fn checkpoint_generation_start(
+            &self,
+            prev: Option<&[u8]>,
+            start: &GenerationStart,
+        ) -> CheckpointStart {
+            sources::snapshot_position::checkpoint_start(&Te, prev, None, start)
+        }
+    }
+
+    /// Refuses terminal barriers when told to; acknowledges the rest.
+    struct Sk {
+        id: String,
+        required: bool,
+        refuse_terminal: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl deltaforge_core::Sink for Sk {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn required(&self) -> bool {
+            self.required
+        }
+        async fn send(&self, _e: &Event) -> SinkResult<()> {
+            Ok(())
+        }
+        async fn barrier(
+            &self,
+            kind: &BarrierKind,
+            _ctx: &SinkBatchContext,
+        ) -> SinkResult<()> {
+            if self.refuse_terminal && *kind == BarrierKind::Terminal {
+                Err(SinkError::Fatal {
+                    details: "down".into(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    const SRC: &str = "src";
+
+    struct World {
+        store: QueueStore,
+        checkpoints: Arc<dyn CheckpointStore>,
+    }
+
+    fn world() -> World {
+        let backend: storage::ArcStorageBackend =
+            Arc::new(storage::MemoryStorageBackend::new());
+        World {
+            store: QueueStore::new(backend, SRC),
+            checkpoints: Arc::new(MemCheckpointStore::new().unwrap()),
+        }
+    }
+
+    fn sinks(spec: &[(&str, bool, bool)]) -> Vec<ArcDynSink> {
+        spec.iter()
+            .map(|(id, required, refuse)| {
+                Arc::new(Sk {
+                    id: id.to_string(),
+                    required: *required,
+                    refuse_terminal: *refuse,
+                }) as ArcDynSink
+            })
+            .collect()
+    }
+
+    /// The configured cohort, through the runner's plumbing.
+    fn policy(commit: &CommitPolicy, sinks: &[ArcDynSink]) -> PolicySnapshot {
+        PolicySnapshot::from(&crate::pipeline_manager::snapshot_cohort(
+            Some(commit),
+            sinks,
+        ))
+    }
+
+    fn anchor_of(a: &EngineAnchor) -> Option<u64> {
+        match a {
+            EngineAnchor::Postgres { lsn, .. } => lsn.parse().ok(),
+            _ => None,
+        }
+    }
+
+    fn input<'a>(
+        w: &'a World,
+        policy: PolicySnapshot,
+        mode: SnapshotMode,
+    ) -> StartInput<'a, Te> {
+        StartInput {
+            store: &w.store,
+            engine: &Te,
+            checkpoints: w.checkpoints.as_ref(),
+            source_id: SRC,
+            lineage: PersistedLineage::Postgres {
+                system_identifier: 1,
+            },
+            config_fingerprint: "fp",
+            policy,
+            mode,
+            anchor_of: &anchor_of,
+            legacy: None,
+        }
+    }
+
+    /// Deliver `items` through a coordinator over `sinks` with `commit`.
+    async fn deliver(
+        w: &World,
+        commit: &CommitPolicy,
+        sinks: &[ArcDynSink],
+        items: Vec<SourceItem>,
+    ) -> Result<()> {
+        let mut builder = Coordinator::builder("flow")
+            .sinks(sinks.to_vec())
+            .commit_policy(Some(commit.clone()))
+            .batch_config(Some(BatchConfig {
+                max_events: Some(100),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .process_fn(build_batch_processor(
+                Arc::from(Vec::<deltaforge_core::ArcDynProcessor>::new()),
+                "flow".to_string(),
+            ));
+        for s in sinks {
+            let key = sources::snapshot_driver::sink_key(SRC, s.id());
+            builder = builder
+                .commit_fn(
+                    s.id(),
+                    build_commit_fn(w.checkpoints.clone(), key.clone()),
+                )
+                .barrier_fn(
+                    s.id(),
+                    build_barrier_fn(
+                        w.checkpoints.clone(),
+                        key,
+                        Arc::new(TeSource),
+                    ),
+                );
+        }
+        let coord = builder.build();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        for i in items {
+            tx.send(i).await.unwrap();
+        }
+        drop(tx);
+        let (_p, pause) = tokio::sync::watch::channel(PauseState::default());
+        coord
+            .run(rx, tokio_util::sync::CancellationToken::new(), pause)
+            .await
+    }
+
+    fn barrier(kind: BarrierKind, cp: Vec<u8>) -> SourceItem {
+        SourceItem::Barrier {
+            barrier: Barrier {
+                kind,
+                boundary: SourceBoundary {
+                    checkpoint: CheckpointMeta::from_vec(cp.clone()),
+                    durable_watermark: Some(Arc::from(cp)),
+                },
+            },
+        }
+    }
+
+    async fn current(
+        w: &World,
+    ) -> (u64, sources::snapshot_queue::GenerationControl) {
+        match w.store.read().await.unwrap().unwrap() {
+            Stored::Current { version, control } => (version, *control),
+            _ => panic!("not current"),
+        }
+    }
+
+    /// One generation to `rows_produced` with its terminal barrier delivered
+    /// under `commit`: allocate, seal and anchor at 100, start barrier and
+    /// adoption, rows produced, terminal barrier.
+    async fn produce(
+        w: &World,
+        commit: &CommitPolicy,
+        sinks: &[ArcDynSink],
+    ) -> u64 {
+        let cohort = policy(commit, sinks);
+        let StartOutcome::Snapshot { control, .. } =
+            decide_start(&input(w, cohort.clone(), SnapshotMode::Initial))
+                .await
+                .unwrap()
+        else {
+            panic!("a snapshot");
+        };
+        let g = control.generation;
+        let (v, c) = current(w).await;
+        let (v, c) = w
+            .store
+            .seal_and_run(
+                v,
+                &c,
+                PlanDigest::default().seal(),
+                EngineAnchor::Postgres {
+                    lsn: "100".into(),
+                    timeline: None,
+                    chain: None,
+                    transition: None,
+                },
+                "run",
+                0,
+            )
+            .await
+            .unwrap();
+        deliver(
+            w,
+            commit,
+            sinks,
+            vec![barrier(
+                BarrierKind::GenerationStart(GenerationStart {
+                    snapshot_chain: c.snapshot_chain.clone(),
+                    generation: g,
+                    legacy_through: None,
+                }),
+                Vec::new(),
+            )],
+        )
+        .await
+        .unwrap();
+        let _ = v;
+        let (v, c) = await_adoption(
+            &input(w, cohort, SnapshotMode::Initial),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let (_, c) = w.store.rows_produced(v, &c, "run").await.unwrap();
+        let terminal = serde_json::to_vec(
+            &serde_json::json!({ "p": 100, "mark": [c.snapshot_chain, g] }),
+        )
+        .unwrap();
+        deliver(
+            w,
+            commit,
+            sinks,
+            vec![barrier(BarrierKind::Terminal, terminal)],
+        )
+        .await
+        .unwrap();
+        g
+    }
+
+    #[tokio::test]
+    async fn a_generation_completes_under_each_policy_and_restarts_cdc_only() {
+        for (commit, spec, lagging) in [
+            (
+                CommitPolicy::All,
+                vec![("a", true, false), ("b", true, false)],
+                vec![],
+            ),
+            (
+                CommitPolicy::Required,
+                vec![("a", true, false), ("b", false, true)],
+                vec!["b"],
+            ),
+            (
+                CommitPolicy::Quorum { quorum: 2 },
+                vec![
+                    ("a", false, false),
+                    ("b", false, false),
+                    ("c", false, true),
+                ],
+                vec!["c"],
+            ),
+        ] {
+            let w = world();
+            let s = sinks(&spec);
+            let g = produce(&w, &commit, &s).await;
+            let cohort = policy(&commit, &s);
+            // The terminal was acknowledged under the policy: completed.
+            let StartOutcome::Stream {
+                lagging: l,
+                completed_now: Some(done),
+            } = decide_start(&input(&w, cohort.clone(), SnapshotMode::Initial))
+                .await
+                .unwrap()
+            else {
+                panic!("{commit:?}: not completed");
+            };
+            assert_eq!(done.state, State::Completed, "{commit:?}");
+            assert_eq!(done.generation, g);
+            assert_eq!(l, lagging, "{commit:?}");
+            // A restart is CDC only, with no new generation.
+            assert!(matches!(
+                decide_start(&input(&w, cohort, SnapshotMode::Initial))
+                    .await
+                    .unwrap(),
+                StartOutcome::Stream {
+                    completed_now: None,
+                    ..
+                }
+            ));
+            assert_eq!(current(&w).await.1.generation, g, "{commit:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_drift_replaces_before_completion_and_changes_nothing_after()
+    {
+        let commit = CommitPolicy::Required;
+        let s = sinks(&[("a", true, false)]);
+        let more = sinks(&[("a", true, false), ("d", true, false)]);
+
+        // Before completion: the cohort changed, the generation is replaced.
+        let w = world();
+        let g = produce(&w, &commit, &s).await;
+        let out = decide_start(&input(
+            &w,
+            policy(&commit, &more),
+            SnapshotMode::Initial,
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(
+            out,
+            StartOutcome::Snapshot {
+                why: Allocation::PolicyChanged,
+                ..
+            }
+        ));
+        assert_eq!(current(&w).await.1.generation, g + 1);
+
+        // After completion: the recorded cohort and completion stand; the
+        // new sink is behind it.
+        let w = world();
+        let g = produce(&w, &commit, &s).await;
+        decide_start(&input(&w, policy(&commit, &s), SnapshotMode::Initial))
+            .await
+            .unwrap();
+        let before = current(&w).await.1;
+        assert_eq!(before.state, State::Completed);
+        let out = decide_start(&input(
+            &w,
+            policy(&commit, &more),
+            SnapshotMode::Initial,
+        ))
+        .await
+        .unwrap();
+        let StartOutcome::Stream { lagging, .. } = out else {
+            panic!("not stream");
+        };
+        assert_eq!(lagging, vec!["d".to_string()]);
+        let after = current(&w).await.1;
+        assert_eq!(after, before, "the completed record is not reinterpreted");
+        assert_eq!(after.generation, g);
+    }
+
+    /// The runner hands the source its cohort; the digest is deterministic and
+    /// independent of the configured order.
+    #[test]
+    fn the_cohort_reaches_the_source_with_a_deterministic_digest() {
+        for (commit, expect) in [
+            (CommitPolicy::All, deltaforge_core::CohortPolicy::All),
+            (
+                CommitPolicy::Required,
+                deltaforge_core::CohortPolicy::Required,
+            ),
+            (
+                CommitPolicy::Quorum { quorum: 2 },
+                deltaforge_core::CohortPolicy::Quorum(2),
+            ),
+        ] {
+            let ab = sinks(&[("a", true, false), ("b", false, false)]);
+            let ba = sinks(&[("b", false, false), ("a", true, false)]);
+            let c1 =
+                crate::pipeline_manager::snapshot_cohort(Some(&commit), &ab);
+            assert_eq!(c1.policy, expect);
+            assert_eq!(
+                c1.sinks
+                    .iter()
+                    .map(|s| (s.id.as_str(), s.required))
+                    .collect::<Vec<_>>(),
+                [("a", true), ("b", false)]
+            );
+            assert_eq!(
+                policy(&commit, &ab).digest,
+                policy(&commit, &ba).digest
+            );
+        }
+        // An unset policy is Required, as the delivery task applies it.
+        let s = sinks(&[("a", true, false)]);
+        assert_eq!(
+            crate::pipeline_manager::snapshot_cohort(None, &s).policy,
+            deltaforge_core::CohortPolicy::Required
+        );
+        // Different policies, different digests.
+        assert_ne!(
+            policy(&CommitPolicy::All, &s).digest,
+            policy(&CommitPolicy::Required, &s).digest
         );
     }
 }

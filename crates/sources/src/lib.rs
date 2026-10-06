@@ -20,12 +20,30 @@ pub mod rotation;
 pub mod rotation_manager;
 pub mod schema_loader;
 pub(crate) mod snapshot_discovery;
+pub mod snapshot_driver;
 pub mod snapshot_event_id;
 pub mod snapshot_frontier;
 pub mod snapshot_generation;
+pub mod snapshot_permits;
 pub mod snapshot_plan;
 pub mod snapshot_position;
 pub mod snapshot_probe;
+pub mod snapshot_publish;
+
+/// A source's snapshot state shared with the runner: the commit policy and
+/// sink cohort the runner set before the source runs
+/// (`Source::set_snapshot_cohort`), which a generation freezes, and the
+/// sinks the resume fold leaves out (`Source::resume_exclusions`).
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotShared {
+    pub cohort: Option<deltaforge_core::SnapshotCohort>,
+    /// Set only from a durably completed generation; empty otherwise.
+    pub resume_exclusions: Vec<String>,
+}
+
+/// [`SnapshotShared`], shared by a source and its clones.
+pub type SnapshotCohortSlot = std::sync::Arc<std::sync::Mutex<SnapshotShared>>;
+pub mod snapshot_queue;
 pub mod stream_probe;
 mod table_patterns;
 // Phase 2 lease-lifecycle machinery (models + durable store + pure state machine).
@@ -338,6 +356,7 @@ pub async fn build_source(
                 on_schema_drift: c.on_schema_drift.clone(),
                 table_options: c.table_options.clone(),
                 rotation,
+                snapshot_cohort: Default::default(),
             }))
         }
 
@@ -363,6 +382,7 @@ pub async fn build_source(
                 on_schema_drift: c.on_schema_drift.clone(),
                 table_options: c.table_options.clone(),
                 rotation,
+                snapshot_cohort: Default::default(),
             }))
         }
     }

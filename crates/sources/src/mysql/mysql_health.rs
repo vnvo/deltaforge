@@ -220,99 +220,136 @@ async fn run_preflight_on<S: AsRef<str>>(
 
     // MySQL 8.0+: binlog_expire_logs_seconds (0 = never expire)
     // MySQL 5.7:  expire_logs_days
-    let retention_secs: Option<u64> = {
-        let secs: Option<u64> = conn
-            .query_first("SELECT @@GLOBAL.binlog_expire_logs_seconds")
-            .await
-            .ok()
-            .flatten()
-            .and_then(|mut r: Row| r.take(0));
-
-        if secs == Some(0) {
-            // 0 means "never expire" — no retention concern
-            None
-        } else if let Some(s) = secs.filter(|&s| s > 0) {
-            Some(s)
-        } else {
-            // Fallback for MySQL 5.7
-            conn.query_first("SELECT @@GLOBAL.expire_logs_days")
-                .await
-                .ok()
-                .flatten()
-                .and_then(|mut r: Row| r.take::<u64, _>(0))
-                .filter(|&d| d > 0)
-                .map(|d| d * 86400)
-        }
-    };
+    let retention_secs = retention_on(conn).await;
 
     report.retention_secs = retention_secs;
 
-    // 3. table size estimation
+    // 3. table size estimation (and the storage engine of every table)
 
     if !tables.is_empty() {
-        // Build per-db groups to minimise queries
-        let mut by_db: std::collections::HashMap<&str, Vec<&str>> =
-            std::collections::HashMap::new();
-        for (db, table) in tables {
-            by_db.entry(db.as_ref()).or_default().push(table.as_ref());
+        let total_bytes = size_and_engines(conn, tables, &mut report).await;
+        report.apply_size_estimate(
+            total_bytes,
+            tables.len(),
+            max_parallel_tables,
+        );
+    }
+
+    Ok(report)
+}
+
+/// The server's binlog retention in seconds (MySQL 8.0+:
+/// `binlog_expire_logs_seconds`, 0 = never expire; 5.7: `expire_logs_days`).
+/// `None`: no expiry, or unknown.
+async fn retention_on(conn: &mut mysql_async::Conn) -> Option<u64> {
+    let secs: Option<u64> = conn
+        .query_first("SELECT @@GLOBAL.binlog_expire_logs_seconds")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|mut r: Row| r.take(0));
+
+    if secs == Some(0) {
+        // 0 means "never expire" — no retention concern
+        None
+    } else if let Some(s) = secs.filter(|&s| s > 0) {
+        Some(s)
+    } else {
+        // Fallback for MySQL 5.7
+        conn.query_first("SELECT @@GLOBAL.expire_logs_days")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|mut r: Row| r.take::<u64, _>(0))
+            .filter(|&d| d > 0)
+            .map(|d| d * 86400)
+    }
+}
+
+/// The total size of `tables` (bounded statements, grouped by database),
+/// recording a hard error in `report` for any table whose storage engine
+/// cannot give the snapshot's consistent read (not InnoDB).
+pub(crate) async fn size_and_engines<S: AsRef<str>>(
+    conn: &mut mysql_async::Conn,
+    tables: &[(S, S)],
+    report: &mut PreflightReport,
+) -> u64 {
+    // Build per-db groups to minimise queries
+    let mut by_db: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    for (db, table) in tables {
+        by_db.entry(db.as_ref()).or_default().push(table.as_ref());
+    }
+
+    let mut total_bytes: u64 = 0;
+
+    // Bounded statements: at most 1000 names per `IN (...)` list.
+    let mut batches: Vec<(&str, &[&str])> = Vec::new();
+    for (db, names) in &by_db {
+        for chunk in names.chunks(1_000) {
+            batches.push((db, chunk));
+        }
+    }
+    for (db, tbl_names) in batches {
+        let placeholders = tbl_names
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("'{}'", tbl_names[i]))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let query = format!(
+            "SELECT COALESCE(SUM(data_length + index_length), 0) \
+             FROM information_schema.tables \
+             WHERE table_schema = '{db}' AND table_name IN ({placeholders})"
+        );
+
+        if let Ok(Some(bytes)) = conn.query_first::<u64, _>(query).await {
+            total_bytes += bytes;
         }
 
-        let mut total_bytes: u64 = 0;
-
-        // Bounded statements: at most 1000 names per `IN (...)` list.
-        let mut batches: Vec<(&str, &[&str])> = Vec::new();
-        for (db, names) in &by_db {
-            for chunk in names.chunks(1_000) {
-                batches.push((db, chunk));
-            }
-        }
-        for (db, tbl_names) in batches {
-            let placeholders = tbl_names
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("'{}'", tbl_names[i]))
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            let query = format!(
-                "SELECT COALESCE(SUM(data_length + index_length), 0) \
-                 FROM information_schema.tables \
-                 WHERE table_schema = '{db}' AND table_name IN ({placeholders})"
-            );
-
-            if let Ok(Some(bytes)) = conn.query_first::<u64, _>(query).await {
-                total_bytes += bytes;
-            }
-
-            // Storage-engine check: only InnoDB gives the MVCC consistent read
-            // the snapshot anchor relies on. Fail closed on anything else.
-            let engine_query = format!(
-                "SELECT table_name, engine \
-                 FROM information_schema.tables \
-                 WHERE table_schema = '{db}' AND table_name IN ({placeholders})"
-            );
-            if let Ok(rows) = conn
-                .query::<(String, Option<String>), _>(engine_query)
-                .await
-            {
-                for (tname, engine) in rows {
-                    if let Some(err) =
-                        engine_hard_error(db, &tname, engine.as_deref())
-                    {
-                        report.hard_errors.push(err);
-                    }
+        // Storage-engine check: only InnoDB gives the MVCC consistent read
+        // the snapshot anchor relies on. Fail closed on anything else.
+        let engine_query = format!(
+            "SELECT table_name, engine \
+             FROM information_schema.tables \
+             WHERE table_schema = '{db}' AND table_name IN ({placeholders})"
+        );
+        if let Ok(rows) = conn
+            .query::<(String, Option<String>), _>(engine_query)
+            .await
+        {
+            for (tname, engine) in rows {
+                if let Some(err) =
+                    engine_hard_error(db, &tname, engine.as_deref())
+                {
+                    report.hard_errors.push(err);
                 }
             }
         }
+    }
 
+    total_bytes
+}
+
+impl PreflightReport {
+    /// Record the snapshot's size and duration estimate over `table_count`
+    /// tables of `total_bytes`, and the binlog retention risk it implies.
+    pub(crate) fn apply_size_estimate(
+        &mut self,
+        total_bytes: u64,
+        table_count: usize,
+        max_parallel_tables: usize,
+    ) {
+        let retention_secs = self.retention_secs;
         if total_bytes > 0 {
-            report.estimated_size_bytes = Some(total_bytes);
+            self.estimated_size_bytes = Some(total_bytes);
 
             let effective_parallel =
-                max_parallel_tables.min(tables.len()).max(1) as u64;
+                max_parallel_tables.min(table_count).max(1) as u64;
             let throughput = THROUGHPUT_PER_WORKER_BYTES * effective_parallel;
             let estimated_secs = total_bytes / throughput;
-            report.estimated_duration_secs = Some(estimated_secs);
+            self.estimated_duration_secs = Some(estimated_secs);
 
             // 4. retention risk assessment
 
@@ -320,7 +357,7 @@ async fn run_preflight_on<S: AsRef<str>>(
                 let pct = (estimated_secs * 100) / retention.max(1);
 
                 if pct >= 80 {
-                    report.warnings.push(format!(
+                    self.warnings.push(format!(
                         "HIGH RETENTION RISK: estimated snapshot duration ({}) \
                          is {}% of binlog_expire_logs_seconds ({}). \
                          The captured binlog position may be purged before the snapshot \
@@ -335,7 +372,7 @@ async fn run_preflight_on<S: AsRef<str>>(
                         estimated_secs * 2,
                     ));
                 } else if pct >= 50 {
-                    report.warnings.push(format!(
+                    self.warnings.push(format!(
                         "RETENTION WARNING: estimated snapshot duration ({}) \
                          is {}% of binlog_expire_logs_seconds ({}). \
                          Consider increasing binlog_expire_logs_seconds if tables \
@@ -348,8 +385,6 @@ async fn run_preflight_on<S: AsRef<str>>(
             }
         }
     }
-
-    Ok(report)
 }
 
 /// Verify the captured binlog file is still present.

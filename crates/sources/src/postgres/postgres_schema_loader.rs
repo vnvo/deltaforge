@@ -1000,6 +1000,11 @@ pub(crate) async fn fetch_tables_on(
             JOIN pg_catalog.pg_attribute a
                 ON a.attrelid = cl.oid AND a.attname = c.column_name
                 AND a.attnum > 0 AND NOT a.attisdropped
+            -- Implied by the join; lets the planner reach the view's
+            -- pg_class by its name index instead of scanning the whole
+            -- catalog per call (O(catalog) per table, O(n^2) per snapshot).
+            WHERE c.table_schema = ANY($1::text[])
+                AND c.table_name = ANY($2::text[])
             ORDER BY c.table_schema, c.table_name, c.ordinal_position
             "#,
             &[&names, &rels],

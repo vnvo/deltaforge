@@ -43,6 +43,8 @@ base64.workspace = true
 
 [dev-dependencies]
 gate-ownership = { path = "../gate-ownership" }
+# The real watermark comparator, for the durable HEAD generation start tests.
+sources = { path = "../sources" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 axum = "0.8"
 ctor = "0.6"

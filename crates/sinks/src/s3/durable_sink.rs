@@ -305,6 +305,38 @@ impl Sink for DurableS3Sink {
 
         Ok(BatchResult::ok())
     }
+
+    /// A terminal barrier publishes a zero-object entry with its watermark
+    /// (everything earlier is already behind HEAD); a generation start moves
+    /// HEAD into the generation after the local check
+    /// ([`super::head::DurableWriter::publish_start`]).
+    async fn barrier(
+        &self,
+        kind: &deltaforge_core::BarrierKind,
+        ctx: &SinkBatchContext,
+    ) -> SinkResult<()> {
+        match kind {
+            deltaforge_core::BarrierKind::Terminal => {
+                self.send_batch_with_context(&[], ctx).await.map(|_| ())
+            }
+            deltaforge_core::BarrierKind::GenerationStart(_) => {
+                let watermark = ctx.durable_watermark.as_ref().ok_or_else(|| {
+                    fatal("durable_v2 generation start is missing its watermark")
+                })?;
+                self.inner
+                    .writer
+                    .publish_start(watermark)
+                    .await
+                    .map_err(|e| {
+                        publish_error(
+                            &self.inner.id,
+                            ctx.checkpoint.as_bytes(),
+                            e,
+                        )
+                    })
+            }
+        }
+    }
 }
 
 /// The sink error for a failed publish: an ambiguous HEAD CAS is a
