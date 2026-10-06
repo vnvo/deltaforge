@@ -2832,6 +2832,12 @@ fn merge_values(base: &mut Value, patch: Value) {
     }
 }
 
+/// A minimal pipeline spec for tests outside this module.
+#[cfg(test)]
+pub(crate) fn tests_support_spec(name: &str) -> PipelineSpec {
+    tests::sample_spec(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2934,7 +2940,7 @@ mod tests {
         );
     }
 
-    fn sample_spec(name: &str) -> PipelineSpec {
+    pub(super) fn sample_spec(name: &str) -> PipelineSpec {
         PipelineSpec {
             metadata: Metadata {
                 name: name.to_string(),
@@ -5271,105 +5277,15 @@ mod tests {
     // ── Recovery operations: lock, quiescence, restart ──────────────────
     mod recovery_ops {
         use super::*;
-        use crate::recovery::{
-            OperationContext, Planned, RecoveryOperation, RecoveryService,
-        };
+        use crate::recovery::RecoveryService;
         use rest_api::recovery::{
-            ApplyRequest, Caller, PlanRequest, RecoveryApiError,
-            RecoveryController,
+            ApplyRequest, Caller, PlanRequest, RecoveryController,
         };
         use std::collections::BTreeMap;
-        use storage::adapters::incidents::{IncidentRecord, IncidentStore};
-        use storage::adapters::recovery::{
-            CanonicalPlan, PlanStep, RecordState, RecoveryStore, StepExecutor,
-            digest_bytes,
-        };
+        use storage::adapters::incidents::IncidentStore;
+        use storage::adapters::recovery::{RecordState, RecoveryStore};
 
-        const NS: &str = "test_op";
-
-        /// Writes `done` to one slot; its write waits for `gate` permits.
-        struct TestOp {
-            gate: Arc<tokio::sync::Semaphore>,
-            entered: Arc<tokio::sync::Notify>,
-        }
-
-        struct Exec {
-            backend: ArcStorageBackend,
-            pipeline: String,
-            gate: Arc<tokio::sync::Semaphore>,
-            entered: Arc<tokio::sync::Notify>,
-        }
-
-        async fn state(b: &ArcStorageBackend, p: &str) -> String {
-            match b.slot_get(NS, p).await.unwrap() {
-                Some((_, v)) => digest_bytes(&v),
-                None => "absent".into(),
-            }
-        }
-
-        #[async_trait]
-        impl StepExecutor for Exec {
-            async fn observe(&self, _s: &PlanStep) -> anyhow::Result<String> {
-                Ok(state(&self.backend, &self.pipeline).await)
-            }
-            async fn perform(
-                &self,
-                _s: &PlanStep,
-            ) -> anyhow::Result<BTreeMap<String, String>> {
-                self.entered.notify_one();
-                self.gate.acquire().await.unwrap().forget();
-                self.backend
-                    .slot_upsert(NS, &self.pipeline, b"done")
-                    .await?;
-                Ok(BTreeMap::from([("written".into(), "done".into())]))
-            }
-        }
-
-        #[async_trait]
-        impl RecoveryOperation for TestOp {
-            fn name(&self) -> &'static str {
-                "test-op"
-            }
-            fn applies_to(&self, _i: &IncidentRecord) -> bool {
-                false
-            }
-            async fn plan(
-                &self,
-                ctx: &OperationContext,
-            ) -> Result<Planned, RecoveryApiError> {
-                let cur = state(&ctx.backend, &ctx.pipeline).await;
-                let steps = vec![PlanStep {
-                    name: "write".into(),
-                    pre: cur,
-                    post: digest_bytes(b"done"),
-                    detail: BTreeMap::new(),
-                }];
-                Ok(Planned {
-                    plan: CanonicalPlan::new(
-                        "test-op",
-                        &ctx.pipeline,
-                        ctx.source_id(),
-                        ctx.base_bindings().await?,
-                        steps,
-                        vec![],
-                    ),
-                    resolves: vec![],
-                    observed: BTreeMap::new(),
-                })
-            }
-            async fn executor(
-                &self,
-                ctx: &OperationContext,
-                _plan: &CanonicalPlan,
-            ) -> Result<Box<dyn StepExecutor>, RecoveryApiError> {
-                Ok(Box::new(Exec {
-                    backend: ctx.backend.clone(),
-                    pipeline: ctx.pipeline.clone(),
-                    gate: Arc::clone(&self.gate),
-                    entered: Arc::clone(&self.entered),
-                }))
-            }
-        }
+        use crate::recovery::test_support::{NS, TestOp};
 
         struct Fixture {
             manager: Arc<PipelineManager>,
@@ -5392,10 +5308,10 @@ mod tests {
             let entered = Arc::new(tokio::sync::Notify::new());
             let service = Arc::new(
                 RecoveryService::new(Arc::clone(&manager)).with_operation(
-                    Arc::new(TestOp {
-                        gate: Arc::clone(&gate),
-                        entered: Arc::clone(&entered),
-                    }),
+                    Arc::new(TestOp::new(
+                        Arc::clone(&gate),
+                        Arc::clone(&entered),
+                    )),
                 ),
             );
             Fixture {

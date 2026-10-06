@@ -4,6 +4,7 @@ pub mod drift_detector;
 pub mod incidents;
 pub mod pipeline_manager;
 pub mod preflight;
+pub mod recover_cli;
 pub mod recovery;
 pub mod replay_controller;
 pub mod replay_gate;

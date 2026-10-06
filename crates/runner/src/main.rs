@@ -129,6 +129,67 @@ enum Command {
         #[command(subcommand)]
         action: GateAction,
     },
+    /// Diagnose, plan and apply recovery operations through the running
+    /// server's loopback admin listener (see "Recovery Operations").
+    ///
+    /// Exit codes: 0 ok; 2 invalid input or authentication; 3 proof
+    /// mismatch; 4 pipeline state; 5 recovery pending, diverged or stopped;
+    /// 6 transport or server failure (outcome may be unknown).
+    Recover {
+        /// The admin listener (loopback http only).
+        #[arg(long, default_value = "http://127.0.0.1:9091")]
+        admin_url: String,
+        /// File holding the admin token (mode 600). The token is never
+        /// accepted on the command line.
+        #[arg(long)]
+        admin_token_file: std::path::PathBuf,
+        /// Emit the server's JSON instead of text.
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        action: RecoverAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum RecoverAction {
+    /// Read-only: state, recovery operation, incidents, next safe action.
+    Diagnose {
+        /// The pipeline.
+        pipeline: String,
+    },
+    /// Read-only: the canonical plan of an operation, ending with its proof.
+    Plan {
+        /// The operation (for example `resnapshot`).
+        operation: String,
+        #[arg(long)]
+        pipeline: String,
+        /// The incident the operation answers.
+        #[arg(long)]
+        incident: Option<String>,
+        /// Operation arguments, `key=value`.
+        #[arg(long = "arg")]
+        args: Vec<String>,
+    },
+    /// Apply exactly the reviewed plan. Never retried automatically.
+    Apply {
+        operation: String,
+        #[arg(long)]
+        pipeline: String,
+        #[arg(long)]
+        incident: Option<String>,
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        /// The proof printed by `recover plan`.
+        #[arg(long)]
+        expect_proof: String,
+        /// Who applies it (recorded, not verified).
+        #[arg(long)]
+        actor: String,
+        /// Why (recorded in the audit).
+        #[arg(long)]
+        reason: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -157,6 +218,64 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!(e))?;
 
     // One-shot subcommands run before server/observability boot (no port binds).
+    if let Some(Command::Recover {
+        admin_url,
+        admin_token_file,
+        json,
+        action,
+    }) = &args.command
+    {
+        use runner::recover_cli::{Action, Client, run};
+        let client = match Client::new(admin_url, admin_token_file) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{}", e.message);
+                std::process::exit(e.code);
+            }
+        };
+        let action = match action.clone() {
+            RecoverAction::Diagnose { pipeline } => {
+                Action::Diagnose { pipeline }
+            }
+            RecoverAction::Plan {
+                operation,
+                pipeline,
+                incident,
+                args,
+            } => Action::Plan {
+                operation,
+                pipeline,
+                incident,
+                args,
+            },
+            RecoverAction::Apply {
+                operation,
+                pipeline,
+                incident,
+                args,
+                expect_proof,
+                actor,
+                reason,
+            } => Action::Apply {
+                operation,
+                pipeline,
+                incident,
+                args,
+                expect_proof,
+                actor,
+                reason,
+            },
+        };
+        let code = run(
+            &client,
+            action,
+            *json,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        )
+        .await;
+        std::process::exit(code);
+    }
     if let Some(Command::Preflight { config, json }) = &args.command {
         // Use the deployment's own storage backend so slot-ownership checks see
         // the same durable owner records startup uses.

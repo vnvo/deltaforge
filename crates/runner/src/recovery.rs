@@ -603,6 +603,19 @@ impl RecoveryController for RecoveryService {
                 }
                 (v, rec)
             }
+            // The operation of this proof already completed (an abandoned
+            // or timed-out request): nothing to do, nothing written.
+            Some((_, rec))
+                if rec.state == RecordState::Completed
+                    && rec.proof == req.expect_proof =>
+            {
+                return Ok(json!({
+                    "state": "completed",
+                    "proof": rec.proof,
+                    "outcomes": rec.outcomes,
+                    "already_completed": true,
+                }));
+            }
             _ => {
                 // 3. Recompute and verify the proof under the lock.
                 let planned = op.plan(&ctx).await?;
@@ -696,6 +709,15 @@ impl RecoveryController for RecoveryService {
 pub fn load_admin_token(
     path: &std::path::Path,
 ) -> anyhow::Result<rest_api::recovery::AdminToken> {
+    let token = read_admin_token(path)?;
+    rest_api::recovery::AdminToken::new(&token).map_err(|e| {
+        anyhow::anyhow!("admin token file {}: {e}", path.display())
+    })
+}
+
+/// The validated token text of the file at `path` (the checks of
+/// [`load_admin_token`]); the CLI sends it, the server only hashes it.
+pub fn read_admin_token(path: &std::path::Path) -> anyhow::Result<String> {
     use anyhow::{Context, bail};
     use std::io::Read;
     let shown = path.display();
@@ -737,7 +759,8 @@ pub fn load_admin_token(
     })?;
     let token = text.strip_suffix('\n').unwrap_or(&text);
     rest_api::recovery::AdminToken::new(token)
-        .map_err(|e| anyhow::anyhow!("admin token file {shown}: {e}"))
+        .map_err(|e| anyhow::anyhow!("admin token file {shown}: {e}"))?;
+    Ok(token.to_string())
 }
 
 /// The admin listener address: loopback only in this release (no TLS).
@@ -756,6 +779,120 @@ pub fn admin_addr(value: &str) -> anyhow::Result<std::net::SocketAddr> {
         );
     }
     Ok(addr)
+}
+
+/// A controllable operation for tests: it writes `done` to one slot of
+/// [`test_support::NS`]; its write waits for `gate` permits and can fail
+/// once.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use storage::adapters::recovery::PlanStep;
+
+    pub(crate) const NS: &str = "test_op";
+
+    pub(crate) struct TestOp {
+        gate: Arc<tokio::sync::Semaphore>,
+        entered: Arc<tokio::sync::Notify>,
+        pub(crate) fail_once: Arc<AtomicBool>,
+    }
+
+    impl TestOp {
+        pub(crate) fn new(
+            gate: Arc<tokio::sync::Semaphore>,
+            entered: Arc<tokio::sync::Notify>,
+        ) -> Self {
+            Self {
+                gate,
+                entered,
+                fail_once: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    struct Exec {
+        backend: ArcStorageBackend,
+        pipeline: String,
+        gate: Arc<tokio::sync::Semaphore>,
+        entered: Arc<tokio::sync::Notify>,
+        fail_once: Arc<AtomicBool>,
+    }
+
+    pub(crate) async fn state(b: &ArcStorageBackend, p: &str) -> String {
+        match b.slot_get(NS, p).await.unwrap() {
+            Some((_, v)) => digest_bytes(&v),
+            None => "absent".into(),
+        }
+    }
+
+    #[async_trait]
+    impl StepExecutor for Exec {
+        async fn observe(&self, _s: &PlanStep) -> anyhow::Result<String> {
+            Ok(state(&self.backend, &self.pipeline).await)
+        }
+        async fn perform(
+            &self,
+            _s: &PlanStep,
+        ) -> anyhow::Result<BTreeMap<String, String>> {
+            self.entered.notify_one();
+            self.gate.acquire().await.unwrap().forget();
+            if self.fail_once.swap(false, Ordering::SeqCst) {
+                anyhow::bail!("injected failure");
+            }
+            self.backend
+                .slot_upsert(NS, &self.pipeline, b"done")
+                .await?;
+            Ok(BTreeMap::from([("written".into(), "done".into())]))
+        }
+    }
+
+    #[async_trait]
+    impl RecoveryOperation for TestOp {
+        fn name(&self) -> &'static str {
+            "test-op"
+        }
+        fn applies_to(&self, _i: &IncidentRecord) -> bool {
+            false
+        }
+        async fn plan(
+            &self,
+            ctx: &OperationContext,
+        ) -> Result<Planned, RecoveryApiError> {
+            let cur = state(&ctx.backend, &ctx.pipeline).await;
+            let steps = vec![PlanStep {
+                name: "write".into(),
+                pre: cur,
+                post: digest_bytes(b"done"),
+                detail: BTreeMap::new(),
+            }];
+            Ok(Planned {
+                plan: CanonicalPlan::new(
+                    "test-op",
+                    &ctx.pipeline,
+                    ctx.source_id(),
+                    ctx.base_bindings().await?,
+                    steps,
+                    vec!["the test slot is written".into()],
+                ),
+                resolves: vec![],
+                observed: BTreeMap::from([("now".into(), "volatile".into())]),
+            })
+        }
+        async fn executor(
+            &self,
+            ctx: &OperationContext,
+            _plan: &CanonicalPlan,
+        ) -> Result<Box<dyn StepExecutor>, RecoveryApiError> {
+            Ok(Box::new(Exec {
+                backend: ctx.backend.clone(),
+                pipeline: ctx.pipeline.clone(),
+                gate: Arc::clone(&self.gate),
+                entered: Arc::clone(&self.entered),
+                fail_once: Arc::clone(&self.fail_once),
+            }))
+        }
+    }
 }
 
 #[cfg(test)]
