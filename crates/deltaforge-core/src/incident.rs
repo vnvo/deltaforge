@@ -208,6 +208,9 @@ pub enum ActionCode {
     VerifySinkState,
     InspectLogs,
     EnableFailoverSlot,
+    /// Adopt the server's current timeline for checkpoints written before
+    /// continuity was recorded (recovery operation `pg-adopt-timeline`).
+    AdoptTimeline,
     /// Give a sink a fresh baseline (a re-snapshot reaching it, or a
     /// re-bootstrap from another sink).
     RebootstrapSink,

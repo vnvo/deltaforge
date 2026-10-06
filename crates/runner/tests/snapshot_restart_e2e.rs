@@ -1181,6 +1181,9 @@ async fn pg_admin(port: u16) -> tokio_postgres::Client {
 fn recovery(mgr: &Arc<PipelineManager>) -> runner::recovery::RecoveryService {
     runner::recovery::RecoveryService::new(Arc::clone(mgr))
         .with_operation(Arc::new(runner::recovery_resnapshot::Resnapshot))
+        .with_operation(Arc::new(
+            runner::recovery_adopt_timeline::AdoptTimeline::default(),
+        ))
 }
 
 fn plan_req(incident: Option<String>) -> rest_api::recovery::PlanRequest {
@@ -1698,5 +1701,392 @@ async fn postgres_a_lost_slot_is_never_recreated_implicitly() -> Result<()> {
     backend
         .kv_put("checkpoints", "slot_owner:pg-src", &owner)
         .await?;
+    Ok(())
+}
+
+/// `pg-adopt-timeline` through the recovery service: for a
+/// `timeline_unrecorded` incident over checkpoints without a continuity
+/// stamp, apply creates the record at transition 0 at F with the plan's
+/// seeded chain, moves no checkpoint and resolves the incident; the same
+/// proof again is a no-op; the explicit resume stamps the checkpoints with
+/// that chain and streams.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn postgres_adopt_timeline_through_the_recovery_service() -> Result<()> {
+    use deltaforge_core::incident::{
+        ActionCode, CauseCode, Component, EvidenceKey, IncidentDraft,
+        ReasonCode, Retryability, SafetyState,
+    };
+    use rest_api::recovery::{
+        ApplyRequest, Caller, PlanRequest, RecoveryController,
+    };
+    trace();
+    let (_pg, port) = start_postgres().await;
+    let (_dir, backend) = sqlite();
+    let hook = Hook::start().await;
+    let mgr = Arc::new(manager_over(backend.clone()).await);
+    let sinks = hooks_yaml(&[("hook", &hook.url, true)]);
+    mgr.start_pipeline(pg_spec_with("pgadopt", port, "", &sinks, ""))
+        .await?;
+    every_row_arrives(&mgr, "pgadopt", &hook).await;
+    until_control(&backend, "pg-src", completed).await;
+    PipelineController::stop(mgr.as_ref(), "pgadopt").await?;
+    until_status(&mgr, "pgadopt", "stopped").await;
+    // Its tasks joined: nothing commits a checkpoint any more.
+    {
+        use rest_api::recovery::RecoveryController;
+        let svc = recovery(&mgr);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while svc.diagnose("pgadopt").await.unwrap()["quiescent"] != true {
+            assert!(Instant::now() < deadline, "the pipeline never stopped");
+            sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    // As an earlier release left it: no continuity record, unstamped
+    // checkpoints, a timeline_unrecorded incident.
+    backend
+        .kv_delete("failover", "pg_continuity:pg-src")
+        .await?;
+    let mut lsns = Vec::new();
+    for (key, bytes) in sink_checkpoints(&backend, "pg-src").await {
+        let mut cp: Value = serde_json::from_slice(&bytes)?;
+        for k in ["timeline", "chain", "transition"] {
+            cp.as_object_mut().unwrap().remove(k);
+        }
+        lsns.push(cp["lsn"].as_str().unwrap().to_string());
+        backend
+            .kv_put("checkpoints", &key, &serde_json::to_vec(&cp)?)
+            .await?;
+    }
+    let before = sink_checkpoints(&backend, "pg-src").await;
+    let incidents = storage::adapters::incidents::IncidentStore::new(
+        backend.clone(),
+        "pgadopt",
+    );
+    let id = incidents
+        .raise(
+            &IncidentDraft::new(
+                ReasonCode::PgContinuityUnproven,
+                Component::Source {
+                    id: "pg-src".into(),
+                },
+                Retryability::OperatorAction,
+                SafetyState::HaltedSafe,
+                CauseCode::SourceLineage,
+            )
+            .discriminate("class", "timeline_unrecorded")
+            .with_evidence(|e| {
+                e.text(EvidenceKey::ReasonClass, "timeline_unrecorded");
+            })
+            .with_actions(&[ActionCode::AdoptTimeline]),
+            1,
+        )
+        .await?
+        .record()
+        .incident_id
+        .clone();
+
+    let svc = recovery(&mgr);
+    let req = || PlanRequest {
+        operation: "pg-adopt-timeline".into(),
+        incident: Some(id.0.clone()),
+        args: Default::default(),
+    };
+    let diag = svc.diagnose("pgadopt").await.unwrap();
+    assert!(diag.to_string().contains("pg-adopt-timeline"), "{diag}");
+    // Settle until the stopped source released its slot.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let planned = loop {
+        match svc.plan("pgadopt", req()).await {
+            Ok(p) => break p,
+            Err(e)
+                if e.code == "precondition_failed"
+                    && Instant::now() < deadline =>
+            {
+                sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    };
+    let step = &planned["plan"]["steps"][0];
+    assert_eq!(step["name"], "create_continuity_record");
+    let chain = step["detail"]["chain_id"].as_str().unwrap().to_string();
+    assert_eq!(chain.len(), 32);
+    let f = lsns.iter().min_by_key(|l| sources_lsn(l)).unwrap().clone();
+    assert_eq!(planned["plan"]["bindings"]["f"], f.as_str());
+    // Recomputing yields the same chain and proof.
+    assert_eq!(
+        svc.plan("pgadopt", req()).await.unwrap()["proof"],
+        planned["proof"]
+    );
+    let apply = || ApplyRequest {
+        plan: req(),
+        expect_proof: planned["proof"].as_str().unwrap().into(),
+        actor: "alice".into(),
+        reason: "upgrade adoption".into(),
+    };
+    let caller = || Caller {
+        origin: "127.0.0.1:1".into(),
+        credential: "token",
+    };
+    let done = svc.apply("pgadopt", apply(), caller()).await.unwrap();
+    assert_eq!(done["state"], "completed");
+    let rec: Value = serde_json::from_slice(
+        &backend
+            .kv_get("failover", "pg_continuity:pg-src")
+            .await?
+            .unwrap(),
+    )?;
+    assert_eq!(rec["chain_id"], chain.as_str());
+    assert_eq!(rec["transition_id"], 0);
+    assert_eq!(rec["proven_at"], f.as_str());
+    assert_eq!(
+        sink_checkpoints(&backend, "pg-src").await,
+        before,
+        "nothing moved"
+    );
+    assert!(incidents.get(&id).await?.unwrap().status.is_resolved());
+    let again = svc.apply("pgadopt", apply(), caller()).await.unwrap();
+    assert_eq!(again["already_completed"], true);
+
+    // The explicit resume: proven against the record, stamped, streaming.
+    mgr.resume("pgadopt").await.unwrap();
+    pg_insert(port, ROWS + 1).await;
+    hook.until_accepted(ROWS + 1).await;
+    for (key, bytes) in sink_checkpoints(&backend, "pg-src").await {
+        let cp: Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(cp["chain"], chain.as_str(), "{key}");
+        assert_eq!(cp["transition"], 0, "{key}");
+    }
+    Ok(())
+}
+
+/// An LSN's numeric order.
+fn sources_lsn(l: &str) -> u64 {
+    let (hi, lo) = l.split_once('/').unwrap();
+    (u64::from_str_radix(hi, 16).unwrap() << 32)
+        | u64::from_str_radix(lo, 16).unwrap()
+}
+
+/// A stopped PostgreSQL pipeline as an earlier release left it for
+/// `pg-adopt-timeline`: no continuity record, unstamped checkpoints, a
+/// `timeline_unrecorded` incident (whose id is returned).
+async fn adoption_ready(
+    mgr: &Arc<PipelineManager>,
+    backend: &ArcStorageBackend,
+    name: &str,
+) -> deltaforge_core::incident::IncidentId {
+    use deltaforge_core::incident::{
+        ActionCode, CauseCode, Component, EvidenceKey, IncidentDraft,
+        ReasonCode, Retryability, SafetyState,
+    };
+    use rest_api::recovery::RecoveryController;
+    PipelineController::stop(mgr.as_ref(), name).await.unwrap();
+    until_status(mgr, name, "stopped").await;
+    let svc = recovery(mgr);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while svc.diagnose(name).await.unwrap()["quiescent"] != true {
+        assert!(Instant::now() < deadline, "the pipeline never stopped");
+        sleep(Duration::from_millis(200)).await;
+    }
+    backend
+        .kv_delete("failover", "pg_continuity:pg-src")
+        .await
+        .unwrap();
+    for (key, bytes) in sink_checkpoints(backend, "pg-src").await {
+        let mut cp: Value = serde_json::from_slice(&bytes).unwrap();
+        for k in ["timeline", "chain", "transition"] {
+            cp.as_object_mut().unwrap().remove(k);
+        }
+        backend
+            .kv_put("checkpoints", &key, &serde_json::to_vec(&cp).unwrap())
+            .await
+            .unwrap();
+    }
+    storage::adapters::incidents::IncidentStore::new(backend.clone(), name)
+        .raise(
+            &IncidentDraft::new(
+                ReasonCode::PgContinuityUnproven,
+                Component::Source {
+                    id: "pg-src".into(),
+                },
+                Retryability::OperatorAction,
+                SafetyState::HaltedSafe,
+                CauseCode::SourceLineage,
+            )
+            .discriminate("class", "timeline_unrecorded")
+            .with_evidence(|e| {
+                e.text(EvidenceKey::ReasonClass, "timeline_unrecorded");
+            })
+            .with_actions(&[ActionCode::AdoptTimeline]),
+            1,
+        )
+        .await
+        .unwrap()
+        .record()
+        .incident_id
+        .clone()
+}
+
+/// A proof-bound server fact (the timeline) that changes after the plan
+/// is never adopted: changed before the apply's recomputation, the proof
+/// no longer matches; changed only for the executor's own observation
+/// (after the proof matched), the apply stops. Either way no continuity
+/// record, no checkpoint or incident change, and replanning shows another
+/// proof; the stopped operation then finishes with its own proof once the
+/// facts are honest again.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn postgres_adopt_timeline_refuses_a_fact_changed_after_the_plan()
+-> Result<()> {
+    use rest_api::recovery::{
+        ApplyRequest, Caller, PlanRequest, RecoveryController,
+    };
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    trace();
+    let (_pg, port) = start_postgres().await;
+    let (_dir, backend) = sqlite();
+    let hook = Hook::start().await;
+    let mgr = Arc::new(manager_over(backend.clone()).await);
+    let sinks = hooks_yaml(&[("hook", &hook.url, true)]);
+    mgr.start_pipeline(pg_spec_with("pgfacts", port, "", &sinks, ""))
+        .await?;
+    every_row_arrives(&mgr, "pgfacts", &hook).await;
+    until_control(&backend, "pg-src", completed).await;
+    let id = adoption_ready(&mgr, &backend, "pgfacts").await;
+
+    // 0: honest; 1: every observation shows another timeline; 2: only
+    // observations after the first one since the switch.
+    let mode = Arc::new(AtomicU8::new(0));
+    let seen = Arc::new(AtomicUsize::new(0));
+    let facts_hook: sources::postgres::postgres_adoption::FactsHook = {
+        let (mode, seen) = (Arc::clone(&mode), Arc::clone(&seen));
+        Arc::new(move |f| {
+            let n = seen.fetch_add(1, Ordering::SeqCst);
+            match mode.load(Ordering::SeqCst) {
+                1 => f.timeline += 1,
+                2 if n >= 1 => f.timeline += 1,
+                _ => {}
+            }
+        })
+    };
+    let svc = runner::recovery::RecoveryService::new(Arc::clone(&mgr))
+        .with_operation(Arc::new(
+        runner::recovery_adopt_timeline::AdoptTimeline::with_session_facts_hook(
+            facts_hook,
+        ),
+    ));
+    let req = || PlanRequest {
+        operation: "pg-adopt-timeline".into(),
+        incident: Some(id.0.clone()),
+        args: Default::default(),
+    };
+    let apply = |proof: &str| ApplyRequest {
+        plan: req(),
+        expect_proof: proof.into(),
+        actor: "alice".into(),
+        reason: "adopt".into(),
+    };
+    let caller = || Caller {
+        origin: "127.0.0.1:1".into(),
+        credential: "token",
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let planned = loop {
+        match svc.plan("pgfacts", req()).await {
+            Ok(p) => break p,
+            Err(e)
+                if e.code == "precondition_failed"
+                    && Instant::now() < deadline =>
+            {
+                sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    };
+    let proof = planned["proof"].as_str().unwrap().to_string();
+    let incidents = storage::adapters::incidents::IncidentStore::new(
+        backend.clone(),
+        "pgfacts",
+    );
+    let incident_before = incidents.get(&id).await?.unwrap();
+    let checkpoints_before = sink_checkpoints(&backend, "pg-src").await;
+    let unchanged = |what: &'static str| {
+        let (backend, incidents, id) = (&backend, &incidents, &id);
+        let (inc, cps) = (&incident_before, &checkpoints_before);
+        async move {
+            assert!(
+                backend
+                    .kv_get("failover", "pg_continuity:pg-src")
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{what}: no continuity record"
+            );
+            assert_eq!(
+                &sink_checkpoints(backend, "pg-src").await,
+                cps,
+                "{what}"
+            );
+            assert_eq!(
+                &incidents.get(id).await.unwrap().unwrap(),
+                inc,
+                "{what}"
+            );
+        }
+    };
+
+    // Changed before the recomputation: the proof no longer matches.
+    mode.store(1, Ordering::SeqCst);
+    let e = svc
+        .apply("pgfacts", apply(&proof), caller())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "proof_mismatch", "{e:?}");
+    unchanged("proof mismatch").await;
+    let replanned = svc.plan("pgfacts", req()).await.unwrap();
+    assert_ne!(replanned["proof"], planned["proof"]);
+    assert!(
+        storage::adapters::recovery::RecoveryStore::new(
+            backend.clone(),
+            "pgfacts"
+        )
+        .read()
+        .await?
+        .is_none(),
+        "nothing claimed"
+    );
+
+    // Changed only for the executor's observation: the apply stops.
+    seen.store(0, Ordering::SeqCst);
+    mode.store(2, Ordering::SeqCst);
+    let e = svc
+        .apply("pgfacts", apply(&proof), caller())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "apply_stopped", "{e:?}");
+    unchanged("divergence at apply").await;
+    mode.store(1, Ordering::SeqCst);
+    assert_ne!(
+        svc.plan("pgfacts", req()).await.unwrap()["proof"],
+        planned["proof"]
+    );
+
+    // Honest again: the pending operation finishes with its own proof.
+    mode.store(0, Ordering::SeqCst);
+    let done = svc.apply("pgfacts", apply(&proof), caller()).await.unwrap();
+    assert_eq!(done["state"], "completed");
+    let rec: Value = serde_json::from_slice(
+        &backend
+            .kv_get("failover", "pg_continuity:pg-src")
+            .await?
+            .unwrap(),
+    )?;
+    assert_eq!(rec["transition_id"], 0);
+    assert_eq!(
+        sink_checkpoints(&backend, "pg-src").await,
+        checkpoints_before
+    );
     Ok(())
 }

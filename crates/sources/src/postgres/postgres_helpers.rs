@@ -738,7 +738,7 @@ fn session_error(slot: &str, e: PgWireError) -> SourceError {
 /// Read what the gated replication session shows before START_REPLICATION:
 /// IDENTIFY_SYSTEM, then the database OID, server version, recovery state and
 /// slot row in one query on the same session.
-async fn read_session_facts(
+pub(super) async fn read_session_facts(
     client: &mut ReplicationClient,
     slot: &str,
 ) -> Result<SessionFacts, PgWireError> {
@@ -912,7 +912,7 @@ fn is_retryable_source_error(e: &SourceError) -> bool {
 }
 
 /// Connect to PostgreSQL replication with timeout.
-async fn connect_replication(
+pub(super) async fn connect_replication(
     source_id: &str,
     config: ReplicationConfig,
 ) -> SourceResult<ReplicationClient> {

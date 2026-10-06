@@ -532,6 +532,9 @@ async fn serve(
                     runner::recovery::RecoveryService::new(manager.clone())
                         .with_operation(Arc::new(
                             runner::recovery_resnapshot::Resnapshot,
+                        ))
+                        .with_operation(Arc::new(
+                            runner::recovery_adopt_timeline::AdoptTimeline::default(),
                         )),
                 ),
                 token,

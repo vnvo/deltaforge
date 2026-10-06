@@ -334,7 +334,8 @@ fn classify(status: StatusCode, v: &Value) -> CliError {
         "pipeline_not_quiescent"
         | "pipeline_deleting"
         | "recovery_in_progress"
-        | "incident_resolved" => exit::PIPELINE_STATE,
+        | "incident_resolved"
+        | "precondition_failed" => exit::PIPELINE_STATE,
         "recovery_pending" | "recovery_diverged" | "apply_stopped"
         | "state_unreadable" | "manual_repair" => exit::RECOVERY,
         _ if status.is_server_error() => exit::TRANSPORT,

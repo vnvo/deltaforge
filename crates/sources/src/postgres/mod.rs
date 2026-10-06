@@ -42,6 +42,7 @@ use postgres_helpers::{
     ensure_slot_and_publication, prepare_replication_client,
 };
 
+pub mod postgres_adoption;
 pub mod postgres_slot_owner;
 
 pub mod postgres_rotation;
@@ -2940,6 +2941,12 @@ pub(super) fn continuity_unproven_draft(
         // A recovery operation may later prove a route; for now inspect and
         // re-snapshot.
         &[ActionCode::InspectLogs, ActionCode::Resnapshot]
+    } else if class == "timeline_unrecorded" {
+        &[
+            ActionCode::AdoptTimeline,
+            ActionCode::Resnapshot,
+            ActionCode::UseNewSourceId,
+        ]
     } else if lost {
         &[ActionCode::Resnapshot, ActionCode::UseNewSourceId]
     } else {
