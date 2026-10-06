@@ -1,6 +1,6 @@
-# Recovery Operations - Design (revision 1)
+# Recovery Operations - Design (revision 2)
 
-**Status:** DRAFT for review. Design only.
+**Status:** Directionally approved (2026-10-06); revision 2 applies the reviewer's four decisions and required corrections.
 **Date:** 2026-10-06
 **Scope:** rc.1 item `recovery-cli`, after the durable snapshot queue (#132, merged as 2401edd). Operations for rc.1: `resnapshot` and `pg-adopt-timeline`. Deferred: `pg-enable-failover-slot` apply, `kafka-replay-from-checkpoint` (I1d), `new-source-id` (a configuration change: never applied).
 
@@ -39,20 +39,29 @@
 
 The CLI takes `--admin-url` (default `http://127.0.0.1:9091`) and `--admin-token-file`.
 
-### 2.2 Admin listener and credential
+### 2.2 Admin listener and credential (decision 1)
 
-- A **separate listener**, `--admin-addr`, default **`127.0.0.1:9091`** (loopback). It serves only `/recovery/...`; the public API is unchanged.
-- `--admin-token-file`: when set, every admin request needs `Authorization: Bearer <token>` (constant-time compare). The file is read at startup; its content is never logged.
-- **Startup refuses a non-loopback `--admin-addr` without a token file.** A loopback address without a token is allowed (local admin interface).
-- The audit records the asserted actor, `actor_verified: false` (a token proves possession, not identity), the credential kind (`loopback` or `token`) and the peer address.
+- A **separate listener**, `--admin-addr`, default **`127.0.0.1:9091`**, serving only `/recovery/...`. The public API is unchanged and has no recovery route.
+- **Loopback only in rc.1.** Startup refuses a non-loopback `--admin-addr` (TLS for the admin listener is not in rc.1; a bearer token over plain HTTP off the host is insufficient). Remote administration uses an SSH tunnel to the loopback port.
+- **A token is always required**, loopback included: `--admin-token-file` is mandatory whenever recovery is enabled; without it the admin listener does not start and `deltaforge recover` explains how to configure it.
+  - The file must be a regular file owned by the server's user, not readable or writable by group or others (mode `0600` or `0400`); otherwise startup refuses.
+  - The token is the file's content with one trailing newline removed; an empty token, or one shorter than 32 bytes, is refused.
+  - Requests carry `Authorization: Bearer <token>`; comparison is constant-time; a missing, empty or wrong credential is `401` with no detail.
+  - The token is never logged, echoed, stored in the recovery record or included in errors.
+- The audit records the asserted actor, `actor_verified: false` (a token proves possession, not identity), `credential: "token"` and the peer address.
 
-### 2.3 Preconditions on the pipeline
+### 2.3 Apply sequence and preconditions
 
-A plan may be computed in any state (it reads). **Apply requires the pipeline to be quiescent**:
-- status `Stopped`, or failed with its source and coordinator tasks joined;
-- no recovery of another operation in progress (section 3).
+A plan may be computed in any state (it only reads). **Apply runs strictly in this order:**
 
-While an apply runs, the manager holds a per-pipeline recovery lock: `resume`, `start`, config `patch` and `delete` are refused with `409 recovery_in_progress`. A pipeline whose durable recovery record is not finished **does not start** (at server start or on resume): it reports `recovery_pending` in status and readiness, naming the operation and proof.
+1. **Acquire the per-pipeline recovery lock** in the manager. While held, `resume`, `start`, configuration `patch` and `delete` are refused with `409 recovery_in_progress`.
+2. **Confirm quiescence:** status `Stopped`, or failed, with the source and coordinator tasks joined (awaited, not only cancelled).
+3. **Read the recovery record** (section 3). If an operation is pending, this is a resume (section 3.2); otherwise:
+4. **Recompute the plan and verify the proof** while holding the lock; any difference refuses with the new proof shown.
+5. **Claim the recovery slot** (create, or CAS from `completed`).
+6. **Only then mutate state**, step by step.
+
+The lock is released after completion or failure. **A pipeline whose recovery record is not `completed` never starts:** at server start and on resume it stays stopped and reports `recovery_pending` (operation, proof, current step) in status and readiness. Server startup never mutates recovery state (decision 3).
 
 ## 3. Durable recovery record
 
@@ -66,46 +75,73 @@ Slot namespace `recovery`, key `segment(pipeline)` (the incidents escaping).
   "source": "orders-pg",
   "proof": "<sha256 hex>",
   "plan": { "...canonical plan, section 4..." },
-  "actor": "alice", "actor_verified": false, "credential": "loopback", "origin": "127.0.0.1:53122",
+  "actor": "alice", "actor_verified": false, "credential": "token", "origin": "127.0.0.1:53122",
   "reason": "binlog purged during snapshot; recopy approved",
   "started_at_ms": 0,
   "step": 2,
+  "verified": [{ "step": 1, "observed": "post", "digest": "<sha256 of the observed state>" }],
+  "outcomes": { "slot": "dropped_owned_slot" },
+  "pending_audit": null,
   "state": "applying"
 }
 ```
 
-- **Claim:** `slot_create` when absent, or `slot_cas` from a record in state `completed` (the previous operation's record is kept until replaced: it is the last-operation view of `diagnose`). A record in state `applying` blocks any other claim.
-- **Advance:** each step's effect is written first; then `step` is advanced by CAS. Every step is idempotent and verifies its own effect before skipping, so a crash between the two re-runs the step harmlessly.
-- **Complete:** after the last step, the incidents named by the plan are resolved (section 6), and the record moves to `completed` by CAS.
-- **Resume after a crash:** the pipeline stays stopped (`recovery_pending`). `recover apply` with the **same proof** continues from `step`, using the plan stored in the record (the live state has moved by the operation's own earlier steps, so it is not recomputed); a different proof is refused. There is no abandonment: an unfinished operation is completed, as with schema-migrate.
+### 3.1 Claim, steps and completion
+
+- **Claim:** `slot_create` when absent, or `slot_cas` from a record in state `completed` (the last completed record is kept until replaced; diagnose shows it). A record in state `applying` refuses any other claim.
+- **Steps:** each step declares its exact **pre-state** and **post-state**. Before acting, the step reads the live state:
+  - exactly the pre-state: perform the write (CAS or create-if-absent), then verify the post-state;
+  - exactly the post-state: already done, skip;
+  - anything else: stop (`recovery_state_diverged`), leaving the record at that step for diagnosis; no further write.
+
+  After the post-state is verified, the record's `step` and `verified` entry advance by CAS.
+- **Completion** (the audit ordering): the `RecoveryApplied` transition and every incident resolution named by the plan are written through the incidents' crash-safe `pending_audit` path; the record's `pending_audit` names them before they are written. Only when each is durable (or recorded as pending for the deterministic repair the incidents store already performs) does the record move to `completed` by CAS. A crash in between leaves `applying` with the audit step pending; the resume finishes it.
+
+### 3.2 Resume (decision 3)
+
+- The pipeline stays stopped with `recovery_pending`. The operator re-runs `recover apply` with **the same proof**; any other proof, operation or pipeline is refused.
+- The resume uses **the plan stored in the record**, never a recomputation (earlier steps have changed the state the original plan was computed from). Each remaining step applies the pre-/post-state rule above; the step that was in flight is either still in its pre-state (performed now) or in its exact post-state (skipped).
+- There is **no abandonment** once mutation began: an operation is completed, or it stops on divergence for manual repair with the record kept as evidence.
 
 ## 4. Plan and proof
 
-- `CanonicalPlan { domain: "DeltaForge.Recovery.Plan.v1", operation, pipeline, source, bindings, steps, consequences }`, proof = `hex(sha256(serde_json(canonical)))` (the schema-migrate construction).
-- **Bindings** (what the proof covers, so that any change between plan and apply refuses):
+- `CanonicalPlan { format: 1, domain: "DeltaForge.Recovery.Plan.v1", operation, pipeline, source, bindings, steps, consequences }`.
+- **Deterministic serialization:** structs with a fixed field order, every collection sorted (`BTreeMap`, sorted vectors), no floats, no timestamps, integers and strings only; proof = `hex(sha256(canonical JSON bytes))`. A format change bumps `format` and the domain version.
+- **Bindings** (any change between plan and apply refuses):
   - the incident id and its `transition_seq`, when the operation answers an incident;
   - the source lineage (`schema_lineage` record digest);
   - the recovery epoch;
-  - every checkpoint key of the source (per-sink and legacy aggregate) with a digest of its bytes;
-  - the operation's own state, with versions (below).
-- **Steps** are the exact writes, in order. **Consequences** are fixed sentences (for example "every captured table is copied again; sinks receive duplicates").
-- Live values that move on their own (WAL flush position, timestamps) are never in the proof; where they matter they are re-checked at apply as preconditions.
+  - **the complete sorted set of the source's checkpoint keys** (every per-sink key and the legacy aggregate key, present or absent) with a SHA-256 digest of each value's bytes;
+  - the operation's own state, with versions (section 5).
+- **Steps** are the exact writes in order, each with its pre-state and post-state digest. **Consequences** are fixed sentences.
+- **Diagnostic observations** (the current WAL flush position, slot `active_pid`, timestamps) are printed in a separate `observed` section that is not part of the canonical plan. A value that matters for safety is re-checked at apply as a precondition instead of being bound.
+
+### 4.1 The checkpoint position F
+
+Where an operation needs the source's resume position, F is derived by **the production per-sink comparator** (`PerSinkCheckpointProxy` over the source's own `compare_checkpoints`, as a running pipeline folds it), never a separate implementation. The plan refuses:
+- a malformed checkpoint;
+- a partial set (a sink of the configured cohort without a checkpoint while others have one);
+- a snapshot position, a generation-start (adoption) position or a snapshot-chain position, when the operation needs a stream position;
+- a checkpoint of another lineage;
+- any incomparable pair.
 
 ## 5. Operations
 
 ### 5.1 `resnapshot`
 
-**When:** a blocked snapshot generation (`snapshot_anchor_unavailable`, `snapshot_bound_exceeded`, `snapshot_state_invalid` where the control record is readable); `pg_continuity_unproven` lost classes; `mysql_gtid_position_unavailable` (not `unknown_*`); or an operator's choice on a pipeline with a completed generation. Refused when `snapshot.mode` is `never` (the plan says to change the mode) and when the control record is unreadable or of an unknown format (that stays a manual repair).
+**When:** a blocked snapshot generation (`snapshot_anchor_unavailable`, `snapshot_bound_exceeded`); `pg_continuity_unproven` lost classes; `mysql_gtid_position_unavailable` (not `unknown_*`); or an operator's choice on a pipeline with a completed generation.
 
-**Bindings:** the control record (version, generation, state, chain, blocked reason) and the plan-item count of the current generation.
+**Refused (manual repair, decision 4):** `snapshot.mode: never` (the plan says to change the mode); a control record that is unreadable, corrupt or of an unknown format, whatever its digest (`snapshot_state_invalid` stays manual); snapshot-chain or generation-start positions in the checkpoints while the control record is missing.
+
+**Bindings:** the control record (version, generation, state, chain, blocked reason) or its verified absence; the plan-item count of the current generation; on PostgreSQL, the slot ownership record and the slot's state.
 
 **Steps:**
-1. Control CAS: replace generation `g` by `g+1` with `QueueStore::replace(.., by_recovery = true)`, a new `Allocation::Recovery`, `adoption = pending`, `blocked` cleared; the plan items of `g` are reclaimed after the CAS. Without a control record (a source that never snapshotted under the queue), allocate the first generation.
-2. PostgreSQL only, when the slot is lost or invalidated: record that the next start recreates its owned slot (the existing owned-slot re-anchoring; a slot this source cannot prove it owns refuses the plan).
+1. **Generation.** Pre-state: the bound control record. Post-state: generation `g+1` of the same chain, `allocated`, `adoption = pending`, `blocked` cleared, `replaced = g`, allocation `Recovery` (`QueueStore::replace(.., by_recovery = true)`). Without a control record, a first generation is allocated, but **only when the checkpoints are empty or are all ordinary, lineage-verified CDC positions**. The plan items of `g` are reclaimed after the CAS (idempotent).
+2. **PostgreSQL slot (only when the slot is lost or invalidated).** An explicit, recorded outcome: the slot is dropped only when the slot ownership record proves this source created it (`slot_owner:{source}`, the existing owned-slot proof) and it is inactive; the record's `outcomes.slot` names what was done (`dropped_owned_slot`, `absent`). A slot whose ownership cannot be proven refuses the plan; recovery never recreates or replaces it. The next start creates the new slot through the existing creation path.
 
-**Checkpoints are not deleted or moved.** The new generation's start barrier moves each sink from its current state into `g+1` (design `snapshot-durable-queue.md` section 5.4: positions of an older generation of the chain and CDC positions of the lineage are accepted). Until a sink has adopted, nothing is resumed from its old position: the snapshot decision precedes the resume-position check, and the stream opens only after the generation, at its anchor.
+**Checkpoints are neither deleted nor advanced (decision 2).** They stay as durable evidence. The new generation's start barrier moves each sink from its current state into `g+1` (`snapshot-durable-queue.md` section 5.4); until a sink adopts, nothing resumes from its old position (the snapshot decision precedes the resume-position check, and the stream opens after the generation, at its anchor).
 
-**Required regression:** for each engine, a source stopped on a lost position (PostgreSQL dropped slot; MySQL purged binlog) and on a blocked generation recovers through `resnapshot` and streams from the new anchor, with every sink checkpoint moved only by the start barrier.
+**Required regression:** for each engine, a source stopped on a lost position (PostgreSQL dropped slot; MySQL purged binlog) and on a blocked generation recovers through `resnapshot` and streams from the new anchor, every sink checkpoint changed only by the start barrier.
 
 **Consequences:** every captured table is copied again; sinks receive the rows again; the anchor is new.
 
@@ -115,47 +151,56 @@ Slot namespace `recovery`, key `segment(pipeline)` (the incidents escaping).
 
 **When:** `pg_continuity_unproven`, class `timeline_unrecorded` only.
 
-**Plan reads on the source** (a regular connection, then the replication session's `IDENTIFY_SYSTEM`): system identifier, database OID, current timeline, the slot (exists, logical, not invalidated, `restart_lsn`, `confirmed_flush_lsn`, `wal_status`) and the durable checkpoint `F` (every sink's position).
+**Identity checks run on one gated replication session** (the vendored session the source proves continuity on), at plan time and again at apply time:
+- `IDENTIFY_SYSTEM`: system identifier, current timeline, database (OID resolved on the same session);
+- server version and `pg_is_in_recovery()`: **a standby is refused**;
+- the slot row: exists, logical, not invalidated, `wal_status`, `restart_lsn`, `confirmed_flush_lsn`, `active`, `active_pid`: **a slot active under another consumer is refused**;
+- the current WAL flush position.
 
-**Preconditions, failing the plan:**
+**Preconditions:**
 - system identifier and database OID equal the recorded source lineage;
 - no continuity record exists for the source;
-- the slot exists, is logical and not invalidated, and `restart_lsn <= F` and `confirmed_flush_lsn <= F`;
-- every sink checkpoint is unstamped (pre-continuity) and comparable.
+- F (section 4.1) is a stream position; every sink checkpoint is unstamped (pre-continuity), well-formed, of this lineage and comparable;
+- at apply: `restart_lsn <= F`, `confirmed_flush_lsn <= F` and WAL flush `>= F`.
 
-**Bindings:** all of the above except the WAL flush position, which apply re-checks (`flush >= F`).
+**Bindings:** system identifier, database OID, timeline, server major version, slot name and its `restart_lsn` and `confirmed_flush_lsn`, F, the checkpoint key set and digests. The WAL flush position is observed and re-checked at apply, not bound.
 
-**Step:** create `failover/pg_continuity:{source}` with format 1, a new chain id, the live system identifier, database OID and timeline, `transition_id = 0` and `proven_at = F`, as create-if-absent (a record that appeared since the plan refuses).
+**Step:** pre-state: no record at `failover/pg_continuity:{source}`; post-state: the record with format 1, a new chain id, the live system identifier, database OID and timeline, `transition_id = 0`, `proven_at = F` (written create-if-absent; a record that differs from the expected post-state stops the operation).
 
-**After apply:** the next start runs the full continuity proof against that record (slot bounds, WAL reachability) and stamps the checkpoints into the chain at transition 0 (`adopt_into_chain`); any failure there raises a new incident. Checkpoint positions never change.
+**After apply:** the next start runs the full continuity proof against that record and stamps the checkpoints into the chain at transition 0 (`adopt_into_chain`); any failure raises a new incident. Checkpoint positions never change.
 
-**Consequences:** the operator asserts that the history from `F` to now is this timeline's; a same-timeline rewind is not detectable and is unsupported.
+**Consequences:** the operator asserts that the history from F to now is this timeline's; a same-timeline rewind is not detectable and is unsupported.
 
 **Resolves:** the `timeline_unrecorded` incident, as `RecoveryOperation { operation: "pg-adopt-timeline", proof }`.
 
-**Required regression:** a PostgreSQL 16 source whose server switched timeline before its checkpoint was stamped stops with `timeline_unrecorded`, is adopted, and continues exactly at `F`; adoption refuses on a lineage mismatch, a missing or invalidated slot, and slot bounds past `F`.
+**Required regression:** a PostgreSQL 16 source whose server switched timeline before its checkpoint was stamped stops with `timeline_unrecorded`, is adopted, and continues exactly at F; adoption refuses a lineage mismatch, a standby, an active slot, a missing or invalidated slot, slot bounds past F, WAL flush behind F, and malformed, partial, snapshot or foreign checkpoints.
 
 ## 6. Incidents and audit
 
 - `Resolution::RecoveryOperation` gains `proof` and stays the resolution of every incident a recovery resolves. A new action code `AdoptTimeline` is recommended for `timeline_unrecorded` (in place of `Resnapshot` first).
 - **Audit:** a new transition `RecoveryApplied { operation, proof, asserted_actor, actor_verified, credential, origin, reason }` precedes the `Resolved` transition of each incident, through the existing crash-safe `pending_audit` path. The recovery record keeps the same fields for operations that resolve no incident.
+- The recovery record is completed only after these audit transitions are durable or pending (section 3.1).
 - The recovery epoch is not raised by an apply: an apply is an audited operator action, not a verified recovery. The next verified start raises it as today; a start that fails again raises a new incident.
-- **Diagnose** lists: pipeline state and quiescence; the recovery record (pending or last completed); open incidents with explanations and evidence; for each, the applicable operations (mapped from its actions and class) or "none in this release".
+- **Diagnose** lists: pipeline state and quiescence; the recovery record (pending or last completed) with the **current step, the last verified pre- or post-state and its digest**, and the **safe remediation** (re-apply with the same proof; on divergence, the state that was expected and what was found, with no abandonment); open incidents with explanations and evidence; for each, the applicable operations or "none in this release".
 
 ## 7. Crash ordering
 
 | Step | Write | Crash before | Crash after |
 |---|---|---|---|
-| Claim | recovery record `applying`, step 0 | nothing changed | pipeline held `recovery_pending`; resume with the same proof |
-| Operation step | its own CAS / create | step re-runs | step verified done, skipped |
-| Step advance | record CAS | step re-runs (idempotent) | next step |
-| Resolve incidents | incident transitions (audited) | re-run (resolving a resolved incident is a no-op) | done |
-| Complete | record CAS to `completed` | resolution re-run, then complete | pipeline may start |
+| Lock, quiescence, proof | none (in memory) | nothing changed | nothing changed (the lock is in memory) |
+| Claim | recovery record `applying`, step 0 | nothing changed | pipeline held `recovery_pending`; re-apply with the same proof |
+| Operation step | its own CAS / create | resume finds the pre-state: performed | resume finds the post-state: skipped |
+| Step advance | record CAS (`step`, `verified`) | resume re-verifies the step | next step |
+| Audit | `pending_audit` in the record, then the incident transitions | resume writes them | repair or resume completes them |
+| Complete | record CAS to `completed` | resume completes | pipeline may start |
 
 ## 8. Tests
 
+- Apply ordering: a resume or start attempt during apply is refused; apply on a running or not-yet-joined pipeline is refused before any read of the recovery slot.
+- Resume: a crash after each step resumes from the stored plan; a step found in neither its pre- nor post-state stops without writing.
 - Per operation: plan/apply round trip; proof mismatch when state moves between plan and apply (a checkpoint written, the incident reopened, the control record changed); a crash after each step resumes with the same proof and refuses another; the incidents resolve with the audit entry; refusal while the pipeline runs and while another recovery is pending; a pending recovery keeps the pipeline from starting across a server restart.
-- Admin listener: refuses a non-loopback address without a token at startup; refuses a missing or wrong token; the public API has no recovery route.
+- Admin listener: refuses a non-loopback address; refuses to start without a token file, with a group- or world-accessible file, or with an empty or short token; refuses a missing, empty or wrong bearer token; never logs the token; the public API has no recovery route.
+- Proof determinism: the same state yields the same proof across processes and backends; observations outside the canonical plan never change it.
 - Recovery record contract on SQLite and PostgreSQL.
 
 ## 9. Documentation
@@ -174,9 +219,9 @@ Slot namespace `recovery`, key `segment(pipeline)` (the incidents escaping).
 
 One core gate on the final accepted tree.
 
-## 11. Decisions for the reviewer
+## 11. Decisions (ruled 2026-10-06)
 
-1. **Admin access:** loopback admin listener by default, bearer token required for any other address (proposed); or a token always.
-2. **`resnapshot` keeps sink checkpoints** and relies on the start barrier to supersede them (proposed); or it also deletes them (simpler to reason about, but it erases the evidence the start barrier checks and loses the per-sink chain ordering).
-3. **Crash resume** by an explicit re-apply with the same proof while the pipeline stays held (proposed); or automatic completion at server start.
-4. **Scope:** `resnapshot` refuses an unreadable or unknown-format control record (stays manual) (proposed); or it may overwrite one after showing its digest.
+1. Admin authentication: a token always, loopback included; loopback-only listener in rc.1 (no TLS); SSH tunnel for remote administration.
+2. `resnapshot` keeps checkpoints; the generation start barrier supersedes them; nothing is deleted or advanced.
+3. Crash recovery by an explicit re-apply with the same proof; startup only exposes `recovery_pending` and refuses pipeline start.
+4. Unknown or corrupt control records fail closed and stay a manual repair.
