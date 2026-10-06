@@ -2155,6 +2155,20 @@ async fn postgres_an_authorized_slot_recreation_survives_a_crash_at_either_point
                 .contains(&"authorize_slot_recreation".to_string())
         );
         let generation = blocked.generation + 1;
+        let (_, authorized) =
+            read_slot_recreation(&backend, "pg-src").await?.unwrap();
+        assert_eq!(authorized.state, SlotRecreationState::Authorized);
+        assert_eq!(authorized.generation, generation);
+        let bound = |r: &sources::snapshot_recovery::SlotRecreation| {
+            (
+                r.source.clone(),
+                r.pipeline.clone(),
+                r.slot.clone(),
+                r.generation,
+                r.proof.clone(),
+                r.owner_record.clone(),
+            )
+        };
 
         // The start stops at the crash point.
         let (reached, release, crash) = hold_slot_recreation(point);
@@ -2168,6 +2182,11 @@ async fn postgres_an_authorized_slot_recreation_survives_a_crash_at_either_point
         let (_, auth) =
             read_slot_recreation(&backend, "pg-src").await?.unwrap();
         assert_eq!(auth.state, SlotRecreationState::Consumed, "{point:?}");
+        assert_eq!(
+            bound(&auth),
+            bound(&authorized),
+            "{point:?}: the same binding"
+        );
         assert_eq!(auth.generation, generation, "{point:?}: still bound");
         assert_eq!(auth.proof, planned["proof"].as_str().unwrap(), "{point:?}");
         let consistent_at_crash = owner_consistent(&backend).await;
@@ -2204,7 +2223,25 @@ async fn postgres_an_authorized_slot_recreation_survives_a_crash_at_either_point
             read_slot_recreation(&backend, "pg-src").await?.unwrap();
         assert_eq!(auth.state, SlotRecreationState::Created, "{point:?}");
         assert_eq!(auth.generation, generation);
-        let created = auth.created.unwrap();
+        assert_eq!(
+            bound(&auth),
+            bound(&authorized),
+            "{point:?}: the same binding"
+        );
+        let created = auth.created.clone().unwrap();
+        let (created_lsn, created_at) =
+            (created.consistent_lsn.clone(), created.at_ms);
+        let anchor = match done.anchor.as_ref() {
+            Some(sources::snapshot_queue::EngineAnchor::Postgres {
+                lsn,
+                ..
+            }) => lsn.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            anchor, created.consistent_lsn,
+            "{point:?}: the anchor is the slot's point"
+        );
         if point == SlotRecreationPoint::AfterCreate {
             assert_eq!(
                 Some(created.consistent_lsn.clone()),
@@ -2226,6 +2263,33 @@ async fn postgres_an_authorized_slot_recreation_survives_a_crash_at_either_point
             trail.iter().filter(|e| e.event == "slot_recreated").count(),
             1,
             "{point:?}: audited once"
+        );
+        // Byte-stable: the same event appended again (as a repair would)
+        // is accepted as identical and adds nothing.
+        let store = storage::adapters::recovery::RecoveryStore::new(
+            backend.clone(),
+            "pgcrash",
+        );
+        store
+            .append_event(
+                &auth.proof,
+                "slot_recreated",
+                std::collections::BTreeMap::from([
+                    ("slot".to_string(), "snap_slot".to_string()),
+                    ("generation".to_string(), generation.to_string()),
+                    ("consistent_lsn".to_string(), created_lsn.clone()),
+                ]),
+                created_at,
+            )
+            .await?;
+        assert_eq!(
+            store
+                .audit_trail(50)
+                .await?
+                .iter()
+                .filter(|e| e.event == "slot_recreated")
+                .count(),
+            1
         );
         PipelineController::stop(mgr.as_ref(), "pgcrash").await?;
     }

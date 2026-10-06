@@ -724,7 +724,9 @@ impl StepExecutor for Exec {
                 .await?;
                 Ok(BTreeMap::from([(
                     "slot_recreation".into(),
-                    format!("authorized for generation {generation}"),
+                    sources::snapshot_recovery::authorization_outcome(
+                        generation,
+                    ),
                 )]))
             }
             RECLAIM => {

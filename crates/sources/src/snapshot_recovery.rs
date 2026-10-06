@@ -289,6 +289,39 @@ pub async fn write_slot_recreation(
     Ok(())
 }
 
+/// The outcome `resnapshot` records in its `applied` audit entry when it
+/// authorizes a slot recreation for `generation`.
+pub fn authorization_outcome(generation: u64) -> String {
+    format!("authorized for generation {generation}")
+}
+
+/// Whether `rec` was written by the recovery whose proof it carries: the
+/// pipeline's audit holds that proof's `applied` entry recording exactly
+/// this authorization. The proof cannot be part of the plan it proves, so
+/// it is bound here, through the durable audit (complete before the
+/// pipeline can start). An authorization under any other proof is refused.
+async fn authorized_by_its_proof(
+    backend: &storage::ArcStorageBackend,
+    rec: &SlotRecreation,
+) -> anyhow::Result<bool> {
+    if rec.proof.is_empty() {
+        return Ok(false);
+    }
+    let want = authorization_outcome(rec.generation);
+    Ok(storage::adapters::recovery::RecoveryStore::new(
+        backend.clone(),
+        &rec.pipeline,
+    )
+    .audit_trail(usize::MAX)
+    .await?
+    .iter()
+    .any(|e| {
+        e.event == "applied"
+            && e.applied.proof == rec.proof
+            && e.outcomes.get("slot_recreation") == Some(&want)
+    }))
+}
+
 fn same_target(
     rec: &SlotRecreation,
     source_id: &str,
@@ -320,7 +353,9 @@ pub async fn take_slot_recreation(
     let Some((v, rec)) = read_slot_recreation(backend, source_id).await? else {
         return Ok(None);
     };
-    if !same_target(&rec, source_id, pipeline, slot, generation) {
+    if !same_target(&rec, source_id, pipeline, slot, generation)
+        || !authorized_by_its_proof(backend, &rec).await?
+    {
         return Ok(None);
     }
     match rec.state {
@@ -362,7 +397,8 @@ pub async fn complete_slot_recreation(
         );
     };
     anyhow::ensure!(
-        same_target(&rec, source_id, pipeline, slot, generation),
+        same_target(&rec, source_id, pipeline, slot, generation)
+            && authorized_by_its_proof(backend, &rec).await?,
         "the slot recreation authorization of {source_id} is for another \
          generation or slot"
     );
@@ -401,10 +437,15 @@ pub async fn slot_recreation_of(
     slot: &str,
     generation: u64,
 ) -> anyhow::Result<Option<SlotRecreation>> {
-    Ok(read_slot_recreation(backend, source_id)
-        .await?
-        .map(|(_, r)| r)
-        .filter(|r| same_target(r, source_id, pipeline, slot, generation)))
+    let Some((_, rec)) = read_slot_recreation(backend, source_id).await? else {
+        return Ok(None);
+    };
+    if !same_target(&rec, source_id, pipeline, slot, generation)
+        || !authorized_by_its_proof(backend, &rec).await?
+    {
+        return Ok(None);
+    }
+    Ok(Some(rec))
 }
 
 #[cfg(test)]
@@ -491,6 +532,35 @@ mod tests {
         );
     }
 
+    /// The `applied` audit entry of `proof` authorizing `generation`.
+    async fn audited(
+        b: &storage::ArcStorageBackend,
+        proof: &str,
+        generation: u64,
+    ) {
+        storage::adapters::recovery::RecoveryStore::new(b.clone(), "p")
+            .append_event(
+                proof,
+                "applied",
+                std::collections::BTreeMap::from([(
+                    "slot_recreation".to_string(),
+                    authorization_outcome(generation),
+                )]),
+                1,
+            )
+            .await
+            .unwrap();
+    }
+
+    fn authorization(proof: &str, generation: u64) -> SlotRecreation {
+        SlotRecreation {
+            proof: proof.into(),
+            ..SlotRecreation::authorized(
+                "src", "p", "slot", generation, "owner",
+            )
+        }
+    }
+
     #[tokio::test]
     async fn a_slot_recreation_is_taken_resumed_and_completed_by_its_generation_only()
      {
@@ -508,8 +578,10 @@ mod tests {
                     .unwrap()
             }
         };
-        let auth = SlotRecreation::authorized("src", "p", "slot", 3, "owner");
-        write_slot_recreation(&b, None, &auth).await.unwrap();
+        audited(&b, "P", 3).await;
+        write_slot_recreation(&b, None, &authorization("P", 3))
+            .await
+            .unwrap();
         // Another generation, slot, pipeline or ownership record: nothing,
         // and the authorization is untouched.
         for (p, s, g, o) in [
@@ -532,8 +604,13 @@ mod tests {
         let taken = take("p", "slot", 3, "owner", false).await.unwrap();
         assert_eq!(taken.state, SlotRecreationState::Consumed);
         assert_eq!(
-            (taken.generation, taken.owner_record.as_str()),
-            (3, "owner")
+            (
+                taken.generation,
+                taken.owner_record.as_str(),
+                taken.proof.as_str(),
+                taken.slot.as_str()
+            ),
+            (3, "owner", "P", "slot")
         );
         // A start of the same generation interrupted before creating:
         // resumed (also over the creation's Creating intent); never by
@@ -543,7 +620,7 @@ mod tests {
         assert!(take("p", "slot", 3, "changed", false).await.is_none());
         assert!(take("p", "slot", 4, "owner", false).await.is_none());
         // Completed once; the same completion again is a no-op; another
-        // slot state is refused.
+        // slot state or generation is refused.
         let done =
             complete_slot_recreation(&b, "src", "p", "slot", 3, "new", "0/10")
                 .await
@@ -575,10 +652,85 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert!(
+            slot_recreation_of(&b, "src", "p", "slot", 3)
+                .await
+                .unwrap()
+                .is_some()
+        );
         // An unreadable record is an error, never taken or replaced.
         b.slot_upsert(AUTHORIZATION_NS, "pg_slot_recreation:bad", b"{")
             .await
             .unwrap();
         assert!(read_slot_recreation(&b, "bad").await.is_err());
+    }
+
+    /// An authorization carrying a proof without the matching `applied`
+    /// audit entry (another proof, or one that authorized another
+    /// generation, or none) is refused in every state, and left untouched.
+    #[tokio::test]
+    async fn an_authorization_of_another_proof_is_refused_in_every_state() {
+        let b: storage::ArcStorageBackend =
+            std::sync::Arc::new(storage::MemoryStorageBackend::new());
+        // Proof P authorized generation 2 only; Q authorized nothing.
+        audited(&b, "P", 2).await;
+        for proof in ["Q", "P", ""] {
+            for state in [
+                SlotRecreationState::Authorized,
+                SlotRecreationState::Consumed,
+                SlotRecreationState::Created,
+            ] {
+                let rec = SlotRecreation {
+                    state,
+                    created: (state == SlotRecreationState::Created).then(
+                        || SlotCreated {
+                            owner_record: "new".into(),
+                            consistent_lsn: "0/10".into(),
+                            at_ms: 1,
+                        },
+                    ),
+                    ..authorization(proof, 3)
+                };
+                b.slot_upsert(
+                    AUTHORIZATION_NS,
+                    "pg_slot_recreation:src",
+                    &serde_json::to_vec(&rec).unwrap(),
+                )
+                .await
+                .unwrap();
+                let what = format!("{proof:?} {state:?}");
+                for (owner, creating) in
+                    [("owner", false), ("intent", true), ("new", false)]
+                {
+                    assert!(
+                        take_slot_recreation(
+                            &b, "src", "p", "slot", 3, owner, creating
+                        )
+                        .await
+                        .unwrap()
+                        .is_none(),
+                        "{what}: taken"
+                    );
+                }
+                assert!(
+                    complete_slot_recreation(
+                        &b, "src", "p", "slot", 3, "new", "0/10"
+                    )
+                    .await
+                    .is_err(),
+                    "{what}: completed"
+                );
+                assert!(
+                    slot_recreation_of(&b, "src", "p", "slot", 3)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "{what}: recognized"
+                );
+                let (_, kept) =
+                    read_slot_recreation(&b, "src").await.unwrap().unwrap();
+                assert_eq!(kept, rec, "{what}: untouched");
+            }
+        }
     }
 }
