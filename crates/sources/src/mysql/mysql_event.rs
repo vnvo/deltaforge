@@ -339,10 +339,7 @@ async fn handle_write_rows(
         if sent > 0 {
             counter!(
                 "deltaforge_source_events_total",
-                "pipeline" => ctx.pipeline.clone(),
-                "source" => ctx.source_id.clone(),
-                "table" => format!("{}.{}", tm.database_name, tm.table_name),
-                "op" => "c",
+                source_event_labels(ctx, tm, "c"),
             )
             .increment(sent);
         }
@@ -441,10 +438,7 @@ async fn handle_update_rows(
         if sent > 0 {
             counter!(
                 "deltaforge_source_events_total",
-                "pipeline" => ctx.pipeline.clone(),
-                "source" => ctx.source_id.clone(),
-                "table" => format!("{}.{}", tm.database_name, tm.table_name),
-                "op" => "u",
+                source_event_labels(ctx, tm, "u"),
             )
             .increment(sent);
         }
@@ -534,10 +528,7 @@ async fn handle_delete_rows(
         if sent > 0 {
             counter!(
                 "deltaforge_source_events_total",
-                "pipeline" => ctx.pipeline.clone(),
-                "source" => ctx.source_id.clone(),
-                "table" => format!("{}.{}", tm.database_name, tm.table_name),
-                "op" => "d",
+                source_event_labels(ctx, tm, "d"),
             )
             .increment(sent);
         }
@@ -1322,6 +1313,24 @@ async fn record_query(
     Ok(())
 }
 
+/// `deltaforge_source_events_total` labels for `tm`'s table (table labels
+/// only when the pipeline enables per-table detail).
+fn source_event_labels(
+    ctx: &RunCtx,
+    tm: &TableMapEvent,
+    op: &'static str,
+) -> Vec<metrics::Label> {
+    let table = format!("{}.{}", tm.database_name, tm.table_name);
+    deltaforge_core::table_metrics::with_table(
+        vec![
+            metrics::Label::new("pipeline", ctx.pipeline.clone()),
+            metrics::Label::new("source", ctx.source_id.clone()),
+            metrics::Label::new("op", op),
+        ],
+        ctx.table_metrics.label(&table).as_ref(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1387,6 +1396,11 @@ mod tests {
         RunCtx {
             source_id: "unit-test".to_string(),
             pipeline: "test-pipeline".to_string(),
+            table_metrics: Arc::new(
+                deltaforge_core::table_metrics::TableMetrics::disabled(
+                    "test-pipeline",
+                ),
+            ),
             tenant: "test-tenant".to_string(),
             dsn: "mysql://fake".to_string().into(),
             host: "localhost".to_string(),

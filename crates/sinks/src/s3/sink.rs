@@ -202,20 +202,23 @@ impl S3Sink {
 /// Record commit + bytes metrics for a set of rolled files. Free function so
 /// both `send_batch` and the background sweeper can call it.
 fn record_committed(pipeline: &str, sink: &str, committed: &[CommittedFile]) {
+    use deltaforge_core::table_metrics::{for_pipeline, with_table};
+    use metrics::Label;
+    let tables = for_pipeline(pipeline);
     for c in committed {
-        counter!(
-            "deltaforge_sink_s3_files_committed_total",
-            "pipeline" => pipeline.to_string(),
-            "sink" => sink.to_string(),
-            "table" => c.partition.table.clone(),
-            "reason" => roll_label(c.reason),
-        )
-        .increment(1);
+        let table = tables.label(&c.partition.table);
+        let base = || {
+            vec![
+                Label::new("pipeline", pipeline.to_string()),
+                Label::new("sink", sink.to_string()),
+            ]
+        };
+        let mut files = with_table(base(), table.as_ref());
+        files.push(Label::new("reason", roll_label(c.reason)));
+        counter!("deltaforge_sink_s3_files_committed_total", files).increment(1);
         counter!(
             "deltaforge_sink_bytes_total",
-            "pipeline" => pipeline.to_string(),
-            "sink" => sink.to_string(),
-            "table" => c.partition.table.clone(),
+            with_table(base(), table.as_ref())
         )
         .increment(c.result.bytes_written);
     }

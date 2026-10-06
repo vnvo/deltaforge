@@ -173,6 +173,8 @@ pub(crate) const READ_TIMEOUT: u64 = 90;
 pub(crate) struct RunCtx {
     source_id: String,
     pipeline: String,
+    /// The pipeline's per-table label policy.
+    table_metrics: Arc<deltaforge_core::table_metrics::TableMetrics>,
     tenant: String,
     dsn: crate::credentials::ProtectedDsn,
     #[allow(dead_code)]
@@ -1573,6 +1575,9 @@ impl MySqlSource {
         let mut ctx = RunCtx {
             source_id: self.id.clone(),
             pipeline: self.pipeline.clone(),
+            table_metrics: deltaforge_core::table_metrics::for_pipeline(
+                &self.pipeline,
+            ),
             tenant: self.tenant.clone(),
             dsn: self.dsn.clone(),
             host,
