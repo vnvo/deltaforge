@@ -1485,7 +1485,7 @@ async fn mysql_resnapshot_recovers_a_blocked_generation_and_a_purged_binlog()
     Ok(())
 }
 
-/// The authorization was consumed by exactly the recovery generation, and
+/// The authorization was used and completed by exactly the recovery generation, and
 /// the recovery audit shows both the authorization and the recreation.
 async fn slot_recreation_consumed(
     backend: &ArcStorageBackend,
@@ -1500,7 +1500,12 @@ async fn slot_recreation_consumed(
             .expect("an authorization");
     assert_eq!(
         auth.state,
-        sources::snapshot_recovery::SlotRecreationState::Consumed
+        sources::snapshot_recovery::SlotRecreationState::Created
+    );
+    assert_eq!(
+        Some(auth.created.as_ref().unwrap().consistent_lsn.clone()),
+        owner_consistent(backend).await,
+        "the recorded slot is the owned one"
     );
     assert_eq!(auth.generation, generation);
     let trail = storage::adapters::recovery::RecoveryStore::new(
@@ -2088,5 +2093,141 @@ async fn postgres_adopt_timeline_refuses_a_fact_changed_after_the_plan()
         sink_checkpoints(&backend, "pg-src").await,
         checkpoints_before
     );
+    Ok(())
+}
+
+/// The consistent point recorded in the slot ownership record.
+async fn owner_consistent(backend: &ArcStorageBackend) -> Option<String> {
+    backend
+        .kv_get("checkpoints", "slot_owner:pg-src")
+        .await
+        .unwrap()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v["consistent_lsn"].as_str().map(String::from))
+}
+
+/// An authorized slot recreation survives a stop at either crash point of
+/// its start: after the authorization was taken and before the slot was
+/// created, the same generation finishes the creation; after the slot was
+/// created and before the completion was recorded, it keeps exactly that
+/// slot (not created again) and repairs the audit. The authorization stays
+/// bound to the generation throughout.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn postgres_an_authorized_slot_recreation_survives_a_crash_at_either_point()
+-> Result<()> {
+    use sources::snapshot_probe::{SlotRecreationPoint, hold_slot_recreation};
+    use sources::snapshot_recovery::{
+        SlotRecreationState, read_slot_recreation,
+    };
+    trace();
+    for point in [
+        SlotRecreationPoint::BeforeCreate,
+        SlotRecreationPoint::AfterCreate,
+    ] {
+        let (_pg, port) = start_postgres().await;
+        let (_dir, backend) = sqlite();
+        let hook = Hook::start().await;
+        let mgr = Arc::new(manager_over(backend.clone()).await);
+        let sinks = hooks_yaml(&[("hook", &hook.url, true)]);
+        mgr.start_pipeline(pg_spec_with("pgcrash", port, "", &sinks, ""))
+            .await?;
+        let blocked = blocked_after_a_completed_snapshot(
+            &mgr, &backend, "pgcrash", "pg-src", &hook,
+        )
+        .await;
+        let admin = pg_admin(port).await;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while admin
+            .execute("SELECT pg_drop_replication_slot('snap_slot')", &[])
+            .await
+            .is_err()
+        {
+            assert!(Instant::now() < deadline, "the slot was never dropped");
+            sleep(Duration::from_millis(200)).await;
+        }
+        let svc = recovery(&mgr);
+        let incident = resnapshot_incident(&svc, "pgcrash").await;
+        let (planned, _) =
+            plan_and_apply(&svc, "pgcrash", Some(incident)).await;
+        assert!(
+            step_names(&planned)
+                .contains(&"authorize_slot_recreation".to_string())
+        );
+        let generation = blocked.generation + 1;
+
+        // The start stops at the crash point.
+        let (reached, release, crash) = hold_slot_recreation(point);
+        mgr.resume("pgcrash").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(120), reached.notified())
+            .await
+            .unwrap_or_else(|_| panic!("{point:?} never reached"));
+        crash.store(true, std::sync::atomic::Ordering::SeqCst);
+        release.notify_one();
+        until_status(&mgr, "pgcrash", "failed").await;
+        let (_, auth) =
+            read_slot_recreation(&backend, "pg-src").await?.unwrap();
+        assert_eq!(auth.state, SlotRecreationState::Consumed, "{point:?}");
+        assert_eq!(auth.generation, generation, "{point:?}: still bound");
+        assert_eq!(auth.proof, planned["proof"].as_str().unwrap(), "{point:?}");
+        let consistent_at_crash = owner_consistent(&backend).await;
+        assert_eq!(
+            slot_exists(&admin).await,
+            point == SlotRecreationPoint::AfterCreate,
+            "{point:?}"
+        );
+        let trail = storage::adapters::recovery::RecoveryStore::new(
+            backend.clone(),
+            "pgcrash",
+        )
+        .audit_trail(50)
+        .await?;
+        assert!(
+            !trail.iter().any(|e| e.event == "slot_recreated"),
+            "{point:?}: not audited yet"
+        );
+
+        // The restart finishes it, in the same generation.
+        let reads = hook.snapshot_reads();
+        mgr.resume("pgcrash").await.unwrap();
+        let done = until_control(&backend, "pg-src", completed).await;
+        assert_eq!(
+            done.generation, generation,
+            "{point:?}: no further generation"
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while hook.snapshot_reads() < reads + ROWS as usize {
+            assert!(Instant::now() < deadline, "{point:?}: not copied again");
+            sleep(Duration::from_millis(200)).await;
+        }
+        let (_, auth) =
+            read_slot_recreation(&backend, "pg-src").await?.unwrap();
+        assert_eq!(auth.state, SlotRecreationState::Created, "{point:?}");
+        assert_eq!(auth.generation, generation);
+        let created = auth.created.unwrap();
+        if point == SlotRecreationPoint::AfterCreate {
+            assert_eq!(
+                Some(created.consistent_lsn.clone()),
+                consistent_at_crash,
+                "the slot created before the stop is kept, not recreated"
+            );
+        }
+        assert_eq!(
+            owner_consistent(&backend).await,
+            Some(created.consistent_lsn)
+        );
+        let trail = storage::adapters::recovery::RecoveryStore::new(
+            backend.clone(),
+            "pgcrash",
+        )
+        .audit_trail(50)
+        .await?;
+        assert_eq!(
+            trail.iter().filter(|e| e.event == "slot_recreated").count(),
+            1,
+            "{point:?}: audited once"
+        );
+        PipelineController::stop(mgr.as_ref(), "pgcrash").await?;
+    }
     Ok(())
 }

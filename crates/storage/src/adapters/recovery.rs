@@ -487,11 +487,14 @@ impl RecoveryStore {
     /// Record a later effect `event` of the operation applied with `proof`
     /// (once per proof and event), with the operation's audit fields when
     /// its record is still the current one.
+    /// `at_ms` is the event's recorded time, so a repeated append is
+    /// byte-identical.
     pub async fn append_event(
         &self,
         proof: &str,
         event: &str,
         outcomes: BTreeMap<String, String>,
+        at_ms: i64,
     ) -> Result<()> {
         let (applied, resolves, source) = match self.read().await? {
             Some((_, rec)) if rec.proof == proof => {
@@ -513,7 +516,7 @@ impl RecoveryStore {
         };
         let entry = RecoveryAuditEntry {
             event: event.to_string(),
-            at_ms: now_ms(),
+            at_ms,
             pipeline: self.pipeline.clone(),
             source,
             applied,

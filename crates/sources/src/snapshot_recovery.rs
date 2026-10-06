@@ -162,8 +162,12 @@ fn slot_authorization_key(source_id: &str) -> String {
 
 /// A single-use authorization to recreate a PostgreSQL slot this source
 /// created and lost (`docs/design/recovery-cli.md`, section 5.1): written
-/// by `resnapshot`, consumed by the start of exactly its generation before
-/// the slot is created.
+/// by `resnapshot` (`authorized`), taken by the start of exactly its
+/// generation before the slot is created (`consumed`), and completed once
+/// the slot exists (`created`). Every state stays bound to the generation,
+/// proof, slot and the ownership record it was authorized over, so a start
+/// interrupted after taking it finishes the creation, and one interrupted
+/// after creating the slot recognizes it; no other generation uses it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SlotRecreation {
@@ -180,6 +184,21 @@ pub struct SlotRecreation {
     /// cannot be part of what it proves).
     pub proof: String,
     pub state: SlotRecreationState,
+    /// Once `created`: what the creation left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<SlotCreated>,
+}
+
+/// The slot an authorized recreation created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SlotCreated {
+    /// The digest of the ownership record the creation wrote.
+    pub owner_record: String,
+    /// The new slot's consistent point.
+    pub consistent_lsn: String,
+    /// When it was recorded (the audit entry's time, fixed for repairs).
+    pub at_ms: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +207,8 @@ pub enum SlotRecreationState {
     Authorized,
     /// Taken by the start of its generation, before the slot was created.
     Consumed,
+    /// The slot was created by that start.
+    Created,
 }
 
 impl SlotRecreation {
@@ -207,6 +228,7 @@ impl SlotRecreation {
             owner_record: owner_record.into(),
             proof: String::new(),
             state: SlotRecreationState::Authorized,
+            created: None,
         }
     }
 
@@ -267,36 +289,122 @@ pub async fn write_slot_recreation(
     Ok(())
 }
 
-/// Consume the authorization to recreate `slot` at the start of
-/// `generation`: only an `authorized` record of exactly this source,
-/// pipeline, slot, generation and ownership record, by one CAS. Returns
-/// the consumed authorization, or `None` when there is none to consume.
-pub async fn consume_slot_recreation(
+fn same_target(
+    rec: &SlotRecreation,
+    source_id: &str,
+    pipeline: &str,
+    slot: &str,
+    generation: u64,
+) -> bool {
+    rec.source == source_id
+        && rec.pipeline == pipeline
+        && rec.slot == slot
+        && rec.generation == generation
+}
+
+/// Before the start of `generation` creates the missing `slot`: take the
+/// authorization (`authorized` over exactly `owner_record`, by one CAS to
+/// `consumed`), or resume one this generation already took (`consumed`,
+/// with the ownership record still the authorized one, or replaced by the
+/// creation's own `Creating` intent). `None`: no authorization for this
+/// creation.
+pub async fn take_slot_recreation(
     backend: &storage::ArcStorageBackend,
     source_id: &str,
     pipeline: &str,
     slot: &str,
     generation: u64,
     owner_record: &str,
+    owner_creating: bool,
 ) -> anyhow::Result<Option<SlotRecreation>> {
     let Some((v, rec)) = read_slot_recreation(backend, source_id).await? else {
         return Ok(None);
     };
-    let matches = rec.state == SlotRecreationState::Authorized
-        && rec.source == source_id
-        && rec.pipeline == pipeline
-        && rec.slot == slot
-        && rec.generation == generation
-        && rec.owner_record == owner_record;
-    if !matches {
+    if !same_target(&rec, source_id, pipeline, slot, generation) {
         return Ok(None);
     }
-    let consumed = SlotRecreation {
-        state: SlotRecreationState::Consumed,
-        ..rec
+    match rec.state {
+        SlotRecreationState::Authorized
+            if !owner_creating && rec.owner_record == owner_record =>
+        {
+            let consumed = SlotRecreation {
+                state: SlotRecreationState::Consumed,
+                ..rec
+            };
+            write_slot_recreation(backend, Some(v), &consumed).await?;
+            Ok(Some(consumed))
+        }
+        SlotRecreationState::Consumed
+            if owner_creating || rec.owner_record == owner_record =>
+        {
+            Ok(Some(rec))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Record that the start of `generation` created the slot (`consumed` to
+/// `created`, once): the ownership record it wrote and its consistent
+/// point. Already `created` with exactly these: unchanged. Returns the
+/// record, with the audit time to use.
+pub async fn complete_slot_recreation(
+    backend: &storage::ArcStorageBackend,
+    source_id: &str,
+    pipeline: &str,
+    slot: &str,
+    generation: u64,
+    owner_record: &str,
+    consistent_lsn: &str,
+) -> anyhow::Result<SlotRecreation> {
+    let Some((v, rec)) = read_slot_recreation(backend, source_id).await? else {
+        anyhow::bail!(
+            "the slot recreation authorization of {source_id} is gone"
+        );
     };
-    write_slot_recreation(backend, Some(v), &consumed).await?;
-    Ok(Some(consumed))
+    anyhow::ensure!(
+        same_target(&rec, source_id, pipeline, slot, generation),
+        "the slot recreation authorization of {source_id} is for another \
+         generation or slot"
+    );
+    match (&rec.state, &rec.created) {
+        (SlotRecreationState::Created, Some(c))
+            if c.owner_record == owner_record
+                && c.consistent_lsn == consistent_lsn =>
+        {
+            Ok(rec)
+        }
+        (SlotRecreationState::Consumed, None) => {
+            let created = SlotRecreation {
+                state: SlotRecreationState::Created,
+                created: Some(SlotCreated {
+                    owner_record: owner_record.to_string(),
+                    consistent_lsn: consistent_lsn.to_string(),
+                    at_ms: chrono::Utc::now().timestamp_millis(),
+                }),
+                ..rec
+            };
+            write_slot_recreation(backend, Some(v), &created).await?;
+            Ok(created)
+        }
+        _ => anyhow::bail!(
+            "the slot recreation authorization of {source_id} does not match \
+             the slot that exists"
+        ),
+    }
+}
+
+/// The authorization of `generation`'s recreation of `slot`, if any.
+pub async fn slot_recreation_of(
+    backend: &storage::ArcStorageBackend,
+    source_id: &str,
+    pipeline: &str,
+    slot: &str,
+    generation: u64,
+) -> anyhow::Result<Option<SlotRecreation>> {
+    Ok(read_slot_recreation(backend, source_id)
+        .await?
+        .map(|(_, r)| r)
+        .filter(|r| same_target(r, source_id, pipeline, slot, generation)))
 }
 
 #[cfg(test)]
@@ -384,38 +492,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_slot_recreation_is_consumed_once_by_its_generation() {
+    async fn a_slot_recreation_is_taken_resumed_and_completed_by_its_generation_only()
+     {
         let b: storage::ArcStorageBackend =
             std::sync::Arc::new(storage::MemoryStorageBackend::new());
+        let take = |p: &'static str,
+                    s: &'static str,
+                    g: u64,
+                    o: &'static str,
+                    creating: bool| {
+            let b = b.clone();
+            async move {
+                take_slot_recreation(&b, "src", p, s, g, o, creating)
+                    .await
+                    .unwrap()
+            }
+        };
         let auth = SlotRecreation::authorized("src", "p", "slot", 3, "owner");
         write_slot_recreation(&b, None, &auth).await.unwrap();
-        // Another generation, slot, pipeline or ownership record: nothing.
+        // Another generation, slot, pipeline or ownership record: nothing,
+        // and the authorization is untouched.
         for (p, s, g, o) in [
             ("p", "slot", 2, "owner"),
+            ("p", "slot", 4, "owner"),
             ("p", "other", 3, "owner"),
             ("q", "slot", 3, "owner"),
             ("p", "slot", 3, "changed"),
         ] {
-            assert!(
-                consume_slot_recreation(&b, "src", p, s, g, o)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(take(p, s, g, o, false).await.is_none());
         }
-        let taken = consume_slot_recreation(&b, "src", "p", "slot", 3, "owner")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(taken.state, SlotRecreationState::Consumed);
-        // Single use.
         assert!(
-            consume_slot_recreation(&b, "src", "p", "slot", 3, "owner")
+            take("p", "slot", 3, "owner", true).await.is_none(),
+            "an authorized one needs the authorized record"
+        );
+        let (_, still) =
+            read_slot_recreation(&b, "src").await.unwrap().unwrap();
+        assert_eq!(still.state, SlotRecreationState::Authorized);
+        // Taken: consumed, still bound to everything.
+        let taken = take("p", "slot", 3, "owner", false).await.unwrap();
+        assert_eq!(taken.state, SlotRecreationState::Consumed);
+        assert_eq!(
+            (taken.generation, taken.owner_record.as_str()),
+            (3, "owner")
+        );
+        // A start of the same generation interrupted before creating:
+        // resumed (also over the creation's Creating intent); never by
+        // another generation.
+        assert!(take("p", "slot", 3, "owner", false).await.is_some());
+        assert!(take("p", "slot", 3, "intent", true).await.is_some());
+        assert!(take("p", "slot", 3, "changed", false).await.is_none());
+        assert!(take("p", "slot", 4, "owner", false).await.is_none());
+        // Completed once; the same completion again is a no-op; another
+        // slot state is refused.
+        let done =
+            complete_slot_recreation(&b, "src", "p", "slot", 3, "new", "0/10")
+                .await
+                .unwrap();
+        assert_eq!(done.state, SlotRecreationState::Created);
+        let again =
+            complete_slot_recreation(&b, "src", "p", "slot", 3, "new", "0/10")
+                .await
+                .unwrap();
+        assert_eq!(again, done, "the same audit time");
+        assert!(
+            complete_slot_recreation(
+                &b, "src", "p", "slot", 3, "other", "0/10"
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            complete_slot_recreation(&b, "src", "p", "slot", 4, "new", "0/10")
+                .await
+                .is_err()
+        );
+        // Created: never taken again, by any generation.
+        assert!(take("p", "slot", 3, "new", false).await.is_none());
+        assert!(take("p", "slot", 3, "owner", false).await.is_none());
+        assert!(
+            slot_recreation_of(&b, "src", "p", "slot", 4)
                 .await
                 .unwrap()
                 .is_none()
         );
-        // An unreadable record is an error, never consumed or replaced.
+        // An unreadable record is an error, never taken or replaced.
         b.slot_upsert(AUTHORIZATION_NS, "pg_slot_recreation:bad", b"{")
             .await
             .unwrap();

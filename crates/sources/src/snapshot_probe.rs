@@ -320,3 +320,57 @@ pub(crate) async fn before_anchor() {
         release.notified().await;
     }
 }
+
+/// A point of the authorized slot recreation at a generation start
+/// (`docs/design/recovery-cli.md`, section 5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotRecreationPoint {
+    /// The authorization was consumed; the slot is not created yet.
+    BeforeCreate,
+    /// The slot was created; its completion is not recorded yet.
+    AfterCreate,
+}
+
+type CrashPoint = (
+    SlotRecreationPoint,
+    Arc<Notify>,
+    Arc<Notify>,
+    Arc<std::sync::atomic::AtomicBool>,
+);
+
+static SLOT_RECREATION: Mutex<Option<CrashPoint>> = Mutex::new(None);
+
+/// Arm a hold at `point` of the next authorized slot recreation: `reached`
+/// fires when it is reached; setting `crash` before notifying `release`
+/// makes the start stop right there (a process dying at that point:
+/// nothing after it runs), otherwise it continues.
+pub fn hold_slot_recreation(
+    point: SlotRecreationPoint,
+) -> (Arc<Notify>, Arc<Notify>, Arc<std::sync::atomic::AtomicBool>) {
+    let armed = (
+        point,
+        Arc::new(Notify::new()),
+        Arc::new(Notify::new()),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    let (_, reached, release, crash) = armed.clone();
+    *SLOT_RECREATION.lock().expect("not poisoned") = Some(armed);
+    (reached, release, crash)
+}
+
+/// At `point`: whether the start must stop here (an injected crash).
+pub(crate) async fn slot_recreation_point(point: SlotRecreationPoint) -> bool {
+    let armed = {
+        let mut slot = SLOT_RECREATION.lock().expect("not poisoned");
+        match slot.as_ref() {
+            Some((p, ..)) if *p == point => slot.take(),
+            _ => None,
+        }
+    };
+    let Some((_, reached, release, crash)) = armed else {
+        return false;
+    };
+    reached.notify_one();
+    release.notified().await;
+    crash.load(std::sync::atomic::Ordering::SeqCst)
+}
