@@ -36,6 +36,9 @@ serial     scale-harness/live_ttfce         -p scale-harness --test live_ttfce
 parallel   sources/lib                      -p sources --lib -- --include-ignored --test-threads=1 --skip pg_queue_
 # The S3 behavior DeltaForge depends on, against the pinned S3 test server.
 parallel   sinks/lib-s3-server              -p sinks --lib -- --include-ignored --test-threads=1 s3_server_contract
+# The durable_v2 sink's live matrix (publish/recover, fencing, rollup fallback,
+# GC, orphan reconciliation) against the same pinned server.
+parallel   sinks/lib-s3-server-it           -p sinks --lib -- --include-ignored --test-threads=1 s3_server_it
 parallel   sources/failover_e2e             -p sources --test failover_e2e
 parallel   sources/pg_failover_topology_e2e -p sources --test pg_failover_topology_e2e
 parallel   sources/mysql_activation_e2e     -p sources --test mysql_activation_e2e

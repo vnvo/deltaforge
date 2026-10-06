@@ -39,10 +39,12 @@ sinks:
    export DELTAFORGE_IT_S3_BUCKET=deltaforge-it
    export DELTAFORGE_IT_S3_ACCESS_KEY=<access key>
    export DELTAFORGE_IT_S3_SECRET_KEY=<secret key>
-   cargo test -p sinks --lib -- --ignored s3_server_it
+   cargo test -p sinks --lib -- --include-ignored --test-threads=1 s3_server_it
    ```
-   These tests are `#[ignore]`d and require the environment above; run explicitly
-   they exercise the real backend or fail loudly. They cover the probe, publish/ack
+   These tests are `#[ignore]`d. With the full variable set they run against that
+   provider; with none set they start the pinned S3 test server (as the core gate
+   does); a partial set is refused. Run explicitly, they exercise a real server or
+   fail loudly. They cover the probe, publish/ack
    plus restart recovery, concurrent-writer epoch fencing, cumulative-rollup
    fallback after entry GC, compaction, both GC domains, orphan reconciliation, and
    end-to-end recoverability after combined compaction, entry expiry, original

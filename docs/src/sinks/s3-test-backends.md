@@ -6,7 +6,7 @@ real AWS S3.
 
 | Backend | Proves | Suites |
 |---|---|---|
-| RustFS 1.0.1, pinned by image digest in `crates/s3-test-server` | **Portable S3-server behavior:** what any S3-compatible server must do for DeltaForge to be correct on it | `sinks/lib-s3-server` (the contract below), `runner/s3_e2e_tests`, `sinks/s3_server_test` |
+| RustFS 1.0.1, pinned by image digest in `crates/s3-test-server` | **Portable S3-server behavior:** what any S3-compatible server must do for DeltaForge to be correct on it | `sinks/lib-s3-server` (the contract below), `sinks/lib-s3-server-it` (the durable_v2 live matrix), `runner/s3_e2e_tests`, `sinks/s3_server_test` |
 | MiniStack 1.4.9, pinned by image digest in `crates/runner/tests/ministack` | **The AWS-shaped path:** AWS-style endpoints, credentials and responses, through the production legacy rolling and durable_v2 sinks | `runner/s3_ministack_canary`, `runner/s3_ministack_durable_canary` |
 
 Real-AWS qualification remains a separate, eventual step. An emulator
@@ -49,9 +49,13 @@ The suite is `#[ignore]`d and starts its own container:
 cargo test -p sinks --lib -- --include-ignored --test-threads=1 s3_server_contract
 ```
 
-The env-gated live durable_v2 matrix in `s3_server_it` runs against any
-server, the pinned RustFS included. See
-[Durable acknowledgements](s3-durable-acks.md).
+The contract verifies S3 semantics. DeltaForge's durable sink behavior on a
+real server is verified separately by the live durable_v2 matrix in
+`s3_server_it` (core gate lane `sinks/lib-s3-server-it`): publication and
+recovery, writer fencing, rollup fallback, garbage collection and orphan
+reconciliation. It starts the pinned server when no `DELTAFORGE_IT_S3_*`
+variable is set, uses an external server when the full set is given, and
+refuses a partial set. See [Durable acknowledgements](s3-durable-acks.md).
 
 ## Changing the pinned image
 
@@ -59,7 +63,8 @@ The image, credentials, readiness check and container setup live only in
 `crates/s3-test-server`. To move to a new RustFS release:
 
 1. Pin the new release by tag and digest.
-2. Run the contract suite, `runner/s3_e2e_tests` and `sinks/s3_server_test`.
+2. Run the contract suite, `s3_server_it`, `runner/s3_e2e_tests` and
+   `sinks/s3_server_test`.
 3. Adopt it only if every check passes unchanged. If a check fails, record
    the exact request, the expected AWS behavior and the actual response.
    Do not relax the assertion.
