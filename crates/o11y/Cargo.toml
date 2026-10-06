@@ -13,6 +13,7 @@ metrics-exporter-prometheus = "0.17"
 axum.workspace = true
 tokio.workspace = true
 once_cell = "1"
+deltaforge-core = { path = "../deltaforge-core" }
 
 [lints]
 workspace = true

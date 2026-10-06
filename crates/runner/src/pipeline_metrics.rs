@@ -25,4 +25,5 @@ pub fn register(spec: &PipelineSpec) -> Arc<TableMetrics> {
 /// Forget a deleted pipeline's policy and per-table series.
 pub fn forget(pipeline: &str) {
     table_metrics::unregister(pipeline);
+    o11y::table_lag::global().remove_pipeline(pipeline);
 }

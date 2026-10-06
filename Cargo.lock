@@ -3829,6 +3829,7 @@ name = "o11y"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "deltaforge-core",
  "metrics",
  "metrics-exporter-prometheus",
  "once_cell",

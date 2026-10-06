@@ -1,6 +1,7 @@
 pub mod df_metrics;
 pub mod logging;
 pub mod panic;
+pub mod table_lag;
 pub mod tracing;
 
 /// Top-level config for observability.

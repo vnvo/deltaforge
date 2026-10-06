@@ -109,10 +109,18 @@ pub fn bind_metrics_listener(
 
 /// Axum handler that renders the current metrics snapshot.
 pub async fn metrics_handler() -> String {
-    HANDLE
-        .get()
-        .map(|h| h.render())
-        .unwrap_or_else(|| "# recorder not installed\n".into())
+    let Some(handle) = HANDLE.get() else {
+        return "# recorder not installed\n".into();
+    };
+    let mut out = handle.render();
+    let lag = crate::table_lag::global().render(std::time::Instant::now());
+    if !lag.is_empty() {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&lag);
+    }
+    out
 }
 
 pub fn router_with_metrics() -> Router {

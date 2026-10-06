@@ -2054,20 +2054,38 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
             )
             .set(lag_secs);
 
-            // Per-table lag: track the last event timestamp per table in this batch.
-            let mut table_lag: HashMap<String, f64> = HashMap::new();
-            for ev in &events {
-                let table_key = format!("{}.{}", ev.source.db, ev.source.table);
-                let ev_lag = ((now_ms - ev.ts_ms).max(0) as f64) / 1000.0;
-                table_lag.insert(table_key, ev_lag);
-            }
-            for (table, lag) in &table_lag {
-                gauge!(
-                    "deltaforge_source_table_lag_seconds",
-                    "pipeline" => self.pipeline_name.to_string(),
-                    "table" => table.clone(),
-                )
-                .set(*lag);
+            // Per-table lag, only with per-table detail enabled: the lag of
+            // each table's latest event in this batch; tables sharing the
+            // overflow series report their largest.
+            let tables = deltaforge_core::table_metrics::for_pipeline(
+                &self.pipeline_name,
+            );
+            if let Some(policy) = tables.policy() {
+                let mut table_lag: HashMap<String, f64> = HashMap::new();
+                for ev in &events {
+                    let table_key =
+                        format!("{}.{}", ev.source.db, ev.source.table);
+                    let ev_lag = ((now_ms - ev.ts_ms).max(0) as f64) / 1000.0;
+                    table_lag.insert(table_key, ev_lag);
+                }
+                let mut by_label = HashMap::new();
+                for (table, lag) in table_lag {
+                    if let Some(label) = tables.label(&table) {
+                        let slot: &mut f64 =
+                            by_label.entry(label).or_insert(lag);
+                        *slot = slot.max(lag);
+                    }
+                }
+                let now = std::time::Instant::now();
+                for (label, lag) in by_label {
+                    o11y::table_lag::global().set(
+                        &self.pipeline_name,
+                        policy,
+                        label,
+                        lag,
+                        now,
+                    );
+                }
             }
 
             // E2E latency: first event's pipeline-receive time → now (before sink
