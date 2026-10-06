@@ -316,10 +316,12 @@ checkpoint is unaffected** - the notes below apply only when a snapshot runs.
 - **Interrupted snapshots.** An owned, inactive slot left by a snapshot that was
   interrupted before its first checkpoint is re-anchored (dropped and recreated
   for a fresh consistent point) and fully re-snapshotted automatically.
-- **Safe re-snapshotting.** To take a fresh, correctly-anchored snapshot: stop the
-  pipeline; clear the checkpoint (or set `mode: always`); ensure the slot is either
-  owned and inactive or dropped so DeltaForge recreates it; restart. A completed,
-  safely-anchored snapshot resets `deltaforge_snapshot_unsafe_anchor` to `0`.
+- **Safe re-snapshotting.** To take a fresh, correctly-anchored snapshot, stop the
+  pipeline and apply the [`resnapshot` recovery operation](../recovery.md#resnapshot)
+  (or set `mode: always`), then resume. Checkpoints are kept; a slot this source
+  owns is re-anchored, and a lost one is recreated only under the operation's
+  explicit authorization. A completed, safely-anchored snapshot resets
+  `deltaforge_snapshot_unsafe_anchor` to `0`.
 
 ## Type Handling
 

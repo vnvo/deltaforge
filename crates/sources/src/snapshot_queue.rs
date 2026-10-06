@@ -290,6 +290,90 @@ pub struct GenerationControl {
     pub adoption: Adoption,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaced: Option<u64>,
+    /// How the generation was allocated, when it matters to a start: a
+    /// recovery allocation (`docs/design/recovery-cli.md`) with nothing
+    /// planned yet is run in place instead of being replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocation: Option<AllocationMark>,
+}
+
+/// See [`GenerationControl::allocation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AllocationMark {
+    /// Allocated by the recovery operation `resnapshot`.
+    Recovery,
+}
+
+/// The digest of a control record's encoded bytes (a recovery step's
+/// observation of it).
+pub fn control_digest(control: &GenerationControl) -> String {
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(control).expect("a control record serializes"),
+    ))
+}
+
+/// The generation `resnapshot` replaces `control` with: the next one of its
+/// chain, of its (verified) lineage, freezing the currently configured
+/// table fingerprint and policy, its block cleared and its start barrier
+/// pending. Pure, so a plan can bind it.
+pub fn recovery_successor(
+    control: &GenerationControl,
+    config_fingerprint: &str,
+    policy: PolicySnapshot,
+) -> GenerationControl {
+    GenerationControl {
+        record_format: RECORD_FORMAT,
+        snapshot_chain: control.snapshot_chain.clone(),
+        legacy_through: control.legacy_through,
+        generation: control.generation + 1,
+        lineage: control.lineage.clone(),
+        fingerprint_format: CONFIG_FINGERPRINT_FORMAT,
+        config_fingerprint: config_fingerprint.to_string(),
+        state: State::Allocated,
+        run: None,
+        plan: PlanSummary::default(),
+        anchor: None,
+        anchored_at_ms: None,
+        policy,
+        terminal: None,
+        completion: None,
+        blocked: None,
+        adoption: Adoption::Pending,
+        replaced: Some(control.generation),
+        allocation: Some(AllocationMark::Recovery),
+    }
+}
+
+/// The first generation `resnapshot` allocates for a source without a
+/// control record, in the given (deterministic) chain.
+pub fn recovery_first(
+    snapshot_chain: String,
+    lineage: PersistedLineage,
+    config_fingerprint: &str,
+    policy: PolicySnapshot,
+) -> GenerationControl {
+    GenerationControl {
+        record_format: RECORD_FORMAT,
+        snapshot_chain,
+        legacy_through: None,
+        generation: 1,
+        lineage,
+        fingerprint_format: CONFIG_FINGERPRINT_FORMAT,
+        config_fingerprint: config_fingerprint.to_string(),
+        state: State::Allocated,
+        run: None,
+        plan: PlanSummary::default(),
+        anchor: None,
+        anchored_at_ms: None,
+        policy,
+        terminal: None,
+        completion: None,
+        blocked: None,
+        adoption: Adoption::Pending,
+        replaced: None,
+        allocation: Some(AllocationMark::Recovery),
+    }
 }
 
 impl GenerationControl {
@@ -538,6 +622,7 @@ impl QueueStore {
             blocked: None,
             adoption: Adoption::Pending,
             replaced: None,
+            allocation: None,
         };
         let version = self.create(&control).await?;
         Ok((version, control))
@@ -604,6 +689,7 @@ impl QueueStore {
                         blocked: None,
                         adoption: Adoption::Pending,
                         replaced: Some(control.generation),
+                        allocation: None,
                     },
                 )
             }
@@ -634,6 +720,7 @@ impl QueueStore {
                         blocked: None,
                         adoption: Adoption::Pending,
                         replaced: Some(record.generation),
+                        allocation: None,
                     },
                 )
             }
@@ -686,6 +773,7 @@ impl QueueStore {
             blocked: None,
             adoption: Adoption::None,
             replaced: None,
+            allocation: None,
         };
         let version = self.cas(*version, &control).await?;
         Ok((version, control))
@@ -897,6 +985,40 @@ impl QueueStore {
         };
         let version = self.cas(version, &next).await?;
         Ok((version, next))
+    }
+
+    /// Write a recovery allocation (the recovery-only write): `next` over
+    /// exactly `expected` (the version a plan bound), or as the first
+    /// record when `expected` is `None`. Its plan items must not exist.
+    pub async fn write_recovery(
+        &self,
+        expected: Option<u64>,
+        next: &GenerationControl,
+    ) -> Result<u64> {
+        if next.allocation != Some(AllocationMark::Recovery)
+            || next.state != State::Allocated
+        {
+            return Err(QueueError::InvalidTransition(
+                "only a recovery allocation is written by recovery".into(),
+            ));
+        }
+        next.policy.validate().map_err(QueueError::InvalidPolicy)?;
+        match expected {
+            Some(v) => {
+                self.ensure_no_items(next.generation).await?;
+                self.cas(v, next).await
+            }
+            None => self.create(next).await,
+        }
+    }
+
+    /// Whether generation `g` has any plan item.
+    pub async fn has_items(&self, generation: u64) -> Result<bool> {
+        match self.ensure_no_items(generation).await {
+            Ok(()) => Ok(false),
+            Err(QueueError::StaleItems { .. }) => Ok(true),
+            Err(e) => Err(e),
+        }
     }
 
     /// Delete generation `g`'s plan items, page by page, once the control

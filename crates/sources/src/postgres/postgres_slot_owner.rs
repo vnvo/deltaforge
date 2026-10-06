@@ -351,6 +351,8 @@ pub async fn prepare_snapshot_slot_anchor(
     pipeline: &str,
     source_id: &str,
     chkpt: &Arc<dyn CheckpointStore>,
+    backend: &storage::ArcStorageBackend,
+    generation: u64,
 ) -> Result<Lsn, SourceError> {
     let client = connect(dsn).await.map_err(|e| SourceError::Connect {
         details: e.to_string().into(),
@@ -362,14 +364,47 @@ pub async fn prepare_snapshot_slot_anchor(
         .map_err(SourceError::Other)?
     {
         None => {
-            // Fresh: any stale Creating record is overwritten (no slot exists,
-            // so nothing is ambiguous).
+            // A slot this source created and lost is recreated only under a
+            // `resnapshot` authorization for exactly this generation, taken
+            // before the slot is created (or resumed, when a start of this
+            // generation took it and stopped before creating). Fresh: no
+            // finalized record, and any stale Creating record is overwritten
+            // (no slot exists, so nothing is ambiguous).
+            let authorized = authorize_recreation(
+                chkpt, backend, source_id, pipeline, slot, generation,
+            )
+            .await?;
+            if authorized.is_some()
+                && crate::snapshot_probe::slot_recreation_point(
+                    crate::snapshot_probe::SlotRecreationPoint::BeforeCreate,
+                )
+                .await
+            {
+                return Err(SourceError::Other(anyhow::anyhow!(
+                    "injected crash before the slot was created"
+                )));
+            }
             let c = create_owned_slot(
                 &client, chkpt, slot, pipeline, source_id, &id,
             )
             .await
             .map_err(SourceError::Other)?;
             info!(source_id, slot, consistent_lsn = %c, "created replication slot at consistent point");
+            if authorized.is_some() {
+                if crate::snapshot_probe::slot_recreation_point(
+                    crate::snapshot_probe::SlotRecreationPoint::AfterCreate,
+                )
+                .await
+                {
+                    return Err(SourceError::Other(anyhow::anyhow!(
+                        "injected crash after the slot was created"
+                    )));
+                }
+                complete_recreation(
+                    chkpt, backend, source_id, pipeline, slot, generation, c,
+                )
+                .await?;
+            }
             Ok(c)
         }
         Some(active) => {
@@ -381,6 +416,17 @@ pub async fn prepare_snapshot_slot_anchor(
                 .unwrap_or(false);
 
             if owned && !active {
+                // The slot this generation's authorized recreation created
+                // (its completion maybe not recorded yet): the post-state of
+                // that creation, kept as the anchor and audited; never
+                // created again.
+                if let Some(c) = recreated_by_this_generation(
+                    chkpt, backend, source_id, pipeline, slot, generation,
+                )
+                .await?
+                {
+                    return Ok(c);
+                }
                 // Interrupted owned snapshot (or Always re-snapshot): re-anchor.
                 drop_slot(&client, slot).await.map_err(SourceError::Other)?;
                 let c = create_owned_slot(
@@ -408,6 +454,311 @@ pub async fn prepare_snapshot_slot_anchor(
             }
         }
     }
+}
+
+/// The ownership record's bytes, its digest, and its lifecycle.
+async fn owner_state(
+    chkpt: &Arc<dyn CheckpointStore>,
+    source_id: &str,
+) -> Result<Option<(String, SlotOwnership)>, SourceError> {
+    let raw = chkpt.get_raw(&owner_key(source_id)).await.map_err(|e| {
+        SourceError::Checkpoint {
+            details: format!("read the slot ownership record: {e}").into(),
+        }
+    })?;
+    Ok(raw.and_then(|b| {
+        let rec = serde_json::from_slice::<SlotOwnership>(&b).ok()?;
+        use sha2::{Digest, Sha256};
+        Some((hex::encode(Sha256::digest(&b)), rec))
+    }))
+}
+
+/// Before a missing slot is created: when the ownership record shows this
+/// source created it before (or a start of this generation began creating
+/// it), take or resume the matching `resnapshot` authorization, or refuse.
+/// `None`: a fresh creation, no authorization involved.
+async fn authorize_recreation(
+    chkpt: &Arc<dyn CheckpointStore>,
+    backend: &storage::ArcStorageBackend,
+    source_id: &str,
+    pipeline: &str,
+    slot: &str,
+    generation: u64,
+) -> Result<Option<crate::snapshot_recovery::SlotRecreation>, SourceError> {
+    let Some((digest, owner)) = owner_state(chkpt, source_id).await? else {
+        return Ok(None);
+    };
+    let creating = owner.lifecycle == SlotLifecycle::Creating;
+    let taken = crate::snapshot_recovery::take_slot_recreation(
+        backend, source_id, pipeline, slot, generation, &digest, creating,
+    )
+    .await
+    .map_err(SourceError::Other)?;
+    match taken {
+        Some(auth) => {
+            warn!(
+                source_id,
+                slot,
+                generation,
+                "recreating the lost replication slot under its resnapshot authorization"
+            );
+            Ok(Some(auth))
+        }
+        // A creation intent with no authorization: a fresh creation.
+        None if creating => Ok(None),
+        None => Err(fail_closed(format!(
+            "replication slot '{slot}' was created by this source and is gone. \
+             It is never recreated implicitly: run `deltaforge recover plan \
+             resnapshot` and apply it, which authorizes recreating it for the \
+             new snapshot generation."
+        ))),
+    }
+}
+
+/// After an authorized creation: record it (`created`, bound to the
+/// ownership record the creation wrote) and audit it, once.
+async fn complete_recreation(
+    chkpt: &Arc<dyn CheckpointStore>,
+    backend: &storage::ArcStorageBackend,
+    source_id: &str,
+    pipeline: &str,
+    slot: &str,
+    generation: u64,
+    consistent: Lsn,
+) -> Result<(), SourceError> {
+    let (digest, _) =
+        owner_state(chkpt, source_id).await?.ok_or_else(|| {
+            SourceError::Other(anyhow::anyhow!(
+                "the slot ownership record vanished after the slot was created"
+            ))
+        })?;
+    let done = crate::snapshot_recovery::complete_slot_recreation(
+        backend,
+        source_id,
+        pipeline,
+        slot,
+        generation,
+        &digest,
+        &consistent.to_string(),
+    )
+    .await
+    .map_err(SourceError::Other)?;
+    audit_recreation(backend, &done).await
+}
+
+async fn audit_recreation(
+    backend: &storage::ArcStorageBackend,
+    done: &crate::snapshot_recovery::SlotRecreation,
+) -> Result<(), SourceError> {
+    let created = done.created.as_ref().ok_or_else(|| {
+        SourceError::Other(anyhow::anyhow!("the recreation is not completed"))
+    })?;
+    storage::adapters::recovery::RecoveryStore::new(
+        backend.clone(),
+        &done.pipeline,
+    )
+    .append_event(
+        &done.proof,
+        "slot_recreated",
+        std::collections::BTreeMap::from([
+            ("slot".to_string(), done.slot.clone()),
+            ("generation".to_string(), done.generation.to_string()),
+            ("consistent_lsn".to_string(), created.consistent_lsn.clone()),
+        ]),
+        created.at_ms,
+    )
+    .await
+    .map_err(SourceError::Other)
+}
+
+/// The slot, owned and present, when this generation's authorized
+/// recreation created it: its consistent point (completion recorded and
+/// audit repaired if a stop interrupted them). `None` otherwise.
+async fn recreated_by_this_generation(
+    chkpt: &Arc<dyn CheckpointStore>,
+    backend: &storage::ArcStorageBackend,
+    source_id: &str,
+    pipeline: &str,
+    slot: &str,
+    generation: u64,
+) -> Result<Option<Lsn>, SourceError> {
+    use crate::snapshot_recovery::SlotRecreationState as S;
+    let Some(auth) = crate::snapshot_recovery::slot_recreation_of(
+        backend, source_id, pipeline, slot, generation,
+    )
+    .await
+    .map_err(SourceError::Other)?
+    else {
+        return Ok(None);
+    };
+    let Some((digest, owner)) = owner_state(chkpt, source_id).await? else {
+        return Ok(None);
+    };
+    let Some(consistent) = owner
+        .consistent_lsn
+        .as_deref()
+        .and_then(|l| Lsn::parse(l).ok())
+    else {
+        return Ok(None);
+    };
+    let ours = match (&auth.state, &auth.created) {
+        // Created after the authorization was taken: the record is the
+        // creation's own (finalized, not the one authorized over).
+        (S::Consumed, None) => {
+            owner.lifecycle == SlotLifecycle::Created
+                && digest != auth.owner_record
+        }
+        (S::Created, Some(c)) => c.owner_record == digest,
+        _ => false,
+    };
+    if !ours {
+        return Ok(None);
+    }
+    complete_recreation(
+        chkpt, backend, source_id, pipeline, slot, generation, consistent,
+    )
+    .await?;
+    info!(source_id, slot, consistent_lsn = %consistent, "kept the slot this generation's authorized recreation created");
+    Ok(Some(consistent))
+}
+
+/// The configured replication slot as the recovery operation `resnapshot`
+/// sees it (`docs/design/recovery-cli.md`, section 5.1): observed on one
+/// connection, with the durable ownership proof startup uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SlotObservation {
+    pub slot: String,
+    pub system_identifier: String,
+    pub database: String,
+    pub database_oid: i64,
+    /// The ownership record's bytes digest, or `absent`.
+    pub owner_record: String,
+    /// Whether the ownership record proves this source (and pipeline) owns
+    /// a slot of this name on this server and database, under the startup
+    /// rules (a finalized record), whether or not the slot exists now.
+    pub owner_proven: bool,
+    /// `None`: no slot by that name.
+    pub present: Option<SlotPresent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SlotPresent {
+    pub active: bool,
+    pub wal_status: Option<String>,
+    pub invalidation: Option<String>,
+    /// Ownership proven under the startup rules (finalized record of this
+    /// source, pipeline, server, database, slot and plugin).
+    pub owned: bool,
+}
+
+impl SlotObservation {
+    /// The slot exists but its retention is lost or it was invalidated.
+    pub fn lost(&self) -> bool {
+        self.present.as_ref().is_some_and(|p| {
+            p.wal_status.as_deref() == Some("lost") || p.invalidation.is_some()
+        })
+    }
+
+    pub fn digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(self).expect("an observation serializes"),
+        ))
+    }
+}
+
+async fn observe_on(
+    client: &tokio_postgres::Client,
+    slot: &str,
+    pipeline: &str,
+    source_id: &str,
+    chkpt: &Arc<dyn CheckpointStore>,
+) -> Result<SlotObservation> {
+    let id = fetch_identity(client).await?;
+    let raw = chkpt
+        .get_raw(&owner_key(source_id))
+        .await
+        .map_err(|e| anyhow::anyhow!("read the slot ownership record: {e}"))?;
+    let owner_record = match &raw {
+        None => "absent".to_string(),
+        Some(b) => {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(b))
+        }
+    };
+    let row = client
+        .query_opt(
+            &format!(
+                "SELECT active, wal_status::text, {} \
+                 FROM pg_replication_slots s WHERE slot_name = $1",
+                super::postgres_health::INVALIDATION
+            ),
+            &[&slot],
+        )
+        .await
+        .context("query the replication slot")?;
+    let owner_proven = raw
+        .as_deref()
+        .and_then(|b| serde_json::from_slice::<SlotOwnership>(b).ok())
+        .is_some_and(|rec| {
+            ownership_proven(&rec, source_id, pipeline, slot, &id)
+        });
+    let present = row.map(|r| SlotPresent {
+        active: r.get(0),
+        wal_status: r.get(1),
+        invalidation: r.get(2),
+        owned: owner_proven,
+    });
+    Ok(SlotObservation {
+        slot: slot.to_string(),
+        system_identifier: id.system_identifier,
+        database: id.database,
+        database_oid: id.database_oid,
+        owner_record,
+        owner_proven,
+        present,
+    })
+}
+
+/// Observe the configured slot (see [`SlotObservation`]).
+pub async fn observe_slot(
+    dsn: &str,
+    slot: &str,
+    pipeline: &str,
+    source_id: &str,
+    chkpt: &Arc<dyn CheckpointStore>,
+) -> Result<SlotObservation> {
+    let client = connect(dsn).await?;
+    observe_on(&client, slot, pipeline, source_id, chkpt).await
+}
+
+/// Drop the configured slot, only when, observed on the same connection, it
+/// is exactly `expected` (the planned observation) and that is an owned,
+/// inactive, lost slot. The next start creates the new slot through the
+/// ownership-recording path.
+pub async fn drop_lost_owned_slot(
+    dsn: &str,
+    slot: &str,
+    pipeline: &str,
+    source_id: &str,
+    chkpt: &Arc<dyn CheckpointStore>,
+    expected: &str,
+) -> Result<()> {
+    let client = connect(dsn).await?;
+    let now = observe_on(&client, slot, pipeline, source_id, chkpt).await?;
+    let droppable = now.present.as_ref().is_some_and(|p| p.owned && !p.active)
+        && now.lost();
+    anyhow::ensure!(
+        now.digest() == expected && droppable,
+        "replication slot '{slot}' is not the owned, inactive, lost slot the \
+         plan observed; nothing was dropped"
+    );
+    drop_slot(&client, slot).await?;
+    warn!(
+        source_id,
+        slot, "dropped the owned lost replication slot for resnapshot"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

@@ -35,13 +35,14 @@ use postgres_errors::LoopControl;
 pub use postgres_errors::{PostgresSourceError, PostgresSourceResult};
 
 mod postgres_checkpoint_chain;
-mod postgres_continuity;
+pub(crate) mod postgres_continuity;
 mod postgres_helpers;
 use postgres_helpers::{
     connect_replication_with_retries, ensure_publication_exists,
     ensure_slot_and_publication, prepare_replication_client,
 };
 
+pub mod postgres_adoption;
 pub mod postgres_slot_owner;
 
 pub mod postgres_rotation;
@@ -1008,6 +1009,8 @@ impl PostgresSource {
             &self.pipeline,
             &self.id,
             chkpt_store,
+            &self.backend,
+            control.generation,
         )
         .await?;
         let after = facts("snapshot anchor").await?;
@@ -2938,6 +2941,12 @@ pub(super) fn continuity_unproven_draft(
         // A recovery operation may later prove a route; for now inspect and
         // re-snapshot.
         &[ActionCode::InspectLogs, ActionCode::Resnapshot]
+    } else if class == "timeline_unrecorded" {
+        &[
+            ActionCode::AdoptTimeline,
+            ActionCode::Resnapshot,
+            ActionCode::UseNewSourceId,
+        ]
     } else if lost {
         &[ActionCode::Resnapshot, ActionCode::UseNewSourceId]
     } else {

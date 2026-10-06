@@ -136,7 +136,7 @@ pub(crate) fn parse_history(
 /// The slot row as the session read it. Every field is optional: a column
 /// this server version lacks, or a NULL, is unknown.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct SlotFacts {
+pub struct SlotFacts {
     pub slot_type: Option<String>,
     pub temporary: Option<bool>,
     /// Why the slot was invalidated (`invalidation_reason`, or `conflicting`
@@ -147,6 +147,8 @@ pub(crate) struct SlotFacts {
     pub confirmed: Option<Lsn>,
     pub failover: Option<bool>,
     pub synced: Option<bool>,
+    /// Whether a session holds the slot now.
+    pub active: Option<bool>,
 }
 
 impl SlotFacts {
@@ -169,13 +171,14 @@ impl SlotFacts {
             confirmed: lsn("confirmed_flush_lsn"),
             failover: flag("failover"),
             synced: flag("synced"),
+            active: flag("active"),
         }
     }
 }
 
 /// What the replication session showed before START_REPLICATION.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SessionFacts {
+pub struct SessionFacts {
     pub system_identifier: u64,
     pub database_oid: u64,
     pub timeline: u32,
@@ -631,6 +634,7 @@ mod tests {
             restart: Some(lsn(F - 0x100)),
             confirmed: Some(lsn(F)),
             failover: Some(true),
+            active: Some(false),
             synced: Some(false),
         }
     }

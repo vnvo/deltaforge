@@ -67,6 +67,14 @@ struct Args {
     /// `snapshot.max_snapshot_connections`.
     #[arg(long, default_value_t = sources::snapshot_permits::DEFAULT_MAX_SNAPSHOT_CONNECTIONS)]
     max_snapshot_connections: u32,
+    /// Recovery admin listener (`deltaforge recover`). Loopback only; use an
+    /// SSH tunnel for remote administration.
+    #[arg(long, default_value = "127.0.0.1:9091")]
+    admin_addr: String,
+    /// File holding the admin bearer token (mode 600, at least 32 bytes).
+    /// Without it the recovery admin listener does not start.
+    #[arg(long)]
+    admin_token_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -121,6 +129,67 @@ enum Command {
         #[command(subcommand)]
         action: GateAction,
     },
+    /// Diagnose, plan and apply recovery operations through the running
+    /// server's loopback admin listener (see "Recovery Operations").
+    ///
+    /// Exit codes: 0 ok; 2 invalid input or authentication; 3 proof
+    /// mismatch; 4 pipeline state; 5 recovery pending, diverged or stopped;
+    /// 6 transport or server failure (outcome may be unknown).
+    Recover {
+        /// The admin listener (loopback http only).
+        #[arg(long, default_value = "http://127.0.0.1:9091")]
+        admin_url: String,
+        /// File holding the admin token (mode 600). The token is never
+        /// accepted on the command line.
+        #[arg(long)]
+        admin_token_file: std::path::PathBuf,
+        /// Emit the server's JSON instead of text.
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        action: RecoverAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum RecoverAction {
+    /// Read-only: state, recovery operation, incidents, next safe action.
+    Diagnose {
+        /// The pipeline.
+        pipeline: String,
+    },
+    /// Read-only: the canonical plan of an operation, ending with its proof.
+    Plan {
+        /// The operation (for example `resnapshot`).
+        operation: String,
+        #[arg(long)]
+        pipeline: String,
+        /// The incident the operation answers.
+        #[arg(long)]
+        incident: Option<String>,
+        /// Operation arguments, `key=value`.
+        #[arg(long = "arg")]
+        args: Vec<String>,
+    },
+    /// Apply exactly the reviewed plan. Never retried automatically.
+    Apply {
+        operation: String,
+        #[arg(long)]
+        pipeline: String,
+        #[arg(long)]
+        incident: Option<String>,
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        /// The proof printed by `recover plan`.
+        #[arg(long)]
+        expect_proof: String,
+        /// Who applies it (recorded, not verified).
+        #[arg(long)]
+        actor: String,
+        /// Why (recorded in the audit).
+        #[arg(long)]
+        reason: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -149,6 +218,64 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!(e))?;
 
     // One-shot subcommands run before server/observability boot (no port binds).
+    if let Some(Command::Recover {
+        admin_url,
+        admin_token_file,
+        json,
+        action,
+    }) = &args.command
+    {
+        use runner::recover_cli::{Action, Client, run};
+        let client = match Client::new(admin_url, admin_token_file) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{}", e.message);
+                std::process::exit(e.code);
+            }
+        };
+        let action = match action.clone() {
+            RecoverAction::Diagnose { pipeline } => {
+                Action::Diagnose { pipeline }
+            }
+            RecoverAction::Plan {
+                operation,
+                pipeline,
+                incident,
+                args,
+            } => Action::Plan {
+                operation,
+                pipeline,
+                incident,
+                args,
+            },
+            RecoverAction::Apply {
+                operation,
+                pipeline,
+                incident,
+                args,
+                expect_proof,
+                actor,
+                reason,
+            } => Action::Apply {
+                operation,
+                pipeline,
+                incident,
+                args,
+                expect_proof,
+                actor,
+                reason,
+            },
+        };
+        let code = run(
+            &client,
+            action,
+            *json,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        )
+        .await;
+        std::process::exit(code);
+    }
     if let Some(Command::Preflight { config, json }) = &args.command {
         // Use the deployment's own storage backend so slot-ownership checks see
         // the same durable owner records startup uses.
@@ -336,6 +463,22 @@ async fn serve(
         .context("build pipeline manager")?,
     );
     *manager_slot = Some(manager.clone());
+    // The recovery admin listener: loopback only, a token always.
+    let admin = match &args.admin_token_file {
+        Some(path) => {
+            let addr = runner::recovery::admin_addr(&args.admin_addr)?;
+            let token = runner::recovery::load_admin_token(path)?;
+            let listener = TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("bind --admin-addr {addr}"))?;
+            info!(%addr, "recovery admin listening");
+            Some((listener, token))
+        }
+        None => {
+            info!("recovery admin listener disabled (no --admin-token-file)");
+            None
+        }
+    };
     let schema_api = Arc::new(SchemaApi::new(manager.clone()));
     let sensing_api = Arc::new(SensingApi::new(manager.clone()));
 
@@ -371,7 +514,7 @@ async fn serve(
     // ── HTTP server ───────────────────────────────────────────────────────────
     let app: Router = router_full(
         AppState {
-            controller: manager,
+            controller: manager.clone(),
         },
         SchemaState {
             controller: schema_api,
@@ -381,6 +524,34 @@ async fn serve(
         },
     );
     let app = app.merge(o11y::df_metrics::router_with_metrics());
+
+    if let Some((listener, token)) = admin {
+        let admin_app =
+            rest_api::recovery::router(rest_api::recovery::RecoveryState {
+                controller: Arc::new(
+                    runner::recovery::RecoveryService::new(manager.clone())
+                        .with_operation(Arc::new(
+                            runner::recovery_resnapshot::Resnapshot,
+                        ))
+                        .with_operation(Arc::new(
+                            runner::recovery_adopt_timeline::AdoptTimeline::default(),
+                        )),
+                ),
+                token,
+            });
+        let stop = shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(
+                listener,
+                admin_app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(stop.cancelled_owned())
+            .await
+            {
+                tracing::error!(error = %e, "recovery admin listener stopped");
+            }
+        });
+    }
 
     let addr = parse_listen_addr("api-addr", &args.api_addr)?;
     info!(%addr, "api listening");

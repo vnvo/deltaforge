@@ -14,8 +14,8 @@ use deltaforge_config::SnapshotMode;
 use crate::snapshot_generation::PersistedLineage;
 use crate::snapshot_position::{Classified, EngineOrder, classify_stored};
 use crate::snapshot_queue::{
-    Completion, EngineAnchor, GenerationControl, PolicyMode, PolicySnapshot,
-    QueueError, QueueStore, State, Stored,
+    AllocationMark, Completion, EngineAnchor, GenerationControl, PolicyMode,
+    PolicySnapshot, QueueError, QueueStore, State, Stored,
 };
 
 /// A sink's stored checkpoint key.
@@ -174,6 +174,8 @@ pub enum Allocation {
     /// A legacy snapshot without proof of its completion: one full recopy
     /// in a new chain.
     Legacy,
+    /// The recovery operation `resnapshot` allocated it; this start runs it.
+    Recovery,
 }
 
 /// What an engine knows about a legacy (pre-queue) snapshot, from its own
@@ -573,6 +575,24 @@ pub async fn decide_start<E: EngineOrder>(
             if never {
                 return Err(DriverError::NeverIncomplete {
                     generation: control.generation,
+                });
+            }
+            // A recovery allocation nothing has run yet is this start's to
+            // run, in place: no run, no plan item, and the lineage,
+            // configuration and policy it froze are still the source's.
+            // Anything else is replaced like any interrupted generation.
+            if control.state == State::Allocated
+                && control.allocation == Some(AllocationMark::Recovery)
+                && control.run.is_none()
+                && !drift
+                && control.config_fingerprint == input.config_fingerprint
+                && control.lineage.stable_matches(&input.lineage)
+                && !input.store.has_items(control.generation).await?
+            {
+                return Ok(StartOutcome::Snapshot {
+                    version: *version,
+                    control: (**control).clone(),
+                    why: Allocation::Recovery,
                 });
             }
             let why = if drift {
@@ -1063,6 +1083,87 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// A blocked generation replaced by recovery (`resnapshot`): the next
+    /// start runs that allocation in place; drift, a planned item or an
+    /// ordinary allocation is replaced as before.
+    #[tokio::test]
+    async fn a_recovery_allocation_is_run_in_place_only_while_untouched() {
+        use crate::snapshot_queue::{Blocked, recovery_successor};
+        let ck = MemCheckpointStore::new().unwrap();
+        // Blocked generation 1, replaced by recovery with generation 2.
+        let recovered = |backend: storage::ArcStorageBackend| async move {
+            let q = QueueStore::new(backend, "src");
+            let (v, c) = running(&q, "a").await;
+            let (v, c) = q
+                .block(
+                    v,
+                    &c,
+                    Blocked {
+                        reason: "snapshot_anchor_unavailable".into(),
+                        incident: "i".into(),
+                        since_ms: 0,
+                    },
+                )
+                .await
+                .unwrap();
+            let next = recovery_successor(&c, "fp", contract::policy());
+            q.write_recovery(Some(v), &next).await.unwrap();
+            (q, next)
+        };
+        let (q, next) = recovered(mem()).await;
+        assert!(next.blocked.is_none());
+        assert_eq!(next.adoption, crate::snapshot_queue::Adoption::Pending);
+        match decide_start(&input(&q, &ck)).await.unwrap() {
+            StartOutcome::Snapshot { control, why, .. } => {
+                assert_eq!(why, Allocation::Recovery);
+                assert_eq!(control, next, "run in place, unchanged");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Drift of the policy or configuration: replaced (generation 3).
+        for (fp, policy) in [
+            ("other", contract::policy()),
+            (
+                "fp",
+                PolicySnapshot::new(
+                    PolicyMode::All,
+                    None,
+                    vec![crate::snapshot_queue::PolicySink {
+                        id: "x".into(),
+                        required: true,
+                    }],
+                ),
+            ),
+        ] {
+            let (q, _) = recovered(mem()).await;
+            let mut i = input(&q, &ck);
+            i.config_fingerprint = fp;
+            i.policy = policy;
+            match decide_start(&i).await.unwrap() {
+                StartOutcome::Snapshot { control, why, .. } => {
+                    assert_ne!(why, Allocation::Recovery);
+                    assert_eq!(control.generation, 3);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // A plan item already written: replaced.
+        let (q, next) = recovered(mem()).await;
+        q.put_item(&next, &contract::item("t")).await.unwrap();
+        match decide_start(&input(&q, &ck)).await.unwrap() {
+            StartOutcome::Snapshot { why, .. } => {
+                assert_eq!(why, Allocation::ViewLost)
+            }
+            other => panic!("{other:?}"),
+        }
+        // Recovery writes only a recovery allocation.
+        let q = QueueStore::new(mem(), "src");
+        let (v, c) = running(&q, "a").await;
+        let mut plain = recovery_successor(&c, "fp", contract::policy());
+        plain.allocation = None;
+        assert!(q.write_recovery(Some(v), &plain).await.is_err());
     }
 
     /// Generation g of run A is replaced and owned by run B: A's owner
@@ -1596,6 +1697,12 @@ pub async fn report_start(
                         "legacy_recopy",
                     ));
                 }
+                (Allocation::Recovery, _) => tracing::info!(
+                    source_id,
+                    generation = control.generation,
+                    "running the snapshot generation allocated by the \
+                     recovery operation resnapshot: every table is copied again"
+                ),
                 (Allocation::ViewLost, Some(old)) => tracing::info!(
                     source_id,
                     replaced = old,

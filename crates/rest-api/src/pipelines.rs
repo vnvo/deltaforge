@@ -32,6 +32,25 @@ pub struct PipeInfo {
     /// Incident status - populated by the controller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incidents: Option<PipelineIncidents>,
+    /// The pipeline's recovery operation, when one is pending or its record
+    /// cannot be read - populated by the controller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<PipelineRecovery>,
+}
+
+/// A recovery operation that holds the pipeline stopped
+/// (`docs/design/recovery-cli.md`): it never starts until the operation is
+/// completed by an explicit re-apply.
+#[derive(Clone, Serialize, Deserialize, Default, Debug, PartialEq, Eq)]
+pub struct PipelineRecovery {
+    /// `recovery_pending`, or `recovery_record_unreadable`.
+    pub state: String,
+    pub operation: Option<String>,
+    pub proof: Option<String>,
+    pub step: Option<u32>,
+    pub steps: Option<u32>,
+    /// The operation stopped on a step that found an unexpected state.
+    pub diverged: bool,
 }
 
 /// A pipeline's incident status. Incident views hold codes, allow-listed
@@ -709,6 +728,7 @@ mod tests {
             },
             ops: None,
             incidents: None,
+            recovery: None,
         }
     }
 

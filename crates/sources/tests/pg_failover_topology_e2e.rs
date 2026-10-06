@@ -866,3 +866,353 @@ async fn a_standby_endpoint_is_retried_without_streaming() -> Result<()> {
     drop(t.primary);
     Ok(())
 }
+
+// ---- Recovery: pg-adopt-timeline (docs/design/recovery-cli.md, 5.2) -------
+
+/// Every checkpoint key of the source with its bytes.
+async fn all_checkpoints(d: &Durable) -> Vec<(String, Option<Vec<u8>>)> {
+    let mut keys = d
+        .ckpt
+        .list_with_prefix(&format!("{SOURCE}::sink::"))
+        .await
+        .unwrap();
+    keys.push(SOURCE.into());
+    keys.sort();
+    let mut out = Vec::new();
+    for k in keys {
+        let v = d.ckpt.get_raw(&k).await.unwrap();
+        out.push((k, v));
+    }
+    out
+}
+
+async fn put_json(d: &Durable, key: &str, v: &serde_json::Value) {
+    d.ckpt
+        .put_raw(key, &serde_json::to_vec(v).unwrap())
+        .await
+        .unwrap();
+}
+
+fn adoption_input<'a>(
+    dsn_: &'a str,
+    d: &'a Durable,
+    sinks: &'a [String],
+) -> sources::postgres::postgres_adoption::AdoptionInput<'a> {
+    sources::postgres::postgres_adoption::AdoptionInput {
+        dsn: dsn_,
+        slot: SLOT,
+        publication: PUBLICATION,
+        source_id: SOURCE,
+        tenant: "acme",
+        backend: &d.backend,
+        checkpoints: &d.ckpt,
+        sinks,
+        hook: None,
+    }
+}
+
+/// `pg-adopt-timeline` on a promoted PostgreSQL 17 primary whose source's
+/// checkpoints predate continuity records: every refusal writes nothing;
+/// adoption creates exactly transition 0 at F and moves no checkpoint; a
+/// re-apply is idempotent; an explicit resume runs the ordinary continuity
+/// proof and stamps every checkpoint (same chain and transition, same
+/// positions) before the first event, then streams exactly the changes
+/// after F.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn a_timeline_is_adopted_for_checkpoints_that_predate_continuity()
+-> Result<()> {
+    use sources::postgres::postgres_adoption::{
+        AdoptionRefusal, adopted_record, apply_adoption, plan_adoption,
+    };
+    init_test_tracing();
+    let t = start_topology("17").await;
+    create_schema(t.primary_port).await;
+    let root = admin(t.primary_port, "postgres").await;
+    root.batch_execute(
+        "ALTER SYSTEM SET synchronized_standby_slots = 'standby_slot'",
+    )
+    .await?;
+    root.batch_execute("SELECT pg_reload_conf()").await?;
+    let proxy = Proxy::start(t.primary_port).await;
+    let d = Durable::new();
+    run_until(&proxy, t.primary_port, &d, 1).await;
+    sync_idle(&t, &proxy, &d).await;
+
+    // Checkpoints written before continuity records: unstamped, two sinks
+    // at F, and no record.
+    let mut f = d.checkpoint().await;
+    for k in ["timeline", "chain", "transition"] {
+        f.as_object_mut().unwrap().remove(k);
+    }
+    let f_lsn = f["lsn"].as_str().unwrap().to_string();
+    for (k, _) in all_checkpoints(&d).await {
+        d.ckpt.delete(&k).await?;
+    }
+    let (sink_a, sink_b) =
+        (format!("{SOURCE}::sink::a"), format!("{SOURCE}::sink::b"));
+    put_json(&d, SOURCE, &f).await;
+    put_json(&d, &sink_a, &f).await;
+    put_json(&d, &sink_b, &f).await;
+    d.backend
+        .kv_delete("failover", &format!("pg_continuity:{SOURCE}"))
+        .await?;
+    let sinks = vec!["a".to_string(), "b".to_string()];
+    let before = all_checkpoints(&d).await;
+    let zero_writes = |what: &str| {
+        let what = what.to_string();
+        let before = before.clone();
+        let d = &d;
+        async move {
+            assert!(d.record().await.is_none(), "{what}: no record");
+            assert_eq!(all_checkpoints(d).await, before, "{what}: no move");
+        }
+    };
+
+    // Committed after F, before the failover.
+    insert(t.primary_port, 2).await;
+    wait_replayed(&t).await;
+    // A standby endpoint is refused.
+    let standby_dsn = dsn(t.standby_port, DB);
+    assert!(matches!(
+        plan_adoption(&adoption_input(&standby_dsn, &d, &sinks)).await,
+        Err(AdoptionRefusal::Precondition(m)) if m.contains("standby")
+    ));
+    zero_writes("standby").await;
+
+    t.primary.stop().await?;
+    promote(t.standby_port).await;
+    insert(t.standby_port, 3).await;
+    proxy.switch_to(t.standby_port);
+    assert_eq!(refused_with(&proxy, &d).await, "timeline_unrecorded");
+    zero_writes("the refused start").await;
+    // The promoted endpoint is a primary and its synchronized slot is idle.
+    let promoted = admin(t.standby_port, DB).await;
+    let row = promoted
+        .query_one(
+            &format!(
+                "SELECT pg_is_in_recovery(), active, synced \
+                 FROM pg_replication_slots WHERE slot_name = '{SLOT}'"
+            ),
+            &[],
+        )
+        .await?;
+    assert!(!row.get::<_, bool>(0), "primary");
+    assert!(!row.get::<_, bool>(1), "inactive");
+    assert!(row.get::<_, bool>(2), "synchronized");
+
+    // Every other refusal writes nothing.
+    let input = adoption_input(&standby_dsn, &d, &sinks);
+    // An active slot.
+    t.standby
+        .exec(ExecCommand::new([
+            "sh",
+            "-c",
+            &format!(
+                "setsid gosu postgres pg_recvlogical -h /var/run/postgresql \
+                 -d {DB} --slot {SLOT} --start -o proto_version=1 \
+                 -o publication_names={PUBLICATION} -f /dev/null \
+                 >/tmp/recv.log 2>&1 &"
+            ),
+        ]))
+        .await?;
+    let active = format!(
+        "SELECT active FROM pg_replication_slots WHERE slot_name = '{SLOT}'"
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !promoted.query_one(&active, &[]).await?.get::<_, bool>(0) {
+        assert!(Instant::now() < deadline, "the slot never became active");
+        sleep(Duration::from_millis(200)).await;
+    }
+    assert!(matches!(
+        plan_adoption(&input).await,
+        Err(AdoptionRefusal::Precondition(m)) if m.contains("in use")
+    ));
+    zero_writes("active slot").await;
+    t.standby
+        .exec(
+            ExecCommand::new(["sh", "-c", "pkill pg_recvlogical; true"])
+                .with_cmd_ready_condition(CmdWaitFor::exit()),
+        )
+        .await?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while promoted.query_one(&active, &[]).await?.get::<_, bool>(0) {
+        assert!(Instant::now() < deadline, "the slot stayed active");
+        sleep(Duration::from_millis(200)).await;
+    }
+    // F past the WAL flush, a slot bound past F, a snapshot position, a
+    // malformed position, a partial set: each refused, nothing written.
+    let at = |lsn: &str| {
+        let mut v = f.clone();
+        v["lsn"] = lsn.into();
+        v
+    };
+    let adopted =
+        serde_json::to_value(serde_json::from_slice::<serde_json::Value>(
+            &sources::snapshot_position::encode_adopted("c", 2, "d"),
+        )?)?;
+    // (what, checkpoint writes (None: delete), expected refusal text)
+    type Case<'a> =
+        (&'a str, Vec<(String, Option<serde_json::Value>)>, &'a str);
+    let cases: Vec<Case<'_>> = vec![
+        (
+            "flush below F",
+            vec![
+                (sink_a.clone(), Some(at("FF/0"))),
+                (sink_b.clone(), Some(at("FF/0"))),
+            ],
+            "WAL flush",
+        ),
+        (
+            "bound past F",
+            vec![(sink_a.clone(), Some(at("0/1")))],
+            "past the checkpoint",
+        ),
+        (
+            "snapshot position",
+            vec![(sink_b.clone(), Some(adopted))],
+            "snapshot position",
+        ),
+        (
+            "malformed",
+            vec![(sink_b.clone(), Some(serde_json::json!({"lsn": "garbage"})))],
+            "cannot be interpreted",
+        ),
+        ("partial", vec![(sink_b.clone(), None)], "partial"),
+        (
+            "stamped",
+            vec![(
+                sink_b.clone(),
+                Some({
+                    let mut v = f.clone();
+                    v["timeline"] = 1.into();
+                    v["chain"] = "c".into();
+                    v["transition"] = 0.into();
+                    v
+                }),
+            )],
+            "continuity stamp",
+        ),
+    ];
+    for (what, writes, expect) in cases {
+        for (k, v) in &writes {
+            match v {
+                Some(v) => put_json(&d, k, v).await,
+                None => {
+                    d.ckpt.delete(k).await?;
+                }
+            }
+        }
+        let r = plan_adoption(&input).await;
+        let msg = match &r {
+            Err(
+                AdoptionRefusal::Precondition(m) | AdoptionRefusal::Manual(m),
+            ) => m.clone(),
+            other => panic!("{what}: {other:?}"),
+        };
+        assert!(msg.contains(expect), "{what}: {msg}");
+        assert!(d.record().await.is_none(), "{what}: no record");
+        for (k, v) in &before {
+            match v {
+                Some(b) => d.ckpt.put_raw(k, b).await?,
+                None => {
+                    d.ckpt.delete(k).await?;
+                }
+            }
+        }
+        zero_writes(what).await;
+    }
+
+    // Adoption: transition 0 at F, nothing moved; the same apply again is
+    // idempotent. First, an apply after the slot became active since the
+    // plan is refused at apply time, nothing written.
+    let planned = plan_adoption(&input).await.unwrap();
+    let chain = "0123456789abcdef0123456789abcdef";
+    let record = adopted_record(chain, &planned.facts, &planned.f);
+    t.standby
+        .exec(ExecCommand::new([
+            "sh",
+            "-c",
+            &format!(
+                "setsid gosu postgres pg_recvlogical -h /var/run/postgresql \
+                 -d {DB} --slot {SLOT} --start -o proto_version=1 \
+                 -o publication_names={PUBLICATION} -f /dev/null \
+                 >/tmp/recv.log 2>&1 &"
+            ),
+        ]))
+        .await?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !promoted.query_one(&active, &[]).await?.get::<_, bool>(0) {
+        assert!(Instant::now() < deadline, "the slot never became active");
+        sleep(Duration::from_millis(200)).await;
+    }
+    assert!(matches!(
+        apply_adoption(&input, &planned, &record).await,
+        Err(AdoptionRefusal::Precondition(_))
+    ));
+    zero_writes("apply with an active slot").await;
+    t.standby
+        .exec(
+            ExecCommand::new(["sh", "-c", "pkill pg_recvlogical; true"])
+                .with_cmd_ready_condition(CmdWaitFor::exit()),
+        )
+        .await?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while promoted.query_one(&active, &[]).await?.get::<_, bool>(0) {
+        assert!(Instant::now() < deadline, "the slot stayed active");
+        sleep(Duration::from_millis(200)).await;
+    }
+    let planned = plan_adoption(&input).await.unwrap();
+    assert_eq!(planned.f, f_lsn);
+    assert_eq!(planned.facts.timeline, 2);
+    assert!(!planned.facts.in_recovery);
+    let record = adopted_record(chain, &planned.facts, &planned.f);
+    apply_adoption(&input, &planned, &record).await.unwrap();
+    let rec = d.record().await.unwrap();
+    assert_eq!(rec["chain_id"], chain);
+    assert_eq!(rec["transition_id"], 0);
+    assert_eq!(rec["timeline"], 2);
+    assert_eq!(rec["proven_at"], f_lsn.as_str());
+    assert_eq!(
+        all_checkpoints(&d).await,
+        before,
+        "apply moves no checkpoint"
+    );
+    apply_adoption(&input, &planned, &record).await.unwrap();
+    assert_eq!(d.record().await.unwrap(), rec);
+    // With the record there is nothing left to adopt.
+    assert!(matches!(
+        plan_adoption(&input).await,
+        Err(AdoptionRefusal::NotApplicable(m)) if m.contains("continuity record")
+    ));
+
+    // The explicit resume: the ordinary proof against the record, the
+    // checkpoints stamped before the first event, then exactly the changes
+    // after F.
+    let src_run = source(&proxy, &d).await;
+    let (tx, mut rx) =
+        test_common::acked_channel(&src_run, &d.ckpt, &src_run.id, 256);
+    let handle = src_run.run(tx, Arc::clone(&d.ckpt)).await;
+    let first =
+        collect(&mut rx, Duration::from_secs(60), |ids| !ids.is_empty()).await;
+    assert!(!first.is_empty(), "the stream started");
+    for key in [&sink_a, &sink_b] {
+        let cp: serde_json::Value =
+            serde_json::from_slice(&d.ckpt.get_raw(key).await?.unwrap())?;
+        assert_eq!(cp["chain"], chain, "{key}");
+        assert_eq!(cp["transition"], 0, "{key}");
+        assert_eq!(cp["timeline"], 2, "{key}");
+        assert_eq!(cp["lsn"], f_lsn.as_str(), "{key}: the same position");
+    }
+    let mut got = first;
+    got.extend(
+        collect(&mut rx, Duration::from_secs(60), |ids| ids.contains(&3)).await,
+    );
+    assert_eq!(got, vec![2, 3], "exactly the changes after F");
+    handle.stop();
+    handle.join().await.ok();
+    let after = d.record().await.unwrap();
+    assert_eq!(after["chain_id"], chain);
+    assert_eq!(after["transition_id"], 0, "no further transition");
+    Ok(())
+}

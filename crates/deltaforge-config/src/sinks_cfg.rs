@@ -332,6 +332,20 @@ pub enum SinkCfg {
 
 impl SinkCfg {
     /// Return the sink's unique identifier.
+    /// Whether delivery to this sink is required (the default).
+    pub fn required(&self) -> bool {
+        match self {
+            Self::Kafka(c) => c.required,
+            Self::Redis(c) => c.required,
+            Self::Nats(c) => c.required,
+            Self::Http(c) => c.required,
+            Self::S3(c) => c.required,
+            Self::ClickHouse(c) => c.required,
+            Self::Elasticsearch(c) => c.required,
+        }
+        .unwrap_or(true)
+    }
+
     pub fn sink_id(&self) -> &str {
         match self {
             Self::Kafka(c) => &c.id,

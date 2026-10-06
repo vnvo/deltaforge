@@ -2,12 +2,13 @@ use axum::Router;
 mod errors;
 mod health;
 pub mod pipelines;
+pub mod recovery;
 mod schemas;
 mod sensing;
 
 pub use errors::{PipelineAPIError, pipeline_error};
 pub use pipelines::{
-    AppState, PipeInfo, PipelineController, ReplayJobStatus,
+    AppState, PipeInfo, PipelineController, PipelineRecovery, ReplayJobStatus,
     ReplayStartRequest, ReplayStartResponse,
 };
 pub use schemas::{
@@ -244,6 +245,7 @@ mod tests {
             },
             ops: None,
             incidents: None,
+            recovery: None,
         }
     }
 
@@ -311,6 +313,41 @@ mod tests {
 
         assert_eq!(payload["status"], json!("ready"));
         assert_eq!(payload["pipelines"][0]["name"], json!("demo"));
+    }
+
+    #[tokio::test]
+    async fn a_pipeline_held_by_a_recovery_is_not_ready() {
+        let mut info = sample_pipe_info();
+        info.status = "stopped".to_string();
+        info.recovery = Some(PipelineRecovery {
+            state: "recovery_pending".into(),
+            operation: Some("resnapshot".into()),
+            proof: Some("abc".into()),
+            step: Some(1),
+            steps: Some(2),
+            diverged: false,
+        });
+        let app = router(AppState {
+            controller: Arc::new(HappyController { info }),
+        });
+        let ready = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, ready.status());
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(ready.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            payload["blocked_pipelines"][0]["recovery"]["state"],
+            json!("recovery_pending")
+        );
     }
 
     #[tokio::test]
