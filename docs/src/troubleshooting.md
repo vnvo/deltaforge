@@ -36,9 +36,11 @@ A `503` means at least one pipeline has entered a permanently failed state — i
 | Cause | Log message | Resolution |
 |-------|-------------|------------|
 | Failover to a server with no GTID overlap | `position lost after failover` | Re-snapshot from the new primary |
-| `RESET BINARY LOGS AND GTIDS` run on same server | `checkpoint GTID set no longer reachable` | Clear the checkpoint DB and re-snapshot |
+| `RESET BINARY LOGS AND GTIDS` run on same server | `checkpoint GTID set no longer reachable` | Apply the [`resnapshot` recovery operation](recovery.md#resnapshot) for the incident; never delete checkpoints by hand |
 | Unrecoverable source error | `run task ended with error` | Check source logs; fix the root cause and restart |
-| Snapshot generation blocked | incident `snapshot_anchor_unavailable` or `snapshot_bound_exceeded` | Fix the cause (retention, anchor age, plan bounds or tables), then resnapshot explicitly; a restart alone stops again. See [Bounds and blocking](snapshots.md#bounds-and-blocking) |
+| Snapshot generation blocked | incident `snapshot_anchor_unavailable` or `snapshot_bound_exceeded` | Fix the cause (retention, anchor age, plan bounds or tables), then apply the [`resnapshot` recovery operation](recovery.md#resnapshot); a restart alone stops again. See [Bounds and blocking](snapshots.md#bounds-and-blocking) |
+| PostgreSQL source stops with `timeline_unrecorded` | incident `pg_continuity_unproven` | Apply [`pg-adopt-timeline`](recovery.md#pg-adopt-timeline) on the primary, or [`resnapshot`](recovery.md#resnapshot) |
+| Pipeline will not start: `recovery_pending` | status `recovery_pending` | Run `deltaforge recover diagnose`, then re-apply the pending operation with its own proof. See [Pending and diverged operations](recovery.md#pending-and-diverged-operations) |
 | Snapshot state unusable | incident `snapshot_state_invalid` | Stored snapshot state is corrupt or of an unknown format and was left untouched; do not downgrade past it. See [Initial Snapshots](snapshots.md#upgrading-from-an-earlier-release-one-time-recopy) |
 
 Use `GET /pipelines` to see which pipeline has `"status": "failed"` and check its logs for the specific error. After fixing the root cause, restart the DeltaForge process (or the container) to reset pipeline state.

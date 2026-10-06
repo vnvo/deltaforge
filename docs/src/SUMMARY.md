@@ -31,6 +31,7 @@
 - [Guarantees & Correctness](guarantees.md)
 - [Dead Letter Queue](dlq.md)
 - [Event Replay](replay.md)
+- [Recovery Operations](recovery.md)
 - [Architecture](architecture.md)
     - [Checkpoints](checkpoints.md)
     - [Storage](storage.md)

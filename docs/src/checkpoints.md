@@ -75,14 +75,7 @@ sqlite3 ./data/deltaforge.db \
 
 ### Resetting a Pipeline
 
-To force a pipeline to re-read from the beginning, delete its checkpoint:
-
-```bash
-# Stop the pipeline, then delete its checkpoint directly in SQLite
-# (there is no checkpoint-reset REST endpoint).
-sqlite3 ./data/deltaforge.db \
-  "DELETE FROM df_kv WHERE ns = 'checkpoints' AND key = '{source-id}';"
-```
+Checkpoints are never edited or deleted by hand: a deleted or rewritten checkpoint can skip or lose changes, and the snapshot and continuity state that refers to it would no longer match. To copy a source's data again, use the reviewed, audited [`resnapshot` recovery operation](recovery.md#resnapshot) (it keeps every checkpoint and moves each sink into the new snapshot through its start barrier). To start a source from scratch, configure a new source id (it starts with a snapshot).
 
 ### Best Practices
 

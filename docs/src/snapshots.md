@@ -67,7 +67,7 @@ Two related stops are not bounds:
 
 **A blocked generation stays halted across restarts.** Every start re-raises its incident and stops before any row or replacement. These failures need an operator decision (raise the bound, narrow the tables, restore retention), so nothing retries them automatically.
 
-**Recovery** is an explicit, proof-bound `resnapshot` that replaces the blocked generation with a new one, audited with actor and reason. It is part of the recovery CLI, which is required for rc.1 but **not in this build**. Until it ships, a blocked generation stays halted.
+**Recovery** is the explicit, proof-bound [`resnapshot` recovery operation](recovery.md#resnapshot), which replaces the blocked generation with a recovery allocation of the next one, audited with actor and reason. Raise the bound or restore what the incident names first; then plan, review and apply it, and resume the pipeline.
 
 ## Connection limits
 

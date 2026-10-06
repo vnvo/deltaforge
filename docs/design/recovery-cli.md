@@ -1,6 +1,6 @@
 # Recovery Operations - Design (revision 2)
 
-**Status:** Directionally approved (2026-10-06); revision 2 applies the reviewer's four decisions and required corrections.
+**Status:** Implemented on branch `recovery-cli`; revision 2 applies the reviewer's four decisions and required corrections. Operator documentation: [Recovery Operations](../src/recovery.md). Later rulings during implementation: a combined `ResolvedByRecovery` incident transition; an explicit, single-use, crash-resumable slot recreation authorization; the recovery generation freezes the configured policy; identifiers a plan creates are derived from its plan seed.
 **Date:** 2026-10-06
 **Scope:** rc.1 item `recovery-cli`, after the durable snapshot queue (#132, merged as 2401edd). Operations for rc.1: `resnapshot` and `pg-adopt-timeline`. Deferred: `pg-enable-failover-slot` apply, `kafka-replay-from-checkpoint` (I1d), `new-source-id` (a configuration change: never applied).
 
