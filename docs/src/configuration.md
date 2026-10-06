@@ -86,6 +86,9 @@ source:
 | `snapshot.max_parallel_tables` | int | Tables snapshotted concurrently (default: `8`) |
 | `snapshot.discovery_page_size` | int | Tables read per catalog query while discovering the tables a snapshot copies (default: `1000`, allowed `1`-`10000`) |
 | `snapshot.chunk_size` | int | Rows per range chunk for integer-PK tables (default: `10000`) |
+| `snapshot.max_snapshot_connections` | int | This source's share of the process-wide snapshot connection cap (default: `max_parallel_tables x max_parallel_chunks + 2`; the process cap is `--max-snapshot-connections`, default `64`) |
+| `snapshot.max_anchor_age_secs` | int | How long a snapshot generation may hold its anchor before it blocks (default: `86400`) |
+| `snapshot.max_plan_bytes` / `snapshot.max_plan_items` | int | Bounds of a generation's durable table plan; discovery blocks before sealing at either (default: 256 MiB / `1000000`). See [Initial Snapshots](snapshots.md#bounds-and-blocking) |
 | `on_schema_drift` | string | `adapt` (default) - reload schema and continue after failover drift; `halt` — stop and require operator intervention. See [Failover Handling](failover.md). |
 
 </td>
@@ -141,6 +144,9 @@ source:
 | `snapshot.max_parallel_tables` | int | Tables snapshotted concurrently (default: `8`) |
 | `snapshot.discovery_page_size` | int | Tables read per catalog query while discovering the tables a snapshot copies (default: `1000`, allowed `1`-`10000`) |
 | `snapshot.chunk_size` | int | Rows per range chunk (default: `10000`) |
+| `snapshot.max_snapshot_connections` | int | This source's share of the process-wide snapshot connection cap (default: `max_parallel_tables x max_parallel_chunks + 2`; the process cap is `--max-snapshot-connections`, default `64`) |
+| `snapshot.max_anchor_age_secs` | int | How long a snapshot generation may hold its anchor before it blocks (default: `86400`) |
+| `snapshot.max_plan_bytes` / `snapshot.max_plan_items` | int | Bounds of a generation's durable table plan; discovery blocks before sealing at either (default: 256 MiB / `1000000`). See [Initial Snapshots](snapshots.md#bounds-and-blocking) |
 | `on_schema_drift` | string | `adapt` (default) — reload schema and continue after failover drift; `halt` — stop and require operator intervention. See [Failover Handling](failover.md). |
 
 </td>

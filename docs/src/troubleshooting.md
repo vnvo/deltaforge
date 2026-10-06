@@ -19,6 +19,11 @@ Common issues and quick checks when running DeltaForge.
 - Adjust `max_inflight` to allow more concurrent batches if sinks can handle parallelism.
 - Reduce processor work or add guardrails (`limits`) to prevent slow JavaScript from stalling the pipeline.
 
+## Snapshot copied again or a sink reported incomplete
+- `snapshot_replaced`: a generation was replaced (restart, lost read view, policy change, or the one-time upgrade recopy); every table is copied again and sinks receive duplicates.
+- `sink_snapshot_incomplete`: a sink missed part of a completed snapshot. It continues with changes but needs a fresh baseline. See [Completion and lagging sinks](snapshots.md#completion-and-lagging-sinks).
+- A snapshot that never starts may be queued for connections: check `deltaforge_snapshot_queued`.
+
 ## Checkpoints not advancing
 - Review the commit policy: `mode: all` or `required` sinks that are unavailable will block progress.
 - Look for sink-specific errors (for example, Kafka broker unreachability or Redis backpressure).
@@ -33,6 +38,8 @@ A `503` means at least one pipeline has entered a permanently failed state — i
 | Failover to a server with no GTID overlap | `position lost after failover` | Re-snapshot from the new primary |
 | `RESET BINARY LOGS AND GTIDS` run on same server | `checkpoint GTID set no longer reachable` | Clear the checkpoint DB and re-snapshot |
 | Unrecoverable source error | `run task ended with error` | Check source logs; fix the root cause and restart |
+| Snapshot generation blocked | incident `snapshot_anchor_unavailable` or `snapshot_bound_exceeded` | Fix the cause (retention, anchor age, plan bounds or tables), then resnapshot explicitly; a restart alone stops again. See [Bounds and blocking](snapshots.md#bounds-and-blocking) |
+| Snapshot state unusable | incident `snapshot_state_invalid` | Stored snapshot state is corrupt or of an unknown format and was left untouched; do not downgrade past it. See [Initial Snapshots](snapshots.md#upgrading-from-an-earlier-release-one-time-recopy) |
 
 Use `GET /pipelines` to see which pipeline has `"status": "failed"` and check its logs for the specific error. After fixing the root cause, restart the DeltaForge process (or the container) to reset pipeline state.
 

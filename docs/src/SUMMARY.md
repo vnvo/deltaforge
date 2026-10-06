@@ -13,6 +13,7 @@
 - [Sources](sources/README.md)
     - [MySQL](sources/mysql.md)
     - [Postgres](sources/postgres.md)
+    - [Initial Snapshots](snapshots.md)
 - [Processors](processors.md)
 - [Sinks](sinks/README.md)
     - [Redis](sinks/redis.md)

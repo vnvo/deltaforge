@@ -1,6 +1,6 @@
 # Durable Snapshot Queue - Design (revision 3)
 
-**Status:** DRAFT for review. Design only: no production code, schema migration or test harness change accompanies this document.
+**Status:** Implemented in #132. Operator documentation: [Initial Snapshots](../src/snapshots.md).
 **Date:** 2026-10-05
 **Scope:** rc.1 item 3, after `snapshot-paging` (#128), gate reliability (#129) and the snapshot restart fixes (#131).
 **Revision 2:** replaced the chunk-resume design of revision 1. A generation is bound to one database read view and is never resumed by another process.

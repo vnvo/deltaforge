@@ -129,6 +129,8 @@ The initial snapshot and the CDC stream meet at a single anchor so that **no com
 - **PostgreSQL** anchors CDC at the replication slot's consistent point `C`. Every row committed at or before `C` is in the snapshot; every row after `C` is in the CDC stream. Rows committed in `(C, snapshot-export]` fall in **both** - a **bounded at-least-once overlap**, not exactly-once. Current-state sinks (with `version_source: source_position`) converge via last-writer-wins; append-only sinks receive the overlap twice. A snapshot completed under the older anchor is flagged by the gauge `deltaforge_snapshot_unsafe_anchor = 1` until a safe re-snapshot.
 - **MySQL** brackets the anchor under a brief `FLUSH TABLES WITH READ LOCK`: all snapshot workers open their consistent-snapshot transactions and the binlog position + GTID set are captured while the lock is held, so every worker shares one view that matches the captured position exactly. This **closes a real initial-snapshot data-loss window** present in earlier versions (independent per-worker snapshots with the position captured afterward). It requires `gtid_mode = ON`, `binlog_format = ROW`, InnoDB tables, and the global `RELOAD` privilege; managed MySQL without `RELOAD` **fails closed** rather than snapshotting unsafely (no silent fallback).
 
+Snapshot completion follows the commit policy. A snapshot is complete only once its terminal barrier is committed by the sinks the policy requires; an interrupted snapshot is copied again in full (at-least-once, never resumed table by table); a sink that missed part of a completed snapshot is reported (`sink_snapshot_incomplete`) and excluded from the resume position rather than silently treated as complete. See [Initial Snapshots](snapshots.md).
+
 ## Failure Isolation
 
 ### Per-sink independence
@@ -434,7 +436,8 @@ This matrix maps guarantees to their verification. Rows marked **Exists** have a
 | Replication slot drop detection | `slot_dropped` chaos scenario | Chaos | Exists |
 | NATS dedup within window | Verify `Nats-Msg-Id` prevents duplicates | Integration | Planned |
 | Redis idempotency key | Verify consumer-side dedup via key | Integration | Planned |
-| Snapshot → CDC handoff | No gaps; engine-specific documented overlap | Integration | Planned |
+| Snapshot → CDC handoff | No gaps; engine-specific documented overlap | Integration | Exists |
+| Snapshot crash, replacement and policy completion | `snapshot_restart_e2e`, `postgres_snapshot_e2e`, `s3_ministack_durable_canary` | Integration | Exists |
 
 ## Limitations
 
@@ -446,4 +449,4 @@ These are **not guaranteed** and are documented honestly:
 - **No in-session retry for optional sinks** — when `required: false` and a sink fails, the failed batch is **not retried in the same session**. The failed sink's checkpoint stays at its prior position; events are re-delivered only on pipeline restart via source replay. For sinks with realistic outage windows (e.g., S3 throttling, cross-region issues), the operator must weigh source backpressure (`required: true`) against replay-on-restart latency (`required: false`). See [Required vs. optional sinks](#required-vs-optional-sinks).
 - **S3 sink — at-least-once at file granularity** — duplicate events across a crash boundary appear in two files with different ULIDs. Per-row DLQ isolates encoder failures, but does not provide exactly-once delivery on its own; that requires the Phase 2 Iceberg sink (atomic snapshot commits). Consumers must dedup downstream via `MERGE INTO` or `event_id`. See [S3 sink atomicity guarantees](#s3-sink-atomicity-guarantees).
 - **S3 sink — lifecycle policy required for production** — DeltaForge does not track multipart upload IDs externally. Abandoned multiparts are reclaimed by the bucket's `AbortIncompleteMultipartUpload` lifecycle rule. Without this rule, S3 storage cost accumulates on every aborted batch.
-- **Snapshot consistency** — initial snapshots use lock-free parallel reads. The snapshot is eventually consistent with the CDC stream; there may be a brief overlap period where both snapshot rows and CDC events for the same row are delivered. Consumers should use the event timestamp or idempotency key to resolve.
+- **Snapshot duplicates** - snapshot rows can be delivered more than once: PostgreSQL's bounded snapshot-to-stream overlap, and every row of a snapshot copied again after an interruption or upgrade. Consumers should resolve them by source position or idempotency key. See [Initial Snapshots](snapshots.md#restarts-copy-the-whole-snapshot-again).
