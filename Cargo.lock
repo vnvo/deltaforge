@@ -2122,6 +2122,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "fleet-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "futures",
+ "gate-ownership",
+ "mysql_async 0.36.2",
+ "parking_lot",
+ "rand 0.9.4",
+ "rdkafka",
+ "reqwest",
+ "rest-api",
+ "runner",
+ "scale-harness",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "storage",
+ "tempfile",
+ "testcontainers",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "flowstats"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

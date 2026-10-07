@@ -1,0 +1,40 @@
+[package]
+name = "fleet-harness"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+description = "Single-instance MySQL fleet qualification harness (docs/design/mysql-fleet-qualification.md)"
+publish = false
+
+[[bin]]
+name = "fleet-harness"
+path = "src/bin/fleet-harness.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio = { workspace = true, features = ["full"] }
+chrono.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+reqwest.workspace = true
+rdkafka.workspace = true
+clap = { version = "4", features = ["derive"] }
+rand = "0.9"
+mysql_async = "0.36"
+tokio-postgres = "0.7"
+storage = { path = "../storage" }
+scale-harness = { path = "../scale-harness" }
+
+[dev-dependencies]
+tempfile = "3"
+axum.workspace = true
+runner = { path = "../runner" }
+rest-api = { path = "../rest-api" }
+testcontainers = "0.25"
+gate-ownership = { path = "../gate-ownership" }
+
+[lints]
+workspace = true
