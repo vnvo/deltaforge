@@ -1,0 +1,88 @@
+# T1 exploratory run: one MySQL server at full table count, one pipeline.
+#
+# Bare values are PLACEHOLDERS (the owner has not supplied them yet); they
+# only shape exploratory runs and never support a capacity claim. Replace a
+# value with `{ value: ..., provenance: owner }` once the owner supplies it.
+class: exploratory
+profile: cdc
+output_dir: results
+
+topology:
+  servers:
+    - name: c01
+      host: 127.0.0.1
+      port: 3306
+  admin_user: root
+  admin_password: root
+  databases_per_server: 2000
+  tables_per_database: 200
+  database_prefix: cust_
+  seed: 1
+
+deltaforge:
+  api_url: http://127.0.0.1:8080
+  metrics_url: http://127.0.0.1:9000/metrics
+  process:
+    kind: docker_container
+    name: deltaforge
+  state_store: postgres
+  pipeline_prefix: fleet
+  tenant: fleet
+  cdc_user: df
+  cdc_password: df
+  kafka_brokers: 127.0.0.1:9092
+  topic_prefix: fleet
+  key:
+    mode: template
+    template: "${after.id}"
+
+verifier:
+  kafka_brokers: 127.0.0.1:9092
+  # primary_key once the coalescing key exists; until then deletes are
+  # reported, not validated (design section 4.4).
+  expected_key: none
+  work_dir: /var/tmp/fleet-harness
+
+traffic:
+  changes_per_sec_avg: 2000
+  changes_per_sec_peak: 10000
+  peak_fraction: 0.05
+  op_mix: { insert: 0.6, update: 0.3, delete: 0.1 }
+  row_bytes: 256
+  rows_per_txn: 1
+  zipf_exponent: 1.0
+  active_set: { pattern: fixed, fraction: 0.01 }
+  writers_per_server: 8
+
+ddl:
+  migration_statements: 3
+  migration_pace: 50
+  migration_rollout: { kind: sequential }
+  single_customer_ddl_per_hour: 0
+
+lifecycle:
+  onboard_per_hour: 0
+  offboard_per_hour: 0
+
+budgets:
+  lag_p99_secs: 5
+  memory_bytes: 17179869184
+  cpu_cores: 8
+  recovery_p50_secs: 30
+  recovery_p90_secs: 60
+  recovery_p100_secs: 120
+
+disruptions:
+  endpoint_outage_secs: 300
+  sink_outage_secs: 600
+
+measure:
+  interval_secs: 5
+  cdc_users: [df]
+
+run:
+  scenario: S1
+  duration_secs: 3600
+  warmup_secs: 300
+  repetitions: 1
+  sources: [1]
