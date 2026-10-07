@@ -200,6 +200,7 @@ struct SanitizedSpec<'a> {
     sink_batch_deadline_secs: &'a Option<u32>,
     schema_sensing: &'a SchemaSensingConfig,
     journal: &'a Option<JournalConfig>,
+    metrics: &'a crate::MetricsCfg,
 }
 
 impl<'a> SanitizedSpec<'a> {
@@ -215,6 +216,7 @@ impl<'a> SanitizedSpec<'a> {
             sink_batch_deadline_secs: &s.sink_batch_deadline_secs,
             schema_sensing: &s.schema_sensing,
             journal: &s.journal,
+            metrics: &s.metrics,
         }
     }
 }
