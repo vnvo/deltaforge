@@ -9,7 +9,11 @@
 
 pub mod activeset;
 pub mod config;
+pub mod deltaforge;
+pub mod driver;
+pub mod fixture;
 pub mod ledger;
+pub mod measure;
 pub mod stats;
 pub mod topology;
 pub mod verify;

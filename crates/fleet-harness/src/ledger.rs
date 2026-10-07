@@ -218,6 +218,9 @@ pub struct Completeness {
     pub duplicates: u64,
     /// Consumed operations that were never written.
     pub unexpected: u64,
+    /// Consumed operations of transactions whose commit outcome the driver
+    /// could not know (neither missing nor unexpected).
+    pub uncertain_delivered: u64,
     /// Rows whose last written version was never consumed.
     pub final_state_mismatches: u64,
     /// Operations of a row consumed out of order within one partition
@@ -244,10 +247,23 @@ impl Completeness {
     }
 }
 
-/// Compare a sorted written file with a sorted consumed file.
-pub fn compare(written: &Path, consumed: &Path) -> Result<Completeness> {
+/// Compare a sorted written file with a sorted consumed file; `uncertain`
+/// (sorted) lists operations whose commit outcome is unknown.
+pub fn compare(
+    written: &Path,
+    consumed: &Path,
+    uncertain: Option<&Path>,
+) -> Result<Completeness> {
     let mut w = BufReader::with_capacity(1 << 20, File::open(written)?);
     let mut c = BufReader::with_capacity(1 << 20, File::open(consumed)?);
+    let mut u = match uncertain {
+        Some(p) => Some(BufReader::with_capacity(1 << 20, File::open(p)?)),
+        None => None,
+    };
+    let mut next_u = match u.as_mut() {
+        Some(r) => read_record(r)?,
+        None => None,
+    };
     let mut out = Completeness::default();
     let mut next_w = read_record(&mut w)?;
     let mut next_c = read_record(&mut c)?;
@@ -285,7 +301,19 @@ pub fn compare(written: &Path, consumed: &Path) -> Result<Completeness> {
                 if prev_c.is_some_and(|p| p[..SORT_KEY] == b[..SORT_KEY]) {
                     out.duplicates += 1;
                 } else {
-                    out.unexpected += 1;
+                    // Advance the uncertain list to this key.
+                    while let (Some(x), Some(r)) = (next_u, u.as_mut()) {
+                        if x[..SORT_KEY] < b[..SORT_KEY] {
+                            next_u = read_record(r)?;
+                        } else {
+                            break;
+                        }
+                    }
+                    if next_u.is_some_and(|x| x[..SORT_KEY] == b[..SORT_KEY]) {
+                        out.uncertain_delivered += 1;
+                    } else {
+                        out.unexpected += 1;
+                    }
                     order.observe(&Record::decode(&b), &mut out);
                 }
                 prev_c = Some(b);
@@ -477,7 +505,7 @@ mod tests {
             100,
         )
         .unwrap();
-        let r = compare(&w, &c).unwrap();
+        let r = compare(&w, &c, None).unwrap();
         assert_eq!(
             (
                 r.written,
@@ -514,7 +542,7 @@ mod tests {
             1,
         )
         .unwrap();
-        let r = compare(&w, &c).unwrap();
+        let r = compare(&w, &c, None).unwrap();
         assert!(r.ok(), "{r:?}");
         assert_eq!(r.duplicates, 1);
     }
@@ -573,11 +601,40 @@ mod tests {
             100,
         )
         .unwrap();
-        let r = compare(&w, &c).unwrap();
+        let r = compare(&w, &c, None).unwrap();
         assert_eq!(r.missing, 0);
         assert_eq!(r.cross_partition_rows, 1);
         assert_eq!(r.cross_partition_reorders, 1);
         assert_eq!(r.partition_order_violations, 1);
         assert!(!r.ok(), "a within-partition violation fails the run");
+    }
+
+    #[test]
+    fn uncertain_operations_are_neither_missing_nor_unexpected() {
+        let dir = tempfile::tempdir().unwrap();
+        let written = [rec(1, 1, Op::Insert)];
+        let uncertain = [rec(2, 2, Op::Insert), rec(3, 3, Op::Insert)];
+        let consumed = [rec(1, 1, Op::Insert), rec(2, 2, Op::Insert)];
+        let w = sort_files(
+            &[write(dir.path(), "w", &written)],
+            &dir.path().join("ws"),
+            10,
+        )
+        .unwrap();
+        let u = sort_files(
+            &[write(dir.path(), "u", &uncertain)],
+            &dir.path().join("us"),
+            10,
+        )
+        .unwrap();
+        let c = sort_files(
+            &[write(dir.path(), "c", &consumed)],
+            &dir.path().join("cs"),
+            10,
+        )
+        .unwrap();
+        let r = compare(&w, &c, Some(&u)).unwrap();
+        assert_eq!((r.missing, r.unexpected, r.uncertain_delivered), (0, 0, 1));
+        assert!(r.ok());
     }
 }
