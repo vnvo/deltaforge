@@ -648,7 +648,7 @@ metrics:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `per_table.enabled` | bool | `false` | Add `table` and `table_scope` labels to the per-table metrics (see [Observability](observability.md#metric-cardinality-and-per-table-detail)). |
-| `per_table.max_tables` | int | `100` | The first `max_tables` distinct tables keep their own series for the life of the DeltaForge process (across restarts and delete/recreate of the pipeline); every other table shares one overflow series. Fixed once the pipeline has table series: changing it is refused until DeltaForge restarts. |
+| `per_table.max_tables` | int | `100` | The first `max_tables` distinct tables keep their own series for the life of the DeltaForge process (across restarts and delete/recreate of the pipeline); every other table shares one overflow series. Fixed once the pipeline has started with per-table detail: changing it is refused (before anything stops) until DeltaForge restarts. |
 | `per_table.lag_idle_secs` | int | `300` | A table's `deltaforge_source_table_lag_seconds` series is removed after this many seconds without an event for it. |
 
 Out-of-range values are rejected when the pipeline is created and by preflight.

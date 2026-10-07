@@ -87,8 +87,8 @@ pub fn with_table(
 ///
 /// One instance per pipeline name lives for the process (see [`register`]):
 /// the recorder can never remove a series, so the admissions that created
-/// exact series are never discarded, and `max_tables` is fixed once any
-/// table series exists. Enabling, disabling and the lag idle time can
+/// exact series are never discarded, and `max_tables` is fixed once a start
+/// with per-table detail has succeeded (or any table series exists). Enabling, disabling and the lag idle time can
 /// change; they never create series beyond `max_tables + 1`.
 #[derive(Debug)]
 pub struct TableMetrics {
@@ -96,6 +96,11 @@ pub struct TableMetrics {
     enabled: AtomicBool,
     max_tables: AtomicUsize,
     lag_idle_ms: AtomicU64,
+    /// Set when a start with per-table detail succeeds: from then on the
+    /// running pipeline may admit tables at any moment, so the cap cannot
+    /// change for the process (a decision taken before stopping it must not
+    /// depend on whether it admitted one yet).
+    cap_fixed: AtomicBool,
     admitted: RwLock<HashSet<Arc<str>>>,
     /// Allocated at the first overflow.
     overflowed: Mutex<Option<Box<DistinctEstimate>>>,
@@ -108,6 +113,7 @@ impl TableMetrics {
             enabled: AtomicBool::new(false),
             max_tables: AtomicUsize::new(0),
             lag_idle_ms: AtomicU64::new(0),
+            cap_fixed: AtomicBool::new(false),
             admitted: RwLock::new(HashSet::new()),
             overflowed: Mutex::new(None),
         };
@@ -142,17 +148,22 @@ impl TableMetrics {
             || self.overflowed.lock().expect("overflow lock").is_some()
     }
 
-    /// Whether `policy` can apply without exceeding the series already
-    /// created: once table series exist, `max_tables` is fixed.
+    /// Whether `policy` can apply: `max_tables` is fixed once a start with
+    /// per-table detail succeeded (or table series exist), independently of
+    /// whether the running pipeline has admitted a table yet.
     fn compatible(&self, policy: Option<PerTablePolicy>) -> Result<(), String> {
         let Some(p) = policy else { return Ok(()) };
         let fixed = self.max_tables.load(Ordering::Acquire);
-        if p.max_tables != fixed && self.has_table_series() {
+        if p.max_tables != fixed
+            && (self.cap_fixed.load(Ordering::Acquire)
+                || self.has_table_series())
+        {
             return Err(format!(
                 "metrics.per_table.max_tables is fixed at {fixed} for pipeline \
-                 '{}' for the life of this DeltaForge process, because its \
-                 per-table series already exist (they cannot be removed); keep \
-                 {fixed}, or restart DeltaForge to change it",
+                 '{}' for the life of this DeltaForge process: the pipeline has \
+                 run with per-table detail, and per-table series cannot be \
+                 removed once created; keep {fixed}, or restart DeltaForge to \
+                 change it",
                 self.pipeline
             ));
         }
@@ -318,6 +329,13 @@ impl Registration {
         &self.tables
     }
 
+    /// The start succeeded: with per-table detail on, its cap is now fixed.
+    pub fn commit(self) {
+        if self.tables.policy().is_some() {
+            self.tables.cap_fixed.store(true, Ordering::Release);
+        }
+    }
+
     /// Undo the registration: restore the previous policy, or remove a new
     /// entry that created no table series (one that did is kept, disabled,
     /// so its admissions still bound the name).
@@ -341,8 +359,8 @@ impl Registration {
 /// Register `pipeline`'s policy for a start. The pipeline name keeps one
 /// [`TableMetrics`] for the process: its admissions survive restarts,
 /// policy changes and delete/recreate, so the exact series under the name
-/// never exceed `max_tables`. Refused when it would change `max_tables`
-/// after table series exist.
+/// never exceed `max_tables`. Refused when it would change a fixed
+/// `max_tables`; [`Registration::commit`] fixes it.
 pub fn register(
     pipeline: &str,
     policy: Option<PerTablePolicy>,
@@ -510,6 +528,28 @@ mod tests {
         }
         assert_eq!(exact.len(), 3, "the same three admissions: {exact:?}");
         assert!(exact.iter().all(|t| t.starts_with('a')));
+    }
+
+    /// The cap is fixed by a successful start, before any admission, so a
+    /// decision taken while the pipeline runs cannot be invalidated by its
+    /// first admission.
+    #[test]
+    fn a_committed_start_fixes_the_cap_before_any_series() {
+        let started = register("reg-commit", policy(100)).unwrap();
+        started.commit();
+        assert!(!for_pipeline("reg-commit").has_table_series());
+        assert!(check("reg-commit", policy(5)).is_err(), "no series yet");
+        for_pipeline("reg-commit").label("first");
+        assert!(check("reg-commit", policy(5)).is_err(), "and after one");
+        check("reg-commit", policy(100)).unwrap();
+        check("reg-commit", None).unwrap();
+
+        // A failed start does not fix it, nor does a start with detail off.
+        register("reg-rolled", policy(100)).unwrap().rollback();
+        let _ = register("reg-rolled", policy(100)).unwrap();
+        check("reg-rolled", policy(5)).unwrap();
+        register("reg-off", None).unwrap().commit();
+        check("reg-off", policy(5)).unwrap();
     }
 
     #[test]
