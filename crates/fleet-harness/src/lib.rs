@@ -20,6 +20,7 @@ pub mod results;
 pub mod run;
 pub mod scenario;
 pub mod stats;
+pub mod store;
 pub mod topology;
 pub mod verify;
 
