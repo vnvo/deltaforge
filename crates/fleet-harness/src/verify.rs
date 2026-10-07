@@ -211,6 +211,9 @@ pub struct StreamReport {
     pub probes_ok: u64,
     pub probes_failed: u64,
     pub probe_examples: Vec<String>,
+    /// Row events of other runs on the same topics (row ids carry the run
+    /// tag): skipped, not verified.
+    pub foreign_events: u64,
     /// Row events per server index.
     pub per_server: std::collections::BTreeMap<u16, u64>,
 }
@@ -222,6 +225,8 @@ pub struct Verifier {
     probes: Probes,
     marks: RecoveryMarks,
     spill: Writer,
+    /// Only rows of this run (`id >> 40`) are verified.
+    run_tag: Option<u64>,
     pub report: StreamReport,
     /// End-to-end lag (ms) per server, inserts and updates.
     pub lag_ms: HashMap<u16, Histogram>,
@@ -241,9 +246,16 @@ impl Verifier {
             probes,
             marks,
             spill: Writer::create(spill_path)?,
+            run_tag: None,
             report: StreamReport::default(),
             lag_ms: HashMap::new(),
         })
+    }
+
+    /// Verify only rows written by the run tagged `tag`.
+    pub fn for_run(mut self, tag: u64) -> Self {
+        self.run_tag = Some(tag);
+        self
     }
 
     /// Verify one consumed message of `server`.
@@ -268,6 +280,10 @@ impl Verifier {
                 return Ok(());
             }
         };
+        if self.run_tag.is_some_and(|t| d.row.id >> 40 != t) {
+            self.report.foreign_events += 1;
+            return Ok(());
+        }
         self.report.row_events += 1;
         *self.report.per_server.entry(server).or_insert(0) += 1;
         if self.expected_key == ExpectedKey::PrimaryKey {

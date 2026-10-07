@@ -39,7 +39,7 @@ use tokio::sync::watch;
 use crate::activeset::ActiveSet;
 use crate::config::{OpMix, RunConfig, Server};
 use crate::ledger::{Op, Record, Writer};
-use crate::topology::{self, ColumnKind, Naming, RowKey, TableRef, Template};
+use crate::topology::{self, Naming, RowKey, TableRef, Template};
 use crate::verify::Probes;
 
 /// Live rate control for one server (hot-cluster scenarios change it).
@@ -673,11 +673,6 @@ pub async fn lifecycle(
     Ok(report)
 }
 
-/// Kinds of literal used in a probe column (exposed for tests).
-pub fn probe_kind() -> ColumnKind {
-    ColumnKind::Int
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,6 +731,5 @@ mod tests {
         let r = Rate::new(100.0);
         r.set(1_000.0);
         assert_eq!(r.get(), 1_000.0);
-        assert_eq!(probe_kind(), ColumnKind::Int);
     }
 }

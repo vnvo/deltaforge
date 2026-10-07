@@ -245,7 +245,8 @@ pub async fn run_once(
         probes.clone(),
         marks.clone(),
         &work.join("consumed.bin"),
-    )?;
+    )?
+    .for_run(run_tag);
     let (consumer_stop_tx, consumer_stop) = watch::channel(false);
     let topic_to_server: HashMap<String, u16> = servers
         .iter()
