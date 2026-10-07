@@ -55,20 +55,20 @@ sinks:
 }
 ```
 
+**Debezium consumers with `schemas.enable=false`:** this is the shape they read. Kafka Connect's `JsonConverter` with `schemas.enable=false` emits the change object itself (`before`, `after`, `source`, `op`, `ts_ms`), with no `schema`/`payload` wrapper, so use the native envelope (not `debezium`) for these consumers. Check two differences: the `source` block carries DeltaForge's fields, not every field a Debezium connector writes there; and DeltaForge's default message key is an idempotency key, not the primary key, so set `key: "${after.<primary key column>}"` (for example `key: "${after.id}"`) where consumers or partitioning rely on primary-key keys.
+
 **When to use:**
 - Maximum performance with lowest overhead
+- Consumers of Debezium output with `schemas.enable=false`
 - Custom consumers that parse the payload directly
 - When format stability is less important than efficiency
 - Internal systems where you control both producer and consumer
 
 ### Debezium
 
-The Debezium envelope wraps the event in a `{"schema": null, "payload": ...}` structure, 
-following the [Debezium event format specification](https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-events). 
+The Debezium envelope wraps the event in a `{"schema": null, "payload": ...}` structure, with the payload following the [Debezium event format specification](https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-events).
 
-This uses **schemaless mode** (`schema: null`), which is equivalent to Debezium's 
-`JsonConverter` with `schemas.enable=false`. This is the recommended configuration 
-for most production deployments as it avoids the overhead of inline schemas.
+This is **not** the output of `JsonConverter` with `schemas.enable=false`: that emits the payload object unwrapped, which is the [native envelope](#native-default)'s shape. Structurally, the wrapper matches schemas-enabled Connect output (`schemas.enable=true`), except that `schema` is always `null` rather than the full schema, so consumers that need the per-message schema cannot use it.
 ```yaml
 sinks:
   - type: kafka
@@ -102,10 +102,8 @@ sinks:
 ```
 
 **When to use:**
-- Kafka Connect consumers expecting full Debezium format
-- Existing Debezium-based pipelines you're migrating from
-- Tools that specifically parse the `payload` wrapper
-- When you need a stable, well-documented format with broad ecosystem support
+- Tools that specifically parse the `payload` wrapper and accept `schema: null`
+- When you need a stable, documented format (the native envelope may evolve)
 
 > **Note:** When using Avro encoding with Schema Registry, schema handling is at the encoding layer — schema IDs are embedded in the [Confluent wire format](https://docs.confluent.io/platform/current/schema-registry/fundamentals/serdes-develop/index.html#wire-format).
 

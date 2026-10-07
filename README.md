@@ -181,13 +181,13 @@ DeltaForge supports multiple envelope formats for ecosystem compatibility:
 
 | Format | Output | Use Case |
 |--------|--------|----------|
-| `native` | `{"op":"c","after":{...},"source":{...}}` | Lowest overhead, DeltaForge consumers |
-| `debezium` | `{"schema":null,"payload":{...}}` | Drop-in Debezium replacement |
+| `native` | `{"op":"c","after":{...},"source":{...}}` | Lowest overhead; the shape Debezium consumers read with `schemas.enable=false` |
+| `debezium` | `{"schema":null,"payload":{...}}` | Consumers that parse the `payload` wrapper (`schema` is always `null`) |
 | `cloudevents` | `{"specversion":"1.0","type":"...","data":{...}}` | CNCF-standard, event-driven systems |
 
-🔄 **Debezium Compatibility**: DeltaForge uses Debezium's **schemaless mode** (`schema: null`), which matches Debezium's `JsonConverter` with `schemas.enable=false` - the recommended configuration for most Kafka deployments. This provides wire compatibility with existing Debezium consumers without the overhead of inline schemas (~500+ bytes per message).
+🔄 **Debezium Compatibility**: with `JsonConverter` and `schemas.enable=false` (the common Kafka configuration), Debezium emits the change object unwrapped (`before`, `after`, `source`, `op`, `ts_ms`). That is the shape of DeltaForge's **native** envelope, the default. The `debezium` envelope's `{"schema": null, "payload": ...}` wrapper is not that format: it matches schemas-enabled output structurally, without the schema.
 
-> 💡 **Migrating from Debezium?** If your consumers already use `schemas.enable=false`, configure `envelope: { type: debezium }` on your sinks for drop-in compatibility. For consumers expecting Avro with Schema Registry, configure `encoding: { type: avro, schema_registry_url: "http://sr:8081" }` — DeltaForge produces the standard Confluent wire format.
+> 💡 **Migrating from Debezium?** If your consumers use `schemas.enable=false`, keep the native envelope (do not configure `debezium`), set `key: "${after.<primary key column>}"` if they rely on primary-key message keys (the default key is an idempotency key), and check the `source` fields they read (DeltaForge's `source` block differs from a Debezium connector's). For consumers expecting Avro with Schema Registry, configure `encoding: { type: avro, schema_registry_url: "http://sr:8081" }`: DeltaForge produces the standard Confluent wire format.
 
 See [Envelope Formats](docs/src/envelopes.md) for detailed examples and wire format specifications.
 
