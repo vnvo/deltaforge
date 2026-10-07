@@ -16,6 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -82,23 +83,36 @@ pub fn with_table(
     base
 }
 
-/// One pipeline's per-table label policy.
+/// One pipeline's per-table label policy and admissions.
+///
+/// One instance per pipeline name lives for the process (see [`register`]):
+/// the recorder can never remove a series, so the admissions that created
+/// exact series are never discarded, and `max_tables` is fixed once any
+/// table series exists. Enabling, disabling and the lag idle time can
+/// change; they never create series beyond `max_tables + 1`.
 #[derive(Debug)]
 pub struct TableMetrics {
     pipeline: Arc<str>,
-    policy: Option<PerTablePolicy>,
+    enabled: AtomicBool,
+    max_tables: AtomicUsize,
+    lag_idle_ms: AtomicU64,
     admitted: RwLock<HashSet<Arc<str>>>,
-    overflowed: Mutex<DistinctEstimate>,
+    /// Allocated at the first overflow.
+    overflowed: Mutex<Option<Box<DistinctEstimate>>>,
 }
 
 impl TableMetrics {
     pub fn new(pipeline: &str, policy: Option<PerTablePolicy>) -> Self {
-        Self {
+        let tm = Self {
             pipeline: Arc::from(pipeline),
-            policy,
+            enabled: AtomicBool::new(false),
+            max_tables: AtomicUsize::new(0),
+            lag_idle_ms: AtomicU64::new(0),
             admitted: RwLock::new(HashSet::new()),
-            overflowed: Mutex::new(DistinctEstimate::new()),
-        }
+            overflowed: Mutex::new(None),
+        };
+        tm.apply(policy);
+        tm
     }
 
     /// Per-table detail off: every [`label`](Self::label) is `None`.
@@ -110,21 +124,66 @@ impl TableMetrics {
         &self.pipeline
     }
 
+    /// The current policy (`None` while per-table detail is off).
     pub fn policy(&self) -> Option<PerTablePolicy> {
-        self.policy
+        self.enabled
+            .load(Ordering::Acquire)
+            .then(|| PerTablePolicy {
+                max_tables: self.max_tables.load(Ordering::Acquire),
+                lag_idle: Duration::from_millis(
+                    self.lag_idle_ms.load(Ordering::Acquire),
+                ),
+            })
+    }
+
+    /// Whether any table-labelled series was created under this name.
+    pub fn has_table_series(&self) -> bool {
+        !self.admitted.read().expect("admitted lock").is_empty()
+            || self.overflowed.lock().expect("overflow lock").is_some()
+    }
+
+    /// Whether `policy` can apply without exceeding the series already
+    /// created: once table series exist, `max_tables` is fixed.
+    fn compatible(&self, policy: Option<PerTablePolicy>) -> Result<(), String> {
+        let Some(p) = policy else { return Ok(()) };
+        let fixed = self.max_tables.load(Ordering::Acquire);
+        if p.max_tables != fixed && self.has_table_series() {
+            return Err(format!(
+                "metrics.per_table.max_tables is fixed at {fixed} for pipeline \
+                 '{}' for the life of this DeltaForge process, because its \
+                 per-table series already exist (they cannot be removed); keep \
+                 {fixed}, or restart DeltaForge to change it",
+                self.pipeline
+            ));
+        }
+        Ok(())
+    }
+
+    /// Apply `policy` (callers check [`compatible`](Self::compatible)).
+    fn apply(&self, policy: Option<PerTablePolicy>) {
+        // Under the admissions lock, so no admission races a cap change.
+        let _admitted = self.admitted.write().expect("admitted lock");
+        if let Some(p) = policy {
+            self.max_tables.store(p.max_tables, Ordering::Release);
+            self.lag_idle_ms
+                .store(p.lag_idle.as_millis() as u64, Ordering::Release);
+        }
+        self.enabled.store(policy.is_some(), Ordering::Release);
     }
 
     /// The table labels for an observation of `table`: `None` when per-table
     /// detail is off, the exact label for an admitted table (admitting it
     /// while there is room), and the overflow label otherwise.
     pub fn label(&self, table: &str) -> Option<TableLabel> {
-        let policy = self.policy?;
+        if !self.enabled.load(Ordering::Acquire) {
+            return None;
+        }
         {
             let admitted = self.admitted.read().expect("admitted lock");
             if let Some(t) = admitted.get(table) {
                 return Some(TableLabel::Exact(t.clone()));
             }
-            if admitted.len() >= policy.max_tables {
+            if admitted.len() >= self.max_tables.load(Ordering::Acquire) {
                 drop(admitted);
                 self.overflow(table);
                 return Some(TableLabel::Overflow);
@@ -134,7 +193,7 @@ impl TableMetrics {
         if let Some(t) = admitted.get(table) {
             return Some(TableLabel::Exact(t.clone()));
         }
-        if admitted.len() >= policy.max_tables {
+        if admitted.len() >= self.max_tables.load(Ordering::Acquire) {
             drop(admitted);
             self.overflow(table);
             return Some(TableLabel::Overflow);
@@ -153,13 +212,18 @@ impl TableMetrics {
 
     /// Estimated distinct tables reported under the overflow.
     pub fn overflowed_estimate(&self) -> u64 {
-        self.overflowed.lock().expect("overflow lock").estimate()
+        self.overflowed
+            .lock()
+            .expect("overflow lock")
+            .as_ref()
+            .map_or(0, |e| e.estimate())
     }
 
     fn overflow(&self, table: &str) {
         let pipeline = self.pipeline.to_string();
         counter!(METRIC_OVERFLOW, "pipeline" => pipeline.clone()).increment(1);
         let mut est = self.overflowed.lock().expect("overflow lock");
+        let est = est.get_or_insert_with(|| Box::new(DistinctEstimate::new()));
         if est.insert(table) {
             gauge!(METRIC_OVERFLOWED, "pipeline" => pipeline)
                 .set(est.estimate() as f64);
@@ -223,21 +287,82 @@ fn registry() -> &'static RwLock<HashMap<String, Arc<TableMetrics>>> {
     REGISTRY.get_or_init(Default::default)
 }
 
-/// Register `pipeline`'s policy. A restart with the same policy keeps the
-/// existing admissions; a changed policy starts fresh.
+/// Whether `pipeline` can take `policy` now (create and patch check this
+/// before stopping or starting anything).
+pub fn check(
+    pipeline: &str,
+    policy: Option<PerTablePolicy>,
+) -> Result<(), String> {
+    match registry()
+        .read()
+        .expect("table metrics registry")
+        .get(pipeline)
+    {
+        Some(tm) => tm.compatible(policy),
+        None => Ok(()),
+    }
+}
+
+/// A policy registration made for a pipeline start; [`rollback`]
+/// (Self::rollback) undoes it when the start fails.
+#[must_use = "roll back the registration if the start fails"]
+#[derive(Debug)]
+pub struct Registration {
+    tables: Arc<TableMetrics>,
+    /// The policy before this registration; `None` when the entry is new.
+    previous: Option<Option<PerTablePolicy>>,
+}
+
+impl Registration {
+    pub fn tables(&self) -> &Arc<TableMetrics> {
+        &self.tables
+    }
+
+    /// Undo the registration: restore the previous policy, or remove a new
+    /// entry that created no table series (one that did is kept, disabled,
+    /// so its admissions still bound the name).
+    pub fn rollback(self) {
+        let mut reg = registry().write().expect("table metrics registry");
+        match self.previous {
+            Some(previous) => self.tables.apply(previous),
+            None if self.tables.has_table_series() => self.tables.apply(None),
+            None => {
+                if reg
+                    .get(self.tables.pipeline())
+                    .is_some_and(|tm| Arc::ptr_eq(tm, &self.tables))
+                {
+                    reg.remove(self.tables.pipeline());
+                }
+            }
+        }
+    }
+}
+
+/// Register `pipeline`'s policy for a start. The pipeline name keeps one
+/// [`TableMetrics`] for the process: its admissions survive restarts,
+/// policy changes and delete/recreate, so the exact series under the name
+/// never exceed `max_tables`. Refused when it would change `max_tables`
+/// after table series exist.
 pub fn register(
     pipeline: &str,
     policy: Option<PerTablePolicy>,
-) -> Arc<TableMetrics> {
+) -> Result<Registration, String> {
     let mut reg = registry().write().expect("table metrics registry");
-    if let Some(existing) = reg.get(pipeline)
-        && existing.policy == policy
-    {
-        return existing.clone();
+    if let Some(existing) = reg.get(pipeline) {
+        existing.compatible(policy)?;
+        let previous = existing.policy();
+        existing.apply(policy);
+        return Ok(Registration {
+            tables: existing.clone(),
+            previous: Some(previous),
+        });
     }
     let tm = Arc::new(TableMetrics::new(pipeline, policy));
     reg.insert(pipeline.to_string(), tm.clone());
-    tm
+    Ok(Registration {
+        tables: tm,
+        previous: None,
+    })
 }
 
 /// `pipeline`'s policy; an unregistered pipeline has per-table detail off.
@@ -250,12 +375,28 @@ pub fn for_pipeline(pipeline: &str) -> Arc<TableMetrics> {
         .unwrap_or_else(|| Arc::new(TableMetrics::disabled(pipeline)))
 }
 
-/// Forget `pipeline` (on deletion).
+/// `pipeline` was deleted. A name that created no table series is
+/// forgotten; one that did is kept, disabled, for the process: its series
+/// remain in the recorder, and a recreated pipeline of the same name reuses
+/// its admissions rather than creating new exact series. What is kept is
+/// bounded by `max_tables` names and a 1 KiB estimate per such name.
 pub fn unregister(pipeline: &str) {
+    let mut reg = registry().write().expect("table metrics registry");
+    if let Some(tm) = reg.get(pipeline) {
+        if tm.has_table_series() {
+            tm.apply(None);
+        } else {
+            reg.remove(pipeline);
+        }
+    }
+}
+
+/// Whether `pipeline` has a registry entry.
+pub fn is_registered(pipeline: &str) -> bool {
     registry()
-        .write()
+        .read()
         .expect("table metrics registry")
-        .remove(pipeline);
+        .contains_key(pipeline)
 }
 
 #[cfg(test)]
@@ -337,15 +478,106 @@ mod tests {
         }
     }
 
+    fn names(prefix: &str) -> impl Iterator<Item = String> + '_ {
+        (0..).map(move |i| format!("{prefix}{i}"))
+    }
+
     #[test]
-    fn registry_keeps_admissions_for_an_unchanged_policy() {
-        let a = register("reg-p", policy(3));
-        a.label("x");
-        assert!(Arc::ptr_eq(&a, &register("reg-p", policy(3))));
-        assert_eq!(for_pipeline("reg-p").admitted(), 1);
-        let b = register("reg-p", policy(4));
-        assert_eq!(b.admitted(), 0, "a changed policy starts fresh");
-        unregister("reg-p");
-        assert_eq!(for_pipeline("reg-p").policy(), None);
+    fn a_restart_with_the_same_policy_keeps_admissions() {
+        let a = register("reg-same", policy(3)).unwrap();
+        a.tables().label("x");
+        let b = register("reg-same", policy(3)).unwrap();
+        assert!(Arc::ptr_eq(a.tables(), b.tables()));
+        assert_eq!(for_pipeline("reg-same").admitted(), 1);
+    }
+
+    /// Disabling and re-enabling, with disjoint table sets each time, never
+    /// creates more than `max_tables` exact tables under the name.
+    #[test]
+    fn policy_changes_with_disjoint_tables_stay_bounded() {
+        let first = register("reg-toggle", policy(3)).unwrap();
+        for t in names("a").take(10) {
+            first.tables().label(&t);
+        }
+        let _ = register("reg-toggle", None).unwrap();
+        assert_eq!(for_pipeline("reg-toggle").label("b0"), None);
+        let again = register("reg-toggle", policy(3)).unwrap();
+        let mut exact = HashSet::new();
+        for t in names("a").take(10).chain(names("b").take(10)) {
+            if let Some(TableLabel::Exact(t)) = again.tables().label(&t) {
+                exact.insert(t);
+            }
+        }
+        assert_eq!(exact.len(), 3, "the same three admissions: {exact:?}");
+        assert!(exact.iter().all(|t| t.starts_with('a')));
+    }
+
+    #[test]
+    fn max_tables_is_fixed_once_table_series_exist() {
+        // Before any series, the cap can change freely.
+        let _ = register("reg-cap", policy(3)).unwrap();
+        let r = register("reg-cap", policy(5)).unwrap();
+        r.tables().label("t");
+        let err = register("reg-cap", policy(6)).unwrap_err();
+        assert!(err.contains("fixed at 5"), "{err}");
+        assert!(check("reg-cap", policy(6)).is_err());
+        assert_eq!(for_pipeline("reg-cap").policy().unwrap().max_tables, 5);
+        // Disabling, or changing only the lag idle time, is allowed.
+        check("reg-cap", None).unwrap();
+        let lag = Some(PerTablePolicy {
+            max_tables: 5,
+            lag_idle: Duration::from_secs(60),
+        });
+        let _ = register("reg-cap", lag).unwrap();
+        assert_eq!(for_pipeline("reg-cap").policy(), lag);
+    }
+
+    /// Delete and recreate with a disjoint table set reuses the admissions.
+    #[test]
+    fn delete_and_recreate_with_disjoint_tables_stay_bounded() {
+        let first = register("reg-recreate", policy(2)).unwrap();
+        first.tables().label("old.a");
+        first.tables().label("old.b");
+        unregister("reg-recreate");
+        assert!(is_registered("reg-recreate"), "kept: its series exist");
+        assert_eq!(for_pipeline("reg-recreate").label("old.a"), None);
+        let second = register("reg-recreate", policy(2)).unwrap();
+        assert_eq!(second.tables().label("new.a"), Some(TableLabel::Overflow));
+        assert_eq!(second.tables().admitted(), 2);
+        assert!(register("reg-recreate", policy(4)).is_err());
+    }
+
+    #[test]
+    fn names_without_table_series_are_forgotten() {
+        for name in names("reg-unused-").take(1_000) {
+            let _ = register(&name, policy(10)).unwrap();
+            unregister(&name);
+            assert!(!is_registered(&name));
+        }
+        let tm = TableMetrics::new("p", policy(1));
+        tm.label("a");
+        assert!(tm.overflowed.lock().unwrap().is_none(), "no estimator yet");
+    }
+
+    #[test]
+    fn rollback_removes_a_new_entry_and_restores_an_existing_one() {
+        let fresh = register("reg-rb-new", policy(3)).unwrap();
+        fresh.rollback();
+        assert!(!is_registered("reg-rb-new"));
+
+        let running = register("reg-rb-old", policy(3)).unwrap();
+        running.tables().label("t");
+        let failed = register("reg-rb-old", None).unwrap();
+        failed.rollback();
+        assert_eq!(for_pipeline("reg-rb-old").policy(), policy(3));
+        assert_eq!(for_pipeline("reg-rb-old").admitted(), 1);
+
+        // A new entry that created series before failing is kept, disabled.
+        let partial = register("reg-rb-partial", policy(3)).unwrap();
+        partial.tables().label("t");
+        partial.rollback();
+        assert!(is_registered("reg-rb-partial"));
+        assert_eq!(for_pipeline("reg-rb-partial").policy(), None);
+        assert!(register("reg-rb-partial", policy(4)).is_err());
     }
 }

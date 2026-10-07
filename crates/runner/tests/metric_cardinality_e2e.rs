@@ -511,6 +511,11 @@ async fn default_cardinality_ignores_table_count_and_opt_in_is_bounded()
     assert_eq!(o11y::table_lag::global().len("capped"), 0);
     assert!(lag_series("capped").is_empty());
     assert_eq!(table_metrics::for_pipeline("capped").policy(), None);
+    assert!(
+        table_metrics::is_registered("capped"),
+        "its admissions outlive the pipeline (its series cannot be removed)"
+    );
+    assert_eq!(table_metrics::for_pipeline("capped").admitted(), CAP);
 
     for name in ["small", "large"] {
         PipelineController::delete(&mgr, name).await?;

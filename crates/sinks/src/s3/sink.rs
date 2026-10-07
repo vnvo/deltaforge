@@ -1114,13 +1114,14 @@ mod tests {
             PerTablePolicy, register, unregister,
         };
         let pipeline = "s3-labels-on";
-        register(
+        let _registered = register(
             pipeline,
             Some(PerTablePolicy {
                 max_tables: 10,
                 lag_idle: std::time::Duration::from_secs(300),
             }),
-        );
+        )
+        .unwrap();
         let series = committed_labels(pipeline);
         unregister(pipeline);
         let tables: std::collections::BTreeSet<_> = series
