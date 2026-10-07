@@ -36,7 +36,7 @@ The profiles are qualified and published separately: a snapshot that cannot meet
 
 | Dimension | Criterion |
 |---|---|
-| Correctness | no lost change, no change of a logical row out of order, no checkpoint advanced past undelivered data, no wrong-schema decode, in every scenario (section 4.4) |
+| Correctness | no lost change, no checkpoint advanced past undelivered data, no wrong-schema decode, and no change of a logical row out of order **within the configured Kafka partition**, in every scenario (section 4.4). Until a before/after-coalescing key exists, ordering of a row's delete relative to its earlier events across partitions is **reported, not guaranteed** |
 | Steady CDC | sustains the production change profile with lag p99 under the budget **(owner; proposed 5 s)**, with lag not growing over a 6-hour run |
 | Memory | process cgroup peak under the budget **(owner; proposed 16 GiB)** at every point of the active-set matrix, explained by the resource inventory (section 3.4) and memory model (section 3.5) |
 | Connections | per cluster: 1 binlog session plus a stated, bounded number of control and snapshot connections; per instance: a stated total |
@@ -109,16 +109,16 @@ From the code on main (cited), for the reference pipeline: one MySQL source, one
 | Listeners | API, metrics, optional admin (2-3 sockets) | `main.rs` |
 | Locks and semaphores | manager lifecycle mutex (serializes every start, stop, patch, resume and delete in the process); registry high-water lock (every schema registration); registry cache mutex; snapshot connection semaphore (64 by default, `--max-snapshot-connections`); table-metrics registry lock; lag collector mutex | `pipeline_manager.rs:806`, `schema_registry.rs:411-414, 1166`, `snapshot_permits.rs:18, 76`, `table_metrics.rs`, `table_lag.rs` |
 
-**Formulas and values** (reference pipeline, `B = 3`; "ceiling" is what the code permits, "expected" is the steady use above):
+**Formulas and values** (reference pipeline, `B = 3`; "ceiling" is what the code permits, "expected" is the steady use above). These are **planning estimates** read from the code and library defaults, to be verified by the harness; in particular the MySQL connection counts and the Kafka thread counts (librdkafka's thread model) are not runtime guarantees:
 
 | Resource | Formula | N = 1 | 25 | 50 | 100 | 300 |
 |---|---|---|---|---|---|---|
-| MySQL connections, expected steady | `2N` | 2 | 50 | 100 | 200 | 600 |
-| MySQL connections, transient peak (all sources reconnecting, S11) | `5N` | 5 | 125 | 250 | 500 | 1,500 |
-| MySQL connections, ceiling (two loader pools at the library maximum, plus binlog) | `201N` | 201 | 5,025 | 10,050 | 20,100 | 60,300 |
+| MySQL connections, expected steady (estimate) | `2N` | 2 | 50 | 100 | 200 | 600 |
+| MySQL connections, transient peak, all sources reconnecting (estimate) | `5N` | 5 | 125 | 250 | 500 | 1,500 |
+| MySQL connections, ceiling: two loader pools at the library maximum, plus binlog (estimate) | `201N` | 201 | 5,025 | 10,050 | 20,100 | 60,300 |
 | Long-lived tokio tasks | `5N + 4` | 9 | 129 | 254 | 504 | 1,504 |
 | Coordinator wake-ups per second when idle | `20N` | 20 | 500 | 1,000 | 2,000 | 6,000 |
-| Kafka producer OS threads | `N(3 + B)` | 6 | 150 | 300 | 600 | 1,800 |
+| Kafka producer OS threads (estimate) | `N(3 + B)` | 6 | 150 | 300 | 600 | 1,800 |
 | Queued source items (channel capacity) | `32,768N` | 33K | 819K | 1.6M | 3.3M | 9.8M |
 | Batch bytes, nominal (3 batches of 16 MiB) | `48 MiB x N` | 48 MiB | 1.2 GiB | 2.3 GiB | 4.7 GiB | 14 GiB |
 | Resident schema cache ceiling (1 loader) | `64 MiB x N + 64 MiB` | 128 MiB | 1.6 GiB | 3.2 GiB | 6.3 GiB | 18.8 GiB |
@@ -187,7 +187,7 @@ A verifying consumer reads the sink (Kafka, as production **(owner)**) and check
 
 1. **Completeness:** every committed change is delivered.
 2. **Duplicates:** counted and reported (at-least-once).
-3. **Order per logical row:** `version` never goes backwards for a row within what Kafka orders (a partition).
+3. **Order per logical row within a partition:** `version` never goes backwards for a row among the events Kafka orders together (one partition). This is the only ordering the qualification guarantees while key templates cannot key deletes; order across partitions is measured and reported.
 4. **Final state:** applying the consumed changes per logical row in `version` order gives the source's final rows.
 5. **Schema across DDL:** rows written right before and after each migration statement carry values only the right schema decodes correctly.
 
