@@ -132,7 +132,7 @@ Synthetic registries: *N* tables per source × 2 sources with the same table nam
 
 ## Throughput
 
-Throughput is environment-dependent and is **[measured] only on a developer machine** (single runs, heavy desktop contention observed), so no headline number is published as a guarantee. Treat sustained throughput as **[unknown]** for your environment until you run a soak. Backpressure bounds queued item count and batch/transaction payloads where their byte limits are enabled, but it does not provide a process-wide memory bound.
+Throughput is environment-dependent and is **[measured] only on a developer machine** (single runs, heavy desktop contention observed), so no headline number is published as a guarantee. The figures in [Performance Tuning](performance.md) are such development-machine observations, useful for the relative effect of settings only; comparative benchmarks are defined in the [benchmark design](https://github.com/vnvo/deltaforge/blob/main/docs/design/benchmarks.md) and run after rc.1. Treat sustained throughput as **[unknown]** for your environment until you run a soak. Backpressure bounds queued item count and batch/transaction payloads where their byte limits are enabled, but it does not provide a process-wide memory bound.
 
 ## Known scaling caveats (pending benchmark)
 
