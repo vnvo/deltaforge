@@ -7,13 +7,18 @@
 //! a capacity: runs are exploratory unless every input is an owner input
 //! ([`config::RunConfig::check_class`]).
 
+pub mod actions;
 pub mod activeset;
 pub mod config;
+pub mod consumer;
 pub mod deltaforge;
 pub mod driver;
 pub mod fixture;
 pub mod ledger;
 pub mod measure;
+pub mod results;
+pub mod run;
+pub mod scenario;
 pub mod stats;
 pub mod topology;
 pub mod verify;

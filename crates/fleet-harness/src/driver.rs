@@ -555,6 +555,124 @@ pub async fn migration(
     Ok(done)
 }
 
+/// First database index of onboarded customers: beyond any fixture, so
+/// offboarding (which drops only databases onboarded in this run) never
+/// touches the reusable fixture.
+pub const ONBOARD_BASE: u32 = 90_000;
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LifecycleReport {
+    pub onboarded: u32,
+    pub offboarded: u32,
+    pub rows_written: u64,
+}
+
+/// Onboard and offboard customers at the configured rates until stopped:
+/// onboarding creates a database with every template table and writes one
+/// row per table; offboarding drops the oldest database onboarded in this
+/// run.
+pub async fn lifecycle(
+    ctx: Arc<ServerCtx>,
+    cfg: Arc<RunConfig>,
+    ledger: &Path,
+    mut stop: watch::Receiver<bool>,
+) -> Result<LifecycleReport> {
+    let rate = |p: &Option<crate::config::Param<f64>>| {
+        p.as_ref().map_or(0.0, |p| p.value)
+    };
+    let (on, off) = (
+        rate(&cfg.lifecycle.onboard_per_hour),
+        rate(&cfg.lifecycle.offboard_per_hour),
+    );
+    let mut report = LifecycleReport::default();
+    if on <= 0.0 && off <= 0.0 {
+        return Ok(report);
+    }
+    let mut out = Writer::create(ledger)?;
+    let mut conn = Conn::new(ctx.opts.clone()).await?;
+    let every = |per_hour: f64| {
+        (per_hour > 0.0).then(|| Duration::from_secs_f64(3_600.0 / per_hour))
+    };
+    let (on_every, off_every) = (every(on), every(off));
+    let started = Instant::now();
+    let (mut next_on, mut next_off) = (on_every, off_every);
+    let mut live: std::collections::VecDeque<u32> = Default::default();
+    let mut next_index = ONBOARD_BASE + (ctx.run_tag as u32 % 1_000) * 9;
+    let id_base = (ctx.run_tag << 40) | (1 << 38);
+    loop {
+        let due = [next_on, next_off].into_iter().flatten().min();
+        let Some(due) = due else { break };
+        let wait = due.saturating_sub(started.elapsed());
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = stop.changed() => break,
+        }
+        if *stop.borrow() {
+            break;
+        }
+        if next_on == Some(due) {
+            let db = next_index;
+            next_index += 1;
+            let name = ctx.naming.database(db);
+            conn.query_drop(format!("CREATE DATABASE IF NOT EXISTS `{name}`"))
+                .await?;
+            for t in ctx.templates.iter() {
+                let tname = ctx.naming.table(t.index);
+                conn.query_drop(t.create_sql(&name, &tname)).await?;
+                let version = ctx.next_version();
+                let at = now_micros();
+                let id = id_base + u64::from(t.index);
+                conn.query_drop(insert_sql(
+                    &name,
+                    &tname,
+                    t,
+                    &RowWrite {
+                        id,
+                        version,
+                        at,
+                        payload: "onboard",
+                        extra: None,
+                    },
+                ))
+                .await?;
+                out.append(&Record {
+                    row: RowKey {
+                        table: TableRef {
+                            server: ctx.index,
+                            db,
+                            table: t.index,
+                        },
+                        id,
+                    },
+                    version,
+                    op: Op::Insert,
+                    at_micros: at,
+                    partition: -1,
+                    offset: -1,
+                })?;
+                report.rows_written += 1;
+            }
+            live.push_back(db);
+            report.onboarded += 1;
+            next_on = on_every.map(|e| due + e);
+        }
+        if next_off == Some(due) {
+            if let Some(db) = live.pop_front() {
+                conn.query_drop(format!(
+                    "DROP DATABASE IF EXISTS `{}`",
+                    ctx.naming.database(db)
+                ))
+                .await?;
+                report.offboarded += 1;
+            }
+            next_off = off_every.map(|e| due + e);
+        }
+    }
+    conn.disconnect().await.ok();
+    out.finish()?;
+    Ok(report)
+}
+
 /// Kinds of literal used in a probe column (exposed for tests).
 pub fn probe_kind() -> ColumnKind {
     ColumnKind::Int

@@ -180,6 +180,11 @@ impl RecoveryMarks {
         }
     }
 
+    /// Marked servers without a later event yet.
+    pub fn pending(&self) -> usize {
+        self.0.lock().values().filter(|(_, f)| f.is_none()).count()
+    }
+
     /// Seconds from the mark to the first later event, per server.
     pub fn take(&self) -> HashMap<u16, Option<f64>> {
         self.0
@@ -206,6 +211,8 @@ pub struct StreamReport {
     pub probes_ok: u64,
     pub probes_failed: u64,
     pub probe_examples: Vec<String>,
+    /// Row events per server index.
+    pub per_server: std::collections::BTreeMap<u16, u64>,
 }
 
 /// In-stream verification state.
@@ -262,6 +269,7 @@ impl Verifier {
             }
         };
         self.report.row_events += 1;
+        *self.report.per_server.entry(server).or_insert(0) += 1;
         if self.expected_key == ExpectedKey::PrimaryKey {
             let want = d.row.id.to_string();
             if key != Some(want.as_bytes()) {
