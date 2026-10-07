@@ -668,8 +668,23 @@ pub struct SchemaSensorState {
 
 impl SchemaSensorState {
     pub fn new(config: SchemaSensingConfig) -> Self {
+        Self::with_table_metrics(
+            config,
+            Arc::new(deltaforge_core::table_metrics::TableMetrics::disabled(
+                "",
+            )),
+        )
+    }
+
+    /// Sensing whose metrics report under `tables`' pipeline and policy.
+    pub fn with_table_metrics(
+        config: SchemaSensingConfig,
+        tables: Arc<deltaforge_core::table_metrics::TableMetrics>,
+    ) -> Self {
         Self {
-            sensor: Mutex::new(SchemaSensor::new(config.clone())),
+            sensor: Mutex::new(
+                SchemaSensor::new(config.clone()).with_table_metrics(tables),
+            ),
             drift_detector: Mutex::new(DriftDetector::new()),
             config,
         }

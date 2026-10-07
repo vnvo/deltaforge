@@ -1167,9 +1167,12 @@ impl PipelineManager {
 
         // Schema sensing
         let sensing_cfg = spec.spec.schema_sensing.clone();
-        let sensor = sensing_cfg
-            .enabled
-            .then(|| Arc::new(SchemaSensorState::new(sensing_cfg)));
+        let sensor = sensing_cfg.enabled.then(|| {
+            Arc::new(SchemaSensorState::with_table_metrics(
+                sensing_cfg,
+                deltaforge_core::table_metrics::for_pipeline(&pipeline_name),
+            ))
+        });
 
         let mut builder = Coordinator::builder(pipeline_name.clone())
             .sinks(sinks.clone())

@@ -19,10 +19,12 @@ tracing.workspace = true
 chrono.workspace = true
 
 deltaforge-config = { path = "../deltaforge-config" }
+deltaforge-core = { path = "../deltaforge-core" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 criterion = { version = "0.5", features = ["html_reports"] }
+metrics-util = "0.19"
 
 [[bench]]
 name = "sensing_bench"
