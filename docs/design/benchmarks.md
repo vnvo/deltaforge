@@ -33,14 +33,14 @@ The two systems are configured to do the same work, and every remaining differen
 | Aspect | DeltaForge | Debezium |
 |---|---|---|
 | Message value | `envelope: { type: native }`, JSON: the change object itself (`before`, `after`, `source`, `op`, `ts_ms`) | `JsonConverter` with `value.converter.schemas.enable=false`: the payload object itself, with no `schema`/`payload` wrapper |
-| Message key | `key: "${after.id}"` (the primary key; DeltaForge has no automatic primary-key key, and its default key is an idempotency key) | the primary key struct, `key.converter.schemas.enable=false` |
+| Message key | `key: "${after.id}"`: the primary key for events with an after image only; a delete resolves to an empty key (DeltaForge has no automatic primary-key key and no before/after-coalescing key expression; its default key is an idempotency key) | the primary key struct for every operation, `key.converter.schemas.enable=false` |
 | Topic per table | `topic: "bench.${source.schema}.${source.table}"` (PostgreSQL), `"bench.${source.db}.${source.table}"` (MySQL) | `topic.prefix=bench`, default `<prefix>.<schema>.<table>` / `<prefix>.<db>.<table>` naming |
 | Delivery | at-least-once (`exactly_once` unset) | at-least-once (no exactly-once source support enabled) |
 | Producer | `acks=all`, idempotence on (sink defaults), compression `lz4` | `producer.override.acks=all`, `enable.idempotence=true`, `compression.type=lz4` |
 | Snapshot mode | `snapshot.mode: initial` for the snapshot workloads, `never` otherwise | `snapshot.mode=initial` / `no_data` (PostgreSQL), `initial` / `no_data` (MySQL) |
 | Topics | pre-created with the same partition count and replication factor 1 | same |
 
-Key bytes differ (`1` versus `{"id":1}`); parity is on partitioning by primary key, not on byte equality. The `source` block differs in its fields (Debezium carries more connector metadata); its size shows in the payload bytes per message, reported for both systems.
+Key bytes differ (`1` versus `{"id":1}`); parity is on partitioning by primary key, not on byte equality, and holds for inserts and updates only. For deletes, primary-key partitioning parity is not achievable today without a routing override (a processor setting each event's key) or a product change; the benchmark does not add an override, reports the partition of DeltaForge's deletes as a measured difference, and never relies on the message key for correctness (section 6). The `source` block differs in its fields (Debezium carries more connector metadata); its size shows in the payload bytes per message, reported for both systems.
 
 DeltaForge's `debezium` envelope is **not** the parity choice: its `{"schema": null, "payload": {...}}` wrapper corresponds structurally to schemas-enabled Connect output (`schemas.enable=true`), which carries the full schema rather than `null`. With `schemas.enable=false`, Connect emits the payload object directly, which is the shape of DeltaForge's native envelope. DeltaForge's documentation currently states the opposite (see section 12).
 
@@ -104,10 +104,10 @@ Kafka broker, databases and driver run in separate containers whose resources ar
 
 A run whose checks fail is invalid and is reported as a failure, not as a number.
 
-1. **Completeness:** every operation the driver committed is delivered: the verifier compares the set of `(table, id, version, op)` written with the set consumed.
+1. **Completeness:** every operation the driver committed is delivered: the verifier compares the set of `(table, id, version, op)` written with the set consumed. Logical identity (`table`, `id`) comes from `after`, or from `before` for deletes, never from the message key.
 2. **Duplicates:** at-least-once allows duplicates; their count is reported for each system and run.
-3. **Order:** for each key, consumed `version` values never go backwards within a partition (W4, W5).
-4. **Final state:** after the run, applying the consumed changes per key gives the same final rows as the source (checksum over `id`, `version` and payload).
+3. **Order:** for each logical row, consumed `version` values never go backwards within a partition (W4, W5). A DeltaForge delete partitioned away from its row's earlier events is reported as a cross-partition reordering, a measured difference of the keying (section 3), not hidden.
+4. **Final state:** after the run, applying the consumed changes per logical row in `version` order gives the same final rows as the source (checksum over `id`, `version` and payload).
 5. **Snapshot boundary:** for W6/W7 with concurrent writes, every row is present exactly in its latest version after the stream catches up.
 
 ## 7. Environment
@@ -147,6 +147,8 @@ A run whose checks fail is invalid and is reported as a failure, not as a number
 3. Publication of the first results with this method; reconcile `docs/src/performance.md` against them.
 
 ## 12. Found while preparing this design (follow-ups, not part of the design)
+
+- **No before/after-coalescing message key (product and documentation follow-up):** a key template such as `${after.id}` resolves to an empty key on deletes (the Kafka sink's lenient resolver does not fall back to the default key when a template is configured, contrary to its code comment), so primary-key keys consistent across inserts, updates and deletes cannot be configured. Needed: a declarative key expression taking `after`, else `before`, and documentation of the current behavior in `docs/src/sinks/kafka.md` and `docs/src/routing.md`.
 
 - **Incorrect compatibility claim (documentation follow-up):** `README.md` (Debezium compatibility note and the migration tip) and `docs/src/envelopes.md` (Debezium envelope) state that the `debezium` envelope's `{"schema": null, "payload": ...}` output matches `JsonConverter` with `schemas.enable=false`, and advise `envelope: { type: debezium }` for drop-in compatibility with such consumers. With `schemas.enable=false`, Connect emits the payload object without a wrapper, which matches the native envelope's shape; the wrapped form matches schemas-enabled output structurally, which carries a full schema instead of `null`. Both documents need correcting.
 
