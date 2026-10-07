@@ -297,6 +297,21 @@ async fn the_harness_runs_scenarios_end_to_end() {
         "{}",
         r["completeness"]
     );
+    assert_eq!(r["verdict"]["repetition_ok"], true, "{}", r["verdict"]);
+    assert_eq!(r["verdict"]["plan_executed"], true, "{}", r["verdict"]);
+    assert_eq!(r["driver"]["c01"]["uncertain_txns"], 0);
+    let w = &r["workload"]["c01"];
+    assert!(
+        w["ratio"].as_f64().unwrap() > 0.5,
+        "the writers kept up with the target: {w}"
+    );
+    for side in ["written", "consumed"] {
+        assert!(
+            r["sort"][side]["max_open_runs"].as_u64().unwrap() <= 64,
+            "{}",
+            r["sort"]
+        );
+    }
     let step = &r["steps"][0];
     assert_eq!(step["action"]["action"], "restart_pipelines");
     assert_eq!(step["error"], Value::Null, "{step}");

@@ -121,10 +121,32 @@ pub struct Verdict {
     /// Completeness, ordering within partitions, schema probes and (when
     /// expected) primary-key keys.
     pub correctness_ok: bool,
+    /// Every action of the plan ran without error.
+    pub plan_executed: bool,
+    pub actions_not_run: usize,
+    pub action_errors: usize,
+    /// Uncertain transactions within the owner's allowance (none by
+    /// default), and no driver writer ended in error.
+    pub uncertainty_ok: bool,
+    /// Every server committed at least the owner's minimum share of the
+    /// configured workload; `None` without an owner minimum.
+    pub workload_ok: Option<bool>,
     /// Every owner budget evaluated passed; `None` if none was evaluated.
     pub budgets_ok: Option<bool>,
-    /// Actions of the plan that could not run.
-    pub actions_not_run: usize,
+    /// What a sweep counts. Exploratory: correctness. Qualification:
+    /// correctness, the whole plan executed, uncertainty within the
+    /// allowance and the workload achieved (budgets are judged by the
+    /// sweep).
+    pub repetition_ok: bool,
+}
+
+/// The configured workload against what was committed, per server, over
+/// the measured window.
+#[derive(Debug, Clone, Serialize)]
+pub struct Workload {
+    pub target_ops: f64,
+    pub committed_ops: u64,
+    pub ratio: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -148,6 +170,11 @@ pub struct RunResult {
     /// Committed operations per second per server over the measured window.
     pub achieved_ops_per_sec: BTreeMap<String, f64>,
     pub achieved_ops_per_sec_total: f64,
+    pub workload: BTreeMap<String, Workload>,
+    /// Writers that ended with an error (their remaining workload was not
+    /// exercised).
+    pub writer_errors: Vec<String>,
+    pub sort: BTreeMap<String, crate::ledger::SortStats>,
     pub stream: StreamReport,
     pub lag_ms: BTreeMap<String, Summary>,
     pub resources: Aggregate,
@@ -232,18 +259,49 @@ impl RunResult {
         let evaluated: Vec<bool> =
             self.budgets.iter().filter_map(|c| c.passed).collect();
         let s = &self.stream;
+        let correctness_ok = self.completeness.ok()
+            && s.probes_failed == 0
+            && s.key_mismatches == 0
+            && s.decode_errors == 0;
+        let actions_not_run =
+            self.steps.iter().filter(|s| s.not_run.is_some()).count();
+        let action_errors =
+            self.steps.iter().filter(|s| s.error.is_some()).count();
+        let plan_executed = actions_not_run == 0 && action_errors == 0;
+        let uncertain: u64 =
+            self.driver.values().map(|c| c.uncertain_txns).sum();
+        let uncertainty_ok = uncertain
+            <= self.config.policy.uncertain_allowance()
+            && self.writer_errors.is_empty();
+        let workload_ok = match &self.config.policy.min_achieved_ratio {
+            Some(p) if p.provenance == Provenance::Owner => Some(
+                !self.workload.is_empty()
+                    && self
+                        .workload
+                        .values()
+                        .all(|w| w.ratio.is_some_and(|r| r >= p.value)),
+            ),
+            _ => None,
+        };
+        let repetition_ok = match self.class {
+            RunClass::Exploratory => correctness_ok,
+            RunClass::Qualification => {
+                correctness_ok
+                    && plan_executed
+                    && uncertainty_ok
+                    && workload_ok == Some(true)
+            }
+        };
         self.verdict = Verdict {
-            correctness_ok: self.completeness.ok()
-                && s.probes_failed == 0
-                && s.key_mismatches == 0
-                && s.decode_errors == 0,
+            correctness_ok,
+            plan_executed,
+            actions_not_run,
+            action_errors,
+            uncertainty_ok,
+            workload_ok,
             budgets_ok: (!evaluated.is_empty())
                 .then(|| evaluated.iter().all(|&p| p)),
-            actions_not_run: self
-                .steps
-                .iter()
-                .filter(|s| s.not_run.is_some())
-                .count(),
+            repetition_ok,
         };
     }
 
@@ -381,5 +439,144 @@ mod tests {
             vec![point(1, false, Some(true))],
         );
         assert_eq!(s.largest_passing_sources, None, "correctness first");
+    }
+
+    use crate::config::tests::EXAMPLE;
+    use crate::scenario::Action;
+
+    fn result(class: RunClass) -> RunResult {
+        let mut config: RunConfig = serde_yaml::from_str(EXAMPLE).unwrap();
+        config.class = class;
+        RunResult {
+            run_id: "r".into(),
+            class,
+            claims_allowed: false,
+            scenario: "S7".into(),
+            sources: 1,
+            repetition: 1,
+            started_at: String::new(),
+            ended_at: String::new(),
+            harness_revision: String::new(),
+            placeholders: vec![],
+            config,
+            environment: Environment::default(),
+            fixture_tables: BTreeMap::new(),
+            pipelines_running_secs: None,
+            measured_secs: 60.0,
+            driver: BTreeMap::from([(
+                "c01".to_string(),
+                CountersSnapshot::default(),
+            )]),
+            achieved_ops_per_sec: BTreeMap::new(),
+            achieved_ops_per_sec_total: 0.0,
+            workload: BTreeMap::from([(
+                "c01".to_string(),
+                Workload {
+                    target_ops: 1_000.0,
+                    committed_ops: 1_000,
+                    ratio: Some(1.0),
+                },
+            )]),
+            writer_errors: vec![],
+            sort: BTreeMap::new(),
+            stream: StreamReport::default(),
+            lag_ms: BTreeMap::new(),
+            resources: Aggregate::default(),
+            steps: vec![],
+            completeness: Completeness::default(),
+            budgets: vec![],
+            verdict: Verdict {
+                correctness_ok: false,
+                plan_executed: false,
+                actions_not_run: 0,
+                action_errors: 0,
+                uncertainty_ok: false,
+                workload_ok: None,
+                budgets_ok: None,
+                repetition_ok: false,
+            },
+        }
+    }
+
+    fn step(not_run: Option<&str>, error: Option<&str>) -> StepOutcome {
+        StepOutcome {
+            at_secs: 0,
+            action: Action::Failover,
+            not_run: not_run.map(String::from),
+            error: error.map(String::from),
+            duration_secs: None,
+            shutdown_secs: None,
+            recovery: None,
+        }
+    }
+
+    fn qualified(mut r: RunResult) -> RunResult {
+        r.config.policy.min_achieved_ratio = Some(Param::owner(0.95));
+        r
+    }
+
+    #[test]
+    fn a_qualification_repetition_fails_when_an_action_did_not_run_or_failed() {
+        let mut r = qualified(result(RunClass::Qualification));
+        r.evaluate();
+        assert!(r.verdict.repetition_ok, "baseline: {:?}", r.verdict);
+        for s in [
+            step(Some("hooks not configured: failover"), None),
+            step(None, Some("hook failover failed")),
+        ] {
+            let mut q = qualified(result(RunClass::Qualification));
+            q.steps = vec![s.clone()];
+            q.evaluate();
+            assert!(
+                !q.verdict.plan_executed && !q.verdict.repetition_ok,
+                "{:?}",
+                q.verdict
+            );
+            let mut e = result(RunClass::Exploratory);
+            e.steps = vec![s];
+            e.evaluate();
+            assert!(
+                e.verdict.repetition_ok,
+                "exploratory runs record, not fail"
+            );
+            assert!(!e.verdict.plan_executed);
+        }
+    }
+
+    #[test]
+    fn uncertainty_fails_a_qualification_unless_the_owner_allows_it() {
+        let mut r = qualified(result(RunClass::Qualification));
+        r.driver.get_mut("c01").unwrap().uncertain_txns = 1;
+        r.evaluate();
+        assert!(!r.verdict.uncertainty_ok && !r.verdict.repetition_ok);
+        r.config.policy.max_uncertain_transactions = Some(Param::owner(1));
+        r.evaluate();
+        assert!(r.verdict.uncertainty_ok && r.verdict.repetition_ok);
+        r.writer_errors = vec!["writer connection to c01".into()];
+        r.evaluate();
+        assert!(
+            !r.verdict.uncertainty_ok,
+            "a writer that stopped early fails"
+        );
+    }
+
+    #[test]
+    fn a_workload_shortfall_fails_against_an_owner_minimum() {
+        let mut r = qualified(result(RunClass::Qualification));
+        r.workload.get_mut("c01").unwrap().ratio = Some(0.5);
+        r.evaluate();
+        assert_eq!(r.verdict.workload_ok, Some(false));
+        assert!(!r.verdict.repetition_ok);
+        let mut p = result(RunClass::Qualification);
+        p.config.policy.min_achieved_ratio = Some(Param::placeholder(0.95));
+        p.evaluate();
+        assert_eq!(
+            p.verdict.workload_ok, None,
+            "a placeholder minimum is not evaluated"
+        );
+        assert!(
+            !p.verdict.repetition_ok,
+            "and a qualification cannot pass without one"
+        );
     }
 }

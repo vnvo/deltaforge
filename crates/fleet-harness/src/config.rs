@@ -137,6 +137,8 @@ pub struct RunConfig {
     #[serde(default)]
     pub budgets: Budgets,
     #[serde(default)]
+    pub policy: Policy,
+    #[serde(default)]
     pub disruptions: Disruptions,
     #[serde(default)]
     pub actions: BTreeMap<String, String>,
@@ -356,6 +358,29 @@ pub struct Budgets {
     pub connections_per_server: Option<Param<u64>>,
 }
 
+/// What a qualification repetition tolerates beyond correctness.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Policy {
+    /// Committed operations over the configured target in the measured
+    /// window, per server, at least this (an owner input for a
+    /// qualification).
+    pub min_achieved_ratio: Option<Param<f64>>,
+    /// Transactions whose commit outcome could not be determined. Absent or
+    /// not an owner input means none is tolerated.
+    pub max_uncertain_transactions: Option<Param<u64>>,
+}
+
+impl Policy {
+    /// The uncertain transactions a qualification tolerates.
+    pub fn uncertain_allowance(&self) -> u64 {
+        match &self.max_uncertain_transactions {
+            Some(p) if p.provenance == Provenance::Owner => p.value,
+            _ => 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Disruptions {
@@ -504,6 +529,9 @@ impl RunConfig {
         b.shutdown_secs.collect("budgets.shutdown_secs", &mut out);
         b.connections_per_server
             .collect("budgets.connections_per_server", &mut out);
+        self.policy
+            .min_achieved_ratio
+            .collect("policy.min_achieved_ratio", &mut out);
         out
     }
 
@@ -612,5 +640,24 @@ pub(crate) mod tests {
         let mut cfg: RunConfig = serde_yaml::from_str(EXAMPLE).unwrap();
         cfg.run.sources = vec![1, 1_000];
         assert!(cfg.validate().unwrap_err().to_string().contains("servers"));
+    }
+
+    #[test]
+    fn uncertain_transactions_are_tolerated_only_by_an_owner_policy() {
+        let mut cfg: RunConfig = serde_yaml::from_str(EXAMPLE).unwrap();
+        assert_eq!(cfg.policy.uncertain_allowance(), 0);
+        cfg.policy.max_uncertain_transactions = Some(Param::placeholder(5));
+        assert_eq!(
+            cfg.policy.uncertain_allowance(),
+            0,
+            "a placeholder allows nothing"
+        );
+        cfg.policy.max_uncertain_transactions = Some(Param::owner(5));
+        assert_eq!(cfg.policy.uncertain_allowance(), 5);
+        assert!(
+            cfg.placeholders()
+                .iter()
+                .any(|p| p.starts_with("policy.min_achieved_ratio"))
+        );
     }
 }

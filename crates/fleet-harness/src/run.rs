@@ -45,6 +45,8 @@ pub struct RunOptions {
     pub keep_pipelines: bool,
     /// Records per in-memory chunk of the external sort.
     pub sort_chunk_records: usize,
+    /// Run files merged at once by the external sort (bounds descriptors).
+    pub sort_fan_in: usize,
 }
 
 impl Default for RunOptions {
@@ -56,6 +58,7 @@ impl Default for RunOptions {
             start_timeout: Duration::from_secs(900),
             keep_pipelines: false,
             sort_chunk_records: 8_000_000,
+            sort_fan_in: ledger::DEFAULT_FAN_IN,
         }
     }
 }
@@ -72,7 +75,7 @@ pub async fn sweep(cfg: RunConfig, opts: RunOptions) -> Result<Sweep> {
         for rep in 1..=cfg.run.repetitions {
             match run_once(cfg.clone(), n, rep, &opts).await {
                 Ok(r) => {
-                    failed |= !r.verdict.correctness_ok;
+                    failed |= !r.verdict.repetition_ok;
                     runs.push(r);
                 }
                 Err(e) => {
@@ -300,6 +303,16 @@ pub async fn run_once(
         .collect();
     let (driver_stop_tx, driver_stop) = watch::channel(false);
     let mut writers: Vec<JoinHandle<Result<u64>>> = Vec::new();
+    let integrators: Vec<JoinHandle<()>> = ctxs
+        .iter()
+        .map(|ctx| {
+            tokio::spawn(driver::target_integrator(
+                ctx.clone(),
+                cfg.clone(),
+                driver_stop.clone(),
+            ))
+        })
+        .collect();
     for ctx in &ctxs {
         for w in 0..cfg.traffic.writers_per_server.max(1) {
             let path = work.join(format!("w-{}-{w}.bin", ctx.server.name));
@@ -319,6 +332,8 @@ pub async fn run_once(
     let window_start = Instant::now();
     let ops_at_start: Vec<u64> =
         ctxs.iter().map(|c| c.counters.snapshot().ops).collect();
+    let target_at_start: Vec<f64> =
+        ctxs.iter().map(|c| c.target_ops()).collect();
     let shared = Shared {
         cfg: cfg.clone(),
         servers: servers.clone(),
@@ -353,14 +368,23 @@ pub async fn run_once(
     let measured_secs = window_start.elapsed().as_secs_f64();
     let counters: Vec<CountersSnapshot> =
         ctxs.iter().map(|c| c.counters.snapshot()).collect();
+    let target_at_end: Vec<f64> = ctxs.iter().map(|c| c.target_ops()).collect();
 
     // Stop and drain.
     driver_stop_tx.send(true).ok();
+    let mut writer_errors = Vec::new();
     for w in writers {
-        if let Err(e) = w.await? {
-            eprintln!("writer ended with an error: {e:#}");
+        match w.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => writer_errors.push(format!("{e:#}")),
+            Err(e) => writer_errors.push(format!("writer task: {e}")),
         }
     }
+    for i in integrators {
+        i.await.ok();
+    }
+    let final_counters: Vec<CountersSnapshot> =
+        ctxs.iter().map(|c| c.counters.snapshot()).collect();
     for (i, t) in background {
         match t.await? {
             Ok(note) => {
@@ -387,20 +411,23 @@ pub async fn run_once(
             })
             .collect())
     };
-    let written = ledger::sort_files(
+    let (written, written_stats) = ledger::sort_files_with(
         &files("bin")?,
         &work.join("sorted-written"),
         opts.sort_chunk_records,
+        opts.sort_fan_in,
     )?;
-    let uncertain = ledger::sort_files(
+    let (uncertain, uncertain_stats) = ledger::sort_files_with(
         &files("uncertain")?,
         &work.join("sorted-uncertain"),
         opts.sort_chunk_records,
+        opts.sort_fan_in,
     )?;
-    let consumed = ledger::sort_files(
+    let (consumed, consumed_stats) = ledger::sort_files_with(
         &[work.join("consumed.bin")],
         &work.join("sorted-consumed"),
         opts.sort_chunk_records,
+        opts.sort_fan_in,
     )?;
     let completeness = ledger::compare(&written, &consumed, Some(&uncertain))?;
 
@@ -417,6 +444,24 @@ pub async fn run_once(
             .map(|(_, s)| s.name.clone())
             .unwrap_or_default()
     };
+    let mut workload = BTreeMap::new();
+    for (((_, s), (c, start)), (t0, t1)) in servers
+        .iter()
+        .zip(counters.iter().zip(&ops_at_start))
+        .zip(target_at_start.iter().zip(&target_at_end))
+    {
+        let target_ops = t1 - t0;
+        let committed_ops = c.ops - start;
+        workload.insert(
+            s.name.clone(),
+            crate::results::Workload {
+                target_ops,
+                committed_ops,
+                ratio: (target_ops > 0.0)
+                    .then(|| committed_ops as f64 / target_ops),
+            },
+        );
+    }
     let mut achieved = BTreeMap::new();
     for ((i, s), (c, start)) in
         servers.iter().zip(counters.iter().zip(&ops_at_start))
@@ -447,10 +492,17 @@ pub async fn run_once(
         driver: servers
             .iter()
             .map(|(_, s)| s.name.clone())
-            .zip(counters)
+            .zip(final_counters)
             .collect(),
         achieved_ops_per_sec_total: achieved.values().sum(),
         achieved_ops_per_sec: achieved,
+        workload,
+        writer_errors,
+        sort: BTreeMap::from([
+            ("written".to_string(), written_stats),
+            ("uncertain".to_string(), uncertain_stats),
+            ("consumed".to_string(), consumed_stats),
+        ]),
         stream,
         lag_ms: lag
             .into_iter()
@@ -462,8 +514,13 @@ pub async fn run_once(
         budgets: Vec::new(),
         verdict: Verdict {
             correctness_ok: false,
-            budgets_ok: None,
+            plan_executed: false,
             actions_not_run: 0,
+            action_errors: 0,
+            uncertainty_ok: false,
+            workload_ok: None,
+            budgets_ok: None,
+            repetition_ok: false,
         },
     };
     result.evaluate();

@@ -92,9 +92,17 @@ pub struct Counters {
     pub errors: AtomicU64,
     pub ddl_statements: AtomicU64,
     pub probes: AtomicU64,
+    /// Failed transactions whose outcome was read back from MySQL.
+    pub reconciled_committed: AtomicU64,
+    pub reconciled_rolled_back: AtomicU64,
+    /// Failed transactions whose outcome could not be determined.
+    pub uncertain_txns: AtomicU64,
+    pub uncertain_ops: AtomicU64,
+    /// Tables no longer written because of an uncertain transaction.
+    pub retired_tables: AtomicU64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct CountersSnapshot {
     pub ops: u64,
     pub inserts: u64,
@@ -105,6 +113,11 @@ pub struct CountersSnapshot {
     pub errors: u64,
     pub ddl_statements: u64,
     pub probes: u64,
+    pub reconciled_committed: u64,
+    pub reconciled_rolled_back: u64,
+    pub uncertain_txns: u64,
+    pub uncertain_ops: u64,
+    pub retired_tables: u64,
 }
 
 impl Counters {
@@ -120,6 +133,11 @@ impl Counters {
             errors: g(&self.errors),
             ddl_statements: g(&self.ddl_statements),
             probes: g(&self.probes),
+            reconciled_committed: g(&self.reconciled_committed),
+            reconciled_rolled_back: g(&self.reconciled_rolled_back),
+            uncertain_txns: g(&self.uncertain_txns),
+            uncertain_ops: g(&self.uncertain_ops),
+            retired_tables: g(&self.retired_tables),
         }
     }
 }
@@ -137,6 +155,9 @@ pub struct ServerCtx {
     pub counters: Arc<Counters>,
     pub probes: Probes,
     pub run_tag: u64,
+    /// The configured workload so far (operations x 1000), integrated over
+    /// the peak schedule and any rate change ([`target_integrator`]).
+    pub target_milli_ops: Arc<AtomicU64>,
 }
 
 impl ServerCtx {
@@ -181,7 +202,13 @@ impl ServerCtx {
             counters: Arc::new(Counters::default()),
             probes,
             run_tag,
+            target_milli_ops: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Operations the configuration asked for so far.
+    pub fn target_ops(&self) -> f64 {
+        self.target_milli_ops.load(Ordering::Relaxed) as f64 / 1_000.0
     }
 
     fn next_version(&self) -> u64 {
@@ -322,6 +349,7 @@ pub async fn writer(
         let mut sql = Vec::new();
         let mut records = Vec::new();
         let mut kinds = Vec::new();
+        let mut planned: Vec<Planned> = Vec::new();
         for _ in 0..rows_per_txn {
             let table = loop {
                 let t = ctx.active.pick(started.elapsed().as_secs(), &mut rng);
@@ -392,6 +420,13 @@ pub async fn writer(
                 }
             };
             sql.extend(statements);
+            planned.push(Planned {
+                db: db.clone(),
+                table: tname.clone(),
+                row: RowKey { table, id },
+                version,
+                op,
+            });
             let row = RowKey { table, id };
             if op == Op::Delete {
                 // The stamp (an update) and the delete share the version.
@@ -435,18 +470,63 @@ pub async fn writer(
                 }
             }
             Err(e) => {
-                // The commit may or may not have happened (a lost reply):
-                // the operations go to the uncertain ledger (delivered or
-                // not, neither is an error) and their tables are retired.
-                ctx.counters.errors.fetch_add(1, Ordering::Relaxed);
+                // A lost reply leaves the commit unknown: read the rows
+                // back (this writer is their only writer) to learn it.
+                let c = &ctx.counters;
+                c.errors.fetch_add(1, Ordering::Relaxed);
                 tracing_like_warn(&ctx.server.name, &e.to_string());
-                for r in &records {
-                    uncertain.append(r)?;
-                    poisoned.insert(r.row.table);
-                }
-                conn.query_drop("ROLLBACK").await.ok();
-                if let Ok(c) = Conn::new(ctx.opts.clone()).await {
-                    conn = c;
+                match reconcile(&ctx, &mut conn, &planned, &mut stop).await {
+                    Some(true) => {
+                        for r in &records {
+                            out.append(r)?;
+                        }
+                        c.reconciled_committed.fetch_add(1, Ordering::Relaxed);
+                        c.txns.fetch_add(1, Ordering::Relaxed);
+                        for op in kinds {
+                            c.ops.fetch_add(1, Ordering::Relaxed);
+                            match op {
+                                Op::Insert => {
+                                    c.inserts.fetch_add(1, Ordering::Relaxed)
+                                }
+                                Op::Update => {
+                                    c.updates.fetch_add(1, Ordering::Relaxed)
+                                }
+                                Op::Delete => {
+                                    c.stamps.fetch_add(1, Ordering::Relaxed);
+                                    c.deletes.fetch_add(1, Ordering::Relaxed)
+                                }
+                            };
+                        }
+                    }
+                    Some(false) => {
+                        // Not committed: undo the row-range changes.
+                        for p in planned.iter().rev() {
+                            if let Some(range) = rows.get_mut(&p.row.table) {
+                                match p.op {
+                                    Op::Insert => range.hi -= 1,
+                                    Op::Delete => range.lo -= 1,
+                                    Op::Update => {}
+                                }
+                            }
+                        }
+                        c.reconciled_rolled_back
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    None => {
+                        // Undeterminable (the run stopped first, or the
+                        // rows contradict each other): expected neither way,
+                        // and the tables are retired.
+                        c.uncertain_txns.fetch_add(1, Ordering::Relaxed);
+                        c.uncertain_ops
+                            .fetch_add(planned.len() as u64, Ordering::Relaxed);
+                        for r in &records {
+                            uncertain.append(r)?;
+                            if poisoned.insert(r.row.table) {
+                                c.retired_tables
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -454,6 +534,125 @@ pub async fn writer(
     conn.disconnect().await.ok();
     uncertain.finish()?;
     out.finish()
+}
+
+/// One operation of a transaction, for reconciliation.
+#[derive(Debug, Clone)]
+struct Planned {
+    db: String,
+    table: String,
+    row: RowKey,
+    version: u64,
+    op: Op,
+}
+
+/// What a row should look like if the transaction committed: present at
+/// the version of its last operation, or absent after a delete. A row the
+/// transaction both created and deleted looks the same either way and is
+/// left out (`None`).
+fn committed_states(
+    planned: &[Planned],
+) -> Vec<(&Planned, Option<Option<u64>>)> {
+    let mut last: HashMap<RowKey, (usize, bool)> = HashMap::new();
+    for (i, p) in planned.iter().enumerate() {
+        let created = last.get(&p.row).map_or(p.op == Op::Insert, |(_, c)| *c);
+        last.insert(p.row, (i, created));
+    }
+    let mut out: Vec<_> = last
+        .into_values()
+        .map(|(i, created)| {
+            let p = &planned[i];
+            let expect = match p.op {
+                Op::Delete if created => None, // ambiguous
+                Op::Delete => Some(None),
+                _ => Some(Some(p.version)),
+            };
+            (p, expect)
+        })
+        .collect();
+    out.sort_by_key(|(p, _)| (p.row, p.version));
+    out
+}
+
+/// Decide from the rows read back: `Some(true)` committed, `Some(false)`
+/// not committed, `None` when nothing decides or the rows disagree.
+fn decide(states: &[(Option<Option<u64>>, Option<u64>)]) -> Option<bool> {
+    let mut verdicts = states
+        .iter()
+        .filter_map(|(expect, actual)| expect.map(|e| e == *actual));
+    let first = verdicts.next()?;
+    verdicts.all(|v| v == first).then_some(first)
+}
+
+/// Learn a failed transaction's outcome by reading its rows back, retrying
+/// the connection until it succeeds or the run stops.
+async fn reconcile(
+    ctx: &ServerCtx,
+    conn: &mut Conn,
+    planned: &[Planned],
+    stop: &mut watch::Receiver<bool>,
+) -> Option<bool> {
+    conn.query_drop("ROLLBACK").await.ok();
+    let expectations = committed_states(planned);
+    loop {
+        let mut states = Vec::with_capacity(expectations.len());
+        let mut failed = false;
+        for (p, expect) in &expectations {
+            let q = format!(
+                "SELECT `version` FROM `{}`.`{}` WHERE `id` = {}",
+                p.db, p.table, p.row.id
+            );
+            match conn.query_first::<u64, _>(q).await {
+                Ok(actual) => states.push((*expect, actual)),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !failed {
+            return decide(&states);
+        }
+        if *stop.borrow() {
+            return None;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            _ = stop.changed() => return None,
+        }
+        if let Ok(c) = Conn::new(ctx.opts.clone()).await {
+            *conn = c;
+        }
+    }
+}
+
+/// Integrate the configured workload of one server (the peak schedule
+/// times any rate change) into `ctx.target_milli_ops` until stopped.
+pub async fn target_integrator(
+    ctx: Arc<ServerCtx>,
+    cfg: Arc<RunConfig>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let (avg, peak, pf) = (
+        cfg.traffic.changes_per_sec_avg.value,
+        cfg.traffic.changes_per_sec_peak.value,
+        cfg.traffic.peak_fraction.value,
+    );
+    let started = Instant::now();
+    let mut last = started;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            _ = stop.changed() => break,
+        }
+        let now = Instant::now();
+        let scale = ctx.rate.get() / avg.max(f64::MIN_POSITIVE);
+        let rate = scheduled_rate(avg, peak, pf, now - started) * scale;
+        let add = rate * (now - last).as_secs_f64() * 1_000.0;
+        ctx.target_milli_ops
+            .fetch_add(add as u64, Ordering::Relaxed);
+        last = now;
+    }
 }
 
 fn tracing_like_warn(server: &str, error: &str) {
@@ -731,5 +930,60 @@ mod tests {
         let r = Rate::new(100.0);
         r.set(1_000.0);
         assert_eq!(r.get(), 1_000.0);
+    }
+
+    fn planned(id: u64, version: u64, op: Op) -> Planned {
+        Planned {
+            db: "d".into(),
+            table: "t".into(),
+            row: RowKey {
+                table: TableRef {
+                    server: 0,
+                    db: 0,
+                    table: 0,
+                },
+                id,
+            },
+            version,
+            op,
+        }
+    }
+
+    #[test]
+    fn reconciliation_follows_each_rows_last_operation() {
+        // Insert row 1 (v5), then update it (v6) in the same transaction.
+        let p = [
+            planned(1, 5, Op::Insert),
+            planned(1, 6, Op::Update),
+            planned(2, 7, Op::Delete),
+        ];
+        let states = committed_states(&p);
+        assert_eq!(states.len(), 2);
+        let expect: Vec<_> = states.iter().map(|(_, e)| *e).collect();
+        assert_eq!(expect, vec![Some(Some(6)), Some(None)]);
+        // Committed: row 1 at v6, row 2 gone.
+        assert_eq!(
+            decide(&[(expect[0], Some(6)), (expect[1], None)]),
+            Some(true)
+        );
+        // Rolled back: row 1 absent, row 2 still present at its old version.
+        assert_eq!(
+            decide(&[(expect[0], None), (expect[1], Some(3))]),
+            Some(false)
+        );
+        // Contradictory rows decide nothing.
+        assert_eq!(decide(&[(expect[0], Some(6)), (expect[1], Some(3))]), None);
+    }
+
+    #[test]
+    fn a_row_created_and_deleted_in_the_transaction_decides_nothing() {
+        let p = [planned(1, 5, Op::Insert), planned(1, 5, Op::Delete)];
+        let states = committed_states(&p);
+        assert_eq!(states[0].1, None);
+        assert_eq!(
+            decide(&[(None, None)]),
+            None,
+            "only ambiguous rows: undeterminable"
+        );
     }
 }

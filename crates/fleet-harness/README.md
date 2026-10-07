@@ -36,6 +36,24 @@ A result records what was achieved, not only pass or fail:
 - recovery to 50%, 90% and 100% of sources after each disruption;
 - metrics scrape time and size.
 
+## What a repetition must achieve
+
+A sweep counts a repetition only if `verdict.repetition_ok` holds.
+
+- **Exploratory:** correctness. Everything else is recorded.
+- **Qualification:**
+  - **correctness;**
+  - **every action of the plan ran without error** (a missing hook or a failed
+    action fails the repetition);
+  - **no uncertain transaction**, unless the owner allows some with
+    `policy.max_uncertain_transactions`, and no writer ended early;
+  - **the workload was achieved:** per server, committed operations over the
+    configured target (integrated over the peak schedule and any rate change) of
+    at least `policy.min_achieved_ratio`, an owner input. Losing writers or
+    tables cannot pass as capacity.
+
+  Budgets are then judged by the sweep.
+
 ## Commands
 
 ```bash
@@ -73,9 +91,19 @@ cargo run --release -p fleet-harness -- store-matrix --dsn postgres://... \
   - deletes stamped with an update in the same transaction;
   - row ids namespaced per run, so events of other runs on the same topics are
     skipped as foreign.
-- **Uncertain commits are neither missing nor unexpected.** A transaction whose
-  commit outcome the driver could not know goes to an uncertain ledger, and its
-  tables are retired for the rest of the run.
+- **Failed transactions are reconciled against MySQL.** Each table has a single
+  writer, so after a failed transaction the driver reads its rows back:
+  - committed operations go to the ledger;
+  - rolled-back ones have their row ranges undone.
+
+  Only a transaction whose outcome cannot be determined is uncertain: the server
+  was unreachable until the run stopped, or its rows contradict each other. It
+  goes to an uncertain ledger, is neither missing nor unexpected, and its tables
+  are retired. All of these are counted per server: driver errors, reconciled
+  commits and rollbacks, uncertain transactions and operations, retired tables.
+- **The sort is bounded in memory and open files.** Runs are merged at most
+  `sort_fan_in` (default 64) at a time, in as many passes as needed. A truncated
+  record is an error, never a silent end of file.
 - **Migrations are verified with probe rows.** After every `ALTER TABLE`, a
   probe row must arrive with the new column's value.
 - **Primary-key keys.** With `expected_key: primary_key`, every event must carry

@@ -11,7 +11,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::topology::RowKey;
@@ -107,22 +107,60 @@ impl Writer {
     }
 }
 
+/// The next record, `None` at a clean end of file. A partial record (a
+/// truncated file) is an error: evidence is never dropped silently.
 fn read_record(r: &mut impl Read) -> Result<Option<[u8; RECORD_BYTES]>> {
     let mut b = [0u8; RECORD_BYTES];
-    match r.read_exact(&mut b) {
-        Ok(()) => Ok(Some(b)),
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
-        Err(e) => Err(e.into()),
+    let mut filled = 0;
+    while filled < RECORD_BYTES {
+        match r.read(&mut b[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    match filled {
+        0 => Ok(None),
+        RECORD_BYTES => Ok(Some(b)),
+        n => bail!(
+            "truncated record: {n} of {RECORD_BYTES} bytes at the end of the file"
+        ),
     }
 }
 
-/// Sort the records of `inputs` by (row, version) into one file in `dir`,
-/// holding at most `chunk_records` in memory.
+/// Runs merged at once: bounds the open files of the sort.
+pub const DEFAULT_FAN_IN: usize = 64;
+
+/// How a sort went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SortStats {
+    pub runs: usize,
+    pub merge_passes: usize,
+    /// The most run files open at once.
+    pub max_open_runs: usize,
+}
+
+/// Sort the records of `inputs` by (row, version, op) into one file in
+/// `dir`, holding at most `chunk_records` in memory and
+/// [`DEFAULT_FAN_IN`] run files open.
 pub fn sort_files(
     inputs: &[PathBuf],
     dir: &Path,
     chunk_records: usize,
 ) -> Result<PathBuf> {
+    Ok(sort_files_with(inputs, dir, chunk_records, DEFAULT_FAN_IN)?.0)
+}
+
+/// [`sort_files`] with an explicit merge fan-in (at least 2): runs are
+/// merged `fan_in` at a time, in as many passes as needed.
+pub fn sort_files_with(
+    inputs: &[PathBuf],
+    dir: &Path,
+    chunk_records: usize,
+    fan_in: usize,
+) -> Result<(PathBuf, SortStats)> {
+    let fan_in = fan_in.max(2);
     std::fs::create_dir_all(dir)?;
     let mut runs = Vec::new();
     let mut chunk: Vec<[u8; RECORD_BYTES]> =
@@ -154,12 +192,35 @@ pub fn sort_files(
         }
     }
     flush(&mut chunk, &mut runs)?;
+    let mut stats = SortStats {
+        runs: runs.len(),
+        merge_passes: 0,
+        max_open_runs: 0,
+    };
+    let mut generation = 0;
+    while runs.len() > fan_in {
+        generation += 1;
+        let mut next = Vec::new();
+        for (i, group) in runs.chunks(fan_in).enumerate() {
+            let path = dir.join(format!("merge-{generation:03}-{i:05}.bin"));
+            merge_runs(group, &path)?;
+            stats.max_open_runs = stats.max_open_runs.max(group.len());
+            for r in group {
+                std::fs::remove_file(r).ok();
+            }
+            next.push(path);
+        }
+        stats.merge_passes += 1;
+        runs = next;
+    }
     let out = dir.join("sorted.bin");
     merge_runs(&runs, &out)?;
+    stats.merge_passes += 1;
+    stats.max_open_runs = stats.max_open_runs.max(runs.len());
     for run in runs {
         std::fs::remove_file(run).ok();
     }
-    Ok(out)
+    Ok((out, stats))
 }
 
 struct Head {
@@ -636,5 +697,40 @@ mod tests {
         let r = compare(&w, &c, Some(&u)).unwrap();
         assert_eq!((r.missing, r.unexpected, r.uncertain_delivered), (0, 0, 1));
         assert!(r.ok());
+    }
+
+    #[test]
+    fn the_merge_is_bounded_by_its_fan_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let records: Vec<Record> =
+            (0..50u64).rev().map(|i| rec(i, i, Op::Insert)).collect();
+        let input = write(dir.path(), "w", &records);
+        let (sorted, stats) =
+            sort_files_with(&[input], &dir.path().join("s"), 2, 2).unwrap();
+        assert_eq!(stats.runs, 25);
+        assert_eq!(stats.max_open_runs, 2, "never more than the fan-in open");
+        assert!(stats.merge_passes >= 5, "{stats:?}");
+        let mut r = BufReader::new(File::open(sorted).unwrap());
+        let mut ids = Vec::new();
+        while let Some(b) = read_record(&mut r).unwrap() {
+            ids.push(Record::decode(&b).row.id);
+        }
+        assert_eq!(ids, (0..50).collect::<Vec<_>>());
+        let left: Vec<_> =
+            std::fs::read_dir(dir.path().join("s")).unwrap().collect();
+        assert_eq!(left.len(), 1, "intermediate runs are removed");
+    }
+
+    #[test]
+    fn a_truncated_record_is_an_error_not_an_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "w", &[rec(1, 1, Op::Insert)]);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(&[7u8; 10]);
+        std::fs::write(&path, bytes).unwrap();
+        let err = sort_files(&[path], &dir.path().join("s"), 10)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("truncated record: 10 of 48"), "{err}");
     }
 }
