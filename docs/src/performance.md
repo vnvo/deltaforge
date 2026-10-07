@@ -4,9 +4,9 @@ This guide covers throughput optimization for DeltaForge CDC pipelines, based on
 
 > **Note:** These results and recommendations are a starting point. Every deployment has unique requirements — hardware, network topology, database workload patterns, event sizes, and downstream consumer capacity all affect real-world throughput. Profile your own workload and iterate.
 
-## Benchmark Results
+## Development-machine measurements
 
-Measured on Docker containers on a single developer machine (not dedicated infrastructure), draining a 1-10M row backlog to a single-node Kafka broker.
+These are observations from tuning runs, not a supported or comparable throughput figure: single runs on Docker containers on a developer machine (not dedicated infrastructure, contention not controlled), draining a 1-10M row backlog to a single-node Kafka broker. DeltaForge publishes no headline throughput number ([Capacity Envelope](capacity-envelope.md#throughput)); comparative numbers will come only from runs that follow the [benchmark design](https://github.com/vnvo/deltaforge/blob/main/docs/design/benchmarks.md), published with their method and environment. Use the figures below to see the relative effect of the settings, and measure your own workload.
 
 ### With tuned batching (recommended)
 
@@ -53,7 +53,7 @@ spec:
     max_inflight: 4
 ```
 
-For steady-state pipelines with lower latency requirements, the defaults (`max_events=2000, max_bytes=3MB`) are fine.
+For steady-state pipelines with lower latency requirements, the defaults (`max_events=2000`, `max_bytes=16MB`) are fine.
 
 ### Kafka Linger (`linger.ms`)
 
