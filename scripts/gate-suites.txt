@@ -57,6 +57,7 @@ parallel   sources/snapshot_structure_e2e   -p sources --test snapshot_structure
 parallel   sources/source_credentials       -p sources --test source_credentials
 parallel   sources/txn_coordinator_e2e      -p sources --test txn_coordinator_e2e
 parallel   runner/incidents_e2e             -p runner --test incidents_e2e
+parallel   runner/metric_cardinality_e2e    -p runner --test metric_cardinality_e2e
 parallel   runner/snapshot_restart_e2e        -p runner --test snapshot_restart_e2e
 parallel   runner/kafka_outage_restart_e2e  -p runner --test kafka_outage_restart_e2e
 parallel   runner/preflight_e2e             -p runner --test preflight_e2e

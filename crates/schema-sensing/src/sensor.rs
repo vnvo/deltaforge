@@ -1032,8 +1032,9 @@ mod tests {
         ) -> HashMap<String, HashSet<Vec<(String, String)>>> {
             let rec = DebuggingRecorder::new();
             metrics::with_local_recorder(&rec, || {
-                let mut sensor = SchemaSensor::enabled()
-                    .with_table_metrics(Arc::new(TableMetrics::new("p", policy)));
+                let mut sensor = SchemaSensor::enabled().with_table_metrics(
+                    Arc::new(TableMetrics::new("p", policy)),
+                );
                 for i in 0..tables {
                     let table = format!("db.t{i}");
                     for v in 0..1_000 {
@@ -1054,7 +1055,9 @@ mod tests {
                     .map(|l| (l.key().to_string(), l.value().to_string()))
                     .collect();
                 labels.sort();
-                out.entry(k.key().name().to_string()).or_default().insert(labels);
+                out.entry(k.key().name().to_string())
+                    .or_default()
+                    .insert(labels);
             }
             out
         }
@@ -1076,7 +1079,11 @@ mod tests {
                 let series = &sets[name];
                 assert_eq!(series.len(), 1, "{name}: {series:?}");
                 let labels = series.iter().next().unwrap();
-                assert_eq!(labels, &vec![("pipeline".into(), "p".into())], "{name}");
+                assert_eq!(
+                    labels,
+                    &vec![("pipeline".into(), "p".into())],
+                    "{name}"
+                );
             }
         }
 

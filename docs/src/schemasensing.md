@@ -326,24 +326,26 @@ Schema sensing emits these Prometheus metrics:
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `deltaforge_schema_events_total` | Counter | `table` | Total events observed |
-| `deltaforge_schema_cache_hits_total` | Counter | `table` | Structure cache hits |
-| `deltaforge_schema_cache_misses_total` | Counter | `table` | Structure cache misses |
-| `deltaforge_schema_evolutions_total` | Counter | `table` | Schema evolutions detected |
-| `deltaforge_schema_tables_total` | Gauge | - | Tables with detected schemas |
-| `deltaforge_schema_dynamic_maps_total` | Gauge | - | Paths classified as dynamic maps |
-| `deltaforge_schema_sensing_seconds` | Histogram | `table` | Per-event sensing latency |
+| `deltaforge_schema_events_total` | Counter | `pipeline` | Total events observed |
+| `deltaforge_schema_sensing_cache_hits_total` | Counter | `pipeline` | Structure cache hits |
+| `deltaforge_schema_sensing_cache_misses_total` | Counter | `pipeline` | Structure cache misses |
+| `deltaforge_schema_evolutions_total` | Counter | `pipeline` | Schema evolutions detected |
+| `deltaforge_schema_tables_total` | Gauge | `pipeline` | Tables with detected schemas |
+| `deltaforge_schema_dynamic_maps_total` | Gauge | `pipeline` | Paths classified as dynamic maps |
+| `deltaforge_schema_sensing_seconds` | Histogram | `pipeline` | Per-event sensing latency |
+
+With [per-table detail](observability.md#metric-cardinality-and-per-table-detail) enabled, the counters and the histogram also carry `table` and `table_scope` (bounded by `metrics.per_table.max_tables`).
 
 ### Example Queries
 
 ```promql
-# Cache hit rate per table
-sum(rate(deltaforge_schema_cache_hits_total[5m])) by (table)
+# Cache hit rate per pipeline
+sum(rate(deltaforge_schema_sensing_cache_hits_total[5m])) by (pipeline)
 /
-sum(rate(deltaforge_schema_events_total[5m])) by (table)
+sum(rate(deltaforge_schema_events_total[5m])) by (pipeline)
 
 # Schema evolution rate (should be near zero after warmup)
-sum(rate(deltaforge_schema_evolutions_total[5m])) by (table)
+sum(rate(deltaforge_schema_evolutions_total[5m])) by (pipeline)
 
 # P99 sensing latency
 histogram_quantile(0.99, rate(deltaforge_schema_sensing_seconds_bucket[5m]))

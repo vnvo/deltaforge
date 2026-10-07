@@ -50,6 +50,7 @@ tikv-jemallocator = { version = "0.6", optional = true }
 
 [dev-dependencies]
 s3-test-server = { path = "../s3-test-server" }
+metrics-util = "0.19"
 gate-ownership = { path = "../gate-ownership" }
 # Fault-injecting backend for the process-level store-gate tests.
 storage = { path = "../storage", features = ["testing"] }

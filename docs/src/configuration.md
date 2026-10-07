@@ -44,6 +44,7 @@ spec:
 | `sink_batch_deadline_secs` | int | No | Outer per-batch delivery deadline across all sinks (unset = no outer deadline). |
 | `schema_sensing` | object | No | Automatic schema inference from event payloads. See [Schema sensing](#schema-sensing). |
 | `journal` | object | No | Event journal (DLQ). See [Dead Letter Queue](dlq.md). |
+| `metrics` | object | No | Per-table metric detail (off by default). See [Metrics](#metrics). |
 
 ---
 
@@ -631,6 +632,26 @@ schema_sensing:
 </table>
 
 ---
+
+## Metrics
+
+By default no metric carries a `table` label, so a pipeline's series count does not depend on how many tables it captures. Per-table detail is opt-in:
+
+```yaml
+metrics:
+  per_table:
+    enabled: true
+    max_tables: 100      # tables with their own series (1-10,000)
+    lag_idle_secs: 300   # per-table lag disappears after this long without events (10-86,400)
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `per_table.enabled` | bool | `false` | Add `table` and `table_scope` labels to the per-table metrics (see [Observability](observability.md#metric-cardinality-and-per-table-detail)). |
+| `per_table.max_tables` | int | `100` | The first `max_tables` distinct tables keep their own series for the life of the pipeline process; every other table shares one overflow series. |
+| `per_table.lag_idle_secs` | int | `300` | A table's `deltaforge_source_table_lag_seconds` series is removed after this many seconds without an event for it. |
+
+Out-of-range values are rejected when the pipeline is created and by preflight.
 
 ## Complete examples
 

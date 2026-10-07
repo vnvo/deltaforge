@@ -16,6 +16,37 @@ An invalid `--metrics-addr` (not `host:port`) or an unavailable one (port alread
 - Structured logging via `tracing_subscriber` with JSON output by default, optional targets, and support for `RUST_LOG` overrides.
 - Panic hook increments a `deltaforge_panics_total` counter and logs captured panics before delegating to the default hook.
 
+## Metric cardinality and per-table detail
+
+By default **no metric carries a `table` label**: a pipeline's series count does not depend on how many tables it captures. The metrics that can carry table detail are:
+
+| Metric | Default labels |
+|---|---|
+| `deltaforge_source_events_total` | `pipeline`, `source`, `op` |
+| `deltaforge_snapshot_rows_total` | `pipeline` |
+| `deltaforge_sink_s3_files_committed_total` | `pipeline`, `sink`, `reason` |
+| `deltaforge_sink_bytes_total` (S3 sink) | `pipeline`, `sink` |
+| `deltaforge_schema_events_total`, `deltaforge_schema_sensing_seconds`, `deltaforge_schema_sensing_cache_hits_total`, `deltaforge_schema_sensing_cache_misses_total`, `deltaforge_schema_evolutions_total` | `pipeline` |
+| `deltaforge_source_table_lag_seconds` | not emitted |
+
+`deltaforge_schema_tables_total` and `deltaforge_schema_dynamic_maps_total` carry `pipeline` (previously no label, so pipelines overwrote each other).
+
+With [`metrics.per_table.enabled`](configuration.md#metrics), these metrics also carry `table` (the qualified name: `schema.table` on PostgreSQL, `database.table` on MySQL) and `table_scope`:
+
+- The first `max_tables` distinct tables the pipeline reports get exact series, `table="<name>", table_scope="exact"`. Admission lasts for the life of the pipeline process (it starts again after a restart of DeltaForge or a change of the per-table settings), so a table's history never moves between its own series and the overflow.
+- Every other table shares one overflow series, `table="__other__", table_scope="overflow"`. Select by `table_scope`, not by the `table` value: a real table named `__other__` keeps `table_scope="exact"`.
+- `deltaforge_source_table_lag_seconds` is the lag of each table's latest event in a batch (the overflow series reports the largest among its tables). A table's series is removed after `lag_idle_secs` without events for it, and comes back with its next event: a quiet table's detailed lag disappears. This does not mean DeltaForge detected that the table was dropped or deselected. Deleting the pipeline removes all of its series.
+
+Series count with per-table detail: at most `max_tables + 1` table values per metric and remaining label set. Truncation is visible without table labels:
+
+| Metric | Meaning |
+|---|---|
+| `deltaforge_metrics_tables_admitted{pipeline}` | Tables with exact series. |
+| `deltaforge_metrics_table_overflow_total{pipeline}` | Observations reported under the overflow series. |
+| `deltaforge_metrics_tables_overflowed{pipeline}` | Estimated distinct tables reported under the overflow (a fixed 1 KiB HyperLogLog: about 3% standard error, near exact for small counts). Counting them exactly would need memory per table. |
+
+To migrate dashboards that relied on per-table series: aggregate away the label (`sum without (table) (...)`), or enable per-table detail for the pipelines that need it and select `table_scope="exact"`.
+
 ## Instrumentation gaps and recommendations
 
 The sections below call out concrete metrics and log events to add per component. All metrics should include `pipeline`, `tenant`, and component identifiers where applicable so users can aggregate across fleets.
@@ -24,10 +55,10 @@ The sections below call out concrete metrics and log events to add per component
 
 | Status | Metric/log | Rationale |
 | --- | --- | --- |
-| ✅ Implemented | `deltaforge_source_events_total{pipeline,source,table}` counter increments when MySQL events are handed to the coordinator. | Surfaces ingress per table and pipeline. |
+| ✅ Implemented | `deltaforge_source_events_total{pipeline,source,op}` counter increments when events are handed to the coordinator (`table`, `table_scope` with per-table detail enabled). | Surfaces ingress per pipeline and operation. |
 | ✅ Implemented | `deltaforge_source_reconnects_total{pipeline,source}` counter when binlog reads reconnect. | Makes retry storms visible. |
 | ✅ Implemented | `deltaforge_source_lag_seconds{pipeline}` gauge — replication lag based on last event timestamp vs. wall clock. | Alert when sources fall behind. |
-| ✅ Implemented | `deltaforge_source_table_lag_seconds{pipeline,table}` gauge — per-table replication lag within each batch. | Identify which tables are lagging. |
+| ✅ Implemented | `deltaforge_source_table_lag_seconds{pipeline,table,table_scope}` gauge - per-table replication lag within each batch, only with per-table detail enabled. | Identify which tables are lagging. |
 | 🚧 Gap | `deltaforge_source_idle_seconds{pipeline,source}` gauge updated when no events arrive within the inactivity window. | Catch stuck readers before downstream backlogs form. |
 
 ### Coordinator and batching
@@ -137,7 +168,7 @@ Import it via Grafana UI → Dashboards → Import → Upload JSON file.
 | **Fleet Overview** | Running/unhealthy count, total events/s, total data/s, max lag, DLQ total, reconnects, txn aborts, sink errors | One-glance health across all pipelines |
 | **Top Pipelines** | Top 10 laggiest, top 10 throughput, top 10 DLQ backlogs | Identify outliers without drowning in 300 series |
 | **Throughput** | Aggregate events/s, per-pipeline events/s, data throughput | Capacity planning and anomaly detection |
-| **Latency & Lag** | E2E latency p50/p95, source lag, per-table lag (top 10) | SLA monitoring, identify slow tables |
+| **Latency & Lag** | E2E latency p50/p95, source lag, per-table lag (top 10, with per-table detail enabled) | SLA monitoring, identify slow tables |
 | **Checkpoints & transactions** | Per-sink status, commit rate, txn commits/aborts | Transactional-commit health, checkpoint freshness |
 | **Dead Letter Queue** | Entries, events/s, saturation, overflow rate | DLQ monitoring and alerting |
 | **Errors & Reliability** | Sink errors, reconnects, pipeline state timeline | Incident detection |

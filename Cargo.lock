@@ -5042,6 +5042,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "metrics",
+ "metrics-util 0.19.1",
  "mysql-binlog-connector-rust",
  "mysql_async 0.36.2",
  "o11y",

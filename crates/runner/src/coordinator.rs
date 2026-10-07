@@ -2078,8 +2078,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
             if let Some(policy) = tables.policy() {
                 let mut table_lag: HashMap<String, f64> = HashMap::new();
                 for ev in &events {
-                    let table_key =
-                        format!("{}.{}", ev.source.db, ev.source.table);
+                    let table_key = ev.source.full_table_name();
                     let ev_lag = ((now_ms - ev.ts_ms).max(0) as f64) / 1000.0;
                     table_lag.insert(table_key, ev_lag);
                 }

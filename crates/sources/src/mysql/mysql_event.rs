@@ -2355,6 +2355,32 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn source_event_labels_follow_the_per_table_policy() {
+        use deltaforge_core::table_metrics::{PerTablePolicy, TableMetrics};
+        let (tx, _rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        let tm = ctx.table_map[&TABLE_ID].clone();
+        let keys = |labels: Vec<metrics::Label>| {
+            labels
+                .iter()
+                .map(|l| (l.key().to_string(), l.value().to_string()))
+                .collect::<Vec<_>>()
+        };
+        let off = keys(source_event_labels(&ctx, &tm, "c"));
+        assert!(off.iter().all(|(k, _)| k != "table" && k != "table_scope"));
+        ctx.table_metrics = Arc::new(TableMetrics::new(
+            "test-pipeline",
+            Some(PerTablePolicy {
+                max_tables: 1,
+                lag_idle: Duration::from_secs(300),
+            }),
+        ));
+        let on = keys(source_event_labels(&ctx, &tm, "c"));
+        assert!(on.contains(&("table".into(), "shop.orders".into())));
+        assert!(on.contains(&("table_scope".into(), "exact".into())));
+    }
+
     /// An entry evicted by the shared cache budget is rebuilt from the
     /// durable registry and activation records alone, byte-equivalent to
     /// the cached one. The fixture's DSN is unreachable, so a rebuild that
