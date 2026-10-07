@@ -55,7 +55,10 @@ sinks:
 }
 ```
 
-**Debezium consumers with `schemas.enable=false`:** this is the shape they read. Kafka Connect's `JsonConverter` with `schemas.enable=false` emits the change object itself (`before`, `after`, `source`, `op`, `ts_ms`), with no `schema`/`payload` wrapper, so use the native envelope (not `debezium`) for these consumers. Check two differences: the `source` block carries DeltaForge's fields, not every field a Debezium connector writes there; and DeltaForge's default message key is an idempotency key, not the primary key, so set `key: "${after.<primary key column>}"` (for example `key: "${after.id}"`) where consumers or partitioning rely on primary-key keys.
+**Debezium consumers with `schemas.enable=false`:** this is the shape they read. Kafka Connect's `JsonConverter` with `schemas.enable=false` emits the change object itself (`before`, `after`, `source`, `op`, `ts_ms`), with no `schema`/`payload` wrapper, so use the native envelope (not `debezium`) for these consumers. Check two differences:
+
+- The `source` block carries DeltaForge's fields, not every field a Debezium connector writes there.
+- Message keys. DeltaForge's default key is an idempotency key, not the primary key. A key template such as `key: "${after.id}"` gives the primary key only for events with an after image (inserts, updates, snapshot reads): a delete has `after: null`, and the template then resolves to an empty key, not to the primary key or the default key, so a row's delete can be partitioned differently from its earlier events. DeltaForge has no declarative key expression that takes the key from `after` or otherwise `before`, so primary-key keys that are consistent across inserts, updates and deletes are not available through configuration today.
 
 **When to use:**
 - Maximum performance with lowest overhead
