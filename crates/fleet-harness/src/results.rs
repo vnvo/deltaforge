@@ -66,11 +66,41 @@ pub struct StepOutcome {
     pub action: crate::scenario::Action,
     /// Why the action did not run (unconfigured hook or proxy).
     pub not_run: Option<String>,
+    /// Only a failure of the action: never a success note.
     pub error: Option<String>,
+    /// What a successful action reported (background actions).
+    pub note: Option<String>,
     pub duration_secs: Option<f64>,
     /// Shutdown time, for process restarts.
     pub shutdown_secs: Option<f64>,
     pub recovery: Option<Recovery>,
+}
+
+impl StepOutcome {
+    /// Record a background action's end: `Ok` is a note, only `Err` is an
+    /// error.
+    pub fn settle(&mut self, end: std::result::Result<String, String>) {
+        match end {
+            Ok(note) if note.is_empty() => {}
+            Ok(note) => self.note = Some(note),
+            Err(e) => self.error = Some(e),
+        }
+    }
+}
+
+/// Whether `budget` applies to a run whose plan produced `steps`: recovery
+/// budgets need a disrupting action, the shutdown budget a process restart;
+/// the others apply to every run.
+pub fn applicable(budget: &str, steps: &[StepOutcome]) -> bool {
+    match budget {
+        "recovery_p50_secs" | "recovery_p90_secs" | "recovery_p100_secs" => {
+            steps.iter().any(|s| s.action.disrupts())
+        }
+        "shutdown_secs" => steps.iter().any(|s| {
+            matches!(s.action, crate::scenario::Action::ProcessRestart)
+        }),
+        _ => true,
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,36 +113,44 @@ pub struct BudgetCheck {
     pub note: Option<String>,
 }
 
-/// Compare `achieved` with an owner budget (at most `limit`).
+/// Compare `achieved` with an owner budget (at most `limit`). In a strict
+/// (qualification) evaluation, an applicable budget that is missing, or
+/// whose value was not measured, fails: incomplete evidence never passes.
 pub fn check<T: Copy + Into<f64>>(
     name: &str,
     budget: &Option<Param<T>>,
     achieved: Option<f64>,
+    applicable: bool,
+    strict: bool,
 ) -> BudgetCheck {
-    let (limit, note) = match budget {
-        None => (None, Some("no budget".to_string())),
-        Some(p) if p.provenance != Provenance::Owner => (
-            Some(p.value.into()),
+    let limit = budget.as_ref().map(|p| p.value.into());
+    let owner = budget
+        .as_ref()
+        .is_some_and(|p| p.provenance == Provenance::Owner);
+    let (passed, note) = if !applicable {
+        (None, Some("not applicable to this scenario".to_string()))
+    } else if budget.is_none() {
+        (strict.then_some(false), Some("no budget".to_string()))
+    } else if !owner {
+        (
+            strict.then_some(false),
             Some("placeholder budget: not evaluated".to_string()),
-        ),
-        Some(p) => (Some(p.value.into()), None),
-    };
-    let passed = match (budget, limit, achieved) {
-        (Some(p), Some(l), Some(a)) if p.provenance == Provenance::Owner => {
-            Some(a <= l)
+        )
+    } else {
+        match (limit, achieved) {
+            (Some(l), Some(a)) => (Some(a <= l), None),
+            _ => (
+                strict.then_some(false),
+                Some("applicable but not measured in this run".to_string()),
+            ),
         }
-        _ => None,
     };
     BudgetCheck {
         budget: name.to_string(),
         limit,
         achieved,
         passed,
-        note: note.or_else(|| {
-            achieved
-                .is_none()
-                .then(|| "not measured in this run".into())
-        }),
+        note,
     }
 }
 
@@ -178,6 +216,8 @@ pub struct RunResult {
     pub stream: StreamReport,
     pub lag_ms: BTreeMap<String, Summary>,
     pub resources: Aggregate,
+    /// Steps in the scenario's plan; every one must have an outcome.
+    pub planned_steps: usize,
     pub steps: Vec<StepOutcome>,
     pub completeness: Completeness,
     pub budgets: Vec<BudgetCheck>,
@@ -220,8 +260,17 @@ impl RunResult {
             .copied()
             .max()
             .map(|n| n as f64);
+        let strict = self.class == RunClass::Qualification;
+        let steps = &self.steps;
+        let applies = |name: &str| applicable(name, steps);
         self.budgets = vec![
-            check("lag_p99_secs", &b.lag_p99_secs, lag_p99),
+            check(
+                "lag_p99_secs",
+                &b.lag_p99_secs,
+                lag_p99,
+                applies("lag_p99_secs"),
+                strict,
+            ),
             check(
                 "memory_bytes",
                 &b.memory_bytes.as_ref().map(|p| Param {
@@ -229,24 +278,44 @@ impl RunResult {
                     provenance: p.provenance,
                 }),
                 self.resources.memory_peak_bytes.map(|v| v as f64),
+                applies("memory_bytes"),
+                strict,
             ),
-            check("cpu_cores", &b.cpu_cores, self.resources.cpu_cores_mean),
+            check(
+                "cpu_cores",
+                &b.cpu_cores,
+                self.resources.cpu_cores_mean,
+                applies("cpu_cores"),
+                strict,
+            ),
             check(
                 "recovery_p50_secs",
                 &b.recovery_p50_secs,
                 worst(|r| r.p50_secs),
+                applies("recovery_p50_secs"),
+                strict,
             ),
             check(
                 "recovery_p90_secs",
                 &b.recovery_p90_secs,
                 worst(|r| r.p90_secs),
+                applies("recovery_p90_secs"),
+                strict,
             ),
             check(
                 "recovery_p100_secs",
                 &b.recovery_p100_secs,
                 worst(|r| r.p100_secs),
+                applies("recovery_p100_secs"),
+                strict,
             ),
-            check("shutdown_secs", &b.shutdown_secs, shutdown),
+            check(
+                "shutdown_secs",
+                &b.shutdown_secs,
+                shutdown,
+                applies("shutdown_secs"),
+                strict,
+            ),
             check(
                 "connections_per_server",
                 &b.connections_per_server.as_ref().map(|p| Param {
@@ -254,6 +323,8 @@ impl RunResult {
                     provenance: p.provenance,
                 }),
                 connections,
+                applies("connections_per_server"),
+                strict,
             ),
         ];
         let evaluated: Vec<bool> =
@@ -267,7 +338,9 @@ impl RunResult {
             self.steps.iter().filter(|s| s.not_run.is_some()).count();
         let action_errors =
             self.steps.iter().filter(|s| s.error.is_some()).count();
-        let plan_executed = actions_not_run == 0 && action_errors == 0;
+        let plan_executed = actions_not_run == 0
+            && action_errors == 0
+            && self.steps.len() == self.planned_steps;
         let uncertain: u64 =
             self.driver.values().map(|c| c.uncertain_txns).sum();
         let uncertainty_ok = uncertain
@@ -384,14 +457,20 @@ mod tests {
 
     #[test]
     fn placeholder_budgets_are_reported_not_evaluated() {
-        let c = check("lag", &Some(Param::placeholder(5.0)), Some(9.0));
+        let c = check(
+            "lag",
+            &Some(Param::placeholder(5.0)),
+            Some(9.0),
+            true,
+            false,
+        );
         assert_eq!(c.passed, None);
         assert!(c.note.unwrap().contains("placeholder"));
-        let c = check("lag", &Some(Param::owner(5.0)), Some(9.0));
+        let c = check("lag", &Some(Param::owner(5.0)), Some(9.0), true, false);
         assert_eq!(c.passed, Some(false));
-        let c = check("lag", &Some(Param::owner(5.0)), None);
+        let c = check("lag", &Some(Param::owner(5.0)), None, true, false);
         assert_eq!(c.passed, None);
-        let c = check::<f64>("lag", &None, Some(1.0));
+        let c = check::<f64>("lag", &None, Some(1.0), true, false);
         assert_eq!(c.passed, None);
     }
 
@@ -482,6 +561,7 @@ mod tests {
             stream: StreamReport::default(),
             lag_ms: BTreeMap::new(),
             resources: Aggregate::default(),
+            planned_steps: 0,
             steps: vec![],
             completeness: Completeness::default(),
             budgets: vec![],
@@ -504,6 +584,7 @@ mod tests {
             action: Action::Failover,
             not_run: not_run.map(String::from),
             error: error.map(String::from),
+            note: None,
             duration_secs: None,
             shutdown_secs: None,
             recovery: None,
@@ -526,6 +607,7 @@ mod tests {
         ] {
             let mut q = qualified(result(RunClass::Qualification));
             q.steps = vec![s.clone()];
+            q.planned_steps = 1;
             q.evaluate();
             assert!(
                 !q.verdict.plan_executed && !q.verdict.repetition_ok,
@@ -534,6 +616,7 @@ mod tests {
             );
             let mut e = result(RunClass::Exploratory);
             e.steps = vec![s];
+            e.planned_steps = 1;
             e.evaluate();
             assert!(
                 e.verdict.repetition_ok,
@@ -578,5 +661,75 @@ mod tests {
             !p.verdict.repetition_ok,
             "and a qualification cannot pass without one"
         );
+    }
+
+    #[test]
+    fn a_successful_background_action_with_a_note_is_not_an_error() {
+        let mut ok = step(None, None);
+        ok.action = Action::Migration;
+        ok.settle(Ok("migration statements with probes: 6".into()));
+        assert_eq!(ok.error, None);
+        assert!(ok.note.is_some());
+        let mut r = qualified(result(RunClass::Qualification));
+        r.steps = vec![ok];
+        r.planned_steps = 1;
+        r.evaluate();
+        assert!(
+            r.verdict.plan_executed && r.verdict.repetition_ok,
+            "{:?}",
+            r.verdict
+        );
+        let mut failed = step(None, None);
+        failed.settle(Err("migrate cust_00001.t000".into()));
+        assert!(failed.error.is_some() && failed.note.is_none());
+    }
+
+    #[test]
+    fn a_planned_step_without_an_outcome_fails_the_plan() {
+        let mut r = qualified(result(RunClass::Qualification));
+        r.planned_steps = 1;
+        r.evaluate();
+        assert!(!r.verdict.plan_executed && !r.verdict.repetition_ok);
+    }
+
+    #[test]
+    fn an_applicable_unmeasured_owner_budget_fails_a_qualification() {
+        let owner_budgets = |r: &mut RunResult| {
+            let b = &mut r.config.budgets;
+            b.memory_bytes = Some(Param::owner(1 << 40));
+            b.recovery_p100_secs = Some(Param::owner(60.0));
+        };
+        // Memory measured and within budget; a failover ran, but no
+        // recovery was measured.
+        let mut r = qualified(result(RunClass::Qualification));
+        owner_budgets(&mut r);
+        r.resources.memory_peak_bytes = Some(1 << 30);
+        r.steps = vec![step(None, None)];
+        r.planned_steps = 1;
+        r.evaluate();
+        let get = |r: &RunResult, n: &str| {
+            r.budgets.iter().find(|c| c.budget == n).unwrap().clone()
+        };
+        assert_eq!(get(&r, "memory_bytes").passed, Some(true));
+        assert_eq!(get(&r, "recovery_p100_secs").passed, Some(false));
+        assert_eq!(r.verdict.budgets_ok, Some(false));
+        // Without a disrupting action, recovery budgets do not apply.
+        let mut quiet = qualified(result(RunClass::Qualification));
+        owner_budgets(&mut quiet);
+        quiet.resources.memory_peak_bytes = Some(1 << 30);
+        quiet.evaluate();
+        assert_eq!(get(&quiet, "recovery_p100_secs").passed, None);
+        assert_eq!(
+            get(&quiet, "shutdown_secs").passed,
+            None,
+            "no process restart"
+        );
+        // Exploratory: an unmeasured budget is reported, not failed.
+        let mut e = result(RunClass::Exploratory);
+        owner_budgets(&mut e);
+        e.steps = vec![step(None, None)];
+        e.planned_steps = 1;
+        e.evaluate();
+        assert_eq!(get(&e, "recovery_p100_secs").passed, None);
     }
 }

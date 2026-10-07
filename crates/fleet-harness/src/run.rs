@@ -350,6 +350,21 @@ pub async fn run_once(
     let mut background: Vec<(usize, JoinHandle<Result<String>>)> = Vec::new();
     for step in &plan.steps {
         if step.at_secs >= cfg.run.duration_secs {
+            // Never silently dropped: a planned step without a chance to
+            // run is an outcome that fails the plan.
+            steps.push(StepOutcome {
+                at_secs: step.at_secs,
+                action: step.action.clone(),
+                not_run: Some(format!(
+                    "scheduled at {}s, after the run's {}s",
+                    step.at_secs, cfg.run.duration_secs
+                )),
+                error: None,
+                note: None,
+                duration_secs: None,
+                shutdown_secs: None,
+                recovery: None,
+            });
             continue;
         }
         let due = window_start + Duration::from_secs(step.at_secs);
@@ -386,13 +401,12 @@ pub async fn run_once(
     let final_counters: Vec<CountersSnapshot> =
         ctxs.iter().map(|c| c.counters.snapshot()).collect();
     for (i, t) in background {
-        match t.await? {
-            Ok(note) => {
-                steps[i].error =
-                    (!note.is_empty()).then_some(note).or(steps[i].error.take())
-            }
-            Err(e) => steps[i].error = Some(format!("{e:#}")),
-        }
+        let end = match t.await {
+            Ok(Ok(note)) => Ok(note),
+            Ok(Err(e)) => Err(format!("{e:#}")),
+            Err(e) => Err(format!("background action task: {e}")),
+        };
+        steps[i].settle(end);
     }
     consumer_stop_tx.send(true).ok();
     let verifier = consumer_task.await??;
@@ -509,6 +523,7 @@ pub async fn run_once(
             .map(|(i, h)| (by_name(i), h.summary()))
             .collect(),
         resources: agg.lock().clone(),
+        planned_steps: plan.steps.len(),
         steps,
         completeness,
         budgets: Vec::new(),
@@ -575,6 +590,7 @@ async fn execute(
         action: action.clone(),
         not_run: scenario::unavailable(&shared.cfg, action),
         error: None,
+        note: None,
         duration_secs: None,
         shutdown_secs: None,
         recovery: None,

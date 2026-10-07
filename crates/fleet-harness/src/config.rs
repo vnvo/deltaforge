@@ -455,6 +455,9 @@ impl RunConfig {
 
     /// Structural checks for any run.
     pub fn validate(&self) -> Result<()> {
+        if self.run.duration_secs == 0 {
+            bail!("run.duration_secs must be positive");
+        }
         if self.topology.servers.is_empty() {
             bail!("topology.servers is empty");
         }
@@ -658,6 +661,18 @@ pub(crate) mod tests {
             cfg.placeholders()
                 .iter()
                 .any(|p| p.starts_with("policy.min_achieved_ratio"))
+        );
+    }
+
+    #[test]
+    fn a_zero_duration_is_rejected() {
+        let mut cfg: RunConfig = serde_yaml::from_str(EXAMPLE).unwrap();
+        cfg.run.duration_secs = 0;
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("duration_secs")
         );
     }
 }

@@ -46,13 +46,24 @@ A sweep counts a repetition only if `verdict.repetition_ok` holds.
   - **every action of the plan ran without error** (a missing hook or a failed
     action fails the repetition);
   - **no uncertain transaction**, unless the owner allows some with
-    `policy.max_uncertain_transactions`, and no writer ended early;
+    `policy.max_uncertain_transactions`, and no writer task ended early.
+    Transaction-level driver errors whose outcome was reconciled (committed or
+    rolled back) do not fail a repetition, since they are expected during
+    disruptions. They stay visible in the result (`errors`,
+    `reconciled_committed`, `reconciled_rolled_back` per server);
   - **the workload was achieved:** per server, committed operations over the
     configured target (integrated over the peak schedule and any rate change) of
     at least `policy.min_achieved_ratio`, an owner input. Losing writers or
     tables cannot pass as capacity.
 
-  Budgets are then judged by the sweep.
+  - **every planned step has an outcome**: a step scheduled after the run's
+    duration is recorded as not run, never dropped.
+
+  The sweep then judges budgets. Each owner budget applies according to the
+  scenario: recovery budgets need a disrupting action, the shutdown budget needs
+  a process restart, and the others always apply. In a qualification, an
+  applicable budget that was not measured fails, so incomplete evidence never
+  passes.
 
 ## Commands
 
