@@ -202,20 +202,26 @@ impl S3Sink {
 /// Record commit + bytes metrics for a set of rolled files. Free function so
 /// both `send_batch` and the background sweeper can call it.
 fn record_committed(pipeline: &str, sink: &str, committed: &[CommittedFile]) {
+    use deltaforge_core::table_metrics::{for_pipeline, with_table};
+    use metrics::Label;
+    let tables = for_pipeline(pipeline);
     for c in committed {
-        counter!(
-            "deltaforge_sink_s3_files_committed_total",
-            "pipeline" => pipeline.to_string(),
-            "sink" => sink.to_string(),
-            "table" => c.partition.table.clone(),
-            "reason" => roll_label(c.reason),
-        )
-        .increment(1);
+        // Qualified as the sources qualify it (`SourceInfo::full_table_name`).
+        let table = tables
+            .label(&format!("{}.{}", c.partition.namespace, c.partition.table));
+        let base = || {
+            vec![
+                Label::new("pipeline", pipeline.to_string()),
+                Label::new("sink", sink.to_string()),
+            ]
+        };
+        let mut files = with_table(base(), table.as_ref());
+        files.push(Label::new("reason", roll_label(c.reason)));
+        counter!("deltaforge_sink_s3_files_committed_total", files)
+            .increment(1);
         counter!(
             "deltaforge_sink_bytes_total",
-            "pipeline" => pipeline.to_string(),
-            "sink" => sink.to_string(),
-            "table" => c.partition.table.clone(),
+            with_table(base(), table.as_ref())
         )
         .increment(c.result.bytes_written);
     }
@@ -1041,6 +1047,92 @@ mod tests {
             gauge_value(&snap, "deltaforge_sink_s3_non_durable_ack_mode"),
             Some(1.0),
             "legacy_rolling must report non-durable ack mode = 1"
+        );
+    }
+
+    /// The files-committed and bytes counters' label sets for two files of
+    /// same-named tables in two schemas, recorded under `pipeline`.
+    fn committed_labels(
+        pipeline: &str,
+    ) -> Vec<(String, Vec<(String, String)>)> {
+        use metrics_util::debugging::DebuggingRecorder;
+        let file = |namespace: &str| CommittedFile {
+            partition: crate::s3::router::PartitionKey {
+                namespace: namespace.into(),
+                table: "orders".into(),
+                year: 2026,
+                month: 10,
+                day: 7,
+            },
+            path: format!("{namespace}/orders.parquet"),
+            result: crate::s3::file_format::WriteResult {
+                rows_written: 1,
+                bytes_written: 10,
+            },
+            reason: crate::s3::rolling::RollReason::Events,
+        };
+        let rec = DebuggingRecorder::new();
+        metrics::with_local_recorder(&rec, || {
+            record_committed(pipeline, "s3", &[file("east"), file("west")]);
+        });
+        let mut out: Vec<_> = rec
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(k, ..)| {
+                let mut labels: Vec<_> = k
+                    .key()
+                    .labels()
+                    .map(|l| (l.key().to_string(), l.value().to_string()))
+                    .collect();
+                labels.sort();
+                (k.key().name().to_string(), labels)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn committed_metrics_carry_no_table_by_default() {
+        let series = committed_labels("s3-labels-off");
+        assert_eq!(series.len(), 2, "one series per metric: {series:?}");
+        for (name, labels) in series {
+            assert!(
+                labels
+                    .iter()
+                    .all(|(k, _)| k != "table" && k != "table_scope"),
+                "{name}: {labels:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn committed_metrics_qualify_tables_when_enabled() {
+        use deltaforge_core::table_metrics::{
+            PerTablePolicy, register, unregister,
+        };
+        let pipeline = "s3-labels-on";
+        let _registered = register(
+            pipeline,
+            Some(PerTablePolicy {
+                max_tables: 10,
+                lag_idle: std::time::Duration::from_secs(300),
+            }),
+        )
+        .unwrap();
+        let series = committed_labels(pipeline);
+        unregister(pipeline);
+        let tables: std::collections::BTreeSet<_> = series
+            .iter()
+            .flat_map(|(_, l)| l.iter().filter(|(k, _)| k == "table"))
+            .map(|(_, v)| v.clone())
+            .collect();
+        assert_eq!(
+            tables,
+            ["east.orders".to_string(), "west.orders".to_string()].into(),
+            "same-named tables in two schemas stay distinct"
         );
     }
 }

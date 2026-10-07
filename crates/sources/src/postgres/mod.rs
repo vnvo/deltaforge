@@ -30,6 +30,7 @@ use storage::adapters::incidents::IncidentStore;
 use crate::snapshot_generation::PersistedLineage;
 use postgres_snapshot::IdentitySpec;
 
+mod event_counters;
 mod postgres_errors;
 use postgres_errors::LoopControl;
 pub use postgres_errors::{PostgresSourceError, PostgresSourceResult};
@@ -376,9 +377,8 @@ pub(crate) struct RunCtx {
     pub registry_scope: SharedRegistryScope,
     /// Backend holding the durable source-lineage record.
     pub registry_backend: ArcStorageBackend,
-    /// Cached metrics counter handles keyed by (qualified_table_name, op).
-    /// Avoids hash-lookup + key-comparison in the metrics registry per event.
-    pub counter_cache: HashMap<(Arc<str>, &'static str), metrics::Counter>,
+    /// Cached event counter handles (bounded by the per-table policy).
+    pub(crate) event_counters: event_counters::EventCounters,
     /// Cached LSN string to avoid re-formatting the same LSN on consecutive events.
     pub cached_lsn: Option<(Lsn, String)>,
     /// The continuity stamp of the authoritative stream, set only when a
@@ -1705,7 +1705,11 @@ impl PostgresSource {
             identity_store: IdentityStore::new(Arc::clone(&backend)),
             registry_scope: self.registry_scope.clone(),
             registry_backend: Arc::clone(&backend),
-            counter_cache: HashMap::new(),
+            event_counters: event_counters::EventCounters::new(
+                &self.pipeline,
+                &self.id,
+                deltaforge_core::table_metrics::for_pipeline(&self.pipeline),
+            ),
             cached_lsn: None,
             stamp: Arc::clone(&stream_proof.active),
             stamp_members: Arc::from(""),

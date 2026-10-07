@@ -109,10 +109,18 @@ pub fn bind_metrics_listener(
 
 /// Axum handler that renders the current metrics snapshot.
 pub async fn metrics_handler() -> String {
-    HANDLE
-        .get()
-        .map(|h| h.render())
-        .unwrap_or_else(|| "# recorder not installed\n".into())
+    let Some(handle) = HANDLE.get() else {
+        return "# recorder not installed\n".into();
+    };
+    let mut out = handle.render();
+    let lag = crate::table_lag::global().render(std::time::Instant::now());
+    if !lag.is_empty() {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&lag);
+    }
+    out
 }
 
 pub fn router_with_metrics() -> Router {
@@ -275,6 +283,26 @@ pub fn describe_metrics() {
         "Schema evolution events detected per pipeline (pipeline-level aggregate)"
     );
     describe_gauge!(
+        deltaforge_core::table_metrics::METRIC_ADMITTED,
+        Unit::Count,
+        "Tables with exact per-table series (metrics.per_table enabled)"
+    );
+    describe_counter!(
+        deltaforge_core::table_metrics::METRIC_OVERFLOW,
+        Unit::Count,
+        "Observations reported under the per-table overflow series"
+    );
+    describe_gauge!(
+        deltaforge_core::table_metrics::METRIC_OVERFLOWED,
+        Unit::Count,
+        "Estimated distinct tables reported under the per-table overflow series"
+    );
+    describe_counter!(
+        "deltaforge_mysql_selection_cache_evictions_total",
+        Unit::Count,
+        "MySQL schema selection cache entries evicted by the per-source budget"
+    );
+    describe_gauge!(
         "deltaforge_source_lag_seconds",
         Unit::Seconds,
         "Lag between the latest source event timestamp and wall clock time"
@@ -287,7 +315,7 @@ pub fn describe_metrics() {
     describe_counter!(
         "deltaforge_snapshot_rows_total",
         Unit::Count,
-        "Total rows emitted during initial snapshot, per pipeline and table"
+        "Total rows emitted during initial snapshot, per pipeline (and table with metrics.per_table enabled)"
     );
     describe_gauge!(
         "deltaforge_snapshot_unsafe_anchor",

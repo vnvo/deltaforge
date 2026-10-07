@@ -159,6 +159,9 @@ async fn check_pipeline(
     {
         hard.push(format!("commit policy: {e}"));
     }
+    if let Err(e) = spec.spec.metrics.per_table.validate() {
+        hard.push(e);
+    }
     if spec.spec.sinks.is_empty() {
         hard.push("pipeline has no sinks configured".to_string());
     }
@@ -398,6 +401,7 @@ mod tests {
                     annotations: Default::default(),
                 },
                 spec: Spec {
+                    metrics: Default::default(),
                     sharding: None,
                     source: SourceCfg::Mysql(MysqlSrcCfg {
                         id: source_id.into(),

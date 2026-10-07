@@ -944,6 +944,27 @@ impl PipelineManager {
         spec: PipelineSpec,
         carried: Vec<deltaforge_core::IncidentDraft>,
     ) -> Result<PipelineRuntime> {
+        // The per-table metrics policy is registered before the source,
+        // sinks and coordinator are built, and rolled back if any step fails
+        // (a failed start leaves no new entry and no changed policy).
+        let registration = crate::pipeline_metrics::register(&spec)?;
+        match self.spawn_pipeline_registered(spec, carried).await {
+            Ok(runtime) => {
+                registration.commit();
+                Ok(runtime)
+            }
+            Err(e) => {
+                registration.rollback();
+                Err(e)
+            }
+        }
+    }
+
+    async fn spawn_pipeline_registered(
+        &self,
+        spec: PipelineSpec,
+        carried: Vec<deltaforge_core::IncidentDraft>,
+    ) -> Result<PipelineRuntime> {
         let pipeline_name = spec.metadata.name.clone();
         counter!("deltaforge_pipelines_total").increment(1);
 
@@ -1166,9 +1187,12 @@ impl PipelineManager {
 
         // Schema sensing
         let sensing_cfg = spec.spec.schema_sensing.clone();
-        let sensor = sensing_cfg
-            .enabled
-            .then(|| Arc::new(SchemaSensorState::new(sensing_cfg)));
+        let sensor = sensing_cfg.enabled.then(|| {
+            Arc::new(SchemaSensorState::with_table_metrics(
+                sensing_cfg,
+                deltaforge_core::table_metrics::for_pipeline(&pipeline_name),
+            ))
+        });
 
         let mut builder = Coordinator::builder(pipeline_name.clone())
             .sinks(sinks.clone())
@@ -1564,6 +1588,13 @@ impl PipelineManager {
             spec.spec.sinks.len(),
         )
         .map_err(|e| PipelineAPIError::Failed(anyhow::anyhow!(e)))?;
+        spec.spec
+            .metrics
+            .per_table
+            .validate()
+            .map_err(|e| PipelineAPIError::Failed(anyhow::anyhow!(e)))?;
+        crate::pipeline_metrics::check(&spec)
+            .map_err(PipelineAPIError::BadRequest)?;
 
         // Claim the source id before spawning so two pipelines can never share a
         // source id and corrupt each other's checkpoints. A restart of the same
@@ -2365,6 +2396,18 @@ impl PipelineController for PipelineManager {
             ));
         }
 
+        // Refuse settings that cannot apply before stopping anything.
+        new_spec
+            .spec
+            .metrics
+            .per_table
+            .validate()
+            .map_err(PipelineAPIError::BadRequest)?;
+        crate::pipeline_metrics::check(&new_spec)
+            .map_err(PipelineAPIError::BadRequest)?;
+        #[cfg(test)]
+        let _ = crate::pipeline_metrics::run_patch_hook(name);
+
         self.stop_pipeline_locked(name).await?;
         self.start_pipeline_locked(new_spec).await
     }
@@ -2618,6 +2661,7 @@ impl PipelineController for PipelineManager {
 
         // Everything durable is cleaned; now drop the in-memory runtime.
         self.pipelines.write().remove(name);
+        crate::pipeline_metrics::forget(name);
         Ok(())
     }
 
@@ -2969,6 +3013,7 @@ mod tests {
                 annotations: Default::default(),
             },
             spec: Spec {
+                metrics: Default::default(),
                 sharding: None,
                 source: SourceCfg::Mysql(MysqlSrcCfg {
                     id: "mysql".to_string(),
@@ -3007,6 +3052,152 @@ mod tests {
                 secrets: None,
             },
         }
+    }
+
+    // ── Per-table metrics registration ───────────────────────────────────────
+
+    /// `sample_spec` with per-table detail and no source DSN, so the start
+    /// fails while resolving source credentials (after registration).
+    fn failing_spec(name: &str, max_tables: Option<u32>) -> PipelineSpec {
+        let mut spec = sample_spec(name);
+        if let SourceCfg::Mysql(c) = &mut spec.spec.source {
+            c.dsn = None;
+            c.id = format!("src-{name}");
+        }
+        if let Some(max) = max_tables {
+            spec.spec.metrics.per_table.enabled = true;
+            spec.spec.metrics.per_table.max_tables = max;
+        }
+        spec
+    }
+
+    fn policy(
+        max_tables: usize,
+    ) -> deltaforge_core::table_metrics::PerTablePolicy {
+        deltaforge_core::table_metrics::PerTablePolicy {
+            max_tables,
+            lag_idle: std::time::Duration::from_secs(300),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_starts_leave_no_metrics_registration() {
+        use deltaforge_core::table_metrics::is_registered;
+        let mgr = PipelineManager::for_testing();
+        for i in 0..50 {
+            let name = format!("failing-start-{i}");
+            let result =
+                mgr.start_pipeline(failing_spec(&name, Some(10))).await;
+            assert!(result.is_err(), "the start fails");
+            assert!(!is_registered(&name), "{name} left a registration");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_restart_restores_the_previous_policy() {
+        use deltaforge_core::table_metrics::{for_pipeline, register};
+        let name = "failing-reconfigure";
+        // The pipeline ran with per-table detail and admitted a table.
+        let running = register(name, Some(policy(10))).unwrap();
+        running.tables().label("db.t");
+        // A restart that would disable detail fails during its start.
+        let mgr = PipelineManager::for_testing();
+        assert!(mgr.spawn_pipeline(failing_spec(name, None)).await.is_err());
+        let tables = for_pipeline(name);
+        assert_eq!(tables.policy(), Some(policy(10)), "policy restored");
+        assert_eq!(tables.admitted(), 1, "admissions kept");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_refuses_a_max_tables_change_once_series_exist() {
+        use deltaforge_core::table_metrics::{for_pipeline, register};
+        let name = "fixed-cap";
+        let earlier = register(name, Some(policy(5))).unwrap();
+        earlier.tables().label("db.t");
+        let mgr = PipelineManager::for_testing();
+        match mgr.start_pipeline(failing_spec(name, Some(6))).await {
+            Err(PipelineAPIError::BadRequest(msg)) => {
+                assert!(msg.contains("fixed at 5"), "{msg}")
+            }
+            Err(other) => panic!("expected BadRequest, got {other:?}"),
+            Ok(_) => panic!("expected BadRequest, the start succeeded"),
+        }
+        assert_eq!(for_pipeline(name).policy(), Some(policy(5)));
+        // Nothing was claimed for the refused start.
+        assert!(
+            mgr.claim_source_id("src-fixed-cap", "another")
+                .await
+                .unwrap()
+        );
+    }
+
+    /// The running pipeline admits its first table between PATCH's
+    /// per-table check and the stop (the hook). A cap change is refused
+    /// before anything stops, whether or not that admission happened; a
+    /// change that keeps the cap applies.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn patch_decides_the_cap_before_stopping_despite_a_racing_admission()
+    {
+        use deltaforge_core::table_metrics::for_pipeline;
+        let name = "patch-race";
+        let mgr = PipelineManager::for_testing();
+        let mut spec = spec_dead(name);
+        if let SourceCfg::Mysql(c) = &mut spec.spec.source {
+            c.id = format!("src-{name}");
+        }
+        spec.spec.metrics.per_table.enabled = true;
+        spec.spec.metrics.per_table.max_tables = 100;
+        mgr.start_pipeline(spec).await.expect("pipeline starts");
+        assert!(!for_pipeline(name).has_table_series(), "no series yet");
+        let admit_first = || {
+            crate::pipeline_metrics::set_patch_hook(
+                name,
+                Box::new(|| {
+                    for_pipeline("patch-race").label("db.first");
+                }),
+            )
+        };
+
+        // A cap change: refused at the check, the old pipeline untouched.
+        admit_first();
+        let err = mgr
+            .patch(
+                name,
+                serde_json::json!({"spec": {"metrics": {"per_table": {"max_tables": 5}}}}),
+            )
+            .await
+            .map(|_| ())
+            .expect_err("a cap change is refused");
+        assert!(
+            matches!(&err, PipelineAPIError::BadRequest(m) if m.contains("fixed at 100")),
+            "{err:?}"
+        );
+        let running = mgr.get_pipeline(name).expect("still registered");
+        assert_eq!(running.spec.spec.metrics.per_table.max_tables, 100);
+        assert_eq!(for_pipeline(name).policy().unwrap().max_tables, 100);
+        assert!(
+            crate::pipeline_metrics::run_patch_hook(name),
+            "refused before the point between check and stop"
+        );
+        assert!(
+            running.status != "stopped" && running.status != "deleting",
+            "the old pipeline was not stopped"
+        );
+
+        // A change that keeps the cap applies across the racing admission.
+        admit_first();
+        let info = mgr
+            .patch(
+                name,
+                serde_json::json!({"spec": {"metrics": {"per_table": {"lag_idle_secs": 60}}}}),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("a compatible patch applies: {e:?}"));
+        assert_eq!(info.spec.spec.metrics.per_table.lag_idle_secs, 60);
+        let tables = for_pipeline(name);
+        let policy = tables.policy().unwrap();
+        assert_eq!((policy.max_tables, policy.lag_idle.as_secs()), (100, 60));
+        assert_eq!(tables.admitted(), 1, "the racing admission was kept");
     }
 
     // ── R3-C3: duplicate active source-id containment ────────────────────────

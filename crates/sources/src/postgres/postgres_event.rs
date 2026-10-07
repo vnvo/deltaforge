@@ -1081,7 +1081,7 @@ async fn handle_truncate(
 /// Uses `try_send` (non-blocking) when the channel has capacity to avoid
 /// the overhead of the async state machine on every single row. Falls back
 /// to the async `send` only when the channel is full (backpressure).
-/// Counter handles are cached per (table, op) to avoid hash lookups per event.
+/// Counter handles are cached (`EventCounters`) to avoid registry lookups per event.
 #[inline]
 async fn send_event(
     ctx: &mut RunCtx,
@@ -1100,17 +1100,7 @@ async fn send_event(
         if ctx.current_tx_id.is_some() {
             ctx.open_tx_events += 1;
         }
-        let key = (Arc::clone(table_name), op);
-        let ctr = ctx.counter_cache.entry(key).or_insert_with_key(|k| {
-            counter!(
-                "deltaforge_source_events_total",
-                "pipeline" => ctx.pipeline.clone(),
-                "source" => ctx.source_id.clone(),
-                "table" => k.0.to_string(),
-                "op" => k.1,
-            )
-        });
-        ctr.increment(1);
+        ctx.event_counters.increment(table_name, op);
     } else {
         error!(source_id = %ctx.source_id, op, "channel send failed");
     }

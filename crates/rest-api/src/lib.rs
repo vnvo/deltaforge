@@ -204,6 +204,7 @@ mod tests {
                     annotations: Default::default(),
                 },
                 spec: Spec {
+                    metrics: Default::default(),
                     sharding: None,
                     source: SourceCfg::Mysql(MysqlSrcCfg {
                         id: "mysql".to_string(),

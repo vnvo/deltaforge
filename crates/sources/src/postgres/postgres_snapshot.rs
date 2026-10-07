@@ -714,8 +714,12 @@ impl TableWorker {
 
         counter!(
             "deltaforge_snapshot_rows_total",
-            "pipeline" => self.pipeline.clone(),
-            "table" => fqn.clone()
+            deltaforge_core::table_metrics::with_table(
+                vec![metrics::Label::new("pipeline", self.pipeline.clone())],
+                deltaforge_core::table_metrics::for_pipeline(&self.pipeline)
+                    .label(&fqn)
+                    .as_ref(),
+            )
         )
         .increment(rows_sent);
 

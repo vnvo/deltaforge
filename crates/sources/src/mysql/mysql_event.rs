@@ -339,10 +339,7 @@ async fn handle_write_rows(
         if sent > 0 {
             counter!(
                 "deltaforge_source_events_total",
-                "pipeline" => ctx.pipeline.clone(),
-                "source" => ctx.source_id.clone(),
-                "table" => format!("{}.{}", tm.database_name, tm.table_name),
-                "op" => "c",
+                source_event_labels(ctx, tm, "c"),
             )
             .increment(sent);
         }
@@ -441,10 +438,7 @@ async fn handle_update_rows(
         if sent > 0 {
             counter!(
                 "deltaforge_source_events_total",
-                "pipeline" => ctx.pipeline.clone(),
-                "source" => ctx.source_id.clone(),
-                "table" => format!("{}.{}", tm.database_name, tm.table_name),
-                "op" => "u",
+                source_event_labels(ctx, tm, "u"),
             )
             .increment(sent);
         }
@@ -534,10 +528,7 @@ async fn handle_delete_rows(
         if sent > 0 {
             counter!(
                 "deltaforge_source_events_total",
-                "pipeline" => ctx.pipeline.clone(),
-                "source" => ctx.source_id.clone(),
-                "table" => format!("{}.{}", tm.database_name, tm.table_name),
-                "op" => "d",
+                source_event_labels(ctx, tm, "d"),
             )
             .increment(sent);
         }
@@ -1322,6 +1313,24 @@ async fn record_query(
     Ok(())
 }
 
+/// `deltaforge_source_events_total` labels for `tm`'s table (table labels
+/// only when the pipeline enables per-table detail).
+fn source_event_labels(
+    ctx: &RunCtx,
+    tm: &TableMapEvent,
+    op: &'static str,
+) -> Vec<metrics::Label> {
+    let table = format!("{}.{}", tm.database_name, tm.table_name);
+    deltaforge_core::table_metrics::with_table(
+        vec![
+            metrics::Label::new("pipeline", ctx.pipeline.clone()),
+            metrics::Label::new("source", ctx.source_id.clone()),
+            metrics::Label::new("op", op),
+        ],
+        ctx.table_metrics.label(&table).as_ref(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1387,6 +1396,11 @@ mod tests {
         RunCtx {
             source_id: "unit-test".to_string(),
             pipeline: "test-pipeline".to_string(),
+            table_metrics: Arc::new(
+                deltaforge_core::table_metrics::TableMetrics::disabled(
+                    "test-pipeline",
+                ),
+            ),
             tenant: "test-tenant".to_string(),
             dsn: "mysql://fake".to_string().into(),
             host: "localhost".to_string(),
@@ -2252,11 +2266,6 @@ mod tests {
     /// evaluation position: its registered shape (two nullable VARCHAR
     /// columns, as the fixture's TableMap) and a valid baseline.
     async fn prove_orders(ctx: &mut RunCtx) {
-        use crate::mysql::mysql_activation::{
-            ACTIVATION_NS, Kind, Record, append, baseline_capture_id,
-            table_stream,
-        };
-        use crate::mysql::mysql_table_schema::{MySqlColumn, MySqlTableSchema};
         crate::registry_scope::establish_scope(
             &ctx.registry_backend,
             &ctx.registry_scope,
@@ -2278,6 +2287,18 @@ mod tests {
                 gtid_set: format!("{UUID}:1-5"),
             });
         }
+        prove_table(ctx, "orders").await;
+    }
+
+    /// Register `shop.<table>` with the fixture's shape (two nullable
+    /// VARCHAR columns) and a valid baseline at the rows' evaluation
+    /// position (scope already established).
+    async fn prove_table(ctx: &mut RunCtx, table: &str) {
+        use crate::mysql::mysql_activation::{
+            ACTIVATION_NS, Kind, Record, append, baseline_capture_id,
+            table_stream,
+        };
+        use crate::mysql::mysql_table_schema::{MySqlColumn, MySqlTableSchema};
         let r0 = ctx.txn_eval.clone().unwrap();
         let col = |name: &str, ordinal| {
             let mut c = MySqlColumn::new(
@@ -2291,7 +2312,7 @@ mod tests {
             c
         };
         let schema = MySqlTableSchema::new(vec![col("id", 1), col("sku", 2)]);
-        let key = ctx.registry_scope.current().unwrap().key("shop", "orders");
+        let key = ctx.registry_scope.current().unwrap().key("shop", table);
         // Registered under the context's scope (the fixture's loader has its
         // own).
         let hash = schema_registry::SourceSchema::fingerprint(&schema);
@@ -2332,6 +2353,74 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn source_event_labels_follow_the_per_table_policy() {
+        use deltaforge_core::table_metrics::{PerTablePolicy, TableMetrics};
+        let (tx, _rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        let tm = ctx.table_map[&TABLE_ID].clone();
+        let keys = |labels: Vec<metrics::Label>| {
+            labels
+                .iter()
+                .map(|l| (l.key().to_string(), l.value().to_string()))
+                .collect::<Vec<_>>()
+        };
+        let off = keys(source_event_labels(&ctx, &tm, "c"));
+        assert!(off.iter().all(|(k, _)| k != "table" && k != "table_scope"));
+        ctx.table_metrics = Arc::new(TableMetrics::new(
+            "test-pipeline",
+            Some(PerTablePolicy {
+                max_tables: 1,
+                lag_idle: Duration::from_secs(300),
+            }),
+        ));
+        let on = keys(source_event_labels(&ctx, &tm, "c"));
+        assert!(on.contains(&("table".into(), "shop.orders".into())));
+        assert!(on.contains(&("table_scope".into(), "exact".into())));
+    }
+
+    /// An entry evicted by the shared cache budget is rebuilt from the
+    /// durable registry and activation records alone, byte-equivalent to
+    /// the cached one. The fixture's DSN is unreachable, so a rebuild that
+    /// needed the live catalog would fail.
+    #[tokio::test]
+    async fn an_evicted_selection_rebuilds_byte_equivalently() {
+        use crate::mysql::mysql_selection::{Caches, select_for_rows};
+        let (tx, _rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        prove_orders(&mut ctx).await;
+        prove_table(&mut ctx, "items").await;
+        let orders = ctx.table_map[&TABLE_ID].clone();
+        let items = TableMapEvent {
+            table_id: TABLE_ID + 1,
+            table_name: "items".into(),
+            ..orders.clone()
+        };
+        // Room for one table's timeline and selection.
+        ctx.selection = Caches::with_budget_for_test(2);
+
+        let first = select_for_rows(&mut ctx, &orders).await.unwrap();
+        assert!(Arc::ptr_eq(
+            &first,
+            &select_for_rows(&mut ctx, &orders).await.unwrap()
+        ));
+        select_for_rows(&mut ctx, &items).await.unwrap();
+        assert_eq!(ctx.selection.len(), 2, "orders' entries were evicted");
+
+        let rebuilt = select_for_rows(&mut ctx, &orders).await.unwrap();
+        assert!(!Arc::ptr_eq(&first, &rebuilt), "rebuilt, not cached");
+        let bytes = |l: &crate::mysql::mysql_schema_loader::LoadedSchema| {
+            (
+                serde_json::to_vec(&l.schema).unwrap(),
+                l.registry_version,
+                l.fingerprint.to_string(),
+                l.sequence,
+                l.column_names.as_ref().clone(),
+            )
+        };
+        assert_eq!(bytes(&first), bytes(&rebuilt));
     }
 
     #[tokio::test]

@@ -21,7 +21,6 @@
 //! Nothing is ever registered from a TableMap. Every row operation is
 //! stamped with the selected version's hash and its own registry sequence.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -68,22 +67,130 @@ impl Timeline {
     }
 }
 
-/// Per-run caches. Only this process appends activation records for this
-/// source (the store gate), so invalidating on every append keeps them exact.
-#[derive(Debug, Default)]
+/// The per-source entry budget shared by the timeline and selection caches.
+/// Entries beyond it are evicted least recently used first; an evicted entry
+/// is rebuilt exactly from the durable registry and activation records (no
+/// live catalog query), so the bound costs reads, never correctness.
+pub(crate) const SELECTION_CACHE_ENTRIES: usize = 4096;
+
+/// `deltaforge_mysql_selection_cache_evictions_total{pipeline,source}`.
+pub(crate) const METRIC_EVICTIONS: &str =
+    "deltaforge_mysql_selection_cache_evictions_total";
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CacheKey {
+    /// A validated timeline, by table key.
+    Timeline(String),
+    /// A selected schema by (table key, decisive record, TableMap
+    /// signature). The key carries the lineage; the decisive record carries
+    /// the row position's effective proof.
+    Selection(String, String, String),
+}
+
+#[derive(Debug, Clone)]
+enum Cached {
+    Timeline(Arc<Timeline>),
+    Selection(Arc<LoadedSchema>),
+}
+
+/// Per-run caches, bounded by one shared LRU budget. Only this process
+/// appends activation records for this source (the store gate), so
+/// invalidating on every append keeps them exact.
 pub(crate) struct Caches {
-    /// Validated timelines by table key.
-    timelines: HashMap<String, Arc<Timeline>>,
-    /// Selected schemas by (table key, decisive record, TableMap signature).
-    /// The key carries the lineage; the decisive record carries the row
-    /// position's effective proof.
-    selections: HashMap<(String, String, String), Arc<LoadedSchema>>,
+    entries: lru::LruCache<CacheKey, Cached>,
+    evictions: metrics::Counter,
+}
+
+impl std::fmt::Debug for Caches {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Caches")
+            .field("entries", &self.entries.len())
+            .field("budget", &self.entries.cap())
+            .finish()
+    }
+}
+
+impl Default for Caches {
+    fn default() -> Self {
+        Self::with_budget(SELECTION_CACHE_ENTRIES, metrics::Counter::noop())
+    }
 }
 
 impl Caches {
+    /// The source's caches, counting evictions under its labels.
+    pub(crate) fn new(pipeline: &str, source: &str) -> Self {
+        Self::with_budget(
+            SELECTION_CACHE_ENTRIES,
+            metrics::counter!(
+                METRIC_EVICTIONS,
+                "pipeline" => pipeline.to_string(),
+                "source" => source.to_string()
+            ),
+        )
+    }
+
+    fn with_budget(budget: usize, evictions: metrics::Counter) -> Self {
+        Self {
+            entries: lru::LruCache::new(
+                std::num::NonZeroUsize::new(budget).expect("a positive budget"),
+            ),
+            evictions,
+        }
+    }
+
+    fn put(&mut self, key: CacheKey, value: Cached) {
+        if let Some((old, _)) = self.entries.push(key.clone(), value)
+            && old != key
+        {
+            self.evictions.increment(1);
+        }
+    }
+
+    fn timeline(&mut self, key: &str) -> Option<Arc<Timeline>> {
+        match self.entries.get(&CacheKey::Timeline(key.to_string()))? {
+            Cached::Timeline(t) => Some(t.clone()),
+            Cached::Selection(_) => None,
+        }
+    }
+
+    fn put_timeline(&mut self, key: String, timeline: Arc<Timeline>) {
+        self.put(CacheKey::Timeline(key), Cached::Timeline(timeline));
+    }
+
+    fn selection(
+        &mut self,
+        (table, decisive, signature): &(String, String, String),
+    ) -> Option<Arc<LoadedSchema>> {
+        let key = CacheKey::Selection(
+            table.clone(),
+            decisive.clone(),
+            signature.clone(),
+        );
+        match self.entries.get(&key)? {
+            Cached::Selection(s) => Some(s.clone()),
+            Cached::Timeline(_) => None,
+        }
+    }
+
+    fn put_selection(
+        &mut self,
+        (table, decisive, signature): (String, String, String),
+        loaded: Arc<LoadedSchema>,
+    ) {
+        self.put(
+            CacheKey::Selection(table, decisive, signature),
+            Cached::Selection(loaded),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_budget_for_test(budget: usize) -> Self {
+        Self::with_budget(budget, metrics::Counter::noop())
+    }
+
     #[cfg(test)]
     pub(crate) fn seed_for_test(&mut self, key: &SchemaKey) {
-        self.timelines.insert(
+        self.put_timeline(
             key.backend_key(),
             Arc::new(Timeline {
                 records: Vec::new(),
@@ -94,20 +201,29 @@ impl Caches {
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.timelines.len() + self.selections.len()
+        self.entries.len()
     }
 
     /// A record was appended for `key`.
     pub(crate) fn invalidate(&mut self, key: &SchemaKey) {
         let k = key.backend_key();
-        self.timelines.remove(&k);
-        self.selections.retain(|(t, _, _), _| t != &k);
+        let stale: Vec<CacheKey> = self
+            .entries
+            .iter()
+            .map(|(key, _)| key)
+            .filter(|key| match key {
+                CacheKey::Timeline(t) | CacheKey::Selection(t, _, _) => t == &k,
+            })
+            .cloned()
+            .collect();
+        for key in stale {
+            self.entries.pop(&key);
+        }
     }
 
     /// A barrier (or anything lineage-wide) was appended.
     pub(crate) fn invalidate_all(&mut self) {
-        self.timelines.clear();
-        self.selections.clear();
+        self.entries.clear();
     }
 }
 
@@ -446,8 +562,8 @@ async fn timeline(
     key: &SchemaKey,
 ) -> SourceResult<Arc<Timeline>> {
     let k = key.backend_key();
-    if let Some(t) = ctx.selection.timelines.get(&k) {
-        return Ok(t.clone());
+    if let Some(t) = ctx.selection.timeline(&k) {
+        return Ok(t);
     }
     let registry = ctx.schema.registry();
     let records =
@@ -460,7 +576,7 @@ async fn timeline(
     let t = Timeline { records, barriers };
     validate(registry, key, &t).await.map_err(timeline_error)?;
     let t = Arc::new(t);
-    ctx.selection.timelines.insert(k, t.clone());
+    ctx.selection.put_timeline(k, t.clone());
     Ok(t)
 }
 
@@ -551,8 +667,8 @@ pub(crate) async fn select_for_rows(
         Selection::Proven { version } => {
             let decisive = decisive.unwrap_or_default();
             let cache_key = (key.backend_key(), decisive, sig_digest);
-            if let Some(hit) = ctx.selection.selections.get(&cache_key) {
-                return Ok(hit.clone());
+            if let Some(hit) = ctx.selection.selection(&cache_key) {
+                return Ok(hit);
             }
             let (loaded, schema) =
                 loaded(ctx.schema.registry(), &key, version).await?;
@@ -567,7 +683,7 @@ pub(crate) async fn select_for_rows(
                     ),
                 ));
             }
-            ctx.selection.selections.insert(cache_key, loaded.clone());
+            ctx.selection.put_selection(cache_key, loaded.clone());
             Ok(loaded)
         }
         Selection::Unproven(reason) if !is_full(tm) => Err(fail(
@@ -783,6 +899,100 @@ async fn full_fallback(
 mod tests {
     use super::*;
     use crate::mysql::mysql_table_schema::MySqlColumn;
+
+    #[test]
+    fn the_shared_budget_bounds_both_caches_under_churn() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let rec = DebuggingRecorder::new();
+        let budget = 16;
+        let puts = metrics::with_local_recorder(&rec, || {
+            let mut caches = Caches::new("p", "s");
+            caches
+                .entries
+                .resize(std::num::NonZeroUsize::new(budget).unwrap());
+            let timeline = Arc::new(Timeline {
+                records: Vec::new(),
+                barriers: Vec::new(),
+            });
+            let loaded = Arc::new(LoadedSchema {
+                schema: MySqlTableSchema::new(Vec::new()),
+                registry_version: 1,
+                fingerprint: "h".into(),
+                sequence: 1,
+                column_names: Arc::new(Vec::new()),
+            });
+            let mut puts = 0u64;
+            for i in 0..2_000 {
+                let table = format!("t{}", i % 300);
+                caches.put_timeline(table.clone(), timeline.clone());
+                caches.put_selection(
+                    (table, format!("d{i}"), "sig".into()),
+                    loaded.clone(),
+                );
+                puts += 2;
+                assert!(caches.len() <= budget);
+            }
+            assert_eq!(caches.len(), budget);
+            puts
+        });
+        let evictions: Vec<_> = rec
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == METRIC_EVICTIONS)
+            .collect();
+        assert_eq!(evictions.len(), 1, "one series per source");
+        let (key, _, _, value) = &evictions[0];
+        let labels: Vec<_> =
+            key.key().labels().map(|l| l.key().to_string()).collect();
+        assert_eq!(labels, ["pipeline", "source"], "no table label");
+        // Re-putting a cached timeline replaces it (not an eviction).
+        let DebugValue::Counter(n) = value else {
+            panic!("a counter")
+        };
+        assert!(*n > 0 && *n < puts);
+    }
+
+    #[test]
+    fn invalidation_drops_only_the_tables_entries() {
+        let mut caches = Caches::with_budget_for_test(64);
+        let t = Arc::new(Timeline {
+            records: Vec::new(),
+            barriers: Vec::new(),
+        });
+        let loaded = Arc::new(LoadedSchema {
+            schema: MySqlTableSchema::new(Vec::new()),
+            registry_version: 1,
+            fingerprint: "h".into(),
+            sequence: 1,
+            column_names: Arc::new(Vec::new()),
+        });
+        for table in ["a", "b"] {
+            caches.put_timeline(table.into(), t.clone());
+            caches.put_selection(
+                (table.into(), "d".into(), "s".into()),
+                loaded.clone(),
+            );
+        }
+        let key = SchemaKey::new(
+            "t",
+            "s",
+            "0123456789abcdef0123456789abcdef",
+            "d",
+            "x",
+        );
+        caches.put_timeline(key.backend_key(), t.clone());
+        caches
+            .put_selection((key.backend_key(), "d".into(), "s".into()), loaded);
+        assert_eq!(caches.len(), 6);
+        caches.invalidate(&key);
+        assert_eq!(caches.len(), 4);
+        assert!(caches.timeline("a").is_some());
+        assert!(caches.timeline(&key.backend_key()).is_none());
+        caches.invalidate_all();
+        assert_eq!(caches.len(), 0);
+    }
 
     #[test]
     fn a_unique_match_needs_exactly_one_match_and_nothing_unverifiable() {

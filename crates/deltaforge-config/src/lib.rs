@@ -14,6 +14,9 @@ pub use sanitize::serialize_sanitized_spec;
 mod snapshot_cfg;
 pub use snapshot_cfg::*;
 
+mod metrics_cfg;
+pub use metrics_cfg::*;
+
 mod sinks_cfg;
 pub use sinks_cfg::*;
 
@@ -148,6 +151,10 @@ pub struct Spec {
     /// source's rotation configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets: Option<SecretProvidersCfg>,
+
+    /// Metrics configuration (per-table detail is opt-in).
+    #[serde(default)]
+    pub metrics: MetricsCfg,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]

@@ -838,8 +838,17 @@ impl TableWorker {
         // consistent-snapshot transaction once, after its last table.
         counter!(
             "deltaforge_snapshot_rows_total",
-            "pipeline" => self.shape.pipeline.clone(),
-            "table" => table_fqn.clone()
+            deltaforge_core::table_metrics::with_table(
+                vec![metrics::Label::new(
+                    "pipeline",
+                    self.shape.pipeline.clone()
+                )],
+                deltaforge_core::table_metrics::for_pipeline(
+                    &self.shape.pipeline
+                )
+                .label(&table_fqn)
+                .as_ref(),
+            )
         )
         .increment(rows_sent);
 

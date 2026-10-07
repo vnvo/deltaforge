@@ -7,8 +7,10 @@
 //! 4. Skip normalization when not needed
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use metrics::{counter, gauge, histogram};
+use deltaforge_core::table_metrics::{TableMetrics, with_table};
+use metrics::{Label, counter, gauge, histogram};
 use schema_analysis::InferredSchema;
 use tracing::debug;
 
@@ -149,6 +151,9 @@ pub struct SchemaSensor {
     schemas: HashMap<String, TableSchemaState>,
     structure_caches: HashMap<String, StructureCache>,
     hc_states: HashMap<String, TableHcState>,
+    /// The pipeline's per-table label policy (metrics carry `pipeline`, and
+    /// table labels only when per-table detail is enabled).
+    tables: Arc<TableMetrics>,
 }
 
 impl SchemaSensor {
@@ -166,7 +171,14 @@ impl SchemaSensor {
             schemas: HashMap::new(),
             structure_caches: HashMap::new(),
             hc_states: HashMap::new(),
+            tables: Arc::new(TableMetrics::disabled("")),
         }
+    }
+
+    /// Report metrics under `tables`' pipeline and per-table policy.
+    pub fn with_table_metrics(mut self, tables: Arc<TableMetrics>) -> Self {
+        self.tables = tables;
+        self
     }
 
     pub fn enabled() -> Self {
@@ -203,20 +215,43 @@ impl SchemaSensor {
         result: &ObserveResult,
         elapsed: std::time::Duration,
     ) {
-        counter!("deltaforge_schema_events_total", "table" => table.to_string()).increment(1);
-        histogram!("deltaforge_schema_sensing_seconds", "table" => table.to_string())
+        let table_label = self.tables.label(table);
+        let labels = || {
+            with_table(
+                vec![Label::new(
+                    "pipeline",
+                    self.tables.pipeline().to_string(),
+                )],
+                table_label.as_ref(),
+            )
+        };
+        counter!("deltaforge_schema_events_total", labels()).increment(1);
+        histogram!("deltaforge_schema_sensing_seconds", labels())
             .record(elapsed.as_secs_f64());
 
         match result {
             ObserveResult::CacheHit { .. } => {
-                counter!("deltaforge_schema_sensing_cache_hits_total", "table" => table.to_string()).increment(1);
+                counter!(
+                    "deltaforge_schema_sensing_cache_hits_total",
+                    labels()
+                )
+                .increment(1);
             }
             ObserveResult::Evolved { .. } => {
-                counter!("deltaforge_schema_sensing_cache_misses_total", "table" => table.to_string()).increment(1);
-                counter!("deltaforge_schema_evolutions_total", "table" => table.to_string()).increment(1);
+                counter!(
+                    "deltaforge_schema_sensing_cache_misses_total",
+                    labels()
+                )
+                .increment(1);
+                counter!("deltaforge_schema_evolutions_total", labels())
+                    .increment(1);
             }
             ObserveResult::NewSchema { .. } => {
-                counter!("deltaforge_schema_sensing_cache_misses_total", "table" => table.to_string()).increment(1);
+                counter!(
+                    "deltaforge_schema_sensing_cache_misses_total",
+                    labels()
+                )
+                .increment(1);
             }
             ObserveResult::Unchanged { .. } | ObserveResult::Sampled { .. } => {
                 // Not a cache hit but also not a miss - full sensing path
@@ -227,15 +262,21 @@ impl SchemaSensor {
         // Update gauges periodically (every 1000 events to avoid overhead)
         if let Some(state) = self.schemas.get(table) {
             if state.event_count % 1000 == 0 {
-                gauge!("deltaforge_schema_tables_total")
-                    .set(self.schemas.len() as f64);
+                gauge!(
+                    "deltaforge_schema_tables_total",
+                    "pipeline" => self.tables.pipeline().to_string()
+                )
+                .set(self.schemas.len() as f64);
                 let dynamic_maps: usize = self
                     .hc_states
                     .values()
                     .map(|s| s.classifier.map_paths().len())
                     .sum();
-                gauge!("deltaforge_schema_dynamic_maps_total")
-                    .set(dynamic_maps as f64);
+                gauge!(
+                    "deltaforge_schema_dynamic_maps_total",
+                    "pipeline" => self.tables.pipeline().to_string()
+                )
+                .set(dynamic_maps as f64);
             }
         }
     }
@@ -972,5 +1013,93 @@ mod tests {
             unchanged_count,
             evolved_count
         );
+    }
+
+    mod metric_labels {
+        use std::collections::HashSet;
+        use std::time::Duration;
+
+        use deltaforge_core::table_metrics::PerTablePolicy;
+        use metrics_util::debugging::DebuggingRecorder;
+
+        use super::super::*;
+
+        /// Each schema-sensing metric's distinct label sets after sensing
+        /// `tables` tables (two events each, so hits and evolutions occur).
+        fn label_sets(
+            policy: Option<PerTablePolicy>,
+            tables: usize,
+        ) -> HashMap<String, HashSet<Vec<(String, String)>>> {
+            let rec = DebuggingRecorder::new();
+            metrics::with_local_recorder(&rec, || {
+                let mut sensor = SchemaSensor::enabled().with_table_metrics(
+                    Arc::new(TableMetrics::new("p", policy)),
+                );
+                for i in 0..tables {
+                    let table = format!("db.t{i}");
+                    for v in 0..1_000 {
+                        let value = if v == 500 {
+                            serde_json::json!({"id": v, "extra": "x"})
+                        } else {
+                            serde_json::json!({"id": v})
+                        };
+                        sensor.observe_value(&table, &value).unwrap();
+                    }
+                }
+            });
+            let mut out: HashMap<String, HashSet<_>> = HashMap::new();
+            for (k, ..) in rec.snapshotter().snapshot().into_vec() {
+                let mut labels: Vec<_> = k
+                    .key()
+                    .labels()
+                    .map(|l| (l.key().to_string(), l.value().to_string()))
+                    .collect();
+                labels.sort();
+                out.entry(k.key().name().to_string())
+                    .or_default()
+                    .insert(labels);
+            }
+            out
+        }
+
+        const METRICS: [&str; 7] = [
+            "deltaforge_schema_events_total",
+            "deltaforge_schema_sensing_seconds",
+            "deltaforge_schema_sensing_cache_hits_total",
+            "deltaforge_schema_sensing_cache_misses_total",
+            "deltaforge_schema_evolutions_total",
+            "deltaforge_schema_tables_total",
+            "deltaforge_schema_dynamic_maps_total",
+        ];
+
+        #[test]
+        fn off_every_metric_has_one_pipeline_series() {
+            let sets = label_sets(None, 30);
+            for name in METRICS {
+                let series = &sets[name];
+                assert_eq!(series.len(), 1, "{name}: {series:?}");
+                let labels = series.iter().next().unwrap();
+                assert_eq!(
+                    labels,
+                    &vec![("pipeline".into(), "p".into())],
+                    "{name}"
+                );
+            }
+        }
+
+        #[test]
+        fn on_table_series_are_capped() {
+            let policy = PerTablePolicy {
+                max_tables: 2,
+                lag_idle: Duration::from_secs(300),
+            };
+            let sets = label_sets(Some(policy), 30);
+            for name in &METRICS[..5] {
+                assert_eq!(sets[*name].len(), 3, "{name}: max_tables + 1");
+                for labels in &sets[*name] {
+                    assert!(labels.iter().any(|(k, _)| k == "table_scope"));
+                }
+            }
+        }
     }
 }
