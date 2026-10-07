@@ -2266,11 +2266,6 @@ mod tests {
     /// evaluation position: its registered shape (two nullable VARCHAR
     /// columns, as the fixture's TableMap) and a valid baseline.
     async fn prove_orders(ctx: &mut RunCtx) {
-        use crate::mysql::mysql_activation::{
-            ACTIVATION_NS, Kind, Record, append, baseline_capture_id,
-            table_stream,
-        };
-        use crate::mysql::mysql_table_schema::{MySqlColumn, MySqlTableSchema};
         crate::registry_scope::establish_scope(
             &ctx.registry_backend,
             &ctx.registry_scope,
@@ -2292,6 +2287,18 @@ mod tests {
                 gtid_set: format!("{UUID}:1-5"),
             });
         }
+        prove_table(ctx, "orders").await;
+    }
+
+    /// Register `shop.<table>` with the fixture's shape (two nullable
+    /// VARCHAR columns) and a valid baseline at the rows' evaluation
+    /// position (scope already established).
+    async fn prove_table(ctx: &mut RunCtx, table: &str) {
+        use crate::mysql::mysql_activation::{
+            ACTIVATION_NS, Kind, Record, append, baseline_capture_id,
+            table_stream,
+        };
+        use crate::mysql::mysql_table_schema::{MySqlColumn, MySqlTableSchema};
         let r0 = ctx.txn_eval.clone().unwrap();
         let col = |name: &str, ordinal| {
             let mut c = MySqlColumn::new(
@@ -2305,7 +2312,7 @@ mod tests {
             c
         };
         let schema = MySqlTableSchema::new(vec![col("id", 1), col("sku", 2)]);
-        let key = ctx.registry_scope.current().unwrap().key("shop", "orders");
+        let key = ctx.registry_scope.current().unwrap().key("shop", table);
         // Registered under the context's scope (the fixture's loader has its
         // own).
         let hash = schema_registry::SourceSchema::fingerprint(&schema);
@@ -2346,6 +2353,48 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// An entry evicted by the shared cache budget is rebuilt from the
+    /// durable registry and activation records alone, byte-equivalent to
+    /// the cached one. The fixture's DSN is unreachable, so a rebuild that
+    /// needed the live catalog would fail.
+    #[tokio::test]
+    async fn an_evicted_selection_rebuilds_byte_equivalently() {
+        use crate::mysql::mysql_selection::{Caches, select_for_rows};
+        let (tx, _rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        prove_orders(&mut ctx).await;
+        prove_table(&mut ctx, "items").await;
+        let orders = ctx.table_map[&TABLE_ID].clone();
+        let items = TableMapEvent {
+            table_id: TABLE_ID + 1,
+            table_name: "items".into(),
+            ..orders.clone()
+        };
+        // Room for one table's timeline and selection.
+        ctx.selection = Caches::with_budget_for_test(2);
+
+        let first = select_for_rows(&mut ctx, &orders).await.unwrap();
+        assert!(Arc::ptr_eq(
+            &first,
+            &select_for_rows(&mut ctx, &orders).await.unwrap()
+        ));
+        select_for_rows(&mut ctx, &items).await.unwrap();
+        assert_eq!(ctx.selection.len(), 2, "orders' entries were evicted");
+
+        let rebuilt = select_for_rows(&mut ctx, &orders).await.unwrap();
+        assert!(!Arc::ptr_eq(&first, &rebuilt), "rebuilt, not cached");
+        let bytes = |l: &crate::mysql::mysql_schema_loader::LoadedSchema| {
+            (
+                serde_json::to_vec(&l.schema).unwrap(),
+                l.registry_version,
+                l.fingerprint.to_string(),
+                l.sequence,
+                l.column_names.as_ref().clone(),
+            )
+        };
+        assert_eq!(bytes(&first), bytes(&rebuilt));
     }
 
     #[tokio::test]

@@ -1611,7 +1611,7 @@ impl MySqlSource {
             lower_case_table_names,
             txn_eval: None,
             txn_eval_cp: None,
-            selection: Default::default(),
+            selection: mysql_selection::Caches::new(&self.pipeline, &self.id),
             failover: None,
             drift_checked: Default::default(),
             drift_resolver: crate::incident_drafts::DriftResolver::new(

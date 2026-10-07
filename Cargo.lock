@@ -5953,6 +5953,7 @@ dependencies = [
  "deltaforge-core",
  "gate-ownership",
  "hex",
+ "lru 0.12.5",
  "metrics",
  "metrics-util 0.19.1",
  "mysql-binlog-connector-rust",
