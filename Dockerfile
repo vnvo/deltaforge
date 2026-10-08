@@ -21,6 +21,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
 COPY examples ./examples
+COPY vendor ./vendor
 
 RUN cargo build --locked --release --bin runner
 
