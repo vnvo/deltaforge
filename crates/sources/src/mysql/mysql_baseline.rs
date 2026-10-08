@@ -29,8 +29,8 @@ use super::mysql_activation::{
     table_stream,
 };
 use super::mysql_binlog_scan::{
-    CLASSIFIER_VERSION, ProofError, ScanLimits, ScanReport, Statement,
-    scan_interval, stable_capture,
+    CLASSIFIER_VERSION, ProofError, ScanLimits, ScanReport, Statement, capture,
+    covers, scan_interval,
 };
 use super::mysql_ddl_attribution::{BarrierScopeOf, DdlEffect, same_name};
 use super::mysql_selection::Timeline;
@@ -49,9 +49,6 @@ fn other_server(expected: &str, found: &str) -> SourceError {
         .into(),
     }
 }
-
-/// Stable-capture attempts per table before giving up on its baseline.
-const CAPTURE_ATTEMPTS: u32 = 5;
 
 /// Whether a statement in (R0, S] may have changed `db.table` or invalidated
 /// positional proof for it.
@@ -172,16 +169,15 @@ pub(crate) async fn establish(
         return Ok(0);
     }
 
-    // 1. A stable capture of each table's shape.
+    // 1. A capture of each table's shape, bound to its interval by step 2.
     let mut captured = Vec::new();
     for c in candidates {
-        match stable_capture(
+        match capture(
             ctx.dsn.expose(),
             &server_uuid,
             &lineage,
             &c.db,
             &c.table,
-            CAPTURE_ATTEMPTS,
             None,
         )
         .await
@@ -192,7 +188,7 @@ pub(crate) async fn establish(
                 return Err(other_server(&server_uuid, &found));
             }
             Err(e) => {
-                warn!(source_id = %ctx.source_id, db = %c.db, table = %c.table, error = ?e, "no baseline: no stable capture");
+                warn!(source_id = %ctx.source_id, db = %c.db, table = %c.table, error = ?e, "no baseline: no capture");
             }
         }
     }
@@ -238,17 +234,8 @@ pub(crate) async fn establish(
         serde_json::to_vec(&r0_cp).map_err(|e| SourceError::Other(e.into()))?;
     let mut written = 0;
     for (c, cap) in captured {
-        let at_or_before_s = matches!(
-            mysql_checkpoint_position(
-                &cap.position.file,
-                cap.position.pos,
-                cap.position.gtid_set.as_deref()
-            )
-            .map(|p| order_positions(&p, &s)),
-            Some(CheckpointOrder::Before | CheckpointOrder::Equal)
-        );
-        if !at_or_before_s {
-            warn!(source_id = %ctx.source_id, db = %c.db, table = %c.table, "no baseline: capture not before the scan end");
+        if !covers(&cap, &r0, &s) {
+            warn!(source_id = %ctx.source_id, db = %c.db, table = %c.table, "no baseline: the scan does not cover the capture interval");
             continue;
         }
         if report
@@ -333,13 +320,12 @@ pub(crate) async fn establish_at(
             return Ok(false);
         }
     };
-    let cap = match stable_capture(
+    let cap = match capture(
         ctx.dsn.expose(),
         &server_uuid,
         &lineage,
         db,
         table,
-        CAPTURE_ATTEMPTS,
         None,
     )
     .await
@@ -349,7 +335,7 @@ pub(crate) async fn establish_at(
             return Err(other_server(&server_uuid, &found));
         }
         Err(err) => {
-            warn!(source_id = %ctx.source_id, %db, %table, error = ?err, "no lazy baseline: no stable capture");
+            warn!(source_id = %ctx.source_id, %db, %table, error = ?err, "no lazy baseline: no capture");
             return Ok(false);
         }
     };
@@ -361,11 +347,8 @@ pub(crate) async fn establish_at(
     ) else {
         return Ok(false);
     };
-    if !matches!(
-        order_positions(&e, &s),
-        CheckpointOrder::Before | CheckpointOrder::Equal
-    ) {
-        warn!(source_id = %ctx.source_id, %db, %table, "no lazy baseline: the capture is not at or after the rows");
+    if !covers(&cap, &e, &s) {
+        warn!(source_id = %ctx.source_id, %db, %table, "no lazy baseline: the capture did not start at or after the rows");
         return Ok(false);
     }
     let report = match scan_interval(
@@ -515,6 +498,13 @@ mod tests {
         assert!(!affects(&tables(vec![t("D", "A")]), "d", "a", 0));
         assert!(affects(&tables(vec![t("D", "A")]), "d", "a", 1));
         assert!(affects(&tables(vec![t("e", "z")]), "d", "a", 2));
+        let db = |d: &str| {
+            stmt(DdlEffect::Barrier(BarrierScopeOf::Database(d.into())))
+        };
+        assert!(!affects(&db("D"), "d", "a", 0));
+        assert!(affects(&db("D"), "d", "a", 1));
+        assert!(!affects(&db("e"), "d", "a", 1));
+        assert!(affects(&db("e"), "d", "a", 2));
     }
 
     fn st(id: &str, pos: u64, kind: Kind) -> Stored {

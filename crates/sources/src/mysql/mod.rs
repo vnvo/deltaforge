@@ -1300,6 +1300,15 @@ impl MySqlSource {
                 .into(),
             });
         }
+        // A binlog that may miss applied transactions proves nothing:
+        // refused before anything durable, any snapshot or any stream.
+        let ServerIdentity::MySql(root_id) = &root else {
+            return Err(SourceError::Other(anyhow::anyhow!(
+                "MySQL source verified a non-MySQL identity"
+            )));
+        };
+        require_complete_binlog(self.dsn.expose(), &root_id.server_uuid)
+            .await?;
         establish_scope(
             &self.backend,
             &self.registry_scope,
@@ -2117,7 +2126,12 @@ async fn connect_first_stream(
     )
     .await?
     {
-        Opened::Stream(stream) => Ok(stream),
+        // Checked again once the stream is open, before any event is read:
+        // the setting changes only with a restart, which ends this stream.
+        Opened::Stream(stream) => {
+            require_complete_binlog(ctx.dsn.expose(), &expected).await?;
+            Ok(stream)
+        }
         // Startup verified this server on every earlier connection: a
         // replication session elsewhere is split routing, never a failover.
         Opened::OtherServer(found) => Err(SourceError::Lineage {
@@ -2218,6 +2232,9 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
         candidate = %found,
         "reconnect reached another server; reconciling a possible failover"
     );
+    // A candidate whose binlog may miss applied transactions is refused
+    // before reconciliation records anything.
+    require_complete_binlog(ctx.dsn.expose(), &found).await?;
     let previous = mysql_identity(&expected);
     let current = mysql_identity(&found);
     run_failover_reconciliation(ctx, previous, current, &resume).await?;
@@ -2237,6 +2254,7 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
     {
         Opened::Stream(stream) => {
             ctx.retry.reset();
+            require_complete_binlog(ctx.dsn.expose(), &expected).await?;
             Ok(stream)
         }
         Opened::OtherServer(other) => Err(SourceError::Lineage {
@@ -2340,6 +2358,23 @@ impl RunCtx {
             }),
         }
     }
+}
+
+/// Refuse a server whose binlog does not hold every transaction it applies
+/// (`mysql_health::require_complete_binlog`).
+pub(crate) async fn require_complete_binlog(
+    dsn: &str,
+    expected_uuid: &str,
+) -> SourceResult<()> {
+    let mut conn =
+        open_control_connection(dsn, expected_uuid, CONTROL_CONNECT_TIMEOUT)
+            .await
+            .map_err(|e| e.into_source_error(expected_uuid))?;
+    let r = mysql_health::require_complete_binlog(&mut conn).await;
+    conn.disconnect().await.ok();
+    r.map_err(|details| SourceError::Incompatible {
+        details: details.into(),
+    })
 }
 
 /// `@@lower_case_table_names` of the verified server: how DDL table names map
@@ -2828,7 +2863,12 @@ async fn check_identity_post_reconnect(
     let expected = ctx.expected_uuid()?;
     let live = match prefetched {
         Some(live) => live,
-        None => fetch_identity_verified_as(ctx.dsn.expose(), &expected).await?,
+        None => {
+            // A reconnect's stream is open, nothing read yet: the server
+            // may have restarted with another configuration.
+            require_complete_binlog(ctx.dsn.expose(), &expected).await?;
+            fetch_identity_verified_as(ctx.dsn.expose(), &expected).await?
+        }
     };
 
     match ctx

@@ -607,3 +607,59 @@ pub async fn mysql_drop_db(pool: &MySQLPool, db: &str) {
             .ok();
     }
 }
+
+/// Writers committing continuously, until finished, into `{db}.busy` (an
+/// untracked table of the tracked database) and `{db}_other.busy` (another
+/// database): the server position never stands still while a source proves
+/// its tables.
+#[allow(dead_code)]
+pub struct Busy {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    tasks: Vec<tokio::task::JoinHandle<u64>>,
+}
+
+#[allow(dead_code)]
+impl Busy {
+    pub async fn start(dsn: &str, db: &str) -> Self {
+        let busy = "busy (id BIGINT AUTO_INCREMENT PRIMARY KEY, v INT)";
+        let mut c = mysql_async::Conn::from_url(dsn).await.unwrap();
+        for s in [
+            format!("CREATE TABLE IF NOT EXISTS {db}.{busy}"),
+            format!("CREATE DATABASE IF NOT EXISTS {db}_other"),
+            format!("CREATE TABLE IF NOT EXISTS {db}_other.{busy}"),
+        ] {
+            c.query_drop(&s).await.unwrap();
+        }
+        c.disconnect().await.ok();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut tasks = Vec::new();
+        for target in [format!("{db}.busy"), format!("{db}_other.busy")] {
+            for _ in 0..2 {
+                let q = format!("INSERT INTO {target} (v) VALUES (1)");
+                let (dsn, stop) = (dsn.to_string(), stop.clone());
+                tasks.push(tokio::spawn(async move {
+                    let mut c = mysql_async::Conn::from_url(dsn).await.unwrap();
+                    let mut n = 0;
+                    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        c.query_drop(&q).await.unwrap();
+                        n += 1;
+                    }
+                    c.disconnect().await.ok();
+                    n
+                }));
+            }
+        }
+        sleep(Duration::from_millis(300)).await;
+        Self { stop, tasks }
+    }
+
+    /// Stops the writers; returns how many commits they made.
+    pub async fn finish(self) -> u64 {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut total = 0;
+        for t in self.tasks {
+            total += t.await.unwrap();
+        }
+        total
+    }
+}

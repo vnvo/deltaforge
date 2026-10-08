@@ -38,7 +38,7 @@ use super::mysql_activation::{
     resolve_binding, select_decisive, table_stream,
 };
 use super::mysql_binlog_scan::{
-    CLASSIFIER_VERSION, ProofError, stable_capture,
+    CLASSIFIER_VERSION, ProofError, ScanLimits, capture_proven,
 };
 use super::mysql_schema_loader::LoadedSchema;
 use super::mysql_signature::{
@@ -47,7 +47,8 @@ use super::mysql_signature::{
 use super::mysql_table_schema::MySqlTableSchema;
 use crate::durable_checkpoint::{WmPos, order_positions};
 
-/// Stable-capture attempts for the live shape at a FULL fallback.
+/// Capture attempts for the live shape at a FULL fallback (retried only when
+/// a DDL or barrier affecting the table lands inside the capture interval).
 const CAPTURE_ATTEMPTS: u32 = 5;
 
 /// A table's validated timeline: its records and the barriers that apply.
@@ -777,15 +778,22 @@ async fn full_fallback(
         }
     };
 
-    // The live shape, stable-captured and registered through the normal
+    // The live shape, captured with its own interval proven free of anything
+    // affecting the table, and only then registered through the normal
     // registry path (never derived from the TableMap).
-    let cap = match stable_capture(
+    let cap = match capture_proven(
         ctx.dsn.expose(),
+        super::mysql_helpers::derive_server_id(&format!(
+            "{}/capture",
+            ctx.source_id
+        )),
         &server_uuid,
         &lineage,
         db,
         table,
+        ctx.lower_case_table_names,
         CAPTURE_ATTEMPTS,
+        &ScanLimits::default(),
         None,
     )
     .await
@@ -800,7 +808,7 @@ async fn full_fallback(
             return Err(fail(
                 db,
                 table,
-                &format!("no stable live capture ({e})"),
+                &format!("no proven live capture ({e})"),
             ));
         }
     };

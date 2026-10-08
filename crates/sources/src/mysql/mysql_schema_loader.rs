@@ -932,9 +932,15 @@ pub(crate) async fn fetch_table_schema_on(
 }
 
 /// The registered schema model of each of `tables` that exists, read from
-/// INFORMATION_SCHEMA on `conn` in one batch (no lineage proof: the caller's
-/// connection is already proven). The one definition of a MySQL table's
-/// schema: the loader registers it and the snapshot anchor compares it.
+/// INFORMATION_SCHEMA on `conn` (no lineage proof: the caller's connection is
+/// already proven). The one definition of a MySQL table's schema: the loader
+/// registers it and the snapshot anchor compares it.
+///
+/// Not atomic: four separate queries (columns, primary key, primary-key
+/// prefix lengths, table metadata), so a DDL between two of them can yield a
+/// shape assembled from two table versions. Callers that bind the shape to a
+/// position prove the read interval free of DDL for the table
+/// (`mysql_binlog_scan::capture_proven`, or a scan covering the capture).
 pub(crate) async fn fetch_table_schemas_on(
     conn: &mut mysql_async::Conn,
     tables: &[(&str, &str)],
@@ -1028,6 +1034,9 @@ pub(crate) async fn fetch_table_schemas_on(
             .push(column);
     }
 
+    #[cfg(test)]
+    read_hook::after(tables, 1).await;
+
     // Fetch primary key
     let pk_rows: Vec<Row> = conn
         .exec(
@@ -1053,6 +1062,9 @@ pub(crate) async fn fetch_table_schemas_on(
             s.primary_key.push(row.take("COLUMN_NAME").unwrap());
         }
     }
+
+    #[cfg(test)]
+    read_hook::after(tables, 2).await;
 
     // Primary-key prefix lengths (a prefixed key part, e.g. a BLOB prefix).
     let prefix_rows: Vec<Row> = conn
@@ -1084,6 +1096,9 @@ pub(crate) async fn fetch_table_schemas_on(
         }
     }
 
+    #[cfg(test)]
+    read_hook::after(tables, 3).await;
+
     // Fetch table metadata
     let table_rows: Vec<Row> = conn
         .exec(
@@ -1110,6 +1125,44 @@ pub(crate) async fn fetch_table_schemas_on(
     }
 
     Ok(schemas)
+}
+
+/// Test-only: an action run between the schema read's queries (after query
+/// `step` of 1-3) for reads of tables in a given database, so a test can land
+/// a DDL between any two of them. Keyed by database so concurrent tests do
+/// not interfere.
+#[cfg(test)]
+pub(crate) mod read_hook {
+    use std::collections::HashMap;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    pub(crate) type Hook = Arc<
+        dyn Fn(u8) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
+    >;
+
+    fn hooks() -> &'static Mutex<HashMap<String, Hook>> {
+        static HOOKS: OnceLock<Mutex<HashMap<String, Hook>>> = OnceLock::new();
+        HOOKS.get_or_init(Default::default)
+    }
+
+    pub(crate) fn set(db: &str, hook: Hook) {
+        hooks().lock().unwrap().insert(db.to_string(), hook);
+    }
+
+    pub(crate) fn clear(db: &str) {
+        hooks().lock().unwrap().remove(db);
+    }
+
+    pub(crate) async fn after(tables: &[(&str, &str)], step: u8) {
+        let hook = tables
+            .first()
+            .and_then(|(db, _)| hooks().lock().unwrap().get(*db).cloned());
+        if let Some(h) = hook {
+            h(step).await;
+        }
+    }
 }
 
 #[cfg(test)]

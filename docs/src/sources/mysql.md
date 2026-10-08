@@ -18,9 +18,12 @@ log_bin = ON
 binlog_format = ROW
 gtid_mode = ON                    -- required when the initial snapshot runs
 enforce_gtid_consistency = ON     -- required with gtid_mode = ON
+log_replica_updates = ON          -- required (the default); see below
 binlog_row_image = FULL  -- Recommended for complete before-images
 binlog_row_metadata = FULL  -- Recommended: decodes rows across unobserved schema changes
 ```
+
+**`log_replica_updates = ON` is required on every source, primary or replica** (`log_slave_updates` before MySQL 8.0.26; the default since 8.0). With it OFF, transactions the server applies through replication - from a channel configured now or at any later time - change its tables and advance its executed GTID set without reaching the binlog DeltaForge reads, so changes would be missed and a schema change could go unseen. DeltaForge refuses such a server before it writes anything durable, reads any table or runs a snapshot, and checks again each time a binlog stream opens (startup, every reconnect, credential rotation) before reading from it, and before a failover candidate is reconciled. The setting is read-only: changing it requires a server restart, which ends the stream, so the reconnect afterwards is checked. Changing it on a running server is otherwise not possible and not supported. The check fails closed when the setting cannot be read.
 
 If `binlog_row_image` is not `FULL`, DeltaForge will warn at startup and before-images on UPDATE/DELETE events may be incomplete. For `binlog_row_metadata`, see [Schema Tracking](#schema-tracking).
 
@@ -249,6 +252,8 @@ Binlog row events carry values by column position, not by name. DeltaForge decod
 - the table's definition captured when its first rows without other proof arrive, and proven unchanged between those rows and the capture (no DDL of the table and no unattributable statement in between);
 - a DDL's resulting definition, captured right after the source reads the DDL and proven unchanged since;
 - with `binlog_row_metadata = FULL` and neither of the above: the single recorded definition that exactly matches the row's binlog metadata (column names, types, signedness, charsets, primary key), recorded durably before the row is emitted.
+
+Capturing a definition never requires the server to be idle. In one read-only transaction the source takes the table's shared metadata lock (the lock any `SELECT` takes: inserts, updates and deletes proceed, DDL of that table or its database waits), then reads the binlog position, the table's definition (several INFORMATION_SCHEMA queries) and the position again, then releases the lock. A DDL already running on the table finishes before the lock is granted, so the definition read is never older than the position; a DDL issued meanwhile waits a few milliseconds and lands after the capture. The source then proves from the binlog that nothing between the two positions could have changed that table, such as an unattributable statement. Ordinary writes, to any table, and DDL of other tables do not matter, so a busy server proves tables as readily as a quiet one. Only a relevant statement inside that short interval causes a retry; a binlog that cannot be read (purged, unknown events, scan limits) or a lock not granted within 30 seconds stops the proof instead. The capture needs `SELECT` on the table. Table and database names are compared as `lower_case_table_names` defines: exactly with `0`, case-insensitively with `1`, and with `2` (names stored as written, compared case-insensitively) every DDL counts as relevant.
 
 When no version can be proven, the source **stops** with a schema error naming the table, emits nothing for those rows and does not advance its checkpoint. Under the default `binlog_row_metadata = MINIMAL` this happens when:
 

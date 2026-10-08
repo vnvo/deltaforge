@@ -1271,3 +1271,144 @@ async fn a_lazy_baseline_is_written_only_if_it_decides_the_rows() {
         "no baseline written: {records:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A busy server: every proof path under sustained ordinary writes
+// ---------------------------------------------------------------------------
+
+fn kinds(records: &[Value]) -> Vec<String> {
+    records
+        .iter()
+        .map(|r| r["kind"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Lazy baseline, forward proof of a live DDL and of a DDL made while the
+/// source was stopped, all on a busy server (MINIMAL metadata: without
+/// positional proof the source would fail closed).
+async fn busy_lazy_baseline_and_forward_proofs(gtid: bool) {
+    init_test_tracing();
+    let db = if gtid { "pm_busy_g" } else { "pm_busy_f" };
+    let port = server(gtid, false).await;
+    let hash = lineage_hash(port).await;
+    prepare(port, db, &[T]).await;
+    let busy = test_common::Busy::start(&dsn(port, ""), db).await;
+    let st = State::new().await;
+
+    // A lazy baseline proves the first row.
+    let mut r = run(source(db, port, db, &["t"], &st), &st).await;
+    prime(port, db, &["t"], &mut r.rx).await;
+    // A live DDL, proven forward.
+    sql(
+        port,
+        db,
+        &stmts(&[
+            "ALTER TABLE t ADD COLUMN c1 INT",
+            "INSERT INTO t VALUES (1, 'A1', 'B1', 1)",
+        ]),
+    )
+    .await;
+    let live = rows(&mut r.rx, 1).await;
+    stop(r.handle).await;
+    assert_eq!(live.len(), 1, "rows: {:?}", image(&live));
+    assert_eq!(after(&live[0], "c1"), 1);
+
+    // A DDL while stopped, proven forward on the restart.
+    sql(
+        port,
+        db,
+        &stmts(&[
+            "INSERT INTO t VALUES (2, 'A2', 'B2', 2)",
+            "ALTER TABLE t DROP COLUMN a",
+            "INSERT INTO t VALUES (3, 'B3', 3)",
+        ]),
+    )
+    .await;
+    let mut r = run(source(db, port, db, &["t"], &st), &st).await;
+    let got = rows(&mut r.rx, 2).await;
+    stop(r.handle).await;
+    assert!(busy.finish().await > 100, "the server was not busy");
+    assert_eq!(got.len(), 2, "rows: {:?}", image(&got));
+    assert_eq!(after(&got[0], "a"), "A2");
+    assert_eq!(after(&got[1], "b"), "B3");
+    let v = st.decoded(db, &hash, &got).await;
+    assert_ne!(v[0].hash, v[1].hash);
+    let k = kinds(&st.activation(db, &hash, db, "t").await);
+    assert!(k.iter().any(|k| k == "baseline"), "{k:?}");
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn busy_server_lazy_baseline_and_forward_proofs_gtid() {
+    busy_lazy_baseline_and_forward_proofs(true).await;
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn busy_server_lazy_baseline_and_forward_proofs_file_position() {
+    busy_lazy_baseline_and_forward_proofs(false).await;
+}
+
+/// A snapshot proves its tables at the anchor (start baseline) on a busy
+/// server: the baseline exists before any streamed row. (Snapshots require
+/// GTID mode.)
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn busy_server_snapshot_baseline() {
+    init_test_tracing();
+    let db = "pm_busy_snap";
+    let port = server(true, false).await;
+    let hash = lineage_hash(port).await;
+    prepare(port, db, &[T]).await;
+    sql(port, db, &stmts(&["INSERT INTO t VALUES (1, 'A1', 'B1')"])).await;
+    let busy = test_common::Busy::start(&dsn(port, ""), db).await;
+    let st = State::new().await;
+    let mut src = source(db, port, db, &["t"], &st);
+    src.snapshot_cfg.mode = SnapshotMode::Always;
+    let mut r = run(src, &st).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !kinds(&st.activation(db, &hash, db, "t").await)
+        .iter()
+        .any(|k| k == "baseline")
+    {
+        assert!(Instant::now() < deadline, "no snapshot baseline");
+        sleep(Duration::from_millis(200)).await;
+    }
+    // The streamed row after the anchor decodes with that baseline.
+    sql(port, db, &stmts(&["INSERT INTO t VALUES (2, 'A2', 'B2')"])).await;
+    let got = rows(&mut r.rx, 1).await;
+    stop(r.handle).await;
+    assert!(busy.finish().await > 100, "the server was not busy");
+    assert_eq!(got.len(), 1, "rows: {:?}", image(&got));
+    assert_eq!(after(&got[0], "a"), "A2");
+    let k = kinds(&st.activation(db, &hash, db, "t").await);
+    assert_eq!(
+        k.iter().filter(|k| *k == "baseline").count(),
+        1,
+        "only the snapshot baseline: {k:?}"
+    );
+}
+
+/// The FULL fallback past a barrier, on a busy server: the live capture is
+/// proven over its own interval while writes continue.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn busy_server_full_fallback() {
+    init_test_tracing();
+    let db = "pm_busy_full";
+    let port = server(true, true).await;
+    let hash = lineage_hash(port).await;
+    prepare(port, db, &[T]).await;
+    let st = State::new().await;
+    commit_a_position(port, &st, db, db).await;
+    let busy = test_common::Busy::start(&dsn(port, ""), db).await;
+    sql(port, db, &rows_past_a_barrier(KEEPING_BARRIER)).await;
+    let mut r = run(source(db, port, db, &["t"], &st), &st).await;
+    let live = rows(&mut r.rx, 4).await;
+    stop(r.handle).await;
+    assert!(busy.finish().await > 100, "the server was not busy");
+    assert_eq!(live.len(), 4, "rows: {:?}", image(&live));
+    assert_eq!(after(&live[3], "x"), 9);
+    let records = st.activation(db, &hash, db, "t").await;
+    assert_eq!(full_observations(&records).len(), 1, "{records:?}");
+}

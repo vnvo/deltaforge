@@ -30,13 +30,10 @@ use tracing::{info, warn};
 use super::mysql_activation::{self, ForwardProof, resolve_binding};
 use super::mysql_baseline::affects;
 use super::mysql_binlog_scan::{
-    CLASSIFIER_VERSION, ProofError, ScanLimits, scan_interval, stable_capture,
+    CLASSIFIER_VERSION, ProofError, ScanLimits, capture, covers, scan_interval,
 };
 use super::{MySqlCheckpoint, RunCtx};
 use crate::durable_checkpoint::{mysql_checkpoint_position, order_positions};
-
-/// Stable-capture attempts per table before the DDL stays pending.
-const CAPTURE_ATTEMPTS: u32 = 5;
 
 /// A tracked table whose shape a DDL left pending.
 pub(crate) struct Pending {
@@ -124,16 +121,15 @@ pub(crate) async fn prove(
         return Ok(0);
     }
 
-    // 1. Stable captures.
+    // 1. Captures, bound to their intervals by step 3.
     let mut captured = Vec::new();
     for p in open {
-        match stable_capture(
+        match capture(
             ctx.dsn.expose(),
             &server_uuid,
             &lineage,
             &p.db,
             &p.table,
-            CAPTURE_ATTEMPTS,
             None,
         )
         .await
@@ -143,7 +139,7 @@ pub(crate) async fn prove(
                 return Err(other_server(&server_uuid, &found));
             }
             Err(e) => {
-                warn!(source_id = %ctx.source_id, db = %p.db, table = %p.table, error = ?e, "forward proof: no stable capture; the DDL stays pending");
+                warn!(source_id = %ctx.source_id, db = %p.db, table = %p.table, error = ?e, "forward proof: no capture; the DDL stays pending");
             }
         }
     }
@@ -198,17 +194,8 @@ pub(crate) async fn prove(
         serde_json::to_vec(&d_cp).map_err(|e| SourceError::Other(e.into()))?;
     let mut written = 0;
     for (p, cap) in captured {
-        let at_or_before_s = matches!(
-            mysql_checkpoint_position(
-                &cap.position.file,
-                cap.position.pos,
-                cap.position.gtid_set.as_deref()
-            )
-            .map(|c| order_positions(&c, &s)),
-            Some(CheckpointOrder::Before | CheckpointOrder::Equal)
-        );
-        if !at_or_before_s {
-            warn!(source_id = %ctx.source_id, db = %p.db, table = %p.table, "forward proof: capture not before the scan end; the DDL stays pending");
+        if !covers(&cap, &d, &s) {
+            warn!(source_id = %ctx.source_id, db = %p.db, table = %p.table, "forward proof: the scan does not cover the capture interval; the DDL stays pending");
             continue;
         }
         if report

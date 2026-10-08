@@ -191,7 +191,16 @@ async fn open_binlog(
     )
     .await
     {
-        Ok(Opened::Stream(stream)) => Ok(stream),
+        // Open, nothing read: refused unless the binlog is complete (the
+        // server may have restarted with another configuration). The kept
+        // stream, if the server did restart, ends and reconnects through
+        // the same check.
+        Ok(Opened::Stream(stream)) => {
+            match super::require_complete_binlog(dsn, expected_uuid).await {
+                Ok(()) => Ok(stream),
+                Err(_) => Err(RotationReject::ReplacementOpenFailed),
+            }
+        }
         Ok(Opened::OtherServer(_)) | Err(SourceError::Lineage { .. }) => {
             Err(RotationReject::IdentityMismatch)
         }

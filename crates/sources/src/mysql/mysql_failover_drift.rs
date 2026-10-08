@@ -45,7 +45,7 @@ use super::MySqlCheckpoint;
 use super::mysql_activation::Stored;
 use super::mysql_baseline::affects;
 use super::mysql_binlog_scan::{
-    ProofError, ScanLimits, scan_interval, stable_capture,
+    ProofError, ScanLimits, capture, covers, scan_interval,
 };
 use super::mysql_schema_loader::MySqlSchemaLoader;
 use super::mysql_table_schema::MySqlTableSchema;
@@ -59,7 +59,6 @@ use crate::failover::reconciler::{
 pub(crate) const ANCHOR_NS: &str = "schemas.v1.failover.anchor";
 pub(crate) const MARKER_NS: &str = "schemas.v1.failover.drift";
 const FORMAT_VERSION: u32 = 2;
-const CAPTURE_ATTEMPTS: u32 = 5;
 
 /// A failover into the current lineage (written once per transition).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -454,13 +453,12 @@ async fn shape_at_failover(
     };
     let mut from = from;
     from.lineage = Some(anchor.current_lineage.clone());
-    let cap = match stable_capture(
+    let cap = match capture(
         env.dsn,
         env.server_uuid,
         &anchor.current_lineage,
         db,
         table,
-        CAPTURE_ATTEMPTS,
         None,
     )
     .await
@@ -477,10 +475,26 @@ async fn shape_at_failover(
             });
         }
         Err(e) => {
-            warn!(source_id = env.source_id, %db, %table, error = ?e, "failover drift: no stable capture");
+            warn!(source_id = env.source_id, %db, %table, error = ?e, "failover drift: no capture");
             return Ok(None);
         }
     };
+    // The scan (F, capture end] must cover the capture interval.
+    let covered = mysql_checkpoint_position(
+        &from.file,
+        from.pos,
+        from.gtid_set.as_deref(),
+    )
+    .zip(mysql_checkpoint_position(
+        &cap.position.file,
+        cap.position.pos,
+        cap.position.gtid_set.as_deref(),
+    ))
+    .is_some_and(|(f, end)| covers(&cap, &f, &end));
+    if !covered {
+        warn!(source_id = env.source_id, %db, %table, "failover drift: the capture started before F");
+        return Ok(None);
+    }
     let report = match scan_interval(
         env.dsn,
         super::mysql_helpers::derive_server_id(&format!(

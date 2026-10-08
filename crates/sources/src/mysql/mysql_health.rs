@@ -842,6 +842,40 @@ fn engine_hard_error(
     }
 }
 
+/// Refuse a server whose binlog may not hold every transaction it applies:
+/// `log_replica_updates` must be ON on every MySQL source, primary or
+/// replica. With it OFF, transactions applied through any replication
+/// channel (configured now or later) advance the executed GTID set and the
+/// schema without reaching the binlog, so changes are missed and an interval
+/// of the binlog can look free of a DDL that changed a table. The setting is
+/// read-only (a server restart changes it, which ends every session); callers
+/// check it after each stream opens and before any event is read. Fails
+/// closed when it cannot be read.
+pub(crate) async fn require_complete_binlog(
+    conn: &mut mysql_async::Conn,
+) -> std::result::Result<(), String> {
+    let updates: Option<u8> = match conn
+        .query_first("SELECT @@GLOBAL.log_replica_updates")
+        .await
+    {
+        Ok(v) => v,
+        Err(_) => conn
+            .query_first("SELECT @@GLOBAL.log_slave_updates")
+            .await
+            .map_err(|e| format!("cannot read log_replica_updates: {e}"))?,
+    };
+    match updates {
+        Some(1) => Ok(()),
+        other => Err(format!(
+            "log_replica_updates is {other:?}, must be ON (1): with it OFF, \
+             transactions this server applies through replication are not in \
+             its binlog, so changes and schema changes would be missed. Enable \
+             log_replica_updates (log_slave_updates before MySQL 8.0.26) and \
+             restart the server."
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
