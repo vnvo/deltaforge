@@ -49,6 +49,7 @@ parallel   sources/mysql_ddl_replay_failclosed -p sources --test mysql_ddl_repla
 parallel   sources/mysql_failover_drift_e2e -p sources --test mysql_failover_drift_e2e
 parallel   sources/mysql_lineage_failclosed -p sources --test mysql_lineage_failclosed
 parallel   sources/mysql_proof_matrix_e2e   -p sources --test mysql_proof_matrix_e2e
+parallel   sources/mysql_replica_binlog_e2e -p sources --test mysql_replica_binlog_e2e
 parallel   sources/mysql_snapthot_e2e       -p sources --test mysql_snapthot_e2e
 parallel   sources/postgres_cdc_e2e         -p sources --test postgres_cdc_e2e
 parallel   sources/postgres_snapshot_e2e    -p sources --test postgres_snapshot_e2e

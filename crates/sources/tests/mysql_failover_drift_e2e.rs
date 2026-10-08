@@ -613,3 +613,49 @@ async fn a_barrier_after_the_failover_position_is_unprovable() {
     halted(&ended, "cannot be proven");
     assert!(rows(&items).is_empty());
 }
+
+/// The drift proof on a busy promoted server: writes to other tables never
+/// stop B's position, and the capture is still proven (adapt records the
+/// drift, halt streams on with none).
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn drift_is_proven_on_a_busy_server() {
+    init_test_tracing();
+    let (a, b) = servers().await;
+    for (id, drift, policy, outcome) in [
+        (
+            "fd_busy_adapt",
+            Some(STATUS),
+            OnSchemaDrift::Adapt,
+            "adapted",
+        ),
+        ("fd_busy_same", None, OnSchemaDrift::Halt, "unchanged"),
+    ] {
+        let table = format!("{id}.orders");
+        let sc = Scenario {
+            id,
+            db: id,
+            tables: vec![table],
+        };
+        let st = State::new().await;
+        on_a(&sc, &st, a).await;
+        promote_b(&sc, a, b, drift, &[]).await;
+        let busy = test_common::Busy::start(&dsn(b, ""), sc.db).await;
+        let insert = if drift.is_some() {
+            format!("INSERT INTO {}.orders VALUES (2, 'on-b', 'x')", sc.db)
+        } else {
+            format!("INSERT INTO {}.orders VALUES (2, 'on-b')", sc.db)
+        };
+        let src = source(&sc, b, &st, policy, SnapshotMode::Never);
+        let (items, ended) =
+            run(src, &st, b, &[insert], Duration::from_secs(6)).await;
+        assert!(busy.finish().await > 100, "the server was not busy");
+        assert!(ended.is_none(), "{id}: still streaming: {ended:?}");
+        assert_eq!(rows(&items).len(), 1, "{id}");
+        let m = st
+            .marker(b, sc.id, sc.db, "orders")
+            .await
+            .expect("recorded");
+        assert_eq!(m["outcome"], outcome, "{id}: {m}");
+    }
+}

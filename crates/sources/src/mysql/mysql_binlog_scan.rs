@@ -10,9 +10,23 @@
 //!   a gap), a framing error (incl. a transaction without a GTID in a GTID
 //!   interval), passing `to` without reaching it, or a resource limit (a
 //!   guard, never "no DDL").
-//! - [`stable_capture`] reads the server position, one table's shape and the
-//!   position again on ONE connection, after proving the server's identity on
-//!   it, and accepts only equal positions; bounded retries, then fail closed.
+//! - [`capture`] reads the server position A, one table's shape and the
+//!   position B on ONE connection, after proving the server's identity on it,
+//!   while holding the table's shared-read metadata lock in a transaction.
+//!   That lock is compatible with DML and conflicts with every DDL of the
+//!   table: it is granted only once a DDL already running on the table has
+//!   committed (binlog event written, dictionary change visible), and no DDL
+//!   of the table can commit until it is released after B. So a DDL of the
+//!   table at or before A is visible to the shape read (closing the window in
+//!   which a binlog position already includes a DDL whose dictionary change is
+//!   not yet visible), and none lands in (A, B]. The server is never required
+//!   to be quiet: ordinary writes, to the table or any other, continue, and
+//!   DDL of other tables is irrelevant. The lock's schema intention lock also
+//!   holds off DDL of the table's database. Unattributable statements that
+//!   are neither are not locked out: a scan proves the interval free of them, a covering scan by
+//!   the caller ([`covers`]) or the capture's own interval
+//!   ([`capture_proven`], which retries only when something affecting the
+//!   table landed inside it).
 //!
 //! The scan digest is deterministic for an interval: it binds the classifier
 //! version, both boundaries and every classified statement with its binlog
@@ -109,7 +123,9 @@ pub(crate) enum ProofError {
     NotReached(String),
     #[error("scan resource limit reached ({0}); the interval is unproven")]
     Limit(String),
-    #[error("no stable position could be captured after {0} attempts")]
+    #[error(
+        "a DDL or barrier affecting the table landed inside the capture interval on each of {0} attempts"
+    )]
     Unstable(u32),
     #[error("schema capture failed: {0}")]
     Capture(String),
@@ -529,16 +545,24 @@ pub(crate) async fn scan_interval(
     })
 }
 
-/// A consistent `(position, shape)` pair.
+/// One table's shape read between two server positions, on one connection
+/// whose server identity was proven: `from` was read before the shape and
+/// `position` after it (`from <= position`). The shape is the table's shape
+/// at every point of `[from, position]` only if `(from, position]` holds no
+/// DDL or barrier affecting the table: the caller proves that with a scan of
+/// an interval covering it ([`covers`]), or uses [`capture_proven`].
+/// Ordinary writes in the interval, and DDL on other tables, are irrelevant.
 #[derive(Debug, Clone)]
 pub(crate) struct Captured {
+    pub from: MySqlCheckpoint,
     pub position: MySqlCheckpoint,
     pub schema: MySqlTableSchema,
     pub attempts: u32,
 }
 
 /// Runs between the shape read and the second position read (tests use it
-/// to make a capture deterministically unstable; production passes `None`).
+/// to land a statement inside the capture interval; production passes
+/// `None`).
 pub(crate) type BetweenHook<'a> = &'a (
         dyn Fn() -> std::pin::Pin<
     Box<dyn std::future::Future<Output = ()> + Send>,
@@ -578,14 +602,29 @@ async fn read_position(
     })
 }
 
-/// Capture `db.table`'s shape at a stable server position (module docs).
-pub(crate) async fn stable_capture(
+/// Bound on waiting for the table's metadata lock (a DDL in progress on the
+/// table): a capture that cannot lock fails, never reads unlocked.
+const LOCK_WAIT_SECS: u32 = 30;
+
+fn quoted(db: &str, table: &str) -> String {
+    let q = |s: &str| format!("`{}`", s.replace('`', "``"));
+    format!("{}.{}", q(db), q(table))
+}
+
+fn wm(c: &MySqlCheckpoint) -> Result<WmPos, ProofError> {
+    mysql_checkpoint_position(&c.file, c.pos, c.gtid_set.as_deref()).ok_or_else(
+        || ProofError::Positions(format!("unparseable position {c:?}")),
+    )
+}
+
+/// Read `db.table`'s shape between two positions (module docs). Never
+/// requires the server to be quiet: the positions may differ.
+pub(crate) async fn capture(
     dsn: &str,
     server_uuid: &str,
     lineage_hash: &str,
     db: &str,
     table: &str,
-    max_attempts: u32,
     between: Option<BetweenHook<'_>>,
 ) -> Result<Captured, ProofError> {
     let pool = mysql_async::Pool::new(dsn);
@@ -599,50 +638,129 @@ pub(crate) async fn stable_capture(
             .await
             .map_err(|e| ProofError::Capture(e.to_string()))?;
         let gtid_mode = mode.is_some_and(|m| m.eq_ignore_ascii_case("ON"));
-        for attempt in 1..=max_attempts.max(1) {
-            let before =
-                read_position(&mut conn, gtid_mode, lineage_hash).await?;
-            let schema =
-                match fetch_table_schema_on(&mut conn, server_uuid, db, table)
-                    .await
-                {
-                    Ok(Live::Found(s)) => s,
-                    Ok(Live::OtherLineage(who)) => {
-                        return Err(ProofError::OtherServer(who));
-                    }
-                    Err(e) => return Err(ProofError::Capture(e.to_string())),
-                };
-            if let Some(hook) = between {
-                hook().await;
-            }
-            let after =
-                read_position(&mut conn, gtid_mode, lineage_hash).await?;
-            let p = |c: &MySqlCheckpoint| {
-                mysql_checkpoint_position(&c.file, c.pos, c.gtid_set.as_deref())
-                    .ok_or_else(|| {
-                        ProofError::Capture(format!(
-                            "unparseable position {c:?}"
-                        ))
-                    })
-            };
-            if order_positions(&p(&before)?, &p(&after)?)
-                == CheckpointOrder::Equal
-            {
-                conn.disconnect().await.ok();
-                return Ok(Captured {
-                    position: after,
-                    schema,
-                    attempts: attempt,
-                });
-            }
-            tokio::time::sleep(Duration::from_millis(20 * u64::from(attempt)))
-                .await;
+        // Identity first: nothing is locked or read on another server.
+        let live: Option<String> = conn
+            .query_first("SELECT @@GLOBAL.server_uuid")
+            .await
+            .map_err(|e| ProofError::Capture(e.to_string()))?;
+        if !live
+            .as_deref()
+            .is_some_and(|l| server_uuid.eq_ignore_ascii_case(l.trim()))
+        {
+            return Err(ProofError::OtherServer(format!("{live:?}")));
         }
-        Err(ProofError::Unstable(max_attempts.max(1)))
+        // The table's metadata lock, held until COMMIT (module docs).
+        for q in [
+            format!("SET SESSION lock_wait_timeout = {LOCK_WAIT_SECS}"),
+            "START TRANSACTION READ ONLY".to_string(),
+            format!("SELECT 1 FROM {} LIMIT 0", quoted(db, table)),
+        ] {
+            conn.query_drop(&q)
+                .await
+                .map_err(|e| ProofError::Capture(format!("{q}: {e}")))?;
+        }
+        let from = read_position(&mut conn, gtid_mode, lineage_hash).await?;
+        let schema =
+            match fetch_table_schema_on(&mut conn, server_uuid, db, table).await {
+                Ok(Live::Found(s)) => s,
+                Ok(Live::OtherLineage(who)) => {
+                    return Err(ProofError::OtherServer(who));
+                }
+                Err(e) => return Err(ProofError::Capture(e.to_string())),
+            };
+        if let Some(hook) = between {
+            hook().await;
+        }
+        let position = read_position(&mut conn, gtid_mode, lineage_hash).await?;
+        match order_positions(&wm(&from)?, &wm(&position)?) {
+            CheckpointOrder::Before | CheckpointOrder::Equal => {}
+            other => {
+                return Err(ProofError::Positions(format!(
+                    "the server position went backwards during the capture ({other:?})"
+                )));
+            }
+        }
+        conn.query_drop("COMMIT")
+            .await
+            .map_err(|e| ProofError::Capture(format!("COMMIT: {e}")))?;
+        conn.disconnect().await.ok();
+        Ok(Captured {
+            from,
+            position,
+            schema,
+            attempts: 1,
+        })
     }
     .await;
     pool.disconnect().await.ok();
     result
+}
+
+/// Whether a scan of `(start, end]` covers the capture interval
+/// `(cap.from, cap.position]`: `start <= cap.from` and `cap.position <= end`.
+/// A covering scan in which nothing affects the table proves the captured
+/// shape for the whole interval.
+pub(crate) fn covers(cap: &Captured, start: &WmPos, end: &WmPos) -> bool {
+    let (Ok(a), Ok(b)) = (wm(&cap.from), wm(&cap.position)) else {
+        return false;
+    };
+    matches!(
+        order_positions(start, &a),
+        CheckpointOrder::Before | CheckpointOrder::Equal
+    ) && matches!(
+        order_positions(&b, end),
+        CheckpointOrder::Before | CheckpointOrder::Equal
+    )
+}
+
+/// A capture whose own interval is proven: [`capture`], then a scan of
+/// `(from, position]` in which nothing affects `db.table` (a DDL naming it, a
+/// database barrier of its database, a lineage barrier). Ordinary writes and
+/// other tables' DDL never cause a retry; only a relevant statement inside the
+/// interval does, up to `attempts` times. Anything the scan cannot prove
+/// (retention, unknown events, limits, another server) fails closed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn capture_proven(
+    dsn: &str,
+    scan_server_id: u64,
+    server_uuid: &str,
+    lineage_hash: &str,
+    db: &str,
+    table: &str,
+    lower_case_table_names: u8,
+    attempts: u32,
+    limits: &ScanLimits,
+    between: Option<BetweenHook<'_>>,
+) -> Result<Captured, ProofError> {
+    for attempt in 1..=attempts.max(1) {
+        let mut cap =
+            capture(dsn, server_uuid, lineage_hash, db, table, between).await?;
+        cap.attempts = attempt;
+        let report = scan_interval(
+            dsn,
+            scan_server_id,
+            server_uuid,
+            lineage_hash,
+            &cap.from,
+            &cap.position,
+            limits,
+        )
+        .await?;
+        let relevant = report.statements.iter().any(|st| {
+            super::mysql_baseline::affects(
+                st,
+                db,
+                table,
+                lower_case_table_names,
+            )
+        });
+        if !relevant {
+            return Ok(cap);
+        }
+        tokio::time::sleep(Duration::from_millis(20 * u64::from(attempt)))
+            .await;
+    }
+    Err(ProofError::Unstable(attempts.max(1)))
 }
 
 #[cfg(test)]
@@ -804,6 +922,7 @@ mod tests {
     /// Live MySQL 8.4 (Docker): one GTID-mode and one file/position server.
     mod live {
         use super::*;
+        use crate::mysql::mysql_schema_loader::read_hook;
         use gate_ownership::GateOwned;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1497,31 +1616,141 @@ mod tests {
             .await;
         }
 
+        type Action = Arc<
+            dyn Fn() -> std::pin::Pin<
+                    Box<dyn std::future::Future<Output = ()> + Send>,
+                > + Send
+                + Sync,
+        >;
+
+        /// Runs `stmts` the first `times` calls, then nothing.
+        fn sql_times(dsn: &str, stmts: Vec<String>, times: u32) -> Action {
+            let (dsn, calls) = (dsn.to_string(), Arc::new(AtomicU32::new(0)));
+            Arc::new(move || {
+                let (dsn, stmts, calls) =
+                    (dsn.clone(), stmts.clone(), calls.clone());
+                Box::pin(async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) < times {
+                        let s: Vec<&str> =
+                            stmts.iter().map(String::as_str).collect();
+                        sql(&dsn, &s).await;
+                    }
+                })
+            })
+        }
+
+        fn limits() -> ScanLimits {
+            ScanLimits {
+                max_duration: Duration::from_secs(20),
+                ..ScanLimits::default()
+            }
+        }
+
+        async fn proven(
+            dsn: &str,
+            db: &str,
+            attempts: u32,
+            between: Option<&Action>,
+        ) -> Result<Captured, ProofError> {
+            let hook = between.map(|a| {
+                let a = a.clone();
+                move || a()
+            });
+            capture_proven(
+                dsn,
+                4_000_140,
+                &uuid(dsn).await,
+                LINEAGE,
+                db,
+                "t",
+                0,
+                attempts,
+                &limits(),
+                hook.as_ref().map(|h| h as BetweenHook<'_>),
+            )
+            .await
+        }
+
+        fn columns(c: &Captured) -> Vec<&str> {
+            c.schema.columns.iter().map(|x| x.name.as_str()).collect()
+        }
+
+        fn strictly_before(a: &MySqlCheckpoint, b: &MySqlCheckpoint) -> bool {
+            order_positions(&wm(a).unwrap(), &wm(b).unwrap())
+                == CheckpointOrder::Before
+        }
+
+        /// Writers committing continuously, until stopped, into the
+        /// captured table and into unrelated tables (same and another
+        /// database).
+        struct Busy {
+            stop: Arc<std::sync::atomic::AtomicBool>,
+            tasks: Vec<tokio::task::JoinHandle<u64>>,
+        }
+
+        impl Busy {
+            async fn start(dsn: &str, db: &str) -> Self {
+                sql(dsn, &[
+                    &format!("CREATE TABLE {db}.busy (id BIGINT AUTO_INCREMENT PRIMARY KEY, v INT)"),
+                    &format!("CREATE DATABASE IF NOT EXISTS {db}_other"),
+                    &format!("CREATE TABLE IF NOT EXISTS {db}_other.busy (id BIGINT AUTO_INCREMENT PRIMARY KEY, v INT)"),
+                ])
+                .await;
+                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let targets = [
+                    format!("INSERT INTO {db}.busy (v) VALUES (1)"),
+                    format!("INSERT INTO {db}_other.busy (v) VALUES (1)"),
+                    // The captured table itself (ids far above the tests').
+                    format!(
+                        "INSERT INTO {db}.t (id, name) SELECT COALESCE(MAX(id), 0) + 1000000, 'w' FROM {db}.t AS x"
+                    ),
+                ];
+                let tasks = targets
+                    .into_iter()
+                    .map(|q| {
+                        let (dsn, stop) = (dsn.to_string(), stop.clone());
+                        tokio::spawn(async move {
+                            let mut c =
+                                mysql_async::Conn::from_url(dsn).await.unwrap();
+                            let mut n = 0;
+                            while !stop.load(Ordering::SeqCst) {
+                                c.query_drop(&q)
+                                    .await
+                                    .unwrap_or_else(|e| panic!("{q}: {e}"));
+                                n += 1;
+                            }
+                            n
+                        })
+                    })
+                    .collect();
+                // Running before the capture starts.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Self { stop, tasks }
+            }
+
+            async fn finish(self) -> u64 {
+                self.stop.store(true, Ordering::SeqCst);
+                let mut total = 0;
+                for t in self.tasks {
+                    total += t.await.unwrap();
+                }
+                total
+            }
+        }
+
         #[tokio::test]
         #[ignore = "requires docker"]
-        async fn a_quiet_server_gives_a_stable_capture() {
+        async fn a_quiet_server_gives_an_empty_capture_interval() {
             for gtid in [true, false] {
                 let dsn = server(gtid).await;
                 let db = if gtid { "cap_quiet_g" } else { "cap_quiet_f" };
                 capture_table(&dsn, db).await;
-                let c = stable_capture(
-                    &dsn,
-                    &uuid(&dsn).await,
-                    LINEAGE,
-                    db,
-                    "t",
-                    3,
-                    None,
-                )
-                .await
-                .unwrap();
+                let c = proven(&dsn, db, 1, None).await.unwrap();
                 assert_eq!(c.attempts, 1);
-                let names: Vec<_> =
-                    c.schema.columns.iter().map(|x| x.name.as_str()).collect();
-                assert_eq!(names, ["id", "name"]);
+                assert_eq!(columns(&c), ["id", "name"]);
                 assert_eq!(c.position.lineage.as_deref(), Some(LINEAGE));
                 assert_eq!(c.position.gtid_set.is_some(), gtid);
-                // The captured position is the server's current one.
+                assert_eq!(c.from, c.position);
                 let now = position(&dsn).await;
                 assert_eq!(
                     (c.position.file, c.position.pos),
@@ -1530,89 +1759,536 @@ mod tests {
             }
         }
 
-        /// A write between the shape read and the second position read makes
-        /// the attempt unstable; once the writes stop, a retry succeeds; if
-        /// they never stop, the bounded retries fail closed.
+        /// The busy-server regression: continuous commits, on the captured
+        /// table and on unrelated ones, never prevent a capture or its proof.
+        /// The positions differ (the server never stands still) and the
+        /// first attempt is accepted.
         #[tokio::test]
         #[ignore = "requires docker"]
-        async fn an_unstable_position_is_retried_then_refused() {
-            let dsn = server(true).await;
-            capture_table(&dsn, "cap_unstable").await;
-            let calls = Arc::new(AtomicU32::new(0));
-            let ids = Arc::new(AtomicU32::new(1000));
-            let writer = |limit: u32| {
-                let (dsn, calls, ids) =
-                    (dsn.clone(), calls.clone(), ids.clone());
-                move || {
-                    let (dsn, calls, ids) =
-                        (dsn.clone(), calls.clone(), ids.clone());
+        async fn ordinary_writes_never_prevent_a_capture() {
+            for gtid in [true, false] {
+                let dsn = server(gtid).await;
+                let db = if gtid { "cap_busy_g" } else { "cap_busy_f" };
+                capture_table(&dsn, db).await;
+                let busy = Busy::start(&dsn, db).await;
+                // And one commit certainly inside each capture interval.
+                let ids = Arc::new(AtomicU32::new(1));
+                let (d, i) = (dsn.clone(), ids.clone());
+                let write: Action = Arc::new(move || {
+                    let (dsn, ids) = (d.clone(), i.clone());
                     Box::pin(async move {
-                        let n = calls.fetch_add(1, Ordering::SeqCst);
-                        if n < limit {
-                            let id = ids.fetch_add(1, Ordering::SeqCst);
-                            sql(&dsn, &[&format!("INSERT INTO cap_unstable.t VALUES ({id}, 'x')")]).await;
-                        }
+                        let id = ids.fetch_add(1, Ordering::SeqCst);
+                        sql(
+                            &dsn,
+                            &[&format!(
+                                "INSERT INTO {db}.t VALUES ({id}, 'x')"
+                            )],
+                        )
+                        .await;
+                    })
+                });
+                for _ in 0..5 {
+                    let c = proven(&dsn, db, 1, Some(&write)).await.unwrap();
+                    assert_eq!(c.attempts, 1);
+                    assert_eq!(columns(&c), ["id", "name"]);
+                    assert!(strictly_before(&c.from, &c.position), "{c:?}");
+                }
+                let hook = {
+                    let w = write.clone();
+                    move || w()
+                };
+                let c = capture(
+                    &dsn,
+                    &uuid(&dsn).await,
+                    LINEAGE,
+                    db,
+                    "t",
+                    Some(&hook),
+                )
+                .await
+                .unwrap();
+                assert!(strictly_before(&c.from, &c.position));
+                assert!(busy.finish().await > 0);
+            }
+        }
+
+        /// DDL of other tables (same database or another) inside the
+        /// capture interval, between any two of its reads, is irrelevant.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn unrelated_ddl_does_not_invalidate_a_capture() {
+            for gtid in [true, false] {
+                let dsn = server(gtid).await;
+                let db = if gtid { "cap_unrel_g" } else { "cap_unrel_f" };
+                capture_table(&dsn, db).await;
+                sql(
+                    &dsn,
+                    &[
+                        &format!("CREATE TABLE {db}.u (id INT PRIMARY KEY)"),
+                        &format!("DROP DATABASE IF EXISTS {db}_o"),
+                        &format!("CREATE DATABASE {db}_o"),
+                        &format!("CREATE TABLE {db}_o.t (id INT PRIMARY KEY)"),
+                    ],
+                )
+                .await;
+                let n = Arc::new(AtomicU32::new(0));
+                let (d, n2) = (dsn.clone(), n.clone());
+                read_hook::set(
+                    db,
+                    Arc::new(move |_| {
+                        let (dsn, n) = (d.clone(), n2.clone());
+                        Box::pin(async move {
+                            let k = n.fetch_add(1, Ordering::SeqCst);
+                            sql(&dsn, &[
+                                &format!("ALTER TABLE {db}.u ADD COLUMN c{k} INT"),
+                                &format!("ALTER TABLE {db}_o.t ADD COLUMN c{k} INT"),
+                                &format!("RENAME TABLE {db}_o.t TO {db}_o.t2, {db}_o.t2 TO {db}_o.t"),
+                            ])
+                            .await;
+                        })
+                    }),
+                );
+                let between = sql_times(
+                    &dsn,
+                    vec![
+                        format!("CREATE TABLE {db}.v (id INT PRIMARY KEY)"),
+                        format!("ALTER DATABASE {db}_o CHARACTER SET utf8mb4"),
+                    ],
+                    1,
+                );
+                let c = proven(&dsn, db, 1, Some(&between)).await;
+                read_hook::clear(db);
+                let c = c.unwrap();
+                assert_eq!(c.attempts, 1);
+                assert_eq!(columns(&c), ["id", "name"]);
+                assert_eq!(n.load(Ordering::SeqCst), 3);
+            }
+        }
+
+        /// The schema read is four separate queries. A DDL of the table or
+        /// its database (an ALTER, a rename swap, an ALTER DATABASE) issued between any two of them, or after
+        /// the last, waits for the capture's lock: the capture reads one
+        /// coherent shape (never one assembled from two versions), the DDL
+        /// lands after its interval, and the next capture reads the new
+        /// shape.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_ddl_between_any_two_reads_waits_for_the_capture() {
+            for gtid in [true, false] {
+                let dsn = server(gtid).await;
+                for step in 1..=4u8 {
+                    for (k, ddl, new_shape) in [
+                        (
+                            "alter",
+                            "ALTER TABLE {db}.t ADD COLUMN c INT",
+                            vec!["id", "name", "c"],
+                        ),
+                        (
+                            "database",
+                            "ALTER DATABASE {db} CHARACTER SET utf8mb4",
+                            vec!["id", "name"],
+                        ),
+                        (
+                            "swap",
+                            "RENAME TABLE {db}.t TO {db}.t_tmp, {db}.t_x TO {db}.t, {db}.t_tmp TO {db}.t_x",
+                            vec!["id", "other"],
+                        ),
+                    ] {
+                        let db = format!(
+                            "cap_rel_{}_{step}_{k}",
+                            if gtid { "g" } else { "f" }
+                        );
+                        let db: &'static str = Box::leak(db.into_boxed_str());
+                        capture_table(&dsn, db).await;
+                        sql(&dsn, &[&format!(
+                            "CREATE TABLE {db}.t_x (id INT PRIMARY KEY, other INT)"
+                        )])
+                        .await;
+                        let ddl = ddl.replace("{db}", db);
+                        let task: Arc<
+                            std::sync::Mutex<
+                                Option<tokio::task::JoinHandle<()>>,
+                            >,
+                        > = Default::default();
+                        let (d, slot) = (dsn.clone(), task.clone());
+                        let issue: Action = Arc::new(move || {
+                            let (dsn, slot, ddl) =
+                                (d.clone(), slot.clone(), ddl.clone());
+                            Box::pin(async move {
+                                let t = tokio::spawn(async move {
+                                    sql(&dsn, &[&ddl]).await;
+                                });
+                                tokio::time::sleep(Duration::from_millis(300))
+                                    .await;
+                                assert!(!t.is_finished(), "the DDL must wait");
+                                *slot.lock().unwrap() = Some(t);
+                            })
+                        });
+                        let between = if step == 4 {
+                            Some(issue)
+                        } else {
+                            read_hook::set(
+                                db,
+                                Arc::new(move |s| {
+                                    let issue = issue.clone();
+                                    Box::pin(async move {
+                                        if s == step {
+                                            issue().await;
+                                        }
+                                    })
+                                }),
+                            );
+                            None
+                        };
+                        let r = proven(&dsn, db, 1, between.as_ref()).await;
+                        read_hook::clear(db);
+                        let c = r.unwrap();
+                        assert_eq!(
+                            columns(&c),
+                            ["id", "name"],
+                            "gtid={gtid} step={step} {k}"
+                        );
+                        let t =
+                            task.lock().unwrap().take().expect("DDL issued");
+                        tokio::time::timeout(Duration::from_secs(10), t)
+                            .await
+                            .expect("the DDL proceeds after the capture")
+                            .unwrap();
+                        assert!(strictly_before(
+                            &c.position,
+                            &position(&dsn).await
+                        ));
+                        let after = proven(&dsn, db, 1, None).await.unwrap();
+                        assert_eq!(
+                            columns(&after),
+                            new_shape,
+                            "gtid={gtid} step={step} {k}"
+                        );
+                    }
+                }
+            }
+        }
+
+        /// Lineage barriers (unattributable statements) that are not DDL of
+        /// the table or its database are not held off by the lock: one inside
+        /// the interval refuses the attempt.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn barriers_in_the_interval_are_detected() {
+            for gtid in [true, false] {
+                let dsn = server(gtid).await;
+                let db = if gtid { "cap_bar_g" } else { "cap_bar_f" };
+                for stmts in [
+                    // A multi-statement body cannot be attributed.
+                    vec![
+                        format!("DROP PROCEDURE IF EXISTS {db}.p"),
+                        format!(
+                            "CREATE PROCEDURE {db}.p() BEGIN SELECT 1; SELECT 2; END"
+                        ),
+                    ],
+                    // A versioned comment cannot be interpreted.
+                    vec![
+                        format!("DROP TABLE IF EXISTS {db}.w"),
+                        format!(
+                            "CREATE TABLE {db}.w (id INT) /*!50100 ENGINE=InnoDB */"
+                        ),
+                    ],
+                ] {
+                    capture_table(&dsn, db).await;
+                    let between = sql_times(&dsn, stmts.clone(), u32::MAX);
+                    let r = proven(&dsn, db, 2, Some(&between)).await;
+                    assert!(
+                        matches!(r, Err(ProofError::Unstable(2))),
+                        "gtid={gtid} {stmts:?}: {r:?}"
+                    );
+                }
+            }
+        }
+
+        /// Whatever the scan of the capture interval cannot prove fails
+        /// closed, never retried into a pass: purged binlogs, a resource
+        /// limit, another server, a missing table.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn an_unprovable_capture_interval_fails_closed() {
+            // Own server: purging must not disturb the other tests.
+            let (_c, port) = start(true).await;
+            let dsn = dsn_of(port);
+            capture_table(&dsn, "cap_fail").await;
+            let purge = {
+                let d = dsn.clone();
+                Arc::new(move || {
+                    let dsn = d.clone();
+                    Box::pin(async move {
+                        sql(
+                            &dsn,
+                            &[
+                                "INSERT INTO cap_fail.t VALUES (1, 'x')",
+                                "FLUSH BINARY LOGS",
+                            ],
+                        )
+                        .await;
+                        let now = position(&dsn).await;
+                        sql(
+                            &dsn,
+                            &[&format!("PURGE BINARY LOGS TO '{}'", now.file)],
+                        )
+                        .await;
                     })
                         as std::pin::Pin<
                             Box<dyn std::future::Future<Output = ()> + Send>,
                         >
-                }
+                }) as Action
             };
-            let disturb_once = writer(1);
-            let c = stable_capture(
+            let r = proven(&dsn, "cap_fail", 3, Some(&purge)).await;
+            assert!(
+                matches!(
+                    r,
+                    Err(ProofError::Open(_)) | Err(ProofError::Read(_))
+                ),
+                "{r:?}"
+            );
+
+            let write = sql_times(
                 &dsn,
+                vec!["INSERT INTO cap_fail.t VALUES (2, 'y'), (3, 'z')".into()],
+                u32::MAX,
+            );
+            let hook = {
+                let w = write.clone();
+                move || w()
+            };
+            let r = capture_proven(
+                &dsn,
+                4_000_141,
                 &uuid(&dsn).await,
                 LINEAGE,
-                "cap_unstable",
+                "cap_fail",
                 "t",
+                0,
                 3,
-                Some(&disturb_once),
-            )
-            .await
-            .unwrap();
-            assert_eq!(c.attempts, 2);
-            calls.store(0, Ordering::SeqCst);
-            let always = writer(u32::MAX);
-            let r = stable_capture(
-                &dsn,
-                &uuid(&dsn).await,
-                LINEAGE,
-                "cap_unstable",
-                "t",
-                3,
-                Some(&always),
+                &ScanLimits {
+                    max_events: 1,
+                    ..limits()
+                },
+                Some(&hook),
             )
             .await;
-            assert!(matches!(r, Err(ProofError::Unstable(3))), "{r:?}");
-        }
+            assert!(matches!(r, Err(ProofError::Limit(_))), "{r:?}");
 
-        #[tokio::test]
-        #[ignore = "requires docker"]
-        async fn capture_refuses_another_server_or_a_missing_table() {
-            let dsn = server(true).await;
-            capture_table(&dsn, "cap_refuse").await;
-            let r = stable_capture(
+            let r = capture(
                 &dsn,
                 "00000000-1111-2222-3333-444444444444",
                 LINEAGE,
-                "cap_refuse",
+                "cap_fail",
                 "t",
-                3,
                 None,
             )
             .await;
             assert!(matches!(r, Err(ProofError::OtherServer(_))), "{r:?}");
-            let r = stable_capture(
+            let r = capture(
                 &dsn,
                 &uuid(&dsn).await,
                 LINEAGE,
-                "cap_refuse",
+                "cap_fail",
                 "missing",
-                3,
                 None,
             )
             .await;
             assert!(matches!(r, Err(ProofError::Capture(_))), "{r:?}");
+        }
+
+        async fn live_columns(dsn: &str, db: &str) -> u64 {
+            let mut c = mysql_async::Conn::from_url(dsn).await.unwrap();
+            let n: u64 = c
+                .query_first(format!(
+                    "SELECT COUNT(*) FROM information_schema.COLUMNS \
+                     WHERE TABLE_SCHEMA = '{db}' AND TABLE_NAME = 't'"
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            c.disconnect().await.ok();
+            n
+        }
+
+        /// While the capture runs, its connection holds the table's
+        /// SHARED_READ metadata lock for the transaction: inserts and
+        /// updates of the table proceed, a DDL of the table waits until the
+        /// capture ends and lands after its interval.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn the_capture_lock_admits_writes_and_holds_off_ddl() {
+            for gtid in [true, false] {
+                let dsn = server(gtid).await;
+                let db = if gtid { "cap_lock_g" } else { "cap_lock_f" };
+                capture_table(&dsn, db).await;
+                sql(&dsn, &[&format!("INSERT INTO {db}.t VALUES (1, 'a')")])
+                    .await;
+                let alter: Arc<
+                    std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+                > = Default::default();
+                let (d, slot) = (dsn.clone(), alter.clone());
+                let hook = move || {
+                    let (dsn, slot) = (d.clone(), slot.clone());
+                    Box::pin(async move {
+                        let mut c =
+                            mysql_async::Conn::from_url(&dsn).await.unwrap();
+                        let held: Option<String> = c
+                            .query_first(format!(
+                                "SELECT CONCAT(LOCK_TYPE, '/', LOCK_DURATION, '/', LOCK_STATUS) \
+                                 FROM performance_schema.metadata_locks \
+                                 WHERE OBJECT_TYPE = 'TABLE' AND OBJECT_SCHEMA = '{db}' \
+                                 AND OBJECT_NAME = 't'"
+                            ))
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            held.as_deref(),
+                            Some("SHARED_READ/TRANSACTION/GRANTED")
+                        );
+                        // Writes to the table are not held off.
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            c.query_drop(format!(
+                                "INSERT INTO {db}.t VALUES (2, 'b')"
+                            ))
+                            .await
+                            .unwrap();
+                            c.query_drop(format!(
+                                "UPDATE {db}.t SET name = 'u' WHERE id = 1"
+                            ))
+                            .await
+                            .unwrap();
+                        })
+                        .await
+                        .expect("DML proceeds under the capture lock");
+                        c.disconnect().await.ok();
+                        // A DDL of the table waits for the lock.
+                        let task = tokio::spawn(async move {
+                            sql(
+                                &dsn,
+                                &[&format!(
+                                    "ALTER TABLE {db}.t ADD COLUMN c INT"
+                                )],
+                            )
+                            .await;
+                        });
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        assert!(!task.is_finished(), "the DDL must wait");
+                        *slot.lock().unwrap() = Some(task);
+                    })
+                        as std::pin::Pin<
+                            Box<dyn std::future::Future<Output = ()> + Send>,
+                        >
+                };
+                let c = capture(
+                    &dsn,
+                    &uuid(&dsn).await,
+                    LINEAGE,
+                    db,
+                    "t",
+                    Some(&hook),
+                )
+                .await
+                .unwrap();
+                assert_eq!(columns(&c), ["id", "name"]);
+                let task = alter.lock().unwrap().take().unwrap();
+                tokio::time::timeout(Duration::from_secs(10), task)
+                    .await
+                    .expect("the DDL proceeds once the capture ends")
+                    .unwrap();
+                assert!(strictly_before(&c.position, &position(&dsn).await));
+                // The DDL is after the interval: the capture's own proof holds.
+                let r = scan(&dsn, &c.from, &c.position).await.unwrap();
+                assert!(affected(&r).iter().all(|a| a != &format!("{db}.t")));
+            }
+        }
+
+        /// The adversarial window: a DDL of the table whose binlog event is
+        /// already written (the binlog position includes it) while its
+        /// dictionary change is not yet visible (the group commit holds it
+        /// before the engine commit). A capture then must not read the prior
+        /// shape as if valid at that position: it waits for the DDL and reads
+        /// the new shape.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_ddl_in_the_binlog_but_not_yet_visible_is_never_captured_stale()
+         {
+            for gtid in [false, true] {
+                // Own server: the commit delay is global.
+                let (_c, port) = start(gtid).await;
+                let dsn = dsn_of(port);
+                let db = "cap_window";
+                capture_table(&dsn, db).await;
+                let before = position(&dsn).await;
+                sql(
+                    &dsn,
+                    &["SET GLOBAL binlog_group_commit_sync_delay = 1000000"],
+                )
+                .await;
+                let d = dsn.clone();
+                let alter = tokio::spawn(async move {
+                    sql(&d, &[&format!("ALTER TABLE {db}.t ADD COLUMN c INT")])
+                        .await;
+                });
+                // The window: the binlog position already includes the DDL,
+                // the catalog still shows the prior shape.
+                let deadline =
+                    std::time::Instant::now() + Duration::from_millis(800);
+                let mut seen = false;
+                while std::time::Instant::now() < deadline {
+                    let now = position(&dsn).await;
+                    if (now.file.as_str(), now.pos)
+                        != (before.file.as_str(), before.pos)
+                        && live_columns(&dsn, db).await == 2
+                    {
+                        seen = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(seen, "gtid={gtid}: the window was not reproduced");
+                let c = proven(&dsn, db, 3, None).await;
+                sql(&dsn, &["SET GLOBAL binlog_group_commit_sync_delay = 0"])
+                    .await;
+                alter.await.unwrap();
+                let c = c.unwrap();
+                assert_eq!(columns(&c), ["id", "name", "c"], "gtid={gtid}");
+            }
+        }
+
+        /// A covering scan must contain the whole capture interval.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn covers_requires_the_whole_capture_interval() {
+            let dsn = server(true).await;
+            capture_table(&dsn, "cap_cover").await;
+            let before = wm(&position(&dsn).await).unwrap();
+            let write = sql_times(
+                &dsn,
+                vec!["INSERT INTO cap_cover.t VALUES (1, 'x')".into()],
+                1,
+            );
+            let hook = {
+                let w = write.clone();
+                move || w()
+            };
+            let c = capture(
+                &dsn,
+                &uuid(&dsn).await,
+                LINEAGE,
+                "cap_cover",
+                "t",
+                Some(&hook),
+            )
+            .await
+            .unwrap();
+            let (a, b) = (wm(&c.from).unwrap(), wm(&c.position).unwrap());
+            assert!(covers(&c, &before, &b));
+            assert!(covers(&c, &a, &b));
+            // Starting inside the interval, or ending before its end.
+            assert!(!covers(&c, &b, &b));
+            assert!(!covers(&c, &before, &a));
         }
     }
 }
