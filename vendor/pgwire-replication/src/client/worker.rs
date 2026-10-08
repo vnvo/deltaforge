@@ -248,7 +248,13 @@ impl WorkerState {
             ("database", self.cfg.database.as_str()),
             ("replication", "database"),
             ("client_encoding", "UTF8"),
-            ("application_name", "pgwire-replication"),
+            (
+                "application_name",
+                self.cfg
+                    .application_name
+                    .as_deref()
+                    .unwrap_or("pgwire-replication"),
+            ),
         ];
         write_startup_message(stream, 196608, &params).await
     }

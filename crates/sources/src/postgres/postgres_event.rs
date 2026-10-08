@@ -556,6 +556,135 @@ async fn handle_relation(
             .await;
     }
 
+    // Capture-time catalog work, proven against this stream at this
+    // transaction's position: the generated-column guard and the annotation.
+    catalog_on_relation(ctx, relation_id)
+        .await
+        .map_err(LoopControl::Fail)?;
+
+    Ok(())
+}
+
+/// One proven stamp per Relation; a locked capture only when the stamp's
+/// canonical inputs changed since the table's last capture this run.
+async fn catalog_on_relation(
+    ctx: &mut RunCtx,
+    relation_id: u32,
+) -> SourceResult<()> {
+    use super::postgres_catalog_capture as cc;
+    let relation = &ctx.relation_map[&relation_id];
+    let (schema, table) = (relation.schema.clone(), relation.table.clone());
+    let binding_digest = relation.projection.digest();
+    let qualified = format!("{schema}.{table}");
+    let token = ctx
+        .stream_token
+        .read()
+        .expect("not poisoned")
+        .clone()
+        .ok_or_else(|| {
+            crate::incident_drafts::catalog_visibility_unproven(
+                &ctx.source_id,
+                "-",
+                "-",
+                "no_stream_token",
+            )
+        })?;
+    let target = ctx
+        .current_final_lsn
+        .as_deref()
+        .and_then(|l| Lsn::parse(l).ok())
+        .ok_or_else(|| {
+            SourceError::Other(anyhow::anyhow!(
+                "Relation of {qualified} outside a transaction"
+            ))
+        })?;
+    let key = (schema.clone(), table.clone());
+    let cc::Read::Found { attributes, .. } = cc::stamp(
+        &mut ctx.catalog,
+        &ctx.source_id,
+        &token,
+        target,
+        &schema,
+        &table,
+    )
+    .await?
+    else {
+        // Dropped since (retained WAL): nothing to capture, the rows decode
+        // from their Relation.
+        return Ok(());
+    };
+    if ctx.catalog_digests.get(&key) == Some(&attributes.digest()) {
+        return Ok(());
+    }
+    let cc::Read::Found {
+        attributes,
+        captured_lsn,
+    } = cc::capture(
+        &mut ctx.catalog,
+        &ctx.source_id,
+        &token,
+        target,
+        &schema,
+        &table,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let generated = attributes.generated_columns();
+    if !generated.is_empty() {
+        return Err(crate::incident_drafts::table_unsupported(
+            &ctx.source_id,
+            &qualified,
+            "stored_generated_column",
+            format!(
+                "table {qualified} has stored generated column(s) {}: \
+                 unsupported (pgoutput does not publish them); exclude the \
+                 table or drop the generation",
+                generated.join(", ")
+            ),
+        ));
+    }
+    let scope = ctx.schema.current_scope()?;
+    let incidents = storage::adapters::incidents::IncidentStore::new(
+        Arc::clone(&ctx.registry_backend),
+        &ctx.pipeline,
+    );
+    match cc::record_annotation(
+        &ctx.registry_backend,
+        &scope.key(&schema, &table),
+        &binding_digest,
+        &attributes,
+        captured_lsn,
+    )
+    .await
+    {
+        Ok(_) => {
+            let component = deltaforge_core::incident::Component::Source {
+                id: ctx.source_id.clone(),
+            };
+            let _ = incidents
+                .resolve_matching(
+                    deltaforge_core::incident::ReasonCode::PgAnnotationUnavailable,
+                    &component,
+                    Some(&deltaforge_core::incident::scope_key(
+                        &component, &qualified,
+                    )),
+                    storage::adapters::incidents::ANNOTATION_RECORDED,
+                )
+                .await;
+        }
+        Err(e) => {
+            warn!(table = %qualified, error = %e, "annotation not recorded; rows unaffected");
+            let draft = crate::incident_drafts::annotation_unavailable(
+                &ctx.source_id,
+                &qualified,
+                "write_failed",
+            );
+            let _ = incidents.raise(&draft, 1).await;
+        }
+    }
+    ctx.catalog_digests.insert(key, attributes.digest());
     Ok(())
 }
 

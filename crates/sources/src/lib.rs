@@ -43,6 +43,7 @@ pub struct SnapshotShared {
 
 /// [`SnapshotShared`], shared by a source and its clones.
 pub type SnapshotCohortSlot = std::sync::Arc<std::sync::Mutex<SnapshotShared>>;
+pub mod catalog_probe;
 pub mod snapshot_queue;
 pub mod snapshot_recovery;
 pub mod stream_probe;

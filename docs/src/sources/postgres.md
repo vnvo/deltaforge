@@ -41,6 +41,20 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO deltaforge;
 -- yourself (see "Replication Slot and Publication" below).
 ```
 
+The same role reads the catalog for capture-time annotations and checks.
+Each such read first proves, in its own snapshot, that it reaches the node
+and the live walsender serving the stream: it reads `pg_replication_slots`,
+`pg_stat_activity` (the walsender's row; visible to the same role, otherwise
+grant `pg_read_all_stats`) and `pg_control_system()`. A capture takes the
+table's `ACCESS SHARE` lock (granted by `SELECT` on the table) for a few
+milliseconds: inserts, updates and deletes are not blocked, DDL on that table
+waits until the capture ends.
+
+**Unsupported:** a tracked table with a stored generated column
+(`GENERATED ALWAYS AS ... STORED`) stops the source before its next row
+(`pg_table_unsupported`): pgoutput does not publish generated columns.
+Exclude the table or drop the generation.
+
 ### pg_hba.conf
 
 Ensure your `pg_hba.conf` allows replication connections:

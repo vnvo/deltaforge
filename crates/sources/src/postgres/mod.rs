@@ -52,6 +52,7 @@ use postgres_slot_owner::prepare_snapshot_slot_anchor;
 pub mod postgres_object;
 
 mod postgres_builtin_types;
+mod postgres_catalog_capture;
 pub mod postgres_event_schema;
 mod postgres_relation_binding;
 mod postgres_schema_loader;
@@ -390,6 +391,14 @@ pub(crate) struct RunCtx {
     /// That stamp as checkpoint JSON members, refreshed whenever another
     /// stream becomes authoritative (before its first event is read).
     pub stamp_members: Arc<str>,
+    /// The authoritative stream's walsender token, for catalog proofs.
+    pub(crate) stream_token:
+        Arc<std::sync::RwLock<Option<postgres_helpers::StreamToken>>>,
+    /// The catalog session (every read on it carries its own proof).
+    pub(crate) catalog: postgres_catalog_capture::CatalogSession,
+    /// Per table seen this run: the digest of its last captured catalog
+    /// inputs (a changed stamp triggers a locked capture).
+    pub(crate) catalog_digests: HashMap<(String, String), String>,
 }
 
 impl RunCtx {
@@ -1659,6 +1668,7 @@ impl PostgresSource {
             active: Default::default(),
             recovery_window: REACHABILITY_RETRY_WINDOW,
             recovery_retry: Default::default(),
+            token: Default::default(),
         };
 
         let client = connect_replication_with_retries(
@@ -1715,7 +1725,12 @@ impl PostgresSource {
             ),
             cached_lsn: None,
             stamp: Arc::clone(&stream_proof.active),
+            stream_token: Arc::clone(&stream_proof.token),
             stamp_members: Arc::from(""),
+            catalog: postgres_catalog_capture::CatalogSession::new(
+                self.dsn.clone(),
+            ),
+            catalog_digests: HashMap::new(),
         };
         ctx.refresh_stamp();
 

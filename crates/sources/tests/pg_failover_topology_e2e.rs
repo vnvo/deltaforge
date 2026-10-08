@@ -1220,3 +1220,166 @@ async fn a_timeline_is_adopted_for_checkpoints_that_predate_continuity()
     assert_eq!(after["transition_id"], 0, "no further transition");
     Ok(())
 }
+
+// ============================================================================
+// Catalog visibility (design section 8): the catalog session must reach the
+// node and walsender that produce the stream
+// ============================================================================
+
+/// A failover endpoint that sends replication sessions and ordinary
+/// sessions (the source's catalog connection) to separately switchable
+/// servers, by the startup packet's `replication` parameter.
+struct SplitProxy {
+    port: u16,
+    other: Arc<AtomicU16>,
+}
+
+impl SplitProxy {
+    async fn start(replication_to: u16, other_to: u16) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let other = Arc::new(AtomicU16::new(other_to));
+        let o = other.clone();
+        tokio::spawn(async move {
+            while let Ok((mut client, _)) = l.accept().await {
+                let o = o.clone();
+                tokio::spawn(async move {
+                    let mut head = [0u8; 8];
+                    if client.read_exact(&mut head).await.is_err() {
+                        return;
+                    }
+                    // SSLRequest: decline, read the real startup packet.
+                    if u32::from_be_bytes(head[4..8].try_into().unwrap())
+                        == 80_877_103
+                    {
+                        if client.write_all(b"N").await.is_err()
+                            || client.read_exact(&mut head).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                    let len = u32::from_be_bytes(head[0..4].try_into().unwrap())
+                        as usize;
+                    let mut rest = vec![0u8; len.saturating_sub(8)];
+                    if client.read_exact(&mut rest).await.is_err() {
+                        return;
+                    }
+                    let parts: Vec<&[u8]> = rest.split(|b| *b == 0).collect();
+                    let replication = parts
+                        .windows(2)
+                        .any(|w| w[0] == b"replication" && w[1] != b"false");
+                    let to = if replication {
+                        replication_to
+                    } else {
+                        o.load(Ordering::SeqCst)
+                    };
+                    let Ok(mut server) =
+                        tokio::net::TcpStream::connect(("127.0.0.1", to)).await
+                    else {
+                        return;
+                    };
+                    if server.write_all(&head).await.is_err()
+                        || server.write_all(&rest).await.is_err()
+                    {
+                        return;
+                    }
+                    let _ =
+                        tokio::io::copy_bidirectional(&mut client, &mut server)
+                            .await;
+                });
+            }
+        });
+        Self { port, other }
+    }
+
+    fn route_catalog_to(&self, to: u16) {
+        self.other.store(to, Ordering::SeqCst);
+    }
+}
+
+async fn cdc_source(port: u16, d: &Durable) -> PostgresSource {
+    let mut s = source(
+        &Proxy {
+            port,
+            to: Arc::new(AtomicU16::new(0)),
+        },
+        d,
+    )
+    .await;
+    s.snapshot_cfg = SnapshotCfg {
+        mode: SnapshotMode::Never,
+        ..Default::default()
+    };
+    s
+}
+
+/// V1: with the stream on the primary and the catalog connection routed to
+/// the physical standby (in recovery, behind), no catalog fact is used: the
+/// source fails closed before the row.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn a_catalog_session_on_a_standby_is_refused() -> Result<()> {
+    init_test_tracing();
+    let t = start_topology("17").await;
+    create_schema(t.primary_port).await;
+    wait_replayed(&t).await;
+    let proxy = SplitProxy::start(t.primary_port, t.primary_port).await;
+    let d = Durable::new();
+    let src = cdc_source(proxy.port, &d).await;
+    let (tx, mut rx) = test_common::acked_channel(&src, &d.ckpt, &src.id, 256);
+    let handle = src.run(tx, Arc::clone(&d.ckpt)).await;
+    sleep(Duration::from_secs(4)).await;
+    proxy.route_catalog_to(t.standby_port);
+    insert(t.primary_port, 1).await;
+    let got =
+        collect(&mut rx, Duration::from_secs(60), |ids| ids.contains(&1)).await;
+    assert!(got.is_empty(), "no row without a proven catalog: {got:?}");
+    let ended = timeout(Duration::from_secs(60), handle.join)
+        .await
+        .expect("the source stops")
+        .expect("task");
+    let msg = format!("{:#}", ended.expect_err("fails closed"));
+    assert!(
+        msg.contains("server_in_recovery") || msg.contains("slot_not_held"),
+        "{msg}"
+    );
+    drop(t.standby);
+    Ok(())
+}
+
+/// V3: a promoted node of the same cluster (same system identifier and
+/// database) that does not hold the stream's slot is refused; once the
+/// catalog connection is routed to the streaming node, the row flows.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn a_catalog_endpoint_on_another_node_is_refused_until_routed()
+-> Result<()> {
+    init_test_tracing();
+    let t = start_topology("17").await;
+    create_schema(t.primary_port).await;
+    wait_replayed(&t).await;
+    promote(t.standby_port).await;
+    let proxy = SplitProxy::start(t.primary_port, t.primary_port).await;
+    let d = Durable::new();
+    let src = cdc_source(proxy.port, &d).await;
+    let (tx, mut rx) = test_common::acked_channel(&src, &d.ckpt, &src.id, 256);
+    let handle = src.run(tx, Arc::clone(&d.ckpt)).await;
+    sleep(Duration::from_secs(4)).await;
+    proxy.route_catalog_to(t.standby_port);
+    insert(t.primary_port, 1).await;
+    let early =
+        collect(&mut rx, Duration::from_secs(6), |ids| ids.contains(&1)).await;
+    assert!(
+        early.is_empty(),
+        "refused while routed elsewhere: {early:?}"
+    );
+    proxy.route_catalog_to(t.primary_port);
+    let got =
+        collect(&mut rx, Duration::from_secs(40), |ids| ids.contains(&1)).await;
+    assert_eq!(got, vec![1], "the row flows once the proof holds");
+    handle.stop();
+    handle.join().await.ok();
+    drop(t.standby);
+    Ok(())
+}

@@ -4543,6 +4543,228 @@ mod event_schema_identity {
         Ok(())
     }
 
+    const ANNOTATION_NS: &str = "schemas.v1.pg.catalog_annotation";
+
+    impl Es {
+        /// Like `run`, but each phase's writes start only after the
+        /// previous phase's row arrived.
+        async fn run_phases(
+            &self,
+            policy: OnSchemaDrift,
+            phases: &[(&[&str], i32)],
+        ) -> (Vec<Event>, std::result::Result<(), anyhow::Error>) {
+            let src = configured_source(
+                &self.id,
+                &self.db,
+                &format!("slot_{}", self.id),
+                &format!("pub_{}", self.id),
+                policy,
+                self.registry.clone(),
+                self.backend.clone(),
+            )
+            .await;
+            let (tx, mut rx) =
+                test_common::acked_channel(&src, &self.ckpt, &src.id, 128);
+            let h = src.run(tx, self.ckpt.clone()).await;
+            sleep(Duration::from_secs(3)).await;
+            let mut events = Vec::new();
+            for (writes, until) in phases {
+                self.sql(writes).await.unwrap();
+                events.extend(
+                    collect_until(&mut rx, Duration::from_secs(12), |e| {
+                        e.iter().any(|x| has_id(x, *until))
+                    })
+                    .await,
+                );
+            }
+            events.extend(
+                drain_items(&mut rx, Duration::from_millis(500))
+                    .await
+                    .into_iter()
+                    .filter_map(|i| match i {
+                        SourceItem::Event(e) => Some(e),
+                        _ => None,
+                    }),
+            );
+            h.stop();
+            let ended = h.join().await.map(|_| ());
+            (events, ended)
+        }
+
+        async fn annotations(&self) -> Result<Vec<Value>> {
+            Ok(self
+                .backend
+                .log_list(ANNOTATION_NS, &self.key().await?.backend_key())
+                .await?
+                .into_iter()
+                .map(|(_, b)| serde_json::from_slice(&b).unwrap())
+                .collect())
+        }
+
+        async fn incidents(
+            &self,
+            reason: deltaforge_core::incident::ReasonCode,
+        ) -> Result<Vec<storage::adapters::incidents::IncidentRecord>> {
+            Ok(storage::adapters::incidents::IncidentStore::new(
+                self.backend.clone(),
+                "test",
+            )
+            .list()
+            .await?
+            .into_iter()
+            .filter(|r| r.reason_code == reason)
+            .collect())
+        }
+    }
+
+    /// P9: one annotation per catalog content, never one per restart; it is
+    /// labelled capture-time with the position read under the proof.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn annotations_are_capture_time_and_deduplicated() -> Result<()> {
+        let es = Es::new("esann", &[ORDERS]).await?;
+        let _ = es
+            .run(
+                OnSchemaDrift::Halt,
+                &["INSERT INTO orders VALUES (1, 'a')"],
+                1,
+            )
+            .await;
+        let _ = es
+            .run(
+                OnSchemaDrift::Halt,
+                &["INSERT INTO orders VALUES (2, 'b')"],
+                2,
+            )
+            .await;
+        let a = es.annotations().await?;
+        assert_eq!(a.len(), 1, "no new annotation for a restart: {a:?}");
+        assert_eq!(a[0]["provenance"], "catalog_at_capture");
+        assert!(a[0]["captured_lsn"].as_str().unwrap().contains('/'));
+        assert_eq!(a[0]["attributes"]["primary_key"][0], "id");
+        // A catalog-only change (NOT NULL) adds one annotation and no new
+        // event schema version.
+        let (ev, _) = es
+            .run(
+                OnSchemaDrift::Halt,
+                &[
+                    "ALTER TABLE orders ALTER COLUMN sku SET NOT NULL",
+                    "INSERT INTO orders VALUES (3, 'c')",
+                ],
+                3,
+            )
+            .await;
+        assert!(ev.iter().any(|e| has_id(e, 3)), "not drift");
+        let a = es.annotations().await?;
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[1]["attributes"]["columns"][1]["not_null"], true);
+        assert_eq!(es.versions().await?.len(), 1, "content unchanged");
+        es.done().await;
+        Ok(())
+    }
+
+    /// P9: an annotation write failure never blocks rows; it raises the
+    /// running-degraded incident, resolved once a later write succeeds.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn an_annotation_failure_is_degraded_then_resolved() -> Result<()> {
+        use deltaforge_core::incident::{ReasonCode, SafetyState};
+        let fault = Arc::new(FaultBackend::wrap(make_storage_backend().await));
+        let backend: storage::ArcStorageBackend = fault.clone();
+        let es = Es::over("esannfail", &[ORDERS], backend).await?;
+        fault
+            .fail_writes_to
+            .lock()
+            .unwrap()
+            .push(ANNOTATION_NS.into());
+        let (ev, ended) = es
+            .run(
+                OnSchemaDrift::Halt,
+                &["INSERT INTO orders VALUES (1, 'a')"],
+                1,
+            )
+            .await;
+        assert!(ended.is_ok(), "{ended:?}");
+        assert!(ev.iter().any(|e| has_id(e, 1)), "rows unaffected");
+        let open = es.incidents(ReasonCode::PgAnnotationUnavailable).await?;
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].safety_state, SafetyState::RunningDegraded);
+        assert!(!open[0].status.is_resolved());
+        fault.fail_writes_to.lock().unwrap().clear();
+        let _ = es
+            .run(
+                OnSchemaDrift::Halt,
+                &["INSERT INTO orders VALUES (2, 'b')"],
+                2,
+            )
+            .await;
+        let after = es.incidents(ReasonCode::PgAnnotationUnavailable).await?;
+        assert!(after.iter().all(|r| r.status.is_resolved()), "{after:?}");
+        assert_eq!(es.annotations().await?.len(), 1);
+        es.done().await;
+        Ok(())
+    }
+
+    /// P10: steady DML costs no catalog work: one stamp per Relation and one
+    /// locked capture; stats-only re-sends (ANALYZE, VACUUM) cost a stamp,
+    /// never a capture.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn steady_dml_causes_no_catalog_captures() -> Result<()> {
+        let es = Es::new("essteady", &[ORDERS]).await?;
+        sources::catalog_probe::reset();
+        let mut writes: Vec<String> = (1..=300)
+            .map(|i| format!("INSERT INTO orders VALUES ({i}, 'x')"))
+            .collect();
+        writes.push("ANALYZE orders".into());
+        writes.push("VACUUM orders".into());
+        writes.push("INSERT INTO orders VALUES (1000, 'y')".into());
+        let w: Vec<&str> = writes.iter().map(String::as_str).collect();
+        let (ev, ended) = es.run(OnSchemaDrift::Halt, &w, 1000).await;
+        assert!(ended.is_ok(), "{ended:?}");
+        assert!(ev.iter().any(|e| has_id(e, 1000)));
+        let (stamps, captures) = sources::catalog_probe::counts();
+        assert_eq!(captures, 1, "one locked capture for 301 transactions");
+        assert!(
+            (1..=3).contains(&stamps),
+            "one stamp per Relation (first, plus stats re-sends): {stamps}"
+        );
+        es.done().await;
+        Ok(())
+    }
+
+    /// P11 (generated column): added after startup, the table is refused
+    /// before its next row; nothing after it is emitted.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn a_generated_column_added_mid_stream_is_refused() -> Result<()> {
+        use deltaforge_core::incident::ReasonCode;
+        let es = Es::new("esgen", &[ORDERS]).await?;
+        let (ev, ended) = es
+            .run_phases(
+                OnSchemaDrift::Adapt,
+                &[
+                    (&["INSERT INTO orders VALUES (1, 'a')"], 1),
+                    (
+                        &[
+                            "ALTER TABLE orders ADD COLUMN twice INT \
+                             GENERATED ALWAYS AS (id * 2) STORED",
+                            "INSERT INTO orders VALUES (2, 'b')",
+                        ],
+                        2,
+                    ),
+                ],
+            )
+            .await;
+        assert!(ev.iter().any(|e| has_id(e, 1)));
+        assert!(!ev.iter().any(|e| has_id(e, 2)), "refused before row 2");
+        let msg = format!("{:#}", ended.expect_err("refused"));
+        assert!(msg.contains("generated"), "{msg}");
+        let _ = ReasonCode::PgTableUnsupported;
+        es.done().await;
+        Ok(())
+    }
+
     async fn schema_key(
         client: &tokio_postgres::Client,
         id: &str,
