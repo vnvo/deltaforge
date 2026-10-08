@@ -51,6 +51,9 @@ use postgres_slot_owner::prepare_snapshot_slot_anchor;
 
 pub mod postgres_object;
 
+mod postgres_builtin_types;
+pub mod postgres_event_schema;
+mod postgres_relation_binding;
 mod postgres_schema_loader;
 pub use postgres_schema_loader::{LoadedSchema, PostgresSchemaLoader};
 
@@ -1540,7 +1543,7 @@ impl PostgresSource {
                     }
                     Err(LoopControl::ReloadSchema { .. }) => continue,
                     // The ensure/startup path does not decode Relation messages,
-                    // so drift cannot originate here; reload-and-retry defensively.
+                    // so drift cannot originate here; retry defensively.
                     Err(LoopControl::SchemaDrift(_)) => continue,
                 }
             }
@@ -1844,12 +1847,14 @@ impl PostgresSource {
                     }
                 }
                 Err(LoopControl::SchemaDrift(drift)) => {
-                    // Apply the policy, failing closed on a reload error under
-                    // Adapt or on Halt. The drift Relation precedes the
-                    // transaction's rows, so failing here leaves the open
-                    // transaction uncommitted (the coordinator discards it, no
-                    // sink checkpoint advances past the last committed pre-drift
-                    // transaction) and skips the graceful-stop checkpoint put.
+                    // Apply the policy. Halt fails closed: the drift Relation
+                    // precedes the transaction's rows, so the open transaction
+                    // stays uncommitted (the coordinator discards it, no sink
+                    // checkpoint advances past the last committed pre-drift
+                    // transaction) and the graceful-stop checkpoint put is
+                    // skipped. Adapt continues: the changed table's next row
+                    // binds its new Relation (version, then binding, durable)
+                    // before it is emitted.
                     apply_schema_drift(
                         &ctx.schema,
                         &self.on_schema_drift,
@@ -3294,13 +3299,12 @@ async fn check_identity_post_reconnect(ctx: &mut RunCtx) -> SourceResult<()> {
     Ok(())
 }
 
-/// Apply the configured `on_schema_drift` policy to a detected drift, failing
-/// closed. Under Adapt, reload the table's schema and continue only if the reload
-/// succeeds - a reload failure fails closed rather than proceeding to the first
-/// changed row with an unverified schema. Under Halt, return a typed, actionable
-/// error naming the table, the change, and the remediation. In both error cases
-/// the caller returns before emitting any post-drift row or advancing the
-/// checkpoint.
+/// Apply the configured `on_schema_drift` policy to a detected drift. Under
+/// Adapt, accept it without reading the catalog: the table's next row binds
+/// the new Relation's event schema (registered, verified, bound durably)
+/// before it is emitted. Under Halt, return a typed, actionable error naming
+/// the table, the change and the remediation; the caller returns before
+/// emitting any post-drift row or advancing the checkpoint.
 pub(crate) async fn apply_schema_drift(
     loader: &PostgresSchemaLoader,
     policy: &OnSchemaDrift,
@@ -3309,20 +3313,14 @@ pub(crate) async fn apply_schema_drift(
 ) -> SourceResult<()> {
     match policy {
         OnSchemaDrift::Adapt => {
+            // The changed table's next rows resolve their event schema from
+            // the new Relation (R, V, B); no catalog read is needed or
+            // trusted. Forget its capture-time catalog entry.
             info!(
                 schema = %drift.schema, table = %drift.table, change = %drift.detail,
-                "schema drift; reloading (on_schema_drift=adapt)"
+                "schema drift accepted (on_schema_drift=adapt)"
             );
-            loader
-                .reload_schema(&drift.schema, &drift.table)
-                .await
-                .map_err(|e| {
-                    error!(
-                        schema = %drift.schema, table = %drift.table, error = %e,
-                        "schema reload failed under on_schema_drift=adapt; failing closed"
-                    );
-                    e
-                })?;
+            loader.forget(&drift.schema, &drift.table).await;
             Ok(())
         }
         OnSchemaDrift::Halt => {
@@ -3750,17 +3748,13 @@ mod schema_drift_policy_tests {
     }
 
     #[tokio::test]
-    async fn adapt_fails_closed_when_reload_fails() {
-        // Unreachable DSN: reload_schema -> load_schema -> connect fails, so Adapt
-        // must NOT continue - it fails closed instead of proceeding with an
-        // unverified schema.
+    async fn adapt_accepts_without_a_catalog_read() {
+        // Unreachable DSN: Adapt never reads the catalog. The changed table's
+        // event schema comes from its new Relation at the next row.
         let l = loader("host=127.0.0.1 port=1 dbname=x").await;
-        let r = apply_schema_drift(&l, &OnSchemaDrift::Adapt, &drift(), "src")
-            .await;
-        assert!(
-            r.is_err(),
-            "adapt must fail closed when the schema reload fails"
-        );
+        apply_schema_drift(&l, &OnSchemaDrift::Adapt, &drift(), "src")
+            .await
+            .expect("adapt accepts the drift");
     }
 }
 

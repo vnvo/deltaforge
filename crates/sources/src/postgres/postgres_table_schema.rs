@@ -166,7 +166,7 @@ impl PostgresTableSchema {
 
     /// The stored replica identity as a pgoutput identity char (`d`/`n`/`f`/`i`), or
     /// `None` when it was not recorded (older schema) or is unrecognized.
-    fn replica_identity_char(&self) -> Option<char> {
+    pub(crate) fn replica_identity_char(&self) -> Option<char> {
         match self.replica_identity.as_deref() {
             Some("default") => Some('d'),
             Some("nothing") => Some('n'),
@@ -175,116 +175,6 @@ impl PostgresTableSchema {
             _ => None,
         }
     }
-
-    /// Whether this persisted schema version is a safe match for a retained pgoutput
-    /// relation, binding the **relation lifetime** (table OID), the ordered
-    /// `(name, type_oid)` structural signature, and the replica identity. All three must
-    /// be known and equal; a missing/unverifiable field is not a match (fail-closed).
-    ///
-    /// The OID binds a specific relation lifetime (a dropped-and-recreated table gets a
-    /// new OID), and, within a cluster, a specific database's relation - so historical
-    /// versions of other relations, other lifetimes, or a same-named table in a different
-    /// database do not match. Callers additionally require a *unique* match across the
-    /// table's version history, failing closed on zero or multiple candidates.
-    pub(crate) fn matches_relation(&self, rel: &RelationIdentity) -> bool {
-        // Allocation-free (runs on the per-row cache-hit path): compare OID, replica
-        // identity, then the ordered (name, type_oid) columns in lockstep. A column whose
-        // persisted `type_oid` is unavailable never matches (fail-closed), mirroring
-        // `verify_first_resolution`.
-        if self.oid != Some(rel.oid)
-            || self.replica_identity_char() != Some(rel.replica_identity)
-            || self.columns.len() != rel.signature.len()
-        {
-            return false;
-        }
-        self.columns.iter().zip(rel.signature.iter()).all(
-            |(col, (name, type_oid))| {
-                col.name == *name && col.type_oid == Some(*type_oid)
-            },
-        )
-    }
-}
-
-/// Identity of a retained pgoutput relation, used to select the correct historical
-/// schema version for decoding: the table OID (relation lifetime + within-cluster
-/// database/relation identity), the ordered `(name, type_oid)` signature, and the
-/// replica identity char.
-pub(crate) struct RelationIdentity {
-    pub oid: u32,
-    pub signature: Vec<(String, u32)>,
-    pub replica_identity: char,
-}
-
-/// Result of verifying a table's first Relation this run against its persisted baseline.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum FirstResolution {
-    NoDrift,
-    Drift(String),
-}
-
-/// Compare the first Relation for a table against its durably persisted schema,
-/// deterministically and without any catalog query.
-///
-/// The persisted schema already carries each column's `type_oid` (populated at load
-/// time), so the comparison is a direct match of the ordered `(name, type_oid)`
-/// signature the pgoutput Relation message sends - the same fields the in-stream path
-/// compares (name/order/count/type-OID).
-///
-/// Fails closed: a persisted column whose `type_oid` is unavailable (e.g. a schema
-/// persisted before type OIDs were recorded) is **unverifiable** and reported as drift,
-/// never silently accepted as unchanged.
-///
-/// Note on scope: this guards replication-visible structural changes
-/// (name/order/count/type-OID), matching the in-stream contract. Catalog-only changes
-/// not present in the Relation payload (nullability, defaults, identity metadata) are out
-/// of scope.
-pub(crate) fn verify_first_resolution(
-    persisted_signature: &[(String, Option<u32>)],
-    relation_signature: &[(String, u32)],
-) -> FirstResolution {
-    let describe = || {
-        let persisted = persisted_signature
-            .iter()
-            .map(|(n, o)| match o {
-                Some(o) => format!("{n}:{o}"),
-                None => format!("{n}:?"),
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let relation = relation_signature
-            .iter()
-            .map(|(n, o)| format!("{n}:{o}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("columns [{persisted}] -> [{relation}]")
-    };
-
-    if persisted_signature.len() != relation_signature.len() {
-        return FirstResolution::Drift(describe());
-    }
-    for ((p_name, p_oid), (r_name, r_oid)) in
-        persisted_signature.iter().zip(relation_signature.iter())
-    {
-        if p_name != r_name {
-            return FirstResolution::Drift(describe());
-        }
-        match p_oid {
-            // Persisted type OID unavailable: cannot verify -> fail closed as drift
-            // (unverifiable), never treated as unchanged.
-            None => {
-                return FirstResolution::Drift(format!(
-                    "persisted type OID unavailable for column \"{p_name}\"; \
-                     cannot verify schema ({})",
-                    describe()
-                ));
-            }
-            Some(o) if o != r_oid => {
-                return FirstResolution::Drift(describe());
-            }
-            _ => {}
-        }
-    }
-    FirstResolution::NoDrift
 }
 
 impl PostgresColumn {
@@ -550,63 +440,5 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let parsed: PostgresTableSchema = serde_json::from_str(&json).unwrap();
         assert_eq!(s, parsed);
-    }
-
-    fn oid_schema() -> PostgresTableSchema {
-        PostgresTableSchema::new(vec![
-            PostgresColumn::new("id", "integer", false, 1)
-                .with_type_oid(type_oids::INT4),
-            PostgresColumn::new("sku", "character varying(64)", true, 2)
-                .with_type_oid(type_oids::VARCHAR),
-        ])
-        .with_oid(16386)
-        .with_replica_identity("full")
-    }
-
-    fn rel(oid: u32, sig: Vec<(&str, u32)>, replica: char) -> RelationIdentity {
-        RelationIdentity {
-            oid,
-            signature: sig
-                .into_iter()
-                .map(|(n, o)| (n.to_string(), o))
-                .collect(),
-            replica_identity: replica,
-        }
-    }
-
-    #[test]
-    fn matches_relation_binds_oid_signature_and_replica() {
-        let s = oid_schema();
-        let sig = vec![("id", type_oids::INT4), ("sku", type_oids::VARCHAR)];
-
-        // Exact match: OID + ordered (name, type_oid) + replica identity.
-        assert!(s.matches_relation(&rel(16386, sig.clone(), 'f')));
-        // Dropped-and-recreated: a new OID must not match the old version.
-        assert!(!s.matches_relation(&rel(16400, sig.clone(), 'f')));
-        // Replica identity differs.
-        assert!(!s.matches_relation(&rel(16386, sig.clone(), 'd')));
-        // Structural drift (extra column).
-        let mut sig2 = sig.clone();
-        sig2.push(("status", type_oids::VARCHAR));
-        assert!(!s.matches_relation(&rel(16386, sig2, 'f')));
-        // Type OID drift on an existing column.
-        let sig3 = vec![("id", type_oids::INT8), ("sku", type_oids::VARCHAR)];
-        assert!(!s.matches_relation(&rel(16386, sig3, 'f')));
-    }
-
-    #[test]
-    fn matches_relation_fails_closed_without_oid_or_replica() {
-        // A version missing the table OID or replica identity is unverifiable, never a
-        // match (fail-closed).
-        let no_oid = PostgresTableSchema::new(vec![
-            PostgresColumn::new("id", "integer", false, 1)
-                .with_type_oid(type_oids::INT4),
-        ])
-        .with_replica_identity("full");
-        assert!(!no_oid.matches_relation(&rel(
-            16386,
-            vec![("id", type_oids::INT4)],
-            'f'
-        )));
     }
 }

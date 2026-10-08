@@ -32,7 +32,7 @@ use tokio::time::{Duration, sleep, timeout};
 use tokio_postgres::NoTls;
 
 mod test_common;
-use test_common::{PG_PASS, PG_USER, init_test_tracing, make_registry};
+use test_common::{PG_PASS, PG_USER, init_test_tracing};
 
 const DB: &str = "shop";
 const SLOT: &str = "df_slot";
@@ -468,7 +468,11 @@ async fn source(proxy: &Proxy, d: &Durable) -> PostgresSource {
         tables: vec!["public.orders".into()],
         tenant: "acme".into(),
         pipeline: "test".into(),
-        registry: make_registry().await,
+        // The registry lives in the source's durable store, as in a
+        // pipeline: Relation bindings reference its versions.
+        registry: storage::DurableSchemaRegistry::new(Arc::clone(&d.backend))
+            .await
+            .unwrap(),
         registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         backend: Arc::clone(&d.backend),
         outbox_prefixes: AllowList::default(),
