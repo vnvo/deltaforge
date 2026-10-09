@@ -3,7 +3,9 @@
 #
 #   scripts/gate.sh [label]             core merge gate
 #   scripts/gate.sh --release [label]   core gate plus the release-tier suites
-#                                       (service-backed sinks, S3 canary)
+#                                       (service-backed sinks, S3 canary) and
+#                                       the release images
+#                                       (scripts/release-images.sh)
 #   scripts/gate.sh --check             only check the manifest: every
 #                                       integration test file classified once,
 #                                       no stale entry, a reason on every
@@ -11,7 +13,9 @@
 #                                       left to the workspace step
 #
 # Steps: manifest check; fmt; clippy -D warnings (also with the `vault`
-# feature); workspace tests; every test binary built once; then the
+# feature); workspace tests; with --release, the release images (both
+# Dockerfiles built from the committed tree and smoke-tested); every test
+# binary built once; then the
 # `serial-pg` and `serial` suites one at a time in one lane while the
 # `parallel` suites (and, with --release, the `release` suites) run
 # GATE_PARALLEL (default 3) at a time. Needs Docker.
@@ -262,6 +266,9 @@ if [ "${GATE_ONLY_SUITES:-}" != 1 ]; then
   run clippy-vault "$OUT/clippy-vault.log" \
     cargo clippy -p sources -p runner -p secrets --features vault --all-targets -- -D warnings
   run workspace "$OUT/workspace.log" cargo test --workspace --no-fail-fast
+  if [ "$TIER" = release ]; then
+    run release-images "$OUT/release-images.log" "$ROOT/scripts/release-images.sh"
+  fi
 fi
 
 # ---- build every gated test binary once
