@@ -213,17 +213,13 @@ async fn pg_create_schema(port: u16, db: &str, slot: &str, pub_name: &str) {
         .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
         .await
         .unwrap();
-    client
-        .execute(&format!("DROP PUBLICATION IF EXISTS {pub_name}"), &[])
-        .await
-        .ok();
-    client
-        .execute(
-            &format!("CREATE PUBLICATION {pub_name} FOR TABLE orders"),
-            &[],
-        )
-        .await
-        .unwrap();
+    sources::postgres::postgres_publication::fixtures::recreate_registered(
+        &client,
+        pub_name,
+        &["orders"],
+    )
+    .await
+    .unwrap();
     client.execute(
         &format!("SELECT pg_create_logical_replication_slot('{slot}', 'pgoutput')"),
         &[],

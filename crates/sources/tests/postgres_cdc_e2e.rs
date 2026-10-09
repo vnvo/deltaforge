@@ -60,18 +60,11 @@ async fn create_publication_only(
     slot: &str,
     tables: &[&str],
 ) -> Result<()> {
-    client
-        .execute(&format!("DROP PUBLICATION IF EXISTS {pub_name}"), &[])
-        .await?;
     drop_repl_slot(client, slot).await;
-    let tbl = if tables.is_empty() {
-        "ALL TABLES".into()
-    } else {
-        format!("TABLE {}", tables.join(", "))
-    };
-    client
-        .execute(&format!("CREATE PUBLICATION {pub_name} FOR {tbl}"), &[])
-        .await?;
+    sources::postgres::postgres_publication::fixtures::recreate_registered(
+        client, pub_name, tables,
+    )
+    .await?;
     Ok(())
 }
 
@@ -98,6 +91,9 @@ async fn cleanup_repl(
     pub_name: &str,
     slot: &str,
 ) {
+    sources::postgres::postgres_publication::fixtures::release_all(client)
+        .await
+        .ok();
     client
         .execute(&format!("DROP PUBLICATION IF EXISTS {pub_name}"), &[])
         .await
@@ -1201,10 +1197,16 @@ async fn pg_dropped_table_retained_wal_recovers_via_durable_schema()
     client
         .execute("INSERT INTO orders VALUES (3, 'c')", &[])
         .await?;
-    client.execute("DROP TABLE orders", &[]).await?;
+    // The publication contract refuses dropping a published table.
+    let refused = client.execute("DROP TABLE orders", &[]).await.unwrap_err();
+    assert!(
+        refused
+            .as_db_error()
+            .is_some_and(|d| d.message().starts_with("deltaforge:")),
+        "{refused:?}"
+    );
 
-    // Run 2: resume from cp0. The table is gone from the live catalog, but its
-    // retained rows must still be delivered from the durable schema.
+    // Run 2: resume from cp0: the retained rows are delivered.
     let src = configured_source(
         "dropwal",
         &db,
@@ -1321,7 +1323,14 @@ async fn pg_dropped_table_altered_while_down_is_drift() -> Result<()> {
     client
         .execute("INSERT INTO orders VALUES (2, 'b', 'active')", &[])
         .await?;
-    client.execute("DROP TABLE orders", &[]).await?;
+    // The publication contract refuses dropping a published table.
+    let refused = client.execute("DROP TABLE orders", &[]).await.unwrap_err();
+    assert!(
+        refused
+            .as_db_error()
+            .is_some_and(|d| d.message().starts_with("deltaforge:")),
+        "{refused:?}"
+    );
 
     // Run 2 under Halt: stops before row 2, checkpoint unchanged.
     {
@@ -1469,16 +1478,24 @@ async fn pg_dropped_table_recreated_uses_historical_not_recreated() -> Result<()
     client
         .execute("INSERT INTO orders VALUES (3, 'c')", &[])
         .await?;
-    client.execute("DROP TABLE orders", &[]).await?;
-    client
-        .execute(
-            "CREATE TABLE orders (id INT, sku VARCHAR(64), PRIMARY KEY (id, sku))",
-            &[],
-        )
-        .await?;
-    client
-        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
-        .await?;
+    // The publication contract refuses dropping a published table.
+    let refused = client.execute("DROP TABLE orders", &[]).await.unwrap_err();
+    assert!(
+        refused
+            .as_db_error()
+            .is_some_and(|d| d.message().starts_with("deltaforge:")),
+        "{refused:?}"
+    );
+    // So the same name cannot be recreated either.
+    assert!(
+        client
+            .execute(
+                "CREATE TABLE orders (id INT, sku VARCHAR(64), PRIMARY KEY (id, sku))",
+                &[],
+            )
+            .await
+            .is_err()
+    );
 
     // Run 2: the retained rows must be decoded with the ORIGINAL schema (via history),
     // not the recreated live table's schema.
@@ -2214,12 +2231,13 @@ async fn postgres_cdc_slot_auto_created() -> Result<()> {
         .await?;
 
     // Create publication but NO slot - slot should be auto-created
-    client
-        .execute("DROP PUBLICATION IF EXISTS pub_auto", &[])
-        .await?;
-    client
-        .execute("CREATE PUBLICATION pub_auto FOR TABLE orders", &[])
-        .await?;
+    sources::postgres::postgres_publication::fixtures::recreate_registered(
+        &client,
+        "pub_auto",
+        &["orders"],
+    )
+    .await?;
+    client.execute("SELECT 1", &[]).await?;
 
     // Verify slot doesn't exist yet
     let slot_exists: bool = client
@@ -2272,6 +2290,8 @@ async fn postgres_cdc_slot_auto_created() -> Result<()> {
         .batch_execute("SELECT pg_drop_replication_slot('auto_slot')")
         .await
         .ok();
+    sources::postgres::postgres_publication::fixtures::release_all(&client)
+        .await?;
     client
         .execute("DROP PUBLICATION IF EXISTS pub_auto", &[])
         .await?;
@@ -2295,11 +2315,12 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
         .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
         .await?;
 
+    sources::postgres::postgres_publication::fixtures::release_all(&client)
+        .await?;
     client
         .execute("DROP PUBLICATION IF EXISTS missing_pub", &[])
         .await?;
     client.batch_execute("SELECT pg_drop_replication_slot('slot_missing_pub') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='slot_missing_pub')").await.ok();
-    client.batch_execute("SELECT pg_create_logical_replication_slot('slot_missing_pub', 'pgoutput')").await?;
 
     let pub_exists: bool = client
         .query_one("SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = 'missing_pub')", &[])
@@ -2332,12 +2353,38 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
     );
     info!("✓ verified source does not auto-create publication");
 
-    client
-        .execute("CREATE PUBLICATION missing_pub FOR TABLE orders", &[])
-        .await?;
+    // The admin creates and registers it; the source creates its slot
+    // after the registration (a slot from before it would be retained WAL).
+    sources::postgres::postgres_publication::fixtures::recreate_registered(
+        &client,
+        "missing_pub",
+        &["orders"],
+    )
+    .await?;
     info!("✓ admin created publication");
 
-    sleep(Duration::from_secs(2)).await;
+    // The source picks it up on its next retry and creates its slot then:
+    // write only once it streams from that slot (a row before the slot is
+    // not in its stream).
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let active: bool = client
+            .query_one(
+                "SELECT coalesce(bool_or(active), false) FROM pg_replication_slots \
+                 WHERE slot_name = 'slot_missing_pub'",
+                &[],
+            )
+            .await?
+            .get(0);
+        if active {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the source never streamed after the publication was created"
+        );
+        sleep(Duration::from_millis(200)).await;
+    }
     client
         .execute("INSERT INTO orders (id, name) VALUES (1, 'test')", &[])
         .await?;
@@ -2357,6 +2404,8 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
         .batch_execute("SELECT pg_drop_replication_slot('slot_missing_pub')")
         .await
         .ok();
+    sources::postgres::postgres_publication::fixtures::release_all(&client)
+        .await?;
     client
         .execute("DROP PUBLICATION IF EXISTS missing_pub", &[])
         .await?;
@@ -4203,9 +4252,30 @@ mod event_schema_identity {
             .await;
         let f1 = row(&ev, 1).schema_version.clone().unwrap();
         let oid1 = es.oid().await?;
+        // A published table is recreated only through maintenance: the
+        // source is stopped (run returned), a decision is recorded, the
+        // registration is released, the change applied and re-registered.
+        sources::postgres::postgres_publication::fixtures::decide_for(
+            &es.backend,
+            "acme",
+            &es.id,
+            &format!("pub_{}", es.id),
+            "abandon",
+        )
+        .await?;
+        sources::postgres::postgres_publication::fixtures::release_all(
+            &es.client,
+        )
+        .await?;
         es.sql(&["DROP TABLE orders", ORDERS]).await?;
         es.sql(&[&format!("GRANT SELECT ON orders TO {PG_CDC_USER}")])
             .await?;
+        sources::postgres::postgres_publication::fixtures::recreate_registered(
+            &es.client,
+            &format!("pub_{}", es.id),
+            &["orders"],
+        )
+        .await?;
         let (ev, ended) = es
             .run(
                 OnSchemaDrift::Halt,
@@ -4244,11 +4314,13 @@ mod event_schema_identity {
             .await;
         let f_old = row(&ev, 1).schema_version.clone().unwrap();
         let oid_old = es.oid().await?;
+        es.sql(&["INSERT INTO orders VALUES (2, 'b')"]).await?;
+        // The publication contract refuses dropping (and so recreating) a
+        // published table; the retained row keeps its own binding and a
+        // shape change is an ALTER, which is drift.
+        assert!(es.sql(&["DROP TABLE orders"]).await.is_err());
         es.sql(&[
-            "INSERT INTO orders VALUES (2, 'b')",
-            "DROP TABLE orders",
-            "CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64), note TEXT)",
-            &format!("GRANT SELECT ON orders TO {PG_CDC_USER}"),
+            "ALTER TABLE orders ADD COLUMN note TEXT",
             "INSERT INTO orders VALUES (3, 'c', 'n')",
         ])
         .await?;
@@ -4269,7 +4341,8 @@ mod event_schema_identity {
         let b = es.bindings().await?;
         assert_eq!(b.len(), 2);
         assert_eq!(b[0]["oid"].as_u64().unwrap(), oid_old as u64);
-        assert_ne!(b[1]["oid"].as_u64().unwrap(), oid_old as u64);
+        assert_eq!(b[1]["oid"].as_u64().unwrap(), oid_old as u64);
+        assert_ne!(b[0]["digest"], b[1]["digest"]);
         es.done().await;
         Ok(())
     }

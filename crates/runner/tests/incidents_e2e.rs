@@ -62,6 +62,12 @@ async fn start_postgres() -> (ContainerAsync<GenericImage>, u16) {
     )
     .await
     .unwrap();
+    sources::postgres::postgres_publication::register(
+        &c2,
+        &["inc_pub".to_string()],
+    )
+    .await
+    .unwrap();
     (c, port)
 }
 

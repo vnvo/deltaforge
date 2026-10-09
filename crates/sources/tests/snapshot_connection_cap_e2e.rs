@@ -37,6 +37,11 @@ async fn source(
              CREATE PUBLICATION pub_{id} FOR TABLE {id};"
         ))
         .await?;
+    sources::postgres::postgres_publication::register(
+        client,
+        &[format!("pub_{id}")],
+    )
+    .await?;
     Ok(sources::postgres::PostgresSource {
         id: id.into(),
         dsn: pg_admin_dsn(db).await.into(),

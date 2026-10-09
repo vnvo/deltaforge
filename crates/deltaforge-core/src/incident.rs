@@ -76,11 +76,16 @@ pub enum ReasonCode {
     /// A tracked PostgreSQL table uses an unsupported feature (for example a
     /// stored generated column).
     PgTableUnsupported,
+    /// The source's PostgreSQL publication is not registered, or changed
+    /// since the registration the source accepted.
+    PgPublicationChanged,
+    /// The database's publication enforcement is missing or tampered with.
+    PgPublicationEnforcement,
 }
 
 impl ReasonCode {
     /// Every reason (bounded metric label values).
-    pub const ALL: [ReasonCode; 17] = [
+    pub const ALL: [ReasonCode; 19] = [
         Self::PgDifferentCluster,
         Self::PgContinuityUnproven,
         Self::PgFailoverSlotUnavailable,
@@ -98,6 +103,8 @@ impl ReasonCode {
         Self::PgCatalogVisibilityUnproven,
         Self::PgAnnotationUnavailable,
         Self::PgTableUnsupported,
+        Self::PgPublicationChanged,
+        Self::PgPublicationEnforcement,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -123,6 +130,8 @@ impl ReasonCode {
             }
             Self::PgAnnotationUnavailable => "pg_annotation_unavailable",
             Self::PgTableUnsupported => "pg_table_unsupported",
+            Self::PgPublicationChanged => "pg_publication_changed",
+            Self::PgPublicationEnforcement => "pg_publication_enforcement",
         }
     }
 }
@@ -231,6 +240,9 @@ pub enum ActionCode {
     /// Give a sink a fresh baseline (a re-snapshot reaching it, or a
     /// re-bootstrap from another sink).
     RebootstrapSink,
+    /// Run the database-wide publication maintenance procedure (recovery
+    /// operation `pg-publication-maintenance`).
+    PublicationMaintenance,
 }
 
 /// The pipeline part that raised it.
@@ -389,6 +401,7 @@ pub enum EvidenceKey {
     RecordedTransition,
     SnapshotChain,
     TargetPosition,
+    Publication,
 }
 
 impl EvidenceKey {
@@ -428,6 +441,7 @@ impl EvidenceKey {
             Self::RecordedTransition => "recorded_transition",
             Self::SnapshotChain => "snapshot_chain",
             Self::TargetPosition => "target_position",
+            Self::Publication => "publication",
         }
     }
 }
@@ -724,6 +738,20 @@ pub fn explain(
             "{component} could not record the capture-time catalog \
              annotation of table {} ({}). Rows are unaffected.",
             ev.show(K::Table),
+            ev.show(K::ReasonClass),
+        ),
+        ReasonCode::PgPublicationChanged => format!(
+            "{component} stopped before streaming: publication {} {}. \
+             Publications are immutable while registered; changing one \
+             requires the publication maintenance procedure.",
+            ev.show(K::Publication),
+            ev.show(K::ReasonClass),
+        ),
+        ReasonCode::PgPublicationEnforcement => format!(
+            "{component} stopped before streaming: the publication enforcement \
+             of its database is missing or was tampered with ({}). Events \
+             changed between the tampering and this check are not covered by \
+             the guarantee.",
             ev.show(K::ReasonClass),
         ),
         ReasonCode::PgTableUnsupported => format!(

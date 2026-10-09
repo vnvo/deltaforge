@@ -371,6 +371,11 @@ async fn kafka_outage_across_restart_loses_no_events_and_holds_checkpoint()
     client
         .execute("CREATE PUBLICATION pub_outage FOR TABLE orders", &[])
         .await?;
+    sources::postgres::postgres_publication::register(
+        &client,
+        &["pub_outage".to_string()],
+    )
+    .await?;
     client
         .batch_execute(
             "SELECT pg_create_logical_replication_slot('slot_outage', 'pgoutput')",

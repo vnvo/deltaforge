@@ -217,9 +217,12 @@ async fn postgres_snapshot_scale() -> Result<()> {
                 ))
                 .await?;
         }
-        client
-            .batch_execute("CREATE PUBLICATION pub_scale FOR ALL TABLES")
-            .await?;
+        sources::postgres::postgres_publication::fixtures::recreate_registered(
+            &client,
+            "pub_scale",
+            &[],
+        )
+        .await?;
         let slot = format!("slot_scale{n}");
         let src = sources::postgres::PostgresSource {
             id: format!("scale{n}"),

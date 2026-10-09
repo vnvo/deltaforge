@@ -198,9 +198,22 @@ async fn start_postgres() -> (ContainerAsync<GenericImage>, u16) {
                  EXECUTE format('CREATE TABLE {schema}.t%s (id INT PRIMARY KEY, v TEXT)', i);
                END LOOP;
              END $$;
-             CREATE PUBLICATION pub_{schema} FOR TABLES IN SCHEMA {schema};",
+",
             last = n - 1
         ))
+        .await
+        .unwrap();
+    }
+    // The large publication is built (in batches) before any registration.
+    for (schema, n) in [("s1k", LARGE), ("s10", SMALL)] {
+        let tables: Vec<String> =
+            (0..n).map(|i| format!("{schema}.t{i}")).collect();
+        let tables: Vec<&str> = tables.iter().map(String::as_str).collect();
+        sources::postgres::postgres_publication::fixtures::recreate_registered(
+            &db,
+            &format!("pub_{schema}"),
+            &tables,
+        )
         .await
         .unwrap();
     }

@@ -367,3 +367,74 @@ pub(crate) fn annotation_unavailable(
     })
     .resolved_by_scope(qualified_table)
 }
+
+/// The publication is unregistered or changed since the registration the
+/// source accepted (halted before streaming).
+pub(crate) fn publication_changed(
+    source_id: &str,
+    publication: &str,
+    class: &str,
+    details: String,
+) -> SourceError {
+    let draft = IncidentDraft::new(
+        ReasonCode::PgPublicationChanged,
+        Component::Source {
+            id: source_id.to_string(),
+        },
+        Retryability::OperatorAction,
+        SafetyState::HaltedSafe,
+        CauseCode::SourceSchema,
+    )
+    .discriminate("publication", publication)
+    .discriminate("class", class)
+    .with_evidence(|e| {
+        e.text(K::SourceId, source_id)
+            .text(K::Publication, publication)
+            .text(K::ReasonClass, class);
+    })
+    .with_actions(&[ActionCode::PublicationMaintenance]);
+    SourceError::incident(
+        draft,
+        SourceError::Schema {
+            details: details.into(),
+        },
+    )
+}
+
+/// The database's publication enforcement is missing or tampered with
+/// (halted before streaming).
+pub(crate) fn publication_enforcement(
+    source_id: &str,
+    publication: &str,
+    violations: &[String],
+) -> SourceError {
+    let list = violations.join("; ");
+    let draft = IncidentDraft::new(
+        ReasonCode::PgPublicationEnforcement,
+        Component::Source {
+            id: source_id.to_string(),
+        },
+        Retryability::OperatorAction,
+        SafetyState::HaltedSafe,
+        CauseCode::SourceIncompatible,
+    )
+    .discriminate("publication", publication)
+    .with_evidence(|e| {
+        e.text(K::SourceId, source_id)
+            .text(K::Publication, publication)
+            .text(K::ReasonClass, &list);
+    })
+    .with_actions(&[
+        ActionCode::PublicationMaintenance,
+        ActionCode::InspectLogs,
+    ]);
+    SourceError::incident(
+        draft,
+        SourceError::Incompatible {
+            details: format!(
+                "publication enforcement of {publication}'s database: {list}"
+            )
+            .into(),
+        },
+    )
+}

@@ -1,6 +1,6 @@
 # PostgreSQL schema identity, coherent capture and publication markers
 
-Status: design for review, revision 7 (no implementation).
+Status: revision 7, partly superseded. Sections 1 (event schema, coherent capture) and 8 stand and are implemented. The publication-marker protocol (sections 2-7 and its tests) is superseded by the immutable-publication contract in the addendum at the end and was never implemented.
 Base: main `47974f1`. Code references are to that tree.
 
 Facts marked **verified** were probed on throwaway PostgreSQL containers: 17.10 unless stated, and 14.24 to 18.6 where stated.
@@ -414,3 +414,14 @@ Kept from earlier revisions: V1-V4, M-1-M-7, C-1, C-2, T-1, P1-P12, S1-S8.
 - Annotations are capture-time only.
 - Partition roots and `TABLES IN SCHEMA` membership are rejected.
 - A replication frame is read whole by the client before the prefix is seen. That is existing behaviour for every message, and marker parsing adds no allocation beyond it.
+
+
+## Addendum: the immutable-publication contract (supersedes sections 2-7)
+
+Online publication mutation is unsupported. A registered publication cannot change while any registration exists in its database.
+
+- **Registration** (`deltaforge pg-publication register`, superuser, after an explicit confirmation of the database-wide impact): explicit `FOR TABLE` publications of ordinary tables only, all four publish operations, no row filter, column list, `pubviaroot` or `pubgencols`. The publication is transferred to the NOLOGIN, member-less `deltaforge_publication_owner`; its canonical digest (OIDs only, ordered by OID) and the registration's WAL position are recorded in `deltaforge.registration`.
+- **Enforcement, active while DeltaForge is offline:** a `ddl_command_start` trigger refuses every ALTER and DROP PUBLICATION while any registration exists, for every role including superusers, before PostgreSQL starts the command; a `sql_drop` trigger refuses any drop removing a registered publication or member. There is no `ddl_command_end` trigger. Measured on PostgreSQL 14-18: refused 1K/4K/10K-table `SET TABLE` statements grow the backend by 5-7 MiB (a no-op `sql_drop` trigger alone lets an accepted 4K-table one reach 2.7 GB).
+- **Source verification** at startup and before every stream's first message: enforcement intact, registration present, live digest equal to the registration, the registration equal to the one the source accepted (or re-registered under a recorded maintenance decision), and no stream from before the registration. Failures: `pg_publication_changed`, `pg_publication_enforcement`.
+- **Maintenance** is database-wide: every source stopped; a `pg-publication-maintenance` decision per source (`resnapshot`, with the `resnapshot` operation, or audited `abandon`); every registration removed; enforcement uninstalled (refused while any registration remains); the change applied; publications registered again; sources restarted. Registration, unregistration and uninstall are single transactions.
+- **Residual:** a superuser can disable or drop the triggers. Detection is at the next startup or reconnect; completeness between tampering and detection is not guaranteed.

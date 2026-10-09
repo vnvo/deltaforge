@@ -251,6 +251,12 @@ async fn create_schema(port: u16) {
     ))
     .await
     .unwrap();
+    sources::postgres::postgres_publication::register(
+        &c,
+        &[PUBLICATION.to_string()],
+    )
+    .await
+    .unwrap();
 }
 
 async fn insert(port: u16, id: i64) {

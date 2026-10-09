@@ -427,22 +427,13 @@ pub async fn pg_create_pub_slot(
     slot_name: &str,
     tables: &[&str],
 ) -> Result<()> {
-    client
-        .execute(&format!("DROP PUBLICATION IF EXISTS {pub_name}"), &[])
-        .await?;
-
-    let table_list = tables
-        .iter()
-        .map(|t| format!("public.{t}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    client
-        .execute(
-            &format!("CREATE PUBLICATION {pub_name} FOR TABLE {table_list}"),
-            &[],
-        )
-        .await?;
+    let tables: Vec<String> =
+        tables.iter().map(|t| format!("public.{t}")).collect();
+    let tables: Vec<&str> = tables.iter().map(String::as_str).collect();
+    sources::postgres::postgres_publication::fixtures::recreate_registered(
+        client, pub_name, &tables,
+    )
+    .await?;
 
     client
         .execute(
@@ -461,6 +452,9 @@ pub async fn pg_cleanup_repl(
     pub_name: &str,
     slot_name: &str,
 ) {
+    sources::postgres::postgres_publication::fixtures::release_all(client)
+        .await
+        .ok();
     client
         .execute(&format!("DROP PUBLICATION IF EXISTS {pub_name}"), &[])
         .await

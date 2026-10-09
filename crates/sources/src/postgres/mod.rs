@@ -50,6 +50,7 @@ pub mod postgres_rotation;
 use postgres_slot_owner::prepare_snapshot_slot_anchor;
 
 pub mod postgres_object;
+pub mod postgres_publication;
 
 mod postgres_builtin_types;
 mod postgres_catalog_capture;
@@ -343,6 +344,10 @@ pub(crate) struct RunCtx {
     pub pause_notify: Arc<Notify>,
     pub schema: PostgresSchemaLoader,
     pub allow: AllowList,
+    /// The publication and the registration this run accepted (verified
+    /// again before every stream's first message).
+    pub publication: String,
+    pub publication_registration: postgres_publication::Registration,
     pub retry: RetryPolicy,
     pub inactivity: Duration,
     pub relation_map: HashMap<u32, RelationInfo>,
@@ -1558,6 +1563,30 @@ impl PostgresSource {
             }
         };
 
+        // The immutable-publication contract, before anything is snapshotted,
+        // decoded, emitted or checkpointed: registered, enforced, unchanged
+        // since the registration this source accepted (or re-registered under
+        // a recorded maintenance decision), and no stream from before it.
+        let publication_key = postgres_publication::record_key(
+            &self.tenant,
+            &self.id,
+            &self.publication,
+        );
+        let admitted = postgres_publication::verify_for_start(
+            self.dsn.expose(),
+            &self.id,
+            &self.publication,
+            &self.backend,
+            &publication_key,
+            if needs_snapshot {
+                postgres_publication::Start::Generation
+            } else {
+                postgres_publication::Start::Stream(start_lsn.as_u64())
+            },
+        )
+        .await?;
+        let start_lsn = admitted.abandon_to.map(Lsn::from).unwrap_or(start_lsn);
+
         let schema_loader = PostgresSchemaLoader::new(
             self.dsn.clone(),
             self.registry.clone(),
@@ -1696,6 +1725,8 @@ impl PostgresSource {
             pause_notify,
             schema: schema_loader,
             allow: AllowList::new(&self.tables),
+            publication: self.publication.clone(),
+            publication_registration: admitted.registration.clone(),
             retry: RetryPolicy::default(),
             inactivity: Duration::from_secs(60),
             relation_map: HashMap::new(),
@@ -2531,12 +2562,12 @@ async fn fetch_pg_lineage_verified(
                 if attempt >= IDENTITY_FETCH_ATTEMPTS {
                     return Err(SourceError::Other(anyhow::anyhow!(
                         "failed to fetch server identity after {attempt} \
-                         attempts: {e}; refusing to stream on unverified \
+                         attempts: {e:#}; refusing to stream on unverified \
                          identity"
                     )));
                 }
                 warn!(
-                    attempt, error = %e,
+                    attempt, error = %format!("{e:#}"),
                     "postgres identity fetch failed; retrying before failing closed"
                 );
                 tokio::time::sleep(Duration::from_millis(
@@ -3286,6 +3317,13 @@ async fn verify_before_reconnect(ctx: &mut RunCtx) -> SourceResult<bool> {
 /// server it reached must still be the source's. An unverifiable identity
 /// fails closed rather than skipping the check.
 async fn check_identity_post_reconnect(ctx: &mut RunCtx) -> SourceResult<()> {
+    postgres_publication::verify_for_reconnect(
+        ctx.dsn.expose(),
+        &ctx.source_id,
+        &ctx.publication,
+        &ctx.publication_registration,
+    )
+    .await?;
     let verified = fetch_pg_lineage_verified(ctx.dsn.expose()).await?;
     let (descriptor, live) =
         (verified.descriptor, ServerIdentity::from(verified.identity));

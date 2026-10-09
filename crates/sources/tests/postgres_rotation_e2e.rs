@@ -302,6 +302,21 @@ struct Harness {
 
 impl Harness {
     async fn rotate_password(&mut self, new_password: &str) -> Result<()> {
+        // Rotate a running source: past its startup checks (the
+        // verified-running barrier), whose connections use the startup
+        // credentials. Revoked during them, the start fails closed.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !self.handle.ready.is_ready() {
+            anyhow::ensure!(
+                !self.handle.join.is_finished(),
+                "the source ended before it was ready"
+            );
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "the source never became ready"
+            );
+            sleep(Duration::from_millis(50)).await;
+        }
         self.admin
             .execute(
                 &format!("ALTER ROLE {PG_CDC_USER} PASSWORD '{new_password}'"),
@@ -365,6 +380,11 @@ async fn start_rotation_harness(
             &[],
         )
         .await?;
+    sources::postgres::postgres_publication::register(
+        &admin,
+        std::slice::from_ref(&publication),
+    )
+    .await?;
 
     let proj = Projected::new(&[
         ("username", PG_CDC_USER.as_bytes()),

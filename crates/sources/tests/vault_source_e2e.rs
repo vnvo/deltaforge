@@ -233,6 +233,11 @@ async fn vault_kv_rotation_reconnects_postgres_and_continues_cdc() -> Result<()>
             &[],
         )
         .await?;
+    sources::postgres::postgres_publication::register(
+        &admin,
+        std::slice::from_ref(&publication),
+    )
+    .await?;
 
     // Disposable Vault holding the initial credentials.
     let (_vault, vault_addr) = start_vault().await;
