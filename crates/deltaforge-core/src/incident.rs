@@ -67,11 +67,25 @@ pub enum ReasonCode {
     SnapshotBoundExceeded,
     /// A snapshot is approaching a resource bound.
     SnapshotBoundWarning,
+    /// A PostgreSQL catalog session could not be proven to reach the node
+    /// and live walsender of the stream at the Relation's position.
+    PgCatalogVisibilityUnproven,
+    /// A PostgreSQL capture-time catalog annotation could not be recorded
+    /// (rows are unaffected).
+    PgAnnotationUnavailable,
+    /// A tracked PostgreSQL table uses an unsupported feature (for example a
+    /// stored generated column).
+    PgTableUnsupported,
+    /// The source's PostgreSQL publication is not registered, or changed
+    /// since the registration the source accepted.
+    PgPublicationChanged,
+    /// The database's publication enforcement is missing or tampered with.
+    PgPublicationEnforcement,
 }
 
 impl ReasonCode {
     /// Every reason (bounded metric label values).
-    pub const ALL: [ReasonCode; 14] = [
+    pub const ALL: [ReasonCode; 19] = [
         Self::PgDifferentCluster,
         Self::PgContinuityUnproven,
         Self::PgFailoverSlotUnavailable,
@@ -86,6 +100,11 @@ impl ReasonCode {
         Self::SnapshotStateInvalid,
         Self::SnapshotBoundExceeded,
         Self::SnapshotBoundWarning,
+        Self::PgCatalogVisibilityUnproven,
+        Self::PgAnnotationUnavailable,
+        Self::PgTableUnsupported,
+        Self::PgPublicationChanged,
+        Self::PgPublicationEnforcement,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -106,6 +125,13 @@ impl ReasonCode {
             Self::SnapshotStateInvalid => "snapshot_state_invalid",
             Self::SnapshotBoundExceeded => "snapshot_bound_exceeded",
             Self::SnapshotBoundWarning => "snapshot_bound_warning",
+            Self::PgCatalogVisibilityUnproven => {
+                "pg_catalog_visibility_unproven"
+            }
+            Self::PgAnnotationUnavailable => "pg_annotation_unavailable",
+            Self::PgTableUnsupported => "pg_table_unsupported",
+            Self::PgPublicationChanged => "pg_publication_changed",
+            Self::PgPublicationEnforcement => "pg_publication_enforcement",
         }
     }
 }
@@ -214,6 +240,9 @@ pub enum ActionCode {
     /// Give a sink a fresh baseline (a re-snapshot reaching it, or a
     /// re-bootstrap from another sink).
     RebootstrapSink,
+    /// Run the database-wide publication maintenance procedure (recovery
+    /// operation `pg-publication-maintenance`).
+    PublicationMaintenance,
 }
 
 /// The pipeline part that raised it.
@@ -371,6 +400,8 @@ pub enum EvidenceKey {
     RecordedChain,
     RecordedTransition,
     SnapshotChain,
+    TargetPosition,
+    Publication,
 }
 
 impl EvidenceKey {
@@ -409,6 +440,8 @@ impl EvidenceKey {
             Self::RecordedChain => "recorded_chain",
             Self::RecordedTransition => "recorded_transition",
             Self::SnapshotChain => "snapshot_chain",
+            Self::TargetPosition => "target_position",
+            Self::Publication => "publication",
         }
     }
 }
@@ -691,6 +724,39 @@ pub fn explain(
              replication.",
             ev.show(K::CheckpointPosition),
             ev.show(K::Slot),
+            ev.show(K::ReasonClass),
+        ),
+        ReasonCode::PgCatalogVisibilityUnproven => format!(
+            "{component} could not prove that its catalog session reaches the \
+             node and walsender streaming slot {} at position {} ({}). It \
+             stopped before using any catalog fact.",
+            ev.show(K::Slot),
+            ev.show(K::TargetPosition),
+            ev.show(K::ReasonClass),
+        ),
+        ReasonCode::PgAnnotationUnavailable => format!(
+            "{component} could not record the capture-time catalog \
+             annotation of table {} ({}). Rows are unaffected.",
+            ev.show(K::Table),
+            ev.show(K::ReasonClass),
+        ),
+        ReasonCode::PgPublicationChanged => format!(
+            "{component} stopped before streaming: publication {} {}. \
+             Publications are immutable while registered; changing one \
+             requires the publication maintenance procedure.",
+            ev.show(K::Publication),
+            ev.show(K::ReasonClass),
+        ),
+        ReasonCode::PgPublicationEnforcement => format!(
+            "{component} stopped before streaming: the publication enforcement \
+             of its database is missing or was tampered with ({}). Events \
+             changed between the tampering and this check are not covered by \
+             the guarantee.",
+            ev.show(K::ReasonClass),
+        ),
+        ReasonCode::PgTableUnsupported => format!(
+            "{component} stopped before the next row of table {}: {}.",
+            ev.show(K::Table),
             ev.show(K::ReasonClass),
         ),
         ReasonCode::PgFailoverSlotUnavailable => format!(

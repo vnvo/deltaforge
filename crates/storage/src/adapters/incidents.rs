@@ -66,6 +66,8 @@ pub const LINEAGE_VERIFIED: &str = "lineage_verified";
 pub const POSITION_VERIFIED: &str = "position_verified";
 /// A later stream proved its slot is a PostgreSQL failover slot.
 pub const FAILOVER_SLOT_VERIFIED: &str = "failover_slot_verified";
+/// A later capture-time catalog annotation of the table was recorded.
+pub const ANNOTATION_RECORDED: &str = "annotation_recorded";
 /// The table's schema was accepted at its first use in a later run.
 pub const SCHEMA_ACCEPTED: &str = "schema_accepted";
 /// An authoritative read of exactly the uncertain boundary proved the write

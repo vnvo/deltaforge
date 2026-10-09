@@ -7,7 +7,7 @@ use checkpoints::{CheckpointStore, MemCheckpointStore};
 use common::AllowList;
 use ctor::dtor;
 use deltaforge_core::{
-    BatchContext, Event, Op, Source, SourceError, SourceHandle, SourceItem,
+    BatchContext, Event, Op, Source, SourceHandle, SourceItem,
 };
 
 use sources::postgres::{PostgresSource, pg_row_event_id};
@@ -60,18 +60,11 @@ async fn create_publication_only(
     slot: &str,
     tables: &[&str],
 ) -> Result<()> {
-    client
-        .execute(&format!("DROP PUBLICATION IF EXISTS {pub_name}"), &[])
-        .await?;
     drop_repl_slot(client, slot).await;
-    let tbl = if tables.is_empty() {
-        "ALL TABLES".into()
-    } else {
-        format!("TABLE {}", tables.join(", "))
-    };
-    client
-        .execute(&format!("CREATE PUBLICATION {pub_name} FOR {tbl}"), &[])
-        .await?;
+    sources::postgres::postgres_publication::fixtures::recreate_registered(
+        client, pub_name, tables,
+    )
+    .await?;
     Ok(())
 }
 
@@ -98,6 +91,9 @@ async fn cleanup_repl(
     pub_name: &str,
     slot: &str,
 ) {
+    sources::postgres::postgres_publication::fixtures::release_all(client)
+        .await
+        .ok();
     client
         .execute(&format!("DROP PUBLICATION IF EXISTS {pub_name}"), &[])
         .await
@@ -313,6 +309,36 @@ async fn shared_registry() -> (
         .await
         .expect("registry");
     (registry, backend)
+}
+
+/// Every registered version of `schema.table` under source `id` and the
+/// connected database's lineage.
+async fn registered_versions(
+    client: &tokio_postgres::Client,
+    registry: &storage::DurableSchemaRegistry,
+    id: &str,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<schema_registry::SchemaVersion>> {
+    let row = client
+        .query_one(
+            "SELECT system_identifier, (SELECT oid::int8 FROM pg_database \
+             WHERE datname = current_database()) FROM pg_control_system()",
+            &[],
+        )
+        .await?;
+    let lineage = storage::adapters::LineageDescriptor::Postgres {
+        system_identifier: row.get::<_, i64>(0) as u64,
+        database_oid: row.get::<_, i64>(1) as u64,
+    };
+    let key = storage::adapters::SchemaKey::new(
+        "acme",
+        id,
+        lineage.lineage_hash().as_str(),
+        schema,
+        table,
+    );
+    Ok(registry.history_page(&key, None, 1000).await?.versions)
 }
 
 /// Drain every `SourceItem` available within `dur` (stops early when the channel
@@ -1171,10 +1197,16 @@ async fn pg_dropped_table_retained_wal_recovers_via_durable_schema()
     client
         .execute("INSERT INTO orders VALUES (3, 'c')", &[])
         .await?;
-    client.execute("DROP TABLE orders", &[]).await?;
+    // The publication contract refuses dropping a published table.
+    let refused = client.execute("DROP TABLE orders", &[]).await.unwrap_err();
+    assert!(
+        refused
+            .as_db_error()
+            .is_some_and(|d| d.message().starts_with("deltaforge:")),
+        "{refused:?}"
+    );
 
-    // Run 2: resume from cp0. The table is gone from the live catalog, but its
-    // retained rows must still be delivered from the durable schema.
+    // Run 2: resume from cp0: the retained rows are delivered.
     let src = configured_source(
         "dropwal",
         &db,
@@ -1225,12 +1257,15 @@ async fn pg_dropped_table_retained_wal_recovers_via_durable_schema()
     Ok(())
 }
 
-/// Dropped table whose durable schema does NOT match the retained WAL's Relation
-/// (the table was altered while the source was down, then dropped). The source must
-/// fail closed - never guess a schema, skip the event, or advance the checkpoint.
+/// A table altered while the source was down, written under the new shape,
+/// then dropped. The resumed session's Relation proves the shape the retained
+/// rows were written under, so no stored schema is needed to decode them; the
+/// content differs from the table's last binding, which is drift and follows
+/// the policy. Halt stops before the row without advancing the checkpoint;
+/// Adapt delivers it under the Relation's three-column event schema.
 #[tokio::test]
 #[ignore = "requires docker"]
-async fn pg_dropped_table_schema_mismatch_fails_closed() -> Result<()> {
+async fn pg_dropped_table_altered_while_down_is_drift() -> Result<()> {
     use deltaforge_config::OnSchemaDrift;
 
     let (db, client) = pg_setup("dropmis").await?;
@@ -1288,9 +1323,52 @@ async fn pg_dropped_table_schema_mismatch_fails_closed() -> Result<()> {
     client
         .execute("INSERT INTO orders VALUES (2, 'b', 'active')", &[])
         .await?;
-    client.execute("DROP TABLE orders", &[]).await?;
+    // The publication contract refuses dropping a published table.
+    let refused = client.execute("DROP TABLE orders", &[]).await.unwrap_err();
+    assert!(
+        refused
+            .as_db_error()
+            .is_some_and(|d| d.message().starts_with("deltaforge:")),
+        "{refused:?}"
+    );
 
-    // Run 2: resume from cp0 and fail closed on the signature mismatch.
+    // Run 2 under Halt: stops before row 2, checkpoint unchanged.
+    {
+        let src = configured_source(
+            "dropmis",
+            &db,
+            "slot_dropmis",
+            "pub_dropmis",
+            OnSchemaDrift::Halt,
+            registry.clone(),
+            backend.clone(),
+        )
+        .await;
+        let (tx, mut rx) =
+            test_common::acked_channel(&src, &ckpt, &src.id, 128);
+        let h = src.run(tx, ckpt.clone()).await;
+        let items = drain_items(&mut rx, Duration::from_secs(5)).await;
+        h.stop();
+        let err = h.join().await.expect_err("halt must stop on the drift");
+        assert!(
+            format!("{err:#}").contains("on_schema_drift=halt"),
+            "a drift halt: {err:#}"
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|i| matches!(i, SourceItem::Event(e) if has_id(e, 2))),
+            "row 2 must not be delivered under halt"
+        );
+        assert_eq!(
+            ckpt.get_raw("dropmis").await?.as_deref(),
+            Some(cp0.as_slice()),
+            "checkpoint must not advance under halt"
+        );
+    }
+
+    // Run 3 under Adapt: row 2 is delivered with the Relation's shape, and
+    // stamped with a pg_event_v2 version of three columns.
     let src = configured_source(
         "dropmis",
         &db,
@@ -1303,36 +1381,27 @@ async fn pg_dropped_table_schema_mismatch_fails_closed() -> Result<()> {
     .await;
     let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
     let h = src.run(tx, ckpt.clone()).await;
-    let ready = wait_ready(&h, Duration::from_secs(10)).await;
-    let items = drain_items(&mut rx, Duration::from_secs(3)).await;
+    let events = collect_until(&mut rx, Duration::from_secs(15), |e| {
+        e.iter().any(|x| has_id(x, 2))
+    })
+    .await;
     h.stop();
-    let joined = h.join().await;
-
-    assert!(
-        ready.is_err(),
-        "source must fail closed on a dropped-table schema mismatch"
-    );
-    // The contract is a typed schema failure before the row, with the
-    // checkpoint left at the last safe boundary - not the message wording.
-    let err = joined.expect_err("run must fail closed");
-    assert!(
-        matches!(
-            err.downcast_ref::<SourceError>(),
-            Some(SourceError::Schema { .. })
-        ),
-        "a dropped-table mismatch must stop with a schema error: {err:?}"
-    );
-    assert!(
-        !items
-            .iter()
-            .any(|i| matches!(i, SourceItem::Event(e) if has_id(e, 2))),
-        "the mismatched retained row must not be delivered"
-    );
-    assert_eq!(
-        ckpt.get_raw("dropmis").await?.as_deref(),
-        Some(cp0.as_slice()),
-        "checkpoint must not advance on a fail-closed mismatch"
-    );
+    h.join().await.ok();
+    let row2 = events
+        .iter()
+        .find(|e| has_id(e, 2))
+        .expect("row 2 delivered under adapt");
+    assert_eq!(row2.after.as_ref().unwrap()["status"], "active");
+    let fingerprint = row2.schema_version.clone().expect("stamped");
+    let found =
+        registered_versions(&client, &registry, "dropmis", "public", "orders")
+            .await?
+            .into_iter()
+            .find(|v| v.hash == fingerprint)
+            .expect("the stamped version is registered");
+    assert_eq!(found.schema_json["format"], "pg_event_v2");
+    assert_eq!(found.schema_json["columns"].as_array().unwrap().len(), 3);
+    assert_eq!(row2.schema_sequence, Some(found.sequence));
 
     cleanup_repl(&client, "pub_dropmis", "slot_dropmis").await;
     pg_drop_db(&db).await;
@@ -1409,16 +1478,24 @@ async fn pg_dropped_table_recreated_uses_historical_not_recreated() -> Result<()
     client
         .execute("INSERT INTO orders VALUES (3, 'c')", &[])
         .await?;
-    client.execute("DROP TABLE orders", &[]).await?;
-    client
-        .execute(
-            "CREATE TABLE orders (id INT, sku VARCHAR(64), PRIMARY KEY (id, sku))",
-            &[],
-        )
-        .await?;
-    client
-        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
-        .await?;
+    // The publication contract refuses dropping a published table.
+    let refused = client.execute("DROP TABLE orders", &[]).await.unwrap_err();
+    assert!(
+        refused
+            .as_db_error()
+            .is_some_and(|d| d.message().starts_with("deltaforge:")),
+        "{refused:?}"
+    );
+    // So the same name cannot be recreated either.
+    assert!(
+        client
+            .execute(
+                "CREATE TABLE orders (id INT, sku VARCHAR(64), PRIMARY KEY (id, sku))",
+                &[],
+            )
+            .await
+            .is_err()
+    );
 
     // Run 2: the retained rows must be decoded with the ORIGINAL schema (via history),
     // not the recreated live table's schema.
@@ -2154,12 +2231,13 @@ async fn postgres_cdc_slot_auto_created() -> Result<()> {
         .await?;
 
     // Create publication but NO slot - slot should be auto-created
-    client
-        .execute("DROP PUBLICATION IF EXISTS pub_auto", &[])
-        .await?;
-    client
-        .execute("CREATE PUBLICATION pub_auto FOR TABLE orders", &[])
-        .await?;
+    sources::postgres::postgres_publication::fixtures::recreate_registered(
+        &client,
+        "pub_auto",
+        &["orders"],
+    )
+    .await?;
+    client.execute("SELECT 1", &[]).await?;
 
     // Verify slot doesn't exist yet
     let slot_exists: bool = client
@@ -2212,6 +2290,8 @@ async fn postgres_cdc_slot_auto_created() -> Result<()> {
         .batch_execute("SELECT pg_drop_replication_slot('auto_slot')")
         .await
         .ok();
+    sources::postgres::postgres_publication::fixtures::release_all(&client)
+        .await?;
     client
         .execute("DROP PUBLICATION IF EXISTS pub_auto", &[])
         .await?;
@@ -2235,11 +2315,12 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
         .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
         .await?;
 
+    sources::postgres::postgres_publication::fixtures::release_all(&client)
+        .await?;
     client
         .execute("DROP PUBLICATION IF EXISTS missing_pub", &[])
         .await?;
     client.batch_execute("SELECT pg_drop_replication_slot('slot_missing_pub') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='slot_missing_pub')").await.ok();
-    client.batch_execute("SELECT pg_create_logical_replication_slot('slot_missing_pub', 'pgoutput')").await?;
 
     let pub_exists: bool = client
         .query_one("SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = 'missing_pub')", &[])
@@ -2272,12 +2353,38 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
     );
     info!("✓ verified source does not auto-create publication");
 
-    client
-        .execute("CREATE PUBLICATION missing_pub FOR TABLE orders", &[])
-        .await?;
+    // The admin creates and registers it; the source creates its slot
+    // after the registration (a slot from before it would be retained WAL).
+    sources::postgres::postgres_publication::fixtures::recreate_registered(
+        &client,
+        "missing_pub",
+        &["orders"],
+    )
+    .await?;
     info!("✓ admin created publication");
 
-    sleep(Duration::from_secs(2)).await;
+    // The source picks it up on its next retry and creates its slot then:
+    // write only once it streams from that slot (a row before the slot is
+    // not in its stream).
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let active: bool = client
+            .query_one(
+                "SELECT coalesce(bool_or(active), false) FROM pg_replication_slots \
+                 WHERE slot_name = 'slot_missing_pub'",
+                &[],
+            )
+            .await?
+            .get(0);
+        if active {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the source never streamed after the publication was created"
+        );
+        sleep(Duration::from_millis(200)).await;
+    }
     client
         .execute("INSERT INTO orders (id, name) VALUES (1, 'test')", &[])
         .await?;
@@ -2297,6 +2404,8 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
         .batch_execute("SELECT pg_drop_replication_slot('slot_missing_pub')")
         .await
         .ok();
+    sources::postgres::postgres_publication::fixtures::release_all(&client)
+        .await?;
     client
         .execute("DROP PUBLICATION IF EXISTS missing_pub", &[])
         .await?;
@@ -3939,4 +4048,819 @@ async fn logical_message_ids_are_replay_stable() -> Result<()> {
     cleanup_repl(&client, "pub_b", "slot_b").await;
     pg_drop_db(&db).await;
     Ok(())
+}
+
+/// The Relation-proven event schema (`pg_event_v2`) and its Relation
+/// bindings (design `docs/design/postgres-catalog-capture.md`).
+mod event_schema_identity {
+    use super::*;
+    use deltaforge_config::OnSchemaDrift;
+    use schema_registry::SourceSchema;
+    use serde_json::Value;
+    use storage::adapters::SchemaKey;
+    use storage::adapters::test_util::FaultBackend;
+
+    const BINDING_NS: &str = "schemas.v1.pg.relation_binding";
+
+    struct Es {
+        id: String,
+        db: String,
+        client: tokio_postgres::Client,
+        registry: Arc<storage::DurableSchemaRegistry>,
+        backend: storage::ArcStorageBackend,
+        ckpt: Arc<dyn CheckpointStore>,
+    }
+
+    impl Es {
+        /// A database with `orders` created by `ddl`, a FOR ALL TABLES
+        /// publication and a slot.
+        async fn new(id: &str, ddl: &[&str]) -> Result<Self> {
+            Self::over(id, ddl, make_storage_backend().await).await
+        }
+
+        async fn over(
+            id: &str,
+            ddl: &[&str],
+            backend: storage::ArcStorageBackend,
+        ) -> Result<Self> {
+            let (db, client) = pg_setup(id).await?;
+            for s in ddl {
+                client.batch_execute(s).await?;
+            }
+            client
+                .batch_execute(&format!(
+                    "GRANT SELECT ON ALL TABLES IN SCHEMA public TO {PG_CDC_USER}"
+                ))
+                .await?;
+            create_pub_slot(
+                &client,
+                &format!("pub_{id}"),
+                &format!("slot_{id}"),
+                &[],
+            )
+            .await?;
+            Ok(Self {
+                id: id.into(),
+                db,
+                client,
+                registry: storage::DurableSchemaRegistry::new(backend.clone())
+                    .await?,
+                backend,
+                ckpt: Arc::new(MemCheckpointStore::new()?),
+            })
+        }
+
+        /// Drop the slot, the publication and the database (slots are a
+        /// server-wide limited resource shared by every test).
+        async fn done(self) {
+            cleanup_repl(
+                &self.client,
+                &format!("pub_{}", self.id),
+                &format!("slot_{}", self.id),
+            )
+            .await;
+            pg_drop_db(&self.db).await;
+        }
+
+        async fn sql(&self, stmts: &[&str]) -> Result<()> {
+            for s in stmts {
+                self.client.batch_execute(s).await?;
+            }
+            Ok(())
+        }
+
+        /// Run the source under `policy`, execute `writes` once it streams,
+        /// and collect until row `until` arrives or the source stops.
+        async fn run(
+            &self,
+            policy: OnSchemaDrift,
+            writes: &[&str],
+            until: i32,
+        ) -> (Vec<Event>, std::result::Result<(), anyhow::Error>) {
+            self.run_on(
+                self.registry.clone(),
+                self.backend.clone(),
+                self.ckpt.clone(),
+                policy,
+                writes,
+                until,
+            )
+            .await
+        }
+
+        async fn run_on(
+            &self,
+            registry: Arc<storage::DurableSchemaRegistry>,
+            backend: storage::ArcStorageBackend,
+            ckpt: Arc<dyn CheckpointStore>,
+            policy: OnSchemaDrift,
+            writes: &[&str],
+            until: i32,
+        ) -> (Vec<Event>, std::result::Result<(), anyhow::Error>) {
+            let src = configured_source(
+                &self.id,
+                &self.db,
+                &format!("slot_{}", self.id),
+                &format!("pub_{}", self.id),
+                policy,
+                registry,
+                backend,
+            )
+            .await;
+            let (tx, mut rx) =
+                test_common::acked_channel(&src, &ckpt, &src.id, 128);
+            let h = src.run(tx, ckpt.clone()).await;
+            sleep(Duration::from_secs(3)).await;
+            self.sql(writes).await.unwrap();
+            let events = collect_until(&mut rx, Duration::from_secs(12), |e| {
+                e.iter().any(|x| has_id(x, until))
+            })
+            .await;
+            let items = drain_items(&mut rx, Duration::from_millis(500)).await;
+            let mut events = events;
+            events.extend(items.into_iter().filter_map(|i| match i {
+                SourceItem::Event(e) => Some(e),
+                _ => None,
+            }));
+            h.stop();
+            let ended = h.join().await.map(|_| ());
+            (events, ended)
+        }
+
+        async fn key(&self) -> Result<SchemaKey> {
+            schema_key(&self.client, &self.id, "public", "orders").await
+        }
+
+        async fn bindings(&self) -> Result<Vec<Value>> {
+            Ok(self
+                .backend
+                .log_list(BINDING_NS, &self.key().await?.backend_key())
+                .await?
+                .into_iter()
+                .map(|(_, b)| serde_json::from_slice(&b).unwrap())
+                .collect())
+        }
+
+        async fn versions(
+            &self,
+        ) -> Result<Vec<schema_registry::SchemaVersion>> {
+            Ok(self
+                .registry
+                .history_page(&self.key().await?, None, 1000)
+                .await?
+                .versions)
+        }
+
+        async fn oid(&self) -> Result<u32> {
+            Ok(self
+                .client
+                .query_one("SELECT 'public.orders'::regclass::oid", &[])
+                .await?
+                .get(0))
+        }
+    }
+
+    fn row(events: &[Event], id: i32) -> &Event {
+        events
+            .iter()
+            .find(|e| has_id(e, id))
+            .unwrap_or_else(|| panic!("row {id} not delivered"))
+    }
+
+    fn halted(ended: &std::result::Result<(), anyhow::Error>) {
+        let msg = format!("{:#}", ended.as_ref().expect_err("must halt"));
+        assert!(msg.contains("on_schema_drift=halt"), "{msg}");
+    }
+
+    const ORDERS: &str =
+        "CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64))";
+
+    /// S1, T6: the same content under two OIDs (dropped and recreated while
+    /// stopped) has one public fingerprint and two bindings, and is not
+    /// drift: Halt streams on.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn identical_content_under_two_oids_shares_a_fingerprint()
+    -> Result<()> {
+        let es = Es::new("esoids", &[ORDERS]).await?;
+        let (ev, _) = es
+            .run(
+                OnSchemaDrift::Halt,
+                &["INSERT INTO orders VALUES (1, 'a')"],
+                1,
+            )
+            .await;
+        let f1 = row(&ev, 1).schema_version.clone().unwrap();
+        let oid1 = es.oid().await?;
+        // A published table is recreated only through maintenance: the
+        // source is stopped (run returned), a decision is recorded, the
+        // registration is released, the change applied and re-registered.
+        sources::postgres::postgres_publication::fixtures::decide_for(
+            &es.backend,
+            "acme",
+            &es.id,
+            &format!("pub_{}", es.id),
+            "abandon",
+        )
+        .await?;
+        sources::postgres::postgres_publication::fixtures::release_all(
+            &es.client,
+        )
+        .await?;
+        es.sql(&["DROP TABLE orders", ORDERS]).await?;
+        es.sql(&[&format!("GRANT SELECT ON orders TO {PG_CDC_USER}")])
+            .await?;
+        sources::postgres::postgres_publication::fixtures::recreate_registered(
+            &es.client,
+            &format!("pub_{}", es.id),
+            &["orders"],
+        )
+        .await?;
+        let (ev, ended) = es
+            .run(
+                OnSchemaDrift::Halt,
+                &["INSERT INTO orders VALUES (2, 'b')"],
+                2,
+            )
+            .await;
+        assert!(ended.is_ok(), "no drift: {ended:?}");
+        assert_eq!(row(&ev, 2).schema_version.clone().unwrap(), f1);
+        let oid2 = es.oid().await?;
+        assert_ne!(oid1, oid2);
+        let b = es.bindings().await?;
+        let oids: Vec<u64> =
+            b.iter().map(|x| x["oid"].as_u64().unwrap()).collect();
+        assert_eq!(oids, [oid1 as u64, oid2 as u64]);
+        assert_eq!(b[0]["fingerprint"], b[1]["fingerprint"]);
+        assert_ne!(b[0]["digest"], b[1]["digest"]);
+        assert_eq!(es.versions().await?.len(), 1, "one content version");
+        es.done().await;
+        Ok(())
+    }
+
+    /// S2, retained WAL: rows of the old relation keep their own binding
+    /// after the table is recreated with another shape; no live catalog is
+    /// consulted for them.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn retained_rows_bind_to_their_own_relation() -> Result<()> {
+        let es = Es::new("esretain", &[ORDERS]).await?;
+        let (ev, _) = es
+            .run(
+                OnSchemaDrift::Adapt,
+                &["INSERT INTO orders VALUES (1, 'a')"],
+                1,
+            )
+            .await;
+        let f_old = row(&ev, 1).schema_version.clone().unwrap();
+        let oid_old = es.oid().await?;
+        es.sql(&["INSERT INTO orders VALUES (2, 'b')"]).await?;
+        // The publication contract refuses dropping (and so recreating) a
+        // published table; the retained row keeps its own binding and a
+        // shape change is an ALTER, which is drift.
+        assert!(es.sql(&["DROP TABLE orders"]).await.is_err());
+        es.sql(&[
+            "ALTER TABLE orders ADD COLUMN note TEXT",
+            "INSERT INTO orders VALUES (3, 'c', 'n')",
+        ])
+        .await?;
+        let (ev, _) = es.run(OnSchemaDrift::Adapt, &[], 3).await;
+        assert_eq!(row(&ev, 2).schema_version.clone().unwrap(), f_old);
+        assert_eq!(
+            row(&ev, 2)
+                .after
+                .as_ref()
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_ne!(row(&ev, 3).schema_version.clone().unwrap(), f_old);
+        assert_eq!(row(&ev, 3).after.as_ref().unwrap()["note"], "n");
+        let b = es.bindings().await?;
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0]["oid"].as_u64().unwrap(), oid_old as u64);
+        assert_eq!(b[1]["oid"].as_u64().unwrap(), oid_old as u64);
+        assert_ne!(b[0]["digest"], b[1]["digest"]);
+        es.done().await;
+        Ok(())
+    }
+
+    /// T6: an in-stream typmod change is drift. Halt stops before the next
+    /// row; Adapt stamps it with the new typmod.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn a_typmod_change_in_stream_is_drift() -> Result<()> {
+        let fault = Arc::new(FaultBackend::wrap(make_storage_backend().await));
+        let backend: storage::ArcStorageBackend = fault.clone();
+        let es = Es::over("estypmod", &[ORDERS], backend).await?;
+        let (ev, ended) = es
+            .run(
+                OnSchemaDrift::Halt,
+                &[
+                    "INSERT INTO orders VALUES (1, 'a')",
+                    "ALTER TABLE orders ALTER COLUMN sku TYPE VARCHAR(128)",
+                    "INSERT INTO orders VALUES (2, 'b')",
+                ],
+                2,
+            )
+            .await;
+        halted(&ended);
+        assert!(!ev.iter().any(|e| has_id(e, 2)));
+        let f1 = row(&ev, 1).schema_version.clone().unwrap();
+
+        // Adapt with the binding store failing: the changed row is never
+        // emitted before its binding is durable.
+        fault.fail_writes_to.lock().unwrap().push(BINDING_NS.into());
+        let (ev, ended) = es.run(OnSchemaDrift::Adapt, &[], 2).await;
+        assert!(ended.is_err(), "no binding, no row");
+        assert!(!ev.iter().any(|e| has_id(e, 2)));
+        assert_eq!(es.bindings().await?.len(), 1, "only the old binding");
+
+        // Adapt with a working store: the row arrives with the new binding
+        // already durable, stamped with the new typmod's version.
+        fault.fail_writes_to.lock().unwrap().clear();
+        let (ev, ended) = es.run(OnSchemaDrift::Adapt, &[], 2).await;
+        assert!(ended.is_ok(), "{ended:?}");
+        let f2 = row(&ev, 2).schema_version.clone().unwrap();
+        assert_ne!(f1, f2);
+        let b = es.bindings().await?;
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[1]["fingerprint"], f2.as_str());
+        let v = es
+            .versions()
+            .await?
+            .into_iter()
+            .find(|v| v.hash == f2)
+            .unwrap();
+        assert_eq!(v.schema_json["columns"][1]["typmod"], 132);
+        es.done().await;
+        Ok(())
+    }
+
+    /// T6: a key-flag change (replica identity DEFAULT to FULL) in-stream
+    /// is drift.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn a_key_flag_change_in_stream_is_drift() -> Result<()> {
+        let es = Es::new("eskey", &[ORDERS]).await?;
+        let (ev, ended) = es
+            .run(
+                OnSchemaDrift::Halt,
+                &[
+                    "INSERT INTO orders VALUES (1, 'a')",
+                    "ALTER TABLE orders REPLICA IDENTITY FULL",
+                    "INSERT INTO orders VALUES (2, 'b')",
+                ],
+                2,
+            )
+            .await;
+        assert!(ev.iter().any(|e| has_id(e, 1)));
+        assert!(!ev.iter().any(|e| has_id(e, 2)));
+        halted(&ended);
+        es.done().await;
+        Ok(())
+    }
+
+    /// T6: a replica identity change while stopped is drift on the first
+    /// Relation of the next run.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn a_replica_identity_change_while_stopped_is_drift() -> Result<()> {
+        let es = Es::new("esident", &[ORDERS]).await?;
+        let _ = es
+            .run(
+                OnSchemaDrift::Halt,
+                &["INSERT INTO orders VALUES (1, 'a')"],
+                1,
+            )
+            .await;
+        es.sql(&[
+            "ALTER TABLE orders REPLICA IDENTITY FULL",
+            "INSERT INTO orders VALUES (2, 'b')",
+        ])
+        .await?;
+        let (ev, ended) = es.run(OnSchemaDrift::Halt, &[], 2).await;
+        assert!(!ev.iter().any(|e| has_id(e, 2)));
+        halted(&ended);
+        es.done().await;
+        Ok(())
+    }
+
+    /// S8: renaming a user-defined type changes no content and is not drift.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn a_user_type_rename_is_not_drift() -> Result<()> {
+        let es = Es::new(
+            "esenum",
+            &[
+                "CREATE TYPE mood AS ENUM ('ok', 'sad')",
+                "CREATE TABLE orders (id INT PRIMARY KEY, m mood)",
+            ],
+        )
+        .await?;
+        let (ev, ended) = es
+            .run(
+                OnSchemaDrift::Halt,
+                &[
+                    "INSERT INTO orders VALUES (1, 'ok')",
+                    "ALTER TYPE mood RENAME TO feeling",
+                    "INSERT INTO orders VALUES (2, 'sad')",
+                ],
+                2,
+            )
+            .await;
+        assert!(ended.is_ok(), "{ended:?}");
+        assert_eq!(row(&ev, 1).schema_version, row(&ev, 2).schema_version);
+        es.done().await;
+        Ok(())
+    }
+
+    /// P8: a crash between registering the version and appending its binding
+    /// converges on the next run: the same version, one binding, the row
+    /// delivered.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn the_binding_state_machine_converges_after_a_crash() -> Result<()> {
+        let fault = Arc::new(FaultBackend::wrap(make_storage_backend().await));
+        let backend: storage::ArcStorageBackend = fault.clone();
+        let es = Es::over("escrash", &[ORDERS], backend).await?;
+        fault.fail_writes_to.lock().unwrap().push(BINDING_NS.into());
+        let (ev, ended) = es
+            .run(
+                OnSchemaDrift::Halt,
+                &["INSERT INTO orders VALUES (1, 'a')"],
+                1,
+            )
+            .await;
+        assert!(ended.is_err(), "the failed binding append stops the source");
+        assert!(
+            !ev.iter().any(|e| has_id(e, 1)),
+            "no row before its binding"
+        );
+        assert_eq!(es.versions().await?.len(), 1, "R happened");
+        assert!(es.bindings().await?.is_empty(), "B did not");
+        fault.fail_writes_to.lock().unwrap().clear();
+        let (ev, ended) = es.run(OnSchemaDrift::Halt, &[], 1).await;
+        assert!(ended.is_ok(), "{ended:?}");
+        let f = row(&ev, 1).schema_version.clone().unwrap();
+        assert_eq!(es.versions().await?.len(), 1, "R is idempotent");
+        let b = es.bindings().await?;
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0]["fingerprint"], f.as_str());
+
+        es.done().await;
+        Ok(())
+    }
+
+    /// P8: a stored binding under the same digest with other bytes is
+    /// corruption: the source fails closed and never overwrites it.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn a_conflicting_binding_fails_closed() -> Result<()> {
+        let es = Es::new("esconflict", &[ORDERS]).await?;
+        let _ = es
+            .run(
+                OnSchemaDrift::Halt,
+                &["INSERT INTO orders VALUES (1, 'a')"],
+                1,
+            )
+            .await;
+        let mut forged = es.bindings().await?.remove(0);
+        let digest = forged["digest"].as_str().unwrap().to_string();
+        forged["schema_version"] = 99.into();
+        let other = make_storage_backend().await;
+        other
+            .log_append_if_absent(
+                BINDING_NS,
+                &es.key().await?.backend_key(),
+                &digest,
+                &serde_json::to_vec(&forged)?,
+            )
+            .await?;
+        let registry =
+            storage::DurableSchemaRegistry::new(other.clone()).await?;
+        let ckpt: Arc<dyn CheckpointStore> =
+            Arc::new(MemCheckpointStore::new()?);
+        let (ev, ended) = es
+            .run_on(
+                registry,
+                other.clone(),
+                ckpt,
+                OnSchemaDrift::Halt,
+                &["INSERT INTO orders VALUES (2, 'b')"],
+                2,
+            )
+            .await;
+        let msg = format!("{:#}", ended.expect_err("conflict fails closed"));
+        assert!(msg.contains("conflicts"), "{msg}");
+        assert!(!ev.iter().any(|e| has_id(e, 2)));
+        es.done().await;
+        Ok(())
+    }
+
+    /// S3, P12: a table with only legacy (catalog-capture) history upgrades
+    /// once: no drift for an unchanged table, one `pg_event_v2` version
+    /// registered next to the untouched legacy one, nothing new on restart.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn legacy_history_upgrades_once() -> Result<()> {
+        let es = Es::new("eslegacy", &[ORDERS]).await?;
+        let oid = es.oid().await?;
+        let legacy = serde_json::json!({
+            "columns": [
+                {"name": "id", "data_type": "integer", "type_oid": 23,
+                 "nullable": false, "ordinal_position": 1},
+                {"name": "sku", "data_type": "character varying",
+                 "type_oid": 1043, "nullable": true, "ordinal_position": 2},
+            ],
+            "primary_key": ["id"],
+            "replica_identity": "default",
+            "oid": oid,
+            "schema_name": "public",
+        });
+        let legacy_fp = serde_json::from_value::<
+            sources::postgres::postgres_table_schema::PostgresTableSchema,
+        >(legacy.clone())?
+        .fingerprint();
+        let key = es.key().await?;
+        es.registry
+            .register_with_checkpoint(&key, &legacy_fp, &legacy, None)
+            .await?;
+        let (ev, ended) = es
+            .run(
+                OnSchemaDrift::Halt,
+                &["INSERT INTO orders VALUES (1, 'a')"],
+                1,
+            )
+            .await;
+        assert!(ended.is_ok(), "no drift: {ended:?}");
+        let f = row(&ev, 1).schema_version.clone().unwrap();
+        assert_ne!(f, legacy_fp);
+        let v = es.versions().await?;
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].hash, legacy_fp, "the legacy version is untouched");
+        assert_eq!(v[0].schema_json, legacy);
+        assert_eq!(v[1].schema_json["format"], "pg_event_v2");
+        let (_, ended) = es
+            .run(
+                OnSchemaDrift::Halt,
+                &["INSERT INTO orders VALUES (2, 'b')"],
+                2,
+            )
+            .await;
+        assert!(ended.is_ok());
+        assert_eq!(es.versions().await?.len(), 2, "not registered again");
+        es.done().await;
+        Ok(())
+    }
+
+    const ANNOTATION_NS: &str = "schemas.v1.pg.catalog_annotation";
+
+    impl Es {
+        /// Like `run`, but each phase's writes start only after the
+        /// previous phase's row arrived.
+        async fn run_phases(
+            &self,
+            policy: OnSchemaDrift,
+            phases: &[(&[&str], i32)],
+        ) -> (Vec<Event>, std::result::Result<(), anyhow::Error>) {
+            let src = configured_source(
+                &self.id,
+                &self.db,
+                &format!("slot_{}", self.id),
+                &format!("pub_{}", self.id),
+                policy,
+                self.registry.clone(),
+                self.backend.clone(),
+            )
+            .await;
+            let (tx, mut rx) =
+                test_common::acked_channel(&src, &self.ckpt, &src.id, 128);
+            let h = src.run(tx, self.ckpt.clone()).await;
+            sleep(Duration::from_secs(3)).await;
+            let mut events = Vec::new();
+            for (writes, until) in phases {
+                self.sql(writes).await.unwrap();
+                events.extend(
+                    collect_until(&mut rx, Duration::from_secs(12), |e| {
+                        e.iter().any(|x| has_id(x, *until))
+                    })
+                    .await,
+                );
+            }
+            events.extend(
+                drain_items(&mut rx, Duration::from_millis(500))
+                    .await
+                    .into_iter()
+                    .filter_map(|i| match i {
+                        SourceItem::Event(e) => Some(e),
+                        _ => None,
+                    }),
+            );
+            h.stop();
+            let ended = h.join().await.map(|_| ());
+            (events, ended)
+        }
+
+        async fn annotations(&self) -> Result<Vec<Value>> {
+            Ok(self
+                .backend
+                .log_list(ANNOTATION_NS, &self.key().await?.backend_key())
+                .await?
+                .into_iter()
+                .map(|(_, b)| serde_json::from_slice(&b).unwrap())
+                .collect())
+        }
+
+        async fn incidents(
+            &self,
+            reason: deltaforge_core::incident::ReasonCode,
+        ) -> Result<Vec<storage::adapters::incidents::IncidentRecord>> {
+            Ok(storage::adapters::incidents::IncidentStore::new(
+                self.backend.clone(),
+                "test",
+            )
+            .list()
+            .await?
+            .into_iter()
+            .filter(|r| r.reason_code == reason)
+            .collect())
+        }
+    }
+
+    /// P9: one annotation per catalog content, never one per restart; it is
+    /// labelled capture-time with the position read under the proof.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn annotations_are_capture_time_and_deduplicated() -> Result<()> {
+        let es = Es::new("esann", &[ORDERS]).await?;
+        let _ = es
+            .run(
+                OnSchemaDrift::Halt,
+                &["INSERT INTO orders VALUES (1, 'a')"],
+                1,
+            )
+            .await;
+        let _ = es
+            .run(
+                OnSchemaDrift::Halt,
+                &["INSERT INTO orders VALUES (2, 'b')"],
+                2,
+            )
+            .await;
+        let a = es.annotations().await?;
+        assert_eq!(a.len(), 1, "no new annotation for a restart: {a:?}");
+        assert_eq!(a[0]["provenance"], "catalog_at_capture");
+        assert!(a[0]["captured_lsn"].as_str().unwrap().contains('/'));
+        assert_eq!(a[0]["attributes"]["primary_key"][0], "id");
+        // A catalog-only change (NOT NULL) adds one annotation and no new
+        // event schema version.
+        let (ev, _) = es
+            .run(
+                OnSchemaDrift::Halt,
+                &[
+                    "ALTER TABLE orders ALTER COLUMN sku SET NOT NULL",
+                    "INSERT INTO orders VALUES (3, 'c')",
+                ],
+                3,
+            )
+            .await;
+        assert!(ev.iter().any(|e| has_id(e, 3)), "not drift");
+        let a = es.annotations().await?;
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[1]["attributes"]["columns"][1]["not_null"], true);
+        assert_eq!(es.versions().await?.len(), 1, "content unchanged");
+        es.done().await;
+        Ok(())
+    }
+
+    /// P9: an annotation write failure never blocks rows; it raises the
+    /// running-degraded incident, resolved once a later write succeeds.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn an_annotation_failure_is_degraded_then_resolved() -> Result<()> {
+        use deltaforge_core::incident::{ReasonCode, SafetyState};
+        let fault = Arc::new(FaultBackend::wrap(make_storage_backend().await));
+        let backend: storage::ArcStorageBackend = fault.clone();
+        let es = Es::over("esannfail", &[ORDERS], backend).await?;
+        fault
+            .fail_writes_to
+            .lock()
+            .unwrap()
+            .push(ANNOTATION_NS.into());
+        let (ev, ended) = es
+            .run(
+                OnSchemaDrift::Halt,
+                &["INSERT INTO orders VALUES (1, 'a')"],
+                1,
+            )
+            .await;
+        assert!(ended.is_ok(), "{ended:?}");
+        assert!(ev.iter().any(|e| has_id(e, 1)), "rows unaffected");
+        let open = es.incidents(ReasonCode::PgAnnotationUnavailable).await?;
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].safety_state, SafetyState::RunningDegraded);
+        assert!(!open[0].status.is_resolved());
+        fault.fail_writes_to.lock().unwrap().clear();
+        let _ = es
+            .run(
+                OnSchemaDrift::Halt,
+                &["INSERT INTO orders VALUES (2, 'b')"],
+                2,
+            )
+            .await;
+        let after = es.incidents(ReasonCode::PgAnnotationUnavailable).await?;
+        assert!(after.iter().all(|r| r.status.is_resolved()), "{after:?}");
+        assert_eq!(es.annotations().await?.len(), 1);
+        es.done().await;
+        Ok(())
+    }
+
+    /// P10: steady DML costs no catalog work: one stamp per Relation and one
+    /// locked capture; stats-only re-sends (ANALYZE, VACUUM) cost a stamp,
+    /// never a capture.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn steady_dml_causes_no_catalog_captures() -> Result<()> {
+        let es = Es::new("essteady", &[ORDERS]).await?;
+        sources::catalog_probe::reset();
+        let mut writes: Vec<String> = (1..=300)
+            .map(|i| format!("INSERT INTO orders VALUES ({i}, 'x')"))
+            .collect();
+        writes.push("ANALYZE orders".into());
+        writes.push("VACUUM orders".into());
+        writes.push("INSERT INTO orders VALUES (1000, 'y')".into());
+        let w: Vec<&str> = writes.iter().map(String::as_str).collect();
+        let (ev, ended) = es.run(OnSchemaDrift::Halt, &w, 1000).await;
+        assert!(ended.is_ok(), "{ended:?}");
+        assert!(ev.iter().any(|e| has_id(e, 1000)));
+        let (stamps, captures) = sources::catalog_probe::counts();
+        assert_eq!(captures, 1, "one locked capture for 301 transactions");
+        assert!(
+            (1..=3).contains(&stamps),
+            "one stamp per Relation (first, plus stats re-sends): {stamps}"
+        );
+        es.done().await;
+        Ok(())
+    }
+
+    /// P11 (generated column): added after startup, the table is refused
+    /// before its next row; nothing after it is emitted.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn a_generated_column_added_mid_stream_is_refused() -> Result<()> {
+        use deltaforge_core::incident::ReasonCode;
+        let es = Es::new("esgen", &[ORDERS]).await?;
+        let (ev, ended) = es
+            .run_phases(
+                OnSchemaDrift::Adapt,
+                &[
+                    (&["INSERT INTO orders VALUES (1, 'a')"], 1),
+                    (
+                        &[
+                            "ALTER TABLE orders ADD COLUMN twice INT \
+                             GENERATED ALWAYS AS (id * 2) STORED",
+                            "INSERT INTO orders VALUES (2, 'b')",
+                        ],
+                        2,
+                    ),
+                ],
+            )
+            .await;
+        assert!(ev.iter().any(|e| has_id(e, 1)));
+        assert!(!ev.iter().any(|e| has_id(e, 2)), "refused before row 2");
+        let msg = format!("{:#}", ended.expect_err("refused"));
+        assert!(msg.contains("generated"), "{msg}");
+        let _ = ReasonCode::PgTableUnsupported;
+        es.done().await;
+        Ok(())
+    }
+
+    async fn schema_key(
+        client: &tokio_postgres::Client,
+        id: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<SchemaKey> {
+        let row = client
+            .query_one(
+                "SELECT system_identifier, (SELECT oid::int8 FROM pg_database \
+                 WHERE datname = current_database()) FROM pg_control_system()",
+                &[],
+            )
+            .await?;
+        let lineage = storage::adapters::LineageDescriptor::Postgres {
+            system_identifier: row.get::<_, i64>(0) as u64,
+            database_oid: row.get::<_, i64>(1) as u64,
+        };
+        Ok(SchemaKey::new(
+            "acme",
+            id,
+            lineage.lineage_hash().as_str(),
+            schema,
+            table,
+        ))
+    }
 }

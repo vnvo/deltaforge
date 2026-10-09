@@ -55,9 +55,12 @@ async fn pg_source(
     cfg: SnapshotCfg,
     backend: storage::ArcStorageBackend,
 ) -> Result<PostgresSource> {
-    client
-        .batch_execute(&format!("CREATE PUBLICATION pub_{id} FOR ALL TABLES"))
-        .await?;
+    sources::postgres::postgres_publication::fixtures::recreate_registered(
+        client,
+        &format!("pub_{id}"),
+        &[],
+    )
+    .await?;
     Ok(PostgresSource {
         id: id.into(),
         dsn: pg_admin_dsn(db).await.into(),
@@ -707,11 +710,16 @@ async fn snapshot_with_setup(
     client
         .batch_execute(
             "CREATE TABLE other_a (id INT PRIMARY KEY); \
-             CREATE TABLE zz_other (id INT PRIMARY KEY); \
-             CREATE PUBLICATION pub_shape FOR ALL TABLES;",
+             CREATE TABLE zz_other (id INT PRIMARY KEY);",
         )
         .await?;
     client.batch_execute(setup).await?;
+    sources::postgres::postgres_publication::fixtures::recreate_registered(
+        &client,
+        "pub_shape",
+        &[],
+    )
+    .await?;
     let slot = format!("slot_shape{n}");
     let src = PostgresSource {
         id: format!("shape{n}"),
@@ -744,9 +752,15 @@ async fn snapshot_with_setup(
         Hold::BeforeAnchor => snapshot_probe::hold_before_anchor(),
     });
     let handle = deltaforge_core::Source::run(&src, tx, chkpt.clone()).await;
+    // The hold is always released, whatever the DDL's outcome.
+    let mut ddl_err = None;
     if let (Some((reached, release)), Some((_, ddl))) = (&hold, ddl) {
         reached.notified().await;
-        client.batch_execute(ddl).await?;
+        ddl_err = client.batch_execute(ddl).await.err().map(|e| {
+            e.as_db_error()
+                .map(|d| d.message().to_string())
+                .unwrap_or_else(|| e.to_string())
+        });
         release.notify_one();
     }
     let mut reads = 0;
@@ -785,6 +799,7 @@ async fn snapshot_with_setup(
         err,
         finished,
         generation_status,
+        ddl_err,
     })
 }
 
@@ -806,6 +821,8 @@ struct SnapRun {
     finished: bool,
     /// The control record's state (`None`: no record).
     generation_status: Option<String>,
+    /// The held DDL's error, if it was refused.
+    ddl_err: Option<String>,
 }
 
 /// Discovery reads the catalog in pages and each table is prepared once:
@@ -946,16 +963,15 @@ async fn discovery_pages_share_one_catalog_snapshot() -> Result<()> {
     );
     assert!(run.err.is_none() && run.finished);
 
+    // A published table cannot be dropped mid-discovery: the publication
+    // contract refuses it, and the snapshot copies every table.
     let run =
         snapshot_with_ddl(25, Some((Hold::FirstPage, "DROP TABLE pgt_020")))
             .await?;
-    let err = run.err.expect("the snapshot stops");
-    assert!(
-        err.contains("pgt_020") && err.contains("no longer exists"),
-        "{err}"
-    );
-    assert_eq!(run.reads, 0, "before any row");
-    assert!(!run.finished);
+    let refused = run.ddl_err.expect("the drop is refused");
+    assert!(refused.starts_with("deltaforge:"), "{refused}");
+    assert_eq!(run.reads, 25);
+    assert!(run.err.is_none() && run.finished);
 
     let run = snapshot_with_ddl(
         25,

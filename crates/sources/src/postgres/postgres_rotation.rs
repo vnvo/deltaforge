@@ -368,6 +368,8 @@ impl RotationRuntime {
         {
             ctx.dsn = candidate.dsn.clone();
             ctx.schema.set_dsn(candidate.dsn.clone());
+            // The catalog session follows the rotated credentials too.
+            ctx.catalog.set_dsn(candidate.dsn.clone());
         }
         Ok(())
     }

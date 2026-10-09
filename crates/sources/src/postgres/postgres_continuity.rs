@@ -189,6 +189,20 @@ pub struct SessionFacts {
     pub in_recovery: bool,
     /// `None`: no slot of that name.
     pub slot: Option<SlotFacts>,
+    /// This session's own walsender, as `pg_stat_activity` shows it.
+    pub walsender: Option<Walsender>,
+}
+
+/// A replication session's walsender identity: with the session's nonce in
+/// `application_name`, what binds a catalog session to the node and live
+/// walsender that produce the stream (design section 8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Walsender {
+    pub pid: i32,
+    /// `pg_stat_activity.backend_start`, as text (microsecond precision).
+    pub backend_start: String,
+    /// The session's `application_name`: `deltaforge:<128-bit hex nonce>`.
+    pub application_name: String,
 }
 
 /// Where in a continuity chain a checkpoint was read.
@@ -404,6 +418,8 @@ pub(crate) struct Proven {
     /// The record must be persisted before the stream starts.
     pub record_changed: bool,
     pub failover_slot: FailoverSlot,
+    /// The proven session's walsender (from its facts).
+    pub walsender: Option<Walsender>,
 }
 
 /// Safe-text facts behind a refusal.
@@ -612,6 +628,7 @@ pub(crate) fn prove(
         record,
         record_changed: !unchanged,
         failover_slot,
+        walsender: facts.walsender.clone(),
     })
 }
 
@@ -648,6 +665,7 @@ mod tests {
             server_version_num: 170_002,
             in_recovery: false,
             slot: Some(good_slot()),
+            walsender: None,
         }
     }
 

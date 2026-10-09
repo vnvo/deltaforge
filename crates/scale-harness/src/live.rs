@@ -366,6 +366,11 @@ async fn prepare(
                  CREATE PUBLICATION scale_pub FOR TABLE app_events;",
             )
             .await?;
+            sources::postgres::postgres_publication::register(
+                &c,
+                &["scale_pub".to_string()],
+            )
+            .await?;
             for n in 0..catalog {
                 c.batch_execute(&format!(
                     "CREATE TABLE {} (id BIGINT PRIMARY KEY, v TEXT)",

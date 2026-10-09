@@ -50,7 +50,12 @@ pub mod postgres_rotation;
 use postgres_slot_owner::prepare_snapshot_slot_anchor;
 
 pub mod postgres_object;
+pub mod postgres_publication;
 
+mod postgres_builtin_types;
+mod postgres_catalog_capture;
+pub mod postgres_event_schema;
+mod postgres_relation_binding;
 mod postgres_schema_loader;
 pub use postgres_schema_loader::{LoadedSchema, PostgresSchemaLoader};
 
@@ -339,6 +344,10 @@ pub(crate) struct RunCtx {
     pub pause_notify: Arc<Notify>,
     pub schema: PostgresSchemaLoader,
     pub allow: AllowList,
+    /// The publication and the registration this run accepted (verified
+    /// again before every stream's first message).
+    pub publication: String,
+    pub publication_registration: postgres_publication::Registration,
     pub retry: RetryPolicy,
     pub inactivity: Duration,
     pub relation_map: HashMap<u32, RelationInfo>,
@@ -387,6 +396,14 @@ pub(crate) struct RunCtx {
     /// That stamp as checkpoint JSON members, refreshed whenever another
     /// stream becomes authoritative (before its first event is read).
     pub stamp_members: Arc<str>,
+    /// The authoritative stream's walsender token, for catalog proofs.
+    pub(crate) stream_token:
+        Arc<std::sync::RwLock<Option<postgres_helpers::StreamToken>>>,
+    /// The catalog session (every read on it carries its own proof).
+    pub(crate) catalog: postgres_catalog_capture::CatalogSession,
+    /// Per table seen this run: the digest of its last captured catalog
+    /// inputs (a changed stamp triggers a locked capture).
+    pub(crate) catalog_digests: HashMap<(String, String), String>,
 }
 
 impl RunCtx {
@@ -1540,11 +1557,35 @@ impl PostgresSource {
                     }
                     Err(LoopControl::ReloadSchema { .. }) => continue,
                     // The ensure/startup path does not decode Relation messages,
-                    // so drift cannot originate here; reload-and-retry defensively.
+                    // so drift cannot originate here; retry defensively.
                     Err(LoopControl::SchemaDrift(_)) => continue,
                 }
             }
         };
+
+        // The immutable-publication contract, before anything is snapshotted,
+        // decoded, emitted or checkpointed: registered, enforced, unchanged
+        // since the registration this source accepted (or re-registered under
+        // a recorded maintenance decision), and no stream from before it.
+        let publication_key = postgres_publication::record_key(
+            &self.tenant,
+            &self.id,
+            &self.publication,
+        );
+        let admitted = postgres_publication::verify_for_start(
+            self.dsn.expose(),
+            &self.id,
+            &self.publication,
+            &self.backend,
+            &publication_key,
+            if needs_snapshot {
+                postgres_publication::Start::Generation
+            } else {
+                postgres_publication::Start::Stream(start_lsn.as_u64())
+            },
+        )
+        .await?;
+        let start_lsn = admitted.abandon_to.map(Lsn::from).unwrap_or(start_lsn);
 
         let schema_loader = PostgresSchemaLoader::new(
             self.dsn.clone(),
@@ -1656,6 +1697,7 @@ impl PostgresSource {
             active: Default::default(),
             recovery_window: REACHABILITY_RETRY_WINDOW,
             recovery_retry: Default::default(),
+            token: Default::default(),
         };
 
         let client = connect_replication_with_retries(
@@ -1683,6 +1725,8 @@ impl PostgresSource {
             pause_notify,
             schema: schema_loader,
             allow: AllowList::new(&self.tables),
+            publication: self.publication.clone(),
+            publication_registration: admitted.registration.clone(),
             retry: RetryPolicy::default(),
             inactivity: Duration::from_secs(60),
             relation_map: HashMap::new(),
@@ -1712,7 +1756,12 @@ impl PostgresSource {
             ),
             cached_lsn: None,
             stamp: Arc::clone(&stream_proof.active),
+            stream_token: Arc::clone(&stream_proof.token),
             stamp_members: Arc::from(""),
+            catalog: postgres_catalog_capture::CatalogSession::new(
+                self.dsn.clone(),
+            ),
+            catalog_digests: HashMap::new(),
         };
         ctx.refresh_stamp();
 
@@ -1844,12 +1893,14 @@ impl PostgresSource {
                     }
                 }
                 Err(LoopControl::SchemaDrift(drift)) => {
-                    // Apply the policy, failing closed on a reload error under
-                    // Adapt or on Halt. The drift Relation precedes the
-                    // transaction's rows, so failing here leaves the open
-                    // transaction uncommitted (the coordinator discards it, no
-                    // sink checkpoint advances past the last committed pre-drift
-                    // transaction) and skips the graceful-stop checkpoint put.
+                    // Apply the policy. Halt fails closed: the drift Relation
+                    // precedes the transaction's rows, so the open transaction
+                    // stays uncommitted (the coordinator discards it, no sink
+                    // checkpoint advances past the last committed pre-drift
+                    // transaction) and the graceful-stop checkpoint put is
+                    // skipped. Adapt continues: the changed table's next row
+                    // binds its new Relation (version, then binding, durable)
+                    // before it is emitted.
                     apply_schema_drift(
                         &ctx.schema,
                         &self.on_schema_drift,
@@ -2511,12 +2562,12 @@ async fn fetch_pg_lineage_verified(
                 if attempt >= IDENTITY_FETCH_ATTEMPTS {
                     return Err(SourceError::Other(anyhow::anyhow!(
                         "failed to fetch server identity after {attempt} \
-                         attempts: {e}; refusing to stream on unverified \
+                         attempts: {e:#}; refusing to stream on unverified \
                          identity"
                     )));
                 }
                 warn!(
-                    attempt, error = %e,
+                    attempt, error = %format!("{e:#}"),
                     "postgres identity fetch failed; retrying before failing closed"
                 );
                 tokio::time::sleep(Duration::from_millis(
@@ -3266,6 +3317,13 @@ async fn verify_before_reconnect(ctx: &mut RunCtx) -> SourceResult<bool> {
 /// server it reached must still be the source's. An unverifiable identity
 /// fails closed rather than skipping the check.
 async fn check_identity_post_reconnect(ctx: &mut RunCtx) -> SourceResult<()> {
+    postgres_publication::verify_for_reconnect(
+        ctx.dsn.expose(),
+        &ctx.source_id,
+        &ctx.publication,
+        &ctx.publication_registration,
+    )
+    .await?;
     let verified = fetch_pg_lineage_verified(ctx.dsn.expose()).await?;
     let (descriptor, live) =
         (verified.descriptor, ServerIdentity::from(verified.identity));
@@ -3294,13 +3352,12 @@ async fn check_identity_post_reconnect(ctx: &mut RunCtx) -> SourceResult<()> {
     Ok(())
 }
 
-/// Apply the configured `on_schema_drift` policy to a detected drift, failing
-/// closed. Under Adapt, reload the table's schema and continue only if the reload
-/// succeeds - a reload failure fails closed rather than proceeding to the first
-/// changed row with an unverified schema. Under Halt, return a typed, actionable
-/// error naming the table, the change, and the remediation. In both error cases
-/// the caller returns before emitting any post-drift row or advancing the
-/// checkpoint.
+/// Apply the configured `on_schema_drift` policy to a detected drift. Under
+/// Adapt, accept it without reading the catalog: the table's next row binds
+/// the new Relation's event schema (registered, verified, bound durably)
+/// before it is emitted. Under Halt, return a typed, actionable error naming
+/// the table, the change and the remediation; the caller returns before
+/// emitting any post-drift row or advancing the checkpoint.
 pub(crate) async fn apply_schema_drift(
     loader: &PostgresSchemaLoader,
     policy: &OnSchemaDrift,
@@ -3309,20 +3366,14 @@ pub(crate) async fn apply_schema_drift(
 ) -> SourceResult<()> {
     match policy {
         OnSchemaDrift::Adapt => {
+            // The changed table's next rows resolve their event schema from
+            // the new Relation (R, V, B); no catalog read is needed or
+            // trusted. Forget its capture-time catalog entry.
             info!(
                 schema = %drift.schema, table = %drift.table, change = %drift.detail,
-                "schema drift; reloading (on_schema_drift=adapt)"
+                "schema drift accepted (on_schema_drift=adapt)"
             );
-            loader
-                .reload_schema(&drift.schema, &drift.table)
-                .await
-                .map_err(|e| {
-                    error!(
-                        schema = %drift.schema, table = %drift.table, error = %e,
-                        "schema reload failed under on_schema_drift=adapt; failing closed"
-                    );
-                    e
-                })?;
+            loader.forget(&drift.schema, &drift.table).await;
             Ok(())
         }
         OnSchemaDrift::Halt => {
@@ -3750,17 +3801,13 @@ mod schema_drift_policy_tests {
     }
 
     #[tokio::test]
-    async fn adapt_fails_closed_when_reload_fails() {
-        // Unreachable DSN: reload_schema -> load_schema -> connect fails, so Adapt
-        // must NOT continue - it fails closed instead of proceeding with an
-        // unverified schema.
+    async fn adapt_accepts_without_a_catalog_read() {
+        // Unreachable DSN: Adapt never reads the catalog. The changed table's
+        // event schema comes from its new Relation at the next row.
         let l = loader("host=127.0.0.1 port=1 dbname=x").await;
-        let r = apply_schema_drift(&l, &OnSchemaDrift::Adapt, &drift(), "src")
-            .await;
-        assert!(
-            r.is_err(),
-            "adapt must fail closed when the schema reload fails"
-        );
+        apply_schema_drift(&l, &OnSchemaDrift::Adapt, &drift(), "src")
+            .await
+            .expect("adapt accepts the drift");
     }
 }
 

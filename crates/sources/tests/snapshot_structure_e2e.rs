@@ -202,11 +202,12 @@ async fn postgres_generation_operations_are_structurally_linear() -> Result<()>
                 .await?;
         }
         let id = format!("struct{n}");
-        client
-            .batch_execute(&format!(
-                "CREATE PUBLICATION pub_{id} FOR ALL TABLES"
-            ))
-            .await?;
+        sources::postgres::postgres_publication::fixtures::recreate_registered(
+            &client,
+            &format!("pub_{id}"),
+            &[],
+        )
+        .await?;
         let inner = test_common::make_storage_backend().await;
         let counting = Arc::new(CountingBackend::new(inner.clone()));
         let src = sources::postgres::PostgresSource {

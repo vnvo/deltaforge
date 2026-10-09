@@ -63,17 +63,6 @@ impl From<crate::mysql::mysql_health::LiveColumn> for ColumnSnapshot {
     }
 }
 
-impl From<crate::postgres::postgres_health::LiveColumn> for ColumnSnapshot {
-    fn from(c: crate::postgres::postgres_health::LiveColumn) -> Self {
-        Self {
-            name: c.name,
-            data_type: c.data_type,
-            is_nullable: c.is_nullable,
-            is_primary_key: c.is_primary_key,
-        }
-    }
-}
-
 // ============================================================================
 // SchemaDelta
 // ============================================================================

@@ -129,6 +129,16 @@ enum Command {
         #[command(subcommand)]
         action: GateAction,
     },
+    /// Administer the immutable-publication contract of a PostgreSQL
+    /// database (superuser): status, register, unregister, uninstall.
+    PgPublication {
+        /// File holding a superuser DSN for the database (never accepted on
+        /// the command line).
+        #[arg(long)]
+        dsn_file: std::path::PathBuf,
+        #[command(subcommand)]
+        action: PgPublicationAction,
+    },
     /// Diagnose, plan and apply recovery operations through the running
     /// server's loopback admin listener (see "Recovery Operations").
     ///
@@ -190,6 +200,29 @@ enum RecoverAction {
         #[arg(long)]
         reason: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum PgPublicationAction {
+    /// Publications, owners, registrations and the state of enforcement.
+    Status,
+    /// Register publications: makes publication DDL governance database-wide
+    /// (shown before anything changes; requires --confirm).
+    Register {
+        #[arg(long = "publication", required = true)]
+        publications: Vec<String>,
+        /// Confirm the database-wide impact shown.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Remove registrations (each publication back to its previous owner).
+    /// Stop every source using them first.
+    Unregister {
+        #[arg(long = "publication", required = true)]
+        publications: Vec<String>,
+    },
+    /// Remove enforcement; refused while any publication is registered.
+    Uninstall,
 }
 
 #[derive(Subcommand, Debug)]
@@ -310,6 +343,34 @@ async fn main() -> Result<()> {
             json: *json,
         };
         return runner::schema_migrate::run(migrate, backend).await;
+    }
+    if let Some(Command::PgPublication { dsn_file, action }) = &args.command {
+        let dsn = std::fs::read_to_string(dsn_file)
+            .with_context(|| format!("read {}", dsn_file.display()))?;
+        return runner::pg_publication_cli::run(
+            dsn.trim(),
+            match action {
+                PgPublicationAction::Status => {
+                    runner::pg_publication_cli::Action::Status
+                }
+                PgPublicationAction::Register {
+                    publications,
+                    confirm,
+                } => runner::pg_publication_cli::Action::Register {
+                    publications: publications.clone(),
+                    confirm: *confirm,
+                },
+                PgPublicationAction::Unregister { publications } => {
+                    runner::pg_publication_cli::Action::Unregister {
+                        publications: publications.clone(),
+                    }
+                }
+                PgPublicationAction::Uninstall => {
+                    runner::pg_publication_cli::Action::Uninstall
+                }
+            },
+        )
+        .await;
     }
     if let Some(Command::StoreGate { action }) = &args.command {
         let backend = build_storage_backend(&storage_config_from(&args))
@@ -535,6 +596,9 @@ async fn serve(
                         ))
                         .with_operation(Arc::new(
                             runner::recovery_adopt_timeline::AdoptTimeline::default(),
+                        ))
+                        .with_operation(Arc::new(
+                            runner::recovery_publication::PublicationMaintenance,
                         )),
                 ),
                 token,

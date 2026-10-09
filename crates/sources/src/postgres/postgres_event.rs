@@ -18,13 +18,14 @@ use common::watchdog;
 
 use super::RunCtx;
 use super::postgres_errors::{LoopControl, SchemaDrift};
+use super::postgres_event_schema::{PgEventSchema, RelationProjection};
 use super::postgres_helpers::{
     make_checkpoint_meta, make_checkpoint_meta_str, pg_timestamp_to_unix_ms,
 };
 use super::postgres_logical_message;
 use super::postgres_object::{RelationColumn, build_object, parse_tuple_data};
-use super::postgres_table_schema::{
-    FirstResolution, RelationIdentity, verify_first_resolution,
+use super::postgres_relation_binding::{
+    self as postgres_relation_binding, FirstResolution, ResolvedEventSchema,
 };
 
 /// Relation metadata from pgoutput.
@@ -38,6 +39,10 @@ pub struct RelationInfo {
     pub columns: Arc<Vec<RelationColumn>>,
     /// Replica identity: d=default, n=nothing, f=full, i=index
     pub replica_identity: char,
+    /// Physical projection (OID, identity, name/type OID/typmod/key).
+    pub(crate) projection: RelationProjection,
+    /// The event schema version its rows are stamped with, once resolved.
+    pub(crate) resolved: Option<ResolvedEventSchema>,
 }
 
 /// Build the commit boundary: the resume checkpoint plus, atomically, the
@@ -439,33 +444,26 @@ async fn handle_relation(
         });
     }
 
-    // Check if this relation already exists and if schema changed. Capture the
-    // prior columns before the map is updated so a drift can be described.
+    // The physical projection of this Relation; its content (everything but
+    // the OID) is what drift compares.
+    let projection =
+        RelationProjection::of(relation_id, replica_identity, &columns);
     let existing = ctx.relation_map.get(&relation_id);
     let is_new = existing.is_none();
-    let old_columns: Option<Vec<RelationColumn>> =
-        existing.map(|r| r.columns.to_vec());
-    let schema_changed = old_columns
-        .as_ref()
-        .map(|old| old.len() != columns.len() || columns_differ(old, &columns))
-        .unwrap_or(false);
-    // Describe the change before `columns` is moved into the relation map.
-    let drift_detail = if schema_changed {
-        Some(describe_schema_change(
-            old_columns.as_deref().unwrap_or(&[]),
-            &columns,
-        ))
-    } else {
-        None
-    };
-
-    // The (name, type_oid) signature in pgoutput order, captured before `columns`
-    // is moved into the relation map (used for the first-resolution comparison
-    // below - same fields the in-stream path compares).
-    let relation_signature: Vec<(String, u32)> = columns
-        .iter()
-        .map(|c| (c.name.clone(), c.type_oid))
-        .collect();
+    // An identical re-send (relcache invalidation: ANALYZE, VACUUM, ...)
+    // keeps the resolved version; any change resolves again at the next row.
+    let carried = existing
+        .filter(|r| r.projection == projection)
+        .and_then(|r| r.resolved.clone());
+    let drift_detail = existing
+        .filter(|r| !r.projection.same_content(&projection))
+        .map(|r| {
+            format!(
+                "{} -> {}",
+                postgres_relation_binding::describe(&r.projection),
+                postgres_relation_binding::describe(&projection)
+            )
+        });
 
     // Update relation map with new column info
     let qualified_name: Arc<str> = format!("{schema}.{table}").into();
@@ -478,6 +476,8 @@ async fn handle_relation(
             qualified_name,
             columns: Arc::new(columns),
             replica_identity,
+            projection: projection.clone(),
+            resolved: carried,
         },
     );
 
@@ -490,9 +490,9 @@ async fn handle_relation(
         debug!(relation_id, schema = %schema, table = %table, "relation re-mapped");
     }
 
-    // In-stream drift: the table was already mapped this run and changed.
-    if schema_changed {
-        let detail = drift_detail.unwrap_or_default();
+    // In-stream drift: the table was already mapped this run and its content
+    // changed (column, type, typmod, key flag or replica identity).
+    if let Some(detail) = drift_detail {
         info!(
             relation_id, schema = %schema, table = %table, change = %detail,
             "in-stream schema drift detected"
@@ -504,24 +504,33 @@ async fn handle_relation(
         }));
     }
 
-    // First resolution this run: verify the Relation against the durably persisted
-    // schema so a change made while the source was down (or a previously
-    // Halt-failed drift) is caught here, before this table's rows are decoded.
-    // Read from durable history (single-flight per key), never from a loader
-    // cache: a cold or contended cache cannot skip it. No history = first
-    // use; unreadable history fails closed. No catalog query.
+    // First Relation this run: compare with what is durably recorded, so a
+    // change made while the source was down (or a previously Halt-failed
+    // drift) is caught before this table's rows are decoded. Read from
+    // durable storage, never from a cache. No catalog query.
     if is_new {
-        let persisted = ctx
-            .schema
-            .persisted(&schema, &table)
-            .await
-            .map_err(LoopControl::Fail)?;
-        if let Some(persisted) = persisted {
-            let persisted_signature = persisted.signature();
-            if let FirstResolution::Drift(detail) = verify_first_resolution(
-                &persisted_signature,
-                &relation_signature,
-            ) {
+        let relation = &ctx.relation_map[&relation_id];
+        let event = PgEventSchema::from_relation(
+            relation.replica_identity,
+            &relation.columns,
+        )
+        .map_err(|e| {
+            LoopControl::Fail(SourceError::Schema {
+                details: format!("table {schema}.{table}: {e}").into(),
+            })
+        })?;
+        let scope = ctx.schema.current_scope().map_err(LoopControl::Fail)?;
+        let outcome = postgres_relation_binding::first_resolution(
+            ctx.schema.registry(),
+            &ctx.registry_backend,
+            &scope.key(&schema, &table),
+            &projection,
+            &event,
+        )
+        .await
+        .map_err(LoopControl::Fail)?;
+        match outcome {
+            FirstResolution::Drift(detail) => {
                 info!(
                     relation_id, schema = %schema, table = %table, change = %detail,
                     "restart schema drift detected on first resolution"
@@ -532,43 +541,194 @@ async fn handle_relation(
                     detail,
                 }));
             }
+            FirstResolution::Replaced => {
+                info!(
+                    relation_id, schema = %schema, table = %table,
+                    "relation replaced with the same content (new OID)"
+                );
+            }
+            FirstResolution::NoDrift => {}
         }
-        // First use accepted: its schema matches the durable one (or it is
-        // new).
+        // First use accepted: its content matches the durable record (or it
+        // is new).
         ctx.drift_resolver
             .accepted(&format!("{schema}.{table}"))
             .await;
     }
 
+    // Capture-time catalog work, proven against this stream at this
+    // transaction's position: the generated-column guard and the annotation.
+    catalog_on_relation(ctx, relation_id)
+        .await
+        .map_err(LoopControl::Fail)?;
+
     Ok(())
 }
 
-/// Describe a relation-definition change as `old cols -> new cols`, for the
-/// drift log line and the Halt error message.
-fn describe_schema_change(
-    old: &[RelationColumn],
-    new: &[RelationColumn],
-) -> String {
-    fn cols(c: &[RelationColumn]) -> String {
-        c.iter()
-            .map(|c| format!("{}:{}", c.name, c.type_oid))
-            .collect::<Vec<_>>()
-            .join(", ")
+/// One proven stamp per Relation; a locked capture only when the stamp's
+/// canonical inputs changed since the table's last capture this run.
+async fn catalog_on_relation(
+    ctx: &mut RunCtx,
+    relation_id: u32,
+) -> SourceResult<()> {
+    use super::postgres_catalog_capture as cc;
+    let relation = &ctx.relation_map[&relation_id];
+    let (schema, table) = (relation.schema.clone(), relation.table.clone());
+    let binding_digest = relation.projection.digest();
+    let qualified = format!("{schema}.{table}");
+    let token = ctx
+        .stream_token
+        .read()
+        .expect("not poisoned")
+        .clone()
+        .ok_or_else(|| {
+            crate::incident_drafts::catalog_visibility_unproven(
+                &ctx.source_id,
+                "-",
+                "-",
+                "no_stream_token",
+            )
+        })?;
+    let target = ctx
+        .current_final_lsn
+        .as_deref()
+        .and_then(|l| Lsn::parse(l).ok())
+        .ok_or_else(|| {
+            SourceError::Other(anyhow::anyhow!(
+                "Relation of {qualified} outside a transaction"
+            ))
+        })?;
+    let key = (schema.clone(), table.clone());
+    let cc::Read::Found { attributes, .. } = cc::stamp(
+        &mut ctx.catalog,
+        &ctx.source_id,
+        &token,
+        target,
+        &schema,
+        &table,
+    )
+    .await?
+    else {
+        // Dropped since (retained WAL): nothing to capture, the rows decode
+        // from their Relation.
+        return Ok(());
+    };
+    if ctx.catalog_digests.get(&key) == Some(&attributes.digest()) {
+        return Ok(());
     }
-    format!("columns [{}] -> [{}]", cols(old), cols(new))
-}
-
-/// Check if columns differ (by name or type).
-fn columns_differ(old: &[RelationColumn], new: &[RelationColumn]) -> bool {
-    if old.len() != new.len() {
-        return true;
+    let cc::Read::Found {
+        attributes,
+        captured_lsn,
+    } = cc::capture(
+        &mut ctx.catalog,
+        &ctx.source_id,
+        &token,
+        target,
+        &schema,
+        &table,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let generated = attributes.generated_columns();
+    if !generated.is_empty() {
+        return Err(crate::incident_drafts::table_unsupported(
+            &ctx.source_id,
+            &qualified,
+            "stored_generated_column",
+            format!(
+                "table {qualified} has stored generated column(s) {}: \
+                 unsupported (pgoutput does not publish them); exclude the \
+                 table or drop the generation",
+                generated.join(", ")
+            ),
+        ));
     }
-    for (o, n) in old.iter().zip(new.iter()) {
-        if o.name != n.name || o.type_oid != n.type_oid {
-            return true;
+    let scope = ctx.schema.current_scope()?;
+    let incidents = storage::adapters::incidents::IncidentStore::new(
+        Arc::clone(&ctx.registry_backend),
+        &ctx.pipeline,
+    );
+    match cc::record_annotation(
+        &ctx.registry_backend,
+        &scope.key(&schema, &table),
+        &binding_digest,
+        &attributes,
+        captured_lsn,
+    )
+    .await
+    {
+        Ok(_) => {
+            let component = deltaforge_core::incident::Component::Source {
+                id: ctx.source_id.clone(),
+            };
+            let _ = incidents
+                .resolve_matching(
+                    deltaforge_core::incident::ReasonCode::PgAnnotationUnavailable,
+                    &component,
+                    Some(&deltaforge_core::incident::scope_key(
+                        &component, &qualified,
+                    )),
+                    storage::adapters::incidents::ANNOTATION_RECORDED,
+                )
+                .await;
+        }
+        Err(e) => {
+            warn!(table = %qualified, error = %e, "annotation not recorded; rows unaffected");
+            let draft = crate::incident_drafts::annotation_unavailable(
+                &ctx.source_id,
+                &qualified,
+                "write_failed",
+            );
+            let _ = incidents.raise(&draft, 1).await;
         }
     }
-    false
+    ctx.catalog_digests.insert(key, attributes.digest());
+    Ok(())
+}
+
+/// The event schema version for `relation_id`'s rows: resolved once per
+/// Relation (R, V, B), then cached on the relation (C) until the Relation
+/// changes or the registry scope moves.
+pub(super) async fn resolve_event_schema(
+    ctx: &mut RunCtx,
+    relation_id: u32,
+) -> SourceResult<ResolvedEventSchema> {
+    let scope = ctx.schema.current_scope()?;
+    let relation = ctx.relation_map.get(&relation_id).ok_or_else(|| {
+        SourceError::Other(anyhow::anyhow!(
+            "rows for relation {relation_id} without its Relation message"
+        ))
+    })?;
+    if let Some(r) = &relation.resolved
+        && r.scope_generation == scope.generation()
+    {
+        return Ok(r.clone());
+    }
+    let event = PgEventSchema::from_relation(
+        relation.replica_identity,
+        &relation.columns,
+    )
+    .map_err(|e| SourceError::Schema {
+        details: format!("table {}.{}: {e}", relation.schema, relation.table)
+            .into(),
+    })?;
+    let key = scope.key(&relation.schema, &relation.table);
+    let projection = relation.projection.clone();
+    let resolved = postgres_relation_binding::bind(
+        ctx.schema.registry(),
+        &ctx.registry_backend,
+        &key,
+        scope.generation(),
+        &projection,
+        &event,
+    )
+    .await?;
+    if let Some(r) = ctx.relation_map.get_mut(&relation_id) {
+        r.resolved = Some(resolved.clone());
+    }
+    Ok(resolved)
 }
 
 /// Static version string - allocated once, not per event.
@@ -667,23 +827,11 @@ async fn handle_insert(
 
     // Extract all needed data from relation upfront to release the borrow.
     let columns = Arc::clone(&relation.columns);
-    let replica_identity = relation.replica_identity;
     let qualified_name = Arc::clone(&relation.qualified_name);
     let schema = relation.schema.clone();
     let table = relation.table.clone();
 
-    let rel_identity = RelationIdentity {
-        oid: relation_id,
-        signature: columns
-            .iter()
-            .map(|c| (c.name.clone(), c.type_oid))
-            .collect(),
-        replica_identity,
-    };
-    let loaded = ctx
-        .schema
-        .load_schema_for_relation(&schema, &table, None, &rel_identity)
-        .await?;
+    let loaded = resolve_event_schema(ctx, relation_id).await?;
 
     let tuple_data = payload_bytes.slice(5..);
     let (values, _) = parse_tuple_data(&tuple_data, columns.len());
@@ -762,7 +910,6 @@ async fn handle_update(
     }
 
     let columns = Arc::clone(&relation.columns);
-    let replica_identity = relation.replica_identity;
     let qualified_name = Arc::clone(&relation.qualified_name);
     let schema = relation.schema.clone();
     let table = relation.table.clone();
@@ -797,18 +944,7 @@ async fn handle_update(
         return Ok(());
     };
 
-    let rel_identity = RelationIdentity {
-        oid: relation_id,
-        signature: columns
-            .iter()
-            .map(|c| (c.name.clone(), c.type_oid))
-            .collect(),
-        replica_identity,
-    };
-    let loaded = ctx
-        .schema
-        .load_schema_for_relation(&schema, &table, None, &rel_identity)
-        .await?;
+    let loaded = resolve_event_schema(ctx, relation_id).await?;
 
     let before = before_values.map(|v| build_object(&columns, &v));
     let after = build_object(&columns, &after_vals);
@@ -891,23 +1027,11 @@ async fn handle_delete(
     }
 
     let columns = Arc::clone(&relation.columns);
-    let replica_identity = relation.replica_identity;
     let qualified_name = Arc::clone(&relation.qualified_name);
     let schema = relation.schema.clone();
     let table = relation.table.clone();
 
-    let rel_identity = RelationIdentity {
-        oid: relation_id,
-        signature: columns
-            .iter()
-            .map(|c| (c.name.clone(), c.type_oid))
-            .collect(),
-        replica_identity,
-    };
-    let loaded = ctx
-        .schema
-        .load_schema_for_relation(&schema, &table, None, &rel_identity)
-        .await?;
+    let loaded = resolve_event_schema(ctx, relation_id).await?;
 
     let tuple_data = payload_bytes.slice(5..);
     let (values, _) = parse_tuple_data(&tuple_data, columns.len());
@@ -1142,92 +1266,6 @@ fn read_cstring(data: &[u8], offset: &mut usize) -> String {
 mod tests {
     use super::*;
 
-    mod verify_first_resolution_tests {
-        use super::super::{FirstResolution, verify_first_resolution};
-
-        // (name, type_oid) persisted signature helper.
-        fn persisted(cols: &[(&str, u32)]) -> Vec<(String, Option<u32>)> {
-            cols.iter()
-                .map(|(n, o)| (n.to_string(), Some(*o)))
-                .collect()
-        }
-        // pgoutput Relation signature helper.
-        fn relation(cols: &[(&str, u32)]) -> Vec<(String, u32)> {
-            cols.iter().map(|(n, o)| (n.to_string(), *o)).collect()
-        }
-
-        // Same names/order but a changed type OID is drift - detected purely from
-        // cached state, with no catalog query (the function takes no connection).
-        #[test]
-        fn same_names_changed_type_oid_is_drift() {
-            let out = verify_first_resolution(
-                &persisted(&[("id", 23), ("sku", 1043)]),
-                &relation(&[("id", 23), ("sku", 25)]), // varchar -> text
-            );
-            assert!(matches!(out, FirstResolution::Drift(_)));
-        }
-
-        // Added / removed / reordered columns are drift.
-        #[test]
-        fn structural_changes_are_drift() {
-            // added
-            assert!(matches!(
-                verify_first_resolution(
-                    &persisted(&[("id", 23), ("sku", 1043)]),
-                    &relation(&[("id", 23), ("sku", 1043), ("status", 1043)]),
-                ),
-                FirstResolution::Drift(_)
-            ));
-            // removed
-            assert!(matches!(
-                verify_first_resolution(
-                    &persisted(&[("id", 23), ("sku", 1043)]),
-                    &relation(&[("id", 23)]),
-                ),
-                FirstResolution::Drift(_)
-            ));
-            // reordered
-            assert!(matches!(
-                verify_first_resolution(
-                    &persisted(&[("id", 23), ("sku", 1043)]),
-                    &relation(&[("sku", 1043), ("id", 23)]),
-                ),
-                FirstResolution::Drift(_)
-            ));
-        }
-
-        // Identical persisted and relation signatures are not drift.
-        #[test]
-        fn identical_signatures_no_drift() {
-            let out = verify_first_resolution(
-                &persisted(&[("id", 23), ("sku", 1043)]),
-                &relation(&[("id", 23), ("sku", 1043)]),
-            );
-            assert_eq!(out, FirstResolution::NoDrift);
-        }
-
-        // A persisted column without a type OID is unverifiable: it must fail
-        // closed as drift, never be treated as "unchanged".
-        #[test]
-        fn missing_persisted_type_oid_fails_closed_unverifiable() {
-            let out = verify_first_resolution(
-                &[("id".into(), Some(23)), ("sku".into(), None)],
-                &relation(&[("id", 23), ("sku", 1043)]),
-            );
-            match out {
-                FirstResolution::Drift(detail) => {
-                    assert!(
-                        detail.contains("unavailable"),
-                        "unverifiable reason surfaced: {detail}"
-                    );
-                }
-                FirstResolution::NoDrift => {
-                    panic!("missing type OID must not read as unchanged")
-                }
-            }
-        }
-    }
-
     /// The TxCommit marker carries a boundary built from the COMMIT record's
     /// end_lsn and the frozen system_identifier lineage: the checkpoint passes
     /// through and a durable watermark is produced when lineage is available.
@@ -1274,6 +1312,30 @@ mod tests {
         let mut offset = 0;
         assert_eq!(read_cstring(data, &mut offset), "abc");
         assert_eq!(offset, 3);
+    }
+
+    /// In-stream drift compares Relation content (the projection without
+    /// its OID).
+    fn columns_differ(a: &[RelationColumn], b: &[RelationColumn]) -> bool {
+        use super::super::postgres_event_schema::RelationProjection;
+        !RelationProjection::of(1, 'd', a)
+            .same_content(&RelationProjection::of(1, 'd', b))
+    }
+
+    #[test]
+    fn typmod_or_key_flag_changes_are_drift() {
+        let base = vec![RelationColumn {
+            name: "sku".into(),
+            type_oid: 1043,
+            type_modifier: 14,
+            flags: 0,
+        }];
+        let mut typmod = base.clone();
+        typmod[0].type_modifier = 24;
+        let mut key = base.clone();
+        key[0].flags = 1;
+        assert!(columns_differ(&base, &typmod));
+        assert!(columns_differ(&base, &key));
     }
 
     #[test]

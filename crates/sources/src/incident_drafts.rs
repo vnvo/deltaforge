@@ -273,3 +273,168 @@ mod tests {
         );
     }
 }
+
+/// A catalog session could not be proven to reach the stream's node and
+/// walsender at the target position (halted: nothing was used).
+pub(crate) fn catalog_visibility_unproven(
+    source_id: &str,
+    slot: &str,
+    target: &str,
+    class: &str,
+) -> SourceError {
+    let draft = IncidentDraft::new(
+        ReasonCode::PgCatalogVisibilityUnproven,
+        Component::Source {
+            id: source_id.to_string(),
+        },
+        Retryability::OperatorAction,
+        SafetyState::HaltedSafe,
+        CauseCode::SourceLineage,
+    )
+    .discriminate("slot", slot)
+    .discriminate("class", class)
+    .with_evidence(|e| {
+        e.text(K::SourceId, source_id)
+            .text(K::Slot, slot)
+            .text(K::TargetPosition, target)
+            .text(K::ReasonClass, class);
+    })
+    .with_actions(&[ActionCode::VerifyEndpoint]);
+    SourceError::incident(
+        draft,
+        SourceError::Lineage {
+            details: format!(
+                "catalog session not proven to reach the stream of slot \
+                 {slot} at {target} ({class})"
+            )
+            .into(),
+        },
+    )
+}
+
+/// A tracked table uses an unsupported feature (halted before its next row).
+pub(crate) fn table_unsupported(
+    source_id: &str,
+    qualified_table: &str,
+    class: &str,
+    details: String,
+) -> SourceError {
+    let draft = IncidentDraft::new(
+        ReasonCode::PgTableUnsupported,
+        Component::Source {
+            id: source_id.to_string(),
+        },
+        Retryability::OperatorAction,
+        SafetyState::HaltedSafe,
+        CauseCode::SourceIncompatible,
+    )
+    .discriminate("table", qualified_table)
+    .discriminate("class", class)
+    .with_evidence(|e| {
+        e.text(K::SourceId, source_id)
+            .text(K::Table, qualified_table)
+            .text(K::ReasonClass, class);
+    })
+    .with_actions(&[ActionCode::ReviewSchemaChange]);
+    SourceError::incident(
+        draft,
+        SourceError::Incompatible {
+            details: details.into(),
+        },
+    )
+}
+
+/// A capture-time annotation could not be recorded (running degraded).
+pub(crate) fn annotation_unavailable(
+    source_id: &str,
+    qualified_table: &str,
+    class: &str,
+) -> IncidentDraft {
+    IncidentDraft::new(
+        ReasonCode::PgAnnotationUnavailable,
+        Component::Source {
+            id: source_id.to_string(),
+        },
+        Retryability::AutoRetry,
+        SafetyState::RunningDegraded,
+        CauseCode::SourceOther,
+    )
+    .discriminate("table", qualified_table)
+    .with_evidence(|e| {
+        e.text(K::SourceId, source_id)
+            .text(K::Table, qualified_table)
+            .text(K::ReasonClass, class);
+    })
+    .resolved_by_scope(qualified_table)
+}
+
+/// The publication is unregistered or changed since the registration the
+/// source accepted (halted before streaming).
+pub(crate) fn publication_changed(
+    source_id: &str,
+    publication: &str,
+    class: &str,
+    details: String,
+) -> SourceError {
+    let draft = IncidentDraft::new(
+        ReasonCode::PgPublicationChanged,
+        Component::Source {
+            id: source_id.to_string(),
+        },
+        Retryability::OperatorAction,
+        SafetyState::HaltedSafe,
+        CauseCode::SourceSchema,
+    )
+    .discriminate("publication", publication)
+    .discriminate("class", class)
+    .with_evidence(|e| {
+        e.text(K::SourceId, source_id)
+            .text(K::Publication, publication)
+            .text(K::ReasonClass, class);
+    })
+    .with_actions(&[ActionCode::PublicationMaintenance]);
+    SourceError::incident(
+        draft,
+        SourceError::Schema {
+            details: details.into(),
+        },
+    )
+}
+
+/// The database's publication enforcement is missing or tampered with
+/// (halted before streaming).
+pub(crate) fn publication_enforcement(
+    source_id: &str,
+    publication: &str,
+    violations: &[String],
+) -> SourceError {
+    let list = violations.join("; ");
+    let draft = IncidentDraft::new(
+        ReasonCode::PgPublicationEnforcement,
+        Component::Source {
+            id: source_id.to_string(),
+        },
+        Retryability::OperatorAction,
+        SafetyState::HaltedSafe,
+        CauseCode::SourceIncompatible,
+    )
+    .discriminate("publication", publication)
+    .with_evidence(|e| {
+        e.text(K::SourceId, source_id)
+            .text(K::Publication, publication)
+            .text(K::ReasonClass, &list);
+    })
+    .with_actions(&[
+        ActionCode::PublicationMaintenance,
+        ActionCode::InspectLogs,
+    ]);
+    SourceError::incident(
+        draft,
+        SourceError::Incompatible {
+            details: format!(
+                "publication enforcement of {publication}'s database: {list}"
+            )
+            .into(),
+        },
+    )
+}

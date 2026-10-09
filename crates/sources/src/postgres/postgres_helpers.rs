@@ -166,6 +166,20 @@ pub(crate) struct StreamProof {
     /// failure (the endpoint may be mid-failover) for this long, then stops.
     pub(super) recovery_window: Duration,
     pub(super) recovery_retry: Arc<std::sync::Mutex<RecoveryRetry>>,
+    /// The authoritative stream's walsender token (`None` until a stream is
+    /// activated); replaced on every activation, so a catalog proof never
+    /// accepts a previous stream's nonce.
+    pub(super) token: Arc<std::sync::RwLock<Option<StreamToken>>>,
+}
+
+/// What a catalog session must find to prove it reaches the node and live
+/// walsender of the authoritative stream (design section 8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamToken {
+    pub slot: String,
+    pub walsender: super::postgres_continuity::Walsender,
+    pub system_identifier: u64,
+    pub database_oid: u64,
 }
 
 /// The bounded retry of sessions on a server in recovery: when it began and
@@ -318,6 +332,12 @@ impl StreamProof {
         };
         // Dropping the client before `start` ends the session without
         // replication.
+        // A fresh nonce per session: the catalog proof matches the exact
+        // walsender of the stream it serves, never an earlier one.
+        let cfg = cfg.with_application_name(format!(
+            "deltaforge:{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         let mut client = connect_replication(&self.source_id, cfg).await?;
         let proven = match tokio::time::timeout(
             Duration::from_secs(30),
@@ -441,6 +461,13 @@ impl StreamProof {
             });
         }
         self.report_failover_slot(proven.failover_slot).await;
+        *self.token.write().expect("not poisoned") =
+            proven.walsender.clone().map(|walsender| StreamToken {
+                slot: self.slot.clone(),
+                walsender,
+                system_identifier: proven.record.system_identifier,
+                database_oid: proven.record.database_oid,
+            });
         *self.active.write().expect("not poisoned") = Some(stamp);
         Ok(client)
     }
@@ -755,7 +782,12 @@ pub(super) async fn read_session_facts(
                 current_setting('server_version_num'), \
                 pg_is_in_recovery()::text, \
                 (SELECT to_jsonb(s)::text FROM pg_replication_slots s \
-                 WHERE s.slot_name = '{}')",
+                 WHERE s.slot_name = '{}'), \
+                pg_backend_pid()::text, \
+                (SELECT backend_start::text FROM pg_stat_activity \
+                 WHERE pid = pg_backend_pid()), \
+                (SELECT application_name FROM pg_stat_activity \
+                 WHERE pid = pg_backend_pid())",
         slot.replace('\'', "''")
     );
     let rows = client.simple_query(&sql).await?;
@@ -784,7 +816,22 @@ pub(super) async fn read_session_facts(
             &serde_json::from_str(&json).map_err(|_| malformed("slot row"))?,
         )),
     };
+    let walsender = match (
+        text(4).and_then(|p| p.parse::<i32>().ok()),
+        text(5),
+        text(6),
+    ) {
+        (Some(pid), Some(backend_start), Some(application_name)) => {
+            Some(super::postgres_continuity::Walsender {
+                pid,
+                backend_start,
+                application_name,
+            })
+        }
+        _ => None,
+    };
     Ok(SessionFacts {
+        walsender,
         system_identifier,
         database_oid,
         timeline: id.timeline,
@@ -1285,6 +1332,7 @@ mod tests {
                     record,
                     record_changed: changed,
                     failover_slot: FailoverSlot::Unsupported,
+                    walsender: None,
                 },
             }
         }
@@ -1426,6 +1474,7 @@ mod tests {
                 active: Default::default(),
                 recovery_window: window,
                 recovery_retry: Default::default(),
+                token: Default::default(),
             }
         }
 

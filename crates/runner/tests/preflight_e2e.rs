@@ -148,6 +148,12 @@ async fn preflight_slot_ownership_lifecycle() {
         .execute("CREATE PUBLICATION df_pf_pub FOR TABLE orders", &[])
         .await
         .unwrap();
+    sources::postgres::postgres_publication::register(
+        &client,
+        &["df_pf_pub".to_string()],
+    )
+    .await
+    .unwrap();
 
     let cfg = write_config(&config_yaml(port));
     let specs = load_cfg(cfg.path().to_str().unwrap()).expect("load config");

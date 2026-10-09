@@ -41,6 +41,20 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO deltaforge;
 -- yourself (see "Replication Slot and Publication" below).
 ```
 
+The same role reads the catalog for capture-time annotations and checks.
+Each such read first proves, in its own snapshot, that it reaches the node
+and the live walsender serving the stream: it reads `pg_replication_slots`,
+`pg_stat_activity` (the walsender's row; visible to the same role, otherwise
+grant `pg_read_all_stats`) and `pg_control_system()`. A capture takes the
+table's `ACCESS SHARE` lock (granted by `SELECT` on the table) for a few
+milliseconds: inserts, updates and deletes are not blocked, DDL on that table
+waits until the capture ends.
+
+**Unsupported:** a tracked table with a stored generated column
+(`GENERATED ALWAYS AS ... STORED`) stops the source before its next row
+(`pg_table_unsupported`): pgoutput does not publish generated columns.
+Exclude the table or drop the generation.
+
 ### pg_hba.conf
 
 Ensure your `pg_hba.conf` allows replication connections:
@@ -53,21 +67,69 @@ host    your_database   deltaforge      0.0.0.0/0               scram-sha-256
 
 ### Replication Slot and Publication
 
-DeltaForge automatically creates the replication **slot** on first run and records
-durable **ownership** of it (bound to the server's `system_identifier`, the
-database, the slot name, and the plugin). The **publication** is not auto-created —
-you must create it yourself. Create both manually if you prefer:
+DeltaForge creates the replication **slot** on first run and records durable
+**ownership** of it (bound to the server's `system_identifier`, the database, the
+slot name, and the plugin). The **publication** is never created by DeltaForge:
+create it, then register it.
 
 ```sql
--- Create publication for specific tables
 CREATE PUBLICATION my_pub FOR TABLE public.orders, public.order_items;
-
--- Or for all tables
-CREATE PUBLICATION my_pub FOR ALL TABLES;
-
--- Create replication slot
-SELECT pg_create_logical_replication_slot('my_slot', 'pgoutput');
 ```
+
+### The publication contract
+
+A publication DeltaForge streams from is **immutable while it is registered**.
+Registration is a superuser step, done before the source's first start:
+
+```bash
+deltaforge pg-publication --dsn-file superuser.dsn register --publication my_pub
+# review the database-wide impact printed, then repeat with --confirm
+```
+
+Registering a publication:
+
+- requires an explicit `FOR TABLE` list of ordinary tables, with all four
+  publish operations, no row filter, no column list, no
+  `publish_via_partition_root` and no `publish_generated_columns`. `FOR ALL
+  TABLES`, `TABLES IN SCHEMA` and partitioned tables are refused: their
+  membership changes without publication DDL;
+- transfers the publication to the NOLOGIN role
+  `deltaforge_publication_owner` and records its canonical digest and the WAL
+  position of the registration;
+- installs enforcement for the **whole database**. While any publication of
+  the database is registered, every `ALTER PUBLICATION` and `DROP PUBLICATION`
+  is refused for every role, superusers included, and any drop that would
+  remove a registered publication's table (`DROP TABLE`, `DROP SCHEMA ...
+  CASCADE`, `DROP OWNED`, ...) is refused inside its transaction. The database
+  enforces this while DeltaForge is stopped.
+
+At startup and on every reconnect, before it snapshots, decodes, emits or
+advances a checkpoint, the source verifies that enforcement is intact, the
+publication is registered and its live digest equals the registration it
+accepted, and that it does not stream from WAL older than the registration.
+Otherwise it stops with `pg_publication_changed` or
+`pg_publication_enforcement`.
+
+**Changing a publication** (membership, options, a table drop) is a
+database-wide maintenance procedure:
+
+1. stop every DeltaForge PostgreSQL source using the database;
+2. for each, record how it continues:
+   `deltaforge recover apply <pipeline> pg-publication-maintenance --arg mode=resnapshot`
+   (then the `resnapshot` operation) or `--arg mode=abandon` (the backlog
+   before the new registration is skipped and never delivered; the applied
+   plan is the audit record);
+3. `deltaforge pg-publication ... unregister --publication <each>`;
+4. `deltaforge pg-publication ... uninstall` (refused while any registration
+   remains, naming them);
+5. apply the change;
+6. register the publications again (new digests);
+7. restart the sources.
+
+**Outside the guarantee:** a superuser can disable or drop the enforcement
+triggers. The source detects it at its next startup or reconnect and stops,
+but changes made between the tampering and that check are not guaranteed to
+have been captured completely.
 
 ### Replica Identity
 

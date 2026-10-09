@@ -282,6 +282,11 @@ async fn pg_to_kafka_backlog_drain_throughput() -> Result<()> {
             &[],
         )
         .await?;
+    sources::postgres::postgres_publication::register(
+        &client,
+        &[PUBLICATION.to_string()],
+    )
+    .await?;
     client
         .batch_execute(&format!(
             "SELECT pg_create_logical_replication_slot('{SLOT}', 'pgoutput')"

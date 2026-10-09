@@ -29,10 +29,8 @@ pub enum PgColumnValue {
 pub struct RelationColumn {
     pub name: String,
     pub type_oid: u32,
-    #[allow(dead_code)]
     pub type_modifier: i32,
     /// Flags: 1 = part of key
-    #[allow(dead_code)]
     pub flags: u8,
 }
 

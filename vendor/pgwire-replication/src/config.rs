@@ -427,6 +427,13 @@ pub struct ReplicationConfig {
     ///
     /// Default: `false`
     pub binary: bool,
+
+    /// `application_name` sent in the startup message. `None` (default):
+    /// `pgwire-replication`. A consumer that must recognise its own walsender
+    /// from another session (in `pg_stat_activity`) sets a unique value.
+    ///
+    /// (DeltaForge patch.)
+    pub application_name: Option<String>,
 }
 
 impl Default for ReplicationConfig {
@@ -447,6 +454,7 @@ impl Default for ReplicationConfig {
             idle_wakeup_interval: Duration::from_secs(10),
             buffer_events: 8192,
             binary: false,
+            application_name: None,
         }
     }
 }
@@ -608,6 +616,12 @@ impl ReplicationConfig {
     /// Request binary-format column values from `pgoutput` (requires PG 14+).
     ///
     /// See [`binary`](Self::binary) for caveats — off by default.
+    /// Set the startup `application_name` (DeltaForge patch).
+    pub fn with_application_name(mut self, name: impl Into<String>) -> Self {
+        self.application_name = Some(name.into());
+        self
+    }
+
     pub fn with_binary(mut self, binary: bool) -> Self {
         self.binary = binary;
         self

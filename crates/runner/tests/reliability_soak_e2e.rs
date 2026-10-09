@@ -195,6 +195,11 @@ async fn provision(client: &tokio_postgres::Client) -> Result<()> {
     client
         .execute(&format!("CREATE PUBLICATION {PUB} FOR TABLE orders"), &[])
         .await?;
+    sources::postgres::postgres_publication::register(
+        client,
+        &[PUB.to_string()],
+    )
+    .await?;
     client
         .batch_execute(&format!(
             "SELECT pg_create_logical_replication_slot('{SLOT}', 'pgoutput')"
