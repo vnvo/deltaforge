@@ -142,9 +142,12 @@ pub async fn sweep(cfg: RunConfig, opts: RunOptions) -> Result<Sweep> {
     let name = format!(
         "sweep-{}-{}.json",
         cfg.run.scenario,
-        Utc::now().format("%Y%m%dT%H%M%S")
+        crate::evidence::unique_stem(Utc::now())
     );
-    std::fs::write(dir.join(name), serde_json::to_vec_pretty(&sweep)?)?;
+    crate::evidence::write_new(
+        &dir.join(name),
+        &serde_json::to_vec_pretty(&sweep)?,
+    )?;
     Ok(sweep)
 }
 
@@ -180,24 +183,29 @@ pub async fn run_once(
     opts: &RunOptions,
 ) -> Result<RunResult> {
     let started_at = Utc::now();
-    let run_id = format!(
-        "{}-{}-n{n}-r{rep}",
-        started_at.format("%Y%m%dT%H%M%S"),
-        cfg.run.scenario
-    );
-    let dir = RunResult::dir(&cfg.output_dir, cfg.class, &run_id);
+    // Allocated before anything else: a run that cannot own a new result
+    // directory writes nothing (never into another run's evidence).
+    let id = crate::evidence::allocate_run(
+        &cfg.output_dir,
+        cfg.class,
+        &cfg.run.scenario,
+        n,
+        rep,
+        started_at,
+    )?;
+    let (run_id, dir) = (id.run_id.clone(), id.dir.clone());
     let progress = Mutex::new(Progress {
         stage: "start",
         ..Progress::default()
     });
-    match run_inner(cfg.clone(), n, rep, opts, started_at, &run_id, &progress)
-        .await
+    match run_inner(cfg.clone(), n, rep, opts, started_at, &id, &progress).await
     {
         Ok(r) => Ok(r),
         Err(e) => {
             let p = progress.lock();
             let failure = json!({
                 "run_id": run_id,
+                "run_tag": id.run_tag,
                 "outcome": "failed",
                 "stage": p.stage,
                 "reason": format!("{e:#}"),
@@ -213,14 +221,12 @@ pub async fn run_once(
                 "driver": p.ctxs.iter()
                     .map(|c| (c.server.name.clone(), c.counters.snapshot()))
                     .collect::<BTreeMap<_, _>>(),
-                "verdict": {"completed": false, "correctness_ok": false, "repetition_ok": false},
+                "verdict": {"completed": false, "correctness_ok": false, "evidence_ok": false, "repetition_ok": false},
             });
-            if let Err(w) = std::fs::create_dir_all(&dir).and_then(|_| {
-                std::fs::write(
-                    dir.join("result.json"),
-                    serde_json::to_vec_pretty(&failure).unwrap_or_default(),
-                )
-            }) {
+            if let Err(w) = crate::evidence::write_new(
+                &dir.join("result.json"),
+                &serde_json::to_vec_pretty(&failure).unwrap_or_default(),
+            ) {
                 eprintln!("could not write the failure result: {w}");
             }
             Err(e)
@@ -266,17 +272,15 @@ async fn run_inner(
     rep: u32,
     opts: &RunOptions,
     started_at: chrono::DateTime<Utc>,
-    run_id: &str,
+    id: &crate::evidence::RunIdentity,
     progress: &Mutex<Progress>,
 ) -> Result<RunResult> {
-    let run_id = run_id.to_string();
-    let run_tag = (started_at.timestamp() as u64) & ((1 << 23) - 1);
-    let dir = RunResult::dir(&cfg.output_dir, cfg.class, &run_id);
+    let (run_id, dir, run_tag) =
+        (id.run_id.clone(), id.dir.clone(), id.run_tag);
     let stage = |s: &'static str| progress.lock().stage = s;
     stage("servers");
     let work = Path::new(&cfg.verifier.work_dir).join(&run_id);
-    std::fs::create_dir_all(&dir)?;
-    std::fs::create_dir_all(&work)?;
+    crate::evidence::create_new_dir(&work)?;
     let plan: Plan = scenario::plan(&cfg)?;
     let mut run_cfg = (*cfg).clone();
     if let Some(p) = plan.active_set.clone() {
@@ -734,6 +738,7 @@ async fn run_inner(
     }
     let mut result = RunResult {
         run_id: run_id.clone(),
+        run_tag,
         outcome: if aborted.is_some() {
             "aborted"
         } else {
@@ -741,6 +746,7 @@ async fn run_inner(
         }
         .into(),
         reason: aborted,
+        missing_artifacts: Vec::new(),
         readiness,
         proof_trace,
         class: cfg.class,
@@ -792,12 +798,17 @@ async fn run_inner(
             uncertainty_ok: false,
             workload_ok: None,
             budgets_ok: None,
+            evidence_ok: false,
+            proof_conclusions_allowed: false,
             repetition_ok: false,
         },
     };
     stage("result");
     result.evaluate();
     result.write(&dir)?;
+    for missing in &result.missing_artifacts {
+        eprintln!("run {run_id}: MISSING EVIDENCE: {missing}");
+    }
     if result.verdict.correctness_ok && result.verdict.completed {
         std::fs::remove_dir_all(&work).ok();
     }

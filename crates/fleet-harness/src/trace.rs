@@ -1,8 +1,13 @@
 //! The instance's proof trace: the `deltaforge::proof_trace` records
 //! (`scan`, `request`, `proof`) it logged during the run, collected per
 //! server with the server's binlog inventory (captured once, at the end)
-//! and summarized offline by `scripts/proof-trace-report.py`. Collection
-//! never fails a run: what could not be collected is recorded.
+//! and summarized offline by `scripts/proof-trace-report.py`.
+//!
+//! Collection is checked: every server's records, inventory and report
+//! must exist and no record line may be malformed. Incomplete evidence
+//! fails a run that requires it (`RunConfig::proof_trace_required`);
+//! otherwise the run completes, records what is missing and supports no
+//! proof-performance conclusion.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -102,13 +107,41 @@ async fn read_since(source: &TraceSource, mark: &Mark) -> Result<String> {
 /// What was collected.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Collected {
+    /// A proof trace was configured.
+    pub requested: bool,
+    /// It is required evidence: incomplete, it fails the repetition.
+    pub required: bool,
+    /// Every server's records, inventory and report exist and no record
+    /// line is malformed.
+    pub complete: bool,
     pub records: u64,
     pub scans: u64,
     pub requests: u64,
     pub proofs: u64,
+    /// Lines that look like proof-trace records but do not parse as one.
+    pub malformed: u64,
     pub files: Vec<String>,
-    /// Collection or report problems (the run's verdict is unaffected).
+    /// Why the evidence is incomplete (empty when complete).
     pub errors: Vec<String>,
+}
+
+/// The records in `text`, and how many lines claim to carry one but do
+/// not parse.
+fn parse(text: &str) -> (Vec<Value>, u64) {
+    let (mut records, mut malformed) = (Vec::new(), 0);
+    for line in text.lines() {
+        match record(line) {
+            Some(r) => records.push(r),
+            None if claims_record(line) => malformed += 1,
+            None => {}
+        }
+    }
+    (records, malformed)
+}
+
+/// A line that claims to carry a proof-trace record.
+fn claims_record(line: &str) -> bool {
+    line.contains("deltaforge::proof_trace") || line.contains("{\"record\":")
 }
 
 /// One server's binlog inventory, identity and executed set, for the
@@ -163,18 +196,27 @@ pub async fn collect(
     mark: &Mark,
     dir: &Path,
 ) -> Collected {
-    let mut out = Collected::default();
+    let mut out = Collected {
+        requested: cfg.deltaforge.proof_trace.is_some(),
+        required: cfg.proof_trace_required(),
+        ..Collected::default()
+    };
     let Some(source) = &cfg.deltaforge.proof_trace else {
         return out;
     };
     let text = match read_since(source, mark).await {
         Ok(t) => t,
         Err(e) => {
-            out.errors.push(format!("{e:#}"));
+            out.errors.push(format!("read the trace: {e:#}"));
             return out;
         }
     };
-    let records: Vec<Value> = text.lines().filter_map(record).collect();
+    let records;
+    (records, out.malformed) = parse(&text);
+    if out.malformed > 0 {
+        out.errors
+            .push(format!("{} malformed proof-trace lines", out.malformed));
+    }
     out.records = records.len() as u64;
     for r in &records {
         match r["record"].as_str() {
@@ -193,6 +235,14 @@ pub async fn collect(
             .filter(|r| r["source"] == source_id.as_str())
             .map(|r| format!("{r}\n"))
             .collect();
+        if mine.is_empty() {
+            // Most often the instance's log filter drops the target.
+            out.errors.push(format!(
+                "no proof-trace records for {} (is deltaforge::proof_trace \
+                 logged at info?)",
+                s.name
+            ));
+        }
         if let Err(e) = std::fs::write(&jsonl, mine) {
             out.errors.push(format!("{}: {e}", jsonl.display()));
             continue;
@@ -219,7 +269,10 @@ pub async fn collect(
             .output()
             .await
         {
-            Ok(o) if o.status.success() => {
+            Ok(o)
+                if o.status.success()
+                    && o.stdout.starts_with(b"# Proof-trace evidence") =>
+            {
                 if let Err(e) = std::fs::write(&report, &o.stdout) {
                     out.errors.push(format!("{}: {e}", report.display()));
                 } else {
@@ -227,13 +280,15 @@ pub async fn collect(
                 }
             }
             Ok(o) => out.errors.push(format!(
-                "report for {}: {}",
+                "report for {}: {} {}",
                 s.name,
+                o.status,
                 String::from_utf8_lossy(&o.stderr)
             )),
             Err(e) => out.errors.push(format!("report for {}: {e}", s.name)),
         }
     }
+    out.complete = out.errors.is_empty();
     out
 }
 
@@ -267,6 +322,20 @@ mod tests {
         ] {
             assert!(record(other).is_none(), "{other}");
         }
+    }
+
+    #[test]
+    fn truncated_or_unparsable_record_lines_are_counted_as_malformed() {
+        let text = [
+            r#"{"record":"scan","scan_id":1}"#,
+            r#"{"record":"scan","scan_id":2"#,
+            "INFO deltaforge::proof_trace: not json",
+            "INFO sources::mysql: connected",
+        ]
+        .join("\n");
+        let (records, malformed) = parse(&text);
+        assert_eq!(records.len(), 1);
+        assert_eq!(malformed, 2);
     }
 
     #[test]

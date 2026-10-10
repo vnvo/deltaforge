@@ -39,7 +39,7 @@ use mysql_async::prelude::Queryable;
 use rdkafka::ClientConfig;
 use rest_api::AppState;
 use runner::pipeline_manager::PipelineManager;
-use serde_json::Value;
+use serde_json::{Value, json};
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
@@ -288,6 +288,7 @@ deltaforge:
   key: {{mode: template, template: "${{after.id}}"}}
   topic_partitions: 2
   proof_trace: {{kind: file, path: "{trace}"}}
+  proof_trace_required: true
 verifier:
   kafka_brokers: {brokers}
   expected_key: {expected_key}
@@ -452,8 +453,37 @@ async fn the_harness_runs_scenarios_end_to_end() {
     assert!(r["resources"]["samples"].as_u64().unwrap() > 0);
     assert!(r["resources"]["connections_max"]["c01"].as_u64().unwrap() >= 1);
 
+    // An interrupted run stops its writers, drains and still checks what it
+    // wrote. The next run (S5, successful) starts immediately after it.
+    let mut cfg = config("S5", &env, "none");
+    cfg.run.duration_secs = 30;
+    let (abort_tx, abort_rx) = tokio::sync::watch::channel(None);
+    let name = pipeline_name(&cfg, &cfg.topology.servers[0]);
+    let client = Api::new(&api).unwrap();
+    let before = run_ids(out_s);
+    let run = tokio::spawn(sweep(
+        cfg,
+        RunOptions {
+            abort: Some(abort_rx),
+            ..opts.clone()
+        },
+    ));
+    until_status(&client, &name, "running").await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    abort_tx.send(Some("interrupted (test)".into())).unwrap();
+    let interrupted = run.await.unwrap().unwrap();
+    assert!(!interrupted.points[0].correctness_ok);
+    let r = new_result(out_s, &before);
+    assert_eq!(r["outcome"], "aborted", "{r}");
+    assert_eq!(r["reason"], "interrupted (test)");
+    assert!(r["measured_secs"].as_f64().unwrap() < 30.0);
+    assert_eq!(r["steps"], json!([]), "aborted before the restart");
+    assert_partial_counters(&r);
+    assert_eq!(r["completeness"]["missing"], 0, "{}", r["completeness"]);
+
     // S5: restart the pipeline mid-run; recovery is measured.
     let cfg = config("S5", &env, "none");
+    let before = run_ids(out_s);
     let sweep_s5 = sweep(cfg, opts.clone()).await.unwrap();
     let run_s5 = &sweep_s5.points[0].runs[0];
     let r = result(out_s, run_s5);
@@ -495,7 +525,16 @@ async fn the_harness_runs_scenarios_end_to_end() {
     // server's binlog inventory and the generated report.
     let pt = &r["proof_trace"];
     assert!(pt["records"].as_u64().unwrap() > 0, "{pt}");
-    assert_eq!(pt["errors"], serde_json::json!([]), "{pt}");
+    assert_eq!(pt["errors"], json!([]), "{pt}");
+    assert_eq!(pt["malformed"], 0, "{pt}");
+    assert_eq!(
+        (&pt["required"], &pt["complete"]),
+        (&json!(true), &json!(true))
+    );
+    assert_eq!(r["missing_artifacts"], json!([]));
+    assert_eq!(r["verdict"]["evidence_ok"], true);
+    assert_eq!(r["verdict"]["proof_conclusions_allowed"], true);
+    assert_eq!(new_result(out_s, &before)["run_id"], run_s5.as_str());
     let dir = Path::new(out_s).join("exploratory").join(run_s5);
     let meta: Value = serde_json::from_slice(
         &std::fs::read(dir.join("proof-trace-c01-meta.json")).unwrap(),
@@ -510,38 +549,6 @@ async fn the_harness_runs_scenarios_end_to_end() {
         "{report}"
     );
 
-    // An interrupted run stops its writers, drains and still checks what it
-    // wrote.
-    let mut cfg = config("S5", &env, "none");
-    cfg.run.duration_secs = 30;
-    let (abort_tx, abort_rx) = tokio::sync::watch::channel(None);
-    let name = pipeline_name(&cfg, &cfg.topology.servers[0]);
-    let client = Api::new(&api).unwrap();
-    let before = run_ids(out_s);
-    let run = tokio::spawn(sweep(
-        cfg,
-        RunOptions {
-            abort: Some(abort_rx),
-            ..opts.clone()
-        },
-    ));
-    until_status(&client, &name, "running").await;
-    tokio::time::sleep(Duration::from_secs(8)).await;
-    abort_tx.send(Some("interrupted (test)".into())).unwrap();
-    let interrupted = run.await.unwrap().unwrap();
-    assert!(!interrupted.points[0].correctness_ok);
-    let r = new_result(out_s, &before);
-    assert_eq!(r["outcome"], "aborted", "{r}");
-    assert_eq!(r["reason"], "interrupted (test)");
-    assert!(r["measured_secs"].as_f64().unwrap() < 30.0);
-    assert_eq!(
-        r["steps"],
-        serde_json::json!([]),
-        "aborted before the restart"
-    );
-    assert_partial_counters(&r);
-    assert_eq!(r["completeness"]["missing"], 0, "{}", r["completeness"]);
-
     // A server over the redo budget fails the run before any pipeline.
     let mut cfg = config("S5", &env, "none");
     cfg.topology.redo_log_capacity_max_bytes = Some(1 << 20);
@@ -553,9 +560,7 @@ async fn the_harness_runs_scenarios_end_to_end() {
     assert_eq!(r["stage"], "servers", "{r}");
     let reason = r["reason"].as_str().unwrap();
     assert!(reason.contains("innodb_redo_log_capacity"), "{reason}");
-    assert_eq!(r["pipelines"], serde_json::json!([]), "{r}");
-    // Run ids have a resolution of one second.
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert_eq!(r["pipelines"], json!([]), "{r}");
 
     // A run failing after its window (its ledger lost) still writes its
     // partial counters and readiness.
@@ -583,7 +588,7 @@ async fn the_harness_runs_scenarios_end_to_end() {
         ["drain", "completeness"].contains(&r["stage"].as_str().unwrap()),
         "{r}"
     );
-    assert_eq!(r["pipelines"], serde_json::json!([name]), "{r}");
+    assert_eq!(r["pipelines"], json!([name]), "{r}");
     assert_eq!(r["readiness"]["topics"]["fleet.c01"], 2, "{r}");
     assert_partial_counters(&r);
 
@@ -645,4 +650,13 @@ async fn the_harness_runs_scenarios_end_to_end() {
     assert_eq!(incident["safety_state"], "halted_uncertain", "{incident}");
     assert!(r["measured_secs"].as_f64().unwrap() < 60.0);
     assert_partial_counters(&r);
+
+    // Six runs, each with its own evidence and row namespace.
+    let ids = run_ids(out_s);
+    assert_eq!(ids.len(), 6, "{ids:?}");
+    let tags: BTreeSet<u64> = ids
+        .iter()
+        .map(|id| result(out_s, id)["run_tag"].as_u64().unwrap())
+        .collect();
+    assert_eq!(tags.len(), 6, "{tags:?}");
 }

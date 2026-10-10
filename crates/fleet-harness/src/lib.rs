@@ -13,6 +13,8 @@ pub mod config;
 pub mod consumer;
 pub mod deltaforge;
 pub mod driver;
+pub mod evidence;
+
 pub mod fixture;
 pub mod ledger;
 pub mod measure;

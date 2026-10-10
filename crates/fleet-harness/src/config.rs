@@ -256,6 +256,11 @@ pub struct DeltaForge {
     /// is read from; `None` collects none.
     #[serde(default)]
     pub proof_trace: Option<TraceSource>,
+    /// The requested proof trace is required evidence even in an
+    /// exploratory run (always in a qualification run): missing, malformed
+    /// or incomplete evidence fails the repetition.
+    #[serde(default)]
+    pub proof_trace_required: bool,
 }
 
 /// Where the instance under test writes its log.
@@ -467,6 +472,13 @@ fn default_true() -> bool {
 }
 
 impl RunConfig {
+    /// Whether the requested proof trace is required evidence.
+    pub fn proof_trace_required(&self) -> bool {
+        self.deltaforge.proof_trace.is_some()
+            && (self.class == RunClass::Qualification
+                || self.deltaforge.proof_trace_required)
+    }
+
     pub fn load(path: &str) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("read run config {path}"))?;
@@ -633,6 +645,18 @@ pub(crate) mod tests {
             serde_yaml::from_str::<Param<f64>>("{value: 1, provenance: x}")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn requested_proof_evidence_is_required_in_qualification_or_on_request() {
+        let mut cfg: RunConfig = serde_yaml::from_str(EXAMPLE).unwrap();
+        assert!(cfg.proof_trace_required(), "the T1 run requires it");
+        cfg.deltaforge.proof_trace_required = false;
+        assert!(!cfg.proof_trace_required());
+        cfg.class = RunClass::Qualification;
+        assert!(cfg.proof_trace_required());
+        cfg.deltaforge.proof_trace = None;
+        assert!(!cfg.proof_trace_required(), "nothing requested");
     }
 
     #[test]

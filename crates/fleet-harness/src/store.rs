@@ -333,16 +333,16 @@ pub async fn run_cell(
     };
     let dir = Path::new(output_dir).join(class.dir()).join(format!(
         "store-{}-s{}-t{}-v{}-f{}",
-        Utc::now().format("%Y%m%dT%H%M%S"),
+        crate::evidence::unique_stem(Utc::now()),
         result.cell.sources,
         result.cell.tables_per_source,
         result.cell.versions_changed,
         result.cell.changed_fraction
     ));
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(
-        dir.join("result.json"),
-        serde_json::to_vec_pretty(&result)?,
+    crate::evidence::create_new_dir(&dir)?;
+    crate::evidence::write_new(
+        &dir.join("result.json"),
+        &serde_json::to_vec_pretty(&result)?,
     )?;
     Ok(result)
 }

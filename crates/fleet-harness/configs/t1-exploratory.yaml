@@ -35,6 +35,13 @@ deltaforge:
   key:
     mode: template
     template: "${after.id}"
+  # Diagnosing the remaining proof and activation costs is this run's
+  # purpose: its proof trace is required evidence (the instance must log
+  # deltaforge::proof_trace at info).
+  proof_trace:
+    kind: docker_logs
+    container: deltaforge
+  proof_trace_required: true
 
 verifier:
   kafka_brokers: 127.0.0.1:9092
