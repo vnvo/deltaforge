@@ -163,6 +163,47 @@ def main(jsonl, meta_path):
     print(json.dumps(rows, indent=1))
     print("```\n")
 
+    reqs = [r for r in recs if r["record"] == "request"]
+    if reqs:
+        print("## Shared scanner requests")
+        scan_by_id = {s["scan_id"]: s for s in scans}
+        for kind in sorted({r["kind"] for r in reqs}) + ["all"]:
+            rs = [r for r in reqs if kind == "all" or r["kind"] == kind]
+            spans = [(off(r["from"]), off(r["to"])) for r in rs if r["served"] != "failed"]
+            spans = [(a, b) for a, b in spans if a is not None and b is not None]
+            distinct = union(spans)
+            phys_b = sum(r["bytes"] for r in rs)
+            phys_e = sum(r["events"] for r in rs)
+            served = defaultdict(int)
+            for r in rs:
+                served[r["served"]] += 1
+            ext = sum(len(r["scan_ids"]) for r in rs)
+            row = {
+                "kind": kind,
+                "requests": len(rs),
+                "served": dict(served),
+                "extensions": ext,
+                "requested_bytes": sum(b - a for a, b in spans),
+                "distinct_bytes": distinct,
+                "physical_bytes": phys_b,
+                "physical_events": phys_e,
+                "amplification": phys_b / distinct if distinct else None,
+                "peak_record_statements": max((r["record_statements"] or 0) for r in rs),
+                "peak_record_bytes": max((r["record_bytes"] or 0) for r in rs),
+            }
+            if gtid:
+                tx = []
+                for r in rs:
+                    if r["served"] == "failed":
+                        continue
+                    a = gno_max(r["from"]["gtid_set"], uuid)
+                    b = gno_max(r["to"]["gtid_set"], uuid)
+                    if a is not None and b is not None:
+                        tx.append((a, b))
+                row["distinct_txns"] = union(tx)
+            print(json.dumps(row))
+        print()
+
     outcomes = defaultdict(lambda: defaultdict(int))
     lock, schema = defaultdict(list), defaultdict(list)
     for p in proofs:
