@@ -558,8 +558,15 @@ async fn a_snapshot_after_failover_applies_the_policy_first() {
         )
         .await;
         let src = source(&sc, b, &st, policy.clone(), SnapshotMode::Always);
+        let records = test_common::TraceRecords::default();
+        let guard = records.install();
         let (items, ended) =
             run(src, &st, b, &[], Duration::from_secs(8)).await;
+        drop(guard);
+        // The proof from the failover position was served by the source's
+        // shared proof scanner.
+        let served = records.of("request", "failover_drift");
+        assert!(served.iter().any(|r| r["served"] != "failed"), "{served:?}");
         if policy == OnSchemaDrift::Halt {
             halted(&ended, "schema drift since the failover");
             assert!(rows(&items).is_empty(), "no snapshot row under halt");

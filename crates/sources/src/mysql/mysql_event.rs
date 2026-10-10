@@ -1473,6 +1473,7 @@ mod tests {
             lower_case_table_names: 0,
             txn_eval: None,
             txn_eval_cp: None,
+            proof_scanner: Default::default(),
             selection: Default::default(),
             failover: None,
             drift_checked: Default::default(),

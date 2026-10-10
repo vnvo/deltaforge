@@ -36,6 +36,7 @@ mod mysql_ddl_attribution;
 mod mysql_failover_drift;
 mod mysql_forward_proof;
 mod mysql_helpers;
+mod mysql_proof_scanner;
 mod mysql_selection;
 mod mysql_session;
 mod mysql_signature;
@@ -228,6 +229,8 @@ pub(crate) struct RunCtx {
     /// The same position as binlog coordinates (lineage left unset): where a
     /// lazy baseline's scan starts.
     txn_eval_cp: Option<MySqlCheckpoint>,
+    /// The source's shared proof scanner (`mysql_proof_scanner`).
+    proof_scanner: mysql_proof_scanner::ProofScanner,
     /// Validated activation timelines and row-time selections.
     selection: mysql_selection::Caches,
     /// The current lineage's failover anchor (`Some(None)`: not entered by
@@ -1413,6 +1416,9 @@ impl MySqlSource {
         let committed_resume = stream_resume.is_some() && !needs_snapshot;
 
         // The generation this start ran, if any.
+        // One proof scanner for the whole run: the snapshot's drift checks
+        // and baselines, then the stream's proofs.
+        let proof_scanner = mysql_proof_scanner::ProofScanner::default();
         let mut generation_run: Option<MyGenerationRun> = None;
         // The anchor a snapshot of this start, or the completed generation,
         // leaves the stream at.
@@ -1464,6 +1470,7 @@ impl MySqlSource {
                                     &server_uuid,
                                 )
                                 .await?,
+                            proofs: Some(&proof_scanner),
                         },
                     }),
                     None => None,
@@ -1620,6 +1627,7 @@ impl MySqlSource {
             lower_case_table_names,
             txn_eval: None,
             txn_eval_cp: None,
+            proof_scanner,
             selection: mysql_selection::Caches::new(&self.pipeline, &self.id),
             failover: None,
             drift_checked: Default::default(),

@@ -45,7 +45,8 @@ use super::MySqlCheckpoint;
 use super::mysql_activation::Stored;
 use super::mysql_baseline::affects;
 use super::mysql_binlog_scan::{
-    ProofError, ScanLimits, capture, covers, scan_interval,
+    ProofError, ProofKind, ScanLimits, ScanTag, capture, covers,
+    observe_capture, scan_interval, trace_proof,
 };
 use super::mysql_schema_loader::MySqlSchemaLoader;
 use super::mysql_table_schema::MySqlTableSchema;
@@ -126,6 +127,9 @@ pub(crate) struct DriftEnv<'a> {
     pub source_id: &'a str,
     pub halt: bool,
     pub lower_case_table_names: u8,
+    /// The source's shared proof scanner (rows evaluated in the stream);
+    /// `None` scans directly.
+    pub proofs: Option<&'a super::mysql_proof_scanner::ProofScanner>,
 }
 
 /// One stream per lineage transition, holding at most its one anchor (read with
@@ -453,6 +457,11 @@ async fn shape_at_failover(
     };
     let mut from = from;
     from.lineage = Some(anchor.current_lineage.clone());
+    let tag = ScanTag {
+        source_id: env.source_id,
+        kind: ProofKind::FailoverDrift,
+    };
+    let lctn = env.lower_case_table_names;
     let cap = match capture(
         env.dsn,
         env.server_uuid,
@@ -463,7 +472,10 @@ async fn shape_at_failover(
     )
     .await
     {
-        Ok(cap) => cap,
+        Ok(cap) => {
+            observe_capture(&tag, &cap);
+            cap
+        }
         Err(ProofError::OtherServer(found)) => {
             return Err(SourceError::Lineage {
                 details: format!(
@@ -476,6 +488,7 @@ async fn shape_at_failover(
         }
         Err(e) => {
             warn!(source_id = env.source_id, %db, %table, error = ?e, "failover drift: no capture");
+            trace_proof(&tag, db, table, None, None, lctn, "no_capture");
             return Ok(None);
         }
     };
@@ -493,22 +506,48 @@ async fn shape_at_failover(
     .is_some_and(|(f, end)| covers(&cap, &f, &end));
     if !covered {
         warn!(source_id = env.source_id, %db, %table, "failover drift: the capture started before F");
+        trace_proof(&tag, db, table, Some(&cap), None, lctn, "not_covered");
         return Ok(None);
     }
-    let report = match scan_interval(
-        env.dsn,
-        super::mysql_helpers::derive_server_id(&format!(
-            "{}/failover-drift",
-            env.source_id
-        )),
-        env.server_uuid,
-        &anchor.current_lineage,
-        &from,
-        &cap.position,
-        &ScanLimits::default(),
-    )
-    .await
-    {
+    let scanned = match env.proofs {
+        // The shared scanner. Rows in the stream: their position is the
+        // stream's boundary. A snapshot: the stream has not started, the
+        // failover position F (this request's start) is pinned while the
+        // request waits and runs.
+        Some(proofs) => {
+            let boundary =
+                matches!(event, FirstEvent::Rows { .. }).then_some(&from);
+            super::mysql_proof_scanner::shared_interval(
+                proofs,
+                env.dsn,
+                env.source_id,
+                env.server_uuid,
+                &anchor.current_lineage,
+                &from,
+                &cap.position,
+                boundary,
+                &tag,
+            )
+            .await
+        }
+        _ => {
+            scan_interval(
+                env.dsn,
+                super::mysql_helpers::derive_server_id(&format!(
+                    "{}/failover-drift",
+                    env.source_id
+                )),
+                env.server_uuid,
+                &anchor.current_lineage,
+                &from,
+                &cap.position,
+                &ScanLimits::default(),
+                &tag,
+            )
+            .await
+        }
+    };
+    let report = match scanned {
         Ok(report) => report,
         Err(ProofError::OtherServer(found)) => {
             return Err(SourceError::Lineage {
@@ -522,6 +561,7 @@ async fn shape_at_failover(
         }
         Err(e) => {
             warn!(source_id = env.source_id, %db, %table, error = ?e, "failover drift: the interval scan failed");
+            trace_proof(&tag, db, table, Some(&cap), None, lctn, "scan_failed");
             return Ok(None);
         }
     };
@@ -531,8 +571,18 @@ async fn shape_at_failover(
         .any(|st| affects(st, db, table, env.lower_case_table_names))
     {
         info!(source_id = env.source_id, %db, %table, "failover drift: a DDL or barrier in the interval");
+        trace_proof(
+            &tag,
+            db,
+            table,
+            Some(&cap),
+            Some(&report),
+            lctn,
+            "relevant_ddl",
+        );
         return Ok(None);
     }
+    trace_proof(&tag, db, table, Some(&cap), Some(&report), lctn, "proven");
     Ok(Some(cap.schema))
 }
 
@@ -697,6 +747,7 @@ pub(crate) async fn check_in_stream(
             source_id: &ctx.source_id,
             halt: ctx.on_schema_drift == deltaforge_config::OnSchemaDrift::Halt,
             lower_case_table_names: ctx.lower_case_table_names,
+            proofs: Some(&ctx.proof_scanner),
         };
         check(&env, &anchor, db, table, event).await?;
     }
@@ -813,6 +864,7 @@ mod tests {
             source_id: "s",
             halt: true,
             lower_case_table_names: 0,
+            proofs: None,
         };
         let key = scope.key("d", "x");
         let previous_key = SchemaKey::new("t", "s", hash(A), "d", "x");
@@ -932,6 +984,7 @@ mod tests {
                     source_id: "s",
                     halt: true,
                     lower_case_table_names: 0,
+                    proofs: None,
                 };
                 completed(&env, key, previous_key, anchor).await
             }

@@ -96,6 +96,98 @@ pub(crate) struct ScanReport {
     pub bytes: u64,
     pub duration: Duration,
     pub digest: String,
+    pub trace: ScanTrace,
+}
+
+/// Which proof a scan or capture serves (bounded: a metric label).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProofKind {
+    Lazy,
+    FullFallback,
+    Snapshot,
+    Forward,
+    FailoverDrift,
+}
+
+impl ProofKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ProofKind::Lazy => "lazy",
+            ProofKind::FullFallback => "full_fallback",
+            ProofKind::Snapshot => "snapshot",
+            ProofKind::Forward => "forward",
+            ProofKind::FailoverDrift => "failover_drift",
+        }
+    }
+}
+
+/// Who asks for a scan or capture: bounded labels for its metrics.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScanTag<'a> {
+    pub source_id: &'a str,
+    pub kind: ProofKind,
+}
+
+/// The qualification trace target. Everything costly - per-event
+/// classification, GTID arithmetic, table names, JSON - runs only while it
+/// is enabled; the trace never changes a scan's outcome.
+pub(crate) const TRACE_TARGET: &str = "deltaforge::proof_trace";
+
+pub(crate) fn trace_enabled() -> bool {
+    tracing::enabled!(target: "deltaforge::proof_trace", tracing::Level::INFO)
+}
+
+static NEXT_SCAN_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// A binlog position as decoded: the file, the event's end position and
+/// the GTID of the transaction it belongs to (if any).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct DecodedAt {
+    pub file: String,
+    pub end_pos: u64,
+    pub gtid: Option<String>,
+}
+
+/// What a scan did (always collected: a handful of integers and two
+/// positions). `detail` is filled only while the trace target is enabled.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct ScanTrace {
+    /// Process-unique: joins this scan with the proofs it served.
+    pub scan_id: u64,
+    /// Connect, identity proof and dump command.
+    pub setup: Duration,
+    /// From the dump command to the first transaction event.
+    pub seek: Duration,
+    /// From the first transaction event to the end position.
+    pub scan: Duration,
+    /// The first transaction event decoded (protocol events excluded).
+    pub first: Option<DecodedAt>,
+    /// The event at which the end position was proven reached.
+    pub terminal: Option<DecodedAt>,
+    pub detail: Option<ScanDetail>,
+}
+
+/// Event classification of a scan (trace target only).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct ScanDetail {
+    /// Rotate, format description, previous-GTIDs: protocol/file events,
+    /// never evidence of decoding before the start.
+    pub protocol_events: u64,
+    pub heartbeats: u64,
+    pub table_maps: u64,
+    pub row_events: u64,
+    pub query_events: u64,
+    /// Transactions completed in the scan: of the source server's UUID,
+    /// and of any other UUID.
+    pub source_txns: u64,
+    pub other_txns: u64,
+    /// Transaction events decoded at or before the start position (GTID
+    /// mode: a transaction already in the start set).
+    pub before_start: u64,
+    /// The source server's transactions in (from, to] by GTID arithmetic
+    /// (other UUIDs in the executed set are not counted).
+    pub interval_source_txns: Option<u64>,
 }
 
 /// Why a scan or capture failed (always fail-closed).
@@ -158,7 +250,7 @@ fn lp(h: &mut Sha256, bytes: &[u8]) {
     h.update(bytes);
 }
 
-fn encode_effect(e: &DdlEffect) -> String {
+pub(super) fn encode_effect(e: &DdlEffect) -> String {
     let tables = |v: &[super::mysql_ddl_attribution::TableName]| {
         v.iter()
             .map(|t| format!("{}\u{1f}{}", t.db, t.table))
@@ -176,7 +268,7 @@ fn encode_effect(e: &DdlEffect) -> String {
     }
 }
 
-fn encode_event(e: &EventIdentity) -> String {
+pub(super) fn encode_event(e: &EventIdentity) -> String {
     match e {
         EventIdentity::Gtid { gtid, ordinal } => {
             format!("gtid\u{1d}{gtid}\u{1d}{ordinal}")
@@ -248,6 +340,9 @@ struct Walk {
     file: String,
     statements: Vec<Statement>,
     reached: bool,
+    /// The GTID of the last transaction completed (the terminal one once
+    /// `reached`).
+    last_completed: Option<String>,
 }
 
 impl Walk {
@@ -270,6 +365,7 @@ impl Walk {
             if gtid_subseteq(to, &self.done) {
                 self.reached = true;
             }
+            self.last_completed = Some(g);
         }
         Ok(())
     }
@@ -369,6 +465,7 @@ impl Walk {
 /// Scan the retained interval `(from, to]` (module docs). Both positions must
 /// carry the verified `lineage_hash`; `server_id` must differ from every
 /// other replication connection of this source.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn scan_interval(
     dsn: &str,
     server_id: u64,
@@ -377,6 +474,107 @@ pub(crate) async fn scan_interval(
     from: &MySqlCheckpoint,
     to: &MySqlCheckpoint,
     limits: &ScanLimits,
+    tag: &ScanTag<'_>,
+) -> Result<ScanReport, ProofError> {
+    let scan_id =
+        NEXT_SCAN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let detail = trace_enabled();
+    let mut trace = ScanTrace {
+        scan_id,
+        ..Default::default()
+    };
+    let result = scan(
+        dsn,
+        server_id,
+        server_uuid,
+        lineage_hash,
+        from,
+        to,
+        limits,
+        detail,
+        &mut trace,
+    )
+    .await;
+    observe_scan(tag, from, to, &trace, &result);
+    result.map(|mut r| {
+        r.trace = trace;
+        r
+    })
+}
+
+/// Bounded metrics for every scan; the qualification record only while the
+/// trace target is enabled. Never fails.
+fn observe_scan(
+    tag: &ScanTag<'_>,
+    from: &MySqlCheckpoint,
+    to: &MySqlCheckpoint,
+    trace: &ScanTrace,
+    result: &Result<ScanReport, ProofError>,
+) {
+    let outcome = if result.is_ok() { "ok" } else { "failed" };
+    let labels = [
+        ("source", tag.source_id.to_string()),
+        ("kind", tag.kind.as_str().to_string()),
+        ("outcome", outcome.to_string()),
+    ];
+    let (events, bytes) = match result {
+        Ok(r) => (r.events, r.bytes),
+        Err(_) => (0, 0),
+    };
+    metrics::histogram!("deltaforge_mysql_proof_scan_events", &labels)
+        .record(events as f64);
+    metrics::histogram!("deltaforge_mysql_proof_scan_bytes", &labels)
+        .record(bytes as f64);
+    metrics::histogram!("deltaforge_mysql_proof_scan_setup_seconds", &labels)
+        .record(trace.setup.as_secs_f64());
+    metrics::histogram!("deltaforge_mysql_proof_scan_seek_seconds", &labels)
+        .record(trace.seek.as_secs_f64());
+    metrics::histogram!("deltaforge_mysql_proof_scan_seconds", &labels)
+        .record(trace.scan.as_secs_f64());
+    if !trace_enabled() {
+        return;
+    }
+    let record = serde_json::json!({
+        "record": "scan",
+        "scan_id": trace.scan_id,
+        "source": tag.source_id,
+        "kind": tag.kind.as_str(),
+        "outcome": outcome,
+        "error": result.as_ref().err().map(|e| e.to_string()),
+        "from": {"file": from.file, "pos": from.pos, "gtid_set": from.gtid_set},
+        "to": {"file": to.file, "pos": to.pos, "gtid_set": to.gtid_set},
+        "events": events,
+        "bytes": bytes,
+        "setup_ms": trace.setup.as_secs_f64() * 1e3,
+        "seek_ms": trace.seek.as_secs_f64() * 1e3,
+        "scan_ms": trace.scan.as_secs_f64() * 1e3,
+        "first": trace.first,
+        "terminal": trace.terminal,
+        "detail": trace.detail,
+    });
+    tracing::info!(target: "deltaforge::proof_trace", "{record}");
+}
+
+/// The source server's transactions in a GTID set (other UUIDs ignored).
+fn source_txns(set: &GtidSet, server_uuid: &str) -> u64 {
+    set.iter()
+        .filter(|(u, _)| u.eq_ignore_ascii_case(server_uuid))
+        .flat_map(|(_, ivs)| ivs.iter())
+        .map(|(a, b)| b.saturating_sub(*a) + 1)
+        .sum()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn scan(
+    dsn: &str,
+    server_id: u64,
+    server_uuid: &str,
+    lineage_hash: &str,
+    from: &MySqlCheckpoint,
+    to: &MySqlCheckpoint,
+    limits: &ScanLimits,
+    detail: bool,
+    trace: &mut ScanTrace,
 ) -> Result<ScanReport, ProofError> {
     let started = Instant::now();
     for (name, p) in [("from", from), ("to", to)] {
@@ -400,6 +598,7 @@ pub(crate) async fn scan_interval(
         events: 0,
         bytes: 0,
         duration: started.elapsed(),
+        trace: ScanTrace::default(),
     };
     match order_positions(&pf, &pt) {
         CheckpointOrder::Equal => return Ok(empty(Vec::new())),
@@ -445,6 +644,16 @@ pub(crate) async fn scan_interval(
     } else {
         GtidSet::new()
     };
+    // Trace only: the start set (to recognise a transaction decoded before
+    // the start) and the source server's transactions in the interval.
+    let start_set = (detail && gtid_mode).then(|| done.clone());
+    let mut det = detail.then(|| ScanDetail {
+        interval_source_txns: to_set.as_ref().map(|to| {
+            source_txns(to, server_uuid)
+                .saturating_sub(source_txns(&done, server_uuid))
+        }),
+        ..Default::default()
+    });
     let mut walk = Walk {
         gtid_mode,
         to_set,
@@ -455,6 +664,7 @@ pub(crate) async fn scan_interval(
         file: from.file.clone(),
         statements: Vec::new(),
         reached: false,
+        last_completed: None,
     };
 
     let mut stream = tokio::time::timeout(
@@ -470,6 +680,9 @@ pub(crate) async fn scan_interval(
         SessionError::NoIdentity(why) => ProofError::OtherServer(why),
         SessionError::Connect(why) => ProofError::Open(why),
     })?;
+    let opened = Instant::now();
+    trace.setup = opened - started;
+    let mut first_at: Option<Instant> = None;
     // The session's abortive close was armed right after it connected (see
     // `open_replication_session_abortive`): however this scan ends -
     // completion, error, timeout, or the future being cancelled or dropped -
@@ -497,7 +710,33 @@ pub(crate) async fn scan_interval(
             if bytes > limits.max_bytes {
                 return Err(ProofError::Limit("bytes".into()));
             }
+            let protocol = matches!(
+                data,
+                EventData::HeartBeat
+                    | EventData::Rotate(_)
+                    | EventData::FormatDescription(_)
+                    | EventData::PreviousGtids(_)
+            );
+            if let Some(d) = det.as_mut() {
+                observe_event(
+                    d,
+                    &header,
+                    &data,
+                    &walk,
+                    start_set.as_ref(),
+                    &pf,
+                    server_uuid,
+                );
+            }
             walk.event(&header, &data)?;
+            if !protocol && trace.first.is_none() {
+                first_at = Some(Instant::now());
+                trace.first = Some(DecodedAt {
+                    file: walk.file.clone(),
+                    end_pos: u64::from(header.next_event_position),
+                    gtid: walk.current_gtid.clone(),
+                });
+            }
             if !gtid_mode
                 && !matches!(
                     data,
@@ -530,11 +769,27 @@ pub(crate) async fn scan_interval(
                     }
                 }
             }
+            if walk.reached {
+                trace.terminal = Some(DecodedAt {
+                    file: walk.file.clone(),
+                    end_pos: u64::from(header.next_event_position),
+                    gtid: walk.last_completed.clone(),
+                });
+            }
         }
         Ok((events, bytes))
     }
     .await;
     drop(stream);
+    let now = Instant::now();
+    match first_at {
+        Some(f) => {
+            trace.seek = f - opened;
+            trace.scan = now - f;
+        }
+        None => trace.seek = now - opened,
+    }
+    trace.detail = det;
     let (events, bytes) = walked?;
     Ok(ScanReport {
         digest: scan_digest(&pf, &pt, &walk.statements),
@@ -542,7 +797,77 @@ pub(crate) async fn scan_interval(
         events,
         bytes,
         duration: started.elapsed(),
+        trace: ScanTrace::default(),
     })
+}
+
+/// Classify one decoded event (trace target only; never fails).
+fn observe_event(
+    d: &mut ScanDetail,
+    header: &EventHeader,
+    data: &EventData,
+    walk: &Walk,
+    start_set: Option<&GtidSet>,
+    start: &WmPos,
+    server_uuid: &str,
+) {
+    match data {
+        EventData::HeartBeat => d.heartbeats += 1,
+        EventData::Rotate(_)
+        | EventData::FormatDescription(_)
+        | EventData::PreviousGtids(_) => d.protocol_events += 1,
+        EventData::TableMap(_) => d.table_maps += 1,
+        EventData::WriteRows(_)
+        | EventData::UpdateRows(_)
+        | EventData::DeleteRows(_) => d.row_events += 1,
+        EventData::Query(_) => d.query_events += 1,
+        _ => {}
+    }
+    match (data, start_set) {
+        // GTID mode: a transaction already in the start set was decoded.
+        (EventData::Gtid(g), Some(set)) => {
+            if single(&g.gtid).is_ok_and(|one| gtid_subseteq(&one, set)) {
+                d.before_start += 1;
+            }
+            let source = g.gtid.rsplit_once(':').is_some_and(|(u, _)| {
+                u.trim().eq_ignore_ascii_case(server_uuid)
+            });
+            if source {
+                d.source_txns += 1;
+            } else {
+                d.other_txns += 1;
+            }
+        }
+        // File mode: a transaction event ending at or before the start.
+        (
+            EventData::Query(_)
+            | EventData::TableMap(_)
+            | EventData::WriteRows(_)
+            | EventData::UpdateRows(_)
+            | EventData::DeleteRows(_)
+            | EventData::Xid(_)
+            | EventData::Gtid(_),
+            None,
+        ) => {
+            let at = mysql_checkpoint_position(
+                &walk.file,
+                u64::from(header.next_event_position),
+                None,
+            );
+            if at.is_some_and(|at| {
+                matches!(
+                    order_positions(&at, start),
+                    CheckpointOrder::Before | CheckpointOrder::Equal
+                )
+            }) {
+                d.before_start += 1;
+            }
+            if matches!(data, EventData::Xid(_)) {
+                d.source_txns += 1;
+            }
+        }
+        _ => {}
+    }
 }
 
 /// One table's shape read between two server positions, on one connection
@@ -558,6 +883,22 @@ pub(crate) struct Captured {
     pub position: MySqlCheckpoint,
     pub schema: MySqlTableSchema,
     pub attempts: u32,
+    pub trace: CaptureTrace,
+}
+
+/// Where a capture's time went (always collected), and why it was retried.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct CaptureTrace {
+    /// Connection, GTID-mode and identity queries.
+    pub connect: Duration,
+    /// Waiting for the table's metadata lock (a DDL of the table running).
+    pub lock_wait: Duration,
+    /// The schema query itself, under the lock.
+    pub schema: Duration,
+    /// Both server position reads.
+    pub positions: Duration,
+    /// `capture_proven`: each retried attempt's cause.
+    pub retries: Vec<String>,
 }
 
 /// Runs between the shape read and the second position read (tests use it
@@ -628,6 +969,8 @@ pub(crate) async fn capture(
     between: Option<BetweenHook<'_>>,
 ) -> Result<Captured, ProofError> {
     let pool = mysql_async::Pool::new(dsn);
+    let mut trace = CaptureTrace::default();
+    let t0 = Instant::now();
     let result = async {
         let mut conn = pool
             .get_conn()
@@ -653,13 +996,22 @@ pub(crate) async fn capture(
         for q in [
             format!("SET SESSION lock_wait_timeout = {LOCK_WAIT_SECS}"),
             "START TRANSACTION READ ONLY".to_string(),
-            format!("SELECT 1 FROM {} LIMIT 0", quoted(db, table)),
         ] {
             conn.query_drop(&q)
                 .await
                 .map_err(|e| ProofError::Capture(format!("{q}: {e}")))?;
         }
+        trace.connect = t0.elapsed();
+        let t = Instant::now();
+        let lock = format!("SELECT 1 FROM {} LIMIT 0", quoted(db, table));
+        conn.query_drop(&lock)
+            .await
+            .map_err(|e| ProofError::Capture(format!("{lock}: {e}")))?;
+        trace.lock_wait = t.elapsed();
+        let t = Instant::now();
         let from = read_position(&mut conn, gtid_mode, lineage_hash).await?;
+        trace.positions = t.elapsed();
+        let t = Instant::now();
         let schema =
             match fetch_table_schema_on(&mut conn, server_uuid, db, table).await {
                 Ok(Live::Found(s)) => s,
@@ -668,10 +1020,13 @@ pub(crate) async fn capture(
                 }
                 Err(e) => return Err(ProofError::Capture(e.to_string())),
             };
+        trace.schema = t.elapsed();
         if let Some(hook) = between {
             hook().await;
         }
+        let t = Instant::now();
         let position = read_position(&mut conn, gtid_mode, lineage_hash).await?;
+        trace.positions += t.elapsed();
         match order_positions(&wm(&from)?, &wm(&position)?) {
             CheckpointOrder::Before | CheckpointOrder::Equal => {}
             other => {
@@ -689,11 +1044,93 @@ pub(crate) async fn capture(
             position,
             schema,
             attempts: 1,
+            trace: CaptureTrace::default(),
         })
     }
     .await;
     pool.disconnect().await.ok();
-    result
+    result.map(|mut c| {
+        c.trace = trace;
+        c
+    })
+}
+
+/// Bounded capture metrics (lock wait and schema query apart). Never fails.
+pub(crate) fn observe_capture(tag: &ScanTag<'_>, cap: &Captured) {
+    let labels = [
+        ("source", tag.source_id.to_string()),
+        ("kind", tag.kind.as_str().to_string()),
+    ];
+    metrics::histogram!(
+        "deltaforge_mysql_proof_capture_lock_wait_seconds",
+        &labels
+    )
+    .record(cap.trace.lock_wait.as_secs_f64());
+    metrics::histogram!(
+        "deltaforge_mysql_proof_capture_schema_seconds",
+        &labels
+    )
+    .record(cap.trace.schema.as_secs_f64());
+    if !cap.trace.retries.is_empty() {
+        metrics::counter!(
+            "deltaforge_mysql_proof_capture_retries_total",
+            &labels
+        )
+        .increment(cap.trace.retries.len() as u64);
+    }
+}
+
+/// The qualification record of one table proof: the table, its capture,
+/// the scan that served it (joined by `scan_id`) and what that scan found
+/// for this table. Trace target only; never fails.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn trace_proof(
+    tag: &ScanTag<'_>,
+    db: &str,
+    table: &str,
+    cap: Option<&Captured>,
+    report: Option<&ScanReport>,
+    lower_case_table_names: u8,
+    outcome: &str,
+) {
+    if !trace_enabled() {
+        return;
+    }
+    let (mut relevant, mut unrelated, mut barriers) = (0u64, 0u64, 0u64);
+    for st in report.map(|r| r.statements.as_slice()).unwrap_or_default() {
+        if matches!(st.effect, DdlEffect::Barrier(_)) {
+            barriers += 1;
+        }
+        if super::mysql_baseline::affects(st, db, table, lower_case_table_names)
+        {
+            relevant += 1;
+        } else {
+            unrelated += 1;
+        }
+    }
+    let record = serde_json::json!({
+        "record": "proof",
+        "source": tag.source_id,
+        "kind": tag.kind.as_str(),
+        "db": db,
+        "table": table,
+        "outcome": outcome,
+        "scan_id": report.map(|r| r.trace.scan_id),
+        "capture": cap.map(|c| serde_json::json!({
+            "from": {"file": c.from.file, "pos": c.from.pos, "gtid_set": c.from.gtid_set},
+            "to": {"file": c.position.file, "pos": c.position.pos, "gtid_set": c.position.gtid_set},
+            "attempts": c.attempts,
+            "connect_ms": c.trace.connect.as_secs_f64() * 1e3,
+            "lock_wait_ms": c.trace.lock_wait.as_secs_f64() * 1e3,
+            "schema_ms": c.trace.schema.as_secs_f64() * 1e3,
+            "positions_ms": c.trace.positions.as_secs_f64() * 1e3,
+            "retries": c.trace.retries,
+        })),
+        "relevant_ddl": relevant,
+        "unrelated_ddl": unrelated,
+        "barriers": barriers,
+    });
+    tracing::info!(target: "deltaforge::proof_trace", "{record}");
 }
 
 /// Whether a scan of `(start, end]` covers the capture interval
@@ -711,6 +1148,14 @@ pub(crate) fn covers(cap: &Captured, start: &WmPos, end: &WmPos) -> bool {
         order_positions(&b, end),
         CheckpointOrder::Before | CheckpointOrder::Equal
     )
+}
+
+/// The source's shared proof scanner and the stream's boundary, for a
+/// proof whose interval it should serve.
+#[derive(Clone, Copy)]
+pub(crate) struct SharedProofs<'a> {
+    pub scanner: &'a super::mysql_proof_scanner::ProofScanner,
+    pub boundary: Option<&'a MySqlCheckpoint>,
 }
 
 /// A capture whose own interval is proven: [`capture`], then a scan of
@@ -731,21 +1176,43 @@ pub(crate) async fn capture_proven(
     attempts: u32,
     limits: &ScanLimits,
     between: Option<BetweenHook<'_>>,
+    tag: &ScanTag<'_>,
+    shared: Option<SharedProofs<'_>>,
 ) -> Result<Captured, ProofError> {
+    let mut retries = Vec::new();
     for attempt in 1..=attempts.max(1) {
         let mut cap =
             capture(dsn, server_uuid, lineage_hash, db, table, between).await?;
         cap.attempts = attempt;
-        let report = scan_interval(
-            dsn,
-            scan_server_id,
-            server_uuid,
-            lineage_hash,
-            &cap.from,
-            &cap.position,
-            limits,
-        )
-        .await?;
+        let report = match &shared {
+            Some(sp) => {
+                super::mysql_proof_scanner::shared_interval(
+                    sp.scanner,
+                    dsn,
+                    tag.source_id,
+                    server_uuid,
+                    lineage_hash,
+                    &cap.from,
+                    &cap.position,
+                    sp.boundary,
+                    tag,
+                )
+                .await?
+            }
+            None => {
+                scan_interval(
+                    dsn,
+                    scan_server_id,
+                    server_uuid,
+                    lineage_hash,
+                    &cap.from,
+                    &cap.position,
+                    limits,
+                    tag,
+                )
+                .await?
+            }
+        };
         let relevant = report.statements.iter().any(|st| {
             super::mysql_baseline::affects(
                 st,
@@ -754,12 +1221,33 @@ pub(crate) async fn capture_proven(
                 lower_case_table_names,
             )
         });
+        cap.trace.retries = retries.clone();
+        observe_capture(tag, &cap);
         if !relevant {
+            trace_proof(
+                tag,
+                db,
+                table,
+                Some(&cap),
+                Some(&report),
+                lower_case_table_names,
+                "proven",
+            );
             return Ok(cap);
         }
+        retries.push("relevant statement in the capture interval".into());
         tokio::time::sleep(Duration::from_millis(20 * u64::from(attempt)))
             .await;
     }
+    trace_proof(
+        tag,
+        db,
+        table,
+        None,
+        None,
+        lower_case_table_names,
+        "unstable",
+    );
     Err(ProofError::Unstable(attempts.max(1)))
 }
 
@@ -769,6 +1257,10 @@ mod tests {
     use super::*;
 
     const U: &str = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+    const TAG: ScanTag<'static> = ScanTag {
+        source_id: "test",
+        kind: ProofKind::Lazy,
+    };
 
     fn g(n: u64) -> WmPos {
         WmPos::MysqlGtid {
@@ -848,6 +1340,7 @@ mod tests {
             file: "binlog.000001".into(),
             statements: Vec::new(),
             reached: false,
+            last_completed: None,
         }
     }
 
@@ -907,6 +1400,204 @@ mod tests {
         w.event(&header(2, 200), &query("ALTER TABLE t ADD c INT"))
             .unwrap();
         assert_eq!(w.statements.len(), 1);
+    }
+
+    fn protocol_events() -> Vec<EventData> {
+        use mysql_binlog_connector_rust::event::{
+            checksum_type::ChecksumType,
+            format_description_event::FormatDescriptionEvent,
+            previous_gtids_event::PreviousGtidsEvent,
+            rotate_event::RotateEvent,
+        };
+        vec![
+            EventData::Rotate(RotateEvent {
+                binlog_filename: "binlog.000001".into(),
+                binlog_position: 4,
+            }),
+            EventData::FormatDescription(FormatDescriptionEvent {
+                binlog_version: 4,
+                server_version: "8.4".into(),
+                create_timestamp: 0,
+                header_length: 19,
+                checksum_type: ChecksumType::None,
+            }),
+            EventData::PreviousGtids(PreviousGtidsEvent {
+                gtid_set: format!("{U}:1-9"),
+            }),
+        ]
+    }
+
+    fn gtid_event(gtid: &str) -> EventData {
+        EventData::Gtid(
+            mysql_binlog_connector_rust::event::gtid_event::GtidEvent {
+                flags: 0,
+                gtid: gtid.into(),
+            },
+        )
+    }
+
+    /// Rotate, format description and previous-GTIDs events at the start
+    /// of a dump are protocol, never "decoded before the start".
+    #[test]
+    fn protocol_events_are_never_decoded_before_the_start() {
+        let start_set = parse_gtid_set(&format!("{U}:1-9")).unwrap();
+        for gtid_mode in [true, false] {
+            let mut d = ScanDetail::default();
+            let start = if gtid_mode {
+                g(9)
+            } else {
+                mysql_checkpoint_position("binlog.000001", 500, None).unwrap()
+            };
+            for e in protocol_events() {
+                observe_event(
+                    &mut d,
+                    &header(0, 120),
+                    &e,
+                    &walk(gtid_mode),
+                    gtid_mode.then_some(&start_set),
+                    &start,
+                    U,
+                );
+            }
+            assert_eq!(
+                (d.protocol_events, d.before_start),
+                (3, 0),
+                "{gtid_mode}"
+            );
+        }
+    }
+
+    /// GTID mode: a transaction already in the start set was decoded before
+    /// the start; transactions are counted per server UUID.
+    #[test]
+    fn gtid_transactions_before_the_start_and_per_uuid() {
+        const OTHER: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let start_set = parse_gtid_set(&format!("{U}:1-9")).unwrap();
+        let mut d = ScanDetail::default();
+        for gtid in [format!("{U}:9"), format!("{U}:10"), format!("{OTHER}:1")]
+        {
+            observe_event(
+                &mut d,
+                &header(33, 0),
+                &gtid_event(&gtid),
+                &walk(true),
+                Some(&start_set),
+                &g(9),
+                U,
+            );
+        }
+        assert_eq!((d.before_start, d.source_txns, d.other_txns), (1, 2, 1));
+    }
+
+    /// File mode: a transaction event ending at or before the start was
+    /// decoded before it; one after it was not.
+    #[test]
+    fn file_events_at_or_before_the_start() {
+        let start =
+            mysql_checkpoint_position("binlog.000001", 500, None).unwrap();
+        let mut d = ScanDetail::default();
+        for end in [400u32, 500, 600] {
+            observe_event(
+                &mut d,
+                &header(2, end),
+                &query("CREATE TABLE d.t (a INT)"),
+                &walk(false),
+                None,
+                &start,
+                U,
+            );
+        }
+        assert_eq!((d.before_start, d.query_events), (2, 3));
+    }
+
+    /// The interval's transactions are the source server's only: other
+    /// UUIDs carried in the executed set are not counted.
+    #[test]
+    fn source_transactions_ignore_other_uuids() {
+        let set = parse_gtid_set(&format!(
+            "{U}:1-9:12,AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE:1-100"
+        ))
+        .unwrap();
+        assert_eq!(source_txns(&set, U), 10);
+        assert_eq!(source_txns(&set, &U.to_uppercase()), 10);
+    }
+
+    /// The bounded metric labels: five proof kinds.
+    #[test]
+    fn proof_kinds_are_a_bounded_label_set() {
+        let all = [
+            ProofKind::Lazy,
+            ProofKind::FullFallback,
+            ProofKind::Snapshot,
+            ProofKind::Forward,
+            ProofKind::FailoverDrift,
+        ]
+        .map(ProofKind::as_str);
+        assert_eq!(
+            all,
+            [
+                "lazy",
+                "full_fallback",
+                "snapshot",
+                "forward",
+                "failover_drift"
+            ]
+        );
+    }
+
+    fn cp(file: &str, pos: u64, gtid: Option<&str>) -> MySqlCheckpoint {
+        MySqlCheckpoint {
+            file: file.into(),
+            pos,
+            gtid_set: gtid.map(Into::into),
+            lineage: Some("l".into()),
+            snapshot_completed: None,
+            snapshot_chain: None,
+        }
+    }
+
+    /// GTID mode, decided before any session: the same set at a later file
+    /// offset is the canonical empty interval; sets that do not include
+    /// each other, or a GTID against a file position, are refused.
+    #[tokio::test]
+    async fn gtid_sets_are_authoritative_before_any_session() {
+        let nowhere = "mysql://u:p@127.0.0.1:1/";
+        let set = format!("{U}:1-9");
+        let r = scan_interval(
+            nowhere,
+            1,
+            U,
+            "l",
+            &cp("binlog.000001", 100, Some(&set)),
+            &cp("binlog.000002", 900, Some(&set)),
+            &ScanLimits::default(),
+            &TAG,
+        )
+        .await
+        .unwrap();
+        assert!(r.statements.is_empty());
+        assert_eq!(r.digest, scan_digest(&g(9), &g(9), &[]));
+        for to in [
+            cp(
+                "binlog.000001",
+                100,
+                Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:1-3"),
+            ),
+            cp("binlog.000001", 200, None),
+        ] {
+            let r = scan_interval(
+                nowhere,
+                1,
+                U,
+                "l",
+                &cp("binlog.000001", 100, Some(&set)),
+                &to,
+                &ScanLimits::default(),
+                &TAG,
+            )
+            .await;
+            assert!(matches!(r, Err(ProofError::Positions(_))), "{r:?}");
+        }
     }
 
     #[test]
@@ -1052,6 +1743,7 @@ mod tests {
                     max_duration: Duration::from_secs(20),
                     ..ScanLimits::default()
                 },
+                &TAG,
             )
             .await
         }
@@ -1069,6 +1761,156 @@ mod tests {
                     DdlEffect::None => "none".into(),
                 })
                 .collect()
+        }
+
+        /// Collects the qualification trace records, while installed as
+        /// this thread's default subscriber.
+        #[derive(Clone, Default)]
+        struct Records(Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Records {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() != TRACE_TARGET {
+                    return;
+                }
+                struct Msg(String);
+                impl tracing::field::Visit for Msg {
+                    fn record_debug(
+                        &mut self,
+                        f: &tracing::field::Field,
+                        v: &dyn std::fmt::Debug,
+                    ) {
+                        if f.name() == "message" {
+                            self.0 = format!("{v:?}");
+                        }
+                    }
+                }
+                let mut m = Msg(String::new());
+                event.record(&mut m);
+                if let Ok(v) = serde_json::from_str(&m.0) {
+                    self.0.lock().unwrap().push(v);
+                }
+            }
+        }
+
+        impl Records {
+            /// Trace enabled on this thread until the guard drops.
+            fn install(&self) -> tracing::subscriber::DefaultGuard {
+                use tracing_subscriber::layer::SubscriberExt;
+                tracing::subscriber::set_default(
+                    tracing_subscriber::registry().with(self.clone()),
+                )
+            }
+
+            fn of(&self, record: &str) -> Vec<serde_json::Value> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|v| v["record"] == record)
+                    .cloned()
+                    .collect()
+            }
+        }
+
+        /// A scan's trace: where it started and ended, its timings and its
+        /// event classification. Transactions are counted per server UUID
+        /// (GTID mode: one of another UUID in the interval); nothing is
+        /// decoded before the start. With the trace off the outcome and
+        /// digest are identical and no detail is collected.
+        async fn traced(gtid: bool, db: &str) {
+            let dsn = server(gtid).await;
+            sql(&dsn, &[&format!("CREATE DATABASE {db}")]).await;
+            let from = position(&dsn).await;
+            sql(
+                &dsn,
+                &[
+                    &format!("CREATE TABLE {db}.t (a INT PRIMARY KEY)"),
+                    &format!("INSERT INTO {db}.t VALUES (1)"),
+                ],
+            )
+            .await;
+            if gtid {
+                sql(
+                    &dsn,
+                    &[
+                        "SET gtid_next = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:1'",
+                        &format!("INSERT INTO {db}.t VALUES (2)"),
+                        "SET gtid_next = 'AUTOMATIC'",
+                    ],
+                )
+                .await;
+            }
+            let to = position(&dsn).await;
+
+            let records = Records::default();
+            let guard = records.install();
+            let r = scan(&dsn, &from, &to).await.unwrap();
+            drop(guard);
+            let t = &r.trace;
+            let d = t.detail.as_ref().expect("detail while the trace is on");
+            assert_eq!(d.before_start, 0, "{d:?}");
+            assert!(d.protocol_events > 0, "{d:?}");
+            assert_eq!(d.row_events, if gtid { 2 } else { 1 }, "{d:?}");
+            if gtid {
+                assert_eq!(d.interval_source_txns, Some(2), "{d:?}");
+                assert_eq!((d.source_txns, d.other_txns), (2, 1), "{d:?}");
+            }
+            let first = t.first.as_ref().expect("a first transaction event");
+            let terminal = t.terminal.as_ref().expect("a terminal event");
+            if gtid {
+                assert!(first.gtid.is_some() && terminal.gtid.is_some());
+            } else {
+                assert_eq!(
+                    (&terminal.file, terminal.end_pos),
+                    (&to.file, to.pos)
+                );
+                assert!(first.end_pos > from.pos || first.file != from.file);
+            }
+            let scans = records.of("scan");
+            assert_eq!(scans.len(), 1, "{scans:?}");
+            assert_eq!(scans[0]["scan_id"], t.scan_id);
+            assert_eq!(scans[0]["outcome"], "ok");
+            assert_eq!(scans[0]["kind"], "lazy");
+
+            // The trace off: the same outcome, nothing collected.
+            let plain = scan(&dsn, &from, &to).await.unwrap();
+            assert_eq!(plain.digest, r.digest);
+            assert!(plain.trace.detail.is_none());
+            assert!(plain.trace.terminal.is_some());
+
+            // An interval holding only a DDL (no rows): the terminal is
+            // still the proven end.
+            let a = position(&dsn).await;
+            sql(&dsn, &[&format!("CREATE TABLE {db}.u (a INT PRIMARY KEY)")])
+                .await;
+            let b = position(&dsn).await;
+            let ddl = scan(&dsn, &a, &b).await.unwrap();
+            assert!(ddl.trace.terminal.is_some());
+            assert!(ddl.trace.first.is_some());
+
+            // A failing scan: the trace changes nothing about the error.
+            let guard = records.install();
+            let err = scan(&dsn, &to, &from).await.unwrap_err();
+            drop(guard);
+            assert!(matches!(err, ProofError::Positions(_)), "{err:?}");
+            assert_eq!(records.of("scan").last().unwrap()["outcome"], "failed");
+        }
+
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn gtid_scan_traces() {
+            traced(true, "trace_g").await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn file_position_scan_traces() {
+            traced(false, "trace_f").await;
         }
 
         async fn scenario(gtid: bool, db: &str) {
@@ -1173,6 +2015,7 @@ mod tests {
                                 max_duration: Duration::from_secs(20),
                                 ..ScanLimits::default()
                             },
+                            &TAG,
                         )
                         .await
                     }
@@ -1286,6 +2129,7 @@ mod tests {
                     max_duration: Duration::from_secs(3),
                     ..ScanLimits::default()
                 },
+                &TAG,
             )
             .await;
             assert!(
@@ -1316,6 +2160,7 @@ mod tests {
                     max_events: 1,
                     ..ScanLimits::default()
                 },
+                &TAG,
             )
             .await;
             assert!(matches!(r, Err(ProofError::Limit(_))), "{r:?}");
@@ -1363,7 +2208,7 @@ mod tests {
                 },
             ] {
                 let r = scan_interval(
-                    &dsn, 4_000_124, &uuid, LINEAGE, &from, &to, &limits,
+                    &dsn, 4_000_124, &uuid, LINEAGE, &from, &to, &limits, &TAG,
                 )
                 .await;
                 assert_eq!(
@@ -1469,6 +2314,7 @@ mod tests {
                             max_duration: Duration::from_secs(120),
                             ..ScanLimits::default()
                         },
+                        &TAG,
                     )
                     .await
                 }
@@ -1562,6 +2408,7 @@ mod tests {
                 &from,
                 &later,
                 &ScanLimits::default(),
+                &TAG,
             )
             .await;
             assert!(matches!(r, Err(ProofError::OtherServer(_))), "{r:?}");
@@ -1667,8 +2514,265 @@ mod tests {
                 attempts,
                 &limits(),
                 hook.as_ref().map(|h| h as BetweenHook<'_>),
+                &TAG,
+                None,
             )
             .await
+        }
+
+        /// The shared proof scanner equals direct scans on a real server:
+        /// nested and overlapping requests over a workload with DDL (create,
+        /// alter, rename, a database operation) between DML.
+        async fn shared_equals_direct(gtid: bool, db: &str) {
+            use super::super::super::mysql_proof_scanner::{
+                LiveSegments, ProofScanner,
+            };
+            let dsn = server(gtid).await;
+            let id = uuid(&dsn).await;
+            sql(
+                &dsn,
+                &[
+                    &format!("CREATE DATABASE {db}"),
+                    &format!("CREATE TABLE {db}.t (a INT PRIMARY KEY)"),
+                ],
+            )
+            .await;
+            let mut points = vec![position(&dsn).await];
+            for i in 0..16 {
+                let stmt = match i % 4 {
+                    0 => format!("CREATE TABLE {db}.x{i} (a INT PRIMARY KEY)"),
+                    1 => format!("INSERT INTO {db}.t (a) VALUES ({i})"),
+                    2 => format!("ALTER TABLE {db}.t ADD COLUMN c{i} INT"),
+                    _ => format!("RENAME TABLE {db}.x{} TO {db}.y{i}", i - 3),
+                };
+                sql(&dsn, &[&stmt]).await;
+                if i == 9 {
+                    sql(&dsn, &[&format!("CREATE DATABASE {db}_other")]).await;
+                }
+                points.push(position(&dsn).await);
+            }
+            let scanner = ProofScanner::default();
+            let segments = LiveSegments {
+                dsn: &dsn,
+                server_id: 4_000_150,
+                server_uuid: &id,
+                lineage_hash: LINEAGE,
+                limits: ScanLimits::default(),
+            };
+            let n = points.len();
+            for i in 0..n {
+                for j in [i, (i + 3).min(n - 1), n - 1] {
+                    let shared = scanner
+                        .interval(
+                            &segments,
+                            &id,
+                            LINEAGE,
+                            &points[i],
+                            &points[j],
+                            Some(&points[i]),
+                            &TAG,
+                        )
+                        .await
+                        .unwrap();
+                    let direct =
+                        scan(&dsn, &points[i], &points[j]).await.unwrap();
+                    assert_eq!(
+                        shared.statements, direct.statements,
+                        "({i}, {j}]"
+                    );
+                    assert_eq!(shared.digest, direct.digest, "({i}, {j}]");
+                }
+            }
+            let (first, last) = (&points[0], &points[n - 1]);
+            use super::super::super::mysql_proof_scanner::RecordLimits;
+
+            // The record's bounds fail closed (and clear it).
+            for limits in [
+                RecordLimits {
+                    max_statements: 3,
+                    max_bytes: 1 << 20,
+                },
+                RecordLimits {
+                    max_statements: 1000,
+                    max_bytes: 200,
+                },
+            ] {
+                let small = ProofScanner::new(limits);
+                let r = small
+                    .interval(&segments, &id, LINEAGE, first, last, None, &TAG)
+                    .await;
+                assert!(matches!(r, Err(ProofError::Limit(_))), "{r:?}");
+                assert_eq!(small.retained().await, None);
+            }
+
+            // A request cancelled during its extension leaves the record
+            // as it was; the next request equals the direct scan.
+            let fresh = ProofScanner::default();
+            fresh
+                .interval(
+                    &segments,
+                    &id,
+                    LINEAGE,
+                    first,
+                    &points[2],
+                    Some(first),
+                    &TAG,
+                )
+                .await
+                .unwrap();
+            let before = fresh.retained().await;
+            let cut = tokio::time::timeout(
+                Duration::from_micros(1),
+                fresh.interval(
+                    &segments,
+                    &id,
+                    LINEAGE,
+                    first,
+                    last,
+                    Some(first),
+                    &TAG,
+                ),
+            )
+            .await;
+            assert!(cut.is_err(), "the request was cancelled");
+            assert_eq!(fresh.retained().await, before);
+            assert_eq!(fresh.pinned(), 0);
+            let r = fresh
+                .interval(
+                    &segments,
+                    &id,
+                    LINEAGE,
+                    first,
+                    last,
+                    Some(first),
+                    &TAG,
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.digest, scan(&dsn, first, last).await.unwrap().digest);
+
+            // Another lineage never reuses the record: it scans again.
+            const OTHER: &str = "fedcba9876543210fedcba9876543210";
+            let relabel = |p: &MySqlCheckpoint| MySqlCheckpoint {
+                lineage: Some(OTHER.into()),
+                ..p.clone()
+            };
+            let other = LiveSegments {
+                dsn: &dsn,
+                server_id: 4_000_152,
+                server_uuid: &id,
+                lineage_hash: OTHER,
+                limits: ScanLimits::default(),
+            };
+            let r = fresh
+                .interval(
+                    &other,
+                    &id,
+                    OTHER,
+                    &relabel(first),
+                    &relabel(last),
+                    None,
+                    &TAG,
+                )
+                .await
+                .unwrap();
+            assert!(r.events > 0, "a new lineage rescans");
+        }
+
+        /// GTID mode: B at A's file offset but holding one more transaction
+        /// (a DDL) is a real interval: the direct and the shared scans both
+        /// read and prove it, with identical statements and digest.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn the_same_file_offset_with_one_more_gtid_is_scanned() {
+            use super::super::super::mysql_proof_scanner::{
+                LiveSegments, ProofScanner,
+            };
+            let dsn = server(true).await;
+            let id = uuid(&dsn).await;
+            sql(&dsn, &["CREATE DATABASE dual_pos"]).await;
+            let a = position(&dsn).await;
+            sql(&dsn, &["CREATE TABLE dual_pos.t (a INT PRIMARY KEY)"]).await;
+            let real_b = position(&dsn).await;
+            let b = MySqlCheckpoint {
+                file: a.file.clone(),
+                pos: a.pos,
+                ..real_b.clone()
+            };
+            let direct = scan(&dsn, &a, &b).await.unwrap();
+            assert_eq!(direct.statements.len(), 1, "{:?}", direct.statements);
+            assert_eq!(
+                direct.digest,
+                scan(&dsn, &a, &real_b).await.unwrap().digest
+            );
+            let shared = ProofScanner::default()
+                .interval(
+                    &LiveSegments {
+                        dsn: &dsn,
+                        server_id: 4_000_153,
+                        server_uuid: &id,
+                        lineage_hash: LINEAGE,
+                        limits: ScanLimits::default(),
+                    },
+                    &id,
+                    LINEAGE,
+                    &a,
+                    &b,
+                    Some(&a),
+                    &TAG,
+                )
+                .await
+                .unwrap();
+            assert_eq!(shared.statements, direct.statements);
+            assert_eq!(shared.digest, direct.digest);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn gtid_shared_scans_equal_direct_scans() {
+            shared_equals_direct(true, "shared_g").await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn file_position_shared_scans_equal_direct_scans() {
+            shared_equals_direct(false, "shared_f").await;
+        }
+
+        /// A FULL-fallback capture records its proof: lock wait and schema
+        /// query apart, the scan that proved it.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_proven_capture_is_traced() {
+            let dsn = server(true).await;
+            sql(
+                &dsn,
+                &[
+                    "CREATE DATABASE trace_c",
+                    "CREATE TABLE trace_c.t (a INT PRIMARY KEY)",
+                ],
+            )
+            .await;
+            let records = Records::default();
+            let guard = records.install();
+            let cap = proven(&dsn, "trace_c", 3, None).await.unwrap();
+            drop(guard);
+            let proofs = records.of("proof");
+            assert_eq!(proofs.len(), 1, "{proofs:?}");
+            let p = &proofs[0];
+            assert_eq!(
+                (p["kind"].as_str(), p["outcome"].as_str()),
+                (Some("lazy"), Some("proven"))
+            );
+            assert_eq!(
+                (p["db"].as_str(), p["table"].as_str()),
+                (Some("trace_c"), Some("t"))
+            );
+            assert!(p["capture"]["lock_wait_ms"].is_number());
+            assert!(p["capture"]["schema_ms"].is_number());
+            assert!(cap.trace.schema > Duration::ZERO);
+            let scans = records.of("scan");
+            assert_eq!(p["scan_id"], scans.last().unwrap()["scan_id"]);
         }
 
         fn columns(c: &Captured) -> Vec<&str> {
@@ -2072,6 +3176,8 @@ mod tests {
                     ..limits()
                 },
                 Some(&hook),
+                &TAG,
+                None,
             )
             .await;
             assert!(matches!(r, Err(ProofError::Limit(_))), "{r:?}");

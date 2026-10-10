@@ -30,7 +30,8 @@ use tracing::{info, warn};
 use super::mysql_activation::{self, ForwardProof, resolve_binding};
 use super::mysql_baseline::affects;
 use super::mysql_binlog_scan::{
-    CLASSIFIER_VERSION, ProofError, ScanLimits, capture, covers, scan_interval,
+    CLASSIFIER_VERSION, ProofError, ProofKind, ScanTag, capture, covers,
+    observe_capture, trace_proof,
 };
 use super::{MySqlCheckpoint, RunCtx};
 use crate::durable_checkpoint::{mysql_checkpoint_position, order_positions};
@@ -122,6 +123,11 @@ pub(crate) async fn prove(
         return Ok(0);
     }
 
+    let tag = ScanTag {
+        source_id: &ctx.source_id,
+        kind: ProofKind::Forward,
+    };
+    let lctn = ctx.lower_case_table_names;
     // 1. Captures, bound to their intervals by step 3.
     let mut captured = Vec::new();
     for p in open {
@@ -135,12 +141,24 @@ pub(crate) async fn prove(
         )
         .await
         {
-            Ok(cap) => captured.push((p, cap)),
+            Ok(cap) => {
+                observe_capture(&tag, &cap);
+                captured.push((p, cap))
+            }
             Err(ProofError::OtherServer(found)) => {
                 return Err(other_server(&server_uuid, &found));
             }
             Err(e) => {
                 warn!(source_id = %ctx.source_id, db = %p.db, table = %p.table, error = ?e, "forward proof: no capture; the DDL stays pending");
+                trace_proof(
+                    &tag,
+                    &p.db,
+                    &p.table,
+                    None,
+                    None,
+                    lctn,
+                    "no_capture",
+                );
             }
         }
     }
@@ -166,17 +184,16 @@ pub(crate) async fn prove(
     }
 
     // 3. One complete scan of (D, S].
-    let report = match scan_interval(
+    let report = match super::mysql_proof_scanner::shared_interval(
+        &ctx.proof_scanner,
         ctx.dsn.expose(),
-        super::mysql_helpers::derive_server_id(&format!(
-            "{}/forward",
-            ctx.source_id
-        )),
+        &ctx.source_id,
         &server_uuid,
         &lineage,
         &d_cp,
         &s_cp,
-        &ScanLimits::default(),
+        Some(&d_cp),
+        &tag,
     )
     .await
     {
@@ -186,6 +203,17 @@ pub(crate) async fn prove(
         }
         Err(e) => {
             warn!(source_id = %ctx.source_id, error = ?e, "forward proof: the interval scan failed; the DDL stays pending");
+            for (p, cap) in &captured {
+                trace_proof(
+                    &tag,
+                    &p.db,
+                    &p.table,
+                    Some(cap),
+                    None,
+                    lctn,
+                    "scan_failed",
+                );
+            }
             return Ok(0);
         }
     };
@@ -197,6 +225,15 @@ pub(crate) async fn prove(
     for (p, cap) in captured {
         if !covers(&cap, &d, &s) {
             warn!(source_id = %ctx.source_id, db = %p.db, table = %p.table, "forward proof: the scan does not cover the capture interval; the DDL stays pending");
+            trace_proof(
+                &tag,
+                &p.db,
+                &p.table,
+                Some(&cap),
+                Some(&report),
+                lctn,
+                "not_covered",
+            );
             continue;
         }
         if report
@@ -205,6 +242,15 @@ pub(crate) async fn prove(
             .any(|st| affects(st, &p.db, &p.table, ctx.lower_case_table_names))
         {
             info!(source_id = %ctx.source_id, db = %p.db, table = %p.table, "forward proof: a DDL or barrier in (D, S]; the DDL stays pending");
+            trace_proof(
+                &tag,
+                &p.db,
+                &p.table,
+                Some(&cap),
+                Some(&report),
+                lctn,
+                "relevant_ddl",
+            );
             continue;
         }
         let (version, schema_hash) = ctx
@@ -230,6 +276,15 @@ pub(crate) async fn prove(
         .map_err(|e| {
             SourceError::Other(e.context("persist a forward-proof binding"))
         })?;
+        trace_proof(
+            &tag,
+            &p.db,
+            &p.table,
+            Some(&cap),
+            Some(&report),
+            lctn,
+            "proven",
+        );
         written += 1;
     }
     info!(source_id = %ctx.source_id, bindings = written, "forward proof after DDL");
