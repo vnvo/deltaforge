@@ -112,3 +112,4 @@ release    runner/s3_ministack_durable_canary -p runner --test s3_ministack_dura
 parallel   sources/mysql_proof_amplification -p sources --test mysql_proof_amplification -- --include-ignored --test-threads=1 bounded
 excluded   sources/snapshot_scale_measure   1K/10K acceptance measurement (about 20 min, asserts the scale gates): run once on the final candidate, not per gate
 excluded   gate-ownership/gate_probe        the gate self-test probe: run inside a real gate by scripts/gate-selftest.sh, fails or hangs on purpose
+excluded   runner/mysql_type_probe          measurement probe (MySQL, Kafka, Schema Registry, RustFS; about 5 min): records every MySQL type through every path for docs/design/mysql-canonical-types.md, asserts nothing
