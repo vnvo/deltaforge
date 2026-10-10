@@ -286,15 +286,18 @@ impl MySqlRotationRuntime {
     /// Stage B: apply a completed preflight at the current transaction boundary. The
     /// caller must ensure `ctx.current_gtid.is_none()` (between transactions) and
     /// `ctx.last_gtid.is_some()` (a GTID boundary exists). Takes the live stream by
-    /// value and returns the resulting stream; a fatal outcome returns an error so
-    /// the run loop stops without advancing the checkpoint.
+    /// value and returns the resulting stream and whether it was replaced; a fatal
+    /// outcome returns an error so the run loop stops without advancing the
+    /// checkpoint. `lost`: the stream already ended (the server closed it), so
+    /// there is no reader to shut down.
     pub(crate) async fn apply_at_boundary(
         &mut self,
         ctx: &mut RunCtx,
         stream: BinlogStream,
-    ) -> SourceResult<BinlogStream> {
+        lost: bool,
+    ) -> SourceResult<(BinlogStream, bool)> {
         let Some(ready) = self.mgr.take_ready() else {
-            return Ok(stream);
+            return Ok((stream, false));
         };
         let ReadyPreflight {
             generation,
@@ -303,13 +306,14 @@ impl MySqlRotationRuntime {
         } = ready;
         if let Err(reject) = result {
             self.mgr.record_preflight_failure(generation, reject);
-            return Ok(stream);
+            return Ok((stream, false));
         }
 
         // The live stream is moved into a shared holder so the Stage-B closures can
         // close it and install the replacement; the resulting stream is taken back
         // out afterwards.
         let holder = Arc::new(Mutex::new(Some(stream)));
+        let replaced = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Both the replacement and a recovery session must prove they are the
         // verified server before their dump command.
         let expected = ctx.expected_uuid()?;
@@ -355,7 +359,9 @@ impl MySqlRotationRuntime {
                     let mut guard = holder.lock().await;
                     guard.take()
                 };
-                if let Some(mut stream) = old {
+                if let Some(mut stream) = old
+                    && !lost
+                {
                     stream
                         .close()
                         .await
@@ -369,6 +375,7 @@ impl MySqlRotationRuntime {
 
         // open_new: replacement stream from the frozen GTID set with the new creds.
         let open_new = {
+            let replaced = Arc::clone(&replaced);
             let expected = expected.clone();
             let holder = Arc::clone(&holder);
             let new_dsn = new_dsn.clone();
@@ -388,12 +395,14 @@ impl MySqlRotationRuntime {
                 )
                 .await?;
                 *holder.lock().await = Some(s);
+                replaced.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok::<(), RotationReject>(())
             }
         };
 
         // open_old: bounded recovery to the old creds if the replacement fails.
         let open_old = {
+            let replaced = Arc::clone(&replaced);
             let expected = expected.clone();
             let holder = Arc::clone(&holder);
             let old_dsn = old_dsn.clone();
@@ -413,6 +422,7 @@ impl MySqlRotationRuntime {
                 )
                 .await?;
                 *holder.lock().await = Some(s);
+                replaced.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok::<(), RotationReject>(())
             }
         };
@@ -439,7 +449,7 @@ impl MySqlRotationRuntime {
             .await
             .take()
             .ok_or_else(|| fail_closed("rotation left no binlog stream"))?;
-        Ok(stream)
+        Ok((stream, replaced.load(std::sync::atomic::Ordering::SeqCst)))
     }
 
     pub(crate) async fn shutdown(self) {

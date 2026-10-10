@@ -48,6 +48,21 @@ pub trait CheckpointStore: Send + Sync {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
+    /// Before a source delivers anything: give every configured sink that
+    /// has no checkpoint yet `checkpoint`, the position the source starts
+    /// from, durably. A sink without one is outside the resume minimum, so
+    /// batches it failed before its first acknowledgement would never be
+    /// replayed to it. Existing checkpoints are never changed. An error
+    /// must stop the source before it delivers (fail closed). A store that
+    /// does not manage per-sink checkpoints has nothing to initialize.
+    async fn initialize_sink_checkpoints(
+        &self,
+        _source_id: &str,
+        _checkpoint: &[u8],
+    ) -> CheckpointResult<()> {
+        Ok(())
+    }
+
     /// Get raw checkpoint bytes.
     async fn get_raw(
         &self,

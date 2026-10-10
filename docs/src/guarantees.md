@@ -178,9 +178,11 @@ When an optional sink fails for batch B (events at LSN 100):
 1. Required sinks succeed → their checkpoints advance to LSN 100.
 2. The optional sink's checkpoint **stays at its prior position** (LSN 50, say).
 3. The pipeline continues to batch B+1 (events at LSN 101+). The source's in-memory position is now 101, not 50.
-4. The optional sink receives batch B+1 with events at LSN 101+. It may succeed or fail again — irrelevant to LSN 100, which was already "passed over" in this session.
+4. The optional sink receives batch B+1 with events at LSN 101+. It may succeed or fail again: its checkpoint stays at LSN 50 for the rest of the session either way. A later success never moves a sink's checkpoint past a batch that sink failed (in both batching modes).
 5. **Until restart**: if the optional sink stays failing, the source's in-memory position keeps marching forward. The failed events between the sink's stuck checkpoint and "now" are **not in any retry queue** for this session.
-6. **On restart**: the source reads `MIN(required_cp, optional_cp) = 50` and replays from 50. The optional sink (back from outage, presumably) catches up. Required sinks see duplicates and dedup or accept (idempotent design).
+6. **On restart**: the source reads `MIN(required_cp, optional_cp) = 50` and replays from 50. The optional sink (back from outage, presumably) catches up. The replay is source-level: every sink receives it, so sinks already past LSN 50 see duplicates and dedup or accept (idempotent design).
+
+Before the source delivers anything, every configured sink without a checkpoint (a new pipeline, or a newly added sink) gets one at the position the source starts from. A sink that fails its very first batch is therefore part of `MIN(...)` and the batch is replayed to it on restart. If that initial checkpoint cannot be persisted, the source does not start (fail closed).
 
 This is the practical reality of `required: false`:
 
@@ -420,6 +422,9 @@ This matrix maps guarantees to their verification. Rows marked **Exists** have a
 | Required sink + un-routable row + no DLQ holds checkpoint | `test_required_sink_dlq_failure_no_writer_holds_checkpoint` | Unit | Exists |
 | Required sink + DLQ cannot persist (full/reject) holds checkpoint | `test_required_sink_dlq_full_reject_holds_checkpoint` | Unit | Exists |
 | Optional sink drop holds its own checkpoint (pipeline continues) | `test_optional_sink_dlq_failure_holds_its_checkpoint` | Unit | Exists |
+| Every configured sink is initialized at the start position before delivery; failure stops startup | `sink_checkpoints_are_initialized_only_where_absent`, `sink_checkpoint_initialization_fails_closed`, `startup_fails_closed_without_sink_checkpoints`, `pg_startup_fails_closed_without_sink_checkpoints` | Unit / Integration | Exists |
+| A first-batch failure replays after restart (MySQL, PostgreSQL, both batching modes) | `*_first_batch_failure_replays_after_restart` | Unit / Integration | Exists |
+| A failed sink stays held through later successes; restart replays the batch to it (both batching modes) | `aligned_/unaligned_optional_failure_replays_after_restart`, `*_consecutive_failures_hold`, `*_final_batch_failure_replays_after_idle` | Unit | Exists |
 | Out-of-range DLQ failure index fails closed | `test_out_of_range_dlq_index_holds_checkpoint` | Unit | Exists |
 | DLQ `Block` overflow is bounded (fails closed, no hang) | `dlq::overflow_block_times_out_and_fails_closed` | Unit | Exists |
 | DLQ overflow (drop_oldest) | `dlq::overflow_drop_oldest` | Unit | Exists |

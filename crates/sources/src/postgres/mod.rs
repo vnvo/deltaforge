@@ -1769,6 +1769,32 @@ impl PostgresSource {
         // verify again before the first message is read.
         check_identity_post_reconnect(&mut ctx).await?;
 
+        // Before anything is delivered: every configured sink without a
+        // checkpoint gets this start position, durably, so a batch it fails
+        // before its first acknowledgement is replayed to it on restart.
+        // Fails closed: no message is read without it.
+        let start = serde_json::to_vec(&PostgresCheckpoint {
+            lsn: start_lsn.to_string(),
+            tx_id: None,
+            timeline: ctx.active_stamp().map(|s| s.timeline),
+            chain: ctx.active_stamp().map(|s| s.chain_id),
+            transition: ctx.active_stamp().map(|s| s.transition),
+            ..Default::default()
+        })
+        .map_err(|e| SourceError::Checkpoint {
+            details: format!("encode the start checkpoint: {e}").into(),
+        })?;
+        chkpt_store
+            .initialize_sink_checkpoints(&self.id, &start)
+            .await
+            .map_err(|e| SourceError::Checkpoint {
+                details: format!(
+                    "could not initialize the sink checkpoints at the start \
+                     position: {e}"
+                )
+                .into(),
+            })?;
+
         // Controlled credential rotation (opt-in, file-backed credentials only).
         // The runtime owns the watcher/manager task (a child of the source cancel
         // token); it is cancelled and joined after the loop on every exit path

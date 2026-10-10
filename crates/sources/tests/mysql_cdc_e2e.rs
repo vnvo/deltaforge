@@ -1717,3 +1717,170 @@ async fn derived_event_ids_are_replay_stable() -> Result<()> {
     mysql_drop_db(&pool, &db_name).await;
     Ok(())
 }
+
+/// The shared container's readiness wait: what it retries, and that it is
+/// bounded (no Docker; paused time).
+mod readiness {
+    use super::test_common::{
+        AttemptClass, NotReady, mysql_attempt_class, until_ready,
+    };
+    use mysql_async::{DriverError, Error, IoError, ServerError};
+    use std::io::ErrorKind;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use tokio::time::{Duration, Instant};
+
+    fn io(kind: ErrorKind) -> Error {
+        Error::Io(IoError::Io(kind.into()))
+    }
+
+    fn server(code: u16) -> Error {
+        Error::Server(ServerError {
+            code,
+            message: "m".into(),
+            state: "HY000".into(),
+        })
+    }
+
+    #[test]
+    fn startup_errors_are_transient_and_misconfiguration_is_not() {
+        for e in [
+            io(ErrorKind::ConnectionRefused),
+            io(ErrorKind::ConnectionReset),
+            io(ErrorKind::UnexpectedEof),
+            Error::Driver(DriverError::ConnectionClosed),
+            server(1040),
+            server(1053),
+        ] {
+            assert_eq!(mysql_attempt_class(&e), AttemptClass::Transient, "{e}");
+        }
+        let url: Error =
+            mysql_async::Opts::from_url("nonsense").unwrap_err().into();
+        for e in [server(1045), server(1049), url] {
+            assert_eq!(mysql_attempt_class(&e), AttemptClass::Fatal, "{e}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_errors_retry_until_success() {
+        let n = AtomicU32::new(0);
+        until_ready(
+            Duration::from_secs(10),
+            Duration::from_millis(500),
+            || {
+                let i = n.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if i < 2 {
+                        Err(io(ErrorKind::ConnectionRefused))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(n.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_non_transient_error_stops_at_once() {
+        let n = AtomicU32::new(0);
+        let r = until_ready(
+            Duration::from_secs(10),
+            Duration::from_millis(500),
+            || {
+                n.fetch_add(1, Ordering::SeqCst);
+                async { Err(server(1045)) }
+            },
+        )
+        .await;
+        assert!(matches!(r, Err(NotReady::Fatal(_))), "{r:?}");
+        assert_eq!(n.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_bounds_retries_and_reports_the_last_error() {
+        let t0 = Instant::now();
+        let r = until_ready(
+            Duration::from_secs(10),
+            Duration::from_millis(500),
+            || async { Err(io(ErrorKind::ConnectionRefused)) },
+        )
+        .await;
+        assert_eq!(t0.elapsed(), Duration::from_secs(10));
+        match r {
+            Err(NotReady::Deadline {
+                attempts,
+                last: Some(e),
+            }) => {
+                assert_eq!(attempts, 20);
+                assert!(e.to_string().contains("refused"), "{e}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_abandons_a_hung_attempt() {
+        let t0 = Instant::now();
+        let r = until_ready(
+            Duration::from_secs(10),
+            Duration::from_millis(500),
+            std::future::pending::<Result<(), Error>>,
+        )
+        .await;
+        assert_eq!(t0.elapsed(), Duration::from_secs(10));
+        assert!(
+            matches!(
+                r,
+                Err(NotReady::Deadline {
+                    attempts: 1,
+                    last: None
+                })
+            ),
+            "{r:?}"
+        );
+    }
+}
+
+/// The sink checkpoints cannot be initialized at the start position: the
+/// source stops before it streams and emits nothing.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn startup_fails_closed_without_sink_checkpoints() -> Result<()> {
+    let (db, pool, dsn) = mysql_setup("init_closed").await?;
+    let mut conn = pool.get_conn().await?;
+    conn.query_drop(format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)"))
+        .await?;
+    let src = MySqlSource {
+        id: "init-closed".into(),
+        dsn: dsn.into(),
+        tables: vec![format!("{db}.t")],
+        tenant: "acme".into(),
+        pipeline: "test".to_string(),
+        registry: make_registry().await,
+        registry_scope: sources::registry_scope::SharedRegistryScope::default(),
+        outbox_tables: AllowList::default(),
+        snapshot_cfg: SnapshotCfg {
+            mode: deltaforge_config::SnapshotMode::Never,
+            ..Default::default()
+        },
+        backend: make_storage_backend().await,
+        on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
+        table_options: Default::default(),
+        rotation: None,
+        snapshot_cohort: Default::default(),
+    };
+    let ckpt = test_common::unwritable_sink_checkpoints(
+        Arc::new(src.clone()),
+        "init-closed",
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let handle = src.run(tx, ckpt).await;
+    conn.query_drop(format!("INSERT INTO {db}.t VALUES (1)"))
+        .await?;
+    test_common::assert_fails_closed_without_sink_checkpoints(handle, &mut rx)
+        .await;
+    mysql_drop_db(&pool, &db).await;
+    Ok(())
+}

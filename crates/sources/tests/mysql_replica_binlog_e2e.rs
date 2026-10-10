@@ -697,3 +697,142 @@ async fn a_restart_into_off_is_refused_on_reconnect_gtid() {
 async fn a_restart_into_off_is_refused_on_reconnect_file_position() {
     a_restart_into_off(false).await;
 }
+
+/// A failover at every boundary of a transaction. The source is held inside
+/// it; B (a replica with `log_replica_updates`, so its own binlog holds the
+/// transaction with its original GTID) applies it and is promoted; the
+/// endpoint switches to B and the stream is cut at the held point. The
+/// source resumes on B from the last proven boundary: the cut transaction is
+/// read again (its partial prefix aborted), none of it skipped.
+async fn failover_at(
+    point: sources::stream_probe::Point,
+    nth: usize,
+    base: u32,
+) {
+    use sources::stream_probe;
+    init_test_tracing();
+    let (a_c, a) = start(base, true, Some(true)).await;
+    let (_b_c, b) = start(base + 1, true, Some(true)).await;
+    create_table(a).await;
+    let ip = a_c.get_bridge_ip_address().await.unwrap().to_string();
+    replicate(b, &ip, true).await;
+    until("the replica has the table", async || columns(b).await == 2).await;
+
+    let proxy = Proxy::start(a).await;
+    let st = State::new().await;
+    let (h, mut rx) = st
+        .run(st.source("fob", proxy.port, SnapshotMode::Never))
+        .await;
+    sleep(Duration::from_secs(3)).await;
+    stream_probe::reset_event_hooks();
+    let (reached, release) = stream_probe::hold_then_disconnect(point, nth);
+    sql(
+        a,
+        &[
+            "BEGIN".into(),
+            format!("INSERT INTO {DB}.t VALUES (1, 1), (2, 1)"),
+            format!("INSERT INTO {DB}.t VALUES (3, 1)"),
+            format!("UPDATE {DB}.t SET v = 2 WHERE id = 1"),
+            "COMMIT".into(),
+        ],
+    )
+    .await;
+    timeout(Duration::from_secs(30), reached.notified())
+        .await
+        .expect("the boundary was never reached");
+    // B applies the transaction, then is promoted; the endpoint follows.
+    let executed: String = one(a, "SELECT @@GLOBAL.gtid_executed").await;
+    until("the replica caught up", async || {
+        one::<i64>(
+            b,
+            &format!(
+                "SELECT GTID_SUBSET('{executed}', @@GLOBAL.gtid_executed)"
+            ),
+        )
+        .await
+            == 1
+    })
+    .await;
+    sql(b, &["STOP REPLICA".into(), "RESET REPLICA ALL".into()]).await;
+    proxy.switch_to(b);
+    release.notify_one();
+    sql(b, &[format!("INSERT INTO {DB}.t VALUES (4, 1)")]).await;
+
+    // What a coordinator delivers: TxAbort drops the open prefix.
+    let mut delivered: Vec<Event> = Vec::new();
+    let mut open: Option<Vec<Event>> = None;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !delivered
+        .iter()
+        .any(|e| e.after.as_ref().is_some_and(|a| a["id"] == 4))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "row 4 never delivered: {delivered:?}"
+        );
+        assert!(!h.join.is_finished(), "the source ended");
+        match timeout(Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(SourceItem::TxBegin { .. })) => open = Some(vec![]),
+            Ok(Some(SourceItem::TxAbort { .. })) => open = None,
+            Ok(Some(SourceItem::TxCommit { .. })) => {
+                delivered.extend(open.take().unwrap_or_default())
+            }
+            Ok(Some(SourceItem::Event(e)))
+                if matches!(e.op, Op::Create | Op::Update | Op::Delete) =>
+            {
+                match open.as_mut() {
+                    Some(o) => o.push(e),
+                    None => delivered.push(e),
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut last = std::collections::BTreeMap::new();
+    for e in &delivered {
+        let a = e.after.as_ref().unwrap();
+        let (id, v) = (a["id"].as_i64().unwrap(), a["v"].as_i64().unwrap());
+        if let Some(prev) = last.insert(id, v) {
+            assert!(prev <= v, "row {id} went back from {prev} to {v}");
+        }
+    }
+    assert_eq!(
+        last,
+        std::collections::BTreeMap::from([(1, 2), (2, 1), (3, 1), (4, 1)]),
+        "complete, final state"
+    );
+    assert!(st.identity_is("fob", b).await, "the failover was recorded");
+    stream_probe::reset_event_hooks();
+    h.stop();
+    timeout(Duration::from_secs(30), h.join).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn a_failover_after_a_gtid_rereads_the_transaction() {
+    failover_at(sources::stream_probe::Point::AfterGtid, 1, 160).await;
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn a_failover_after_a_table_map_rereads_the_transaction() {
+    failover_at(sources::stream_probe::Point::AfterTableMap, 1, 162).await;
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn a_failover_between_rows_rereads_the_transaction() {
+    failover_at(sources::stream_probe::Point::AfterRows, 1, 164).await;
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn a_failover_before_the_xid_rereads_the_transaction() {
+    failover_at(sources::stream_probe::Point::AfterRows, 3, 166).await;
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn a_failover_after_the_xid_continues() {
+    failover_at(sources::stream_probe::Point::AfterXid, 1, 168).await;
+}

@@ -4864,3 +4864,40 @@ mod event_schema_identity {
         ))
     }
 }
+
+/// The sink checkpoints cannot be initialized at the start position: the
+/// source stops before it reads a message and emits nothing.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_startup_fails_closed_without_sink_checkpoints() -> Result<()> {
+    let (db, client) = pg_setup("init_closed").await?;
+    client
+        .execute("CREATE TABLE t (id INT PRIMARY KEY)", &[])
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON t TO {PG_CDC_USER}"), &[])
+        .await?;
+    create_pub_slot(&client, "pub_init", "slot_init", &["t"]).await?;
+    let mut src = make_source(
+        "init-closed",
+        &db,
+        "slot_init",
+        "pub_init",
+        vec!["public.t".into()],
+        AllowList::default(),
+    )
+    .await;
+    src.snapshot_cfg.mode = deltaforge_config::SnapshotMode::Never;
+    let ckpt = test_common::unwritable_sink_checkpoints(
+        Arc::new(src.clone()),
+        "init-closed",
+    );
+    let (tx, mut rx) = mpsc::channel(16);
+    let handle = src.run(tx, ckpt).await;
+    client.execute("INSERT INTO t VALUES (1)", &[]).await?;
+    test_common::assert_fails_closed_without_sink_checkpoints(handle, &mut rx)
+        .await;
+    cleanup_repl(&client, "pub_init", "slot_init").await;
+    pg_drop_db(&db).await;
+    Ok(())
+}

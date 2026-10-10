@@ -508,7 +508,18 @@ async fn mysql_container_and_port()
                 .expect("start mysql container");
             let port =
                 c.get_host_port_ipv4(3306).await.expect("get mysql port");
-            sleep(Duration::from_secs(8)).await;
+            // The entrypoint restarts mysqld after initialising it: wait for
+            // the real server with an authenticated query.
+            if let Err(e) =
+                until_ready(MYSQL_READY_DEADLINE, READY_STEP, || {
+                    mysql_ready_attempt(port)
+                })
+                .await
+            {
+                let logs = container_logs(&c).await;
+                let _ = c.rm().await;
+                panic!("mysql test container never became ready: {e}\n{logs}");
+            }
             mysql_provision_cdc_user(port)
                 .await
                 .expect("provision mysql cdc user");
@@ -523,6 +534,114 @@ pub async fn mysql_get_container() -> &'static ContainerAsync<GenericImage> {
 
 pub async fn mysql_port() -> u16 {
     mysql_container_and_port().await.1
+}
+
+/// How long a fresh MySQL container may take to accept an authenticated
+/// query (initialisation plus the restart into the real server).
+pub const MYSQL_READY_DEADLINE: Duration = Duration::from_secs(120);
+const READY_STEP: Duration = Duration::from_millis(500);
+
+/// Whether a failed readiness attempt may be retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptClass {
+    /// The server is still starting (or restarting): connection refused,
+    /// reset or closed, too many connections, shutdown in progress.
+    Transient,
+    /// A real failure - wrong credentials, a bad URL, any other server
+    /// error: retrying cannot fix it.
+    Fatal,
+}
+
+pub fn mysql_attempt_class(e: &mysql_async::Error) -> AttemptClass {
+    use mysql_async::{DriverError, Error};
+    match e {
+        Error::Io(_) | Error::Driver(DriverError::ConnectionClosed) => {
+            AttemptClass::Transient
+        }
+        // ER_CON_COUNT_ERROR, ER_SERVER_SHUTDOWN
+        Error::Server(s) if matches!(s.code, 1040 | 1053) => {
+            AttemptClass::Transient
+        }
+        _ => AttemptClass::Fatal,
+    }
+}
+
+/// Why a server never became ready.
+#[derive(Debug)]
+pub enum NotReady {
+    Fatal(mysql_async::Error),
+    Deadline {
+        attempts: u32,
+        last: Option<mysql_async::Error>,
+    },
+}
+
+impl std::fmt::Display for NotReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotReady::Fatal(e) => write!(f, "non-transient error: {e}"),
+            NotReady::Deadline { attempts, last } => write!(
+                f,
+                "not ready by the deadline after {attempts} attempts; last \
+                 error: {}",
+                last.as_ref()
+                    .map_or("none (attempts timed out)".into(), |e| e
+                        .to_string())
+            ),
+        }
+    }
+}
+
+/// Repeat `attempt` every `step` until it succeeds, a non-transient error
+/// stops it, or `deadline` passes (an attempt in flight at the deadline is
+/// abandoned). Dropping the future stops it.
+pub async fn until_ready<F, Fut>(
+    deadline: Duration,
+    step: Duration,
+    mut attempt: F,
+) -> Result<(), NotReady>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), mysql_async::Error>>,
+{
+    let end = tokio::time::Instant::now() + deadline;
+    let (mut attempts, mut last) = (0, None);
+    loop {
+        let left = end.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return Err(NotReady::Deadline { attempts, last });
+        }
+        attempts += 1;
+        match tokio::time::timeout(left, attempt()).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(e)) => match mysql_attempt_class(&e) {
+                AttemptClass::Fatal => return Err(NotReady::Fatal(e)),
+                AttemptClass::Transient => last = Some(e),
+            },
+            Err(_) => {}
+        }
+        let left = end.saturating_duration_since(tokio::time::Instant::now());
+        sleep(step.min(left)).await;
+    }
+}
+
+/// One authenticated query as root.
+async fn mysql_ready_attempt(port: u16) -> Result<(), mysql_async::Error> {
+    let opts = Opts::from_url(&mysql_root_dsn_on(port))?;
+    let mut conn = mysql_async::Conn::new(opts).await?;
+    conn.query_drop("SELECT 1").await?;
+    conn.disconnect().await
+}
+
+/// The container's output, for a failure report.
+async fn container_logs(c: &ContainerAsync<GenericImage>) -> String {
+    let out = c.stdout_to_vec().await.unwrap_or_default();
+    let err = c.stderr_to_vec().await.unwrap_or_default();
+    format!(
+        "--- container stdout ---\n{}\n--- container stderr ---\n{}",
+        String::from_utf8_lossy(&out),
+        String::from_utf8_lossy(&err)
+    )
 }
 
 async fn mysql_provision_cdc_user(port: u16) -> Result<()> {
@@ -655,5 +774,74 @@ impl Busy {
             total += t.await.unwrap();
         }
         total
+    }
+}
+
+// ============================================================================
+// Sink checkpoint initialization - shared
+// ============================================================================
+
+/// A checkpoint store that holds nothing and refuses every write.
+pub struct UnwritableStore;
+
+#[async_trait::async_trait]
+impl checkpoints::CheckpointStore for UnwritableStore {
+    async fn get_raw(
+        &self,
+        _key: &str,
+    ) -> checkpoints::CheckpointResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    async fn put_raw(
+        &self,
+        _key: &str,
+        _bytes: &[u8],
+    ) -> checkpoints::CheckpointResult<()> {
+        Err(checkpoints::CheckpointError::Database("unwritable".into()))
+    }
+    async fn delete(&self, _key: &str) -> checkpoints::CheckpointResult<bool> {
+        Ok(false)
+    }
+    async fn list(&self) -> checkpoints::CheckpointResult<Vec<String>> {
+        Ok(vec![])
+    }
+}
+
+/// The production per-sink checkpoint proxy for `source` with one
+/// configured sink, over a store that cannot persist its checkpoint.
+pub fn unwritable_sink_checkpoints(
+    source: deltaforge_core::ArcDynSource,
+    source_id: &str,
+) -> Arc<dyn checkpoints::CheckpointStore> {
+    Arc::new(
+        runner::pipeline_manager::PerSinkCheckpointProxy::for_source(
+            Arc::new(UnwritableStore),
+            source_id.to_string(),
+            &source,
+        )
+        .with_sinks(vec![TEST_SINK.to_string()]),
+    )
+}
+
+/// The source stops before it streams: its run fails with the
+/// initialization error and nothing was emitted.
+pub async fn assert_fails_closed_without_sink_checkpoints(
+    handle: deltaforge_core::SourceHandle,
+    rx: &mut tokio::sync::mpsc::Receiver<deltaforge_core::SourceItem>,
+) {
+    let result = tokio::time::timeout(Duration::from_secs(60), handle.join)
+        .await
+        .expect("the source stops")
+        .expect("the source task joins");
+    let err = result.expect_err("startup fails closed");
+    assert!(
+        err.to_string().contains("initialize the sink checkpoints"),
+        "{err}"
+    );
+    while let Ok(item) = rx.try_recv() {
+        assert!(
+            !matches!(item, deltaforge_core::SourceItem::Event(_)),
+            "an event was emitted"
+        );
     }
 }
