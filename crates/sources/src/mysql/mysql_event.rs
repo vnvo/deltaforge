@@ -47,6 +47,10 @@ pub(super) async fn read_next_event(
     stream: &mut BinlogStream,
     ctx: &RunCtx,
 ) -> Result<(EventHeader, EventData), LoopControl> {
+    // Test hook: the connection "dropped" right here.
+    if crate::stream_probe::take_disconnect() {
+        return Err(LoopControl::Reconnect);
+    }
     match watchdog(stream.read(), ctx.inactivity, &ctx.cancel, "binlog_read")
         .await
     {
@@ -156,6 +160,31 @@ async fn dispatch_one(
         // Every rows event counts, tracked table or not.
         ctx.rows_ordinal += 1;
     }
+    use crate::stream_probe::Point;
+    let point = match &data {
+        EventData::Gtid(_) => Some(Point::AfterGtid),
+        EventData::TableMap(_) => Some(Point::AfterTableMap),
+        EventData::WriteRows(_)
+        | EventData::UpdateRows(_)
+        | EventData::DeleteRows(_) => Some(Point::AfterRows),
+        EventData::Xid(_) => Some(Point::AfterXid),
+        EventData::Query(q) if q.query.trim().eq_ignore_ascii_case("BEGIN") => {
+            Some(Point::AfterBegin)
+        }
+        _ => None,
+    };
+    let handled = dispatch_kind(ctx, header, data).await;
+    if let (Ok(()), Some(p)) = (&handled, point) {
+        crate::stream_probe::after(p).await;
+    }
+    handled
+}
+
+async fn dispatch_kind(
+    ctx: &mut RunCtx,
+    header: &EventHeader,
+    data: EventData,
+) -> SourceResult<()> {
     match data {
         EventData::TableMap(tm) => handle_table_map(ctx, tm).await,
         EventData::WriteRows(wr) => handle_write_rows(ctx, header, wr).await,
@@ -268,10 +297,14 @@ async fn handle_write_rows(
         // Pre-compute values shared across all rows in this event.
         let ts_ms = ts_sec_to_ms(header.timestamp);
         let event_len = header.event_length as usize;
+        // Inside a transaction a row's checkpoint is the last proven
+        // boundary: a resume from it re-reads the transaction, never starts
+        // inside it.
+        let (cp_file, cp_pos, cp_gtid) = ctx.resume_point();
         let checkpoint = make_checkpoint_meta(
-            &ctx.last_file,
-            ctx.last_pos,
-            &ctx.last_gtid,
+            &cp_file,
+            cp_pos,
+            &cp_gtid,
             checkpoint_lineage(&ctx.registry_scope),
         );
         let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
@@ -364,10 +397,14 @@ async fn handle_update_rows(
 
         let ts_ms = ts_sec_to_ms(header.timestamp);
         let event_len = header.event_length as usize;
+        // Inside a transaction a row's checkpoint is the last proven
+        // boundary: a resume from it re-reads the transaction, never starts
+        // inside it.
+        let (cp_file, cp_pos, cp_gtid) = ctx.resume_point();
         let checkpoint = make_checkpoint_meta(
-            &ctx.last_file,
-            ctx.last_pos,
-            &ctx.last_gtid,
+            &cp_file,
+            cp_pos,
+            &cp_gtid,
             checkpoint_lineage(&ctx.registry_scope),
         );
         let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
@@ -463,10 +500,14 @@ async fn handle_delete_rows(
 
         let ts_ms = ts_sec_to_ms(header.timestamp);
         let event_len = header.event_length as usize;
+        // Inside a transaction a row's checkpoint is the last proven
+        // boundary: a resume from it re-reads the transaction, never starts
+        // inside it.
+        let (cp_file, cp_pos, cp_gtid) = ctx.resume_point();
         let checkpoint = make_checkpoint_meta(
-            &ctx.last_file,
-            ctx.last_pos,
-            &ctx.last_gtid,
+            &cp_file,
+            cp_pos,
+            &cp_gtid,
             checkpoint_lineage(&ctx.registry_scope),
         );
         let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
@@ -587,13 +628,9 @@ async fn handle_gtid(
     ctx.query_ordinal = 0;
     ctx.rows_ordinal = 0;
 
-    // Accumulate the full executed GTID set rather than storing just the last
-    // transaction. MySQL needs the full set to resume correctly on reconnect.
-    // Format: "uuid:1-N" built by extending the existing range.
-    ctx.last_gtid = Some(match &ctx.last_gtid {
-        None => gtid_str,
-        Some(existing) => merge_gtid(existing, &gtid_str),
-    });
+    // Seeing a GTID is not completion: `last_gtid` (every resume position)
+    // holds only transactions proven complete. This one joins it at its
+    // commit boundary (`emit_tx_commit`); until then it is `current_gtid`.
 
     // The GTID event is the unambiguous start of every transaction (row, DDL,
     // or empty) - open it on the coordinator's stream.
@@ -606,7 +643,7 @@ async fn handle_gtid(
 /// Handles both single-source ("uuid:1-N") and multi-source sets
 /// ("uuid1:1-N,uuid2:1-M") by splitting on commas and updating the matching
 /// UUID entry in-place. Appends a new entry if the UUID is not yet present.
-fn merge_gtid(existing: &str, new_gtid: &str) -> String {
+pub(super) fn merge_gtid(existing: &str, new_gtid: &str) -> String {
     // Parse the incoming single GTID: "uuid:N"
     let n_colon = match new_gtid.rfind(':') {
         Some(p) => p,
@@ -683,6 +720,8 @@ async fn emit_tx_commit(ctx: &mut RunCtx) {
     // Any close ends the explicit-transaction state (safe even in non-GTID mode,
     // where the early return below skips the marker).
     ctx.in_explicit_txn = false;
+    // The transaction is complete: only now does it join the committed set.
+    ctx.last_gtid = ctx.executed_through_current();
     // Rows of the next transaction are evaluated at this boundary.
     ctx.mark_transaction_boundary();
     let Some(tx_id) = ctx.current_gtid.clone() else {
@@ -1011,7 +1050,7 @@ async fn emit_ddl_event(
         snapshot: None,
         position: SourcePosition::mysql(
             ctx.server_id as u32,
-            ctx.last_gtid.clone(),
+            ctx.executed_through_current(),
             Some(ctx.last_file.clone()),
             Some(ctx.last_pos),
             None,
@@ -1037,7 +1076,8 @@ async fn emit_ddl_event(
     .with_checkpoint(make_checkpoint_meta(
         &ctx.last_file,
         ctx.last_pos,
-        &ctx.last_gtid,
+        // The DDL statement completes its (autocommit) transaction.
+        &ctx.executed_through_current(),
         checkpoint_lineage(&ctx.registry_scope),
     ));
     ev.transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
@@ -1234,10 +1274,11 @@ async fn record_query(
             ctx.last_file, ctx.last_pos
         )))
     };
+    let executed = ctx.executed_through_current();
     let position = crate::durable_checkpoint::mysql_checkpoint_position(
         &ctx.last_file,
         ctx.last_pos,
-        ctx.last_gtid.as_deref(),
+        executed.as_deref(),
     )
     .ok_or_else(|| {
         fail(
@@ -1246,7 +1287,7 @@ async fn record_query(
                 "unparseable stream position {}:{} {:?}",
                 ctx.last_file,
                 ctx.last_pos,
-                ctx.last_gtid
+                executed
             ),
         )
     })?;
@@ -2856,14 +2897,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_gtid_accumulates_executed_set() {
-        // handle_gtid must extend the resume GTID set; a no-op body would
-        // lose progress and cause re-delivery on reconnect.
-        let (tx, _rx) = mpsc::channel::<SourceItem>(1);
+    async fn a_gtid_joins_the_resume_set_only_at_its_commit() {
+        // Seeing a GTID is not completion: until its commit, the transaction
+        // is outside every resume position (a reconnect or a checkpoint
+        // re-reads it rather than skipping its remainder).
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
         let mut ctx = make_runctx(tx);
-        // A GTID opens at a clean boundary (previous transaction terminated).
         ctx.current_gtid = None;
         ctx.last_gtid = Some("uuid-a:1-10".to_string());
+        ctx.mark_transaction_boundary();
         handle_gtid(
             &mut ctx,
             GtidEvent {
@@ -2873,7 +2915,66 @@ mod tests {
         )
         .await
         .expect("gtid at a clean boundary is accepted");
+        assert_eq!(ctx.last_gtid.as_deref(), Some("uuid-a:1-10"));
+        assert_eq!(ctx.current_gtid.as_deref(), Some("uuid-a:11"));
+        assert_eq!(
+            ctx.executed_through_current().as_deref(),
+            Some("uuid-a:1-11")
+        );
+        assert_eq!(ctx.resume_point().2.as_deref(), Some("uuid-a:1-10"));
+        emit_tx_commit(&mut ctx).await;
         assert_eq!(ctx.last_gtid.as_deref(), Some("uuid-a:1-11"));
+        assert_eq!(ctx.resume_point().2.as_deref(), Some("uuid-a:1-11"));
+        let mut commit = None;
+        while let Ok(item) = rx.try_recv() {
+            if let SourceItem::TxCommit { boundary, .. } = item {
+                commit = Some(boundary);
+            }
+        }
+        let cp: MySqlCheckpoint = serde_json::from_slice(
+            commit.expect("a commit marker").checkpoint.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(cp.gtid_set.as_deref(), Some("uuid-a:1-11"));
+    }
+
+    #[tokio::test]
+    async fn a_reopen_inside_a_transaction_resumes_before_it() {
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        ctx.current_gtid = None;
+        ctx.last_gtid = Some("uuid-a:1-10".to_string());
+        ctx.last_file = "mysql-bin.000004".into();
+        ctx.last_pos = 1000;
+        ctx.mark_transaction_boundary();
+        handle_gtid(
+            &mut ctx,
+            GtidEvent {
+                flags: 0,
+                gtid: "uuid-a:11".into(),
+            },
+        )
+        .await
+        .unwrap();
+        ctx.in_explicit_txn = true;
+        ctx.last_pos = 1600; // rows read
+        ctx.abandon_open_transaction().await.unwrap();
+        assert!(!ctx.transaction_open());
+        assert_eq!(ctx.last_gtid.as_deref(), Some("uuid-a:1-10"));
+        assert_eq!(
+            (ctx.last_file.as_str(), ctx.last_pos),
+            ("mysql-bin.000004", 1000)
+        );
+        let mut aborted = None;
+        while let Ok(item) = rx.try_recv() {
+            if let SourceItem::TxAbort { tx_id } = item {
+                aborted = Some(tx_id);
+            }
+        }
+        assert_eq!(aborted.as_deref(), Some("uuid-a:11"));
+        // At a boundary nothing is abandoned.
+        ctx.abandon_open_transaction().await.unwrap();
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

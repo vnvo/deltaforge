@@ -65,3 +65,127 @@ pub(crate) async fn after_slot_proof() {
         release.notified().await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Binlog event-boundary hooks (MySQL): after the Nth event of a kind, hold
+// the source there (to kill its connection or apply backpressure for real)
+// or make its next read fail as a dropped connection. Disarmed: one atomic
+// load per event.
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::AtomicBool;
+
+/// An event boundary of the binlog stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Point {
+    AfterGtid,
+    /// After a `BEGIN` statement (file-position mode opens transactions so).
+    AfterBegin,
+    AfterTableMap,
+    AfterRows,
+    AfterXid,
+}
+
+enum Action {
+    /// The next read fails as a dropped connection.
+    Disconnect,
+    /// Wait for `release`.
+    Hold(Arc<Notify>),
+    /// Wait for `release`, then the next read fails as a dropped connection.
+    HoldThenDisconnect(Arc<Notify>),
+}
+
+struct Armed {
+    point: Point,
+    remaining: usize,
+    action: Action,
+    reached: Arc<Notify>,
+}
+
+static ARMED: AtomicBool = AtomicBool::new(false);
+static STATE: Mutex<Option<Armed>> = Mutex::new(None);
+static DISCONNECT: AtomicBool = AtomicBool::new(false);
+
+fn arm(point: Point, nth: usize, action: Action) -> Arc<Notify> {
+    let reached = Arc::new(Notify::new());
+    *STATE.lock().unwrap() = Some(Armed {
+        point,
+        remaining: nth.max(1),
+        action,
+        reached: reached.clone(),
+    });
+    ARMED.store(true, Ordering::SeqCst);
+    reached
+}
+
+/// After the `nth` event at `point`, the source's next read fails as a
+/// dropped connection. `reached` is notified when it fires.
+pub fn disconnect_after(point: Point, nth: usize) -> Arc<Notify> {
+    arm(point, nth, Action::Disconnect)
+}
+
+/// After the `nth` event at `point`, the source waits for `release`.
+/// Returns `(reached, release)`.
+pub fn hold_after(point: Point, nth: usize) -> (Arc<Notify>, Arc<Notify>) {
+    let release = Arc::new(Notify::new());
+    (arm(point, nth, Action::Hold(release.clone())), release)
+}
+
+/// After the `nth` event at `point`, the source waits for `release`; then
+/// its next read fails as a dropped connection (a cut inside a transaction
+/// even if the server already sent the rest). Returns `(reached, release)`.
+pub fn hold_then_disconnect(
+    point: Point,
+    nth: usize,
+) -> (Arc<Notify>, Arc<Notify>) {
+    let release = Arc::new(Notify::new());
+    (
+        arm(point, nth, Action::HoldThenDisconnect(release.clone())),
+        release,
+    )
+}
+
+/// Disarm everything.
+pub fn reset_event_hooks() {
+    ARMED.store(false, Ordering::SeqCst);
+    DISCONNECT.store(false, Ordering::SeqCst);
+    *STATE.lock().unwrap() = None;
+}
+
+/// Called after the source handled an event at `point`.
+pub(crate) async fn after(point: Point) {
+    if !ARMED.load(Ordering::Relaxed) {
+        return;
+    }
+    let fired = {
+        let mut st = STATE.lock().unwrap();
+        match st.as_mut() {
+            Some(a) if a.point == point => {
+                a.remaining -= 1;
+                if a.remaining == 0 {
+                    ARMED.store(false, Ordering::SeqCst);
+                    st.take()
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    };
+    if let Some(a) = fired {
+        a.reached.notify_one();
+        match a.action {
+            Action::Disconnect => DISCONNECT.store(true, Ordering::SeqCst),
+            Action::Hold(release) => release.notified().await,
+            Action::HoldThenDisconnect(release) => {
+                release.notified().await;
+                DISCONNECT.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+/// Whether the next read must fail as a dropped connection (consumed).
+pub(crate) fn take_disconnect() -> bool {
+    DISCONNECT.swap(false, Ordering::SeqCst)
+}

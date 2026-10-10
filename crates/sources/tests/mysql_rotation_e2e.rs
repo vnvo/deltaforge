@@ -600,6 +600,111 @@ async fn mysql_rotation_waits_for_commit_boundary_no_loss_or_dup() -> Result<()>
     Ok(())
 }
 
+/// Row ids as a coordinator delivers them (a transaction's rows count only
+/// at its `TxCommit`; a `TxAbort` drops the buffered prefix), and how many
+/// transactions were aborted.
+async fn committed_create_ids(
+    rx: &mut mpsc::Receiver<SourceItem>,
+    want: &[i64],
+    dur: Duration,
+) -> (Vec<i64>, usize) {
+    let mut ids = Vec::new();
+    let mut aborts = 0;
+    let mut open: Option<Vec<i64>> = None;
+    let deadline = Instant::now() + dur;
+    while !want.iter().all(|w| ids.contains(w)) && Instant::now() < deadline {
+        match timeout(Duration::from_millis(200), rx.recv()).await {
+            Ok(Some(SourceItem::TxBegin { .. })) => open = Some(vec![]),
+            Ok(Some(SourceItem::TxAbort { .. })) => {
+                open = None;
+                aborts += 1;
+            }
+            Ok(Some(SourceItem::TxCommit { .. })) => {
+                ids.extend(open.take().unwrap_or_default())
+            }
+            Ok(Some(SourceItem::Event(e))) if matches!(e.op, Op::Create) => {
+                let id = e.after.as_ref().and_then(|v| v["id"].as_i64());
+                if let Some(id) = id {
+                    match open.as_mut() {
+                        Some(o) => o.push(id),
+                        None => ids.push(id),
+                    }
+                }
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    (ids, aborts)
+}
+
+/// The password is rotated (the old one no longer authenticates) while the
+/// source is inside a transaction, and the stream is then cut. Recovery
+/// reconnects with the new credentials from the last proven boundary: the
+/// cut transaction is read again in full (its prefix aborted), nothing is
+/// skipped, and the stream continues.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_rotation_with_a_cut_inside_a_transaction_rereads_it()
+-> Result<()> {
+    use sources::stream_probe::{
+        Point, hold_then_disconnect, reset_event_hooks,
+    };
+    let mut h = start_rotation_harness("rot_cut", 256).await?;
+    wait_for_dump_thread(&h.root_dsn, Duration::from_secs(30)).await?;
+    drain_for(&mut h.rx, Duration::from_secs(2)).await;
+    reset_event_hooks();
+    let (reached, release) = hold_then_disconnect(Point::AfterRows, 1);
+
+    let mut conn = h.pool.get_conn().await?;
+    conn.query_drop(format!(
+        "INSERT INTO {}.orders (sku) \
+         WITH RECURSIVE seq(n) AS \
+           (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 30) \
+         SELECT CONCAT('row', n) FROM seq",
+        h.db
+    ))
+    .await?;
+    conn.disconnect().await.ok();
+    // Held after the transaction's first rows event; the old password stops
+    // working; then the stream is cut there.
+    timeout(Duration::from_secs(30), reached.notified())
+        .await
+        .expect("the rows event was never reached");
+    h.rotate_password("cutpw").await?;
+    release.notify_one();
+
+    let (ids, aborts) = committed_create_ids(
+        &mut h.rx,
+        &(1..=30).collect::<Vec<_>>(),
+        Duration::from_secs(60),
+    )
+    .await;
+    reset_event_hooks();
+    assert_eq!(aborts, 1, "the cut transaction's prefix was aborted");
+    assert_eq!(
+        ids,
+        (1..=30).collect::<Vec<i64>>(),
+        "every row of the cut transaction, once, in order"
+    );
+
+    let mut conn = h.pool.get_conn().await?;
+    conn.query_drop(format!(
+        "INSERT INTO {}.orders (sku) VALUES ('after')",
+        h.db
+    ))
+    .await?;
+    let id: i64 = conn.query_first("SELECT LAST_INSERT_ID()").await?.unwrap();
+    conn.disconnect().await.ok();
+    let (after, _) =
+        committed_create_ids(&mut h.rx, &[id], Duration::from_secs(30)).await;
+    assert_eq!(after, vec![id], "the stream continues after recovery");
+
+    h.finish().await;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_invalid_replacement_retained_then_valid_supersedes() -> Result<()>

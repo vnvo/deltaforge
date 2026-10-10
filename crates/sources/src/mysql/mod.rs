@@ -1742,6 +1742,8 @@ impl MySqlSource {
         // fatal exit paths. A fatal result (including gate-6 rotation failures) is
         // re-propagated after join and before the teardown checkpoint put.
         let loop_result: SourceResult<()> = async {
+            // The stream ended and no reconnect has succeeded yet.
+            let mut lost = false;
             loop {
                 if !pause_until_resumed(
                     &ctx.cancel,
@@ -1763,8 +1765,54 @@ impl MySqlSource {
                         // A CloseUncertain/FailedClosed outcome returns an error from
                         // this block (gate 6); `loop_result?` re-propagates it before the
                         // teardown checkpoint put, so the checkpoint never advances.
-                        stream = rt.apply_at_boundary(&mut ctx, stream).await?;
+                        let (s, replaced) = rt
+                            .apply_at_boundary(&mut ctx, stream, lost)
+                            .await?;
+                        stream = s;
+                        lost &= !replaced;
                     }
+                }
+
+                // A stream given up for a reconnect is never read again: what
+                // it still holds is past the position the reconnect resumes
+                // from (an abandoned transaction's remainder). One attempt per
+                // pass, after the backoff; rotation activity cuts the wait
+                // short so new credentials apply (at the top of the loop)
+                // instead of retrying ones the server may have revoked.
+                if lost {
+                    let delay = ctx.retry.next_backoff();
+                    warn!(
+                        source_id = %ctx.source_id,
+                        delay_ms = delay.as_millis(),
+                        "scheduling reconnect after backoff"
+                    );
+                    let woken = match rotation.as_mut() {
+                        Some(rt) => tokio::select! {
+                            _ = tokio::time::sleep(delay) => false,
+                            _ = rt.wait_activity() => true,
+                            _ = ctx.cancel.cancelled() => break,
+                        },
+                        None => tokio::select! {
+                            _ = tokio::time::sleep(delay) => false,
+                            _ = ctx.cancel.cancelled() => break,
+                        },
+                    };
+                    if woken {
+                        continue;
+                    }
+                    match reconnect_stream(&mut ctx).await {
+                        Ok(s) => {
+                            stream = s;
+                            lost = false;
+                            ctx.mark_transaction_boundary();
+                        }
+                        Err(SourceError::Connect { .. })
+                        | Err(SourceError::Io(_))
+                        | Err(SourceError::Timeout { .. }) => {}
+                        Err(SourceError::Cancelled) => break,
+                        Err(e) => return Err(e),
+                    }
+                    continue;
                 }
 
                 debug!(source_id=%ctx.source_id, "reading the next event ..");
@@ -1796,22 +1844,12 @@ impl MySqlSource {
                     Ok(()) => {}
                     Err(LoopControl::ReloadSchema { db, table }) => {
                         apply_reload_request(&mut ctx, db, table).await?;
-                        match do_reconnect(&mut ctx).await? {
-                            Some(s) => {
-                                stream = s;
-                                ctx.mark_transaction_boundary();
-                            }
-                            None => continue,
-                        }
+                        ctx.abandon_open_transaction().await?;
+                        lost = true;
                     }
                     Err(LoopControl::Reconnect) => {
-                        match do_reconnect(&mut ctx).await? {
-                            Some(s) => {
-                                stream = s;
-                                ctx.mark_transaction_boundary();
-                            }
-                            None => continue,
-                        }
+                        ctx.abandon_open_transaction().await?;
+                        lost = true;
                     }
                     Err(LoopControl::Stop) => break,
                     Err(LoopControl::Fail(e)) => return Err(e),
@@ -1838,17 +1876,19 @@ impl MySqlSource {
         if !ctx.chkpt.manages_per_sink_checkpoints() {
             let _ = ctx
                 .chkpt
-                .put(
-                    &ctx.source_id,
+                .put(&ctx.source_id, {
+                    // Never inside a transaction: a stop mid-transaction
+                    // restarts before it.
+                    let (file, pos, gtid_set) = ctx.resume_point();
                     MySqlCheckpoint {
                         lineage: checkpoint_lineage(&ctx.registry_scope),
-                        file: ctx.last_file,
-                        pos: ctx.last_pos,
-                        gtid_set: ctx.last_gtid,
+                        file,
+                        pos,
+                        gtid_set,
                         snapshot_completed: None,
                         snapshot_chain: None,
-                    },
-                )
+                    }
+                })
                 .await;
         }
 
@@ -2151,6 +2191,9 @@ async fn connect_first_stream(
 /// connections verified as U and records it durably; a fresh session verified
 /// as U is then opened. Callers see a ready stream regardless.
 async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
+    // Every reopen (same server, rotation recovery, failover candidate)
+    // resumes from a proven boundary only.
+    ctx.abandon_open_transaction().await?;
     let expected = ctx.expected_uuid()?;
     let (gtid_to_use, file_to_use, pos_to_use) = if let Some(g) = &ctx.last_gtid
     {
@@ -2211,7 +2254,7 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
         make_client.clone(),
         &ctx.cancel,
         &ctx.default_db,
-        ctx.retry.clone(),
+        reconnect_attempt(&ctx.retry),
     )
     .await?;
     let found = match opened {
@@ -2248,7 +2291,7 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
         make_client,
         &ctx.cancel,
         &ctx.default_db,
-        ctx.retry.clone(),
+        reconnect_attempt(&ctx.retry),
     )
     .await?
     {
@@ -2267,32 +2310,13 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
     }
 }
 
-/// Apply backoff, sleep (cancel-aware), reconnect, and absorb transient errors.
-///
-/// Returns:
-/// - `Ok(Some(stream))` - reconnected, caller assigns the new stream.
-/// - `Ok(None)` - cancelled during sleep or transient connect error;
-///   caller should `continue` the loop (next iteration will either break
-///   on cancel or retry with fresh backoff).
-/// - `Err(e)`           - fatal error, caller propagates.
-async fn do_reconnect(ctx: &mut RunCtx) -> SourceResult<Option<BinlogStream>> {
-    let delay = ctx.retry.next_backoff();
-    warn!(
-        source_id = %ctx.source_id,
-        delay_ms = delay.as_millis(),
-        "scheduling reconnect after backoff"
-    );
-
-    tokio::select! {
-        _ = tokio::time::sleep(delay) => {}
-        _ = ctx.cancel.cancelled() => return Ok(None),
-    }
-
-    match reconnect_stream(ctx).await {
-        Ok(s) => Ok(Some(s)),
-        Err(SourceError::Connect { .. }) | Err(SourceError::Io(_)) => Ok(None),
-        Err(e) => Err(e),
-    }
+/// One connect attempt per reconnect: the run loop owns the retry (with its
+/// backoff), so between attempts a credential rotation can apply. Retrying
+/// inside would keep presenting credentials the server may have revoked.
+fn reconnect_attempt(retry: &RetryPolicy) -> RetryPolicy {
+    let mut once = retry.clone();
+    once.max_retries = Some(1);
+    once
 }
 
 // ============================================================================
@@ -2326,6 +2350,78 @@ fn mysql_server_lineage(
 }
 
 impl RunCtx {
+    /// The committed set plus the open transaction's GTID: the executed state
+    /// through the current statement (the position a completed statement -
+    /// a commit, an autocommit DDL - records). Not a resume position while a
+    /// transaction is open.
+    pub(crate) fn executed_through_current(&self) -> Option<String> {
+        match (&self.last_gtid, &self.current_gtid) {
+            (_, None) => self.last_gtid.clone(),
+            (None, Some(g)) => Some(g.clone()),
+            (Some(set), Some(g)) => Some(mysql_event::merge_gtid(set, g)),
+        }
+    }
+
+    /// Whether a transaction has started and not reached a proven boundary.
+    pub(crate) fn transaction_open(&self) -> bool {
+        self.current_gtid.is_some() || self.in_explicit_txn
+    }
+
+    /// Where a resume may start: the last proven transaction boundary while
+    /// a transaction is open (its events are read again), else the current
+    /// position. A resume position contains only transactions proven
+    /// complete.
+    pub(crate) fn resume_point(&self) -> (String, u64, Option<String>) {
+        match (&self.txn_eval_cp, self.transaction_open()) {
+            (Some(cp), true) => (cp.file.clone(), cp.pos, cp.gtid_set.clone()),
+            _ => (
+                self.last_file.clone(),
+                self.last_pos,
+                self.last_gtid.clone(),
+            ),
+        }
+    }
+
+    /// Before a stream is reopened: a transaction cut short by the
+    /// disconnect is abandoned - the coordinator drops its buffered prefix
+    /// (`TxAbort`), the decoder state is discarded and the cursor returns to
+    /// the last proven boundary, so the server sends the whole transaction
+    /// again. Duplicates of its rows are possible; skipping any is not.
+    pub(crate) async fn abandon_open_transaction(
+        &mut self,
+    ) -> SourceResult<()> {
+        if !self.transaction_open() {
+            return Ok(());
+        }
+        let (file, pos, gtid) = self.resume_point();
+        warn!(
+            source_id = %self.source_id,
+            open = ?self.current_gtid,
+            resume_file = %file, resume_pos = pos, resume_gtid = ?gtid,
+            "stream ended inside a transaction: resuming before it"
+        );
+        metrics::counter!(
+            "deltaforge_source_abandoned_transactions_total",
+            "pipeline" => self.pipeline.clone(),
+            "source" => self.source_id.clone(),
+        )
+        .increment(1);
+        if let Some(tx_id) = self.current_gtid.take() {
+            self.tx
+                .send(SourceItem::TxAbort { tx_id })
+                .await
+                .map_err(|e| SourceError::Other(e.into()))?;
+        }
+        self.in_explicit_txn = false;
+        self.message_ordinal = 0;
+        self.query_ordinal = 0;
+        self.rows_ordinal = 0;
+        self.last_file = file;
+        self.last_pos = pos;
+        self.last_gtid = gtid;
+        Ok(())
+    }
+
     /// The stream is at a transaction boundary: rows of the next transaction
     /// are evaluated at the current position.
     pub(crate) fn mark_transaction_boundary(&mut self) {

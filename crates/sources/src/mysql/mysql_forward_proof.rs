@@ -68,7 +68,8 @@ pub(crate) async fn prove(
     let d_cp = MySqlCheckpoint {
         file: ctx.last_file.clone(),
         pos: ctx.last_pos,
-        gtid_set: ctx.last_gtid.clone(),
+        // The DDL statement completes its transaction: D includes it.
+        gtid_set: ctx.executed_through_current(),
         lineage: Some(lineage.clone()),
         snapshot_completed: None,
         snapshot_chain: None,
