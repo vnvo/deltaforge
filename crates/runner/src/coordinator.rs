@@ -5530,6 +5530,53 @@ mod tests {
         optional_failure_replays_after_restart(false).await;
     }
 
+    /// The optional sink fails the very first batch. Its checkpoint was
+    /// initialized at the start position before delivery began (as the
+    /// source does at startup), so the restart resumes there and the batch
+    /// is replayed to it.
+    async fn first_batch_failure_replays_after_restart(aligned: bool) {
+        let t = TwoSinks::new();
+        let source: Arc<dyn deltaforge_core::Source> = Arc::new(SeqSource);
+        crate::pipeline_manager::PerSinkCheckpointProxy::for_source(
+            t.store.clone(),
+            "src".into(),
+            &source,
+        )
+        .with_sinks(vec!["kafka".into(), "redis".into()])
+        .initialize_sink_checkpoints("src", b"0")
+        .await
+        .unwrap();
+        let r = t.start(aligned, None);
+        t.deliver(&r, 1..=2, &[1]).await;
+        r.stop().await.unwrap();
+        assert_eq!(
+            (t.at("kafka").await, t.at("redis").await),
+            (Some(2), Some(0))
+        );
+
+        let from = resume_position(&t.store).await.unwrap();
+        assert_eq!(from, 0, "restart resumes at the start position");
+        let r = t.start(aligned, None);
+        t.deliver(&r, from + 1..=2, &[]).await;
+        r.stop().await.unwrap();
+        assert_eq!(
+            t.opt.ids(),
+            vec![2, 1, 2],
+            "the first batch replayed to it"
+        );
+        assert_eq!(t.at("redis").await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn aligned_first_batch_failure_replays_after_restart() {
+        first_batch_failure_replays_after_restart(true).await;
+    }
+
+    #[tokio::test]
+    async fn unaligned_first_batch_failure_replays_after_restart() {
+        first_batch_failure_replays_after_restart(false).await;
+    }
+
     /// Consecutive failures, then successes: held at the last acknowledged
     /// batch while the other sink advances independently.
     async fn consecutive_failures_hold(aligned: bool) {

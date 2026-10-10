@@ -1656,6 +1656,7 @@ impl MySqlSource {
         if needs_snapshot || !committed_resume {
             record_stream_start(&ctx).await?;
         }
+        initialize_sink_checkpoints(&ctx).await?;
 
         info!(source_id=%self.id, "connecting for binlog stream ..");
         let mut stream = connect_first_stream(&ctx, client).await?;
@@ -2517,6 +2518,35 @@ pub(crate) async fn apply_reload_request(
         ctx.selection.invalidate_all();
     }
     Ok(())
+}
+
+/// Before anything is delivered: every configured sink without a
+/// checkpoint gets the position this stream starts from, durably, so a
+/// batch it fails before its first acknowledgement is replayed to it on
+/// restart. Fails closed: no stream opens without it.
+async fn initialize_sink_checkpoints(ctx: &RunCtx) -> SourceResult<()> {
+    let (file, pos, gtid_set) = ctx.resume_point();
+    let start = serde_json::to_vec(&MySqlCheckpoint {
+        lineage: checkpoint_lineage(&ctx.registry_scope),
+        file,
+        pos,
+        gtid_set,
+        snapshot_completed: None,
+        snapshot_chain: None,
+    })
+    .map_err(|e| SourceError::Checkpoint {
+        details: format!("encode the start checkpoint: {e}").into(),
+    })?;
+    ctx.chkpt
+        .initialize_sink_checkpoints(&ctx.source_id, &start)
+        .await
+        .map_err(|e| SourceError::Checkpoint {
+            details: format!(
+                "could not initialize the sink checkpoints at the start \
+                 position: {e}"
+            )
+            .into(),
+        })
 }
 
 /// The lineage-wide barrier of a stream discontinuity at the position the

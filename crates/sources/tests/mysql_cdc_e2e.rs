@@ -1842,3 +1842,45 @@ mod readiness {
         );
     }
 }
+
+/// The sink checkpoints cannot be initialized at the start position: the
+/// source stops before it streams and emits nothing.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn startup_fails_closed_without_sink_checkpoints() -> Result<()> {
+    let (db, pool, dsn) = mysql_setup("init_closed").await?;
+    let mut conn = pool.get_conn().await?;
+    conn.query_drop(format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)"))
+        .await?;
+    let src = MySqlSource {
+        id: "init-closed".into(),
+        dsn: dsn.into(),
+        tables: vec![format!("{db}.t")],
+        tenant: "acme".into(),
+        pipeline: "test".to_string(),
+        registry: make_registry().await,
+        registry_scope: sources::registry_scope::SharedRegistryScope::default(),
+        outbox_tables: AllowList::default(),
+        snapshot_cfg: SnapshotCfg {
+            mode: deltaforge_config::SnapshotMode::Never,
+            ..Default::default()
+        },
+        backend: make_storage_backend().await,
+        on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
+        table_options: Default::default(),
+        rotation: None,
+        snapshot_cohort: Default::default(),
+    };
+    let ckpt = test_common::unwritable_sink_checkpoints(
+        Arc::new(src.clone()),
+        "init-closed",
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let handle = src.run(tx, ckpt).await;
+    conn.query_drop(format!("INSERT INTO {db}.t VALUES (1)"))
+        .await?;
+    test_common::assert_fails_closed_without_sink_checkpoints(handle, &mut rx)
+        .await;
+    mysql_drop_db(&pool, &db).await;
+    Ok(())
+}

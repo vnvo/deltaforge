@@ -121,6 +121,9 @@ pub struct PerSinkCheckpointProxy {
     /// long fallback still re-confirms during long idle. Defaults to an unshared handle
     /// (never signaled) so a proxy built without wiring falls back to the interval.
     commit_signal: Arc<tokio::sync::Notify>,
+    /// The pipeline's configured sinks: each gets a checkpoint at the start
+    /// position before the source delivers (`initialize_sink_checkpoints`).
+    sinks: Vec<String>,
 }
 
 /// Fallback re-confirmation interval when no commit notification arrives (long, so idle
@@ -147,7 +150,15 @@ impl PerSinkCheckpointProxy {
             is_snapshot: Arc::new(move |raw| snap.checkpoint_is_snapshot(raw)),
             exclusions: Arc::new(move || excl.resume_exclusions()),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
+            sinks: Vec::new(),
         }
+    }
+
+    /// The pipeline's configured sinks, initialized at the start position.
+    #[must_use]
+    pub fn with_sinks(mut self, sinks: Vec<String>) -> Self {
+        self.sinks = sinks;
+        self
     }
 
     /// Wire the coordinator's commit signal so WAL-feedback refreshes are change-driven.
@@ -258,6 +269,28 @@ impl CheckpointStore for PerSinkCheckpointProxy {
 
     async fn put_raw(&self, key: &str, bytes: &[u8]) -> CheckpointResult<()> {
         self.inner.put_raw(key, bytes).await
+    }
+
+    async fn initialize_sink_checkpoints(
+        &self,
+        source_id: &str,
+        checkpoint: &[u8],
+    ) -> CheckpointResult<()> {
+        if source_id != self.source_id {
+            return Ok(());
+        }
+        for sink in &self.sinks {
+            let key = format!("{}::sink::{sink}", self.source_id);
+            if self.inner.get_raw(&key).await?.is_none() {
+                self.inner.put_raw(&key, checkpoint).await?;
+                tracing::info!(
+                    source_id = %self.source_id,
+                    sink = %sink,
+                    "sink checkpoint initialized at the start position"
+                );
+            }
+        }
+        Ok(())
     }
 
     async fn delete(&self, key: &str) -> CheckpointResult<bool> {
@@ -1087,7 +1120,9 @@ impl PipelineManager {
                 spec.spec.source.source_id().to_string(),
                 &source,
             )
-            .with_commit_signal(commit_signal.clone()),
+            .with_commit_signal(commit_signal.clone())
+            // The keys the coordinator commits to (`build_commit_fn` below).
+            .with_sinks(sinks.iter().map(|s| s.id().to_string()).collect()),
         );
 
         // The cohort a snapshot generation freezes: this pipeline's commit
@@ -4332,6 +4367,7 @@ mod tests {
             is_snapshot: Arc::new(|_| false),
             exclusions: Arc::new(Vec::new),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
+            sinks: Vec::new(),
         };
         assert_eq!(
             proxy.list_with_prefix("mysql::sink::").await.unwrap(),
@@ -4356,6 +4392,7 @@ mod tests {
             is_snapshot: Arc::new(|_| false),
             exclusions: Arc::new(Vec::new),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
+            sinks: Vec::new(),
         };
         // No per-sink checkpoints and no legacy key - fresh start.
         let result = proxy.get_raw("mysql").await.unwrap();
@@ -4374,6 +4411,7 @@ mod tests {
             is_snapshot: Arc::new(|_| false),
             exclusions: Arc::new(Vec::new),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
+            sinks: Vec::new(),
         };
         // No per-sink keys exist, so it should fall back to the legacy key.
         let result = proxy.get_raw("mysql").await.unwrap().unwrap();
@@ -4406,6 +4444,7 @@ mod tests {
             is_snapshot: Arc::new(|_| false),
             exclusions: Arc::new(Vec::new),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
+            sinks: Vec::new(),
         };
 
         // Should return the minimum (redis at pos 100).
@@ -4438,6 +4477,7 @@ mod tests {
                     is_snapshot: Arc::new(|_| false),
                     exclusions: Arc::new(Vec::new),
                     commit_signal: Arc::new(tokio::sync::Notify::new()),
+                    sinks: Vec::new(),
                 }
             }
         };
@@ -4476,6 +4516,7 @@ mod tests {
                 is_snapshot: Arc::new(|_| false),
                 exclusions: Arc::new(Vec::new),
                 commit_signal: Arc::new(tokio::sync::Notify::new()),
+                sinks: Vec::new(),
             };
             proxy
                 .get_raw("src")
@@ -4564,6 +4605,7 @@ mod tests {
                 ),
                 exclusions: Arc::new(move || excluded.clone()),
                 commit_signal: Arc::new(tokio::sync::Notify::new()),
+                sinks: Vec::new(),
             };
             proxy
                 .get_raw("src")
@@ -4607,6 +4649,7 @@ mod tests {
             is_snapshot: Arc::new(|_| false),
             exclusions: Arc::new(Vec::new),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
+            sinks: Vec::new(),
         };
 
         // Non-source-id keys pass through directly.
@@ -4629,6 +4672,7 @@ mod tests {
             is_snapshot: Arc::new(|_| false),
             exclusions: Arc::new(Vec::new),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
+            sinks: Vec::new(),
         };
 
         let result = proxy.get_raw("mysql").await.unwrap().unwrap();
@@ -4708,6 +4752,7 @@ mod tests {
             is_snapshot: Arc::new(|_| false),
             exclusions: Arc::new(Vec::new),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
+            sinks: Vec::new(),
         };
         proxy
             .get_raw("src")
@@ -4782,6 +4827,7 @@ mod tests {
             is_snapshot: Arc::new(|_| false),
             exclusions: Arc::new(Vec::new),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
+            sinks: Vec::new(),
         };
         let got = proxy.get_raw("src").await.unwrap().unwrap();
         assert_eq!(got, VALID_A, "must return the earliest checkpoint");
@@ -4809,9 +4855,89 @@ mod tests {
             is_snapshot: Arc::new(|_| false),
             exclusions: Arc::new(Vec::new),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
+            sinks: Vec::new(),
         };
         let got = proxy.get_raw("pg").await.unwrap().unwrap();
         assert_eq!(got, slow, "must rewind to the slower sink's LSN");
+    }
+
+    /// A proxy over `inner` for source "src" and the configured sinks.
+    fn init_proxy(
+        inner: Arc<dyn CheckpointStore>,
+        sinks: &[&str],
+    ) -> PerSinkCheckpointProxy {
+        PerSinkCheckpointProxy {
+            inner,
+            source_id: "src".into(),
+            cmp_fn: Arc::new(|_, _| CheckpointOrder::Equal),
+            is_snapshot: Arc::new(|_| false),
+            exclusions: Arc::new(Vec::new),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
+            sinks: sinks.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Every configured sink without a checkpoint gets the start position;
+    /// an existing checkpoint is never changed.
+    #[tokio::test]
+    async fn sink_checkpoints_are_initialized_only_where_absent() {
+        let inner = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+        inner.put_raw("src::sink::old", b"ahead").await.unwrap();
+        let proxy = init_proxy(inner.clone(), &["old", "new"]);
+        proxy
+            .initialize_sink_checkpoints("src", b"start")
+            .await
+            .unwrap();
+        assert_eq!(
+            inner.get_raw("src::sink::old").await.unwrap().as_deref(),
+            Some(&b"ahead"[..])
+        );
+        assert_eq!(
+            inner.get_raw("src::sink::new").await.unwrap().as_deref(),
+            Some(&b"start"[..])
+        );
+        // Another source's keys are not this proxy's to initialize.
+        proxy
+            .initialize_sink_checkpoints("other", b"x")
+            .await
+            .unwrap();
+        assert_eq!(inner.list().await.unwrap().len(), 2);
+    }
+
+    /// A store that cannot persist: initialization fails (the source then
+    /// stops before delivering).
+    #[tokio::test]
+    async fn sink_checkpoint_initialization_fails_closed() {
+        struct NoWrites;
+        #[async_trait]
+        impl CheckpointStore for NoWrites {
+            async fn get_raw(
+                &self,
+                _k: &str,
+            ) -> CheckpointResult<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            async fn put_raw(
+                &self,
+                _k: &str,
+                _b: &[u8],
+            ) -> CheckpointResult<()> {
+                Err(checkpoints::CheckpointError::Database("down".into()))
+            }
+            async fn delete(&self, _k: &str) -> CheckpointResult<bool> {
+                Ok(false)
+            }
+            async fn list(&self) -> CheckpointResult<Vec<String>> {
+                Ok(vec![])
+            }
+        }
+        let proxy = init_proxy(Arc::new(NoWrites), &["a"]);
+        assert!(
+            proxy
+                .initialize_sink_checkpoints("src", b"start")
+                .await
+                .is_err()
+        );
     }
 
     /// A corrupt PostgreSQL per-sink checkpoint must fail the restart closed
@@ -4832,6 +4958,7 @@ mod tests {
             is_snapshot: Arc::new(|_| false),
             exclusions: Arc::new(Vec::new),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
+            sinks: Vec::new(),
         };
         let err = proxy
             .get_raw("pg")

@@ -776,3 +776,72 @@ impl Busy {
         total
     }
 }
+
+// ============================================================================
+// Sink checkpoint initialization - shared
+// ============================================================================
+
+/// A checkpoint store that holds nothing and refuses every write.
+pub struct UnwritableStore;
+
+#[async_trait::async_trait]
+impl checkpoints::CheckpointStore for UnwritableStore {
+    async fn get_raw(
+        &self,
+        _key: &str,
+    ) -> checkpoints::CheckpointResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    async fn put_raw(
+        &self,
+        _key: &str,
+        _bytes: &[u8],
+    ) -> checkpoints::CheckpointResult<()> {
+        Err(checkpoints::CheckpointError::Database("unwritable".into()))
+    }
+    async fn delete(&self, _key: &str) -> checkpoints::CheckpointResult<bool> {
+        Ok(false)
+    }
+    async fn list(&self) -> checkpoints::CheckpointResult<Vec<String>> {
+        Ok(vec![])
+    }
+}
+
+/// The production per-sink checkpoint proxy for `source` with one
+/// configured sink, over a store that cannot persist its checkpoint.
+pub fn unwritable_sink_checkpoints(
+    source: deltaforge_core::ArcDynSource,
+    source_id: &str,
+) -> Arc<dyn checkpoints::CheckpointStore> {
+    Arc::new(
+        runner::pipeline_manager::PerSinkCheckpointProxy::for_source(
+            Arc::new(UnwritableStore),
+            source_id.to_string(),
+            &source,
+        )
+        .with_sinks(vec![TEST_SINK.to_string()]),
+    )
+}
+
+/// The source stops before it streams: its run fails with the
+/// initialization error and nothing was emitted.
+pub async fn assert_fails_closed_without_sink_checkpoints(
+    handle: deltaforge_core::SourceHandle,
+    rx: &mut tokio::sync::mpsc::Receiver<deltaforge_core::SourceItem>,
+) {
+    let result = tokio::time::timeout(Duration::from_secs(60), handle.join)
+        .await
+        .expect("the source stops")
+        .expect("the source task joins");
+    let err = result.expect_err("startup fails closed");
+    assert!(
+        err.to_string().contains("initialize the sink checkpoints"),
+        "{err}"
+    );
+    while let Ok(item) = rx.try_recv() {
+        assert!(
+            !matches!(item, deltaforge_core::SourceItem::Event(_)),
+            "an event was emitted"
+        );
+    }
+}

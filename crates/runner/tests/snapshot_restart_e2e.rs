@@ -2301,3 +2301,123 @@ async fn postgres_an_authorized_slot_recreation_survives_a_crash_at_either_point
     }
     Ok(())
 }
+
+// ---- first-batch failure of a sink ----------------------------------------------
+
+/// A CDC-only pipeline (`kind` mysql or postgres) delivering to a required
+/// hook and an optional one.
+fn cdc_spec(
+    kind: &str,
+    name: &str,
+    port: u16,
+    main: &Hook,
+    side: &Hook,
+) -> deltaforge_config::PipelineSpec {
+    let source = match kind {
+        "mysql" => format!(
+            r#"    type: mysql
+    config:
+      id: my-src
+      dsn: "mysql://df:dfpw@127.0.0.1:{port}/shop"
+      tables: [shop.orders]"#
+        ),
+        _ => format!(
+            r#"    type: postgres
+    config:
+      id: pg-src
+      dsn: "host=127.0.0.1 port={port} user=postgres password={PASS} dbname=postgres"
+      slot: snap_slot
+      publication: snap_pub
+      tables: [public.orders]"#
+        ),
+    };
+    let yaml = format!(
+        r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: {name}
+  tenant: acme
+spec:
+  source:
+{source}
+      snapshot:
+        mode: never
+  processors: []
+{}"#,
+        hooks_yaml(&[("main", &main.url, true), ("side", &side.url, false)])
+    );
+    serde_yaml::from_str(&yaml).expect("pipeline spec")
+}
+
+/// Every configured sink has a checkpoint at the start position before
+/// anything is delivered. The optional sink fails the first batch (and
+/// every one after it): it is held there, and a restart replays the batch
+/// to it.
+async fn first_batch_failure_replays_after_restart(
+    kind: &str,
+    port: u16,
+    insert: impl AsyncFn(i64),
+) {
+    trace();
+    let (mgr, backend) = manager_with_backend().await;
+    let (main, side) = (Hook::start().await, Hook::start().await);
+    side.answer(Answer::AcceptThenFail(0));
+    let name = format!("{kind}first");
+    mgr.start_pipeline(cdc_spec(kind, &name, port, &main, &side))
+        .await
+        .unwrap();
+    let src = if kind == "mysql" { "my-src" } else { "pg-src" };
+    let start =
+        until_checkpoint(&backend, &format!("{src}::sink::side"), |_| true)
+            .await;
+    until_checkpoint(&backend, &format!("{src}::sink::main"), |v| *v == start)
+        .await;
+    assert!(
+        main.accepted().is_empty(),
+        "initialized before any delivery"
+    );
+
+    insert(1001).await;
+    main.until_accepted(1001).await;
+    // Main moves past the row; side stays at the start position.
+    until_checkpoint(&backend, &format!("{src}::sink::main"), |v| *v != start)
+        .await;
+    sleep(Duration::from_secs(2)).await;
+    assert_eq!(status(&mgr, &name).await, "running");
+    assert!(side.accepted().is_empty());
+    assert_eq!(
+        until_checkpoint(&backend, &format!("{src}::sink::side"), |_| true)
+            .await,
+        start,
+        "held at the start position"
+    );
+
+    PipelineController::stop(&mgr, &name).await.unwrap();
+    until_status(&mgr, &name, "stopped").await;
+    side.answer(Answer::Accept);
+    mgr.resume(&name).await.unwrap();
+    side.until_accepted(1001).await;
+    assert_eq!(status(&mgr, &name).await, "running");
+    PipelineController::stop(&mgr, &name).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn mysql_a_first_batch_failure_replays_after_restart() {
+    let (_my, port) = start_mysql().await;
+    first_batch_failure_replays_after_restart("mysql", port, async |id| {
+        mysql_insert(port, id).await
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker"]
+async fn postgres_a_first_batch_failure_replays_after_restart() {
+    let (_pg, port) = start_postgres().await;
+    first_batch_failure_replays_after_restart("postgres", port, async |id| {
+        pg_insert(port, id).await
+    })
+    .await;
+}
