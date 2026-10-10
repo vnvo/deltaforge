@@ -395,12 +395,15 @@ async fn amplification(
         .iter()
         .filter(|r| r["record"] == "request")
         .collect();
-    let mut spans: Vec<(u64, u64)> = requests
+    // An empty request (A == B) has no span and reads nothing.
+    let spanned: Vec<_> =
+        requests.iter().filter(|r| r["served"] != "empty").collect();
+    let mut spans: Vec<(u64, u64)> = spanned
         .iter()
         .filter_map(|r| Some((off(&r["from"])?, off(&r["to"])?)))
         .filter(|(a, b)| b > a)
         .collect();
-    assert_eq!(spans.len(), requests.len(), "every request has a byte span");
+    assert_eq!(spans.len(), spanned.len(), "every request has a byte span");
     spans.sort();
     let (mut distinct, mut cur) = (0u64, None::<(u64, u64)>);
     for (a, b) in spans {
