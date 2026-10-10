@@ -233,7 +233,7 @@ pub async fn ensure_cdc_user(cfg: &RunConfig, server: &Server) -> Result<()> {
 
 /// Server settings that matter at this scale (design R11), recorded with
 /// every run.
-pub const SETTINGS: [&str; 13] = [
+pub const SETTINGS: [&str; 14] = [
     "version",
     "binlog_format",
     "binlog_row_image",
@@ -247,6 +247,7 @@ pub const SETTINGS: [&str; 13] = [
     "innodb_file_per_table",
     "max_connections",
     "lower_case_table_names",
+    "innodb_redo_log_capacity",
 ];
 
 pub async fn settings(

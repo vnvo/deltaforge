@@ -188,6 +188,11 @@ pub struct Topology {
     /// Seed of the deterministic table templates.
     #[serde(default)]
     pub seed: u64,
+    /// The disk budget for each server's InnoDB redo log: a run refuses to
+    /// start on a server whose `innodb_redo_log_capacity` exceeds it (the
+    /// value and the budget are recorded in the result).
+    #[serde(default)]
+    pub redo_log_capacity_max_bytes: Option<u64>,
 }
 
 fn default_db_prefix() -> String {
@@ -243,6 +248,29 @@ pub struct DeltaForge {
     /// features, ...).
     #[serde(default)]
     pub spec_overrides: Option<serde_yaml::Value>,
+    /// Partitions of each run topic the harness creates before the run
+    /// (`None`: the broker's default).
+    #[serde(default)]
+    pub topic_partitions: Option<i32>,
+    /// Where the instance's proof trace (`deltaforge::proof_trace` records)
+    /// is read from; `None` collects none.
+    #[serde(default)]
+    pub proof_trace: Option<TraceSource>,
+    /// The requested proof trace is required evidence even in an
+    /// exploratory run (always in a qualification run): missing, malformed
+    /// or incomplete evidence fails the repetition.
+    #[serde(default)]
+    pub proof_trace_required: bool,
+}
+
+/// Where the instance under test writes its log.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TraceSource {
+    /// `docker logs` of a container, for the run's time window.
+    DockerLogs { container: String },
+    /// A log file; the part written during the run is read.
+    File { path: String },
 }
 
 fn default_pipeline_prefix() -> String {
@@ -444,6 +472,13 @@ fn default_true() -> bool {
 }
 
 impl RunConfig {
+    /// Whether the requested proof trace is required evidence.
+    pub fn proof_trace_required(&self) -> bool {
+        self.deltaforge.proof_trace.is_some()
+            && (self.class == RunClass::Qualification
+                || self.deltaforge.proof_trace_required)
+    }
+
     pub fn load(path: &str) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("read run config {path}"))?;
@@ -610,6 +645,18 @@ pub(crate) mod tests {
             serde_yaml::from_str::<Param<f64>>("{value: 1, provenance: x}")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn requested_proof_evidence_is_required_in_qualification_or_on_request() {
+        let mut cfg: RunConfig = serde_yaml::from_str(EXAMPLE).unwrap();
+        assert!(cfg.proof_trace_required(), "the T1 run requires it");
+        cfg.deltaforge.proof_trace_required = false;
+        assert!(!cfg.proof_trace_required());
+        cfg.class = RunClass::Qualification;
+        assert!(cfg.proof_trace_required());
+        cfg.deltaforge.proof_trace = None;
+        assert!(!cfg.proof_trace_required(), "nothing requested");
     }
 
     #[test]

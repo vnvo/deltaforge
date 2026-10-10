@@ -13,6 +13,8 @@ pub mod config;
 pub mod consumer;
 pub mod deltaforge;
 pub mod driver;
+pub mod evidence;
+
 pub mod fixture;
 pub mod ledger;
 pub mod measure;
@@ -22,6 +24,7 @@ pub mod scenario;
 pub mod stats;
 pub mod store;
 pub mod topology;
+pub mod trace;
 pub mod verify;
 
 /// The git revision this harness was built from.

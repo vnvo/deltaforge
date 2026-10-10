@@ -154,8 +154,23 @@ pub fn check<T: Copy + Into<f64>>(
     }
 }
 
+/// Kafka readiness before any write: the run's topics existed with complete
+/// metadata, and the verifier held every partition of them.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Readiness {
+    /// Partitions per topic.
+    pub topics: BTreeMap<String, usize>,
+    pub topics_ready_secs: f64,
+    pub verifier_assigned_secs: f64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Verdict {
+    /// The run reached the end of its measured window (not aborted).
+    pub completed: bool,
+    /// Events were consumed and, where the state store is measured, every
+    /// source's checkpoint advanced in the window.
+    pub progress_ok: bool,
     /// Completeness, ordering within partitions, schema probes and (when
     /// expected) primary-key keys.
     pub correctness_ok: bool,
@@ -171,10 +186,15 @@ pub struct Verdict {
     pub workload_ok: Option<bool>,
     /// Every owner budget evaluated passed; `None` if none was evaluated.
     pub budgets_ok: Option<bool>,
+    /// Required evidence (the proof trace, when required) is complete.
+    pub evidence_ok: bool,
+    /// The proof trace was requested and is complete: only then may the
+    /// run support proof-performance conclusions.
+    pub proof_conclusions_allowed: bool,
     /// What a sweep counts. Exploratory: correctness. Qualification:
     /// correctness, the whole plan executed, uncertainty within the
     /// allowance and the workload achieved (budgets are judged by the
-    /// sweep).
+    /// sweep). Both: completed, progress and the required evidence.
     pub repetition_ok: bool,
 }
 
@@ -190,6 +210,18 @@ pub struct Workload {
 #[derive(Debug, Clone, Serialize)]
 pub struct RunResult {
     pub run_id: String,
+    /// The run's row namespace (the high bits of every row id it wrote).
+    pub run_tag: u64,
+    /// `completed`, or `aborted` (interrupted, or a pipeline failed): an
+    /// aborted run keeps its partial counters and is never a passing run.
+    pub outcome: String,
+    pub reason: Option<String>,
+    /// Requested evidence that is missing, malformed or incomplete (set by
+    /// `evaluate`). Required evidence here fails the repetition; otherwise
+    /// the run supports no conclusion that evidence was for.
+    pub missing_artifacts: Vec<String>,
+    pub readiness: Readiness,
+    pub proof_trace: crate::trace::Collected,
     pub class: RunClass,
     pub claims_allowed: bool,
     pub scenario: String,
@@ -356,16 +388,35 @@ impl RunResult {
             ),
             _ => None,
         };
-        let repetition_ok = match self.class {
-            RunClass::Exploratory => correctness_ok,
-            RunClass::Qualification => {
-                correctness_ok
-                    && plan_executed
-                    && uncertainty_ok
-                    && workload_ok == Some(true)
-            }
+        let completed = self.outcome == "completed";
+        let progress_ok = s.events > 0
+            && self.resources.checkpoints.values().all(|c| c.distinct >= 2);
+        let pt = &self.proof_trace;
+        self.missing_artifacts = if pt.requested && !pt.complete {
+            vec![format!(
+                "proof_trace ({}): {}",
+                if pt.required { "required" } else { "optional" },
+                pt.errors.join("; ")
+            )]
+        } else {
+            Vec::new()
         };
+        let evidence_ok = !pt.required || pt.complete;
+        let repetition_ok = completed
+            && progress_ok
+            && evidence_ok
+            && match self.class {
+                RunClass::Exploratory => correctness_ok,
+                RunClass::Qualification => {
+                    correctness_ok
+                        && plan_executed
+                        && uncertainty_ok
+                        && workload_ok == Some(true)
+                }
+            };
         self.verdict = Verdict {
+            completed,
+            progress_ok,
             correctness_ok,
             plan_executed,
             actions_not_run,
@@ -374,6 +425,8 @@ impl RunResult {
             workload_ok,
             budgets_ok: (!evaluated.is_empty())
                 .then(|| evaluated.iter().all(|&p| p)),
+            evidence_ok,
+            proof_conclusions_allowed: pt.requested && pt.complete,
             repetition_ok,
         };
     }
@@ -382,13 +435,13 @@ impl RunResult {
         Path::new(output).join(class.dir()).join(run_id)
     }
 
+    /// Write `result.json` into the run's own directory; an existing
+    /// result is never overwritten.
     pub fn write(&self, dir: &Path) -> Result<()> {
-        std::fs::create_dir_all(dir)?;
-        std::fs::write(
-            dir.join("result.json"),
-            serde_json::to_vec_pretty(self)?,
-        )?;
-        Ok(())
+        crate::evidence::write_new(
+            &dir.join("result.json"),
+            &serde_json::to_vec_pretty(self)?,
+        )
     }
 }
 
@@ -528,6 +581,12 @@ mod tests {
         config.class = class;
         RunResult {
             run_id: "r".into(),
+            run_tag: 1,
+            outcome: "completed".into(),
+            reason: None,
+            missing_artifacts: vec![],
+            readiness: Readiness::default(),
+            proof_trace: crate::trace::Collected::default(),
             class,
             claims_allowed: false,
             scenario: "S7".into(),
@@ -558,7 +617,10 @@ mod tests {
             )]),
             writer_errors: vec![],
             sort: BTreeMap::new(),
-            stream: StreamReport::default(),
+            stream: StreamReport {
+                events: 1,
+                ..StreamReport::default()
+            },
             lag_ms: BTreeMap::new(),
             resources: Aggregate::default(),
             planned_steps: 0,
@@ -566,6 +628,8 @@ mod tests {
             completeness: Completeness::default(),
             budgets: vec![],
             verdict: Verdict {
+                completed: false,
+                progress_ok: false,
                 correctness_ok: false,
                 plan_executed: false,
                 actions_not_run: 0,
@@ -573,9 +637,103 @@ mod tests {
                 uncertainty_ok: false,
                 workload_ok: None,
                 budgets_ok: None,
+                evidence_ok: false,
+                proof_conclusions_allowed: false,
                 repetition_ok: false,
             },
         }
+    }
+
+    /// Requested proof evidence that is incomplete: it fails a run that
+    /// requires it (always a qualification run); an exploratory run that
+    /// does not require it completes, lists it as missing and allows no
+    /// proof conclusion.
+    #[test]
+    fn incomplete_required_evidence_fails_and_optional_evidence_is_flagged() {
+        let incomplete = |required| crate::trace::Collected {
+            requested: true,
+            required,
+            complete: false,
+            errors: vec!["report for c01: exit status: 1".into()],
+            ..Default::default()
+        };
+        let mut q = qualified(result(RunClass::Qualification));
+        q.proof_trace = incomplete(true);
+        q.evaluate();
+        assert!(!q.verdict.evidence_ok && !q.verdict.repetition_ok);
+        assert!(!q.verdict.proof_conclusions_allowed);
+        assert_eq!(q.missing_artifacts.len(), 1);
+        assert!(q.missing_artifacts[0].starts_with("proof_trace (required)"));
+
+        let mut e = result(RunClass::Exploratory);
+        e.proof_trace = incomplete(true);
+        e.evaluate();
+        assert!(!e.verdict.repetition_ok, "required in an exploratory run");
+
+        let mut o = result(RunClass::Exploratory);
+        o.proof_trace = incomplete(false);
+        o.evaluate();
+        assert!(o.verdict.evidence_ok && o.verdict.repetition_ok);
+        assert!(!o.verdict.proof_conclusions_allowed);
+        assert!(o.missing_artifacts[0].starts_with("proof_trace (optional)"));
+
+        let mut c = qualified(result(RunClass::Qualification));
+        c.proof_trace = crate::trace::Collected {
+            requested: true,
+            required: true,
+            complete: true,
+            ..Default::default()
+        };
+        c.evaluate();
+        assert!(c.verdict.repetition_ok && c.verdict.proof_conclusions_allowed);
+        assert!(c.missing_artifacts.is_empty());
+    }
+
+    /// An aborted run, one that consumed nothing, or one whose source
+    /// checkpoint never moved never passes - whatever its counters say.
+    #[test]
+    fn aborted_or_stalled_runs_never_pass() {
+        let mut r = result(RunClass::Exploratory);
+        r.evaluate();
+        assert!(
+            r.verdict.repetition_ok
+                && r.verdict.completed
+                && r.verdict.progress_ok
+        );
+
+        let mut a = result(RunClass::Exploratory);
+        a.outcome = "aborted".into();
+        a.reason = Some("pipeline t-c01 failed".into());
+        a.evaluate();
+        assert!(
+            a.verdict.correctness_ok,
+            "its counters can still be correct"
+        );
+        assert!(!a.verdict.completed && !a.verdict.repetition_ok);
+
+        let mut z = result(RunClass::Exploratory);
+        z.stream.events = 0;
+        z.evaluate();
+        assert!(!z.verdict.progress_ok && !z.verdict.repetition_ok);
+
+        let mut s = result(RunClass::Exploratory);
+        let cp = BTreeMap::from([(
+            "src-c01::sink::kafka".to_string(),
+            "1".to_string(),
+        )]);
+        s.resources.checkpoints("c01", &cp);
+        s.resources.checkpoints("c01", &cp);
+        s.evaluate();
+        assert!(!s.verdict.progress_ok, "one checkpoint value: no progress");
+        s.resources.checkpoints(
+            "c01",
+            &BTreeMap::from([(
+                "src-c01::sink::kafka".to_string(),
+                "2".to_string(),
+            )]),
+        );
+        s.evaluate();
+        assert!(s.verdict.progress_ok && s.verdict.repetition_ok);
     }
 
     fn step(not_run: Option<&str>, error: Option<&str>) -> StepOutcome {

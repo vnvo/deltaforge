@@ -89,11 +89,19 @@ def main(jsonl, meta_path):
     for s in scans:
         by_kind[s["kind"]].append(s)
 
-    print(f"# Proof-trace evidence: {meta['mode']} mode, {meta['tables']} tables")
     print(
-        f"gap {meta['gap']} txns, sustained {meta['rate']} txn/s, "
-        f"catch-up {meta['catch_up_s']:.1f} s; {len(scans)} scans, {len(proofs)} proofs\n"
+        f"# Proof-trace evidence: {meta['mode']} mode, {meta.get('tables', '?')} tables"
     )
+    workload = [
+        f"{label} {meta[k]}{unit}"
+        for k, label, unit in (
+            ("gap", "gap", " txns"),
+            ("rate", "sustained", " txn/s"),
+            ("catch_up_s", "catch-up", " s"),
+        )
+        if k in meta
+    ]
+    print(", ".join(workload + [f"{len(scans)} scans, {len(proofs)} proofs"]) + "\n")
 
     def summary(name, ss):
         ok = [s for s in ss if s["outcome"] == "ok"]

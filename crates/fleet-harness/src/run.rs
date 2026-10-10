@@ -1,11 +1,18 @@
 //! Running a scenario and sweeping source counts.
 //!
-//! One run: prepare the servers, create one pipeline per server through the
-//! REST API, start the verifying consumer, the sampler and the writers, warm
-//! up, execute the plan's steps (measuring recovery after each disruption),
-//! stop, drain, check completeness offline, delete the pipelines and write
-//! the result. A sweep repeats this for each source count and repetition,
-//! and never assumes a count succeeds.
+//! One run: prepare the servers, create the run's Kafka topics, create one
+//! pipeline per server through the REST API, start the verifying consumer
+//! and wait until it holds every partition, start the sampler and the
+//! writers, warm up, execute the plan's steps (measuring recovery after each
+//! disruption), stop, drain, check completeness offline, collect the proof
+//! trace, delete the pipelines and write the result. A sweep repeats this
+//! for each source count and repetition, and never assumes a count succeeds.
+//!
+//! A run is aborted - writers stopped, the stream drained, a result with
+//! its partial counters written - when it is interrupted (`RunOptions::
+//! abort`) or a pipeline fails (its incidents are the reason). A run that
+//! fails before or after the measured window still writes a `result.json`:
+//! `outcome: failed`, the stage, the reason and its partial counters.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
@@ -28,7 +35,7 @@ use crate::fixture;
 use crate::ledger;
 use crate::measure::{self, Aggregate};
 use crate::results::{
-    Environment, RunResult, StepOutcome, Sweep, SweepPoint, Verdict,
+    Environment, Readiness, RunResult, StepOutcome, Sweep, SweepPoint, Verdict,
 };
 use crate::scenario::{self, Action, Plan};
 use crate::stats;
@@ -47,6 +54,11 @@ pub struct RunOptions {
     pub sort_chunk_records: usize,
     /// Run files merged at once by the external sort (bounds descriptors).
     pub sort_fan_in: usize,
+    /// Set (with the reason) to abort the run: the binary sets it on
+    /// SIGINT/SIGTERM.
+    pub abort: Option<watch::Receiver<Option<String>>>,
+    /// How often pipeline status is checked (a failed pipeline aborts).
+    pub status_poll: Duration,
 }
 
 impl Default for RunOptions {
@@ -59,6 +71,8 @@ impl Default for RunOptions {
             keep_pipelines: false,
             sort_chunk_records: 8_000_000,
             sort_fan_in: ledger::DEFAULT_FAN_IN,
+            abort: None,
+            status_poll: Duration::from_secs(5),
         }
     }
 }
@@ -128,9 +142,12 @@ pub async fn sweep(cfg: RunConfig, opts: RunOptions) -> Result<Sweep> {
     let name = format!(
         "sweep-{}-{}.json",
         cfg.run.scenario,
-        Utc::now().format("%Y%m%dT%H%M%S")
+        crate::evidence::unique_stem(Utc::now())
     );
-    std::fs::write(dir.join(name), serde_json::to_vec_pretty(&sweep)?)?;
+    crate::evidence::write_new(
+        &dir.join(name),
+        &serde_json::to_vec_pretty(&sweep)?,
+    )?;
     Ok(sweep)
 }
 
@@ -147,7 +164,18 @@ struct Shared {
     run_tag: u64,
 }
 
-/// One run with the first `n` servers.
+/// How far a run got, for its failure result.
+#[derive(Default)]
+struct Progress {
+    stage: &'static str,
+    pipelines: Vec<String>,
+    readiness: Option<Readiness>,
+    ctxs: Vec<Arc<ServerCtx>>,
+}
+
+/// One run with the first `n` servers. Any failure still writes the run's
+/// `result.json` (`outcome: failed`, the stage, the reason, its partial
+/// counters) before it is returned.
 pub async fn run_once(
     cfg: Arc<RunConfig>,
     n: u32,
@@ -155,16 +183,104 @@ pub async fn run_once(
     opts: &RunOptions,
 ) -> Result<RunResult> {
     let started_at = Utc::now();
-    let run_tag = (started_at.timestamp() as u64) & ((1 << 23) - 1);
-    let run_id = format!(
-        "{}-{}-n{n}-r{rep}",
-        started_at.format("%Y%m%dT%H%M%S"),
-        cfg.run.scenario
-    );
-    let dir = RunResult::dir(&cfg.output_dir, cfg.class, &run_id);
+    // Allocated before anything else: a run that cannot own a new result
+    // directory writes nothing (never into another run's evidence).
+    let id = crate::evidence::allocate_run(
+        &cfg.output_dir,
+        cfg.class,
+        &cfg.run.scenario,
+        n,
+        rep,
+        started_at,
+    )?;
+    let (run_id, dir) = (id.run_id.clone(), id.dir.clone());
+    let progress = Mutex::new(Progress {
+        stage: "start",
+        ..Progress::default()
+    });
+    match run_inner(cfg.clone(), n, rep, opts, started_at, &id, &progress).await
+    {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            let p = progress.lock();
+            let failure = json!({
+                "run_id": run_id,
+                "run_tag": id.run_tag,
+                "outcome": "failed",
+                "stage": p.stage,
+                "reason": format!("{e:#}"),
+                "scenario": cfg.run.scenario,
+                "class": cfg.class,
+                "sources": n,
+                "repetition": rep,
+                "started_at": started_at.to_rfc3339(),
+                "ended_at": Utc::now().to_rfc3339(),
+                "harness_revision": crate::git_revision(),
+                "pipelines": p.pipelines,
+                "readiness": p.readiness,
+                "driver": p.ctxs.iter()
+                    .map(|c| (c.server.name.clone(), c.counters.snapshot()))
+                    .collect::<BTreeMap<_, _>>(),
+                "verdict": {"completed": false, "correctness_ok": false, "evidence_ok": false, "repetition_ok": false},
+            });
+            if let Err(w) = crate::evidence::write_new(
+                &dir.join("result.json"),
+                &serde_json::to_vec_pretty(&failure).unwrap_or_default(),
+            ) {
+                eprintln!("could not write the failure result: {w}");
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Wait until `until`, unless the run is aborted first (returns the reason).
+async fn wait_or_abort(
+    until: tokio::time::Instant,
+    abort: &mut watch::Receiver<Option<String>>,
+) -> Option<String> {
+    loop {
+        if let Some(r) = abort.borrow().clone() {
+            return Some(r);
+        }
+        tokio::select! {
+            _ = tokio::time::sleep_until(until) => return None,
+            changed = abort.changed() => if changed.is_err() {
+                tokio::time::sleep_until(until).await;
+                return None;
+            },
+        }
+    }
+}
+
+/// Set the run's abort reason (the first one wins).
+fn abort_with(tx: &watch::Sender<Option<String>>, reason: String) {
+    tx.send_if_modified(|v| {
+        if v.is_none() {
+            *v = Some(reason);
+            true
+        } else {
+            false
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_inner(
+    cfg: Arc<RunConfig>,
+    n: u32,
+    rep: u32,
+    opts: &RunOptions,
+    started_at: chrono::DateTime<Utc>,
+    id: &crate::evidence::RunIdentity,
+    progress: &Mutex<Progress>,
+) -> Result<RunResult> {
+    let (run_id, dir, run_tag) =
+        (id.run_id.clone(), id.dir.clone(), id.run_tag);
+    let stage = |s: &'static str| progress.lock().stage = s;
+    stage("servers");
     let work = Path::new(&cfg.verifier.work_dir).join(&run_id);
-    std::fs::create_dir_all(&dir)?;
-    std::fs::create_dir_all(&work)?;
+    crate::evidence::create_new_dir(&work)?;
     let plan: Plan = scenario::plan(&cfg)?;
     let mut run_cfg = (*cfg).clone();
     if let Some(p) = plan.active_set.clone() {
@@ -192,9 +308,26 @@ pub async fn run_once(
         fixture::ensure_cdc_user(&cfg, s).await?;
         let pool = fixture::admin_pool(&cfg, s, 1)?;
         let mut conn = pool.get_conn().await?;
-        environment
-            .mysql
-            .insert(s.name.clone(), fixture::settings(&mut conn).await?);
+        let settings = fixture::settings(&mut conn).await?;
+        if let Some(max) = cfg.topology.redo_log_capacity_max_bytes {
+            let redo: u64 = settings
+                .get("innodb_redo_log_capacity")
+                .and_then(|v| v.parse().ok())
+                .with_context(|| {
+                    format!(
+                        "server {}: innodb_redo_log_capacity unknown",
+                        s.name
+                    )
+                })?;
+            if redo > max {
+                bail!(
+                    "server {}: innodb_redo_log_capacity {redo} exceeds the \
+                     disk budget {max}",
+                    s.name
+                );
+            }
+        }
+        environment.mysql.insert(s.name.clone(), settings);
         let like =
             format!("{}%", cfg.topology.database_prefix.replace('_', "\\_"));
         use mysql_async::prelude::Queryable;
@@ -217,7 +350,30 @@ pub async fn run_once(
         }
     }
 
+    // The run's topics, with complete metadata, before any pipeline.
+    stage("topics");
+    let topics: Vec<String> = servers
+        .iter()
+        .map(|(_, s)| deltaforge::topic(&cfg, s))
+        .collect();
+    let readying = Instant::now();
+    let partitions = consumer::ensure_topics(
+        &cfg.verifier.kafka_brokers,
+        &topics,
+        cfg.deltaforge.topic_partitions,
+        opts.start_timeout,
+    )
+    .await
+    .context("create the run's topics")?;
+    let topics_ready_secs = readying.elapsed().as_secs_f64();
+    let trace_mark = cfg
+        .deltaforge
+        .proof_trace
+        .as_ref()
+        .map(|t| crate::trace::mark(t, Utc::now()));
+
     // Pipelines.
+    stage("pipelines");
     let api = Api::new(&cfg.deltaforge.api_url)?;
     let names: Vec<String> = servers
         .iter()
@@ -227,6 +383,7 @@ pub async fn run_once(
         .iter()
         .map(|(_, s)| deltaforge::render_spec(&cfg, s, &naming))
         .collect::<Result<_>>()?;
+    progress.lock().pipelines = names.clone();
     for (name, spec) in names.iter().zip(&specs) {
         api.delete(name).await.ok();
         api.create(spec)
@@ -239,6 +396,54 @@ pub async fn run_once(
     }
     let pipelines_running_secs = Some(creating.elapsed().as_secs_f64());
 
+    // Aborts: the caller's (interrupt) or a failed pipeline's.
+    let (abort_tx, mut abort) = watch::channel::<Option<String>>(None);
+    let abort_tx = Arc::new(abort_tx);
+    if let Some(mut external) = opts.abort.clone() {
+        let tx = abort_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Some(r) = external.borrow().clone() {
+                    abort_with(&tx, r);
+                    break;
+                }
+                if external.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    let monitor = {
+        let (tx, api, names, every) = (
+            abort_tx.clone(),
+            api.clone(),
+            names.clone(),
+            opts.status_poll,
+        );
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                for name in &names {
+                    if api.status(name).await.ok().as_deref() == Some("failed")
+                    {
+                        let incidents = api
+                            .incidents(name)
+                            .await
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|e| format!("({e:#})"));
+                        abort_with(
+                            &tx,
+                            format!("pipeline {name} failed: {incidents}"),
+                        );
+                    }
+                }
+                if tx.borrow().is_some() {
+                    break;
+                }
+            }
+        })
+    };
+
     // Verifier.
     let probes = Probes::default();
     let marks = RecoveryMarks::default();
@@ -250,7 +455,9 @@ pub async fn run_once(
         &work.join("consumed.bin"),
     )?
     .for_run(run_tag);
+    stage("verifier");
     let (consumer_stop_tx, consumer_stop) = watch::channel(false);
+    let (ready_tx, mut ready_rx) = watch::channel(false);
     let topic_to_server: HashMap<String, u16> = servers
         .iter()
         .map(|(i, s)| (deltaforge::topic(&cfg, s), *i))
@@ -269,6 +476,7 @@ pub async fn run_once(
             idle: opts.drain_idle,
             max: opts.drain_max,
         };
+        let expected = partitions.clone();
         tokio::spawn(async move {
             consumer::run(
                 &brokers,
@@ -278,10 +486,23 @@ pub async fn run_once(
                 verifier,
                 consumer_stop,
                 drain,
+                expected,
+                ready_tx,
             )
             .await
         })
     };
+    // No write before the verifier holds every partition of the topics.
+    tokio::time::timeout(opts.start_timeout, ready_rx.wait_for(|r| *r))
+        .await
+        .context("the verifier was never assigned the run's partitions")?
+        .context("the verifier ended before its assignment")?;
+    let readiness = Readiness {
+        topics: partitions,
+        topics_ready_secs,
+        verifier_assigned_secs: readying.elapsed().as_secs_f64(),
+    };
+    progress.lock().readiness = Some(readiness.clone());
 
     // Sampler.
     let agg = Arc::new(Mutex::new(Aggregate::default()));
@@ -301,6 +522,8 @@ pub async fn run_once(
             Arc::new(ServerCtx::new(&cfg, *i, s, probes.clone(), run_tag))
         })
         .collect();
+    stage("writers");
+    progress.lock().ctxs = ctxs.clone();
     let (driver_stop_tx, driver_stop) = watch::channel(false);
     let mut writers: Vec<JoinHandle<Result<u64>>> = Vec::new();
     let integrators: Vec<JoinHandle<()>> = ctxs
@@ -327,7 +550,12 @@ pub async fn run_once(
     }
 
     // Warm-up, then the measured window.
-    tokio::time::sleep(Duration::from_secs(cfg.run.warmup_secs)).await;
+    stage("window");
+    let mut aborted = wait_or_abort(
+        tokio::time::Instant::now() + Duration::from_secs(cfg.run.warmup_secs),
+        &mut abort,
+    )
+    .await;
     *agg.lock() = Aggregate::default();
     let window_start = Instant::now();
     let ops_at_start: Vec<u64> =
@@ -349,6 +577,9 @@ pub async fn run_once(
     let mut steps = Vec::new();
     let mut background: Vec<(usize, JoinHandle<Result<String>>)> = Vec::new();
     for step in &plan.steps {
+        if aborted.is_some() {
+            break;
+        }
         if step.at_secs >= cfg.run.duration_secs {
             // Never silently dropped: a planned step without a chance to
             // run is an outcome that fails the plan.
@@ -368,7 +599,10 @@ pub async fn run_once(
             continue;
         }
         let due = window_start + Duration::from_secs(step.at_secs);
-        tokio::time::sleep_until(due.into()).await;
+        aborted = wait_or_abort(due.into(), &mut abort).await;
+        if aborted.is_some() {
+            break;
+        }
         let (outcome, task) =
             execute(&shared, &specs, step.at_secs, &step.action, opts).await;
         if let Some(t) = task {
@@ -376,16 +610,21 @@ pub async fn run_once(
         }
         steps.push(outcome);
     }
-    tokio::time::sleep_until(
-        (window_start + Duration::from_secs(cfg.run.duration_secs)).into(),
-    )
-    .await;
+    if aborted.is_none() {
+        aborted = wait_or_abort(
+            (window_start + Duration::from_secs(cfg.run.duration_secs)).into(),
+            &mut abort,
+        )
+        .await;
+    }
     let measured_secs = window_start.elapsed().as_secs_f64();
     let counters: Vec<CountersSnapshot> =
         ctxs.iter().map(|c| c.counters.snapshot()).collect();
     let target_at_end: Vec<f64> = ctxs.iter().map(|c| c.target_ops()).collect();
 
     // Stop and drain.
+    stage("drain");
+    monitor.abort();
     driver_stop_tx.send(true).ok();
     let mut writer_errors = Vec::new();
     for w in writers {
@@ -415,6 +654,7 @@ pub async fn run_once(
     sampler_task.await?.ok();
 
     // Completeness, offline.
+    stage("completeness");
     let files = |suffix: &str| -> Result<Vec<PathBuf>> {
         Ok(std::fs::read_dir(&work)?
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -444,6 +684,16 @@ pub async fn run_once(
         opts.sort_fan_in,
     )?;
     let completeness = ledger::compare(&written, &consumed, Some(&uncertain))?;
+
+    stage("proof trace");
+    let proof_trace = match &trace_mark {
+        Some(mark) => {
+            let servers: Vec<Server> =
+                servers.iter().map(|(_, s)| s.clone()).collect();
+            crate::trace::collect(&cfg, &servers, mark, &dir).await
+        }
+        None => crate::trace::Collected::default(),
+    };
 
     if !opts.keep_pipelines {
         for name in &names {
@@ -488,6 +738,17 @@ pub async fn run_once(
     }
     let mut result = RunResult {
         run_id: run_id.clone(),
+        run_tag,
+        outcome: if aborted.is_some() {
+            "aborted"
+        } else {
+            "completed"
+        }
+        .into(),
+        reason: aborted,
+        missing_artifacts: Vec::new(),
+        readiness,
+        proof_trace,
         class: cfg.class,
         claims_allowed: cfg.class == crate::config::RunClass::Qualification
             && cfg.qualification_errors().is_empty(),
@@ -528,6 +789,8 @@ pub async fn run_once(
         completeness,
         budgets: Vec::new(),
         verdict: Verdict {
+            completed: false,
+            progress_ok: false,
             correctness_ok: false,
             plan_executed: false,
             actions_not_run: 0,
@@ -535,12 +798,18 @@ pub async fn run_once(
             uncertainty_ok: false,
             workload_ok: None,
             budgets_ok: None,
+            evidence_ok: false,
+            proof_conclusions_allowed: false,
             repetition_ok: false,
         },
     };
+    stage("result");
     result.evaluate();
     result.write(&dir)?;
-    if result.verdict.correctness_ok {
+    for missing in &result.missing_artifacts {
+        eprintln!("run {run_id}: MISSING EVIDENCE: {missing}");
+    }
+    if result.verdict.correctness_ok && result.verdict.completed {
         std::fs::remove_dir_all(&work).ok();
     }
     Ok(result)
@@ -937,6 +1206,16 @@ async fn sampler(
             Some(c) => measure::store_size(c).await.ok(),
             None => None,
         };
+        let mut checkpoints = BTreeMap::new();
+        if let Some(c) = &store {
+            for (_, s) in &servers {
+                // A failed read is a sample without progress, never a
+                // server left out of the progress check.
+                let v =
+                    measure::checkpoints(c, &s.name).await.unwrap_or_default();
+                checkpoints.insert(s.name.clone(), v);
+            }
+        }
         let scrape_started = Instant::now();
         let metrics = match http.get(&cfg.deltaforge.metrics_url).send().await {
             Ok(r) => r.text().await.ok(),
@@ -959,12 +1238,16 @@ async fn sampler(
             if let Some(m) = &metrics {
                 a.scrape(scrape_ms, m.len() as u64);
             }
+            for (server, values) in &checkpoints {
+                a.checkpoints(server, values);
+            }
         }
         let line = json!({
             "at": Utc::now().to_rfc3339(),
             "process": process,
             "connections": connections,
             "store": store_size,
+            "checkpoints": checkpoints,
             "lag_seconds": measure::sum_by(&samples, "deltaforge_source_lag_seconds", "pipeline"),
             "sink_events": measure::sum_by(&samples, "deltaforge_sink_events_total", "pipeline"),
             "scrape_ms": scrape_ms,
