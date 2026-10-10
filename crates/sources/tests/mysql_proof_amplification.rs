@@ -167,10 +167,35 @@ struct Amplification {
     failed: usize,
     /// The largest record the scanner held: statements, encoded bytes.
     peak_record: (u64, u64),
-    /// The union of all requested intervals (A, B], in binlog bytes.
-    distinct_bytes: u64,
+    /// The unit of the two figures below: binlog bytes (file/position
+    /// mode) or the source server's transactions (GTID mode, where a
+    /// position's file/offset and its GTID set are not read atomically).
+    unit: &'static str,
+    /// The union of all requested intervals (A, B].
+    distinct: u64,
     /// What the physical scans read.
-    scanned_bytes: u64,
+    scanned: u64,
+}
+
+/// The source UUID's highest GNO, when its intervals are contiguous from 1.
+fn gno(set: &serde_json::Value, uuid: &str) -> Option<u64> {
+    let set = set.as_str()?;
+    for entry in set.split(',') {
+        let mut parts = entry.trim().split(':');
+        if !parts.next()?.eq_ignore_ascii_case(uuid) {
+            continue;
+        }
+        let ivs: Vec<(u64, u64)> = parts
+            .map(|iv| match iv.split_once('-') {
+                Some((a, b)) => Some((a.parse().ok()?, b.parse().ok()?)),
+                None => iv.parse().ok().map(|n| (n, n)),
+            })
+            .collect::<Option<_>>()?;
+        let contiguous =
+            ivs.first()?.0 == 1 && ivs.windows(2).all(|w| w[1].0 == w[0].1 + 1);
+        return contiguous.then(|| ivs.last().unwrap().1);
+    }
+    Some(0)
 }
 
 /// With `ddl`, on a FULL-metadata server, the backlog also holds table DDL
@@ -398,12 +423,19 @@ async fn amplification(
     // An empty request (A == B) has no span and reads nothing.
     let spanned: Vec<_> =
         requests.iter().filter(|r| r["served"] != "empty").collect();
+    let span = |p: &serde_json::Value| {
+        if gtid {
+            gno(&p["gtid_set"], &uuid)
+        } else {
+            off(p)
+        }
+    };
     let mut spans: Vec<(u64, u64)> = spanned
         .iter()
-        .filter_map(|r| Some((off(&r["from"])?, off(&r["to"])?)))
+        .filter_map(|r| Some((span(&r["from"])?, span(&r["to"])?)))
         .filter(|(a, b)| b > a)
         .collect();
-    assert_eq!(spans.len(), spanned.len(), "every request has a byte span");
+    assert_eq!(spans.len(), spanned.len(), "every request has a span");
     spans.sort();
     let (mut distinct, mut cur) = (0u64, None::<(u64, u64)>);
     for (a, b) in spans {
@@ -422,7 +454,13 @@ async fn amplification(
     let scanned = records
         .iter()
         .filter(|r| r["record"] == "scan" && r["outcome"] == "ok")
-        .map(|r| r["bytes"].as_u64().unwrap())
+        .map(|r| {
+            if gtid {
+                r["detail"]["source_txns"].as_u64().unwrap()
+            } else {
+                r["bytes"].as_u64().unwrap()
+            }
+        })
         .sum();
     let mut kinds = BTreeMap::new();
     for r in &requests {
@@ -442,8 +480,9 @@ async fn amplification(
         failed: requests.iter().filter(|r| r["served"] == "failed").count(),
         peak_record: (peak("record_statements"), peak("record_bytes")),
         requests: requests.len(),
-        distinct_bytes: distinct,
-        scanned_bytes: scanned,
+        unit: if gtid { "source transactions" } else { "bytes" },
+        distinct,
+        scanned,
     }
 }
 
@@ -453,14 +492,15 @@ async fn bounded(gtid: bool) {
     let a = amplification(gtid, 20, 200, 100, false).await;
     eprintln!(
         "amplification {:.2}: {a:?}",
-        a.scanned_bytes as f64 / a.distinct_bytes as f64
+        a.scanned as f64 / a.distinct as f64
     );
     assert!(a.requests >= 20, "{a:?}");
     assert!(
-        a.scanned_bytes <= 2 * a.distinct_bytes,
-        "proof scans read {} bytes for {} distinct: {a:?}",
-        a.scanned_bytes,
-        a.distinct_bytes
+        a.scanned <= 2 * a.distinct,
+        "proof scans read {} {} for {} distinct: {a:?}",
+        a.scanned,
+        a.unit,
+        a.distinct
     );
 }
 
@@ -483,7 +523,7 @@ async fn bounded_ddl(gtid: bool) {
     let a = amplification(gtid, 20, 200, 100, true).await;
     eprintln!(
         "amplification {:.2}: {a:?}",
-        a.scanned_bytes as f64 / a.distinct_bytes as f64
+        a.scanned as f64 / a.distinct as f64
     );
     assert!(a.peak_record.0 > 0, "the record held DDL: {a:?}");
     assert!(
@@ -494,10 +534,11 @@ async fn bounded_ddl(gtid: bool) {
     assert!(a.kinds.get("lazy").is_some_and(|n| *n > 0), "{a:?}");
     assert_eq!(a.failed, 0, "{a:?}");
     assert!(
-        a.scanned_bytes <= 2 * a.distinct_bytes,
-        "proof scans read {} bytes for {} distinct: {a:?}",
-        a.scanned_bytes,
-        a.distinct_bytes
+        a.scanned <= 2 * a.distinct,
+        "proof scans read {} {} for {} distinct: {a:?}",
+        a.scanned,
+        a.unit,
+        a.distinct
     );
 }
 
