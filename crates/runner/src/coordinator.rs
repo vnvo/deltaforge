@@ -256,6 +256,28 @@ fn commit_standalone(b: &mut BuildingBatch) {
     }
 }
 
+/// Without transaction-aligned batching, a commit marker. Soft limits split
+/// transactions here, so rows of this one may already have flushed, each
+/// checkpointed at the boundary before the transaction. The commit boundary
+/// is the position after all of them: it rides on the last buffered event,
+/// or - nothing buffered - waits in the batch as a commit-only batch, which
+/// is delivered in order behind every earlier batch. Consecutive commit-only
+/// boundaries coalesce (the latest wins).
+fn legacy_commit(
+    b: &mut BuildingBatch,
+    boundary: deltaforge_core::SourceBoundary,
+) {
+    match b.raw.last_mut() {
+        Some(last) => last.set_boundary(boundary),
+        None => b.boundary = Some(boundary),
+    }
+}
+
+/// A batch holding only a commit boundary (non-aligned batching).
+fn is_commit_only(b: &BuildingBatch) -> bool {
+    b.raw.is_empty() && b.boundary.is_some()
+}
+
 /// A flush is due when the whole-transaction prefix has reached the soft size
 /// limits. Only ever evaluated at a boundary, so it never splits a transaction.
 fn soft_limit_reached(
@@ -302,7 +324,13 @@ fn finalize_batch(
     pipeline: &str,
 ) -> Option<BuildingBatch> {
     if !respect_source_tx {
-        return if b.raw.is_empty() { None } else { Some(b) };
+        // A pending commit-only batch is delivered too: its boundary is
+        // the resume position after rows already delivered.
+        return if b.raw.is_empty() && b.boundary.is_none() {
+            None
+        } else {
+            Some(b)
+        };
     }
     let discarded = b.raw.len() - b.committed_len;
     if discarded > 0 {
@@ -1004,6 +1032,11 @@ pub struct Coordinator<Tok> {
     /// every row before a terminal barrier, so it never acknowledges one
     /// (design section 5.1).
     snapshot_gaps: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Without transaction-aligned batching: sinks that failed a batch in
+    /// this run. Their checkpoint never advances again before a restart -
+    /// a later batch (a commit-only one included) would otherwise move it
+    /// past the rows they did not deliver.
+    held_sinks: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 pub struct CoordinatorBuilder<Tok> {
@@ -1025,7 +1058,9 @@ pub struct CoordinatorBuilder<Tok> {
     incidents: Option<storage::adapters::incidents::IncidentStore>,
 }
 
-impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
+impl<Tok: Send + Clone + From<CheckpointMeta> + 'static>
+    CoordinatorBuilder<Tok>
+{
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             pipeline_name: name.into(),
@@ -1157,6 +1192,7 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
 
         Coordinator {
             snapshot_gaps: Default::default(),
+            held_sinks: Default::default(),
             pipeline_name: self.pipeline_name.into(),
             sinks: self.sinks,
             batch_cfg_eff,
@@ -1178,7 +1214,7 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
     }
 }
 
-impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
+impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
     pub fn builder(name: impl Into<String>) -> CoordinatorBuilder<Tok> {
         CoordinatorBuilder::new(name)
     }
@@ -1663,7 +1699,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                             let flushable = if respect_source_tx {
                                 b.committed_len > 0 && !b.mid_tx()
                             } else {
-                                !b.raw.is_empty()
+                                !b.raw.is_empty() || is_commit_only(&b)
                             };
                             if flushable && elapsed {
                                 send_to_delivery(&deliver_tx, &inflight, b, "timer").await?;
@@ -1930,7 +1966,20 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                     .await?;
                                     continue;
                                 }
+                                if let SourceItem::TxCommit { boundary, .. } = item {
+                                    legacy_commit(&mut b, boundary);
+                                    continue;
+                                }
                                 let SourceItem::Event(ev) = item else { continue; };
+                                // A commit-only batch goes ahead of later
+                                // rows, never merged with them.
+                                if is_commit_only(&b) {
+                                    let pending = std::mem::replace(
+                                        &mut b,
+                                        BuildingBatch::with_capacity(max_events),
+                                    );
+                                    send_to_delivery(&deliver_tx, &inflight, pending, "tx_commit").await?;
+                                }
                                 if let Some(full) = check_and_split(&mut b, ev, max_events, max_bytes) {
                                     send_to_delivery(&deliver_tx, &inflight, full, "limits").await?;
                                 }
@@ -1962,6 +2011,12 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         mut b: BuildingBatch,
         reason: &str,
     ) -> Result<()> {
+        let legacy = !self.batch_cfg_eff.respect_source_tx.unwrap_or(true);
+        // Non-aligned batching: a commit-only batch's checkpoint is its
+        // commit boundary (each sink acknowledges it with no events).
+        let commit_only_cp = (legacy && is_commit_only(&b))
+            .then(|| b.boundary.as_ref().map(|bd| bd.checkpoint.clone()))
+            .flatten();
         // 1) PROCESS: processors can modify/duplicate/drop events
         let proc_start = Instant::now();
         let processed =
@@ -1992,7 +2047,9 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
             "received events from processors"
         );
 
-        let last_cp = processed.last_checkpoint;
+        let last_cp = processed
+            .last_checkpoint
+            .or_else(|| commit_only_cp.map(Tok::from));
 
         // 2) SCHEMA SENSING: observe and enrich events
         let mut events = processed.events;
@@ -2390,6 +2447,24 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                             },
                         ));
                     }
+                }
+            }
+        }
+        // Non-aligned batching: a sink that failed a batch keeps its
+        // checkpoint for the rest of the run (restart replays from it).
+        if legacy {
+            let mut held = self.held_sinks.lock().expect("not poisoned");
+            for (sink_id, _, succeeded) in sink_results.iter_mut() {
+                if !*succeeded && held.insert(sink_id.clone()) {
+                    warn!(
+                        pipeline = %self.pipeline_name,
+                        sink = %sink_id,
+                        "sink failed a batch: its checkpoint is held until \
+                         the pipeline restarts"
+                    );
+                }
+                if held.contains(sink_id.as_str()) {
+                    *succeeded = false;
                 }
             }
         }
@@ -4933,6 +5008,347 @@ mod tests {
 
         coord.run(rx, cancel, pause_rx).await.unwrap();
         assert_eq!(sink.batch_sizes(), vec![2, 1]);
+    }
+
+    // ── Non-aligned batching: commit-only batches ────────────────────────
+
+    /// Non-aligned batching with a short timer, so split transactions and
+    /// commit-only batches flush promptly.
+    fn legacy_cfg() -> BatchConfig {
+        BatchConfig {
+            max_events: Some(1000),
+            max_ms: Some(20),
+            respect_source_tx: Some(false),
+            max_inflight: Some(1),
+            ..BatchConfig::default()
+        }
+    }
+
+    /// A non-aligned coordinator over `sinks`, each committing to its own key.
+    fn legacy_coord(
+        store: Arc<checkpoints::MemCheckpointStore>,
+        sinks: Vec<ArcDynSink>,
+        processors: Vec<deltaforge_core::ArcDynProcessor>,
+        policy: Option<CommitPolicy>,
+    ) -> Coordinator<CheckpointMeta> {
+        legacy_coord_with(store, sinks, processors, policy, legacy_cfg())
+    }
+
+    fn legacy_coord_with(
+        store: Arc<checkpoints::MemCheckpointStore>,
+        sinks: Vec<ArcDynSink>,
+        processors: Vec<deltaforge_core::ArcDynProcessor>,
+        policy: Option<CommitPolicy>,
+        cfg: BatchConfig,
+    ) -> Coordinator<CheckpointMeta> {
+        let mut b = Coordinator::builder("legacy-test")
+            .sinks(sinks.clone())
+            .batch_config(Some(cfg))
+            .commit_policy(policy)
+            .process_fn(build_batch_processor(
+                Arc::from(processors),
+                "test".to_string(),
+            ));
+        for s in &sinks {
+            b = b.commit_fn(
+                s.id(),
+                build_commit_fn(
+                    store.clone(),
+                    format!("src::sink::{}", s.id()),
+                ),
+            );
+        }
+        b.build()
+    }
+
+    struct Running {
+        tx: tokio::sync::mpsc::Sender<SourceItem>,
+        cancel: CancellationToken,
+        run: tokio::task::JoinHandle<Result<()>>,
+        _pause: watch::Sender<PauseState>,
+    }
+
+    fn start(coord: Coordinator<CheckpointMeta>) -> Running {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let (pause, pause_rx) = watch::channel(PauseState::default());
+        let run = tokio::spawn(coord.run(rx, cancel.clone(), pause_rx));
+        Running {
+            tx,
+            cancel,
+            run,
+            _pause: pause,
+        }
+    }
+
+    impl Running {
+        async fn send(&self, items: Vec<SourceItem>) {
+            for i in items {
+                self.tx.send(i).await.unwrap();
+            }
+        }
+
+        /// A clean stop: the source closes, the coordinator drains.
+        async fn stop(self) -> Result<()> {
+            drop(self.tx);
+            self.run.await.unwrap()
+        }
+    }
+
+    async fn stored(
+        store: &checkpoints::MemCheckpointStore,
+        sink: &str,
+    ) -> Option<Vec<u8>> {
+        store
+            .get_raw(&format!("src::sink::{sink}"))
+            .await
+            .unwrap()
+            .map(|b| b.to_vec())
+    }
+
+    /// Wait (bounded) until `sink`'s stored checkpoint is `want`.
+    async fn until_stored(
+        store: &checkpoints::MemCheckpointStore,
+        sink: &str,
+        want: &[u8],
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while stored(store, sink).await.as_deref() != Some(want) {
+            assert!(
+                Instant::now() < deadline,
+                "{sink} never stored {:?} (has {:?})",
+                String::from_utf8_lossy(want),
+                stored(store, sink)
+                    .await
+                    .map(|b| String::from_utf8_lossy(&b).to_string())
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Rows of an open transaction carry the boundary before it ("before").
+    fn split_rows(tx_id: &str, ids: std::ops::Range<i64>) -> Vec<SourceItem> {
+        ids.map(|i| SourceItem::Event(tx_event(i, tx_id, b"before")))
+            .collect()
+    }
+
+    /// A transaction split by the timer: its rows flush first (checkpointed
+    /// before it), its commit arrives alone and is delivered as a
+    /// commit-only batch while the source is idle. A clean restart resumes
+    /// after the transaction: nothing replays.
+    #[tokio::test]
+    async fn a_commit_only_batch_checkpoints_an_idle_split_transaction() {
+        let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let r = start(legacy_coord(
+            store.clone(),
+            vec![sink.clone() as ArcDynSink],
+            vec![],
+            None,
+        ));
+        r.send(vec![begin("gtid:1")]).await;
+        r.send(split_rows("gtid:1", 1..3)).await;
+        until_stored(&store, "kafka", b"before").await;
+        r.send(vec![commit("gtid:1", b"after")]).await;
+        // Idle source: the commit is persisted without any later event.
+        until_stored(&store, "kafka", b"after").await;
+        assert_eq!(sink.batch_sizes(), vec![2, 0], "no-op acknowledgement");
+        r.stop().await.unwrap();
+        assert_eq!(
+            stored(&store, "kafka").await.as_deref(),
+            Some(&b"after"[..])
+        );
+    }
+
+    /// A crash after an early split batch, before the rest of the
+    /// transaction: the stored position is before the transaction, so all
+    /// of it replays.
+    #[tokio::test]
+    async fn a_crash_inside_a_split_transaction_replays_all_of_it() {
+        let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let r = start(legacy_coord(
+            store.clone(),
+            vec![sink.clone() as ArcDynSink],
+            vec![],
+            None,
+        ));
+        r.send(vec![begin("gtid:1")]).await;
+        r.send(split_rows("gtid:1", 1..2)).await;
+        until_stored(&store, "kafka", b"before").await;
+        r.send(split_rows("gtid:1", 2..3)).await;
+        r.run.abort();
+        let _ = r.run.await;
+        assert_eq!(
+            stored(&store, "kafka").await.as_deref(),
+            Some(&b"before"[..])
+        );
+    }
+
+    /// An earlier required-sink failure (a quorum policy keeps the pipeline
+    /// running): the later commit-only batch cannot advance that sink, even
+    /// though it acknowledges it; the sink that delivered everything does.
+    #[tokio::test]
+    async fn a_commit_only_batch_never_advances_past_a_required_sink_failure() {
+        let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+        let req = MockSink::new("kafka", true);
+        let opt = MockSink::new("redis", false);
+        let r = start(legacy_coord(
+            store.clone(),
+            vec![req.clone() as ArcDynSink, opt.clone() as ArcDynSink],
+            vec![],
+            Some(CommitPolicy::Quorum { quorum: 1 }),
+        ));
+        req.set_fail(true);
+        r.send(vec![begin("gtid:1")]).await;
+        r.send(split_rows("gtid:1", 1..3)).await;
+        until_stored(&store, "redis", b"before").await;
+        req.set_fail(false);
+        r.send(vec![commit("gtid:1", b"after")]).await;
+        until_stored(&store, "redis", b"after").await;
+        r.stop().await.unwrap();
+        assert_eq!(stored(&store, "kafka").await, None, "held at its failure");
+    }
+
+    /// An earlier optional-sink failure: that sink's checkpoint stays held
+    /// through the commit-only batch and every later batch.
+    #[tokio::test]
+    async fn an_optional_sink_failure_stays_held() {
+        let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+        let req = MockSink::new("kafka", true);
+        let opt = MockSink::new("redis", false);
+        let r = start(legacy_coord(
+            store.clone(),
+            vec![req.clone() as ArcDynSink, opt.clone() as ArcDynSink],
+            vec![],
+            None,
+        ));
+        opt.set_fail(true);
+        r.send(vec![begin("gtid:1")]).await;
+        r.send(split_rows("gtid:1", 1..3)).await;
+        until_stored(&store, "kafka", b"before").await;
+        opt.set_fail(false);
+        r.send(vec![commit("gtid:1", b"after")]).await;
+        until_stored(&store, "kafka", b"after").await;
+        r.send(vec![begin("gtid:2")]).await;
+        r.send(
+            (3..5)
+                .map(|i| SourceItem::Event(tx_event(i, "gtid:2", b"after")))
+                .collect(),
+        )
+        .await;
+        r.send(vec![commit("gtid:2", b"after-2")]).await;
+        until_stored(&store, "kafka", b"after-2").await;
+        r.stop().await.unwrap();
+        assert_eq!(opt.ids(), vec![3, 4], "the sink recovered");
+        assert_eq!(stored(&store, "redis").await, None, "but stays held");
+    }
+
+    /// Sinks with different routing outcomes: one receives the rows, one is
+    /// routed none of them. Both acknowledge the commit-only batch and
+    /// advance to the commit boundary.
+    #[tokio::test]
+    async fn a_commit_only_batch_advances_every_routing_outcome() {
+        let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+        let all = MockSink::new("kafka", true);
+        let none = MockSink::new("redis", true);
+        let routed = sinks::filter::FilteredSink::wrap(
+            none.clone() as ArcDynSink,
+            deltaforge_config::SinkFilter {
+                synthetic_only: true,
+                ..Default::default()
+            },
+        );
+        let r = start(legacy_coord(
+            store.clone(),
+            vec![all.clone() as ArcDynSink, routed],
+            vec![],
+            None,
+        ));
+        r.send(vec![begin("gtid:1")]).await;
+        r.send(split_rows("gtid:1", 1..3)).await;
+        until_stored(&store, "kafka", b"before").await;
+        r.send(vec![commit("gtid:1", b"after")]).await;
+        until_stored(&store, "kafka", b"after").await;
+        until_stored(&store, "redis", b"after").await;
+        r.stop().await.unwrap();
+        assert_eq!(all.ids(), vec![1, 2]);
+        assert!(none.ids().is_empty(), "routed none of the rows");
+    }
+
+    /// A transaction whose rows a processor filters out entirely, and an
+    /// empty transaction after a flush: both advance to their commit.
+    #[tokio::test]
+    async fn filtered_and_empty_transactions_reach_their_commit() {
+        let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let r = start(legacy_coord(
+            store.clone(),
+            vec![sink.clone() as ArcDynSink],
+            vec![Arc::new(DropAllProcessor) as _],
+            None,
+        ));
+        r.send(vec![begin("gtid:1")]).await;
+        r.send(split_rows("gtid:1", 1..3)).await;
+        r.send(vec![commit("gtid:1", b"after")]).await;
+        until_stored(&store, "kafka", b"after").await;
+        r.send(vec![begin("gtid:2"), commit("gtid:2", b"after-2")])
+            .await;
+        until_stored(&store, "kafka", b"after-2").await;
+        r.stop().await.unwrap();
+        assert!(sink.ids().is_empty(), "every row was filtered");
+    }
+
+    /// A pending commit-only batch is delivered when the source closes,
+    /// before any timer flush.
+    #[tokio::test]
+    async fn a_clean_stop_delivers_a_pending_commit_only_batch() {
+        let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let r = start(legacy_coord_with(
+            store.clone(),
+            vec![sink.clone() as ArcDynSink],
+            vec![],
+            None,
+            BatchConfig {
+                max_ms: Some(60_000),
+                ..legacy_cfg()
+            },
+        ));
+        r.send(vec![begin("gtid:1"), commit("gtid:1", b"after")])
+            .await;
+        r.stop().await.unwrap();
+        assert_eq!(
+            stored(&store, "kafka").await.as_deref(),
+            Some(&b"after"[..])
+        );
+    }
+
+    /// A commit marker arriving immediately before the timer fires (and
+    /// exactly at it) is still delivered and persisted, on paused time.
+    #[tokio::test(start_paused = true)]
+    async fn a_commit_just_before_the_timer_is_persisted() {
+        for offset_ms in [19u64, 20] {
+            let store =
+                Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+            let sink = MockSink::new("kafka", true);
+            let r = start(legacy_coord(
+                store.clone(),
+                vec![sink.clone() as ArcDynSink],
+                vec![],
+                None,
+            ));
+            r.send(vec![begin("gtid:1")]).await;
+            r.send(split_rows("gtid:1", 1..3)).await;
+            until_stored(&store, "kafka", b"before").await;
+            let t0 = Instant::now();
+            tokio::time::sleep_until(t0 + Duration::from_millis(offset_ms))
+                .await;
+            r.send(vec![commit("gtid:1", b"after")]).await;
+            until_stored(&store, "kafka", b"after").await;
+            r.cancel.cancel();
+            r.run.await.unwrap().unwrap();
+        }
     }
 
     // ── Pure batch-accumulation helpers (check_and_split / policy) ───────
