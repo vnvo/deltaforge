@@ -1,6 +1,8 @@
-//! Evidence harness (not a gate suite): how much binlog the activation
-//! proofs read when many previously unseen tables become active while the
-//! source lags behind sustained writes.
+//! How much binlog the activation proofs read when many previously unseen
+//! tables become active while the source lags behind sustained writes. The
+//! `bounded_*` tests are the gate's regression (the proofs read no more
+//! than twice the distinct interval); `gtid` and `file_position` are the
+//! environment-sized evidence runs, reported offline.
 //!
 //! The source starts at the tail and is paused; meanwhile each of N tables
 //! gets its first row, separated by GAP single-row transactions of an
@@ -12,7 +14,8 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo test -p sources --test mysql_proof_amplification -- --ignored --test-threads=1 gtid
+//! cargo test -p sources --test mysql_proof_amplification -- --ignored --test-threads=1 bounded
+//! cargo test -p sources --test mysql_proof_amplification -- --ignored --exact gtid
 //! ```
 //! Environment: `DF_EVIDENCE_TABLES` (100), `DF_EVIDENCE_GAP` (1000),
 //! `DF_EVIDENCE_RATE` (sustained transactions per second, 200),
@@ -50,6 +53,8 @@ fn env(name: &str, default: u64) -> u64 {
 
 /// The trace records of this process, appended to the current output file.
 static OUT: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
+/// The same records, in memory, for the run's own assertions.
+static RECORDS: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
 
 struct ToFile;
 
@@ -76,10 +81,13 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ToFile {
         }
         let mut m = Msg(String::new());
         event.record(&mut m);
-        if let Some(out) = OUT.get() {
-            if let Some(f) = out.lock().unwrap().as_mut() {
-                let _ = writeln!(f, "{}", m.0);
-            }
+        if let Some(out) = OUT.get()
+            && let Some(f) = out.lock().unwrap().as_mut()
+        {
+            let _ = writeln!(f, "{}", m.0);
+        }
+        if let Ok(v) = serde_json::from_str(&m.0) {
+            RECORDS.lock().unwrap().push(v);
         }
     }
 }
@@ -146,13 +154,24 @@ async fn noise(c: &mut mysql_async::Conn, n: u64) {
     }
 }
 
-async fn amplification(gtid: bool) {
+/// What the proofs of one run read.
+#[derive(Debug)]
+struct Amplification {
+    requests: usize,
+    /// The union of all requested intervals (A, B], in binlog bytes.
+    distinct_bytes: u64,
+    /// What the physical scans read.
+    scanned_bytes: u64,
+}
+
+async fn amplification(
+    gtid: bool,
+    tables: u64,
+    gap: u64,
+    rate: u64,
+) -> Amplification {
     install_trace();
-    let (tables, gap, rate) = (
-        env("DF_EVIDENCE_TABLES", 100),
-        env("DF_EVIDENCE_GAP", 1000),
-        env("DF_EVIDENCE_RATE", 200),
-    );
+    RECORDS.lock().unwrap().clear();
     let mode = if gtid { "gtid" } else { "file" };
     let out = std::path::PathBuf::from(
         std::env::var("DF_EVIDENCE_OUT").unwrap_or_else(|_| {
@@ -313,16 +332,104 @@ async fn amplification(gtid: bool) {
         .unwrap();
     *OUT.get().unwrap().lock().unwrap() = None;
     container.rm().await.ok();
+
+    // Global byte offsets from the inventory.
+    let mut base = BTreeMap::new();
+    let mut acc = 0u64;
+    for (name, size) in &logs {
+        base.insert(name.clone(), acc);
+        acc += size;
+    }
+    let off = |p: &serde_json::Value| -> Option<u64> {
+        Some(base.get(p["file"].as_str()?)? + p["pos"].as_u64()?)
+    };
+    let records = RECORDS.lock().unwrap().clone();
+    let requests: Vec<_> = records
+        .iter()
+        .filter(|r| r["record"] == "request")
+        .collect();
+    let mut spans: Vec<(u64, u64)> = requests
+        .iter()
+        .filter_map(|r| Some((off(&r["from"])?, off(&r["to"])?)))
+        .filter(|(a, b)| b > a)
+        .collect();
+    assert_eq!(spans.len(), requests.len(), "every request has a byte span");
+    spans.sort();
+    let (mut distinct, mut cur) = (0u64, None::<(u64, u64)>);
+    for (a, b) in spans {
+        cur = match cur {
+            Some((ca, cb)) if a <= cb => Some((ca, cb.max(b))),
+            Some((ca, cb)) => {
+                distinct += cb - ca;
+                Some((a, b))
+            }
+            None => Some((a, b)),
+        };
+    }
+    if let Some((ca, cb)) = cur {
+        distinct += cb - ca;
+    }
+    let scanned = records
+        .iter()
+        .filter(|r| r["record"] == "scan" && r["outcome"] == "ok")
+        .map(|r| r["bytes"].as_u64().unwrap())
+        .sum();
+    Amplification {
+        requests: requests.len(),
+        distinct_bytes: distinct,
+        scanned_bytes: scanned,
+    }
+}
+
+/// The proofs of many newly active tables read the distinct interval about
+/// once: no more than twice it in all.
+async fn bounded(gtid: bool) {
+    let a = amplification(gtid, 20, 200, 100).await;
+    eprintln!(
+        "amplification {:.2}: {a:?}",
+        a.scanned_bytes as f64 / a.distinct_bytes as f64
+    );
+    assert!(a.requests >= 20, "{a:?}");
+    assert!(
+        a.scanned_bytes <= 2 * a.distinct_bytes,
+        "proof scans read {} bytes for {} distinct: {a:?}",
+        a.scanned_bytes,
+        a.distinct_bytes
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn bounded_gtid() {
+    bounded(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn bounded_file_position() {
+    bounded(false).await;
+}
+
+/// The evidence run (environment-sized), reported offline.
+async fn evidence(gtid: bool) {
+    let a = amplification(
+        gtid,
+        env("DF_EVIDENCE_TABLES", 100),
+        env("DF_EVIDENCE_GAP", 1000),
+        env("DF_EVIDENCE_RATE", 200),
+    )
+    .await;
+    eprintln!("{a:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "evidence harness"]
 async fn gtid() {
-    amplification(true).await;
+    evidence(true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "evidence harness"]
 async fn file_position() {
-    amplification(false).await;
+    evidence(false).await;
 }

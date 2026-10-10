@@ -29,8 +29,8 @@ use super::mysql_activation::{
     table_stream,
 };
 use super::mysql_binlog_scan::{
-    CLASSIFIER_VERSION, ProofError, ProofKind, ScanLimits, ScanReport, ScanTag,
-    Statement, capture, covers, observe_capture, scan_interval, trace_proof,
+    CLASSIFIER_VERSION, ProofError, ProofKind, ScanReport, ScanTag, Statement,
+    capture, covers, observe_capture, trace_proof,
 };
 use super::mysql_ddl_attribution::{BarrierScopeOf, DdlEffect, same_name};
 use super::mysql_selection::Timeline;
@@ -222,17 +222,15 @@ pub(crate) async fn establish(
     };
 
     // 2. One complete scan of (R0, S].
-    let report: ScanReport = match scan_interval(
+    let report: ScanReport = match super::mysql_proof_scanner::shared_interval(
+        &ctx.proof_scanner,
         ctx.dsn.expose(),
-        super::mysql_helpers::derive_server_id(&format!(
-            "{}/baseline",
-            ctx.source_id
-        )),
+        &ctx.source_id,
         &server_uuid,
         &lineage,
         &r0_cp,
         &s_cp,
-        &ScanLimits::default(),
+        Some(&r0_cp),
         &tag,
     )
     .await
@@ -418,17 +416,15 @@ pub(crate) async fn establish_at(
         trace_proof(&tag, db, table, Some(&cap), None, lctn, "not_covered");
         return Ok(false);
     }
-    let report = match scan_interval(
+    let report = match super::mysql_proof_scanner::shared_interval(
+        &ctx.proof_scanner,
         ctx.dsn.expose(),
-        super::mysql_helpers::derive_server_id(&format!(
-            "{}/baseline",
-            ctx.source_id
-        )),
+        &source_id,
         &server_uuid,
         &lineage,
         &e_cp,
         &s_cp,
-        &ScanLimits::default(),
+        Some(&e_cp),
         &tag,
     )
     .await

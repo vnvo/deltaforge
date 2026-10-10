@@ -250,7 +250,7 @@ fn lp(h: &mut Sha256, bytes: &[u8]) {
     h.update(bytes);
 }
 
-fn encode_effect(e: &DdlEffect) -> String {
+pub(super) fn encode_effect(e: &DdlEffect) -> String {
     let tables = |v: &[super::mysql_ddl_attribution::TableName]| {
         v.iter()
             .map(|t| format!("{}\u{1f}{}", t.db, t.table))
@@ -268,7 +268,7 @@ fn encode_effect(e: &DdlEffect) -> String {
     }
 }
 
-fn encode_event(e: &EventIdentity) -> String {
+pub(super) fn encode_event(e: &EventIdentity) -> String {
     match e {
         EventIdentity::Gtid { gtid, ordinal } => {
             format!("gtid\u{1d}{gtid}\u{1d}{ordinal}")
@@ -2435,6 +2435,83 @@ mod tests {
                 &TAG,
             )
             .await
+        }
+
+        /// The shared proof scanner equals direct scans on a real server:
+        /// nested and overlapping requests over a workload with DDL (create,
+        /// alter, rename, a database operation) between DML.
+        async fn shared_equals_direct(gtid: bool, db: &str) {
+            use super::super::super::mysql_proof_scanner::{
+                LiveSegments, ProofScanner,
+            };
+            let dsn = server(gtid).await;
+            let id = uuid(&dsn).await;
+            sql(
+                &dsn,
+                &[
+                    &format!("CREATE DATABASE {db}"),
+                    &format!("CREATE TABLE {db}.t (a INT PRIMARY KEY)"),
+                ],
+            )
+            .await;
+            let mut points = vec![position(&dsn).await];
+            for i in 0..16 {
+                let stmt = match i % 4 {
+                    0 => format!("CREATE TABLE {db}.x{i} (a INT PRIMARY KEY)"),
+                    1 => format!("INSERT INTO {db}.t (a) VALUES ({i})"),
+                    2 => format!("ALTER TABLE {db}.t ADD COLUMN c{i} INT"),
+                    _ => format!("RENAME TABLE {db}.x{} TO {db}.y{i}", i - 3),
+                };
+                sql(&dsn, &[&stmt]).await;
+                if i == 9 {
+                    sql(&dsn, &[&format!("CREATE DATABASE {db}_other")]).await;
+                }
+                points.push(position(&dsn).await);
+            }
+            let scanner = ProofScanner::default();
+            let segments = LiveSegments {
+                dsn: &dsn,
+                server_id: 4_000_150,
+                server_uuid: &id,
+                lineage_hash: LINEAGE,
+                limits: ScanLimits::default(),
+            };
+            let n = points.len();
+            for i in 0..n {
+                for j in [i, (i + 3).min(n - 1), n - 1] {
+                    let shared = scanner
+                        .interval(
+                            &segments,
+                            &id,
+                            LINEAGE,
+                            &points[i],
+                            &points[j],
+                            Some(&points[i]),
+                            &TAG,
+                        )
+                        .await
+                        .unwrap();
+                    let direct =
+                        scan(&dsn, &points[i], &points[j]).await.unwrap();
+                    assert_eq!(
+                        shared.statements, direct.statements,
+                        "({i}, {j}]"
+                    );
+                    assert_eq!(shared.digest, direct.digest, "({i}, {j}]");
+                }
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn gtid_shared_scans_equal_direct_scans() {
+            shared_equals_direct(true, "shared_g").await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn file_position_shared_scans_equal_direct_scans() {
+            shared_equals_direct(false, "shared_f").await;
         }
 
         /// A FULL-fallback capture records its proof: lock wait and schema

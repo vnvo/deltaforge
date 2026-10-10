@@ -30,8 +30,8 @@ use tracing::{info, warn};
 use super::mysql_activation::{self, ForwardProof, resolve_binding};
 use super::mysql_baseline::affects;
 use super::mysql_binlog_scan::{
-    CLASSIFIER_VERSION, ProofError, ProofKind, ScanLimits, ScanTag, capture,
-    covers, observe_capture, scan_interval, trace_proof,
+    CLASSIFIER_VERSION, ProofError, ProofKind, ScanTag, capture, covers,
+    observe_capture, trace_proof,
 };
 use super::{MySqlCheckpoint, RunCtx};
 use crate::durable_checkpoint::{mysql_checkpoint_position, order_positions};
@@ -184,17 +184,15 @@ pub(crate) async fn prove(
     }
 
     // 3. One complete scan of (D, S].
-    let report = match scan_interval(
+    let report = match super::mysql_proof_scanner::shared_interval(
+        &ctx.proof_scanner,
         ctx.dsn.expose(),
-        super::mysql_helpers::derive_server_id(&format!(
-            "{}/forward",
-            ctx.source_id
-        )),
+        &ctx.source_id,
         &server_uuid,
         &lineage,
         &d_cp,
         &s_cp,
-        &ScanLimits::default(),
+        Some(&d_cp),
         &tag,
     )
     .await

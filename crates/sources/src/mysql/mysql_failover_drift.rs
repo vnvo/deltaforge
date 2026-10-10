@@ -127,6 +127,9 @@ pub(crate) struct DriftEnv<'a> {
     pub source_id: &'a str,
     pub halt: bool,
     pub lower_case_table_names: u8,
+    /// The source's shared proof scanner (rows evaluated in the stream);
+    /// `None` scans directly.
+    pub proofs: Option<&'a super::mysql_proof_scanner::ProofScanner>,
 }
 
 /// One stream per lineage transition, holding at most its one anchor (read with
@@ -506,21 +509,41 @@ async fn shape_at_failover(
         trace_proof(&tag, db, table, Some(&cap), None, lctn, "not_covered");
         return Ok(None);
     }
-    let report = match scan_interval(
-        env.dsn,
-        super::mysql_helpers::derive_server_id(&format!(
-            "{}/failover-drift",
-            env.source_id
-        )),
-        env.server_uuid,
-        &anchor.current_lineage,
-        &from,
-        &cap.position,
-        &ScanLimits::default(),
-        &tag,
-    )
-    .await
-    {
+    let scanned = match (env.proofs, event) {
+        // Rows in the stream: the shared scanner (the rows' position is the
+        // stream's boundary).
+        (Some(proofs), FirstEvent::Rows { .. }) => {
+            super::mysql_proof_scanner::shared_interval(
+                proofs,
+                env.dsn,
+                env.source_id,
+                env.server_uuid,
+                &anchor.current_lineage,
+                &from,
+                &cap.position,
+                Some(&from),
+                &tag,
+            )
+            .await
+        }
+        _ => {
+            scan_interval(
+                env.dsn,
+                super::mysql_helpers::derive_server_id(&format!(
+                    "{}/failover-drift",
+                    env.source_id
+                )),
+                env.server_uuid,
+                &anchor.current_lineage,
+                &from,
+                &cap.position,
+                &ScanLimits::default(),
+                &tag,
+            )
+            .await
+        }
+    };
+    let report = match scanned {
         Ok(report) => report,
         Err(ProofError::OtherServer(found)) => {
             return Err(SourceError::Lineage {
@@ -720,6 +743,7 @@ pub(crate) async fn check_in_stream(
             source_id: &ctx.source_id,
             halt: ctx.on_schema_drift == deltaforge_config::OnSchemaDrift::Halt,
             lower_case_table_names: ctx.lower_case_table_names,
+            proofs: Some(&ctx.proof_scanner),
         };
         check(&env, &anchor, db, table, event).await?;
     }
@@ -836,6 +860,7 @@ mod tests {
             source_id: "s",
             halt: true,
             lower_case_table_names: 0,
+            proofs: None,
         };
         let key = scope.key("d", "x");
         let previous_key = SchemaKey::new("t", "s", hash(A), "d", "x");
@@ -955,6 +980,7 @@ mod tests {
                     source_id: "s",
                     halt: true,
                     lower_case_table_names: 0,
+                    proofs: None,
                 };
                 completed(&env, key, previous_key, anchor).await
             }
