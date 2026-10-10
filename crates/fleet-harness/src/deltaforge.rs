@@ -132,6 +132,16 @@ impl Api {
             .to_string())
     }
 
+    /// The pipeline's open incidents (why it failed).
+    pub async fn incidents(&self, name: &str) -> Result<Value> {
+        self.send(
+            self.http
+                .get(format!("{}/pipelines/{name}/incidents", self.base)),
+            "pipeline incidents",
+        )
+        .await
+    }
+
     pub async fn stop(&self, name: &str) -> Result<Value> {
         self.send(
             self.http

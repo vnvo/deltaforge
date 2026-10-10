@@ -132,15 +132,44 @@ async fn main() -> Result<()> {
             keep_pipelines,
         } => {
             let cfg = RunConfig::load(&config)?;
+            // SIGINT/SIGTERM abort the run: it still drains and writes its
+            // result (outcome `aborted`, the partial counters).
+            let (abort_tx, abort) = tokio::sync::watch::channel(None);
+            let interrupted =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            {
+                let interrupted = interrupted.clone();
+                tokio::spawn(async move {
+                    use tokio::signal::unix::{SignalKind, signal};
+                    let mut term = signal(SignalKind::terminate()).ok();
+                    let why = tokio::select! {
+                        _ = tokio::signal::ctrl_c() => "interrupted (SIGINT)",
+                        _ = async {
+                            match term.as_mut() {
+                                Some(t) => { t.recv().await; }
+                                None => std::future::pending::<()>().await,
+                            }
+                        } => "interrupted (SIGTERM)",
+                    };
+                    eprintln!("{why}: aborting the run");
+                    interrupted
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    abort_tx.send(Some(why.to_string())).ok();
+                });
+            }
             let opts = RunOptions {
                 drain_idle: Duration::from_secs(drain_idle_secs),
                 drain_max: Duration::from_secs(drain_max_secs),
                 recovery_timeout: Duration::from_secs(recovery_timeout_secs),
                 keep_pipelines,
+                abort: Some(abort),
                 ..RunOptions::default()
             };
             let s = sweep(cfg, opts).await?;
             println!("{}", serde_json::to_string_pretty(&s)?);
+            if interrupted.load(std::sync::atomic::Ordering::SeqCst) {
+                std::process::exit(130);
+            }
         }
         Cmd::StoreMatrix {
             dsn,

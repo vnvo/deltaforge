@@ -22,6 +22,7 @@ pub mod scenario;
 pub mod stats;
 pub mod store;
 pub mod topology;
+pub mod trace;
 pub mod verify;
 
 /// The git revision this harness was built from.

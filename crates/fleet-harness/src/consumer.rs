@@ -1,14 +1,19 @@
 //! The Kafka side of the verifier: one consumer group per run, subscribed to
-//! the topics of the clusters in the run, from the earliest offset.
+//! the topics of the clusters in the run, from the earliest offset. The
+//! run's topics are created before any pipeline exists, and no write starts
+//! before the verifier holds every partition of them.
 
-use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rdkafka::ClientConfig;
-use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+use rdkafka::client::DefaultClientContext;
+use rdkafka::consumer::{BaseConsumer, Consumer, StreamConsumer};
 use rdkafka::message::Message;
+use rdkafka::types::RDKafkaErrorCode;
 use tokio::sync::watch;
 
 use crate::verify::Verifier;
@@ -37,7 +42,73 @@ pub fn topic_pattern(prefix: &str, servers: &[String]) -> String {
     )
 }
 
-/// Consume until stopped and drained, feeding `verifier`.
+/// Create `topics` (an existing one is kept) with `partitions` each (`None`:
+/// the broker's default), then wait until each has metadata with a leader
+/// for every partition. Returns each topic's partition count.
+pub async fn ensure_topics(
+    brokers: &str,
+    topics: &[String],
+    partitions: Option<i32>,
+    timeout: Duration,
+) -> Result<BTreeMap<String, usize>> {
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .context("create the kafka admin client")?;
+    let new: Vec<NewTopic<'_>> = topics
+        .iter()
+        .map(|t| {
+            NewTopic::new(
+                t,
+                partitions.unwrap_or(-1),
+                TopicReplication::Fixed(-1),
+            )
+        })
+        .collect();
+    let opts = AdminOptions::new().operation_timeout(Some(timeout));
+    for r in admin.create_topics(&new, &opts).await? {
+        match r {
+            Ok(_) => {}
+            Err((_, RDKafkaErrorCode::TopicAlreadyExists)) => {}
+            Err((t, e)) => anyhow::bail!("create topic {t}: {e}"),
+        }
+    }
+    let meta: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .context("create the kafka metadata client")?;
+    let deadline = Instant::now() + timeout;
+    let mut counts = BTreeMap::new();
+    for t in topics {
+        loop {
+            let ready = meta
+                .fetch_metadata(Some(t), Duration::from_secs(5))
+                .ok()
+                .and_then(|m| {
+                    let topic = m.topics().iter().find(|x| x.name() == t)?;
+                    let ps = topic.partitions();
+                    (topic.error().is_none()
+                        && !ps.is_empty()
+                        && ps.iter().all(|p| p.leader() >= 0))
+                    .then_some(ps.len())
+                });
+            if let Some(n) = ready {
+                counts.insert(t.clone(), n);
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "topic {t} has no complete metadata after {timeout:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    Ok(counts)
+}
+
+/// Consume until stopped and drained, feeding `verifier`. `ready` turns
+/// true once the consumer is assigned every partition in `expected`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     brokers: &str,
     group: &str,
@@ -46,6 +117,8 @@ pub async fn run(
     mut verifier: Verifier,
     mut stop: watch::Receiver<bool>,
     drain: Drain,
+    expected: BTreeMap<String, usize>,
+    ready: watch::Sender<bool>,
 ) -> Result<Verifier> {
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", brokers)
@@ -60,7 +133,18 @@ pub async fn run(
         .subscribe(&[pattern])
         .context("subscribe the verifying consumer")?;
     let mut stopped_at: Option<tokio::time::Instant> = None;
+    let mut assigned = false;
     loop {
+        if !assigned && let Ok(list) = consumer.assignment() {
+            let mut held: BTreeMap<String, usize> = BTreeMap::new();
+            for e in list.elements() {
+                *held.entry(e.topic().to_string()).or_default() += 1;
+            }
+            if expected.iter().all(|(t, n)| held.get(t) >= Some(n)) {
+                assigned = true;
+                ready.send(true).ok();
+            }
+        }
         if stopped_at.is_none() && *stop.borrow() {
             stopped_at = Some(tokio::time::Instant::now());
         }

@@ -188,6 +188,11 @@ pub struct Topology {
     /// Seed of the deterministic table templates.
     #[serde(default)]
     pub seed: u64,
+    /// The disk budget for each server's InnoDB redo log: a run refuses to
+    /// start on a server whose `innodb_redo_log_capacity` exceeds it (the
+    /// value and the budget are recorded in the result).
+    #[serde(default)]
+    pub redo_log_capacity_max_bytes: Option<u64>,
 }
 
 fn default_db_prefix() -> String {
@@ -243,6 +248,24 @@ pub struct DeltaForge {
     /// features, ...).
     #[serde(default)]
     pub spec_overrides: Option<serde_yaml::Value>,
+    /// Partitions of each run topic the harness creates before the run
+    /// (`None`: the broker's default).
+    #[serde(default)]
+    pub topic_partitions: Option<i32>,
+    /// Where the instance's proof trace (`deltaforge::proof_trace` records)
+    /// is read from; `None` collects none.
+    #[serde(default)]
+    pub proof_trace: Option<TraceSource>,
+}
+
+/// Where the instance under test writes its log.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TraceSource {
+    /// `docker logs` of a container, for the run's time window.
+    DockerLogs { container: String },
+    /// A log file; the part written during the run is read.
+    File { path: String },
 }
 
 fn default_pipeline_prefix() -> String {

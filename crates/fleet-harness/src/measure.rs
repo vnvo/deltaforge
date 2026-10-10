@@ -245,6 +245,8 @@ pub struct Aggregate {
     pub store_bytes_max: Option<u64>,
     pub scrape_ms_max: Option<f64>,
     pub scrape_bytes_max: Option<u64>,
+    /// Per server: its source's per-sink checkpoints over the window.
+    pub checkpoints: BTreeMap<String, CheckpointProgress>,
     #[serde(skip)]
     memory_sum: f64,
     #[serde(skip)]
@@ -255,6 +257,42 @@ pub struct Aggregate {
     cpu_sum: f64,
     #[serde(skip)]
     cpu_n: u64,
+}
+
+/// A source's per-sink checkpoints as sampled from the state store.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CheckpointProgress {
+    pub samples: u64,
+    /// Distinct non-empty checkpoint sets seen: at least 2 is progress.
+    pub distinct: u64,
+    pub last: BTreeMap<String, String>,
+    #[serde(skip)]
+    seen: std::collections::HashSet<u64>,
+}
+
+/// The state-store key prefix of a server's source's per-sink checkpoints
+/// (`src-<server>::sink::<sink>`). Run 2's evaluator filtered on the
+/// pipeline prefix and saw none; this is its corrected filter.
+pub fn checkpoint_key_prefix(server: &str) -> String {
+    format!("src-{server}::")
+}
+
+/// A server's source's per-sink checkpoints, by key.
+pub async fn checkpoints(
+    client: &tokio_postgres::Client,
+    server: &str,
+) -> Result<BTreeMap<String, String>> {
+    let rows = client
+        .query(
+            "SELECT key, convert_from(val, 'UTF8') FROM df_kv \
+             WHERE ns = 'checkpoints' AND starts_with(key, $1)",
+            &[&checkpoint_key_prefix(server)],
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+        .collect())
 }
 
 fn max_opt<T: PartialOrd + Copy>(a: Option<T>, b: Option<T>) -> Option<T> {
@@ -307,6 +345,24 @@ impl Aggregate {
         self.store_bytes_max = max_opt(self.store_bytes_max, Some(bytes));
     }
 
+    pub fn checkpoints(
+        &mut self,
+        server: &str,
+        values: &BTreeMap<String, String>,
+    ) {
+        use std::hash::{Hash, Hasher};
+        let e = self.checkpoints.entry(server.to_string()).or_default();
+        e.samples += 1;
+        if !values.is_empty() {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            values.hash(&mut h);
+            if e.seen.insert(h.finish()) {
+                e.distinct += 1;
+            }
+        }
+        e.last = values.clone();
+    }
+
     pub fn scrape(&mut self, ms: f64, bytes: u64) {
         self.scrape_ms_max = max_opt(self.scrape_ms_max, Some(ms));
         self.scrape_bytes_max = max_opt(self.scrape_bytes_max, Some(bytes));
@@ -318,6 +374,25 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn checkpoint_progress_counts_distinct_sets_and_ignores_empty_ones() {
+        let mut a = Aggregate::default();
+        let cp = |v: &str| {
+            BTreeMap::from([(
+                "src-c01::sink::kafka".to_string(),
+                v.to_string(),
+            )])
+        };
+        a.checkpoints("c01", &BTreeMap::new());
+        a.checkpoints("c01", &cp("1"));
+        a.checkpoints("c01", &cp("1"));
+        assert_eq!(a.checkpoints["c01"].distinct, 1, "no progress yet");
+        a.checkpoints("c01", &cp("2"));
+        assert_eq!(a.checkpoints["c01"].distinct, 2);
+        assert_eq!(a.checkpoints["c01"].samples, 4);
+        assert_eq!(checkpoint_key_prefix("c01"), "src-c01::");
+    }
 
     #[test]
     fn prometheus_text_is_parsed_with_escaped_labels() {

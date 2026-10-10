@@ -2147,6 +2147,8 @@ dependencies = [
  "testcontainers",
  "tokio",
  "tokio-postgres",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
