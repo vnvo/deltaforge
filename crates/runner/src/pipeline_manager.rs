@@ -2492,7 +2492,7 @@ impl PipelineController for PipelineManager {
                     })?
                     .health,
             );
-            carried = health.flush().await;
+            carried = health.hand_over().await;
             if !carried.is_empty() {
                 tracing::warn!(
                     pipeline = %name,

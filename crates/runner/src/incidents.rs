@@ -274,6 +274,13 @@ pub struct PipelineHealth {
     inner: Mutex<HealthInner>,
     /// Stops persistence retries when the runtime is replaced or removed.
     shutdown: CancellationToken,
+    /// Held across each persistence attempt and the marking that follows
+    /// it, so an incident whose write is in flight is never raised again by
+    /// another attempt (each known incident is one occurrence).
+    persist: tokio::sync::Mutex<()>,
+    /// Set by [`Self::hand_over`]: background attempts stop; what is still
+    /// not durable is carried by the next runtime.
+    retired: std::sync::atomic::AtomicBool,
 }
 
 impl PipelineHealth {
@@ -291,6 +298,8 @@ impl PipelineHealth {
             epoch: AtomicU64::new(epoch),
             inner: Mutex::new(HealthInner::default()),
             shutdown: CancellationToken::new(),
+            persist: tokio::sync::Mutex::new(()),
+            retired: std::sync::atomic::AtomicBool::new(false),
         });
         for draft in carried {
             let id = draft.incident_id(health.store.pipeline());
@@ -311,6 +320,8 @@ impl PipelineHealth {
             epoch: AtomicU64::new(0),
             inner: Mutex::new(HealthInner::default()),
             shutdown: CancellationToken::new(),
+            persist: tokio::sync::Mutex::new(()),
+            retired: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -455,6 +466,14 @@ impl PipelineHealth {
         }
     }
 
+    fn is_durable(&self, id: &IncidentId) -> bool {
+        self.inner
+            .lock()
+            .known
+            .iter()
+            .any(|k| &k.id == id && k.durable)
+    }
+
     fn mark_durable(&self, id: &IncidentId) {
         if let Some(k) =
             self.inner.lock().known.iter_mut().find(|k| &k.id == id)
@@ -471,11 +490,19 @@ impl PipelineHealth {
             let id = draft.incident_id(health.store.pipeline());
             let mut delay = PERSIST_RETRY_MIN;
             loop {
-                match health.store.raise(&draft, 1).await {
-                    Ok(_) => {
-                        health.mark_durable(&id);
-                        return;
-                    }
+                let attempt = health.persist.lock().await;
+                if health.retired.load(Ordering::SeqCst)
+                    || health.is_durable(&id)
+                {
+                    return;
+                }
+                let raised = health.store.raise(&draft, 1).await;
+                if raised.is_ok() {
+                    health.mark_durable(&id);
+                }
+                drop(attempt);
+                match raised {
+                    Ok(_) => return,
                     Err(e) => warn!(
                         pipeline = %health.store.pipeline(),
                         incident = %id,
@@ -493,9 +520,22 @@ impl PipelineHealth {
         });
     }
 
-    /// One more persistence attempt for every incident not durable yet (used
-    /// before a resume); returns the drafts that are still not durable.
+    /// Hand this runtime's incidents to the next one (a resume): background
+    /// persistence stops, then one more attempt for every incident not
+    /// durable yet; the drafts returned are the next runtime's to persist.
+    /// No attempt of this runtime starts afterwards, so none of them is
+    /// raised by both runtimes.
+    pub async fn hand_over(&self) -> Vec<IncidentDraft> {
+        self.retired.store(true, Ordering::SeqCst);
+        self.flush().await
+    }
+
+    /// One more persistence attempt for every incident not durable yet;
+    /// returns the drafts that are still not durable (background retries
+    /// go on). An attempt in flight finishes first: every occurrence is
+    /// raised once.
     pub async fn flush(&self) -> Vec<IncidentDraft> {
+        let _attempts = self.persist.lock().await;
         let pending: Vec<KnownIncident> = self
             .inner
             .lock()
@@ -769,6 +809,102 @@ mod tests {
         settle().await;
         assert!(!h.durability_pending(), "retried until durable");
         assert!(h.store().get(&d.incident_id("p")).await.unwrap().is_some());
+    }
+
+    /// The occurrence counter of `d`'s incident in `store`.
+    async fn occurrences(store: &IncidentStore, d: &IncidentDraft) -> u64 {
+        store
+            .get(&d.incident_id(store.pipeline()))
+            .await
+            .unwrap()
+            .expect("the incident is recorded")
+            .occurrences
+    }
+
+    /// A resume's flush never raises an occurrence whose background write
+    /// already landed but is not yet marked durable: one failure, one count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flush_never_raises_an_occurrence_being_persisted() {
+        let f = Arc::new(FaultBackend::new());
+        let b: ArcStorageBackend = f.clone();
+        let health = health_on(b.clone()).await;
+        let store = IncidentStore::new(b, "p");
+        // Raising a new incident lists the incidents twice: before its write
+        // (the open-incident limit) and after it (metrics). Hold the
+        // background write at the second listing: written, not yet durable.
+        let arm = || {
+            let reached = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            *f.pause_after_slot_list.lock().unwrap() =
+                Some((INCIDENTS_NS.into(), reached.clone(), release.clone()));
+            (reached, release)
+        };
+        let (reached, release) = arm();
+        health.exit(Task::Source, TaskExit::Failed(draft(1)));
+        reached.notified().await;
+        let (written, hold) = arm();
+        release.notify_one();
+        written.notified().await;
+        assert_eq!(occurrences(&store, &draft(1)).await, 1);
+        assert!(health.durability_pending(), "written, not marked durable");
+
+        let flushing = tokio::spawn({
+            let health = Arc::clone(&health);
+            async move { health.flush().await }
+        });
+        // Long enough for a flush that does not wait to raise again.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        hold.notify_one();
+        let still = flushing.await.unwrap();
+        assert!(still.is_empty(), "durable: nothing carried");
+        assert!(!health.durability_pending());
+        assert_eq!(occurrences(&store, &draft(1)).await, 1, "counted once");
+    }
+
+    /// After a flush persisted an incident, the background retry that was
+    /// waiting out its backoff does not raise it again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_background_retry_after_a_flush_does_not_count_again() {
+        let f = Arc::new(FaultBackend::new());
+        let b: ArcStorageBackend = f.clone();
+        let health = health_on(b.clone()).await;
+        let store = IncidentStore::new(b, "p");
+        f.fail_writes_to.lock().unwrap().push(INCIDENTS_NS.into());
+        health.exit(Task::Source, TaskExit::Failed(draft(1)));
+        // The first background attempt fails; the retry waits its backoff.
+        tokio::time::sleep(PERSIST_RETRY_MIN / 2).await;
+        f.fail_writes_to.lock().unwrap().clear();
+        assert!(health.flush().await.is_empty());
+        assert_eq!(occurrences(&store, &draft(1)).await, 1);
+        // Past the backoff: the retry would have run.
+        tokio::time::sleep(PERSIST_RETRY_MIN * 3).await;
+        assert_eq!(occurrences(&store, &draft(1)).await, 1, "counted once");
+    }
+
+    /// A runtime that handed its incidents over (a resume) never raises
+    /// them itself afterwards, even once the store accepts writes: the next
+    /// runtime carries them, so none is counted by both.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handed_over_incident_is_not_raised_by_the_old_runtime() {
+        let f = Arc::new(FaultBackend::new());
+        let b: ArcStorageBackend = f.clone();
+        let old = health_on(b.clone()).await;
+        let store = IncidentStore::new(b, "p");
+        f.fail_writes_to.lock().unwrap().push(INCIDENTS_NS.into());
+        old.exit(Task::Source, TaskExit::Failed(draft(1)));
+        tokio::time::sleep(PERSIST_RETRY_MIN / 2).await;
+        assert_eq!(old.hand_over().await, vec![draft(1)], "carried");
+        f.fail_writes_to.lock().unwrap().clear();
+        // Past the old runtime's backoff: its retry would have run.
+        tokio::time::sleep(PERSIST_RETRY_MIN * 3).await;
+        assert!(
+            store
+                .get(&draft(1).incident_id("p"))
+                .await
+                .unwrap()
+                .is_none(),
+            "only the next runtime raises it"
+        );
     }
 
     #[tokio::test(start_paused = true)]
