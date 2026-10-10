@@ -106,5 +106,6 @@ release    runner/s3_ministack_canary       -p runner --test s3_ministack_canary
 release    runner/s3_ministack_durable_canary -p runner --test s3_ministack_durable_canary
 
 # Manual measurements, never run by a tier
+excluded   sources/mysql_proof_amplification evidence harness for proof-scan amplification (manual qualification runs, not a gate suite)
 excluded   sources/snapshot_scale_measure   1K/10K acceptance measurement (about 20 min, asserts the scale gates): run once on the final candidate, not per gate
 excluded   gate-ownership/gate_probe        the gate self-test probe: run inside a real gate by scripts/gate-selftest.sh, fails or hangs on purpose
