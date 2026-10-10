@@ -1032,10 +1032,10 @@ pub struct Coordinator<Tok> {
     /// every row before a terminal barrier, so it never acknowledges one
     /// (design section 5.1).
     snapshot_gaps: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// Without transaction-aligned batching: sinks that failed a batch in
-    /// this run. Their checkpoint never advances again before a restart -
-    /// a later batch (a commit-only one included) would otherwise move it
-    /// past the rows they did not deliver.
+    /// Sinks that failed a batch in this run. Their checkpoint never
+    /// advances again before a restart - a later batch (a commit-only one
+    /// included) would otherwise move it past the rows they did not
+    /// deliver, and the restart replays from it.
     held_sinks: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
@@ -2450,9 +2450,9 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                 }
             }
         }
-        // Non-aligned batching: a sink that failed a batch keeps its
-        // checkpoint for the rest of the run (restart replays from it).
-        if legacy {
+        // A sink that failed a batch keeps its checkpoint for the rest of
+        // the run (restart replays from it); other sinks advance on.
+        {
             let mut held = self.held_sinks.lock().expect("not poisoned");
             for (sink_id, _, succeeded) in sink_results.iter_mut() {
                 if !*succeeded && held.insert(sink_id.clone()) {
@@ -5348,6 +5348,276 @@ mod tests {
             until_stored(&store, "kafka", b"after").await;
             r.cancel.cancel();
             r.run.await.unwrap().unwrap();
+        }
+    }
+
+    // ── Per-sink checkpoint invariant (both batching modes) ─────────────
+    //
+    // A sink's checkpoint never advances past a batch that sink failed to
+    // acknowledge; other sinks advance independently. A restart resumes
+    // from the minimum per-sink checkpoint (the production fold), so the
+    // failed batch is replayed - to every sink: sinks already past it
+    // receive it again (at-least-once; there is no per-sink skip).
+
+    /// A source whose checkpoints are decimal positions.
+    struct SeqSource;
+
+    #[async_trait::async_trait]
+    impl deltaforge_core::Source for SeqSource {
+        async fn run(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<SourceItem>,
+            _chkpt: Arc<dyn CheckpointStore>,
+        ) -> deltaforge_core::SourceHandle {
+            unreachable!("not run")
+        }
+        fn compare_checkpoints(
+            &self,
+            a: &[u8],
+            b: &[u8],
+        ) -> deltaforge_core::CheckpointOrder {
+            let n = |x: &[u8]| std::str::from_utf8(x).ok()?.parse::<u64>().ok();
+            match (n(a), n(b)) {
+                (Some(a), Some(b)) => match a.cmp(&b) {
+                    std::cmp::Ordering::Less => {
+                        deltaforge_core::CheckpointOrder::Before
+                    }
+                    std::cmp::Ordering::Equal => {
+                        deltaforge_core::CheckpointOrder::Equal
+                    }
+                    std::cmp::Ordering::Greater => {
+                        deltaforge_core::CheckpointOrder::After
+                    }
+                },
+                _ => deltaforge_core::CheckpointOrder::Incomparable,
+            }
+        }
+    }
+
+    /// Where a restart resumes: the production per-sink fold.
+    async fn resume_position(
+        store: &Arc<checkpoints::MemCheckpointStore>,
+    ) -> Option<u64> {
+        let source: Arc<dyn deltaforge_core::Source> = Arc::new(SeqSource);
+        let proxy = crate::pipeline_manager::PerSinkCheckpointProxy::for_source(
+            store.clone(),
+            "src".into(),
+            &source,
+        );
+        let raw = proxy.get_raw("src").await.unwrap()?;
+        Some(String::from_utf8(raw).unwrap().parse().unwrap())
+    }
+
+    fn per_sink_cfg(aligned: bool) -> BatchConfig {
+        BatchConfig {
+            max_events: Some(1),
+            max_ms: Some(20),
+            respect_source_tx: Some(aligned),
+            max_inflight: Some(1),
+            ..BatchConfig::default()
+        }
+    }
+
+    /// Transaction `k`: one row `k`, committed at position `k`.
+    fn txn(k: u64) -> Vec<SourceItem> {
+        let id = format!("gtid:{k}");
+        vec![
+            begin(&id),
+            SourceItem::Event(tx_event(
+                k as i64,
+                &id,
+                (k - 1).to_string().as_bytes(),
+            )),
+            commit(&id, k.to_string().as_bytes()),
+        ]
+    }
+
+    struct TwoSinks {
+        store: Arc<checkpoints::MemCheckpointStore>,
+        req: Arc<MockSink>,
+        opt: Arc<MockSink>,
+    }
+
+    impl TwoSinks {
+        fn new() -> Self {
+            Self {
+                store: Arc::new(
+                    checkpoints::MemCheckpointStore::new().unwrap(),
+                ),
+                req: MockSink::new("kafka", true),
+                opt: MockSink::new("redis", false),
+            }
+        }
+
+        fn start(
+            &self,
+            aligned: bool,
+            policy: Option<CommitPolicy>,
+        ) -> Running {
+            start(legacy_coord_with(
+                self.store.clone(),
+                vec![
+                    self.req.clone() as ArcDynSink,
+                    self.opt.clone() as ArcDynSink,
+                ],
+                vec![],
+                policy,
+                per_sink_cfg(aligned),
+            ))
+        }
+
+        /// Deliver transactions `ks`, each fully processed before the next;
+        /// `opt` fails the ones in `opt_fails`.
+        async fn deliver(
+            &self,
+            r: &Running,
+            ks: std::ops::RangeInclusive<u64>,
+            opt_fails: &[u64],
+        ) {
+            for k in ks {
+                self.opt.set_fail(opt_fails.contains(&k));
+                r.send(txn(k)).await;
+                until_stored(&self.store, "kafka", k.to_string().as_bytes())
+                    .await;
+            }
+            self.opt.set_fail(false);
+        }
+
+        async fn at(&self, sink: &str) -> Option<u64> {
+            stored(&self.store, sink)
+                .await
+                .map(|b| String::from_utf8(b).unwrap().parse().unwrap())
+        }
+    }
+
+    /// Optional sink fails batch 2, succeeds on 3; the restart replays from
+    /// 1, so batch 2 reaches it - and reaches the required sink again.
+    async fn optional_failure_replays_after_restart(aligned: bool) {
+        let t = TwoSinks::new();
+        let r = t.start(aligned, None);
+        t.deliver(&r, 1..=3, &[2]).await;
+        r.stop().await.unwrap();
+        assert_eq!(
+            (t.at("kafka").await, t.at("redis").await),
+            (Some(3), Some(1))
+        );
+        assert_eq!(t.opt.ids(), vec![1, 3], "batch 2 not acknowledged");
+
+        let from = resume_position(&t.store).await.unwrap();
+        assert_eq!(from, 1, "restart resumes behind the failed batch");
+        let r = t.start(aligned, None);
+        t.deliver(&r, from + 1..=3, &[]).await;
+        r.stop().await.unwrap();
+        assert_eq!(t.opt.ids(), vec![1, 3, 2, 3], "batch 2 replayed to it");
+        assert_eq!(
+            t.req.ids(),
+            vec![1, 2, 3, 2, 3],
+            "sinks already past it receive the replay again"
+        );
+        assert_eq!(
+            (t.at("kafka").await, t.at("redis").await),
+            (Some(3), Some(3))
+        );
+    }
+
+    #[tokio::test]
+    async fn aligned_optional_failure_replays_after_restart() {
+        optional_failure_replays_after_restart(true).await;
+    }
+
+    #[tokio::test]
+    async fn unaligned_optional_failure_replays_after_restart() {
+        optional_failure_replays_after_restart(false).await;
+    }
+
+    /// Consecutive failures, then successes: held at the last acknowledged
+    /// batch while the other sink advances independently.
+    async fn consecutive_failures_hold(aligned: bool) {
+        let t = TwoSinks::new();
+        let r = t.start(aligned, None);
+        t.deliver(&r, 1..=5, &[2, 3]).await;
+        r.stop().await.unwrap();
+        assert_eq!(
+            (t.at("kafka").await, t.at("redis").await),
+            (Some(5), Some(1))
+        );
+        assert_eq!(resume_position(&t.store).await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn aligned_consecutive_failures_hold() {
+        consecutive_failures_hold(true).await;
+    }
+
+    #[tokio::test]
+    async fn unaligned_consecutive_failures_hold() {
+        consecutive_failures_hold(false).await;
+    }
+
+    /// A failure on the final batch, an idle period, a restart: the batch
+    /// is replayed to the sink.
+    async fn final_batch_failure_replays_after_idle(aligned: bool) {
+        let t = TwoSinks::new();
+        let r = t.start(aligned, None);
+        t.deliver(&r, 1..=3, &[3]).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        r.stop().await.unwrap();
+        assert_eq!(
+            (t.at("kafka").await, t.at("redis").await),
+            (Some(3), Some(2))
+        );
+        let from = resume_position(&t.store).await.unwrap();
+        let r = t.start(aligned, None);
+        t.deliver(&r, from + 1..=3, &[]).await;
+        r.stop().await.unwrap();
+        assert_eq!(t.opt.ids(), vec![1, 2, 3]);
+        assert_eq!(t.at("redis").await, Some(3));
+    }
+
+    #[tokio::test]
+    async fn aligned_final_batch_failure_replays_after_idle() {
+        final_batch_failure_replays_after_idle(true).await;
+    }
+
+    #[tokio::test]
+    async fn unaligned_final_batch_failure_replays_after_idle() {
+        final_batch_failure_replays_after_idle(false).await;
+    }
+
+    /// One sink succeeds and one fails the same batch: the checkpoints
+    /// advance independently.
+    #[tokio::test]
+    async fn checkpoints_advance_independently() {
+        for aligned in [true, false] {
+            let t = TwoSinks::new();
+            let r = t.start(aligned, None);
+            t.deliver(&r, 1..=2, &[2]).await;
+            r.stop().await.unwrap();
+            assert_eq!(
+                (t.at("kafka").await, t.at("redis").await),
+                (Some(2), Some(1)),
+                "aligned={aligned}"
+            );
+        }
+    }
+
+    /// A required sink's failure keeps its existing behaviour: the pipeline
+    /// stops and no sink advances past the failed batch.
+    #[tokio::test]
+    async fn a_required_failure_still_stops_the_pipeline() {
+        for aligned in [true, false] {
+            let t = TwoSinks::new();
+            let r = t.start(aligned, None);
+            t.deliver(&r, 1..=1, &[]).await;
+            t.req.set_fail(true);
+            r.send(txn(2)).await;
+            let err = r.run.await.unwrap().expect_err("required failure stops");
+            assert!(err.to_string().contains("commit policy"), "{err}");
+            assert_eq!(
+                (t.at("kafka").await, t.at("redis").await),
+                (Some(1), Some(1)),
+                "aligned={aligned}"
+            );
         }
     }
 
