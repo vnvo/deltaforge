@@ -243,7 +243,38 @@ DeltaForge has a built-in schema registry to track table schemas, per source. Fo
 - Events carry `schema_version` (the fingerprint of the version the row was decoded with) and `schema_sequence` (that version's registry sequence)
 - Schema-to-checkpoint correlation enables reliable replay
 
-Schema changes (DDL) trigger automatic reload of affected table schemas.
+A DDL forgets the cached shapes of the tables it affects; their new versions are registered only by a positional proof (below), never reloaded from the live catalog. See [Schema Registry: DDL Handling](../schemaregistry.md#ddl-handling).
+
+### DDL events
+
+Each DDL statement emits one event (`source.table = "_ddl"`, operation `r`). Its payload (format 2) identifies what the statement acts on:
+
+```json
+{
+  "ddl_format": 2,
+  "scope": "tables",
+  "objects": [
+    {"kind": "table", "database": "shop", "name": "orders"},
+    {"kind": "table", "database": "archive", "name": "orders"}
+  ],
+  "database": null,
+  "session_database": "shop",
+  "sql": "RENAME TABLE shop.orders TO archive.orders"
+}
+```
+
+- **`scope`:** what the statement does to base-table shapes:
+  - `tables`: it may change the listed tables;
+  - `same_shape`: TRUNCATE;
+  - `database`: a database barrier;
+  - `lineage`: unattributable;
+  - `none`: no base table changes (views, account statements).
+- **`objects`:** `{kind, database, name}` for each table, view or barrier database, in statement order. A rename lists source then target. The list is empty when the statement cannot be attributed. Under `lower_case_table_names = 2` table statements are applied as lineage barriers but keep their objects.
+- **`database` and `source.db`:** name the one database every object belongs to. A cross-database statement or one without objects has `database: null` and `source.db: ""`.
+- **`session_database`:** the connection's active database when the statement ran (`null` when none). It is context only, never the attribution.
+- **Account statements** (`CREATE USER`, `ALTER USER`, `SET PASSWORD`) are `scope: none` with no objects. Their SQL is never emitted (`operation`, `redacted: true` instead).
+- **No DDL event, as before:** plain `GRANT` and `REVOKE`.
+
 
 ### Rows are decoded with the definition in effect when they were written
 

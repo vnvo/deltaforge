@@ -643,6 +643,15 @@ impl MySqlSchemaLoader {
         Ok(changed)
     }
 
+    /// Forget one table's cached shape (a DDL changed it). Never reloads:
+    /// a new version enters only through a positional proof.
+    pub async fn invalidate_table(&self, db: &str, table: &str) {
+        self.cache
+            .write()
+            .await
+            .retain(|(d, t)| !(d == db && t == table));
+    }
+
     /// Invalidate cache for a database (called on DDL).
     pub async fn invalidate_db(&self, db: &str) {
         let mut cache = self.cache.write().await;
