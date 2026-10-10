@@ -242,7 +242,7 @@ DeltaForge defaults to **safe** type mappings that prioritize correctness over c
 
 | Source type | Default Avro type | Why | Override |
 |-------------|-------------------|-----|----------|
-| MySQL `BIGINT UNSIGNED` | `string` | Values ≥ 2^63 overflow Avro `long` | `unsigned_bigint_mode: long` |
+| MySQL `BIGINT UNSIGNED` | `string` (exact decimal) | Values ≥ 2^63 do not fit Avro `long`: encoding fails explicitly | `unsigned_bigint_mode: long` |
 | MySQL/PG `ENUM` | `string` | Avro enum symbol changes break compatibility | `enum_mode: enum` |
 | MySQL `DATETIME` | `string` (ISO-8601) | Not a UTC instant — Avro `timestamp-millis` is semantically wrong | `naive_timestamp_mode: timestamp` |
 | PG `timestamp` (no tz) | `string` (ISO-8601) | Same as above — naive local time, not an instant | `naive_timestamp_mode: timestamp` |

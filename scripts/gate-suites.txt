@@ -52,6 +52,7 @@ parallel   sources/mysql_proof_matrix_e2e   -p sources --test mysql_proof_matrix
 parallel   sources/mysql_reconnect_boundaries_e2e -p sources --test mysql_reconnect_boundaries_e2e
 parallel   sources/mysql_replica_binlog_e2e -p sources --test mysql_replica_binlog_e2e
 parallel   sources/mysql_snapthot_e2e       -p sources --test mysql_snapthot_e2e
+parallel   sources/mysql_unsigned_values_e2e -p sources --test mysql_unsigned_values_e2e -- --include-ignored --test-threads=1
 parallel   sources/postgres_cdc_e2e         -p sources --test postgres_cdc_e2e
 parallel   sources/postgres_snapshot_e2e    -p sources --test postgres_snapshot_e2e
 parallel   sources/snapshot_connection_cap_e2e -p sources --test snapshot_connection_cap_e2e
@@ -62,9 +63,11 @@ parallel   runner/incidents_e2e             -p runner --test incidents_e2e
 parallel   runner/metric_cardinality_e2e    -p runner --test metric_cardinality_e2e
 # The fleet qualification harness's own machinery, at toy scale.
 parallel   fleet-harness/harness_smoke      -p fleet-harness --test harness_smoke
+parallel   fleet-harness/run_identity       -p fleet-harness --test run_identity
 parallel   runner/snapshot_restart_e2e        -p runner --test snapshot_restart_e2e
 parallel   runner/publication_contract_e2e  -p runner --test publication_contract_e2e
 parallel   runner/kafka_outage_restart_e2e  -p runner --test kafka_outage_restart_e2e
+parallel   runner/mysql_unsigned_avro_e2e  -p runner --test mysql_unsigned_avro_e2e -- --include-ignored --test-threads=1
 parallel   runner/preflight_e2e             -p runner --test preflight_e2e
 parallel   runner/s3_e2e_tests              -p runner --test s3_e2e_tests
 parallel   runner/store_gate_cli            -p runner --test store_gate_cli

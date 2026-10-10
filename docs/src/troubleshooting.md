@@ -86,7 +86,7 @@ A DDL change produced events that can't be encoded under the cached schema. This
 WARN BIGINT UNSIGNED column {col} mapped to long — values >= 2^63 will fail encoding
 ```
 
-Only appears when `unsigned_bigint_mode: long` is configured. If a row contains a value ≥ 2^63, encoding will fail and the event is routed to DLQ. The default `unsigned_bigint_mode: string` avoids this entirely.
+Only appears when `unsigned_bigint_mode: long` is configured. Values through 2^63 - 1 (`i64::MAX`) encode exactly. A value ≥ 2^63 does not fit an Avro `long`: encoding fails explicitly (`<value> does not fit an Avro long`) and the event is never written wrapped, zeroed or as a floating-point number. Without the event journal's DLQ the pipeline halts with an incident; the failure is DLQ-eligible when the journal is enabled. The default `unsigned_bigint_mode: string` encodes every value, through 2^64 - 1, as its exact decimal string.
 
 ### Using inferred schema instead of DDL
 

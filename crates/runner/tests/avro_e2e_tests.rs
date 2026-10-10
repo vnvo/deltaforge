@@ -325,7 +325,7 @@ fn mysql_build_row(
 ) -> serde_json::Value {
     let cols: Vec<String> = col_names.iter().map(|s| s.to_string()).collect();
     let included: Vec<bool> = vec![true; cols.len()];
-    mysql_object::build_object(&cols, &included, &values)
+    mysql_object::build_object(&cols, &[], &included, &values)
 }
 
 // ── MySQL payment domain (the table that kept failing) ──────────────────────

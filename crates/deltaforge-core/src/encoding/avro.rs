@@ -829,16 +829,12 @@ fn json_to_avro_with_schema(
             _ => Ok(AvroValue::from(json.clone())),
         },
         AvroSchema::Int => match json {
-            serde_json::Value::Number(n) => {
-                Ok(AvroValue::Int(n.as_i64().unwrap_or(0) as i32))
-            }
+            serde_json::Value::Number(n) => Ok(AvroValue::Int(int_of(n)?)),
             serde_json::Value::Null => Ok(AvroValue::Null),
             _ => Ok(AvroValue::from(json.clone())),
         },
         AvroSchema::Long => match json {
-            serde_json::Value::Number(n) => {
-                Ok(AvroValue::Long(n.as_i64().unwrap_or(0)))
-            }
+            serde_json::Value::Number(n) => Ok(AvroValue::Long(long_of(n)?)),
             serde_json::Value::Null => Ok(AvroValue::Null),
             _ => Ok(AvroValue::from(json.clone())),
         },
@@ -966,6 +962,7 @@ fn json_to_avro_with_schema(
                 return Ok(AvroValue::Null);
             }
             // Find the first non-null branch and convert
+            let mut last_error = None;
             for (i, variant) in union_schema.variants().iter().enumerate() {
                 if matches!(variant, AvroSchema::Null) {
                     continue;
@@ -974,12 +971,13 @@ fn json_to_avro_with_schema(
                     Ok(v) => {
                         return Ok(AvroValue::Union(i as u32, Box::new(v)));
                     }
-                    Err(_) => continue,
+                    Err(e) => last_error = Some(e),
                 }
             }
             Err(EncodingError::Avro(format!(
-                "no matching union branch for JSON {}",
+                "no matching union branch for JSON {}{}",
                 json_type_name(json),
+                last_error.map(|e| format!(": {e}")).unwrap_or_default(),
             )))
         }
         AvroSchema::Array(array_schema) => match json {
@@ -1019,7 +1017,7 @@ fn json_to_avro_with_schema(
                 // uses field names for lookup.
                 let fields: Vec<(String, AvroValue)> = map
                     .iter()
-                    .map(|(k, v)| {
+                    .map(|(k, v)| -> Result<_, EncodingError> {
                         // Without the resolved schema, we can't do
                         // schema-aware conversion — use best-effort
                         let av = match v {
@@ -1027,21 +1025,21 @@ fn json_to_avro_with_schema(
                             serde_json::Value::Bool(b) => {
                                 AvroValue::Boolean(*b)
                             }
+                            serde_json::Value::Number(n) if n.is_f64() => {
+                                AvroValue::Double(n.as_f64().unwrap_or(0.0))
+                            }
+                            // An integer is never widened to a double.
                             serde_json::Value::Number(n) => {
-                                if n.is_i64() {
-                                    AvroValue::Long(n.as_i64().unwrap_or(0))
-                                } else {
-                                    AvroValue::Double(n.as_f64().unwrap_or(0.0))
-                                }
+                                AvroValue::Long(long_of(n)?)
                             }
                             serde_json::Value::String(s) => {
                                 AvroValue::String(s.clone())
                             }
                             other => AvroValue::from(other.clone()),
                         };
-                        (k.clone(), av)
+                        Ok((k.clone(), av))
                     })
-                    .collect();
+                    .collect::<Result<_, _>>()?;
                 Ok(AvroValue::Record(fields))
             }
             serde_json::Value::Null => Ok(AvroValue::Null),
@@ -1051,6 +1049,29 @@ fn json_to_avro_with_schema(
         // fall back to the default conversion
         _ => Ok(AvroValue::from(json.clone())),
     }
+}
+
+/// A JSON number as an Avro `long`: integers in the signed 64-bit range
+/// only. Anything else (an unsigned value above `i64::MAX`, a fraction)
+/// fails explicitly; it is never wrapped, zeroed or rounded.
+fn long_of(n: &serde_json::Number) -> Result<i64, EncodingError> {
+    n.as_i64().ok_or_else(|| {
+        EncodingError::Avro(format!(
+            "{n} does not fit an Avro long (signed 64-bit integer)"
+        ))
+    })
+}
+
+/// A JSON number as an Avro `int`: integers in the signed 32-bit range
+/// only; anything else fails explicitly (never truncated).
+fn int_of(n: &serde_json::Number) -> Result<i32, EncodingError> {
+    n.as_i64()
+        .and_then(|v| i32::try_from(v).ok())
+        .ok_or_else(|| {
+            EncodingError::Avro(format!(
+                "{n} does not fit an Avro int (signed 32-bit integer)"
+            ))
+        })
 }
 
 fn json_type_name(v: &serde_json::Value) -> &'static str {
@@ -1335,6 +1356,54 @@ mod tests {
                 assert!(matches!(inner.as_ref(), AvroValue::String(_)));
             }
             _ => panic!("expected Union, got {val:?}"),
+        }
+    }
+
+    /// Integers reach Avro `long`/`int` exactly or fail explicitly: an
+    /// unsigned value above `i64::MAX` (MySQL BIGINT UNSIGNED in `long`
+    /// mode) is never wrapped, zeroed or turned into a double.
+    #[test]
+    fn integers_encode_exactly_or_fail_explicitly() {
+        let long = AvroSchema::parse_str(r#""long""#).unwrap();
+        let nullable_long =
+            AvroSchema::parse_str(r#"["null","long"]"#).unwrap();
+        let int = AvroSchema::parse_str(r#""int""#).unwrap();
+        for (v, want) in [
+            (json!(4_294_967_295_u64), 4_294_967_295_i64),
+            (json!(i64::MAX), i64::MAX),
+            (json!(i64::MIN), i64::MIN),
+        ] {
+            assert_eq!(json_to_avro(&v, &long).unwrap(), AvroValue::Long(want));
+            assert_eq!(
+                json_to_avro(&v, &nullable_long).unwrap(),
+                AvroValue::Union(1, Box::new(AvroValue::Long(want)))
+            );
+        }
+        for v in [json!(i64::MAX as u64 + 1), json!(u64::MAX), json!(1.5)] {
+            let e = json_to_avro(&v, &long).unwrap_err().to_string();
+            assert!(e.contains("does not fit an Avro long"), "{v}: {e}");
+            let e = json_to_avro(&v, &nullable_long).unwrap_err().to_string();
+            assert!(e.contains("does not fit an Avro long"), "{v}: {e}");
+        }
+        assert_eq!(
+            json_to_avro(&json!(i32::MAX), &int).unwrap(),
+            AvroValue::Int(i32::MAX)
+        );
+        for v in [json!(i32::MAX as i64 + 1), json!(i32::MIN as i64 - 1)] {
+            let e = json_to_avro(&v, &int).unwrap_err().to_string();
+            assert!(e.contains("does not fit an Avro int"), "{v}: {e}");
+        }
+    }
+
+    /// BIGINT UNSIGNED in `string` mode keeps the exact decimal value.
+    #[test]
+    fn unsigned_values_encode_as_exact_decimal_strings() {
+        let schema = AvroSchema::parse_str(r#"["null","string"]"#).unwrap();
+        for v in [i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+            assert_eq!(
+                json_to_avro(&json!(v), &schema).unwrap(),
+                AvroValue::Union(1, Box::new(AvroValue::String(v.to_string())))
+            );
         }
     }
 

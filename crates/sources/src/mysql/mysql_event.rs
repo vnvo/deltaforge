@@ -1,4 +1,4 @@
-use super::mysql_object::build_object;
+use super::mysql_object::{build_object, int_signs};
 use crate::mysql::LoopControl;
 use crate::mysql::RunCtx;
 use common::{ts_sec_to_ms, watchdog};
@@ -291,6 +291,7 @@ async fn handle_write_rows(
             return Ok(());
         }
         let loaded = super::mysql_selection::select_for_rows(ctx, tm).await?;
+        let signs = int_signs(&loaded.schema);
         let row_count = wr.rows.len();
         debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=row_count, "write_rows");
 
@@ -325,6 +326,7 @@ async fn handle_write_rows(
         for (row_ordinal, row) in wr.rows.into_iter().enumerate() {
             let after = build_object(
                 &loaded.column_names,
+                &signs,
                 &wr.included_columns,
                 &row.column_values,
             );
@@ -393,6 +395,7 @@ async fn handle_update_rows(
             return Ok(());
         }
         let loaded = super::mysql_selection::select_for_rows(ctx, tm).await?;
+        let signs = int_signs(&loaded.schema);
         debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=ur.rows.len(), "update_rows");
 
         let ts_ms = ts_sec_to_ms(header.timestamp);
@@ -427,11 +430,13 @@ async fn handle_update_rows(
         {
             let before = build_object(
                 &loaded.column_names,
+                &signs,
                 &ur.included_columns_before,
                 &before_row.column_values,
             );
             let after = build_object(
                 &loaded.column_names,
+                &signs,
                 &ur.included_columns_after,
                 &after_row.column_values,
             );
@@ -496,6 +501,7 @@ async fn handle_delete_rows(
             return Ok(());
         }
         let loaded = super::mysql_selection::select_for_rows(ctx, tm).await?;
+        let signs = int_signs(&loaded.schema);
         debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=dr.rows.len(), "delete_rows");
 
         let ts_ms = ts_sec_to_ms(header.timestamp);
@@ -526,6 +532,7 @@ async fn handle_delete_rows(
         for (row_ordinal, row) in dr.rows.into_iter().enumerate() {
             let before = build_object(
                 &loaded.column_names,
+                &signs,
                 &dr.included_columns,
                 &row.column_values,
             );
