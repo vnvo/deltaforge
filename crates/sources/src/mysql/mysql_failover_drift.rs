@@ -45,7 +45,8 @@ use super::MySqlCheckpoint;
 use super::mysql_activation::Stored;
 use super::mysql_baseline::affects;
 use super::mysql_binlog_scan::{
-    ProofError, ScanLimits, capture, covers, scan_interval,
+    ProofError, ProofKind, ScanLimits, ScanTag, capture, covers,
+    observe_capture, scan_interval, trace_proof,
 };
 use super::mysql_schema_loader::MySqlSchemaLoader;
 use super::mysql_table_schema::MySqlTableSchema;
@@ -453,6 +454,11 @@ async fn shape_at_failover(
     };
     let mut from = from;
     from.lineage = Some(anchor.current_lineage.clone());
+    let tag = ScanTag {
+        source_id: env.source_id,
+        kind: ProofKind::FailoverDrift,
+    };
+    let lctn = env.lower_case_table_names;
     let cap = match capture(
         env.dsn,
         env.server_uuid,
@@ -463,7 +469,10 @@ async fn shape_at_failover(
     )
     .await
     {
-        Ok(cap) => cap,
+        Ok(cap) => {
+            observe_capture(&tag, &cap);
+            cap
+        }
         Err(ProofError::OtherServer(found)) => {
             return Err(SourceError::Lineage {
                 details: format!(
@@ -476,6 +485,7 @@ async fn shape_at_failover(
         }
         Err(e) => {
             warn!(source_id = env.source_id, %db, %table, error = ?e, "failover drift: no capture");
+            trace_proof(&tag, db, table, None, None, lctn, "no_capture");
             return Ok(None);
         }
     };
@@ -493,6 +503,7 @@ async fn shape_at_failover(
     .is_some_and(|(f, end)| covers(&cap, &f, &end));
     if !covered {
         warn!(source_id = env.source_id, %db, %table, "failover drift: the capture started before F");
+        trace_proof(&tag, db, table, Some(&cap), None, lctn, "not_covered");
         return Ok(None);
     }
     let report = match scan_interval(
@@ -506,6 +517,7 @@ async fn shape_at_failover(
         &from,
         &cap.position,
         &ScanLimits::default(),
+        &tag,
     )
     .await
     {
@@ -522,6 +534,7 @@ async fn shape_at_failover(
         }
         Err(e) => {
             warn!(source_id = env.source_id, %db, %table, error = ?e, "failover drift: the interval scan failed");
+            trace_proof(&tag, db, table, Some(&cap), None, lctn, "scan_failed");
             return Ok(None);
         }
     };
@@ -531,8 +544,18 @@ async fn shape_at_failover(
         .any(|st| affects(st, db, table, env.lower_case_table_names))
     {
         info!(source_id = env.source_id, %db, %table, "failover drift: a DDL or barrier in the interval");
+        trace_proof(
+            &tag,
+            db,
+            table,
+            Some(&cap),
+            Some(&report),
+            lctn,
+            "relevant_ddl",
+        );
         return Ok(None);
     }
+    trace_proof(&tag, db, table, Some(&cap), Some(&report), lctn, "proven");
     Ok(Some(cap.schema))
 }
 

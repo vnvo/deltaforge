@@ -795,6 +795,10 @@ async fn full_fallback(
         CAPTURE_ATTEMPTS,
         &ScanLimits::default(),
         None,
+        &super::mysql_binlog_scan::ScanTag {
+            source_id: &ctx.source_id,
+            kind: super::mysql_binlog_scan::ProofKind::FullFallback,
+        },
     )
     .await
     {

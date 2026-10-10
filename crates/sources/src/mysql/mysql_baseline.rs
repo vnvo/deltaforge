@@ -29,8 +29,8 @@ use super::mysql_activation::{
     table_stream,
 };
 use super::mysql_binlog_scan::{
-    CLASSIFIER_VERSION, ProofError, ScanLimits, ScanReport, Statement, capture,
-    covers, scan_interval,
+    CLASSIFIER_VERSION, ProofError, ProofKind, ScanLimits, ScanReport, ScanTag,
+    Statement, capture, covers, observe_capture, scan_interval, trace_proof,
 };
 use super::mysql_ddl_attribution::{BarrierScopeOf, DdlEffect, same_name};
 use super::mysql_selection::Timeline;
@@ -114,6 +114,11 @@ pub(crate) async fn establish(
     let scope = ctx.registry_scope.current()?;
     let lineage = scope.lineage().lineage_hash.clone();
     let server_uuid = ctx.expected_uuid()?;
+    let tag = ScanTag {
+        source_id: &ctx.source_id,
+        kind: ProofKind::Snapshot,
+    };
+    let lctn = ctx.lower_case_table_names;
     let r0_cp = MySqlCheckpoint {
         file: ctx.last_file.clone(),
         pos: ctx.last_pos,
@@ -182,13 +187,25 @@ pub(crate) async fn establish(
         )
         .await
         {
-            Ok(cap) => captured.push((c, cap)),
+            Ok(cap) => {
+                observe_capture(&tag, &cap);
+                captured.push((c, cap))
+            }
             // The connection reached another server: never a "no baseline".
             Err(ProofError::OtherServer(found)) => {
                 return Err(other_server(&server_uuid, &found));
             }
             Err(e) => {
                 warn!(source_id = %ctx.source_id, db = %c.db, table = %c.table, error = ?e, "no baseline: no capture");
+                trace_proof(
+                    &tag,
+                    &c.db,
+                    &c.table,
+                    None,
+                    None,
+                    lctn,
+                    "no_capture",
+                );
             }
         }
     }
@@ -216,6 +233,7 @@ pub(crate) async fn establish(
         &r0_cp,
         &s_cp,
         &ScanLimits::default(),
+        &tag,
     )
     .await
     {
@@ -225,6 +243,17 @@ pub(crate) async fn establish(
         }
         Err(e) => {
             warn!(source_id = %ctx.source_id, error = ?e, "no baselines: the interval scan failed");
+            for (c, cap) in &captured {
+                trace_proof(
+                    &tag,
+                    &c.db,
+                    &c.table,
+                    Some(cap),
+                    None,
+                    lctn,
+                    "scan_failed",
+                );
+            }
             return Ok(0);
         }
     };
@@ -236,6 +265,15 @@ pub(crate) async fn establish(
     for (c, cap) in captured {
         if !covers(&cap, &r0, &s) {
             warn!(source_id = %ctx.source_id, db = %c.db, table = %c.table, "no baseline: the scan does not cover the capture interval");
+            trace_proof(
+                &tag,
+                &c.db,
+                &c.table,
+                Some(&cap),
+                Some(&report),
+                lctn,
+                "not_covered",
+            );
             continue;
         }
         if report
@@ -244,6 +282,15 @@ pub(crate) async fn establish(
             .any(|st| affects(st, &c.db, &c.table, ctx.lower_case_table_names))
         {
             info!(source_id = %ctx.source_id, db = %c.db, table = %c.table, "no baseline: a DDL or barrier in the scanned interval");
+            trace_proof(
+                &tag,
+                &c.db,
+                &c.table,
+                Some(&cap),
+                Some(&report),
+                lctn,
+                "relevant_ddl",
+            );
             continue;
         }
         let (version, schema_hash) = ctx
@@ -276,6 +323,15 @@ pub(crate) async fn establish(
         )
         .await
         .map_err(|e| SourceError::Other(e.context("persist a baseline")))?;
+        trace_proof(
+            &tag,
+            &c.db,
+            &c.table,
+            Some(&cap),
+            Some(&report),
+            lctn,
+            "proven",
+        );
         written += 1;
     }
     info!(
@@ -313,6 +369,12 @@ pub(crate) async fn establish_at(
     let lineage = key.lineage_hash.clone();
     e_cp.lineage = Some(lineage.clone());
     let server_uuid = ctx.expected_uuid()?;
+    let source_id = ctx.source_id.clone();
+    let tag = ScanTag {
+        source_id: &source_id,
+        kind: ProofKind::Lazy,
+    };
+    let lctn = ctx.lower_case_table_names;
     let binds = match barrier_to_bind(&current.records, &current.barriers, &e) {
         Ok(binds) => binds,
         Err(why) => {
@@ -330,12 +392,16 @@ pub(crate) async fn establish_at(
     )
     .await
     {
-        Ok(cap) => cap,
+        Ok(cap) => {
+            observe_capture(&tag, &cap);
+            cap
+        }
         Err(ProofError::OtherServer(found)) => {
             return Err(other_server(&server_uuid, &found));
         }
         Err(err) => {
             warn!(source_id = %ctx.source_id, %db, %table, error = ?err, "no lazy baseline: no capture");
+            trace_proof(&tag, db, table, None, None, lctn, "no_capture");
             return Ok(false);
         }
     };
@@ -349,6 +415,7 @@ pub(crate) async fn establish_at(
     };
     if !covers(&cap, &e, &s) {
         warn!(source_id = %ctx.source_id, %db, %table, "no lazy baseline: the capture did not start at or after the rows");
+        trace_proof(&tag, db, table, Some(&cap), None, lctn, "not_covered");
         return Ok(false);
     }
     let report = match scan_interval(
@@ -362,6 +429,7 @@ pub(crate) async fn establish_at(
         &e_cp,
         &s_cp,
         &ScanLimits::default(),
+        &tag,
     )
     .await
     {
@@ -371,6 +439,7 @@ pub(crate) async fn establish_at(
         }
         Err(err) => {
             warn!(source_id = %ctx.source_id, %db, %table, error = ?err, "no lazy baseline: the interval scan failed");
+            trace_proof(&tag, db, table, Some(&cap), None, lctn, "scan_failed");
             return Ok(false);
         }
     };
@@ -380,6 +449,15 @@ pub(crate) async fn establish_at(
         .any(|st| affects(st, db, table, ctx.lower_case_table_names))
     {
         info!(source_id = %ctx.source_id, %db, %table, "no lazy baseline: a DDL or barrier after the rows");
+        trace_proof(
+            &tag,
+            db,
+            table,
+            Some(&cap),
+            Some(&report),
+            lctn,
+            "relevant_ddl",
+        );
         return Ok(false);
     }
     let checkpoint = serde_json::to_vec(&e_cp)
@@ -395,7 +473,7 @@ pub(crate) async fn establish_at(
             version,
             schema_hash,
             to: s,
-            scan_digest: report.digest,
+            scan_digest: report.digest.clone(),
             binds,
             classifier_version: CLASSIFIER_VERSION.to_string(),
         },
@@ -416,6 +494,15 @@ pub(crate) async fn establish_at(
     .await
     {
         info!(source_id = %ctx.source_id, %db, %table, why, "no lazy baseline");
+        trace_proof(
+            &tag,
+            db,
+            table,
+            Some(&cap),
+            Some(&report),
+            lctn,
+            "not_decisive",
+        );
         return Ok(false);
     }
     mysql_activation::append(
@@ -431,6 +518,7 @@ pub(crate) async fn establish_at(
     .map_err(|err| SourceError::Other(err.context("persist a baseline")))?;
     ctx.selection.invalidate(key);
     info!(source_id = %ctx.source_id, %db, %table, version, scanned_events = report.events, "lazy baseline established");
+    trace_proof(&tag, db, table, Some(&cap), Some(&report), lctn, "proven");
     Ok(true)
 }
 
