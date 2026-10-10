@@ -3790,12 +3790,15 @@ mod tests {
             let deadline =
                 std::time::Instant::now() + std::time::Duration::from_secs(120);
             loop {
+                // Failed, and this runtime's occurrence written: the store
+                // already holds the record of an earlier runtime.
                 let id = {
                     let guard = mgr.pipelines.read();
                     let rt = guard.get("pf").unwrap();
-                    rt.health
-                        .blocking_incident()
-                        .filter(|_| rt.info().status == "failed")
+                    rt.health.blocking_incident().filter(|_| {
+                        rt.info().status == "failed"
+                            && !rt.health.durability_pending()
+                    })
                 };
                 if let Some(id) = id
                     && let Some(rec) = store.get(&id).await.unwrap()
@@ -3937,7 +3940,16 @@ mod tests {
         };
         let listed = PipelineController::list(&mgr).await;
         assert!(listed[0].incidents.as_ref().unwrap().blocks_readiness());
-        let one = mgr.incident("px", &id).await.unwrap();
+        // Exposure is synchronous; the incident is written in the background
+        // and reads `durable: false` until it is.
+        let one = loop {
+            let one = mgr.incident("px", &id).await.unwrap();
+            if one["durable"] == true {
+                break one;
+            }
+            assert!(std::time::Instant::now() < deadline, "never durable");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
         assert_eq!(one["reason_code"], "unclassified_failure");
         assert_eq!(one["durable"], true);
         assert!(!one.to_string().contains("root:root"));
