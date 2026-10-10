@@ -225,6 +225,7 @@ impl ProofScanner {
         let (a, b) = (wm(from)?, wm(to)?);
         match order_positions(&a, &b) {
             CheckpointOrder::Equal => {
+                observe_request(tag, from, to, "empty", 0, 0, &[], None);
                 return Ok(answer(&a, &b, Vec::new(), 0, 0, started));
             }
             CheckpointOrder::Before => {}
@@ -937,6 +938,27 @@ mod tests {
             assert_eq!(sc.retained().await, None);
             same_as_direct(&sc, &syn, 5, 20).await;
             assert_eq!(syn.scanned.lock().unwrap().last(), Some(&(5, 20)));
+        }
+    }
+
+    /// A FULL-fallback request at the live end (its capture interval past
+    /// the frontier) extends only to the right: never to the left. The
+    /// extension covers the gap up to the capture, which the stream's later
+    /// proofs then find recorded.
+    #[tokio::test]
+    async fn a_request_at_the_live_end_extends_only_to_the_right() {
+        for gtid in modes() {
+            let syn = Synth::new(gtid).with(55, vec![table("g")]);
+            let sc = ProofScanner::default();
+            ask(&sc, &syn, 0, 50, Some(0)).await.unwrap();
+            // The capture interval (60, 61], the stream at 10.
+            let r = ask(&sc, &syn, 60, 61, Some(10)).await.unwrap();
+            assert_eq!(r.statements, syn.direct(60, 61).0);
+            // A later stream proof (12, 61]: answered from the record.
+            let r = ask(&sc, &syn, 12, 61, Some(12)).await.unwrap();
+            assert_eq!(r.statements, syn.direct(12, 61).0);
+            assert_eq!(r.events, 0);
+            assert_eq!(*syn.scanned.lock().unwrap(), vec![(0, 50), (50, 61)]);
         }
     }
 

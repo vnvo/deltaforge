@@ -105,13 +105,16 @@ fn install_trace() {
     );
 }
 
-async fn start(gtid: bool) -> (ContainerAsync<GenericImage>, u16) {
+async fn start(gtid: bool, full: bool) -> (ContainerAsync<GenericImage>, u16) {
     let mut cmd = vec![
         "--server-id=61".to_string(),
         "--log-bin=mysql-bin".into(),
         "--binlog-format=ROW".into(),
         "--binlog-row-image=FULL".into(),
     ];
+    if full {
+        cmd.push("--binlog-row-metadata=FULL".into());
+    }
     if gtid {
         cmd.push("--gtid-mode=ON".into());
         cmd.push("--enforce-gtid-consistency=ON".into());
@@ -158,17 +161,30 @@ async fn noise(c: &mut mysql_async::Conn, n: u64) {
 #[derive(Debug)]
 struct Amplification {
     requests: usize,
+    /// Requests per proof kind.
+    kinds: BTreeMap<String, usize>,
+    /// Failed requests (a cleared record).
+    failed: usize,
+    /// The largest record the scanner held: statements, encoded bytes.
+    peak_record: (u64, u64),
     /// The union of all requested intervals (A, B], in binlog bytes.
     distinct_bytes: u64,
     /// What the physical scans read.
     scanned_bytes: u64,
 }
 
+/// With `ddl`, on a FULL-metadata server, the backlog also holds table DDL
+/// before some tables' first rows (forward proofs) and after others' (a
+/// relevant, shape-preserving DDL inside their lazy interval: FULL
+/// fallback), a rename, a database barrier of the tables' database and an
+/// unrelated one, and a lineage barrier. (A column change after a table's
+/// first rows, its earlier shape never recorded, is unprovable by design.)
 async fn amplification(
     gtid: bool,
     tables: u64,
     gap: u64,
     rate: u64,
+    ddl: bool,
 ) -> Amplification {
     install_trace();
     RECORDS.lock().unwrap().clear();
@@ -180,11 +196,11 @@ async fn amplification(
         }),
     );
     std::fs::create_dir_all(&out).unwrap();
-    let stem = format!("{mode}-{tables}");
+    let stem = format!("{mode}-{tables}{}", if ddl { "-ddl" } else { "" });
     *OUT.get().unwrap().lock().unwrap() =
         Some(std::fs::File::create(out.join(format!("{stem}.jsonl"))).unwrap());
 
-    let (container, port) = start(gtid).await;
+    let (container, port) = start(gtid, ddl).await;
     let mut c = mysql_async::Conn::from_url(dsn(port, "")).await.unwrap();
     c.query_drop(format!("CREATE DATABASE {DB}")).await.unwrap();
     let mut c = conn(port).await;
@@ -193,6 +209,14 @@ async fn amplification(
     )
     .await
     .unwrap();
+    if ddl {
+        c.query_drop("CREATE TABLE ren0 (id INT PRIMARY KEY)")
+            .await
+            .unwrap();
+        c.query_drop("CREATE TABLE qt0 (id INT PRIMARY KEY)")
+            .await
+            .unwrap();
+    }
     for i in 0..tables {
         c.query_drop(format!(
             "CREATE TABLE t{i:04} (id INT PRIMARY KEY, v INT NOT NULL)"
@@ -253,9 +277,32 @@ async fn amplification(
     // The backlog, behind a paused source.
     handle.pause();
     for i in 0..tables {
-        c.query_drop(format!("INSERT INTO t{i:04} VALUES (1, {i})"))
-            .await
-            .unwrap();
+        let mut stmts = Vec::new();
+        if ddl && i % 10 == 3 {
+            stmts.push(format!("ALTER TABLE t{i:04} ADD COLUMN pre INT"));
+        }
+        stmts.push(format!("INSERT INTO t{i:04} (id, v) VALUES (1, {i})"));
+        if ddl && i % 10 == 5 {
+            // Relevant to the table, its columns unchanged: its lazy proof
+            // is not decisive and the FULL fallback proves the rows.
+            stmts.push(format!("ALTER TABLE t{i:04} ADD INDEX post (v)"));
+        }
+        if ddl && i == tables / 4 {
+            stmts.push("RENAME TABLE ren0 TO ren1".into());
+        }
+        if ddl && i == tables / 2 {
+            stmts.push(format!("ALTER DATABASE {DB} CHARACTER SET utf8mb4"));
+            stmts.push("CREATE DATABASE amp_side".into());
+        }
+        if ddl && i == tables * 3 / 4 {
+            // ANSI_QUOTES identifiers: classified as a lineage barrier.
+            stmts.push("SET SESSION sql_mode = 'ANSI_QUOTES'".into());
+            stmts.push("ALTER TABLE \"qt0\" ADD COLUMN z INT".into());
+            stmts.push("SET SESSION sql_mode = DEFAULT".into());
+        }
+        for stmt in stmts {
+            c.query_drop(stmt).await.unwrap();
+        }
         noise(&mut c, gap).await;
     }
     // Sustained writes while the source catches up.
@@ -374,7 +421,23 @@ async fn amplification(
         .filter(|r| r["record"] == "scan" && r["outcome"] == "ok")
         .map(|r| r["bytes"].as_u64().unwrap())
         .sum();
+    let mut kinds = BTreeMap::new();
+    for r in &requests {
+        *kinds
+            .entry(r["kind"].as_str().unwrap().to_string())
+            .or_default() += 1;
+    }
+    let peak = |field: &str| {
+        requests
+            .iter()
+            .filter_map(|r| r[field].as_u64())
+            .max()
+            .unwrap_or(0)
+    };
     Amplification {
+        kinds,
+        failed: requests.iter().filter(|r| r["served"] == "failed").count(),
+        peak_record: (peak("record_statements"), peak("record_bytes")),
         requests: requests.len(),
         distinct_bytes: distinct,
         scanned_bytes: scanned,
@@ -384,7 +447,7 @@ async fn amplification(
 /// The proofs of many newly active tables read the distinct interval about
 /// once: no more than twice it in all.
 async fn bounded(gtid: bool) {
-    let a = amplification(gtid, 20, 200, 100).await;
+    let a = amplification(gtid, 20, 200, 100, false).await;
     eprintln!(
         "amplification {:.2}: {a:?}",
         a.scanned_bytes as f64 / a.distinct_bytes as f64
@@ -410,6 +473,43 @@ async fn bounded_file_position() {
     bounded(false).await;
 }
 
+/// With relevant DDL and barriers in the interval: the record holds them,
+/// FULL fallback and forward proofs are served by the shared scanner, and
+/// the proofs still read the distinct interval about once.
+async fn bounded_ddl(gtid: bool) {
+    let a = amplification(gtid, 20, 200, 100, true).await;
+    eprintln!(
+        "amplification {:.2}: {a:?}",
+        a.scanned_bytes as f64 / a.distinct_bytes as f64
+    );
+    assert!(a.peak_record.0 > 0, "the record held DDL: {a:?}");
+    assert!(
+        a.kinds.get("full_fallback").is_some_and(|n| *n > 0),
+        "{a:?}"
+    );
+    assert!(a.kinds.get("forward").is_some_and(|n| *n > 0), "{a:?}");
+    assert!(a.kinds.get("lazy").is_some_and(|n| *n > 0), "{a:?}");
+    assert_eq!(a.failed, 0, "{a:?}");
+    assert!(
+        a.scanned_bytes <= 2 * a.distinct_bytes,
+        "proof scans read {} bytes for {} distinct: {a:?}",
+        a.scanned_bytes,
+        a.distinct_bytes
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn bounded_ddl_gtid() {
+    bounded_ddl(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn bounded_ddl_file_position() {
+    bounded_ddl(false).await;
+}
+
 /// The evidence run (environment-sized), reported offline.
 async fn evidence(gtid: bool) {
     let a = amplification(
@@ -417,6 +517,7 @@ async fn evidence(gtid: bool) {
         env("DF_EVIDENCE_TABLES", 100),
         env("DF_EVIDENCE_GAP", 1000),
         env("DF_EVIDENCE_RATE", 200),
+        env("DF_EVIDENCE_DDL", 0) == 1,
     )
     .await;
     eprintln!("{a:?}");

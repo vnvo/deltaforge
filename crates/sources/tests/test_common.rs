@@ -845,3 +845,62 @@ pub async fn assert_fails_closed_without_sink_checkpoints(
         );
     }
 }
+
+// ============================================================================
+// Proof trace records - shared
+// ============================================================================
+
+/// Collects the `deltaforge::proof_trace` records while installed as this
+/// thread's default subscriber (a current-thread runtime runs the source on
+/// it).
+#[derive(Clone, Default)]
+pub struct TraceRecords(Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TraceRecords {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() != "deltaforge::proof_trace" {
+            return;
+        }
+        struct Msg(String);
+        impl tracing::field::Visit for Msg {
+            fn record_debug(
+                &mut self,
+                f: &tracing::field::Field,
+                v: &dyn std::fmt::Debug,
+            ) {
+                if f.name() == "message" {
+                    self.0 = format!("{v:?}");
+                }
+            }
+        }
+        let mut m = Msg(String::new());
+        event.record(&mut m);
+        if let Ok(v) = serde_json::from_str(&m.0) {
+            self.0.lock().unwrap().push(v);
+        }
+    }
+}
+
+impl TraceRecords {
+    pub fn install(&self) -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt;
+        tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(self.clone()),
+        )
+    }
+
+    /// The records of `record` (`scan`, `request`, `proof`) and `kind`.
+    pub fn of(&self, record: &str, kind: &str) -> Vec<serde_json::Value> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|v| v["record"] == record && v["kind"] == kind)
+            .cloned()
+            .collect()
+    }
+}

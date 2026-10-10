@@ -1150,6 +1150,14 @@ pub(crate) fn covers(cap: &Captured, start: &WmPos, end: &WmPos) -> bool {
     )
 }
 
+/// The source's shared proof scanner and the stream's boundary, for a
+/// proof whose interval it should serve.
+#[derive(Clone, Copy)]
+pub(crate) struct SharedProofs<'a> {
+    pub scanner: &'a super::mysql_proof_scanner::ProofScanner,
+    pub boundary: Option<&'a MySqlCheckpoint>,
+}
+
 /// A capture whose own interval is proven: [`capture`], then a scan of
 /// `(from, position]` in which nothing affects `db.table` (a DDL naming it, a
 /// database barrier of its database, a lineage barrier). Ordinary writes and
@@ -1169,23 +1177,42 @@ pub(crate) async fn capture_proven(
     limits: &ScanLimits,
     between: Option<BetweenHook<'_>>,
     tag: &ScanTag<'_>,
+    shared: Option<SharedProofs<'_>>,
 ) -> Result<Captured, ProofError> {
     let mut retries = Vec::new();
     for attempt in 1..=attempts.max(1) {
         let mut cap =
             capture(dsn, server_uuid, lineage_hash, db, table, between).await?;
         cap.attempts = attempt;
-        let report = scan_interval(
-            dsn,
-            scan_server_id,
-            server_uuid,
-            lineage_hash,
-            &cap.from,
-            &cap.position,
-            limits,
-            tag,
-        )
-        .await?;
+        let report = match &shared {
+            Some(sp) => {
+                super::mysql_proof_scanner::shared_interval(
+                    sp.scanner,
+                    dsn,
+                    tag.source_id,
+                    server_uuid,
+                    lineage_hash,
+                    &cap.from,
+                    &cap.position,
+                    sp.boundary,
+                    tag,
+                )
+                .await?
+            }
+            None => {
+                scan_interval(
+                    dsn,
+                    scan_server_id,
+                    server_uuid,
+                    lineage_hash,
+                    &cap.from,
+                    &cap.position,
+                    limits,
+                    tag,
+                )
+                .await?
+            }
+        };
         let relevant = report.statements.iter().any(|st| {
             super::mysql_baseline::affects(
                 st,
@@ -2433,6 +2460,7 @@ mod tests {
                 &limits(),
                 hook.as_ref().map(|h| h as BetweenHook<'_>),
                 &TAG,
+                None,
             )
             .await
         }
@@ -2500,6 +2528,100 @@ mod tests {
                     assert_eq!(shared.digest, direct.digest, "({i}, {j}]");
                 }
             }
+            let (first, last) = (&points[0], &points[n - 1]);
+            use super::super::super::mysql_proof_scanner::RecordLimits;
+
+            // The record's bounds fail closed (and clear it).
+            for limits in [
+                RecordLimits {
+                    max_statements: 3,
+                    max_bytes: 1 << 20,
+                },
+                RecordLimits {
+                    max_statements: 1000,
+                    max_bytes: 200,
+                },
+            ] {
+                let small = ProofScanner::new(limits);
+                let r = small
+                    .interval(&segments, &id, LINEAGE, first, last, None, &TAG)
+                    .await;
+                assert!(matches!(r, Err(ProofError::Limit(_))), "{r:?}");
+                assert_eq!(small.retained().await, None);
+            }
+
+            // A request cancelled during its extension leaves the record
+            // as it was; the next request equals the direct scan.
+            let fresh = ProofScanner::default();
+            fresh
+                .interval(
+                    &segments,
+                    &id,
+                    LINEAGE,
+                    first,
+                    &points[2],
+                    Some(first),
+                    &TAG,
+                )
+                .await
+                .unwrap();
+            let before = fresh.retained().await;
+            let cut = tokio::time::timeout(
+                Duration::from_micros(1),
+                fresh.interval(
+                    &segments,
+                    &id,
+                    LINEAGE,
+                    first,
+                    last,
+                    Some(first),
+                    &TAG,
+                ),
+            )
+            .await;
+            assert!(cut.is_err(), "the request was cancelled");
+            assert_eq!(fresh.retained().await, before);
+            assert_eq!(fresh.pinned(), 0);
+            let r = fresh
+                .interval(
+                    &segments,
+                    &id,
+                    LINEAGE,
+                    first,
+                    last,
+                    Some(first),
+                    &TAG,
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.digest, scan(&dsn, first, last).await.unwrap().digest);
+
+            // Another lineage never reuses the record: it scans again.
+            const OTHER: &str = "fedcba9876543210fedcba9876543210";
+            let relabel = |p: &MySqlCheckpoint| MySqlCheckpoint {
+                lineage: Some(OTHER.into()),
+                ..p.clone()
+            };
+            let other = LiveSegments {
+                dsn: &dsn,
+                server_id: 4_000_152,
+                server_uuid: &id,
+                lineage_hash: OTHER,
+                limits: ScanLimits::default(),
+            };
+            let r = fresh
+                .interval(
+                    &other,
+                    &id,
+                    OTHER,
+                    &relabel(first),
+                    &relabel(last),
+                    None,
+                    &TAG,
+                )
+                .await
+                .unwrap();
+            assert!(r.events > 0, "a new lineage rescans");
         }
 
         #[tokio::test]
@@ -2952,6 +3074,7 @@ mod tests {
                 },
                 Some(&hook),
                 &TAG,
+                None,
             )
             .await;
             assert!(matches!(r, Err(ProofError::Limit(_))), "{r:?}");

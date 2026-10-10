@@ -509,10 +509,14 @@ async fn shape_at_failover(
         trace_proof(&tag, db, table, Some(&cap), None, lctn, "not_covered");
         return Ok(None);
     }
-    let scanned = match (env.proofs, event) {
-        // Rows in the stream: the shared scanner (the rows' position is the
-        // stream's boundary).
-        (Some(proofs), FirstEvent::Rows { .. }) => {
+    let scanned = match env.proofs {
+        // The shared scanner. Rows in the stream: their position is the
+        // stream's boundary. A snapshot: the stream has not started, the
+        // failover position F (this request's start) is pinned while the
+        // request waits and runs.
+        Some(proofs) => {
+            let boundary =
+                matches!(event, FirstEvent::Rows { .. }).then_some(&from);
             super::mysql_proof_scanner::shared_interval(
                 proofs,
                 env.dsn,
@@ -521,7 +525,7 @@ async fn shape_at_failover(
                 &anchor.current_lineage,
                 &from,
                 &cap.position,
-                Some(&from),
+                boundary,
                 &tag,
             )
             .await
