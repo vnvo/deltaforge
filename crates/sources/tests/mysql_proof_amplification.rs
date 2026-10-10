@@ -490,6 +490,9 @@ async fn amplification(
 /// once: no more than twice it in all.
 async fn bounded(gtid: bool) {
     let a = amplification(gtid, 20, 200, 100, false).await;
+    // GTID mode counts the source server's transactions (its positions'
+    // file offsets are diagnostic only); file mode counts bytes.
+    assert_eq!(a.unit, if gtid { "source transactions" } else { "bytes" });
     eprintln!(
         "amplification {:.2}: {a:?}",
         a.scanned as f64 / a.distinct as f64
@@ -521,6 +524,9 @@ async fn bounded_file_position() {
 /// the proofs still read the distinct interval about once.
 async fn bounded_ddl(gtid: bool) {
     let a = amplification(gtid, 20, 200, 100, true).await;
+    // GTID mode counts the source server's transactions (its positions'
+    // file offsets are diagnostic only); file mode counts bytes.
+    assert_eq!(a.unit, if gtid { "source transactions" } else { "bytes" });
     eprintln!(
         "amplification {:.2}: {a:?}",
         a.scanned as f64 / a.distinct as f64

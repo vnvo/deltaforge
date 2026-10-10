@@ -962,6 +962,95 @@ mod tests {
         }
     }
 
+    /// GTID mode: a position whose GTID set is the one after transaction
+    /// `g` and whose file offset is the one after transaction `pos` (the
+    /// two are not read atomically by the server).
+    fn mixed(syn: &Synth, g: u64, pos: u64) -> MySqlCheckpoint {
+        MySqlCheckpoint {
+            pos: syn.at(pos).pos,
+            ..syn.at(g)
+        }
+    }
+
+    /// GTID mode: the GTID set is authoritative, the file offset only
+    /// diagnostic. The same offset with one more transaction is a real,
+    /// non-empty interval; the same set at a later offset is empty; sets
+    /// that do not include each other are refused.
+    #[tokio::test]
+    async fn gtid_sets_decide_intervals_not_file_offsets() {
+        let syn = Synth::new(true).with(5, vec![table("x")]);
+        let sc = ProofScanner::default();
+        // (1) Same offset (after 4), B holds transaction 5.
+        let r = sc
+            .interval(&syn, U, L, &syn.at(4), &mixed(&syn, 5, 4), None, &TAG)
+            .await
+            .unwrap();
+        assert_eq!(r.statements, syn.direct(4, 5).0);
+        assert_eq!(r.digest, syn.direct(4, 5).1);
+        assert_eq!(*syn.scanned.lock().unwrap(), vec![(4, 5)]);
+        // (2) Same set, a later offset: empty, no scan.
+        let r = sc
+            .interval(&syn, U, L, &syn.at(5), &mixed(&syn, 5, 9), None, &TAG)
+            .await
+            .unwrap();
+        assert!(r.statements.is_empty());
+        assert_eq!(syn.scanned.lock().unwrap().len(), 1);
+        // (3) Sets of different servers: refused.
+        let other = MySqlCheckpoint {
+            gtid_set: Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:1-9".into()),
+            ..syn.at(9)
+        };
+        let r = sc
+            .interval(&syn, U, L, &syn.at(4), &other, None, &TAG)
+            .await;
+        assert!(matches!(r, Err(ProofError::Positions(_))), "{r:?}");
+        // A GTID position against a file position: refused.
+        let f = Synth::new(false);
+        let r = sc
+            .interval(&syn, U, L, &syn.at(4), &f.at(9), None, &TAG)
+            .await;
+        assert!(matches!(r, Err(ProofError::Positions(_))), "{r:?}");
+    }
+
+    /// Pruning and coverage follow the authoritative coordinate: in GTID
+    /// mode a boundary or a request start whose file offset is far ahead
+    /// of its GTID set is placed by its set; in file mode by its offset.
+    #[tokio::test]
+    async fn pruning_and_coverage_use_the_authoritative_coordinate() {
+        let syn = Synth::new(true)
+            .with(10, vec![table("a")])
+            .with(30, vec![table("b")]);
+        let sc = ProofScanner::default();
+        ask(&sc, &syn, 0, 40, Some(0)).await.unwrap();
+        // The boundary's set is after 5, its offset after 35: prune by the
+        // set, so the statement at 10 stays recorded.
+        let r = sc
+            .interval(
+                &syn,
+                U,
+                L,
+                &mixed(&syn, 5, 35),
+                &syn.at(40),
+                Some(&mixed(&syn, 5, 35)),
+                &TAG,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.statements, syn.direct(5, 40).0);
+        assert_eq!(r.events, 0, "covered: answered from the record");
+        assert_eq!(sc.retained().await.map(|r| r.0), Some(2));
+
+        let syn = Synth::new(false)
+            .with(10, vec![table("a")])
+            .with(30, vec![table("b")]);
+        let sc = ProofScanner::default();
+        ask(&sc, &syn, 0, 40, Some(0)).await.unwrap();
+        // File mode: the offset decides (a stray GTID set is not consulted:
+        // file positions carry none).
+        ask(&sc, &syn, 20, 40, Some(20)).await.unwrap();
+        assert_eq!(sc.retained().await.map(|r| r.0), Some(1));
+    }
+
     /// Another server identity or lineage never reuses the record.
     #[tokio::test]
     async fn another_identity_starts_a_new_record() {

@@ -1545,6 +1545,61 @@ mod tests {
         );
     }
 
+    fn cp(file: &str, pos: u64, gtid: Option<&str>) -> MySqlCheckpoint {
+        MySqlCheckpoint {
+            file: file.into(),
+            pos,
+            gtid_set: gtid.map(Into::into),
+            lineage: Some("l".into()),
+            snapshot_completed: None,
+            snapshot_chain: None,
+        }
+    }
+
+    /// GTID mode, decided before any session: the same set at a later file
+    /// offset is the canonical empty interval; sets that do not include
+    /// each other, or a GTID against a file position, are refused.
+    #[tokio::test]
+    async fn gtid_sets_are_authoritative_before_any_session() {
+        let nowhere = "mysql://u:p@127.0.0.1:1/";
+        let set = format!("{U}:1-9");
+        let r = scan_interval(
+            nowhere,
+            1,
+            U,
+            "l",
+            &cp("binlog.000001", 100, Some(&set)),
+            &cp("binlog.000002", 900, Some(&set)),
+            &ScanLimits::default(),
+            &TAG,
+        )
+        .await
+        .unwrap();
+        assert!(r.statements.is_empty());
+        assert_eq!(r.digest, scan_digest(&g(9), &g(9), &[]));
+        for to in [
+            cp(
+                "binlog.000001",
+                100,
+                Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:1-3"),
+            ),
+            cp("binlog.000001", 200, None),
+        ] {
+            let r = scan_interval(
+                nowhere,
+                1,
+                U,
+                "l",
+                &cp("binlog.000001", 100, Some(&set)),
+                &to,
+                &ScanLimits::default(),
+                &TAG,
+            )
+            .await;
+            assert!(matches!(r, Err(ProofError::Positions(_))), "{r:?}");
+        }
+    }
+
     #[test]
     fn only_known_harmless_unparsed_events_are_accepted() {
         for t in [3u8, 5, 13, 14, 28, 34, 36, 37, 39] {
@@ -2622,6 +2677,54 @@ mod tests {
                 .await
                 .unwrap();
             assert!(r.events > 0, "a new lineage rescans");
+        }
+
+        /// GTID mode: B at A's file offset but holding one more transaction
+        /// (a DDL) is a real interval: the direct and the shared scans both
+        /// read and prove it, with identical statements and digest.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn the_same_file_offset_with_one_more_gtid_is_scanned() {
+            use super::super::super::mysql_proof_scanner::{
+                LiveSegments, ProofScanner,
+            };
+            let dsn = server(true).await;
+            let id = uuid(&dsn).await;
+            sql(&dsn, &["CREATE DATABASE dual_pos"]).await;
+            let a = position(&dsn).await;
+            sql(&dsn, &["CREATE TABLE dual_pos.t (a INT PRIMARY KEY)"]).await;
+            let real_b = position(&dsn).await;
+            let b = MySqlCheckpoint {
+                file: a.file.clone(),
+                pos: a.pos,
+                ..real_b.clone()
+            };
+            let direct = scan(&dsn, &a, &b).await.unwrap();
+            assert_eq!(direct.statements.len(), 1, "{:?}", direct.statements);
+            assert_eq!(
+                direct.digest,
+                scan(&dsn, &a, &real_b).await.unwrap().digest
+            );
+            let shared = ProofScanner::default()
+                .interval(
+                    &LiveSegments {
+                        dsn: &dsn,
+                        server_id: 4_000_153,
+                        server_uuid: &id,
+                        lineage_hash: LINEAGE,
+                        limits: ScanLimits::default(),
+                    },
+                    &id,
+                    LINEAGE,
+                    &a,
+                    &b,
+                    Some(&a),
+                    &TAG,
+                )
+                .await
+                .unwrap();
+            assert_eq!(shared.statements, direct.statements);
+            assert_eq!(shared.digest, direct.digest);
         }
 
         #[tokio::test]

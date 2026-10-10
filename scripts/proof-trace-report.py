@@ -201,6 +201,21 @@ def main(jsonl, meta_path):
                     if a is not None and b is not None:
                         tx.append((a, b))
                 row["distinct_txns"] = union(tx)
+                # GTID mode: positions' file offsets are diagnostic only (not
+                # read atomically with the GTID set); amplification counts
+                # the source server's transactions.
+                phys_tx = sum(
+                    (scan_by_id.get(i, {}).get("detail") or {}).get("source_txns", 0)
+                    for r in rs
+                    for i in r["scan_ids"]
+                )
+                row["physical_txns"] = phys_tx
+                row["amplification"] = (
+                    phys_tx / row["distinct_txns"] if row["distinct_txns"] else None
+                )
+                row["amplification_unit"] = "source transactions"
+            else:
+                row["amplification_unit"] = "bytes"
             print(json.dumps(row))
         print()
 
