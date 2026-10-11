@@ -858,3 +858,129 @@ fn find_gtid_set(v: &Value) -> Option<String> {
         _ => None,
     }
 }
+
+/// Executable-comment DDL is attributed as executed and emitted with its
+/// original SQL (an applicable guard executes, a non-applicable one does
+/// not); a leading plain comment hides nothing; CREATE, ALTER and DROP
+/// DATABASE are scoped alike, quoted names and IF [NOT] EXISTS included; an
+/// executable-comment account statement is redacted. The statements run
+/// while the source is stopped are emitted the same way on catch-up.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn executable_comment_and_database_ddl() {
+    const SECRET: &str = "Da-x-Secret-4417";
+    let (id, db, dbx) = ("da_x", "da_x", "da x");
+    let (port, st, mut r) = setup(
+        id,
+        db,
+        &[format!("{db}.t")],
+        &[
+            format!("DROP DATABASE IF EXISTS `{dbx}`"),
+            format!("CREATE TABLE {db}.a (id INT PRIMARY KEY)"),
+            "DROP USER IF EXISTS 'da_x_user'@'%'".into(),
+        ],
+    )
+    .await;
+    let t = obj("table", db, "t");
+    let database = obj("database", dbx, dbx);
+
+    // Live.
+    let applicable =
+        format!("/*!50100 ALTER TABLE {db}.t ADD COLUMN c1 INT */");
+    let partial = format!(
+        "ALTER TABLE {db}.t ADD COLUMN c2 INT /*!99999 , ADD COLUMN c3 INT */"
+    );
+    let rename = format!("/*! RENAME TABLE {db}.a TO {db}.a2 */");
+    sql(
+        port,
+        &[
+            applicable.clone(),
+            partial.clone(),
+            rename.clone(),
+            format!("CREATE DATABASE IF NOT EXISTS `{dbx}`"),
+            format!("ALTER DATABASE `{dbx}` CHARACTER SET utf8mb4"),
+            format!(
+                "/*!80000 CREATE USER 'da_x_user'@'%' IDENTIFIED BY '{SECRET}' */"
+            ),
+            format!("INSERT INTO {db}.t (id, v, c1, c2) VALUES (2, 20, 1, 2)"),
+        ],
+    )
+    .await;
+    let row2 = expect_row(&mut r, db, 2, "after executable-comment DDL").await;
+    assert_eq!(
+        cols(&row2),
+        ["c1", "c2", "id", "v"],
+        "c3 was never executed"
+    );
+
+    // The server logs a non-applicable guard as a plain comment (`/*!` ->
+    // `/* `); the event carries the statement exactly as logged.
+    let partial_logged = partial.replace("/*!99999", "/* 99999");
+    for (needle, sql_text, objects) in [
+        ("ADD COLUMN c1", &applicable, serde_json::json!([t])),
+        ("ADD COLUMN c2", &partial_logged, serde_json::json!([t])),
+        (
+            "RENAME TABLE",
+            &rename,
+            serde_json::json!([obj("table", db, "a"), obj("table", db, "a2")]),
+        ),
+    ] {
+        let (source_db, p) = ddl(&mut r, needle).await;
+        assert_eq!(p["sql"], sql_text.as_str(), "original SQL kept");
+        assert_eq!(p["scope"], "tables", "{p}");
+        assert_eq!(p["objects"], objects, "{p}");
+        assert_eq!(source_db, db);
+    }
+    for needle in ["CREATE DATABASE", "ALTER DATABASE"] {
+        let (source_db, p) = ddl(&mut r, needle).await;
+        assert_eq!(p["scope"], "database", "{needle}: {p}");
+        assert_eq!(p["objects"], serde_json::json!([database]), "{needle}");
+        assert_eq!(p["database"], dbx);
+        assert_eq!(source_db, dbx);
+    }
+    let (_, p) = ddl(&mut r, "CREATE USER").await;
+    assert_eq!(p["redacted"], true, "{p}");
+    assert!(p.get("sql").is_none() && !p.to_string().contains(SECRET));
+    stop(r.handle).await;
+
+    // While stopped, then catch-up.
+    // (DROP TABLE is regenerated in the binlog; ALTER is logged as written.)
+    let commented = format!("/* audit */ ALTER TABLE {db}.t ADD COLUMN c5 INT");
+    let drop_db = format!("/*!40101 DROP DATABASE IF EXISTS `{dbx}` */");
+    let c4 = format!("/*!50100 ALTER TABLE {db}.t ADD COLUMN c4 INT */");
+    sql(
+        port,
+        &[
+            commented.clone(),
+            drop_db.clone(),
+            c4.clone(),
+            "DROP USER 'da_x_user'@'%'".into(),
+        ],
+    )
+    .await;
+    let mut r = run(source(id, port, &[format!("{db}.t")], &st), &st).await;
+    sql(
+        port,
+        &[format!(
+            "INSERT INTO {db}.t (id, v, c1, c2, c4) VALUES (3, 30, 1, 2, 4)"
+        )],
+    )
+    .await;
+    let row3 = expect_row(&mut r, db, 3, "after catch-up").await;
+    assert_eq!(cols(&row3), ["c1", "c2", "c4", "c5", "id", "v"]);
+    let (_, p) = ddl(&mut r, "ADD COLUMN c5").await;
+    assert_eq!(p["sql"], commented.as_str());
+    assert_eq!(p["objects"], serde_json::json!([t]));
+    let (source_db, p) = ddl(&mut r, "DROP DATABASE").await;
+    assert_eq!(p["sql"], drop_db.as_str());
+    assert_eq!(p["scope"], "database");
+    assert_eq!(p["objects"], serde_json::json!([database]));
+    assert_eq!(source_db, dbx);
+    let (_, p) = ddl(&mut r, "ADD COLUMN c4").await;
+    assert_eq!(p["sql"], c4.as_str());
+    assert_eq!(p["objects"], serde_json::json!([t]));
+    stop(r.handle).await;
+
+    assert!(logs(id, SECRET).is_empty(), "the secret was logged");
+    no_legacy_reload(id);
+}

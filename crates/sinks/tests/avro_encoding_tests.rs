@@ -2757,7 +2757,7 @@ fn ddl_payloads() -> Vec<(&'static str, serde_json::Value)> {
             "",
             json!({"ddl_format": 2, "scope": "lineage", "objects": [],
             "database": null, "session_database": "shop",
-            "sql": "/*!50100 ALTER TABLE a ADD x INT */"}),
+            "sql": "ALTER TABLE a ADD x INT COMMENT \"x\""}),
         ),
         (
             "",

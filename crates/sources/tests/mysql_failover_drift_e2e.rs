@@ -600,7 +600,9 @@ async fn a_barrier_after_the_failover_position_is_unprovable() {
     sql(
         b,
         &[format!(
-            "/*!50100 ALTER TABLE {}.orders ADD COLUMN status VARCHAR(32) */",
+            // A double-quoted token may be an ANSI_QUOTES identifier: a
+            // lineage barrier.
+            "ALTER TABLE {}.orders ADD COLUMN status VARCHAR(32) COMMENT \"s\"",
             sc.db
         )],
     )
