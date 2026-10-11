@@ -175,17 +175,18 @@ Resolved schemas are cached per source. The resident schemas are capped at 4,096
 
 ## DDL Handling
 
-When the binlog contains DDL events, the schema loader responds:
+Each DDL statement is attributed once, from its text and the event's session database, to the objects it acts on, and that one attribution drives everything:
 
-| DDL Type | Action |
-|----------|--------|
-| `CREATE TABLE` | Schema loaded on first row event |
-| `ALTER TABLE` | Cache invalidated, reloaded on next row |
-| `DROP TABLE` | Cache entry removed |
-| `TRUNCATE` | No schema change |
-| `RENAME TABLE` | Old removed, new loaded on first row |
+| DDL | Schema cache | Registry |
+|-----|--------------|----------|
+| `CREATE TABLE`, `ALTER TABLE`, `CREATE/DROP INDEX` of a tracked table | the table's cached shape is forgotten | its new version is registered only by a positional proof (captured after the DDL and proven unchanged since) |
+| `DROP TABLE`, the source of `RENAME TABLE` | forgotten, never reloaded | nothing registered |
+| `TRUNCATE` | unchanged (same shape) | nothing registered |
+| `DROP DATABASE`, `ALTER DATABASE` (database barrier) | every cached table of that database forgotten | later rows need new proof |
+| Statements that cannot be attributed (lineage barrier) | the whole cache forgotten | later rows need new proof |
+| `CREATE VIEW`, `GRANT`, account statements | unchanged | nothing registered |
 
-DDL detection uses the `QueryEvent` type in the binlog. On DDL, the entire database's schema cache is invalidated since MySQL doesn't always specify the exact table in DDL events.
+A DDL never reloads a schema from the live catalog and never touches a table it does not name. A qualified name (`db.t`) is attributed to `db` whatever database the session has active; the session database only resolves unqualified names.
 
 ## API Endpoints
 

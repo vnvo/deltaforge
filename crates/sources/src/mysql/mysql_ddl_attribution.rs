@@ -29,6 +29,44 @@ pub(crate) enum BarrierScopeOf {
     Database(String),
 }
 
+/// The kind of a named object a statement acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObjectKind {
+    Table,
+    View,
+    Database,
+}
+
+impl ObjectKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ObjectKind::Table => "table",
+            ObjectKind::View => "view",
+            ObjectKind::Database => "database",
+        }
+    }
+}
+
+/// One object a statement acts on, as written (after unquoting and
+/// resolving the default database). A database object's `name` is the
+/// database itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DdlObject {
+    pub kind: ObjectKind,
+    pub db: String,
+    pub name: String,
+}
+
+/// A statement's attribution, computed once and used for every purpose:
+/// activation records, schema-cache invalidation and the DDL event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Classified {
+    pub effect: DdlEffect,
+    /// The objects the statement acts on, in statement order (a rename:
+    /// source then target). Empty when unattributed.
+    pub objects: Vec<DdlObject>,
+}
+
 /// What a statement does to base-table shapes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DdlEffect {
@@ -152,6 +190,8 @@ struct P<'a> {
     t: &'a [Tok],
     i: usize,
     default_db: Option<&'a str>,
+    /// Non-table objects the statement names (views), when resolvable.
+    named: Vec<DdlObject>,
 }
 
 impl P<'_> {
@@ -225,6 +265,43 @@ impl P<'_> {
 /// Classify one QueryEvent statement. `default_db` is the event's own
 /// current database (`None` / empty when unknown).
 pub(crate) fn classify(sql: &str, default_db: Option<&str>) -> DdlEffect {
+    classify_statement(sql, default_db).effect
+}
+
+/// Classify one statement with the objects it acts on: the attributed
+/// tables (statement order), a database barrier's database, or the views it
+/// names when resolvable. Uncertain statements have no objects.
+pub(crate) fn classify_statement(
+    sql: &str,
+    default_db: Option<&str>,
+) -> Classified {
+    let mut named = Vec::new();
+    let effect = classify_inner(sql, default_db, &mut named);
+    let table = |t: &TableName| DdlObject {
+        kind: ObjectKind::Table,
+        db: t.db.clone(),
+        name: t.table.clone(),
+    };
+    let objects = match &effect {
+        DdlEffect::Tables(ts) | DdlEffect::SameShape(ts) => {
+            ts.iter().map(table).collect()
+        }
+        DdlEffect::Barrier(BarrierScopeOf::Database(db)) => vec![DdlObject {
+            kind: ObjectKind::Database,
+            db: db.clone(),
+            name: db.clone(),
+        }],
+        DdlEffect::Barrier(BarrierScopeOf::Lineage) => Vec::new(),
+        DdlEffect::None => named,
+    };
+    Classified { effect, objects }
+}
+
+fn classify_inner(
+    sql: &str,
+    default_db: Option<&str>,
+    named: &mut Vec<DdlObject>,
+) -> DdlEffect {
     let lineage = DdlEffect::Barrier(BarrierScopeOf::Lineage);
     let default_db = default_db.filter(|d| !d.is_empty());
     let Some(mut toks) = tokenize(sql) else {
@@ -250,8 +327,11 @@ pub(crate) fn classify(sql: &str, default_db: Option<&str>) -> DdlEffect {
         t: &toks,
         i: 0,
         default_db,
+        named: Vec::new(),
     };
-    classify_tokens(&mut p).unwrap_or(lineage)
+    let effect = classify_tokens(&mut p).unwrap_or(lineage);
+    *named = p.named;
+    effect
 }
 
 /// Whether `sql` is a `DROP [TEMPORARY] TABLE[S]` statement: its tables get
@@ -264,6 +344,7 @@ pub(crate) fn is_drop_table(sql: &str) -> bool {
         t: &toks,
         i: 0,
         default_db: None,
+        named: Vec::new(),
     };
     if !p.eat_kw("DROP") {
         return false;
@@ -344,9 +425,39 @@ fn non_table_object(p: &P<'_>) -> bool {
     NON_TABLE_OBJECTS.iter().any(|k| p.peek_kw(k))
 }
 
+/// `VIEW [db.]name[, ...]` at the cursor: record the views when every name
+/// resolves (`multiple` for DROP's list); never changes a base table.
+fn views(p: &mut P<'_>, multiple: bool) -> Option<DdlEffect> {
+    if !p.eat_kw("VIEW") {
+        return None;
+    }
+    p.eat_kws(&["IF", "NOT", "EXISTS"]);
+    p.eat_kws(&["IF", "EXISTS"]);
+    let mut found = Vec::new();
+    loop {
+        match p.table_name() {
+            Some(v) => found.push(DdlObject {
+                kind: ObjectKind::View,
+                db: v.db,
+                name: v.table,
+            }),
+            // Unresolvable (no default database): unattributed.
+            None => return Some(DdlEffect::None),
+        }
+        if !(multiple && p.eat_punct(',')) {
+            break;
+        }
+    }
+    p.named = found;
+    Some(DdlEffect::None)
+}
+
 fn create(p: &mut P<'_>) -> Option<DdlEffect> {
     p.i = 1;
     skip_create_modifiers(p)?;
+    if p.peek_kw("VIEW") {
+        return views(p, false);
+    }
     if non_table_object(p) {
         return Some(DdlEffect::None);
     }
@@ -377,6 +488,9 @@ fn create(p: &mut P<'_>) -> Option<DdlEffect> {
 fn drop_(p: &mut P<'_>) -> Option<DdlEffect> {
     p.i = 1;
     p.eat_kw("TEMPORARY");
+    if p.peek_kw("VIEW") {
+        return views(p, true);
+    }
     if non_table_object(p) {
         return Some(DdlEffect::None);
     }
@@ -429,6 +543,9 @@ fn alter(p: &mut P<'_>) -> Option<DdlEffect> {
     if non_table_object(p) || p.peek_kw("ALGORITHM") || p.peek_kw("DEFINER") {
         // ALTER [ALGORITHM=..] [DEFINER=..] VIEW / ALTER EVENT etc.
         skip_create_modifiers(p)?;
+        if p.peek_kw("VIEW") {
+            return views(p, false);
+        }
         return non_table_object(p).then_some(DdlEffect::None);
     }
     if p.eat_kw("DATABASE") || p.eat_kw("SCHEMA") {

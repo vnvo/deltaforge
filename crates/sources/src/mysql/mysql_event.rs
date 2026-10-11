@@ -791,109 +791,6 @@ fn build_cdc_watermark(ctx: &RunCtx) -> Option<std::sync::Arc<[u8]>> {
     Some(std::sync::Arc::from(wm.to_bytes()))
 }
 
-/// Extract table name from DDL statement.
-/// Handles: ALTER TABLE t, CREATE TABLE t, DROP TABLE t, TRUNCATE TABLE t, RENAME TABLE t
-fn extract_table_from_ddl(sql: &str) -> Option<String> {
-    let sql_upper = sql.to_uppercase();
-    let sql_trimmed = sql.trim();
-
-    // Find the position after TABLE keyword
-    let table_pos = if sql_upper.starts_with("ALTER TABLE")
-        || sql_upper.starts_with("CREATE TABLE")
-        || sql_upper.starts_with("DROP TABLE")
-        || sql_upper.starts_with("TRUNCATE TABLE")
-    {
-        // Skip "XXX TABLE " prefix
-        sql_upper.find("TABLE").map(|p| p + 6)
-    } else if sql_upper.starts_with("RENAME TABLE") {
-        sql_upper.find("TABLE").map(|p| p + 6)
-    } else if sql_upper.starts_with("TRUNCATE ")
-        && !sql_upper.starts_with("TRUNCATE TABLE")
-    {
-        // TRUNCATE without TABLE keyword
-        Some(9)
-    } else {
-        None
-    }?;
-
-    // Extract the table name (possibly with backticks or schema prefix)
-    let remaining = sql_trimmed.get(table_pos..)?.trim_start();
-
-    // Handle IF EXISTS / IF NOT EXISTS
-    let remaining = if remaining.to_uppercase().starts_with("IF EXISTS ") {
-        remaining.get(10..)?.trim_start()
-    } else if remaining.to_uppercase().starts_with("IF NOT EXISTS ") {
-        remaining.get(14..)?.trim_start()
-    } else {
-        remaining
-    };
-
-    // Extract identifier (handles `backticks`, schema.table, and plain names)
-    let table_name = extract_identifier(remaining)?;
-
-    // If it's schema.table format, take only the table part
-    if let Some(dot_pos) = table_name.find('.') {
-        Some(table_name[dot_pos + 1..].trim_matches('`').to_string())
-    } else {
-        Some(table_name.trim_matches('`').to_string())
-    }
-}
-
-/// Extract an SQL identifier (table/schema name), handling backticks.
-fn extract_identifier(s: &str) -> Option<String> {
-    let s = s.trim_start();
-    if s.is_empty() {
-        return None;
-    }
-
-    if s.starts_with('`') {
-        // Backtick-quoted identifier, possibly with schema: `schema`.`table` or `table`
-        let mut result = String::new();
-        let mut chars = s.chars().peekable();
-        chars.next(); // skip opening backtick
-
-        // Collect first identifier
-        while let Some(&c) = chars.peek() {
-            if c == '`' {
-                chars.next();
-                break;
-            }
-            result.push(c);
-            chars.next();
-        }
-
-        // Check for schema.table pattern
-        if chars.peek() == Some(&'.') {
-            chars.next(); // skip dot
-            result.push('.');
-            if chars.peek() == Some(&'`') {
-                chars.next(); // skip opening backtick
-                while let Some(&c) = chars.peek() {
-                    if c == '`' {
-                        break;
-                    }
-                    result.push(c);
-                    chars.next();
-                }
-            }
-        }
-
-        Some(result)
-    } else {
-        // Unquoted identifier - take until whitespace or special char
-        let end = s
-            .find(|c: char| {
-                c.is_whitespace() || c == '(' || c == ';' || c == ','
-            })
-            .unwrap_or(s.len());
-        if end == 0 {
-            None
-        } else {
-            Some(s[..end].to_string())
-        }
-    }
-}
-
 #[instrument(skip_all)]
 /// Source lineage for DDL identity: prefer the exact GTID source UUID; fall
 /// back to server-id + current binlog file when GTIDs are unavailable.
@@ -1128,9 +1025,16 @@ async fn handle_query(
         return Ok(());
     }
 
+    // The statement's attribution, computed once: activation records, schema
+    // cache invalidation and the DDL event all use it.
+    let classified = super::mysql_ddl_attribution::classify_statement(
+        &q.query,
+        Some(q.schema.as_str()).filter(|d| !d.is_empty()),
+    );
+
     // The activation records this statement implies are durable before its
     // DDL event or its commit boundary is emitted.
-    record_query(ctx, &q).await?;
+    record_query(ctx, &q, &classified).await?;
 
     // Credential-bearing account statements first: never log or emit their raw
     // SQL (it can carry a password, token, or verifier). Emit a fixed redacted DDL
@@ -1144,13 +1048,15 @@ async fn handle_query(
             operation=op,
             "credential DDL detected; SQL redacted"
         );
-        let payload = serde_json::json!({
-            "operation": op,
-            "database": q.schema,
-            "redacted": true,
-            "note": "credential-bearing account statement; raw SQL omitted",
-        });
-        return emit_ddl_event(ctx, header, &q.schema, payload).await;
+        let (db, mut payload) =
+            ddl_identity(&classified, ctx.lower_case_table_names, &q.schema);
+        payload.insert("operation".into(), op.into());
+        payload.insert("redacted".into(), true.into());
+        payload.insert(
+            "note".into(),
+            "credential-bearing account statement; raw SQL omitted".into(),
+        );
+        return emit_ddl_event(ctx, header, &db, payload.into()).await;
     }
 
     // Ordinary (non-credential) DDL.
@@ -1167,34 +1073,12 @@ async fn handle_query(
             "DDL detected"
         );
 
-        let ddl_payload = serde_json::json!({
-            "sql": q.query,
-            "database": q.schema,
-        });
-        emit_ddl_event(ctx, header, &q.schema, ddl_payload).await?;
-
-        // Reload schema after DDL to pick up changes. Try to extract the table
-        // name from the DDL for a targeted reload.
-        if let Some(table_name) = extract_table_from_ddl(&q.query) {
-            let db = if q.schema.is_empty() {
-                &ctx.default_db
-            } else {
-                &q.schema
-            };
-            info!(
-                source_id=%ctx.source_id,
-                db=%db,
-                table=%table_name,
-                "reloading schema after DDL"
-            );
-            if let Err(e) = ctx.schema.reload_schema(db, &table_name).await {
-                warn!(
-                    source_id=%ctx.source_id,
-                    error=?e,
-                    "failed to reload schema after DDL"
-                );
-            }
-        }
+        // The affected tables' cached shapes were invalidated with the
+        // activation records; nothing is reloaded from the live catalog here.
+        let (db, mut payload) =
+            ddl_identity(&classified, ctx.lower_case_table_names, &q.schema);
+        payload.insert("sql".into(), q.query.clone().into());
+        emit_ddl_event(ctx, header, &db, payload.into()).await?;
         return Ok(());
     }
 
@@ -1227,14 +1111,15 @@ async fn handle_query(
 async fn record_query(
     ctx: &mut RunCtx,
     q: &mysql_binlog_connector_rust::event::query_event::QueryEvent,
+    classified: &super::mysql_ddl_attribution::Classified,
 ) -> SourceResult<()> {
     use super::mysql_activation::{
         BarrierScope, EventIdentity, record_barrier, record_ddl,
     };
-    use super::mysql_ddl_attribution::{BarrierScopeOf, DdlEffect, classify};
+    use super::mysql_ddl_attribution::{BarrierScopeOf, DdlEffect};
 
-    let default_db = Some(q.schema.as_str()).filter(|d| !d.is_empty());
-    let effect = classify(&q.query, default_db);
+    let effect =
+        effective_effect(&classified.effect, ctx.lower_case_table_names);
     let lctn = ctx.lower_case_table_names;
     let name = |n: &str| {
         if lctn == 1 {
@@ -1245,15 +1130,8 @@ async fn record_query(
     };
     let (tables, barrier) = match effect {
         DdlEffect::None | DdlEffect::SameShape(_) => return Ok(()),
-        DdlEffect::Tables(_) if lctn == 2 => {
-            (Vec::new(), Some(BarrierScope::Lineage))
-        }
         DdlEffect::Tables(tables) => (tables, None),
         DdlEffect::Barrier(BarrierScopeOf::Lineage) => {
-            (Vec::new(), Some(BarrierScope::Lineage))
-        }
-        DdlEffect::Barrier(BarrierScopeOf::Database(db)) if lctn == 2 => {
-            let _ = db;
             (Vec::new(), Some(BarrierScope::Lineage))
         }
         DdlEffect::Barrier(BarrierScopeOf::Database(db)) => {
@@ -1334,6 +1212,7 @@ async fn record_query(
             });
         }
     }
+    let cache_barrier = barrier.clone();
     if let Some(barrier) = barrier {
         info!(
             source_id = %ctx.source_id,
@@ -1358,7 +1237,102 @@ async fn record_query(
             ctx.selection.invalidate(key);
         }
     }
+    // The loader's cached shapes of what the statement may change are stale:
+    // forgotten, never reloaded here (a new version enters the registry only
+    // through a positional proof). Only tracked tables are touched; dropped
+    // and renamed-away tables are simply forgotten.
+    match cache_barrier {
+        Some(BarrierScope::Lineage) => ctx.schema.clear_cache().await,
+        Some(BarrierScope::Database { db }) => {
+            ctx.schema.invalidate_db(&db).await
+        }
+        None => {
+            for t in &tables {
+                let (db, table) = (name(&t.db), name(&t.table));
+                if ctx.allow.matches(&db, &table) {
+                    ctx.schema.invalidate_table(&db, &table).await;
+                }
+            }
+        }
+    }
     Ok(())
+}
+
+/// `effect` as the source applies it: under `lower_case_table_names = 2`
+/// (stored as written, compared case-insensitively) names cannot be mapped
+/// to registry keys with certainty, so table and database attributions are
+/// lineage barriers.
+fn effective_effect(
+    effect: &super::mysql_ddl_attribution::DdlEffect,
+    lower_case_table_names: u8,
+) -> super::mysql_ddl_attribution::DdlEffect {
+    use super::mysql_ddl_attribution::{BarrierScopeOf, DdlEffect};
+    match effect {
+        DdlEffect::Tables(_)
+        | DdlEffect::Barrier(BarrierScopeOf::Database(_))
+            if lower_case_table_names == 2 =>
+        {
+            DdlEffect::Barrier(BarrierScopeOf::Lineage)
+        }
+        other => other.clone(),
+    }
+}
+
+/// The DDL event payload format (`ddl_format`).
+pub(crate) const DDL_FORMAT: u64 = 2;
+
+/// A DDL event's identity: `source.db` and the payload fields every DDL
+/// event carries (format 2).
+///
+/// - `scope`: `tables`, `same_shape`, `database`, `lineage` or `none`, as
+///   the source applies the statement.
+/// - `objects`: `{kind, database, name}` in statement order (a rename:
+///   source then target), empty when unattributed.
+/// - `database` / `source.db`: the one database every object belongs to;
+///   `null` / `""` when the objects span databases or there are none.
+/// - `session_database`: the statement's connection context (`null` when
+///   none); never used for attribution.
+pub(crate) fn ddl_identity(
+    classified: &super::mysql_ddl_attribution::Classified,
+    lower_case_table_names: u8,
+    session_db: &str,
+) -> (String, serde_json::Map<String, serde_json::Value>) {
+    use super::mysql_ddl_attribution::{BarrierScopeOf, DdlEffect};
+    let scope =
+        match effective_effect(&classified.effect, lower_case_table_names) {
+            DdlEffect::Tables(_) => "tables",
+            DdlEffect::SameShape(_) => "same_shape",
+            DdlEffect::Barrier(BarrierScopeOf::Database(_)) => "database",
+            DdlEffect::Barrier(BarrierScopeOf::Lineage) => "lineage",
+            DdlEffect::None => "none",
+        };
+    let objects: Vec<serde_json::Value> = classified
+        .objects
+        .iter()
+        .map(|o| {
+            serde_json::json!({
+                "kind": o.kind.as_str(),
+                "database": o.db,
+                "name": o.name,
+            })
+        })
+        .collect();
+    let database = match classified.objects.split_first() {
+        Some((first, rest)) if rest.iter().all(|o| o.db == first.db) => {
+            Some(first.db.clone())
+        }
+        _ => None,
+    };
+    let mut payload = serde_json::Map::new();
+    payload.insert("ddl_format".into(), DDL_FORMAT.into());
+    payload.insert("scope".into(), scope.into());
+    payload.insert("objects".into(), objects.into());
+    payload.insert("database".into(), database.clone().into());
+    payload.insert(
+        "session_database".into(),
+        Some(session_db).filter(|d| !d.is_empty()).into(),
+    );
+    (database.unwrap_or_default(), payload)
 }
 
 /// `deltaforge_source_events_total` labels for `tm`'s table (table labels
@@ -2064,84 +2038,6 @@ mod tests {
         assert_eq!(delete.source.connector, "mysql");
     }
 
-    #[test]
-    fn extract_table_from_ddl_alter_table() {
-        assert_eq!(
-            extract_table_from_ddl(
-                "ALTER TABLE orders ADD COLUMN status VARCHAR(32)"
-            ),
-            Some("orders".to_string())
-        );
-        assert_eq!(
-            extract_table_from_ddl(
-                "ALTER TABLE `orders` ADD COLUMN status VARCHAR(32)"
-            ),
-            Some("orders".to_string())
-        );
-        assert_eq!(
-            extract_table_from_ddl(
-                "ALTER TABLE shop.orders ADD COLUMN status VARCHAR(32)"
-            ),
-            Some("orders".to_string())
-        );
-        assert_eq!(
-            extract_table_from_ddl(
-                "ALTER TABLE `shop`.`orders` ADD COLUMN status VARCHAR(32)"
-            ),
-            Some("orders".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_table_from_ddl_create_table() {
-        assert_eq!(
-            extract_table_from_ddl("CREATE TABLE users (id INT PRIMARY KEY)"),
-            Some("users".to_string())
-        );
-        assert_eq!(
-            extract_table_from_ddl("CREATE TABLE IF NOT EXISTS users (id INT)"),
-            Some("users".to_string())
-        );
-        assert_eq!(
-            extract_table_from_ddl("CREATE TABLE `my_db`.`users` (id INT)"),
-            Some("users".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_table_from_ddl_drop_table() {
-        assert_eq!(
-            extract_table_from_ddl("DROP TABLE orders"),
-            Some("orders".to_string())
-        );
-        assert_eq!(
-            extract_table_from_ddl("DROP TABLE IF EXISTS orders"),
-            Some("orders".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_table_from_ddl_truncate() {
-        assert_eq!(
-            extract_table_from_ddl("TRUNCATE TABLE orders"),
-            Some("orders".to_string())
-        );
-        assert_eq!(
-            extract_table_from_ddl("TRUNCATE orders"),
-            Some("orders".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_table_from_ddl_non_ddl() {
-        assert_eq!(extract_table_from_ddl("SELECT * FROM orders"), None);
-        assert_eq!(
-            extract_table_from_ddl("INSERT INTO orders VALUES (1)"),
-            None
-        );
-        assert_eq!(extract_table_from_ddl("BEGIN"), None);
-    }
-
     // =========================================================================
     // merge_gtid tests
     // =========================================================================
@@ -2209,32 +2105,8 @@ mod tests {
     }
 
     // =========================================================================
-    // extract_identifier / RENAME TABLE
+    // QueryEvent helpers
     // =========================================================================
-
-    #[test]
-    fn extract_identifier_stops_at_each_delimiter() {
-        // Each unquoted terminator individually - pins the `||` chain.
-        assert_eq!(extract_identifier("foo bar").as_deref(), Some("foo"));
-        assert_eq!(extract_identifier("foo(x)").as_deref(), Some("foo"));
-        assert_eq!(extract_identifier("foo;").as_deref(), Some("foo"));
-        assert_eq!(extract_identifier("foo,bar").as_deref(), Some("foo"));
-        // Backtick-quoted schema.table.
-        assert_eq!(
-            extract_identifier("`sch`.`tbl`").as_deref(),
-            Some("sch.tbl")
-        );
-        assert_eq!(extract_identifier(""), None);
-    }
-
-    #[test]
-    fn extract_table_from_ddl_rename() {
-        // The RENAME TABLE branch - untested, so its `+ 6` offset survived.
-        assert_eq!(
-            extract_table_from_ddl("RENAME TABLE foo TO bar").as_deref(),
-            Some("foo")
-        );
-    }
 
     fn query_event(sql: &str) -> QueryEvent {
         QueryEvent {
@@ -2646,6 +2518,198 @@ mod tests {
             == Kind::Barrier {
                 scope: BarrierScope::Lineage
             }));
+    }
+
+    /// The emitted DDL event's (`source.db`, payload) for `sql` run with
+    /// session database `session`.
+    async fn ddl_of(sql: &str, session: &str) -> (String, serde_json::Value) {
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        with_scope(&mut ctx).await;
+        let mut q = query_event(sql);
+        q.schema = session.to_string();
+        handle_query(&mut ctx, &make_header(), q).await.unwrap();
+        let ev = recv_event(&mut rx).await.expect("a DDL event");
+        assert_eq!(ev.source.table, "_ddl");
+        (ev.source.db.clone(), ev.ddl.clone().unwrap())
+    }
+
+    fn obj(kind: &str, db: &str, name: &str) -> serde_json::Value {
+        serde_json::json!({"kind": kind, "database": db, "name": name})
+    }
+
+    /// The DDL event names what the statement acts on, never the session
+    /// database: qualified names without or with another active database,
+    /// unqualified names in the active one, renames within and across
+    /// databases, multi-table statements, views and barriers.
+    #[tokio::test]
+    async fn ddl_events_identify_the_affected_objects() {
+        use serde_json::{Value, json};
+        let cases: Vec<(&str, &str, &str, &str, Value, Value)> = vec![
+            // (sql, session db, scope, source.db, objects, payload database)
+            (
+                "ALTER TABLE shop.orders ADD COLUMN x INT",
+                "",
+                "tables",
+                "shop",
+                json!([obj("table", "shop", "orders")]),
+                json!("shop"),
+            ),
+            (
+                "ALTER TABLE shop.orders ADD COLUMN x INT",
+                "other",
+                "tables",
+                "shop",
+                json!([obj("table", "shop", "orders")]),
+                json!("shop"),
+            ),
+            (
+                "ALTER TABLE orders ADD COLUMN x INT",
+                "app",
+                "tables",
+                "app",
+                json!([obj("table", "app", "orders")]),
+                json!("app"),
+            ),
+            (
+                "RENAME TABLE shop.a TO shop.b",
+                "",
+                "tables",
+                "shop",
+                json!([obj("table", "shop", "a"), obj("table", "shop", "b")]),
+                json!("shop"),
+            ),
+            (
+                "RENAME TABLE shop.a TO archive.a",
+                "shop",
+                "tables",
+                "",
+                json!([
+                    obj("table", "shop", "a"),
+                    obj("table", "archive", "a")
+                ]),
+                Value::Null,
+            ),
+            (
+                "DROP TABLE shop.b, shop.a, shop.c",
+                "",
+                "tables",
+                "shop",
+                json!([
+                    obj("table", "shop", "b"),
+                    obj("table", "shop", "a"),
+                    obj("table", "shop", "c")
+                ]),
+                json!("shop"),
+            ),
+            (
+                "TRUNCATE TABLE shop.orders",
+                "",
+                "same_shape",
+                "shop",
+                json!([obj("table", "shop", "orders")]),
+                json!("shop"),
+            ),
+            (
+                "CREATE VIEW v AS SELECT 1",
+                "app",
+                "none",
+                "app",
+                json!([obj("view", "app", "v")]),
+                json!("app"),
+            ),
+            (
+                "CREATE OR REPLACE ALGORITHM=MERGE VIEW shop.v AS SELECT 1",
+                "",
+                "none",
+                "shop",
+                json!([obj("view", "shop", "v")]),
+                json!("shop"),
+            ),
+            (
+                "CREATE VIEW v AS SELECT 1",
+                "",
+                "none",
+                "",
+                json!([]),
+                Value::Null,
+            ),
+            (
+                "DROP DATABASE shop",
+                "app",
+                "database",
+                "shop",
+                json!([obj("database", "shop", "shop")]),
+                json!("shop"),
+            ),
+            (
+                "ALTER TABLE orders ADD x INT",
+                "",
+                "lineage",
+                "",
+                json!([]),
+                Value::Null,
+            ),
+            (
+                "CREATE TRIGGER t BEFORE INSERT ON orders FOR EACH ROW SET @a = 1",
+                "app",
+                "none",
+                "",
+                json!([]),
+                Value::Null,
+            ),
+        ];
+        for (sql, session, scope, db, objects, database) in cases {
+            let (source_db, p) = ddl_of(sql, session).await;
+            assert_eq!(p["ddl_format"], 2, "{sql}");
+            assert_eq!(p["scope"], scope, "{sql}: {p}");
+            assert_eq!(p["objects"], objects, "{sql}: {p}");
+            assert_eq!(p["database"], database, "{sql}: {p}");
+            assert_eq!(source_db, db, "{sql}: {p}");
+            let session_json = if session.is_empty() {
+                Value::Null
+            } else {
+                json!(session)
+            };
+            assert_eq!(p["session_database"], session_json, "{sql}");
+            assert_eq!(p["sql"], sql);
+        }
+    }
+
+    /// Credential statements are unattributed and keep their SQL redacted.
+    #[tokio::test]
+    async fn credential_ddl_events_are_scope_none_and_redacted() {
+        let (db, p) =
+            ddl_of("CREATE USER 'df'@'%' IDENTIFIED BY 'secret'", "app").await;
+        assert_eq!(db, "");
+        assert_eq!(p["scope"], "none");
+        assert_eq!(p["objects"], serde_json::json!([]));
+        assert_eq!(p["database"], serde_json::Value::Null);
+        assert_eq!(p["session_database"], "app");
+        assert_eq!(p["redacted"], true);
+        assert!(!p.to_string().contains("secret"));
+        assert!(p.get("sql").is_none());
+    }
+
+    /// The format-2 identity serializes deterministically: fixed key order,
+    /// objects in statement order.
+    #[test]
+    fn ddl_identity_serializes_deterministically() {
+        let c = super::super::mysql_ddl_attribution::classify_statement(
+            "RENAME TABLE `b`.`y` TO a.x, b.z TO b.w",
+            None,
+        );
+        let (db, payload) = ddl_identity(&c, 0, "s");
+        assert_eq!(db, "");
+        assert_eq!(
+            serde_json::Value::Object(payload).to_string(),
+            r#"{"ddl_format":2,"scope":"tables","objects":[{"kind":"table","database":"b","name":"y"},{"kind":"table","database":"a","name":"x"},{"kind":"table","database":"b","name":"z"},{"kind":"table","database":"b","name":"w"}],"database":null,"session_database":"s"}"#
+        );
+        // Under lower_case_table_names = 2 the same statement is a lineage
+        // barrier; its objects stay named.
+        let (_, p) = ddl_identity(&c, 2, "s");
+        assert_eq!(p["scope"], "lineage");
+        assert_eq!(p["objects"].as_array().unwrap().len(), 4);
     }
 
     #[tokio::test]

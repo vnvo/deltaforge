@@ -24,6 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (MySQL DDL events): payload format 2 names the affected objects** - DDL events used to carry the statement's *session* database in `source.db` and payload `database`: empty for a qualified statement run without an active database, and the wrong database when another one was active. Each DDL statement is now attributed once, and its event carries:
+  - `ddl_format: 2`;
+  - `scope` (`tables`, `same_shape`, `database`, `lineage`, `none`);
+  - `objects` (`{kind, database, name}` in statement order, a rename listing source and target);
+  - `database` and `source.db` naming the single database of all objects (`null` / `""` when the objects span databases or the statement is unattributed);
+  - `session_database` for the connection context.
+
+  CREATE VIEW is attributed to its schema when resolvable. Account statements are `scope: none`, still redacted.
+
+  **Migration:** consumers that route or apply DDL by `source.db` or payload `database` now get the affected database (or none), not the session's. Read `objects` for the full identity, and `session_database` for the old value. A consumer can tell the formats apart by `ddl_format` (absent before).
+
+  Also, a DDL no longer reloads a schema from the live catalog (the reload targeted the session database, logged `failed to reload schema after DDL ... table .t not found`, and could register a later live definition against an earlier DDL without proof). Affected tables' cached shapes are forgotten, and their new versions are registered only by positional proof. Row decoding was already proof-based, so emitted row values do not change.
 - **Breaking (metrics): no table labels by default** - `deltaforge_source_events_total`, `deltaforge_snapshot_rows_total`, the S3 sink's `deltaforge_sink_s3_files_committed_total` and `deltaforge_sink_bytes_total`, and the five per-table schema-sensing metrics lose their `table` label; `deltaforge_source_table_lag_seconds` is emitted only with `metrics.per_table` enabled. The schema-sensing metrics and the `deltaforge_schema_tables_total` / `deltaforge_schema_dynamic_maps_total` gauges gain `pipeline` (pipelines previously shared one series). Table labels, when enabled, are qualified as the sources qualify them (`schema.table` on PostgreSQL, previously `database.table` in the lag gauge; `namespace.table` in the S3 sink, previously the bare table name). Dashboards: aggregate with `sum without (table) (...)`, or enable per-table detail and select `table_scope="exact"`.
 - **Breaking (upgrade): a snapshot taken by an earlier release may be copied once more, in full** - snapshot state moves to durable snapshot generations. At the first start after the upgrade, each source's earlier snapshot record is classified, with its lineage verified first:
   - **Proven complete:** it is upgraded in place, with nothing copied again, only when the sink checkpoints prove the completion under the pipeline's commit policy (every required sink, or the quorum).

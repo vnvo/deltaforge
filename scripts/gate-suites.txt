@@ -45,6 +45,7 @@ parallel   sources/mysql_activation_e2e     -p sources --test mysql_activation_e
 parallel   sources/mysql_cdc_e2e            -p sources --test mysql_cdc_e2e
 parallel   sources/mysql_checkpoint_lineage_e2e -p sources --test mysql_checkpoint_lineage_e2e
 parallel   sources/mysql_connection_identity_e2e -p sources --test mysql_connection_identity_e2e
+parallel   sources/mysql_ddl_attribution_e2e -p sources --test mysql_ddl_attribution_e2e
 parallel   sources/mysql_ddl_replay_failclosed -p sources --test mysql_ddl_replay_failclosed
 parallel   sources/mysql_failover_drift_e2e -p sources --test mysql_failover_drift_e2e
 parallel   sources/mysql_lineage_failclosed -p sources --test mysql_lineage_failclosed
