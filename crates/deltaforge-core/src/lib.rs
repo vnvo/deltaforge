@@ -45,6 +45,7 @@ pub use event_id::{
 pub mod journal;
 pub use journal::{DlqMeta, JournalEntry};
 
+pub mod canonical;
 pub mod canonical_json;
 pub use canonical_json::canonical_json_bytes;
 
