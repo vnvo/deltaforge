@@ -26,13 +26,37 @@ use bytes::{BufMut, Bytes, BytesMut};
 use metrics::counter;
 use parking_lot::RwLock;
 use serde::Serialize;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::EncodingError;
+use super::avro_infer::Inferred;
 
 // =============================================================================
 // Source schema provider trait
 // =============================================================================
+
+/// The registered source schema version an event was produced under: the
+/// schema registry's content hash of the table schema and, when the event
+/// records it, the registry sequence of that version.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SchemaIdentity {
+    pub fingerprint: String,
+    pub sequence: Option<u64>,
+}
+
+impl SchemaIdentity {
+    /// The identity an event carries (`schema_version`, `schema_sequence`),
+    /// or `None` when it carries no schema version.
+    pub fn of(
+        fingerprint: Option<&str>,
+        sequence: Option<u64>,
+    ) -> Option<Self> {
+        fingerprint.map(|f| Self {
+            fingerprint: f.to_string(),
+            sequence,
+        })
+    }
+}
 
 /// Provides DDL-derived Avro schemas for CDC events (Path A).
 ///
@@ -42,13 +66,20 @@ use super::EncodingError;
 /// The returned schema string is a complete Avro envelope schema JSON
 /// (built by [`super::avro_schema::build_envelope_schema`]).
 pub trait SourceSchemaProvider: Send + Sync {
-    /// Look up the Avro envelope schema for a given source table.
+    /// The Avro envelope schema of `db.table` at exactly the registered
+    /// version `identity` names, never the table's latest schema.
     fn get_envelope_schema(
         &self,
         connector: &str,
         db: &str,
         table: &str,
+        identity: &SchemaIdentity,
     ) -> EnvelopeSchemaLookup;
+
+    /// Identifies the column-to-Avro type mapping (its version and
+    /// options): the same source schema maps to a different Avro schema
+    /// under another mapping.
+    fn mapping_id(&self) -> &str;
 }
 
 /// Outcome of a DDL-derived Avro schema lookup.
@@ -56,12 +87,17 @@ pub trait SourceSchemaProvider: Send + Sync {
 pub enum EnvelopeSchemaLookup {
     /// DDL is available: `(schema_json, parsed_schema)` (Path A).
     Found(String, Arc<AvroSchema>),
-    /// No DDL is known for the table: fall back to JSON inference (Path C).
+    /// The provider does not serve this source: fall back to JSON
+    /// inference (Path C).
     Absent,
     /// The source schema cannot be read right now (for example the source has
     /// not yet verified its server). Encoding must fail retryably: inferring
     /// and registering a schema here would fix a wrong schema for the subject.
     Unavailable(String),
+    /// The event's schema version is not the registered one: its
+    /// fingerprint is unknown, or registered under another sequence.
+    /// Encoding must stop: no schema can be trusted for the event.
+    Conflict(String),
 }
 
 // =============================================================================
@@ -100,14 +136,60 @@ impl SubjectStrategy {
 // Schema Registry client
 // =============================================================================
 
+/// The canonical hash of an Avro schema JSON: SHA-256 of its JSON with
+/// object keys sorted and no whitespace. Two texts of the same schema share
+/// it; schemas differing in any type, name, logical type or attribute do not.
+pub fn canonical_schema_hash(
+    schema_json: &str,
+) -> Result<String, EncodingError> {
+    use sha2::{Digest, Sha256};
+    fn write(v: &serde_json::Value, out: &mut String) {
+        match v {
+            serde_json::Value::Object(m) => {
+                let mut keys: Vec<&String> = m.keys().collect();
+                keys.sort();
+                out.push('{');
+                for (i, k) in keys.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(
+                        &serde_json::Value::from(k.as_str()).to_string(),
+                    );
+                    out.push(':');
+                    write(&m[k], out);
+                }
+                out.push('}');
+            }
+            serde_json::Value::Array(a) => {
+                out.push('[');
+                for (i, x) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write(x, out);
+                }
+                out.push(']');
+            }
+            scalar => out.push_str(&scalar.to_string()),
+        }
+    }
+    let v: serde_json::Value = serde_json::from_str(schema_json)
+        .map_err(|e| EncodingError::Avro(format!("schema is not JSON: {e}")))?;
+    let mut canonical = String::with_capacity(schema_json.len());
+    write(&v, &mut canonical);
+    Ok(hex::encode(Sha256::digest(canonical.as_bytes())))
+}
+
 /// Confluent Schema Registry HTTP client.
 ///
-/// Supports schema registration, lookup, and caching.
+/// Registered schema IDs are cached per `(subject, canonical schema hash)`:
+/// a cached ID is only ever returned for the exact schema it was
+/// registered for, never for another version of the subject.
 pub struct SchemaRegistryClient {
     client: reqwest::Client,
     base_url: String,
-    /// Cache: subject → (schema_id, avro_schema)
-    cache: Arc<RwLock<HashMap<String, CachedSchema>>>,
+    cache: Arc<RwLock<HashMap<(String, String), CachedSchema>>>,
 }
 
 #[derive(Clone)]
@@ -122,10 +204,9 @@ struct RegisterResponse {
     id: u32,
 }
 
-/// Response from POST /subjects/{subject} (lookup)
+/// Response from GET /subjects/{subject}/versions/latest
 #[derive(serde::Deserialize)]
-struct LookupResponse {
-    id: u32,
+struct LatestResponse {
     schema: String,
 }
 
@@ -140,21 +221,13 @@ impl SchemaRegistryClient {
     /// Create a new Schema Registry client.
     pub fn new(
         base_url: &str,
-        username: Option<&str>,
-        password: Option<&str>,
+        _username: Option<&str>,
+        _password: Option<&str>,
     ) -> Result<Self, EncodingError> {
-        let mut builder = reqwest::Client::builder()
+        // Credentials are sent per request (see `AvroEncoder::auth`).
+        let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
-            .connect_timeout(std::time::Duration::from_secs(5));
-
-        if let (Some(u), Some(p)) = (username, password) {
-            // reqwest doesn't have default basic auth on the client,
-            // we'll add it per-request
-            let _ = (u, p); // suppress unused warning, handled in request methods
-            let _ = &mut builder;
-        }
-
-        let client = builder
+            .connect_timeout(std::time::Duration::from_secs(5))
             .build()
             .map_err(|e| EncodingError::SchemaRegistry(e.to_string()))?;
 
@@ -165,7 +238,7 @@ impl SchemaRegistryClient {
         })
     }
 
-    /// Register a schema for a subject, or return the existing ID if already registered.
+    /// Register `schema_json` under `subject`, or return its existing ID.
     ///
     /// Uses the Schema Registry's idempotent registration endpoint:
     /// POST /subjects/{subject}/versions
@@ -175,34 +248,41 @@ impl SchemaRegistryClient {
         schema_json: &str,
         auth: Option<(&str, &str)>,
     ) -> Result<(u32, Arc<AvroSchema>), EncodingError> {
-        // Check cache first
-        {
-            let cache = self.cache.read();
-            if let Some(cached) = cache.get(subject) {
-                return Ok((cached.id, cached.schema.clone()));
-            }
+        let hash = canonical_schema_hash(schema_json)?;
+        self.register_hashed(subject, schema_json, &hash, auth)
+            .await
+    }
+
+    async fn register_hashed(
+        &self,
+        subject: &str,
+        schema_json: &str,
+        hash: &str,
+        auth: Option<(&str, &str)>,
+    ) -> Result<(u32, Arc<AvroSchema>), EncodingError> {
+        if let Some(cached) = self.get_cached(subject, hash) {
+            return Ok(cached);
         }
+        let schema = AvroSchema::parse_str(schema_json).map_err(|e| {
+            EncodingError::Avro(format!("failed to parse schema: {e}"))
+        })?;
 
-        // Register with Schema Registry
         let url = format!("{}/subjects/{}/versions", self.base_url, subject);
-
         let body = serde_json::json!({
             "schema": schema_json,
             "schemaType": "AVRO"
         });
-
         let mut req = self
             .client
             .post(&url)
             .header("Content-Type", "application/vnd.schemaregistry.v1+json")
             .json(&body);
-
         if let Some((u, p)) = auth {
             req = req.basic_auth(u, Some(p));
         }
 
         let resp = req.send().await.map_err(|e| {
-            EncodingError::SchemaRegistry(format!(
+            EncodingError::SchemaRegistryUnavailable(format!(
                 "failed to register schema for subject {subject}: {e}"
             ))
         })?;
@@ -210,31 +290,27 @@ impl SchemaRegistryClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            // Try to parse structured error
-            if let Ok(sr_err) = serde_json::from_str::<SrErrorResponse>(&body) {
-                return Err(EncodingError::SchemaRegistry(format!(
-                    "schema registration failed for {subject}: {} (code: {})",
+            let details = match serde_json::from_str::<SrErrorResponse>(&body) {
+                Ok(sr_err) => format!(
+                    "{} (code: {})",
                     sr_err.message.unwrap_or_default(),
                     sr_err.error_code.unwrap_or(0),
-                )));
-            }
-            return Err(EncodingError::SchemaRegistry(format!(
-                "schema registration failed for {subject}: HTTP {status}: {body}"
-            )));
+                ),
+                Err(_) => format!("HTTP {status}: {body}"),
+            };
+            return Err(registry_error(
+                status,
+                subject,
+                format!("schema registration failed for {subject}: {details}"),
+            ));
         }
 
         let register_resp: RegisterResponse =
             resp.json().await.map_err(|e| {
-                EncodingError::SchemaRegistry(format!(
+                EncodingError::SchemaRegistryUnavailable(format!(
                     "invalid response from schema registry: {e}"
                 ))
             })?;
-
-        let schema = AvroSchema::parse_str(schema_json).map_err(|e| {
-            EncodingError::Avro(format!(
-                "failed to parse registered schema: {e}"
-            ))
-        })?;
         let schema = Arc::new(schema);
 
         debug!(
@@ -243,109 +319,98 @@ impl SchemaRegistryClient {
             "registered Avro schema"
         );
 
-        // Cache it
-        {
-            let mut cache = self.cache.write();
-            cache.insert(
-                subject.to_string(),
-                CachedSchema {
-                    id: register_resp.id,
-                    schema: schema.clone(),
-                },
-            );
-        }
+        self.cache.write().insert(
+            (subject.to_string(), hash.to_string()),
+            CachedSchema {
+                id: register_resp.id,
+                schema: schema.clone(),
+            },
+        );
 
         Ok((register_resp.id, schema))
     }
 
-    /// Look up an existing schema by subject (without registering).
-    #[allow(dead_code)]
-    pub async fn lookup_schema(
+    /// The latest schema registered under `subject`, or `None` when the
+    /// subject has none.
+    pub async fn latest_schema(
         &self,
         subject: &str,
-        schema_json: &str,
         auth: Option<(&str, &str)>,
-    ) -> Result<Option<(u32, Arc<AvroSchema>)>, EncodingError> {
-        // Check cache first
-        {
-            let cache = self.cache.read();
-            if let Some(cached) = cache.get(subject) {
-                return Ok(Some((cached.id, cached.schema.clone())));
-            }
-        }
-
-        let url = format!("{}/subjects/{}", self.base_url, subject);
-        let body = serde_json::json!({
-            "schema": schema_json,
-            "schemaType": "AVRO"
-        });
-
-        let mut req = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/vnd.schemaregistry.v1+json")
-            .json(&body);
-
+    ) -> Result<Option<String>, EncodingError> {
+        let url =
+            format!("{}/subjects/{}/versions/latest", self.base_url, subject);
+        let mut req = self.client.get(&url);
         if let Some((u, p)) = auth {
             req = req.basic_auth(u, Some(p));
         }
-
         let resp = req.send().await.map_err(|e| {
-            EncodingError::SchemaRegistry(format!(
-                "schema lookup failed for {subject}: {e}"
+            EncodingError::SchemaRegistryUnavailable(format!(
+                "latest schema lookup failed for {subject}: {e}"
             ))
         })?;
-
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(EncodingError::SchemaRegistry(format!(
-                "schema lookup failed for {subject}: HTTP {status}: {body}"
-            )));
+            return Err(registry_error(
+                status,
+                subject,
+                format!(
+                    "latest schema lookup failed for {subject}: HTTP {status}: {body}"
+                ),
+            ));
         }
-
-        let lookup: LookupResponse = resp.json().await.map_err(|e| {
-            EncodingError::SchemaRegistry(format!(
-                "invalid lookup response: {e}"
+        let latest: LatestResponse = resp.json().await.map_err(|e| {
+            EncodingError::SchemaRegistryUnavailable(format!(
+                "invalid latest schema response: {e}"
             ))
         })?;
-
-        let schema = AvroSchema::parse_str(&lookup.schema).map_err(|e| {
-            EncodingError::Avro(format!(
-                "failed to parse schema from registry: {e}"
-            ))
-        })?;
-        let schema = Arc::new(schema);
-
-        // Cache it
-        {
-            let mut cache = self.cache.write();
-            cache.insert(
-                subject.to_string(),
-                CachedSchema {
-                    id: lookup.id,
-                    schema: schema.clone(),
-                },
-            );
-        }
-
-        Ok(Some((lookup.id, schema)))
+        Ok(Some(latest.schema))
     }
 
-    /// Get cached schema for a subject (if previously registered).
-    pub fn get_cached(&self, subject: &str) -> Option<(u32, Arc<AvroSchema>)> {
-        let cache = self.cache.read();
-        cache.get(subject).map(|c| (c.id, c.schema.clone()))
+    /// The cached ID of exactly the schema with canonical hash `hash`
+    /// under `subject`.
+    pub fn get_cached(
+        &self,
+        subject: &str,
+        hash: &str,
+    ) -> Option<(u32, Arc<AvroSchema>)> {
+        self.cache
+            .read()
+            .get(&(subject.to_string(), hash.to_string()))
+            .map(|c| (c.id, c.schema.clone()))
     }
 
-    /// Clear the schema cache (useful for testing or schema evolution).
-    #[allow(dead_code)]
+    /// Clear the schema cache; the next encode of each schema registers
+    /// it again (idempotent in the registry).
     pub fn clear_cache(&self) {
         self.cache.write().clear();
+    }
+}
+
+/// The error for a Schema Registry error response: an outage (5xx, 408,
+/// 429) is retryable, 409 is a compatibility rejection, anything else a
+/// registry error. None is a property of the event.
+fn registry_error(
+    status: reqwest::StatusCode,
+    subject: &str,
+    details: String,
+) -> EncodingError {
+    use reqwest::StatusCode as S;
+    match status {
+        S::CONFLICT => EncodingError::SchemaRejected {
+            subject: subject.to_string(),
+            details,
+        },
+        s if s.is_server_error()
+            || s == S::REQUEST_TIMEOUT
+            || s == S::TOO_MANY_REQUESTS =>
+        {
+            EncodingError::SchemaRegistryUnavailable(details)
+        }
+        _ => EncodingError::SchemaRegistry(details),
     }
 }
 
@@ -353,22 +418,70 @@ impl SchemaRegistryClient {
 // Avro Encoder
 // =============================================================================
 
+/// What a DDL-derived (Path A) schema is resolved for: the subject, the
+/// source table, the exact source schema version the event was produced
+/// under, and the type mapping.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ResolvedKey {
+    subject: String,
+    connector: String,
+    db: String,
+    table: String,
+    identity: SchemaIdentity,
+    mapping: String,
+}
+
+/// A schema registered for a subject: its ID and parsed schema.
+type Registered = (u32, Arc<AvroSchema>);
+
+/// The Schema Registry subject of a topic's DDL events: stable, separate from
+/// every row subject, so neither's compatibility checks affect the other.
+pub fn ddl_subject(topic: &str) -> String {
+    format!(
+        "{topic}-deltaforge.DdlEvent-v{}",
+        super::avro_schema::DDL_MAPPING_VERSION
+    )
+}
+
+/// What a DDL schema is registered for: the subject, the canonical hash of
+/// the explicit DDL schema and its mapping version.
+type DdlKey = (String, String, u32);
+
+/// The current widened inferred schema of a subject and record name.
+struct InferredState {
+    shape: Inferred,
+    schema_json: String,
+    hash: String,
+}
+
 /// Avro encoder that produces Confluent wire format.
 ///
 /// Serializes events as:
 /// - Byte 0: Magic byte (0x00)
 /// - Bytes 1-4: Schema ID (big-endian u32)
 /// - Bytes 5+: Avro binary-encoded payload
+///
+/// Each event is encoded with the schema it requires. A DDL-derived event
+/// uses exactly the source schema version it carries (cached per subject,
+/// table, version and type mapping), so events of different versions, in
+/// any order, each get their own schema and ID. An event without a source
+/// schema version uses the subject's inferred schema, widened to hold it.
 pub struct AvroEncoder {
     registry: SchemaRegistryClient,
     strategy: SubjectStrategy,
     auth: Option<(String, String)>,
     /// Optional DDL-derived schema provider (Path A).
-    /// When set, the encoder uses precise DDL-derived Avro schemas
-    /// instead of inferring from JSON (Path C).
     source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
     /// Cache: topic → resolved subject name (avoids format! per event)
     subject_cache: RwLock<HashMap<String, String>>,
+    /// Path A: the registered schema of each resolved version.
+    resolved: RwLock<HashMap<ResolvedKey, Registered>>,
+    /// Path C: (subject, record name) → widened inferred schema.
+    inferred: RwLock<HashMap<(String, String), InferredState>>,
+    /// DDL schemas by connector: (schema JSON, canonical hash).
+    ddl_schemas: RwLock<HashMap<String, (String, String)>>,
+    /// DDL: the registered schema of each (subject, hash, mapping version).
+    ddl: RwLock<HashMap<DdlKey, Registered>>,
 }
 
 impl AvroEncoder {
@@ -391,8 +504,8 @@ impl AvroEncoder {
     /// Create a new Avro encoder with an optional DDL schema provider.
     ///
     /// When `source_schemas` is provided, the encoder uses DDL-derived
-    /// Avro schemas (Path A) for events whose source table is known.
-    /// Falls back to JSON inference (Path C) for unknown tables.
+    /// Avro schemas (Path A) for events that carry their source schema
+    /// version. Other events use JSON inference (Path C).
     pub fn with_source_schemas(
         schema_registry_url: &str,
         strategy: SubjectStrategy,
@@ -414,6 +527,10 @@ impl AvroEncoder {
             auth,
             source_schemas,
             subject_cache: RwLock::new(HashMap::new()),
+            resolved: RwLock::new(HashMap::new()),
+            inferred: RwLock::new(HashMap::new()),
+            ddl_schemas: RwLock::new(HashMap::new()),
+            ddl: RwLock::new(HashMap::new()),
         })
     }
 
@@ -423,6 +540,21 @@ impl AvroEncoder {
         provider: Arc<dyn SourceSchemaProvider>,
     ) {
         self.source_schemas = Some(provider);
+        self.resolved.write().clear();
+    }
+
+    /// Drop every cached schema and ID. Encoding afterwards resolves and
+    /// registers each schema again; inferred schemas resume from the
+    /// subject's latest registered schema.
+    pub fn clear_caches(&self) {
+        self.registry.clear_cache();
+        self.resolved.write().clear();
+        self.inferred.write().clear();
+        self.ddl.write().clear();
+    }
+
+    fn auth(&self) -> Option<(&str, &str)> {
+        self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()))
     }
 
     /// Resolve subject name with caching (avoids format! allocation per event).
@@ -441,11 +573,12 @@ impl AvroEncoder {
         subject
     }
 
-    /// Encode a serializable value to Confluent Avro wire format.
+    /// Encode a serializable value to Confluent Avro wire format with an
+    /// inferred schema (Path C).
     ///
-    /// The value is first serialized to JSON, then an Avro schema is derived
-    /// from its structure, registered with the Schema Registry, and the value
-    /// is encoded as Avro binary with the Confluent wire format prefix.
+    /// The subject's schema is widened to hold the value (see
+    /// [`super::avro_infer`]), registered with the Schema Registry, and the
+    /// value is encoded as Avro binary with the Confluent wire format prefix.
     ///
     /// # Arguments
     ///
@@ -458,46 +591,19 @@ impl AvroEncoder {
         value: &T,
         record_name: Option<&str>,
     ) -> Result<Bytes, EncodingError> {
-        // 1. Serialize to JSON first to derive the schema
         let json_value = serde_json::to_value(value)
             .map_err(|e| EncodingError::Avro(e.to_string()))?;
-
-        // 2. Derive Avro schema from the JSON structure
-        let schema_json = derive_avro_schema(&json_value, record_name);
-
-        // 3. Resolve subject name
         let subject = self.strategy.resolve(topic, record_name);
-
-        // 4. Register schema (idempotent — returns cached ID if unchanged)
-        let auth = self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
-        let (schema_id, schema) = self
-            .registry
-            .register_schema(&subject, &schema_json, auth)
-            .await?;
-
-        // 5. Convert JSON to Avro value
-        let avro_value = json_to_avro(&json_value, &schema)?;
-
-        // 6. Encode as Avro binary
-        let avro_bytes = apache_avro::to_avro_datum(&schema, avro_value)
-            .map_err(|e| {
-                EncodingError::Avro(format!("Avro encoding failed: {e}"))
-            })?;
-
-        // 7. Build Confluent wire format: [0x00][schema_id:4][avro_payload]
-        let mut buf = BytesMut::with_capacity(5 + avro_bytes.len());
-        buf.put_u8(0x00); // magic byte
-        buf.put_u32(schema_id); // schema ID (big-endian)
-        buf.extend_from_slice(&avro_bytes);
-
-        Ok(buf.freeze())
+        let name = record_name.unwrap_or("deltaforge.Event");
+        self.encode_inferred(&subject, name, &json_value).await
     }
 
-    /// Encode a CDC event using DDL-derived schema when available (Path A),
-    /// falling back to JSON inference (Path C).
+    /// Encode a CDC event with the schema it requires.
     ///
-    /// This is the preferred entry point for CDC events where the source
-    /// metadata (connector, db, table) is known.
+    /// An event carrying its source schema version (`identity`) is encoded
+    /// with the DDL-derived schema of exactly that version (Path A); an
+    /// event without one, or from a source the provider does not serve,
+    /// with the subject's inferred schema (Path C).
     ///
     /// # Arguments
     ///
@@ -506,6 +612,7 @@ impl AvroEncoder {
     /// * `connector` - Source connector type ("mysql", "postgresql", etc.)
     /// * `db` - Source database name
     /// * `table` - Source table name
+    /// * `identity` - The event's source schema version, if it carries one
     pub async fn encode_event<T: Serialize>(
         &self,
         topic: &str,
@@ -513,39 +620,52 @@ impl AvroEncoder {
         connector: &str,
         db: &str,
         table: &str,
+        identity: Option<&SchemaIdentity>,
     ) -> Result<Bytes, EncodingError> {
-        // Fast path: if SR cache already has this subject, skip schema lookup entirely
         let subject = self.resolve_subject(topic);
+        let json_value = serde_json::to_value(value)
+            .map_err(|e| EncodingError::Avro(e.to_string()))?;
 
-        if let Some((schema_id, cached_schema)) =
-            self.registry.get_cached(&subject)
+        if let (Some(provider), Some(identity)) =
+            (self.source_schemas.as_ref(), identity)
         {
-            // Hot path: schema registered, encode directly
-            return self.encode_fast(schema_id, &cached_schema, value).await;
-        }
-
-        // Slow path: need to register schema with SR (first event per subject)
-        // 1. Try Path A: DDL-derived schema
-        if let Some(ref provider) = self.source_schemas {
-            match provider.get_envelope_schema(connector, db, table) {
-                EnvelopeSchemaLookup::Found(schema_json, schema) => {
+            let key = ResolvedKey {
+                subject: subject.clone(),
+                connector: connector.to_string(),
+                db: db.to_string(),
+                table: table.to_string(),
+                identity: identity.clone(),
+                mapping: provider.mapping_id().to_string(),
+            };
+            let cached = self.resolved.read().get(&key).cloned();
+            if let Some((schema_id, schema)) = cached {
+                return encode_with(schema_id, &schema, &json_value);
+            }
+            match provider.get_envelope_schema(connector, db, table, identity) {
+                EnvelopeSchemaLookup::Found(schema_json, _) => {
                     debug!(
                         connector,
-                        db, table, "using DDL-derived Avro schema (Path A)"
+                        db,
+                        table,
+                        fingerprint = %identity.fingerprint,
+                        "using DDL-derived Avro schema (Path A)"
                     );
                     counter!("deltaforge_avro_encode_total", "path" => "ddl")
                         .increment(1);
-                    return self
-                        .encode_with_schema(
-                            &subject,
-                            value,
-                            &schema_json,
-                            &schema,
-                        )
-                        .await;
+                    let (schema_id, schema) =
+                        self.register(&key.subject, &schema_json, None).await?;
+                    self.resolved
+                        .write()
+                        .insert(key, (schema_id, schema.clone()));
+                    return encode_with(schema_id, &schema, &json_value);
                 }
                 EnvelopeSchemaLookup::Unavailable(reason) => {
                     return Err(EncodingError::SchemaUnavailable(format!(
+                        "{connector} {db}.{table}: {reason}"
+                    )));
+                }
+                EnvelopeSchemaLookup::Conflict(reason) => {
+                    return Err(EncodingError::SchemaConflict(format!(
                         "{connector} {db}.{table}: {reason}"
                     )));
                 }
@@ -553,72 +673,158 @@ impl AvroEncoder {
             }
         }
 
-        // 2. Fall back to Path C: JSON inference
         debug!(
             connector,
             db,
             table,
-            "no DDL schema available — falling back to JSON inference (Path C)"
+            "no DDL schema version for the event: JSON inference (Path C)"
         );
         counter!("deltaforge_avro_encode_total", "path" => "inferred")
             .increment(1);
-        let record_name =
-            Some(format!("deltaforge.{connector}.{db}.{table}.Value").leak()
-                as &str);
-        self.encode(topic, value, record_name).await
+        let record_name = format!("deltaforge.{connector}.{db}.{table}.Value");
+        self.encode_inferred(&subject, &record_name, &json_value)
+            .await
     }
 
-    /// Hot-path encoder: schema already registered, SR cache hit.
-    ///
-    /// Skips subject resolution, schema lookup, and SR registration.
-    /// Only does: JSON serialization → schema-aware Avro conversion → binary encode.
-    async fn encode_fast<T: Serialize>(
+    /// Encode a DDL event as the explicit DDL record (see
+    /// [`super::avro_schema::build_ddl_schema`]) under the topic's DDL
+    /// subject ([`ddl_subject`]), whatever the sink's envelope. A DDL event
+    /// never enters row-schema inference and is never encoded with a row
+    /// schema; the record stays on `topic`, identified by its schema ID.
+    pub async fn encode_ddl(
         &self,
-        schema_id: u32,
-        schema: &AvroSchema,
-        value: &T,
+        topic: &str,
+        event: &crate::Event,
     ) -> Result<Bytes, EncodingError> {
-        // 1. Serialize value to JSON, then convert to Avro
-        let json_value = serde_json::to_value(value)
-            .map_err(|e| EncodingError::Avro(e.to_string()))?;
-        let avro_value = json_to_avro(&json_value, schema)?;
-
-        // 2. Encode as Avro binary
-        let avro_bytes = apache_avro::to_avro_datum(schema, avro_value)
-            .map_err(|e| {
-                EncodingError::Avro(format!("Avro encoding failed: {e}"))
-            })?;
-
-        // 3. Build Confluent wire format
-        let mut buf = BytesMut::with_capacity(5 + avro_bytes.len());
-        buf.put_u8(0x00);
-        buf.put_u32(schema_id);
-        buf.extend_from_slice(&avro_bytes);
-
-        Ok(buf.freeze())
+        use super::avro_schema::{DDL_MAPPING_VERSION, build_ddl_schema};
+        let Some(ddl) = event.ddl.as_ref() else {
+            return Err(EncodingError::Avro("not a DDL event".into()));
+        };
+        let connector = event.source.connector.as_str();
+        let cached = self.ddl_schemas.read().get(connector).cloned();
+        let (schema_json, hash) = match cached {
+            Some(c) => c,
+            None => {
+                let (json, _) = build_ddl_schema(connector)?;
+                let hash = canonical_schema_hash(&json)?;
+                self.ddl_schemas.write().insert(
+                    connector.to_string(),
+                    (json.clone(), hash.clone()),
+                );
+                (json, hash)
+            }
+        };
+        let record = serde_json::json!({
+            "mapping_version": DDL_MAPPING_VERSION,
+            "ddl": ddl,
+            "source": event.source,
+            "op": event.op.as_str(),
+            "ts_ms": event.ts_ms,
+            "event_id": event.event_id.map(|id| id.to_string()),
+            "tenant_id": event.tenant_id,
+            "transaction": event.transaction,
+        });
+        let subject = ddl_subject(topic);
+        // The mapping version is also bound by the versioned subject, the
+        // record's `mapping_version` field and the canonical schema hash, so
+        // while it is a compile-time constant this component is defensive
+        // domain separation (dropping it is an equivalent mutant). Should
+        // several DDL versions become selectable in one process, add a
+        // mixed-version regression that fails without it.
+        let key = (subject, hash, DDL_MAPPING_VERSION);
+        let cached = self.ddl.read().get(&key).cloned();
+        let (schema_id, schema) = match cached {
+            Some(r) => r,
+            None => {
+                let r =
+                    self.register(&key.0, &schema_json, Some(&key.1)).await?;
+                self.ddl.write().insert(key, r.clone());
+                r
+            }
+        };
+        counter!("deltaforge_avro_encode_total", "path" => "ddl_event")
+            .increment(1);
+        encode_with(schema_id, &schema, &record)
     }
 
-    /// Slow-path encoder: register schema with SR, then encode.
+    /// Path C: widen the inferred schema of `(subject, record_name)` to
+    /// hold `json_value`, register it, and encode the value with it.
     ///
-    /// Called only on first event per subject, or after cache eviction.
-    async fn encode_with_schema<T: Serialize>(
+    /// Inferred events carry no schema identity: an event replayed after the
+    /// schema widened is encoded, exactly, with the current (newer,
+    /// backward-compatible) schema and its ID, not the one it was first
+    /// encoded with. Exact schema-identity replay for inferred events is a
+    /// canonical-typing follow-up.
+    async fn encode_inferred(
         &self,
         subject: &str,
-        value: &T,
-        schema_json: &str,
-        schema: &AvroSchema,
+        record_name: &str,
+        json_value: &serde_json::Value,
     ) -> Result<Bytes, EncodingError> {
-        // 1. Register with SR (idempotent — returns cached ID if unchanged)
-        let auth = self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
-        let (schema_id, registered_schema) = match self
+        let serde_json::Value::Object(map) = json_value else {
+            return Err(EncodingError::Avro(
+                "an inferred Avro schema needs a JSON object".into(),
+            ));
+        };
+        let key = (subject.to_string(), record_name.to_string());
+        if !self.inferred.read().contains_key(&key) {
+            // Resume from the subject's latest schema so a restart widens it
+            // instead of registering a narrower one.
+            let seed =
+                match self.registry.latest_schema(subject, self.auth()).await {
+                    Ok(Some(latest)) => Inferred::seeded(record_name, &latest),
+                    Ok(None) => None,
+                    Err(e) => {
+                        counter!(
+                            "deltaforge_avro_encode_failure_total",
+                            "reason" => "sr_unavailable"
+                        )
+                        .increment(1);
+                        return Err(e);
+                    }
+                };
+            let shape = seed.unwrap_or_else(|| Inferred::new(record_name));
+            let state = inferred_state(shape)?;
+            self.inferred.write().entry(key.clone()).or_insert(state);
+        }
+        let (schema_json, hash) = {
+            let mut states = self.inferred.write();
+            let state = states.get_mut(&key).expect("inserted above");
+            if !state.shape.covers(map) {
+                let mut shape = state.shape.clone();
+                shape.absorb(map);
+                *state = inferred_state(shape)?;
+            }
+            (state.schema_json.clone(), state.hash.clone())
+        };
+        let (schema_id, schema) =
+            self.register(subject, &schema_json, Some(&hash)).await?;
+        encode_with(schema_id, &schema, json_value)
+    }
+
+    /// Register a schema (cached per subject and canonical hash).
+    async fn register(
+        &self,
+        subject: &str,
+        schema_json: &str,
+        hash: Option<&str>,
+    ) -> Result<Registered, EncodingError> {
+        let hash = match hash {
+            Some(h) => h.to_string(),
+            None => canonical_schema_hash(schema_json)?,
+        };
+        if let Some(cached) = self.registry.get_cached(subject, &hash) {
+            return Ok(cached);
+        }
+        match self
             .registry
-            .register_schema(subject, schema_json, auth)
+            .register_hashed(subject, schema_json, &hash, self.auth())
             .await
         {
             Ok(result) => {
                 counter!("deltaforge_avro_schema_registrations_total")
                     .increment(1);
-                result
+                Ok(result)
             }
             Err(e) => {
                 counter!(
@@ -626,462 +832,662 @@ impl AvroEncoder {
                     "reason" => "sr_unavailable"
                 )
                 .increment(1);
-                return Err(e);
+                Err(e)
             }
-        };
-
-        // 2. Serialize value to JSON, then convert to Avro
-        let json_value = serde_json::to_value(value)
-            .map_err(|e| EncodingError::Avro(e.to_string()))?;
-        let avro_value = match json_to_avro(&json_value, &registered_schema) {
-            Ok(v) => v,
-            Err(e) => {
-                counter!(
-                    "deltaforge_avro_encode_failure_total",
-                    "reason" => "schema_mismatch"
-                )
-                .increment(1);
-                return Err(e);
-            }
-        };
-
-        // 3. Encode as Avro binary
-        let avro_bytes = apache_avro::to_avro_datum(schema, avro_value)
-            .map_err(|e| {
-                EncodingError::Avro(format!("Avro encoding failed: {e}"))
-            })?;
-
-        // 4. Build Confluent wire format
-        let mut buf = BytesMut::with_capacity(5 + avro_bytes.len());
-        buf.put_u8(0x00);
-        buf.put_u32(schema_id);
-        buf.extend_from_slice(&avro_bytes);
-
-        Ok(buf.freeze())
-    }
-}
-
-// =============================================================================
-// Schema derivation from JSON
-// =============================================================================
-
-/// Derive an Avro schema from a JSON value.
-///
-/// CDC events have a consistent structure, so the schema is derived from
-/// the first event and cached. Fields are mapped as:
-/// - JSON string → Avro string
-/// - JSON number (integer) → Avro long
-/// - JSON number (float) → Avro double
-/// - JSON boolean → Avro boolean
-/// - JSON null → Avro null
-/// - JSON array → Avro array (union of element types)
-/// - JSON object → Avro record (recursive)
-///
-/// All fields are wrapped in a union with null for optionality, since
-/// CDC events may have nullable columns.
-fn derive_avro_schema(
-    value: &serde_json::Value,
-    record_name: Option<&str>,
-) -> String {
-    let name = record_name.unwrap_or("deltaforge.Event");
-
-    match value {
-        serde_json::Value::Object(map) => {
-            let fields: Vec<String> = map
-                .iter()
-                .map(|(key, val)| {
-                    let avro_type = json_type_to_avro(val, key);
-                    format!(
-                        r#"{{"name":"{}","type":{},"default":null}}"#,
-                        escape_json_string(key),
-                        avro_type
-                    )
-                })
-                .collect();
-
-            format!(
-                r#"{{"type":"record","name":"{}","fields":[{}]}}"#,
-                name,
-                fields.join(",")
-            )
-        }
-        _ => {
-            // Non-object top-level: wrap in a record with a single "value" field
-            warn!(
-                "non-object value for Avro schema derivation, wrapping in record"
-            );
-            let avro_type = json_type_to_avro(value, "value");
-            format!(
-                r#"{{"type":"record","name":"{}","fields":[{{"name":"value","type":{}}}]}}"#,
-                name, avro_type
-            )
         }
     }
 }
 
-/// Map a JSON value to its Avro type representation.
-/// All types are wrapped in ["null", <type>] for optionality.
-fn json_type_to_avro(value: &serde_json::Value, field_name: &str) -> String {
-    match value {
-        serde_json::Value::Null => r#""null""#.to_string(),
-        serde_json::Value::Bool(_) => r#"["null","boolean"]"#.to_string(),
-        serde_json::Value::Number(n) => {
-            if n.is_i64() || n.is_u64() {
-                r#"["null","long"]"#.to_string()
-            } else {
-                r#"["null","double"]"#.to_string()
-            }
-        }
-        serde_json::Value::String(_) => r#"["null","string"]"#.to_string(),
-        serde_json::Value::Array(arr) => {
-            if arr.is_empty() {
-                // Empty array: default to array of strings
-                r#"["null",{"type":"array","items":"string"}]"#.to_string()
-            } else {
-                let item_type = json_type_to_avro_primitive(&arr[0]);
-                format!(r#"["null",{{"type":"array","items":{}}}]"#, item_type)
-            }
-        }
-        serde_json::Value::Object(map) => {
-            // Nested record: use field_name as record name
-            let nested_name = format!("deltaforge.{}", capitalize(field_name));
-            let fields: Vec<String> = map
-                .iter()
-                .map(|(key, val)| {
-                    let avro_type = json_type_to_avro(val, key);
-                    format!(
-                        r#"{{"name":"{}","type":{},"default":null}}"#,
-                        escape_json_string(key),
-                        avro_type
-                    )
-                })
-                .collect();
-
-            format!(
-                r#"["null",{{"type":"record","name":"{}","fields":[{}]}}]"#,
-                nested_name,
-                fields.join(",")
-            )
-        }
-    }
+fn inferred_state(shape: Inferred) -> Result<InferredState, EncodingError> {
+    let schema_json = shape.schema_json();
+    let hash = canonical_schema_hash(&schema_json)?;
+    Ok(InferredState {
+        shape,
+        schema_json,
+        hash,
+    })
 }
 
-/// Map a JSON value to a primitive Avro type (without null union wrapper).
-fn json_type_to_avro_primitive(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Null => r#""null""#.to_string(),
-        serde_json::Value::Bool(_) => r#""boolean""#.to_string(),
-        serde_json::Value::Number(n) => {
-            if n.is_i64() || n.is_u64() {
-                r#""long""#.to_string()
-            } else {
-                r#""double""#.to_string()
-            }
-        }
-        serde_json::Value::String(_) => r#""string""#.to_string(),
-        serde_json::Value::Array(_) => r#""string""#.to_string(),
-        serde_json::Value::Object(_) => r#""string""#.to_string(),
-    }
-}
-
-fn capitalize(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        None => String::new(),
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-    }
-}
-
-fn escape_json_string(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+/// Convert `json_value` exactly to `schema` and frame it in the Confluent
+/// wire format: `[0x00][schema_id:4][avro_payload]`.
+fn encode_with(
+    schema_id: u32,
+    schema: &AvroSchema,
+    json_value: &serde_json::Value,
+) -> Result<Bytes, EncodingError> {
+    let avro_value = json_to_avro(json_value, schema).inspect_err(|_| {
+        counter!(
+            "deltaforge_avro_encode_failure_total",
+            "reason" => "schema_mismatch"
+        )
+        .increment(1);
+    })?;
+    let avro_bytes =
+        apache_avro::to_avro_datum(schema, avro_value).map_err(|e| {
+            EncodingError::Avro(format!("Avro encoding failed: {e}"))
+        })?;
+    let mut buf = BytesMut::with_capacity(5 + avro_bytes.len());
+    buf.put_u8(0x00);
+    buf.put_u32(schema_id);
+    buf.extend_from_slice(&avro_bytes);
+    Ok(buf.freeze())
 }
 
 // =============================================================================
 // JSON → Avro value conversion
 // =============================================================================
 
-/// Convert a JSON value to an Avro value using the given schema.
+/// Convert a JSON value to an Avro value of `schema`.
 ///
-/// `AvroValue::from(serde_json::Value)` maps JSON objects to `Value::Map`
-/// which doesn't match `Record` types in unions. This function does
-/// schema-aware conversion: JSON objects become `Value::Record` when the
-/// schema expects a record.
+/// Every conversion is exact. A value the target type cannot represent
+/// exactly (out of range, the wrong kind, a lost fraction, an undecodable
+/// text, an epoch number of undeclared unit, an unsupported target type)
+/// fails before any record exists, with a [`ConversionFailure`] naming the
+/// field, its source type (`deltaforge.source_type` on the field, else the
+/// JSON kind) and the target type, never the value. Nothing is substituted,
+/// rounded, truncated or defaulted.
 fn json_to_avro(
     json: &serde_json::Value,
     schema: &AvroSchema,
 ) -> Result<AvroValue, EncodingError> {
-    // Schema-aware conversion produces correctly-typed Avro values.
-    // No resolve() pass — our converter handles all schema types
-    // including unions, records, refs, and logical types.
-    json_to_avro_with_schema(json, schema)
+    let resolved = apache_avro::schema::ResolvedSchema::try_from(schema)
+        .map_err(|e| {
+            EncodingError::Avro(format!("unresolvable schema: {e}"))
+        })?;
+    let cx = Cx {
+        names: resolved.get_names(),
+        path: String::new(),
+        source: None,
+    };
+    convert(json, schema, &cx)
 }
 
-/// Recursively convert JSON to Avro values guided by the schema.
-fn json_to_avro_with_schema(
-    json: &serde_json::Value,
-    schema: &AvroSchema,
-) -> Result<AvroValue, EncodingError> {
-    match schema {
-        AvroSchema::Null => Ok(AvroValue::Null),
-        AvroSchema::Boolean => match json {
-            serde_json::Value::Bool(b) => Ok(AvroValue::Boolean(*b)),
-            serde_json::Value::Null => Ok(AvroValue::Null),
-            _ => Ok(AvroValue::from(json.clone())),
-        },
-        AvroSchema::Int => match json {
-            serde_json::Value::Number(n) => Ok(AvroValue::Int(int_of(n)?)),
-            serde_json::Value::Null => Ok(AvroValue::Null),
-            _ => Ok(AvroValue::from(json.clone())),
-        },
-        AvroSchema::Long => match json {
-            serde_json::Value::Number(n) => Ok(AvroValue::Long(long_of(n)?)),
-            serde_json::Value::Null => Ok(AvroValue::Null),
-            _ => Ok(AvroValue::from(json.clone())),
-        },
-        AvroSchema::Float => match json {
-            serde_json::Value::Number(n) => {
-                Ok(AvroValue::Float(n.as_f64().unwrap_or(0.0) as f32))
-            }
-            serde_json::Value::Null => Ok(AvroValue::Null),
-            _ => Ok(AvroValue::from(json.clone())),
-        },
-        AvroSchema::Double => match json {
-            serde_json::Value::Number(n) => {
-                Ok(AvroValue::Double(n.as_f64().unwrap_or(0.0)))
-            }
-            serde_json::Value::Null => Ok(AvroValue::Null),
-            _ => Ok(AvroValue::from(json.clone())),
-        },
-        // Logical types on Long
-        AvroSchema::TimestampMillis | AvroSchema::TimestampMicros => {
-            match json {
-                serde_json::Value::Number(n) => {
-                    Ok(AvroValue::Long(n.as_i64().unwrap_or(0)))
-                }
-                serde_json::Value::Null => Ok(AvroValue::Null),
-                serde_json::Value::String(s) => {
-                    // Try parse as epoch millis/micros
-                    Ok(AvroValue::Long(s.parse::<i64>().unwrap_or(0)))
-                }
-                _ => Ok(AvroValue::Long(0)),
-            }
+/// Where a conversion is: the named types, the field path and the field's
+/// declared source type.
+struct Cx<'a> {
+    names: &'a apache_avro::schema::NamesRef<'a>,
+    path: String,
+    source: Option<String>,
+}
+
+impl Cx<'_> {
+    fn field(&self, name: &str, source: Option<String>) -> Cx<'_> {
+        Cx {
+            names: self.names,
+            path: if self.path.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}.{name}", self.path)
+            },
+            source,
         }
-        // Logical type on Int
-        AvroSchema::Date | AvroSchema::TimeMillis => match json {
-            serde_json::Value::Number(n) => {
-                Ok(AvroValue::Int(n.as_i64().unwrap_or(0) as i32))
-            }
-            serde_json::Value::Null => Ok(AvroValue::Null),
-            _ => Ok(AvroValue::Int(0)),
-        },
-        // Logical type on Long
-        AvroSchema::TimeMicros => match json {
-            serde_json::Value::Number(n) => {
-                Ok(AvroValue::Long(n.as_i64().unwrap_or(0)))
-            }
-            serde_json::Value::Null => Ok(AvroValue::Null),
-            _ => Ok(AvroValue::Long(0)),
-        },
-        // Decimal logical type — in CDC events, decimals come as strings
-        AvroSchema::Decimal(_) => match json {
-            serde_json::Value::String(s) => {
-                // Store decimal as string-encoded Avro bytes
-                Ok(AvroValue::Bytes(s.as_bytes().to_vec()))
-            }
-            serde_json::Value::Number(n) => {
-                let s = n.to_string();
-                Ok(AvroValue::Bytes(s.as_bytes().to_vec()))
-            }
-            serde_json::Value::Null => Ok(AvroValue::Null),
-            _ => Ok(AvroValue::Bytes(json.to_string().into_bytes())),
-        },
-        // Raw bytes
-        AvroSchema::Bytes => match json {
-            serde_json::Value::String(s) => {
-                Ok(AvroValue::Bytes(s.as_bytes().to_vec()))
-            }
-            serde_json::Value::Null => Ok(AvroValue::Null),
-            // Handle DeltaForge's _base64 wrapper for BLOB columns
-            serde_json::Value::Object(map) if map.contains_key("_base64") => {
-                let b64 = map["_base64"].as_str().unwrap_or("");
-                Ok(AvroValue::Bytes(
-                    base64_decode(b64)
-                        .unwrap_or_else(|| b64.as_bytes().to_vec()),
-                ))
-            }
-            _ => Ok(AvroValue::Bytes(json.to_string().into_bytes())),
-        },
-        AvroSchema::String | AvroSchema::Uuid => match json {
-            serde_json::Value::String(s) => Ok(AvroValue::String(s.clone())),
-            serde_json::Value::Null => Ok(AvroValue::Null),
-            // Handle DeltaForge's _base64 wrapper for TEXT/BLOB columns
-            serde_json::Value::Object(map) if map.contains_key("_base64") => {
-                let b64 = map["_base64"].as_str().unwrap_or("");
-                // For String schema, decode base64 and try as UTF-8
-                match base64_decode(b64) {
-                    Some(bytes) => Ok(AvroValue::String(
-                        String::from_utf8_lossy(&bytes).into_owned(),
-                    )),
-                    None => Ok(AvroValue::String(b64.to_string())),
-                }
-            }
-            // Coerce non-string types to string
-            other => Ok(AvroValue::String(other.to_string())),
-        },
-        AvroSchema::Record(record_schema) => match json {
-            serde_json::Value::Object(map) => {
-                let mut fields = Vec::with_capacity(record_schema.fields.len());
-                for field in &record_schema.fields {
-                    let field_json = map
-                        .get(&field.name)
-                        .unwrap_or(&serde_json::Value::Null);
-                    let field_value =
-                        json_to_avro_with_schema(field_json, &field.schema)?;
-                    fields.push((field.name.clone(), field_value));
-                }
-                Ok(AvroValue::Record(fields))
-            }
-            serde_json::Value::Null => Ok(AvroValue::Null),
-            _ => Err(EncodingError::Avro(format!(
-                "expected object for record {}, got {}",
-                record_schema.name.fullname(None),
-                json_type_name(json),
-            ))),
-        },
-        AvroSchema::Union(union_schema) => {
-            if json.is_null() {
-                // Find the null branch
-                for (i, variant) in union_schema.variants().iter().enumerate() {
-                    if matches!(variant, AvroSchema::Null) {
-                        return Ok(AvroValue::Union(
-                            i as u32,
-                            Box::new(AvroValue::Null),
-                        ));
-                    }
-                }
-                return Ok(AvroValue::Null);
-            }
-            // Find the first non-null branch and convert
-            let mut last_error = None;
-            for (i, variant) in union_schema.variants().iter().enumerate() {
-                if matches!(variant, AvroSchema::Null) {
-                    continue;
-                }
-                match json_to_avro_with_schema(json, variant) {
-                    Ok(v) => {
-                        return Ok(AvroValue::Union(i as u32, Box::new(v)));
-                    }
-                    Err(e) => last_error = Some(e),
-                }
-            }
-            Err(EncodingError::Avro(format!(
-                "no matching union branch for JSON {}{}",
-                json_type_name(json),
-                last_error.map(|e| format!(": {e}")).unwrap_or_default(),
-            )))
+    }
+
+    fn item(&self) -> Cx<'_> {
+        Cx {
+            names: self.names,
+            path: format!("{}[]", self.path),
+            source: self.source.clone(),
         }
-        AvroSchema::Array(array_schema) => match json {
-            serde_json::Value::Array(arr) => {
-                let items: Result<Vec<_>, _> = arr
-                    .iter()
-                    .map(|item| {
-                        json_to_avro_with_schema(item, &array_schema.items)
-                    })
-                    .collect();
-                Ok(AvroValue::Array(items?))
-            }
-            serde_json::Value::Null => Ok(AvroValue::Null),
-            _ => Ok(AvroValue::from(json.clone())),
-        },
-        AvroSchema::Map(map_schema) => match json {
-            serde_json::Value::Object(map) => {
-                let entries: Result<HashMap<String, AvroValue>, _> = map
-                    .iter()
-                    .map(|(k, v)| {
-                        json_to_avro_with_schema(v, &map_schema.types)
-                            .map(|av| (k.clone(), av))
-                    })
-                    .collect();
-                Ok(AvroValue::Map(entries?))
-            }
-            serde_json::Value::Null => Ok(AvroValue::Null),
-            _ => Ok(AvroValue::from(json.clone())),
-        },
-        // Ref: named type reference — for JSON objects, treat as Record
-        // by creating a Record from the object keys. The Avro encoder
-        // will resolve the ref to the actual schema during encoding.
-        AvroSchema::Ref { .. } => match json {
-            serde_json::Value::Object(map) => {
-                // Build a Record with field names from the JSON object.
-                // Field order may not match the schema, but the encoder
-                // uses field names for lookup.
-                let fields: Vec<(String, AvroValue)> = map
-                    .iter()
-                    .map(|(k, v)| -> Result<_, EncodingError> {
-                        // Without the resolved schema, we can't do
-                        // schema-aware conversion — use best-effort
-                        let av = match v {
-                            serde_json::Value::Null => AvroValue::Null,
-                            serde_json::Value::Bool(b) => {
-                                AvroValue::Boolean(*b)
-                            }
-                            serde_json::Value::Number(n) if n.is_f64() => {
-                                AvroValue::Double(n.as_f64().unwrap_or(0.0))
-                            }
-                            // An integer is never widened to a double.
-                            serde_json::Value::Number(n) => {
-                                AvroValue::Long(long_of(n)?)
-                            }
-                            serde_json::Value::String(s) => {
-                                AvroValue::String(s.clone())
-                            }
-                            other => AvroValue::from(other.clone()),
-                        };
-                        Ok((k.clone(), av))
-                    })
-                    .collect::<Result<_, _>>()?;
-                Ok(AvroValue::Record(fields))
-            }
-            serde_json::Value::Null => Ok(AvroValue::Null),
-            _ => Ok(AvroValue::from(json.clone())),
-        },
-        // For other schema types (Bytes, Fixed, Enum, Decimal, etc.),
-        // fall back to the default conversion
-        _ => Ok(AvroValue::from(json.clone())),
+    }
+
+    fn fail(
+        &self,
+        json: &serde_json::Value,
+        target: &str,
+        reason: &'static str,
+    ) -> EncodingError {
+        EncodingError::Conversion(super::ConversionFailure {
+            column: self.path.clone(),
+            source_type: self
+                .source
+                .clone()
+                .unwrap_or_else(|| format!("JSON {}", json_kind(json))),
+            target_type: format!("Avro {target}"),
+            reason,
+        })
+    }
+
+    /// Whether the field's source type starts with `prefix` (lowercase).
+    fn source_is(&self, prefixes: &[&str]) -> bool {
+        self.source.as_deref().is_some_and(|s| {
+            let s = s.to_ascii_lowercase();
+            prefixes.iter().any(|p| s.starts_with(p))
+        })
     }
 }
 
-/// A JSON number as an Avro `long`: integers in the signed 64-bit range
-/// only. Anything else (an unsigned value above `i64::MAX`, a fraction)
-/// fails explicitly; it is never wrapped, zeroed or rounded.
-fn long_of(n: &serde_json::Number) -> Result<i64, EncodingError> {
-    n.as_i64().ok_or_else(|| {
-        EncodingError::Avro(format!(
-            "{n} does not fit an Avro long (signed 64-bit integer)"
-        ))
-    })
+/// The `deltaforge.source_type` a DDL-derived schema records on a field.
+const SOURCE_TYPE_ATTR: &str = "deltaforge.source_type";
+
+/// A record whose every input field must be defined by the schema.
+const STRICT_ATTR: &str = "deltaforge.strict";
+
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+fn convert(
+    json: &serde_json::Value,
+    schema: &AvroSchema,
+    cx: &Cx<'_>,
+) -> Result<AvroValue, EncodingError> {
+    use serde_json::Value as J;
+    match (schema, json) {
+        (AvroSchema::Null, J::Null) => Ok(AvroValue::Null),
+        (AvroSchema::Union(u), _) => convert_union(json, u, cx),
+        (AvroSchema::Ref { name }, _) => {
+            let target = cx
+                .names
+                .get(name)
+                .or_else(|| {
+                    cx.names
+                        .iter()
+                        .find(|(n, _)| n.name == name.name)
+                        .map(|(_, s)| s)
+                })
+                .ok_or_else(|| {
+                    cx.fail(json, "named type", "unresolved named reference")
+                })?;
+            convert(json, target, cx)
+        }
+        (_, J::Null) => {
+            Err(cx.fail(json, kind_of(schema), "null for a non-nullable field"))
+        }
+
+        (AvroSchema::Boolean, J::Bool(b)) => Ok(AvroValue::Boolean(*b)),
+        (AvroSchema::Int, J::Number(n)) => n
+            .as_i64()
+            .and_then(|v| i32::try_from(v).ok())
+            .map(AvroValue::Int)
+            .ok_or_else(|| {
+                cx.fail(
+                    json,
+                    "int",
+                    "not an integer in the signed 32-bit range",
+                )
+            }),
+        (AvroSchema::Long, J::Number(n)) => {
+            n.as_i64().map(AvroValue::Long).ok_or_else(|| {
+                cx.fail(
+                    json,
+                    "long",
+                    "not an integer in the signed 64-bit range",
+                )
+            })
+        }
+        (AvroSchema::Float, J::Number(n)) => exact_f64(n)
+            .filter(|f| (*f as f32) as f64 == *f)
+            .map(|f| AvroValue::Float(f as f32))
+            .ok_or_else(|| {
+                cx.fail(
+                    json,
+                    "float",
+                    "not exactly representable as a 32-bit float",
+                )
+            }),
+        (AvroSchema::Double, J::Number(n)) => {
+            exact_f64(n).map(AvroValue::Double).ok_or_else(|| {
+                cx.fail(
+                    json,
+                    "double",
+                    "not exactly representable as a 64-bit float",
+                )
+            })
+        }
+
+        (AvroSchema::String, _) => {
+            convert_string(json, cx).map(AvroValue::String)
+        }
+        (AvroSchema::Uuid, J::String(s)) => Ok(AvroValue::String(s.clone())),
+        (AvroSchema::Bytes, _) => {
+            convert_bytes(json, cx, "bytes").map(AvroValue::Bytes)
+        }
+        (AvroSchema::Fixed(f), _) => {
+            let b = convert_bytes(json, cx, "fixed")?;
+            if b.len() == f.size {
+                Ok(AvroValue::Fixed(f.size, b))
+            } else {
+                Err(cx.fail(
+                    json,
+                    "fixed",
+                    "byte length differs from the fixed size",
+                ))
+            }
+        }
+        (AvroSchema::Enum(e), J::String(s)) => e
+            .symbols
+            .iter()
+            .position(|x| x == s)
+            .map(|i| AvroValue::Enum(i as u32, s.clone()))
+            .ok_or_else(|| cx.fail(json, "enum", "not a symbol of the enum")),
+
+        (AvroSchema::Date, J::Number(n)) => n
+            .as_i64()
+            .and_then(|v| i32::try_from(v).ok())
+            .map(AvroValue::Date)
+            .ok_or_else(|| {
+                cx.fail(json, "date", "not a day count in the 32-bit range")
+            }),
+        (AvroSchema::Date, J::String(s)) => parse_date(s)
+            .and_then(|d| i32::try_from(d).ok())
+            .map(AvroValue::Date)
+            .ok_or_else(|| {
+                cx.fail(json, "date", "not a calendar date (YYYY-MM-DD)")
+            }),
+        (AvroSchema::TimeMillis, J::String(s)) => parse_time_of_day(s)
+            .filter(|us| us % 1_000 == 0)
+            .map(|us| AvroValue::TimeMillis((us / 1_000) as i32))
+            .ok_or_else(|| {
+                cx.fail(
+                    json,
+                    "time-millis",
+                    "not a time of day with at most millisecond precision",
+                )
+            }),
+        (AvroSchema::TimeMicros, J::String(s)) => parse_time_of_day(s)
+            .map(AvroValue::TimeMicros)
+            .ok_or_else(|| {
+                cx.fail(
+                    json,
+                    "time-micros",
+                    "not a time of day with at most microsecond precision",
+                )
+            }),
+        (AvroSchema::TimeMillis, J::Number(n)) => n
+            .as_i64()
+            .filter(|v| (0..86_400_000).contains(v))
+            .map(|v| AvroValue::TimeMillis(v as i32))
+            .ok_or_else(|| {
+                cx.fail(
+                    json,
+                    "time-millis",
+                    "not a time of day in milliseconds",
+                )
+            }),
+        (AvroSchema::TimeMicros, J::Number(n)) => n
+            .as_i64()
+            .filter(|v| (0..MICROS_PER_DAY).contains(v))
+            .map(AvroValue::TimeMicros)
+            .ok_or_else(|| {
+                cx.fail(
+                    json,
+                    "time-micros",
+                    "not a time of day in microseconds",
+                )
+            }),
+        // An epoch number is accepted only where the source declares its
+        // unit: MySQL TIMESTAMP values are epoch microseconds.
+        (AvroSchema::TimestampMicros, J::Number(n))
+            if cx.source_is(&["timestamp"]) =>
+        {
+            n.as_i64().map(AvroValue::TimestampMicros).ok_or_else(|| {
+                cx.fail(
+                    json,
+                    "timestamp-micros",
+                    "not an integer in the signed 64-bit range",
+                )
+            })
+        }
+        (
+            AvroSchema::TimestampMillis | AvroSchema::TimestampMicros,
+            J::Number(_),
+        ) => Err(cx.fail(
+            json,
+            kind_of(schema),
+            "an epoch number whose unit the source does not declare",
+        )),
+        (AvroSchema::TimestampMillis, J::String(s)) => parse_instant_micros(s)
+            .filter(|us| us % 1_000 == 0)
+            .map(|us| AvroValue::TimestampMillis(us / 1_000))
+            .ok_or_else(|| {
+                cx.fail(
+                    json,
+                    "timestamp-millis",
+                    "not a date-time with at most millisecond precision",
+                )
+            }),
+        (AvroSchema::TimestampMicros, J::String(s)) => parse_instant_micros(s)
+            .map(AvroValue::TimestampMicros)
+            .ok_or_else(|| {
+                cx.fail(
+                    json,
+                    "timestamp-micros",
+                    "not a date-time with at most microsecond precision",
+                )
+            }),
+        (AvroSchema::LocalTimestampMillis, J::String(s)) => {
+            parse_local_micros(s)
+                .filter(|us| us % 1_000 == 0)
+                .map(|us| AvroValue::LocalTimestampMillis(us / 1_000))
+                .ok_or_else(|| {
+                    cx.fail(
+                        json,
+                        "local-timestamp-millis",
+                        "not a date-time with at most millisecond precision",
+                    )
+                })
+        }
+        (AvroSchema::LocalTimestampMicros, J::String(s)) => {
+            parse_local_micros(s)
+                .map(AvroValue::LocalTimestampMicros)
+                .ok_or_else(|| {
+                    cx.fail(
+                        json,
+                        "local-timestamp-micros",
+                        "not a date-time with at most microsecond precision",
+                    )
+                })
+        }
+
+        (AvroSchema::Record(r), J::Object(map)) => {
+            // A row image (fields carrying their source column type) or a
+            // strict record (a DDL payload) must represent every input
+            // field: an unknown one fails before any record exists, never
+            // dropped.
+            let strict = r
+                .attributes
+                .get(STRICT_ATTR)
+                .is_some_and(|v| v.as_bool() == Some(true))
+                || r.fields.iter().any(|f| {
+                    f.custom_attributes.contains_key(SOURCE_TYPE_ATTR)
+                });
+            if strict
+                && let Some((k, v)) =
+                    map.iter().find(|(k, _)| !r.lookup.contains_key(*k))
+            {
+                return Err(cx.field(k, None).fail(
+                    v,
+                    "record",
+                    "a column the event's schema version does not define",
+                ));
+            }
+            let mut fields = Vec::with_capacity(r.fields.len());
+            for field in &r.fields {
+                let source = field
+                    .custom_attributes
+                    .get(SOURCE_TYPE_ATTR)
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let value = map.get(&field.name).unwrap_or(&J::Null);
+                let v = convert(
+                    value,
+                    &field.schema,
+                    &cx.field(&field.name, source),
+                )?;
+                fields.push((field.name.clone(), v));
+            }
+            Ok(AvroValue::Record(fields))
+        }
+        (AvroSchema::Array(a), J::Array(items)) => {
+            let item_cx = cx.item();
+            items
+                .iter()
+                .map(|v| convert(v, &a.items, &item_cx))
+                .collect::<Result<Vec<_>, _>>()
+                .map(AvroValue::Array)
+        }
+        (AvroSchema::Map(m), J::Object(map)) => {
+            let item_cx = cx.item();
+            map.iter()
+                .map(|(k, v)| {
+                    convert(v, &m.types, &item_cx).map(|av| (k.clone(), av))
+                })
+                .collect::<Result<HashMap<_, _>, _>>()
+                .map(AvroValue::Map)
+        }
+        (
+            AvroSchema::Decimal(_)
+            | AvroSchema::BigDecimal
+            | AvroSchema::Duration,
+            _,
+        ) => Err(cx.fail(
+            json,
+            kind_of(schema),
+            "target type not supported by the converter",
+        )),
+        _ => Err(cx.fail(
+            json,
+            kind_of(schema),
+            "the value's kind does not match the target type",
+        )),
+    }
 }
 
-/// A JSON number as an Avro `int`: integers in the signed 32-bit range
-/// only; anything else fails explicitly (never truncated).
-fn int_of(n: &serde_json::Number) -> Result<i32, EncodingError> {
-    n.as_i64()
-        .and_then(|v| i32::try_from(v).ok())
-        .ok_or_else(|| {
-            EncodingError::Avro(format!(
-                "{n} does not fit an Avro int (signed 32-bit integer)"
-            ))
-        })
+fn convert_union(
+    json: &serde_json::Value,
+    union: &apache_avro::schema::UnionSchema,
+    cx: &Cx<'_>,
+) -> Result<AvroValue, EncodingError> {
+    let variants = union.variants();
+    if json.is_null() {
+        return variants
+            .iter()
+            .position(|v| matches!(v, AvroSchema::Null))
+            .map(|i| AvroValue::Union(i as u32, Box::new(AvroValue::Null)))
+            .ok_or_else(|| {
+                cx.fail(json, "union", "null for a non-nullable field")
+            });
+    }
+    let mut last = None;
+    for (i, variant) in variants.iter().enumerate() {
+        if matches!(variant, AvroSchema::Null) {
+            continue;
+        }
+        match convert(json, variant, cx) {
+            Ok(v) => return Ok(AvroValue::Union(i as u32, Box::new(v))),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        cx.fail(json, "union", "no branch accepts the value")
+    }))
 }
 
-fn json_type_name(v: &serde_json::Value) -> &'static str {
+/// Text for a `string` field: a string as is; an integer or decimal number
+/// as its exact decimal text (BIGINT UNSIGNED in string mode, numbers of
+/// inferred schemas); `{"_base64"}` text that is valid UTF-8; a JSON
+/// column's structured value as its JSON text. An ENUM or SET index is
+/// never accepted for its label, and text bytes are never replaced.
+fn convert_string(
+    json: &serde_json::Value,
+    cx: &Cx<'_>,
+) -> Result<String, EncodingError> {
+    use serde_json::Value as J;
+    let json_source = cx.source.is_none() || cx.source_is(&["json"]);
+    match json {
+        J::String(s) => Ok(s.clone()),
+        J::Number(_) if cx.source_is(&["enum", "set"]) => {
+            Err(cx.fail(json, "string", "an index cannot stand for its label"))
+        }
+        J::Number(n) => Ok(n.to_string()),
+        J::Object(m) if m.len() == 1 && m.contains_key("_base64") => {
+            let bytes = m["_base64"]
+                .as_str()
+                .and_then(base64_decode)
+                .ok_or_else(|| cx.fail(json, "string", "not valid base64"))?;
+            String::from_utf8(bytes).map_err(|_| {
+                cx.fail(json, "string", "bytes are not valid UTF-8 text")
+            })
+        }
+        J::Bool(_) | J::Array(_) | J::Object(_) if json_source => {
+            Ok(json.to_string())
+        }
+        _ => {
+            Err(cx.fail(json, "string", "a structured value for a text column"))
+        }
+    }
+}
+
+/// Bytes for a `bytes` or `fixed` field: a string's exact UTF-8 bytes or a
+/// strictly decoded `{"_base64"}`. Numbers are never rendered as text.
+fn convert_bytes(
+    json: &serde_json::Value,
+    cx: &Cx<'_>,
+    target: &str,
+) -> Result<Vec<u8>, EncodingError> {
+    use serde_json::Value as J;
+    match json {
+        J::String(s) => Ok(s.as_bytes().to_vec()),
+        J::Object(m) if m.len() == 1 && m.contains_key("_base64") => {
+            m["_base64"]
+                .as_str()
+                .and_then(base64_decode)
+                .ok_or_else(|| cx.fail(json, target, "not valid base64"))
+        }
+        _ => Err(cx.fail(json, target, "not bytes")),
+    }
+}
+
+/// `n` as an `f64` when the conversion is exact.
+fn exact_f64(n: &serde_json::Number) -> Option<f64> {
+    if let Some(i) = n.as_i64() {
+        let f = i as f64;
+        return (f as i128 == i as i128).then_some(f);
+    }
+    if let Some(u) = n.as_u64() {
+        let f = u as f64;
+        return (f as u128 == u as u128 && f < 18_446_744_073_709_551_616.0)
+            .then_some(f);
+    }
+    n.as_f64().filter(|f| f.is_finite())
+}
+
+/// Days since 1970-01-01 of a `YYYY-MM-DD` calendar date (zero and invalid
+/// dates are not dates).
+fn parse_date(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    let shape = b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit());
+    if !shape {
+        return None;
+    }
+    let d = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?;
+    Some((d - epoch).num_days())
+}
+
+/// Microseconds since midnight of `HH:MM:SS[.f{1,6}]`, a time of day
+/// (`00:00:00` to `23:59:59.999999`).
+fn parse_time_of_day(s: &str) -> Option<i64> {
+    let (hms, frac) = match s.split_once('.') {
+        Some((a, b)) => (a, Some(b)),
+        None => (s, None),
+    };
+    let mut parts = hms.split(':');
+    let (h, m, sec) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || h.len() != 2 || m.len() != 2 || sec.len() != 2
+    {
+        return None;
+    }
+    let digits = |x: &str| x.bytes().all(|b| b.is_ascii_digit());
+    if !(digits(h) && digits(m) && digits(sec)) {
+        return None;
+    }
+    let (h, m, sec): (i64, i64, i64) =
+        (h.parse().ok()?, m.parse().ok()?, sec.parse().ok()?);
+    if h > 23 || m > 59 || sec > 59 {
+        return None;
+    }
+    let micros = match frac {
+        None => 0,
+        Some(f) if !f.is_empty() && f.len() <= 6 && digits(f) => {
+            f.parse::<i64>().ok()? * 10_i64.pow(6 - f.len() as u32)
+        }
+        Some(_) => return None,
+    };
+    Some(((h * 60 + m) * 60 + sec) * 1_000_000 + micros)
+}
+
+/// A date-time `YYYY-MM-DD[ T]HH:MM:SS[.f{1,6}]`, split from an optional
+/// UTC offset (`Z`, `+HH`, `+HH:MM`, `+HHMM`): (naive micros since the
+/// epoch, offset seconds).
+fn parse_date_time(s: &str) -> Option<(i64, Option<i64>)> {
+    let sep = s.find([' ', 'T'])?;
+    let (date, rest) = (&s[..sep], &s[sep + 1..]);
+    let (time, offset) = if let Some(t) = rest.strip_suffix('Z') {
+        (t, Some(0))
+    } else if let Some(i) = rest.rfind(['+', '-']) {
+        let (t, o) = rest.split_at(i);
+        let sign = if o.starts_with('-') { -1 } else { 1 };
+        let o = o[1..].replace(':', "");
+        let secs = match o.len() {
+            2 => o.parse::<i64>().ok()? * 3_600,
+            4 => {
+                o[..2].parse::<i64>().ok()? * 3_600
+                    + o[2..].parse::<i64>().ok()? * 60
+            }
+            _ => return None,
+        };
+        (t, Some(sign * secs))
+    } else {
+        (rest, None)
+    };
+    let days = parse_date(date)?;
+    let tod = parse_time_of_day(time)?;
+    Some((days * MICROS_PER_DAY + tod, offset))
+}
+
+/// An instant in epoch microseconds. A date-time without an offset is read
+/// as UTC (the `timestamp` mode of naive date-times).
+fn parse_instant_micros(s: &str) -> Option<i64> {
+    let (naive, offset) = parse_date_time(s)?;
+    naive.checked_sub(offset.unwrap_or(0) * 1_000_000)
+}
+
+/// A local (zone-free) date-time in microseconds; an offset is refused.
+fn parse_local_micros(s: &str) -> Option<i64> {
+    match parse_date_time(s)? {
+        (naive, None) => Some(naive),
+        _ => None,
+    }
+}
+
+/// The JSON kind of a value, for failures without a declared source type.
+fn json_kind(v: &serde_json::Value) -> &'static str {
     match v {
         serde_json::Value::Null => "null",
         serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(n) if n.is_i64() || n.is_u64() => "integer",
         serde_json::Value::Number(_) => "number",
         serde_json::Value::String(_) => "string",
         serde_json::Value::Array(_) => "array",
         serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// The Avro type name of `schema` for failures.
+fn kind_of(schema: &AvroSchema) -> &'static str {
+    match schema {
+        AvroSchema::Null => "null",
+        AvroSchema::Boolean => "boolean",
+        AvroSchema::Int => "int",
+        AvroSchema::Long => "long",
+        AvroSchema::Float => "float",
+        AvroSchema::Double => "double",
+        AvroSchema::Bytes => "bytes",
+        AvroSchema::String => "string",
+        AvroSchema::Array(_) => "array",
+        AvroSchema::Map(_) => "map",
+        AvroSchema::Union(_) => "union",
+        AvroSchema::Record(_) => "record",
+        AvroSchema::Enum(_) => "enum",
+        AvroSchema::Fixed(_) => "fixed",
+        AvroSchema::Decimal(_) | AvroSchema::BigDecimal => "decimal",
+        AvroSchema::Uuid => "uuid",
+        AvroSchema::Date => "date",
+        AvroSchema::TimeMillis => "time-millis",
+        AvroSchema::TimeMicros => "time-micros",
+        AvroSchema::TimestampMillis => "timestamp-millis",
+        AvroSchema::TimestampMicros => "timestamp-micros",
+        AvroSchema::TimestampNanos => "timestamp-nanos",
+        AvroSchema::LocalTimestampMillis => "local-timestamp-millis",
+        AvroSchema::LocalTimestampMicros => "local-timestamp-micros",
+        AvroSchema::LocalTimestampNanos => "local-timestamp-nanos",
+        AvroSchema::Duration => "duration",
+        AvroSchema::Ref { .. } => "named type",
     }
 }
 
@@ -1108,11 +1514,26 @@ mod tests {
             _connector: &str,
             _db: &str,
             _table: &str,
+            _identity: &SchemaIdentity,
         ) -> EnvelopeSchemaLookup {
             EnvelopeSchemaLookup::Unavailable(
                 "schema lineage not established".into(),
             )
         }
+
+        fn mapping_id(&self) -> &str {
+            "test"
+        }
+    }
+
+    /// The schema the inference derives from `value` alone.
+    fn derive_avro_schema(
+        value: &serde_json::Value,
+        _record_name: Option<&str>,
+    ) -> String {
+        let mut s = Inferred::new("deltaforge.Event");
+        s.absorb(value.as_object().expect("an object"));
+        s.schema_json()
     }
 
     #[tokio::test]
@@ -1136,6 +1557,7 @@ mod tests {
                 "mysql",
                 "shop",
                 "orders",
+                SchemaIdentity::of(Some("h1"), Some(1)).as_ref(),
             )
             .await
             .unwrap_err();
@@ -1359,6 +1781,329 @@ mod tests {
         }
     }
 
+    // ---- per-family conversion (slice 1: fail closed) ----------------------
+
+    /// One record `After` with a single field `c` of `avro_type`, recording
+    /// `source` as its `deltaforge.source_type` (as DDL-derived schemas do).
+    fn field_schema(
+        avro_type: serde_json::Value,
+        source: Option<&str>,
+    ) -> AvroSchema {
+        let mut field =
+            json!({"name": "c", "type": ["null", avro_type], "default": null});
+        if let Some(src) = source {
+            field["deltaforge.source_type"] = json!(src);
+        }
+        AvroSchema::parse(
+            &json!({"type": "record", "name": "After", "fields": [field]}),
+        )
+        .unwrap()
+    }
+
+    fn one(
+        v: serde_json::Value,
+        ty: serde_json::Value,
+        src: Option<&str>,
+    ) -> Result<AvroValue, EncodingError> {
+        json_to_avro(&json!({"c": v}), &field_schema(ty, src))
+    }
+
+    fn ok(
+        v: serde_json::Value,
+        ty: serde_json::Value,
+        src: Option<&str>,
+    ) -> AvroValue {
+        match one(v.clone(), ty.clone(), src)
+            .unwrap_or_else(|e| panic!("{v} as {ty}: {e}"))
+        {
+            AvroValue::Record(mut f) => match f.remove(0).1 {
+                AvroValue::Union(_, inner) => *inner,
+                other => other,
+            },
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The typed failure for `v`; it never contains the value's text.
+    fn refused(
+        v: serde_json::Value,
+        ty: serde_json::Value,
+        src: Option<&str>,
+    ) -> super::super::ConversionFailure {
+        match one(v.clone(), ty.clone(), src) {
+            Err(EncodingError::Conversion(f)) => {
+                let text = f.to_string();
+                let shown = match &v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                if shown.len() > 3 {
+                    assert!(!text.contains(&shown), "the value leaked: {text}");
+                }
+                assert_eq!(f.column, "c");
+                f
+            }
+            other => panic!(
+                "{v} as {ty}: expected a conversion failure, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn unsigned_bigint_is_exact_or_refused() {
+        let src = Some("bigint unsigned");
+        assert_eq!(
+            ok(json!(i64::MAX), json!("long"), src),
+            AvroValue::Long(i64::MAX)
+        );
+        for v in [json!(i64::MAX as u64 + 1), json!(u64::MAX)] {
+            let f = refused(v, json!("long"), src);
+            assert_eq!(f.source_type, "bigint unsigned");
+            assert_eq!(f.target_type, "Avro long");
+        }
+        for v in [i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+            assert_eq!(
+                ok(json!(v), json!("string"), src),
+                AvroValue::String(v.to_string())
+            );
+        }
+        // INT UNSIGNED is a long; an int field refuses values above i32.
+        assert_eq!(
+            ok(
+                json!(4_294_967_295_u64),
+                json!("long"),
+                Some("int unsigned")
+            ),
+            AvroValue::Long(4_294_967_295)
+        );
+        refused(json!(2_147_483_648_u64), json!("int"), Some("int"));
+        refused(json!(1.5), json!("long"), None);
+        refused(json!("12"), json!("long"), None);
+    }
+
+    #[test]
+    fn floats_are_exact_or_refused() {
+        // A FLOAT column's value is an f32 widened to f64: exact.
+        assert_eq!(
+            ok(json!(1.100000023841858_f64), json!("float"), Some("float")),
+            AvroValue::Float(1.1)
+        );
+        refused(json!(0.1), json!("float"), Some("float"));
+        assert_eq!(
+            ok(json!(1e308), json!("double"), None),
+            AvroValue::Double(1e308)
+        );
+        // 2^53 + 1 has no exact double.
+        refused(json!(9_007_199_254_740_993_i64), json!("double"), None);
+    }
+
+    #[test]
+    fn dates_convert_exactly_and_zero_dates_are_refused() {
+        let date = json!({"type": "int", "logicalType": "date"});
+        assert_eq!(
+            ok(json!("1970-01-01"), date.clone(), Some("date")),
+            AvroValue::Date(0)
+        );
+        assert_eq!(
+            ok(json!("2024-02-29"), date.clone(), Some("date")),
+            AvroValue::Date(19_782)
+        );
+        assert_eq!(
+            ok(json!("1000-01-01"), date.clone(), Some("date")),
+            AvroValue::Date(-354_285)
+        );
+        for v in [
+            "0000-00-00",
+            "0-00-00",
+            "2023-02-29",
+            "2024-1-5",
+            "2024-01-02 BC",
+        ] {
+            let f = refused(json!(v), date.clone(), Some("date"));
+            assert_eq!(f.target_type, "Avro date");
+        }
+    }
+
+    #[test]
+    fn timestamp_units_are_never_mixed() {
+        let micros = json!({"type": "long", "logicalType": "timestamp-micros"});
+        let millis = json!({"type": "long", "logicalType": "timestamp-millis"});
+        // MySQL TIMESTAMP: epoch microseconds, declared by its source type.
+        assert_eq!(
+            ok(json!(1_000_000), micros.clone(), Some("timestamp")),
+            AvroValue::TimestampMicros(1_000_000)
+        );
+        assert_eq!(
+            ok(json!(1_000_000), micros.clone(), Some("timestamp(6)")),
+            AvroValue::TimestampMicros(1_000_000)
+        );
+        // A number of undeclared unit is never passed through.
+        refused(json!(1_000_000), micros.clone(), None);
+        refused(json!(1_000_000), millis.clone(), Some("timestamp"));
+        // Date-time text with an offset is an instant; precision is kept.
+        assert_eq!(
+            ok(
+                json!("2024-01-02 03:04:05.123456+00"),
+                micros.clone(),
+                Some("timestamp with time zone")
+            ),
+            AvroValue::TimestampMicros(1_704_164_645_123_456)
+        );
+        assert_eq!(
+            ok(json!("2024-01-02T05:04:05.123+02:00"), millis.clone(), None),
+            AvroValue::TimestampMillis(1_704_164_645_123)
+        );
+        // Sub-millisecond digits are not dropped.
+        refused(json!("2024-01-02 03:04:05.123456+00"), millis, None);
+        for v in ["infinity", "0000-00-00 00:00:00", "2024-01-02 25:00:00"] {
+            refused(json!(v), micros.clone(), Some("timestamp"));
+        }
+    }
+
+    #[test]
+    fn times_of_day_are_exact_and_durations_refused() {
+        let micros = json!({"type": "long", "logicalType": "time-micros"});
+        let millis = json!({"type": "int", "logicalType": "time-millis"});
+        assert_eq!(
+            ok(json!("12:34:56.5"), micros.clone(), None),
+            AvroValue::TimeMicros(45_296_500_000)
+        );
+        assert_eq!(
+            ok(json!("12:34:56.123000"), millis.clone(), None),
+            AvroValue::TimeMillis(45_296_123)
+        );
+        refused(json!("12:34:56.123456"), millis, None);
+        // MySQL TIME is a signed duration: not a time of day.
+        for v in ["-00:00:00.500000", "838:59:59", "24:00:00"] {
+            refused(json!(v), micros.clone(), Some("time(6)"));
+        }
+    }
+
+    #[test]
+    fn bits_enums_and_sets_are_never_rendered_from_numbers() {
+        // BIT: a number is not its bytes (never its ASCII digits).
+        let f = refused(json!(255), json!("bytes"), Some("bit(8)"));
+        assert_eq!(f.target_type, "Avro bytes");
+        refused(json!(1), json!("boolean"), Some("bit(1)"));
+        assert_eq!(
+            ok(json!({"_base64": "/w=="}), json!("bytes"), Some("bit(8)")),
+            AvroValue::Bytes(vec![0xff])
+        );
+        // ENUM / SET: an index is not its label.
+        let f = refused(json!(1), json!("string"), Some("enum('a','b','c')"));
+        assert_eq!(f.reason, "an index cannot stand for its label");
+        refused(json!(5), json!("string"), Some("set('x','y','z')"));
+        assert_eq!(
+            ok(json!("b"), json!("string"), Some("enum('a','b','c')")),
+            AvroValue::String("b".into())
+        );
+        let avro_enum =
+            json!({"type": "enum", "name": "c_enum", "symbols": ["a", "b"]});
+        assert_eq!(
+            ok(json!("b"), avro_enum.clone(), None),
+            AvroValue::Enum(1, "b".into())
+        );
+        refused(json!("zz"), avro_enum, None);
+    }
+
+    #[test]
+    fn text_is_exact_and_never_replaced() {
+        use base64::Engine;
+        let b64 = |b: &[u8]| json!({"_base64": base64::engine::general_purpose::STANDARD.encode(b)});
+        // TEXT arrives base64-wrapped from the binlog: valid UTF-8 is exact.
+        assert_eq!(
+            ok(
+                b64("multi\nline 😀".as_bytes()),
+                json!("string"),
+                Some("text")
+            ),
+            AvroValue::String("multi\nline 😀".into())
+        );
+        // latin1 bytes (é = 0xE9) are not UTF-8: refused, never U+FFFD.
+        let f = refused(b64(b"d\xe9j\xe0"), json!("string"), Some("text"));
+        assert_eq!(f.reason, "bytes are not valid UTF-8 text");
+        refused(
+            json!({"_base64": "not base64!"}),
+            json!("string"),
+            Some("text"),
+        );
+        // A JSON column's structured value is its JSON text; a structured
+        // value for a text column is refused.
+        assert_eq!(
+            ok(json!({"a": 1}), json!("string"), Some("json")),
+            AvroValue::String(r#"{"a":1}"#.into())
+        );
+        refused(json!({"a": 1}), json!("string"), Some("varchar(10)"));
+        // Bytes: a string's exact bytes or a strict base64 decode.
+        assert_eq!(
+            ok(json!("ab"), json!("bytes"), Some("varbinary(4)")),
+            AvroValue::Bytes(b"ab".to_vec())
+        );
+        refused(json!({"_base64": "@@"}), json!("bytes"), Some("blob"));
+    }
+
+    #[test]
+    fn nulls_and_unsupported_targets_are_refused() {
+        let schema = AvroSchema::parse(&json!({"type": "record", "name": "R", "fields": [
+            {"name": "c", "type": "long", "deltaforge.source_type": "bigint"}]})).unwrap();
+        match json_to_avro(&json!({"c": null}), &schema) {
+            Err(EncodingError::Conversion(f)) => {
+                assert_eq!(
+                    (f.column.as_str(), f.source_type.as_str()),
+                    ("c", "bigint")
+                );
+                assert_eq!(f.reason, "null for a non-nullable field");
+            }
+            other => panic!("{other:?}"),
+        }
+        let decimal = json!({"type": "bytes", "logicalType": "decimal", "precision": 5, "scale": 2});
+        refused(json!("1.50"), decimal, Some("decimal(5,2)"));
+    }
+
+    /// A named type used twice is resolved, not converted best-effort.
+    #[test]
+    fn named_references_are_resolved_exactly() {
+        let schema = AvroSchema::parse(&json!({"type": "record", "name": "E", "fields": [
+            {"name": "before", "type": ["null", {"type": "record", "name": "V", "fields": [
+                {"name": "b", "type": "long", "deltaforge.source_type": "bigint unsigned"}]}], "default": null},
+            {"name": "after", "type": ["null", "V"], "default": null}]})).unwrap();
+        let v =
+            json_to_avro(&json!({"before": null, "after": {"b": 7}}), &schema)
+                .unwrap();
+        assert!(format!("{v:?}").contains("Long(7)"), "{v:?}");
+        match json_to_avro(
+            &json!({"before": null, "after": {"b": u64::MAX}}),
+            &schema,
+        ) {
+            Err(EncodingError::Conversion(f)) => {
+                assert_eq!(f.column, "after.b")
+            }
+            other => panic!("never a double or a wrapped long: {other:?}"),
+        }
+    }
+
+    /// A conversion failure becomes the `sink_conversion_failed` incident:
+    /// column, source and target type as evidence, never the value; still a
+    /// DLQ-eligible serialization error.
+    #[test]
+    fn conversion_failures_raise_sink_conversion_failed() {
+        let f =
+            refused(json!(u64::MAX), json!("long"), Some("bigint unsigned"));
+        let e = EncodingError::Conversion(f).into_sink_error_for("kafka");
+        assert!(e.is_dlq_eligible());
+        let draft = e.draft().expect("an incident draft");
+        assert_eq!(
+            draft.reason_code,
+            crate::incident::ReasonCode::SinkConversionFailed
+        );
+        let json = serde_json::to_string(draft).unwrap();
+        for want in ["\"column\"", "bigint_unsigned", "avro_long", "kafka"] {
+            assert!(json.contains(want), "{want}: {json}");
+        }
+        assert!(!json.contains("18446744073709551615"), "{json}");
+        assert!(!e.to_string().contains("18446744073709551615"));
+    }
+
     /// Integers reach Avro `long`/`int` exactly or fail explicitly: an
     /// unsigned value above `i64::MAX` (MySQL BIGINT UNSIGNED in `long`
     /// mode) is never wrapped, zeroed or turned into a double.
@@ -1381,9 +2126,15 @@ mod tests {
         }
         for v in [json!(i64::MAX as u64 + 1), json!(u64::MAX), json!(1.5)] {
             let e = json_to_avro(&v, &long).unwrap_err().to_string();
-            assert!(e.contains("does not fit an Avro long"), "{v}: {e}");
+            assert!(
+                e.contains("cannot be represented exactly as Avro long"),
+                "{v}: {e}"
+            );
             let e = json_to_avro(&v, &nullable_long).unwrap_err().to_string();
-            assert!(e.contains("does not fit an Avro long"), "{v}: {e}");
+            assert!(
+                e.contains("cannot be represented exactly as Avro long"),
+                "{v}: {e}"
+            );
         }
         assert_eq!(
             json_to_avro(&json!(i32::MAX), &int).unwrap(),
@@ -1391,7 +2142,10 @@ mod tests {
         );
         for v in [json!(i32::MAX as i64 + 1), json!(i32::MIN as i64 - 1)] {
             let e = json_to_avro(&v, &int).unwrap_err().to_string();
-            assert!(e.contains("does not fit an Avro int"), "{v}: {e}");
+            assert!(
+                e.contains("cannot be represented exactly as Avro int"),
+                "{v}: {e}"
+            );
         }
     }
 

@@ -227,7 +227,47 @@ async fn pipeline(
     db: &str,
     mode: &str,
 ) -> String {
-    let name = format!("ua-{mode}");
+    pipeline_named(i, mgr, &format!("ua-{mode}"), db, mode, false).await
+}
+
+/// A pipeline `name` from `db.t` to topic `db`, with the event journal's
+/// DLQ when `dlq`.
+async fn pipeline_named(
+    i: &Infra,
+    mgr: &PipelineManager,
+    name: &str,
+    db: &str,
+    mode: &str,
+    dlq: bool,
+) -> String {
+    pipeline_with(i, mgr, name, db, mode, dlq, false).await
+}
+
+/// [`pipeline_named`], plus a JSON (native envelope) sink to topic
+/// `{db}_json` when `mirror`: the source's own events to compare with.
+async fn pipeline_with(
+    i: &Infra,
+    mgr: &PipelineManager,
+    name: &str,
+    db: &str,
+    mode: &str,
+    dlq: bool,
+    mirror: bool,
+) -> String {
+    let mirror = if mirror {
+        format!(
+            "\n    - type: kafka\n      config: {{id: json, brokers: \"{}\", \
+             topic: {db}_json, envelope: {{type: native}}, required: true}}",
+            brokers()
+        )
+    } else {
+        String::new()
+    };
+    let journal = if dlq {
+        "\n  journal: {enabled: true}"
+    } else {
+        ""
+    };
     let yaml = format!(
         r#"
 apiVersion: deltaforge/v1
@@ -236,7 +276,7 @@ metadata: {{name: {name}, tenant: t}}
 spec:
   source:
     type: mysql
-    config: {{id: src-{mode}, dsn: "{dsn}", tables: ["{db}.t"]}}
+    config: {{id: src-{name}, dsn: "{dsn}", tables: ["{db}.t"]}}
   processors: []
   sinks:
     - type: kafka
@@ -249,7 +289,7 @@ spec:
         encoding:
           type: avro
           schema_registry_url: "{sr}"
-          unsigned_bigint_mode: {mode}
+          unsigned_bigint_mode: {mode}{mirror}{journal}
 "#,
         dsn = dsn(i).await,
         brokers = brokers(),
@@ -257,8 +297,8 @@ spec:
     );
     let spec: PipelineSpec = serde_yaml::from_str(&yaml).expect("spec");
     mgr.create(spec).await.expect("create pipeline");
-    until_status(mgr, &name, "running").await;
-    name
+    until_status(mgr, name, "running").await;
+    name.to_string()
 }
 
 async fn until_status(mgr: &PipelineManager, name: &str, want: &str) {
@@ -303,8 +343,9 @@ fn image(v: Option<Avro>) -> Option<BTreeMap<String, Avro>> {
     }
 }
 
-/// Decode a Confluent-framed Avro record with its registered schema.
-async fn decode(i: &Infra, bytes: &[u8]) -> Rec {
+/// Decode a Confluent-framed Avro record knowing only its schema ID, as
+/// a generic consumer of the topic does.
+async fn decode_any(i: &Infra, bytes: &[u8]) -> Avro {
     assert_eq!(bytes[0], 0, "magic byte");
     let id = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
     let body: serde_json::Value =
@@ -317,8 +358,12 @@ async fn decode(i: &Infra, bytes: &[u8]) -> Rec {
     let schema =
         apache_avro::Schema::parse_str(body["schema"].as_str().unwrap())
             .unwrap();
-    let value =
-        apache_avro::from_avro_datum(&schema, &mut &bytes[5..], None).unwrap();
+    apache_avro::from_avro_datum(&schema, &mut &bytes[5..], None).unwrap()
+}
+
+/// Decode a row record (see [`decode_any`]).
+async fn decode(i: &Infra, bytes: &[u8]) -> Rec {
+    let value = decode_any(i, bytes).await;
     let Avro::Record(fields) = value else {
         panic!("not a record: {value:?}")
     };
@@ -343,6 +388,20 @@ async fn consume(
     quiet: Duration,
     max: Duration,
 ) -> Vec<Rec> {
+    let mut out = Vec::new();
+    for bytes in consume_raw(topic, want, quiet, max).await {
+        out.push(decode(i, &bytes).await);
+    }
+    out
+}
+
+/// [`consume`]'s raw record values.
+async fn consume_raw(
+    topic: &str,
+    want: usize,
+    quiet: Duration,
+    max: Duration,
+) -> Vec<Vec<u8>> {
     let c: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", brokers())
         .set("group.id", format!("ua-{topic}-{}", rand_suffix()))
@@ -361,7 +420,7 @@ async fn consume(
             left
         };
         match tokio::time::timeout(wait, c.recv()).await {
-            Ok(Ok(m)) => out.push(decode(i, m.payload().unwrap()).await),
+            Ok(Ok(m)) => out.push(m.payload().unwrap().to_vec()),
             // The sink creates the topic with its first record.
             Ok(Err(e))
                 if e.rdkafka_error_code()
@@ -393,7 +452,7 @@ async fn until_streaming(i: &Infra, db: &str) {
     for k in 0..120 {
         sql(
             i,
-            &[format!("INSERT INTO {db}.t VALUES ({}, 0, 0)", MARKER + k)],
+            &[format!("INSERT INTO {db}.t (id) VALUES ({})", MARKER + k)],
         )
         .await;
         let got = consume(
@@ -579,14 +638,504 @@ async fn bigint_unsigned_in_long_mode_is_exact_to_i64_max_and_fails_above() {
     )
     .await;
     until_status(&mgr, &name, "failed").await;
-    let incidents = format!("{:?}", mgr.incidents(&name).await);
-    assert!(incidents.contains("halted"), "{incidents}");
-    let cause = format!("{} does not fit an Avro long", I64_MAX + 1);
-    assert!(logged(&cause), "the failure is the explicit encoding error");
+    // Its own incident: the column and types, never the value.
+    let incidents = mgr.incidents(&name).await.unwrap().to_string();
+    for want in [
+        "sink_conversion_failed",
+        "after.b",
+        "bigint_unsigned",
+        "avro_long",
+    ] {
+        assert!(incidents.contains(want), "{want}: {incidents}");
+    }
+    let value = (I64_MAX + 1).to_string();
+    assert!(!incidents.contains(&value), "{incidents}");
+    assert!(
+        logged(
+            "column after.b (bigint unsigned) cannot be represented exactly as Avro long"
+        ),
+        "the failure is the explicit conversion error"
+    );
+    assert!(!logged(&value), "the value never reaches the log");
     let got = rows(
         consume(i, db, 4, Duration::from_secs(10), Duration::from_secs(120))
             .await,
     );
     assert_eq!(got.len(), 3, "no record after the failure: {got:?}");
+    mgr.delete(&name).await.ok();
+}
+
+/// With the event journal's DLQ, a value long mode cannot hold goes to the
+/// DLQ with its conversion failure (column and types, not the value), the
+/// rows around it are delivered exactly, and the pipeline keeps running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "docker: MySQL, Kafka and Schema Registry"]
+async fn a_conversion_failure_goes_to_the_dlq_when_one_is_configured() {
+    capture_logs();
+    let i = INFRA.get_or_init(start).await;
+    let db = "ua_dlq";
+    sql(
+        i,
+        &[
+            format!("DROP DATABASE IF EXISTS {db}"),
+            format!("CREATE DATABASE {db}"),
+            format!("CREATE TABLE {db}.t ({TABLE})"),
+        ],
+    )
+    .await;
+    let mgr = manager().await;
+    let name = pipeline_named(i, &mgr, "ua-dlq", db, "long", true).await;
+    until_streaming(i, db).await;
+    sql(
+        i,
+        &[
+            format!("INSERT INTO {db}.t VALUES (1, {U32_MAX}, {I64_MAX})"),
+            format!(
+                "INSERT INTO {db}.t VALUES (2, {U32_MAX}, {})",
+                I64_MAX + 1
+            ),
+            format!("INSERT INTO {db}.t VALUES (3, 1, 1)"),
+        ],
+    )
+    .await;
+    let got = rows(
+        consume(i, db, 3, Duration::from_secs(5), Duration::from_secs(120))
+            .await,
+    );
+    let ids: Vec<Avro> = got
+        .iter()
+        .map(|r| r.after.as_ref().unwrap()["id"].clone())
+        .collect();
+    assert_eq!(ids, vec![Avro::Int(1), Avro::Int(3)], "{got:?}");
+    assert_eq!(got[0].after.as_ref().unwrap()["b"], long(I64_MAX));
+    assert_eq!(mgr.get(&name).await.unwrap().status, "running");
+    assert_eq!(mgr.dlq_count(&name).await.unwrap(), 1);
+    let entries = format!("{:?}", mgr.dlq_peek(&name, 10).await.unwrap());
+    for want in ["after.b", "bigint_unsigned", "avro_long"] {
+        assert!(entries.contains(want), "{want}: {entries}");
+    }
+    mgr.delete(&name).await.ok();
+}
+
+/// DATE, TIMESTAMP(6), TEXT and JSON values reach Avro exactly (DATE was
+/// written as the epoch and TIMESTAMP declared in the wrong unit before).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "docker: MySQL, Kafka and Schema Registry"]
+async fn temporal_text_and_json_values_encode_exactly() {
+    let i = INFRA.get_or_init(start).await;
+    let db = "ua_fam";
+    sql(
+        i,
+        &[
+            format!("DROP DATABASE IF EXISTS {db}"),
+            format!("CREATE DATABASE {db}"),
+            format!(
+                "CREATE TABLE {db}.t (id INT PRIMARY KEY, d DATE, \
+                 ts TIMESTAMP(6) NULL, txt TEXT, j JSON)"
+            ),
+        ],
+    )
+    .await;
+    let mgr = manager().await;
+    let name = pipeline_named(i, &mgr, "ua-fam", db, "string", false).await;
+    until_streaming(i, db).await;
+    sql(
+        i,
+        &[
+            "SET time_zone = '+00:00'".into(),
+            format!(
+                "INSERT INTO {db}.t VALUES (1, '2024-02-29', \
+                 '2024-03-30 23:30:00.654321', 'multi\\nline 😀', \
+                 '{{\"k\": [1, 2.5]}}')"
+            ),
+        ],
+    )
+    .await;
+    let got = rows(
+        consume(i, db, 2, Duration::from_secs(5), Duration::from_secs(120))
+            .await,
+    );
+    let after = got[0].after.as_ref().expect("after");
+    assert_eq!(after["d"], Avro::Date(19_782));
+    assert_eq!(after["ts"], Avro::TimestampMicros(1_711_841_400_654_321));
+    assert_eq!(after["txt"], Avro::String("multi\nline 😀".into()));
+    assert_eq!(after["j"], Avro::String(r#"{"k":[1,2.5]}"#.into()));
+    mgr.delete(&name).await.ok();
+}
+
+/// CDC delivers an ENUM as its index (labels come with the canonical
+/// decoder): the index is never written for the label; the pipeline stops
+/// with the conversion incident and no record of the row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "docker: MySQL, Kafka and Schema Registry"]
+async fn an_enum_index_is_never_written_for_its_label() {
+    let i = INFRA.get_or_init(start).await;
+    let db = "ua_enum";
+    sql(
+        i,
+        &[
+            format!("DROP DATABASE IF EXISTS {db}"),
+            format!("CREATE DATABASE {db}"),
+            format!(
+                "CREATE TABLE {db}.t (id INT PRIMARY KEY, e ENUM('a', 'b'))"
+            ),
+        ],
+    )
+    .await;
+    let mgr = manager().await;
+    let name = pipeline_named(i, &mgr, "ua-enum", db, "string", false).await;
+    until_streaming(i, db).await;
+    sql(i, &[format!("INSERT INTO {db}.t VALUES (1, 'b')")]).await;
+    until_status(&mgr, &name, "failed").await;
+    let incidents = mgr.incidents(&name).await.unwrap().to_string();
+    for want in ["sink_conversion_failed", "after.e", "enum", "avro_string"] {
+        assert!(incidents.contains(want), "{want}: {incidents}");
+    }
+    let got = rows(
+        consume(i, db, 1, Duration::from_secs(5), Duration::from_secs(30))
+            .await,
+    );
+    assert!(got.is_empty(), "no record of the row: {got:?}");
+    mgr.delete(&name).await.ok();
+}
+
+/// A column added by DDL reaches Avro: the encoder never keeps converting
+/// rows with the subject's earlier schema (which has no such column).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "docker: MySQL, Kafka and Schema Registry"]
+async fn a_column_added_by_ddl_reaches_avro() {
+    let i = INFRA.get_or_init(start).await;
+    let db = "ua_ddl";
+    sql(
+        i,
+        &[
+            format!("DROP DATABASE IF EXISTS {db}"),
+            format!("CREATE DATABASE {db}"),
+            format!("CREATE TABLE {db}.t (id INT PRIMARY KEY, i INT UNSIGNED, b BIGINT UNSIGNED)"),
+        ],
+    )
+    .await;
+    let mgr = manager().await;
+    let name = pipeline_named(i, &mgr, "ua-ddl", db, "string", false).await;
+    until_streaming(i, db).await;
+    sql(
+        i,
+        &[
+            format!("INSERT INTO {db}.t VALUES (1, 1, 1)"),
+            format!("ALTER TABLE {db}.t ADD COLUMN extra INT"),
+            format!("INSERT INTO {db}.t VALUES (2, 2, 2, 42)"),
+        ],
+    )
+    .await;
+    let got = rows(
+        consume(i, db, 3, Duration::from_secs(5), Duration::from_secs(120))
+            .await,
+    );
+    let status = mgr.get(&name).await.unwrap().status;
+    let second = got.iter().find(|r| {
+        r.after
+            .as_ref()
+            .is_some_and(|a| a.get("id") == Some(&Avro::Int(2)))
+    });
+    assert!(
+        second
+            .is_some_and(|r| r.after.as_ref().unwrap().get("extra")
+                == Some(&Avro::Int(42))),
+        "the added column's value is missing (status {status}): {got:?}"
+    );
+
+    // One lossless DDL record for the ALTER, before the row that has the
+    // new column; every record decodes by its schema ID alone.
+    let mut records = Vec::new();
+    for bytes in
+        consume_raw(db, 4, Duration::from_secs(2), Duration::from_secs(60))
+            .await
+    {
+        records.push(avro_json(&decode_any(i, &bytes).await));
+    }
+    let ddl: Vec<usize> = (0..records.len())
+        .filter(|&k| records[k].get("ddl").is_some())
+        .collect();
+    assert_eq!(ddl.len(), 1, "{records:#?}");
+    assert_eq!(
+        records[ddl[0]]["ddl"],
+        serde_json::json!({
+            "ddl_format": 2,
+            "scope": "tables",
+            "objects": [{"kind": "table", "database": db, "name": "t"}],
+            "database": db,
+            "session_database": null,
+            "sql": format!("ALTER TABLE {db}.t ADD COLUMN extra INT"),
+            "operation": null, "redacted": null, "note": null,
+            "cascade": null, "restart_identity": null
+        })
+    );
+    let row2 = records
+        .iter()
+        .position(|r| r["after"]["id"] == 2)
+        .expect("row 2");
+    assert!(ddl[0] < row2, "the DDL record precedes the row");
+    assert_eq!(records[row2]["after"]["extra"], 42);
+    mgr.delete(&name).await.ok();
+}
+
+/// An Avro value as JSON (unions unwrapped, records as objects); other
+/// kinds as their debug text.
+fn avro_json(v: &Avro) -> serde_json::Value {
+    use serde_json::json;
+    match v {
+        Avro::Null => json!(null),
+        Avro::Boolean(b) => json!(b),
+        Avro::Int(n) => json!(n),
+        Avro::Long(n) => json!(n),
+        Avro::String(s) => json!(s),
+        Avro::Union(_, inner) => avro_json(inner),
+        Avro::Array(items) => {
+            serde_json::Value::Array(items.iter().map(avro_json).collect())
+        }
+        Avro::Record(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), avro_json(v)))
+                .collect(),
+        ),
+        other => json!(format!("{other:?}")),
+    }
+}
+
+/// DDL events reach Avro as lossless DDL records under the topic's DDL
+/// subject, equal to the source's own events (a JSON sink of the same
+/// pipeline): renames keep their ordered source and target objects, a
+/// multi-table DROP every object, database and lineage barriers their
+/// scopes, and account statements no secret. Rows keep flowing with the
+/// new column.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "docker: MySQL, Kafka and Schema Registry"]
+async fn ddl_events_reach_avro_as_lossless_ddl_records() {
+    const SECRETS: [&str; 2] = ["Ua-Secret-7781", "Ua-Secret-9902"];
+    let i = INFRA.get_or_init(start).await;
+    let db = "ua_ddlrec";
+    let x = "ua_ddlrec_x";
+    sql(
+        i,
+        &[
+            format!("DROP DATABASE IF EXISTS {db}"),
+            format!("DROP DATABASE IF EXISTS {x}"),
+            "DROP USER IF EXISTS 'ua_ddl_user'@'%'".into(),
+            format!("CREATE DATABASE {db}"),
+            format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)"),
+            format!("CREATE TABLE {db}.a (id INT PRIMARY KEY)"),
+            format!("CREATE TABLE {db}.b (id INT PRIMARY KEY)"),
+            format!("CREATE TABLE {db}.c (id INT PRIMARY KEY)"),
+            format!("CREATE TABLE {db}.d (id INT PRIMARY KEY)"),
+        ],
+    )
+    .await;
+    let mgr = manager().await;
+    let name =
+        pipeline_with(i, &mgr, "ua-ddlrec", db, "string", false, true).await;
+    until_streaming(i, db).await;
+    sql(
+        i,
+        &[
+            format!("CREATE DATABASE {x}"),
+            format!("ALTER TABLE {db}.t ADD COLUMN extra INT"),
+            format!("USE {db}"),
+            "RENAME TABLE a TO a2".into(),
+            format!("RENAME TABLE {db}.b TO {x}.b2"),
+            format!("DROP TABLE {db}.c, {db}.a2"),
+            // A double-quoted token may be an ANSI_QUOTES identifier: the
+            // statement is a lineage barrier.
+            format!("ALTER TABLE {db}.d ADD COLUMN y VARCHAR(5) DEFAULT \"x\""),
+            format!(
+                "CREATE USER 'ua_ddl_user'@'%' IDENTIFIED BY '{}'",
+                SECRETS[0]
+            ),
+            format!(
+                "ALTER USER 'ua_ddl_user'@'%' IDENTIFIED BY '{}'",
+                SECRETS[1]
+            ),
+            "DROP USER 'ua_ddl_user'@'%'".into(),
+            format!("DROP DATABASE {x}"),
+            format!("INSERT INTO {db}.t (id, extra) VALUES (1, 5)"),
+        ],
+    )
+    .await;
+
+    // The source's own DDL events (JSON sink), in order.
+    let quiet = Duration::from_secs(5);
+    let max = Duration::from_secs(120);
+    let json_raw = consume_raw(&format!("{db}_json"), 12, quiet, max).await;
+    let source: Vec<serde_json::Value> = json_raw
+        .iter()
+        .map(|b| serde_json::from_slice(b).unwrap())
+        .filter(|e: &serde_json::Value| e.get("ddl").is_some())
+        .collect();
+    // The Avro topic, decoded by schema ID alone.
+    let avro_raw = consume_raw(db, 12, quiet, max).await;
+    let mut avro = Vec::new();
+    for bytes in &avro_raw {
+        avro.push(avro_json(&decode_any(i, bytes).await));
+    }
+    let status = mgr.get(&name).await.unwrap().status;
+    let ddl: Vec<&serde_json::Value> =
+        avro.iter().filter(|r| r.get("ddl").is_some()).collect();
+    assert_eq!(ddl.len(), source.len(), "status {status}: {avro:#?}");
+    assert!(ddl.len() >= 10, "every statement: {source:#?}");
+
+    // Each Avro DDL record equals the source's event, field by field.
+    for (a, s) in ddl.iter().zip(&source) {
+        assert_eq!(a["event_id"], s["event_id"]);
+        assert_eq!(a["op"], s["op"]);
+        assert_eq!(a["ts_ms"], s["ts_ms"]);
+        assert_eq!(a["mapping_version"], 2);
+        for k in ["db", "table", "connector", "name", "ts_ms"] {
+            assert_eq!(a["source"][k], s["source"][k], "source.{k}");
+        }
+        let (ap, sp) =
+            (a["ddl"].as_object().unwrap(), s["ddl"].as_object().unwrap());
+        for (k, v) in sp {
+            assert_eq!(ap.get(k), Some(v), "ddl.{k}: {s}");
+        }
+        for (k, v) in ap {
+            assert!(sp.contains_key(k) || v.is_null(), "ddl.{k}: {a}");
+        }
+    }
+
+    let by_sql = |sql: &str| {
+        ddl.iter()
+            .find(|r| r["ddl"]["sql"] == sql)
+            .unwrap_or_else(|| panic!("no record for {sql}: {ddl:#?}"))
+    };
+    let obj = |d: &str, n: &str| serde_json::json!({"kind": "table", "database": d, "name": n});
+    let rename = by_sql("RENAME TABLE a TO a2");
+    assert_eq!(
+        rename["ddl"]["objects"],
+        serde_json::json!([obj(db, "a"), obj(db, "a2")])
+    );
+    assert_eq!(rename["ddl"]["session_database"], db);
+    let cross = by_sql(&format!("RENAME TABLE {db}.b TO {x}.b2"));
+    assert_eq!(
+        cross["ddl"]["objects"],
+        serde_json::json!([obj(db, "b"), obj(x, "b2")])
+    );
+    assert_eq!(cross["ddl"]["database"], serde_json::Value::Null);
+    assert_eq!(cross["source"]["db"], "");
+    let scopes: Vec<&str> = ddl
+        .iter()
+        .filter_map(|r| r["ddl"]["scope"].as_str())
+        .collect();
+    for want in ["database", "lineage", "tables"] {
+        assert!(scopes.contains(&want), "{want}: {scopes:?}");
+    }
+    let drop = ddl
+        .iter()
+        .find(|r| {
+            r["ddl"]["sql"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("DROP TABLE"))
+        })
+        .expect("the DROP TABLE record");
+    assert_eq!(
+        drop["ddl"]["objects"],
+        serde_json::json!([obj(db, "c"), obj(db, "a2")])
+    );
+    let redacted: Vec<_> = ddl
+        .iter()
+        .filter(|r| r["ddl"]["redacted"] == true)
+        .collect();
+    assert_eq!(redacted.len(), 2, "CREATE USER and ALTER USER");
+    for r in &redacted {
+        assert_eq!(r["ddl"]["sql"], serde_json::Value::Null);
+    }
+    for bytes in avro_raw.iter().chain(&json_raw) {
+        let text = String::from_utf8_lossy(bytes);
+        for secret in SECRETS {
+            assert!(!text.contains(secret), "secret in a record");
+        }
+    }
+    // Rows keep flowing with the new column.
+    let row = avro
+        .iter()
+        .find(|r| r["after"]["id"] == 1)
+        .expect("the row after the DDL");
+    assert_eq!(row["after"]["extra"], 5);
+    mgr.delete(&name).await.ok();
+}
+
+/// Every decoded record carries exactly the columns of its table's schema
+/// version, with every value: an insert with a NULL, a later value for the
+/// same column, and the before and after images of an update and a delete.
+/// (Snapshot rows are excluded: they carry every value as text until the
+/// snapshot decoder is schema-driven.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "docker: MySQL, Kafka and Schema Registry"]
+async fn decoded_records_carry_every_column_of_their_schema_version() {
+    let i = INFRA.get_or_init(start).await;
+    let db = "ua_all";
+    sql(
+        i,
+        &[
+            format!("DROP DATABASE IF EXISTS {db}"),
+            format!("CREATE DATABASE {db}"),
+            format!(
+                "CREATE TABLE {db}.t (id INT PRIMARY KEY, n INT NULL, \
+                 s VARCHAR(10), b BIGINT UNSIGNED)"
+            ),
+        ],
+    )
+    .await;
+    let mgr = manager().await;
+    let name = pipeline_named(i, &mgr, "ua-all", db, "string", false).await;
+    until_streaming(i, db).await;
+    sql(
+        i,
+        &[
+            format!("INSERT INTO {db}.t VALUES (2, NULL, 'x', 7)"),
+            format!(
+                "INSERT INTO {db}.t VALUES (3, 9, 'y', 18446744073709551615)"
+            ),
+            format!("UPDATE {db}.t SET n = 10, s = 'z' WHERE id = 2"),
+            format!("DELETE FROM {db}.t WHERE id = 3"),
+        ],
+    )
+    .await;
+    let got = rows(
+        consume(i, db, 5, Duration::from_secs(5), Duration::from_secs(120))
+            .await,
+    );
+    let status = mgr.get(&name).await.unwrap().status;
+
+    let img = |id: i32, n: Avro, s: &str, b: &str| {
+        Some(BTreeMap::from([
+            ("id".to_string(), Avro::Int(id)),
+            ("n".to_string(), n),
+            ("s".to_string(), Avro::String(s.into())),
+            ("b".to_string(), Avro::String(b.into())),
+        ]))
+    };
+    let want = [
+        Rec {
+            op: "c".into(),
+            before: None,
+            after: img(2, Avro::Null, "x", "7"),
+        },
+        Rec {
+            op: "c".into(),
+            before: None,
+            after: img(3, Avro::Int(9), "y", "18446744073709551615"),
+        },
+        Rec {
+            op: "u".into(),
+            before: img(2, Avro::Null, "x", "7"),
+            after: img(2, Avro::Int(10), "z", "7"),
+        },
+        Rec {
+            op: "d".into(),
+            before: img(3, Avro::Int(9), "y", "18446744073709551615"),
+            after: None,
+        },
+    ];
+    assert_eq!(got, want, "status {status}");
     mgr.delete(&name).await.ok();
 }

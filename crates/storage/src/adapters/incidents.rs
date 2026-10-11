@@ -337,6 +337,13 @@ pub fn verified_start_check(
             | ReasonCode::MysqlGtidPositionUnavailable,
             Component::Source { .. },
         ) => Some(POSITION_VERIFIED),
+        // A conversion the sink could not make exactly (an operator changes
+        // the mapping or configures a DLQ, then restarts): settled when the
+        // restarted pipeline is verified running; a recurrence reopens it.
+        (
+            ReasonCode::SinkConversionFailed | ReasonCode::SinkSchemaRejected,
+            Component::Sink { .. },
+        ) => Some(PIPELINE_RECOVERED),
         _ => None,
     }
 }

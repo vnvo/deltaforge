@@ -153,7 +153,7 @@ pub fn classify_coordinator_exit(
     for cause in error.chain() {
         if let Some(sd) = cause.downcast_ref::<SinkDeliveryError>() {
             return match sd.error.draft() {
-                Some(d) => d.clone(),
+                Some(d) => bind_epoch(d.clone(), epoch),
                 None => unclassified(
                     Component::Sink {
                         id: sd.sink_id.clone(),
@@ -166,7 +166,7 @@ pub fn classify_coordinator_exit(
         if let Some(se) = cause.downcast_ref::<SinkError>()
             && let Some(d) = se.draft()
         {
-            return d.clone();
+            return bind_epoch(d.clone(), epoch);
         }
         if cause.downcast_ref::<OversizedTxError>().is_some() {
             return unclassified(
@@ -693,7 +693,12 @@ mod tests {
                 },
             ),
         });
-        assert_eq!(classify_coordinator_exit(&with_draft, 0), raised);
+        // A sink's own draft is used, bound to the recovery epoch like a
+        // source's when a verified start settles its reason.
+        assert_eq!(
+            classify_coordinator_exit(&with_draft, 0),
+            bind_epoch(raised.clone(), 0)
+        );
         assert_eq!(
             classify_coordinator_exit(&anyhow::anyhow!("x"), 0).cause_code,
             CauseCode::CoordinatorOther

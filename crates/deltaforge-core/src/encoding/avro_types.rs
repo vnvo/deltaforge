@@ -18,6 +18,11 @@ use tracing::warn;
 // =============================================================================
 
 /// Type conversion options (from sink encoding config).
+/// Version of the column-to-Avro type mapping. Bump it whenever a column
+/// type maps to a different Avro type, so schemas built under the old
+/// mapping are never reused for the new one.
+pub const AVRO_MAPPING_VERSION: u32 = 2;
+
 #[derive(Debug, Clone)]
 pub struct TypeConversionOpts {
     /// How to map MySQL BIGINT UNSIGNED.
@@ -104,7 +109,7 @@ pub fn mysql_column_to_avro(
     opts: &TypeConversionOpts,
 ) -> Value {
     let avro_type = mysql_type_to_avro(&col.data_type, col, opts);
-    wrap_field(&col.name, avro_type, col.nullable)
+    wrap_field(col, avro_type)
 }
 
 fn mysql_type_to_avro(
@@ -172,8 +177,9 @@ fn mysql_type_to_avro(
                 json!({"type": "long", "logicalType": "timestamp-millis"})
             }
         },
+        // The value is epoch microseconds: declared as such.
         "timestamp" => {
-            json!({"type": "long", "logicalType": "timestamp-millis"})
+            json!({"type": "long", "logicalType": "timestamp-micros"})
         }
         "time" => json!({"type": "long", "logicalType": "time-millis"}),
         "year" => json!("int"),
@@ -258,11 +264,11 @@ pub fn postgres_column_to_avro(
             "type": "array",
             "items": item_avro
         });
-        return wrap_field(&col.name, array_type, col.nullable);
+        return wrap_field(col, array_type);
     }
 
     let avro_type = postgres_scalar_to_avro(&col.data_type, col, opts);
-    wrap_field(&col.name, avro_type, col.nullable)
+    wrap_field(col, avro_type)
 }
 
 fn postgres_scalar_to_avro(
@@ -430,19 +436,25 @@ fn normalize_pg_type(data_type: &str) -> String {
 // =============================================================================
 
 /// Wrap an Avro type in a field definition with optional null union.
-fn wrap_field(name: &str, avro_type: Value, nullable: bool) -> Value {
-    if nullable {
+/// The field for `col`, recording its source type (`deltaforge.source_type`,
+/// the full column type) so a value that cannot be converted exactly is
+/// reported with it, and conversions valid only for some source types (an
+/// epoch number of declared unit) can be checked.
+fn wrap_field(col: &ColumnDesc, avro_type: Value) -> Value {
+    let mut field = if col.nullable {
         json!({
-            "name": name,
+            "name": col.name,
             "type": ["null", avro_type],
             "default": null
         })
     } else {
         json!({
-            "name": name,
+            "name": col.name,
             "type": avro_type
         })
-    }
+    };
+    field["deltaforge.source_type"] = json!(col.column_type.to_lowercase());
+    field
 }
 
 // =============================================================================
@@ -617,7 +629,9 @@ mod tests {
             &col("updated", "timestamp", "timestamp", false),
             &o,
         );
-        assert_eq!(f["type"]["logicalType"], "timestamp-millis");
+        // MySQL TIMESTAMP values are epoch microseconds.
+        assert_eq!(f["type"]["logicalType"], "timestamp-micros");
+        assert_eq!(f["deltaforge.source_type"], "timestamp");
     }
 
     #[test]

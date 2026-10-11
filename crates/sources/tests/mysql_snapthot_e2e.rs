@@ -752,6 +752,15 @@ async fn mysql_snapshot_rows_carry_generation_and_stable_ids() -> Result<()> {
     let ids = snapshot_ids(&events);
     let unique: std::collections::HashSet<_> = ids.iter().collect();
     assert_eq!(unique.len(), ids.len(), "ids must be unique per row");
+    // Every row names the registered schema version it was read with, so
+    // a typed sink encodes it with exactly that version.
+    let version = (reads[0].schema_version.clone(), reads[0].schema_sequence);
+    assert!(version.0.is_some() && version.1.is_some(), "{version:?}");
+    assert!(
+        reads
+            .iter()
+            .all(|e| (e.schema_version.clone(), e.schema_sequence) == version)
+    );
 
     handle.stop();
     handle.join().await.ok();

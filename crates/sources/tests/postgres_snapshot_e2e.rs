@@ -198,6 +198,14 @@ async fn pg_snapshot_captures_all_rows_integer_pk() -> Result<()> {
             .iter()
             .all(|e| e.source.position.snapshot_generation == Some(1))
     );
+    // Every row names the registered schema version it was read with.
+    let version = (first.schema_version.clone(), first.schema_sequence);
+    assert!(version.0.is_some() && version.1.is_some(), "{version:?}");
+    assert!(
+        events
+            .iter()
+            .all(|e| (e.schema_version.clone(), e.schema_sequence) == version)
+    );
 
     // Completed over the frozen cohort, with the acknowledging sink.
     let Some(Stored::Current { control, .. }) =

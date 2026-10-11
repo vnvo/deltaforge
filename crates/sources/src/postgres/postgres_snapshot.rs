@@ -229,6 +229,7 @@ pub async fn copy_generation(ctx: &PgCopyCtx<'_>) -> Result<()> {
                  attempt: u32,
                  permit: Option<ExtraPermit>| {
         let worker = TableWorker {
+            version: None,
             dsn: crate::credentials::ProtectedDsn::from(ctx.dsn),
             schema: table.qualifier.clone(),
             table: table.table.clone(),
@@ -630,6 +631,9 @@ pub fn spawn_generation_guard(
 // ============================================================================
 
 struct TableWorker {
+    /// The registered schema version rows are read with (fingerprint,
+    /// registry sequence), stamped on every snapshot event.
+    version: Option<(String, u64)>,
     dsn: crate::credentials::ProtectedDsn,
     schema: String,
     table: String,
@@ -676,7 +680,7 @@ async fn import_view(
 }
 
 impl TableWorker {
-    async fn run(self) -> Result<u64> {
+    async fn run(mut self) -> Result<u64> {
         info!(pipeline=%self.pipeline, source_id=%self.source_id, schema=%self.schema, table=%self.table, "snapshot worker starting");
         let fqn = fqn(&self.schema, &self.table);
         let t0 = Instant::now();
@@ -690,6 +694,7 @@ impl TableWorker {
             .load_schema(&self.schema, &self.table)
             .await
             .with_context(|| format!("load schema for {fqn}"))?;
+        self.version = Some((loaded.fingerprint.to_string(), loaded.sequence));
 
         let pk = &loaded.schema.primary_key;
         let total = estimate_rows(&client, &self.schema, &self.table).await;
@@ -856,6 +861,7 @@ impl TableWorker {
 
     fn reader(&self) -> RangeReader {
         RangeReader {
+            version: self.version.clone(),
             schema: self.schema.clone(),
             table: self.table.clone(),
             pipeline: self.pipeline.clone(),
@@ -931,6 +937,7 @@ impl TableWorker {
                     &self.table,
                     &self.pipeline,
                     &self.tenant,
+                    self.version.as_ref(),
                 )?);
             }
 
@@ -948,6 +955,7 @@ impl TableWorker {
 
 /// Reads PK ranges of one table and publishes each as a chunk.
 struct RangeReader {
+    version: Option<(String, u64)>,
     schema: String,
     table: String,
     pipeline: String,
@@ -1019,6 +1027,7 @@ impl RangeReader {
                 &self.table,
                 &self.pipeline,
                 &self.tenant,
+                self.version.as_ref(),
             )?);
         }
         let n = events.len() as u64;
@@ -1045,6 +1054,7 @@ fn build_pg_snapshot_event(
     table: &str,
     pipeline: &str,
     tenant: &str,
+    version: Option<&(String, u64)>,
 ) -> Result<Event> {
     let id = provisional_snapshot_id(
         row, identity, lineage, generation, schema, table,
@@ -1068,10 +1078,14 @@ fn build_pg_snapshot_event(
             ..Default::default()
         },
     };
-    Ok(
+    let mut ev =
         Event::new_row(id, source, Op::Read, None, Some(after), ts_ms, size)
-            .with_tenant(tenant.to_string()),
-    )
+            .with_tenant(tenant.to_string());
+    if let Some((fingerprint, sequence)) = version {
+        ev.schema_version = Some(fingerprint.clone());
+        ev.schema_sequence = Some(*sequence);
+    }
+    Ok(ev)
 }
 
 /// The snapshot cursor kind for a table: a signed integer-PK range scan (PG

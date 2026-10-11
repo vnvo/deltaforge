@@ -73,6 +73,16 @@ pub enum SchemaLookupError {
          scope does not exist yet; retry once the source is running"
     )]
     LineageNotEstablished { table: String },
+
+    /// The requested schema version is not the registered one: its
+    /// fingerprint is not registered for the table, or is registered under
+    /// another sequence. Not retryable.
+    #[error("schema version conflict for {table}: {reason}")]
+    VersionConflict { table: String, reason: String },
+
+    /// The schema store could not be read; retry later.
+    #[error("source schema for {table} could not be read: {reason}")]
+    Unreadable { table: String, reason: String },
 }
 
 /// Trait for providing database schema information.
@@ -89,6 +99,19 @@ pub trait SchemaProvider: Send + Sync {
         &self,
         table: &str,
     ) -> Result<Option<TableSchemaInfo>, SchemaLookupError>;
+
+    /// Get the schema of a table at exactly the registered version with
+    /// content hash `fingerprint`, checked against its registry `sequence`:
+    /// `Ok(None)` when no such version is registered.
+    async fn get_table_schema_version(
+        &self,
+        table: &str,
+        fingerprint: &str,
+        sequence: Option<u64>,
+    ) -> Result<Option<TableSchemaInfo>, SchemaLookupError> {
+        let _ = (table, fingerprint, sequence);
+        Ok(None)
+    }
 
     /// Get all cached schemas.
     async fn list_schemas(&self) -> Vec<TableSchemaInfo>;
@@ -155,6 +178,51 @@ impl SchemaProvider for SchemaLoaderAdapter {
             database: loaded.database,
             table: loaded.table,
             columns,
+            primary_key: loaded.primary_key,
+        }))
+    }
+
+    async fn get_table_schema_version(
+        &self,
+        table: &str,
+        fingerprint: &str,
+        sequence: Option<u64>,
+    ) -> Result<Option<TableSchemaInfo>, SchemaLookupError> {
+        let (db, tbl) = match table.split_once('.') {
+            Some((d, t)) => (d, t),
+            None => ("", table),
+        };
+        let loaded = match self
+            .loader
+            .load_version(db, tbl, fingerprint, sequence)
+            .await
+        {
+            Ok(Some(loaded)) => loaded,
+            Ok(None) => return Ok(None),
+            Err(e) if sources::registry_scope::is_lineage_unavailable(&e) => {
+                return Err(SchemaLookupError::LineageNotEstablished {
+                    table: table.to_string(),
+                });
+            }
+            Err(e) => {
+                return Err(
+                    match e.downcast_ref::<sources::schema_loader::SchemaVersionConflict>() {
+                        Some(c) => SchemaLookupError::VersionConflict {
+                            table: table.to_string(),
+                            reason: c.to_string(),
+                        },
+                        None => SchemaLookupError::Unreadable {
+                            table: table.to_string(),
+                            reason: format!("{e:#}"),
+                        },
+                    },
+                );
+            }
+        };
+        Ok(Some(TableSchemaInfo {
+            database: loaded.database,
+            table: loaded.table,
+            columns: extract_column_infos(&loaded.schema_json),
             primary_key: loaded.primary_key,
         }))
     }
@@ -238,27 +306,31 @@ use std::collections::HashMap;
 
 use apache_avro::Schema as AvroSchema;
 use deltaforge_core::encoding::avro::{
-    EnvelopeSchemaLookup, SourceSchemaProvider,
+    EnvelopeSchemaLookup, SchemaIdentity, SourceSchemaProvider,
 };
 use deltaforge_core::encoding::avro_schema::{
     build_envelope_schema, build_value_schema,
 };
 use deltaforge_core::encoding::avro_types::{
-    ColumnDesc, TypeConversionOpts, mysql_column_to_avro,
+    AVRO_MAPPING_VERSION, ColumnDesc, TypeConversionOpts, mysql_column_to_avro,
     postgres_column_to_avro,
 };
 use parking_lot::RwLock;
 use tracing::{debug, warn};
 
-/// Cached Avro envelope schema entry.
-type CachedAvroSchema = (String, Arc<AvroSchema>);
+/// A cached envelope schema: the registry sequence of the version it was
+/// built from, its JSON and the parsed schema.
+type CachedAvroSchema = (Option<u64>, String, Arc<AvroSchema>);
 
 /// Implements `SourceSchemaProvider` by looking up table schemas from
 /// the `SchemaProvider` (which reads from the internal schema registry)
 /// and converting column types to Avro using the type converters.
 ///
-/// Caches envelope schemas per `(db, table)` to avoid re-deriving on
-/// every event.
+/// Each event's schema is built from exactly the registered table schema
+/// version the event carries, never the table's latest schema. Envelope
+/// schemas are cached per `(db, table, fingerprint)` with the version's
+/// registry sequence: a later request for the same fingerprint under
+/// another sequence is a conflict.
 pub struct AvroSchemaProviderImpl {
     /// The underlying schema provider (reads from internal registry).
     schema_provider: ArcSchemaProvider,
@@ -266,8 +338,10 @@ pub struct AvroSchemaProviderImpl {
     connector: String,
     /// Type conversion options.
     opts: TypeConversionOpts,
-    /// Cache: "db.table" → (schema_json, parsed AvroSchema)
-    cache: RwLock<HashMap<String, CachedAvroSchema>>,
+    /// The type mapping version and options (see `mapping_id`).
+    mapping_id: String,
+    /// Cache: (db, table, fingerprint) → (sequence, schema_json, schema)
+    cache: RwLock<HashMap<(String, String, String), CachedAvroSchema>>,
 }
 
 impl AvroSchemaProviderImpl {
@@ -280,22 +354,14 @@ impl AvroSchemaProviderImpl {
         Self {
             schema_provider,
             connector: connector.to_string(),
+            mapping_id: format!("v{AVRO_MAPPING_VERSION}:{opts:?}"),
             opts,
             cache: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Invalidate cached schema for a table (called on DDL change).
-    pub fn invalidate(&self, db: &str, table: &str) {
-        let key = format!("{db}.{table}");
-        let mut cache = self.cache.write();
-        if cache.remove(&key).is_some() {
-            debug!(db, table, "invalidated cached Avro schema");
-        }
-    }
-
-    /// Invalidate all cached schemas.
-    #[allow(dead_code)]
+    /// Invalidate all cached schemas; each is rebuilt from its registered
+    /// version on next use.
     pub fn invalidate_all(&self) {
         self.cache.write().clear();
     }
@@ -358,57 +424,68 @@ impl SourceSchemaProvider for AvroSchemaProviderImpl {
         connector: &str,
         db: &str,
         table: &str,
+        identity: &SchemaIdentity,
     ) -> EnvelopeSchemaLookup {
-        // Ignore if connector doesn't match
         if connector != self.connector {
             return EnvelopeSchemaLookup::Absent;
         }
-
-        let key = format!("{db}.{table}");
-
-        // Check cache
-        {
-            let cache = self.cache.read();
-            if let Some((json, schema)) = cache.get(&key) {
-                return EnvelopeSchemaLookup::Found(
-                    json.clone(),
-                    schema.clone(),
-                );
-            }
+        let key = (
+            db.to_string(),
+            table.to_string(),
+            identity.fingerprint.clone(),
+        );
+        if let Some((sequence, json, schema)) = self.cache.read().get(&key) {
+            return match (sequence, identity.sequence) {
+                (Some(registered), Some(stamped)) if *registered != stamped => {
+                    EnvelopeSchemaLookup::Conflict(format!(
+                        "schema {} is registered with sequence {registered}, \
+                         but the event was stamped with sequence {stamped}",
+                        identity.fingerprint
+                    ))
+                }
+                _ => EnvelopeSchemaLookup::Found(json.clone(), schema.clone()),
+            };
         }
 
-        // Look up table schema from the underlying provider (blocking).
-        // SchemaProvider::get_table_schema is async, but SourceSchemaProvider
-        // is sync (called from the encode path). We use the cached/loaded
-        // schemas that are already populated by the coordinator at startup.
-        //
-        // For the initial implementation, we use tokio::task::block_in_place
-        // to call the async method. This is acceptable because:
-        // 1. Schema lookups are rare (only on first event per table + DDL changes)
-        // 2. The underlying SchemaLoaderAdapter typically hits an in-memory cache
+        // The lookup is async but this path is sync (called from encode):
+        // block in place. It runs once per (table, schema version).
+        let qualified = format!("{db}.{table}");
         let table_schema = match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(self.schema_provider.get_table_schema(&key))
+            tokio::runtime::Handle::current().block_on(
+                self.schema_provider.get_table_schema_version(
+                    &qualified,
+                    &identity.fingerprint,
+                    identity.sequence,
+                ),
+            )
         }) {
             Ok(Some(ts)) => ts,
-            Ok(None) => return EnvelopeSchemaLookup::Absent,
+            Ok(None) => {
+                return EnvelopeSchemaLookup::Conflict(format!(
+                    "schema version {} is not registered for the table",
+                    identity.fingerprint
+                ));
+            }
+            Err(e @ SchemaLookupError::VersionConflict { .. }) => {
+                return EnvelopeSchemaLookup::Conflict(e.to_string());
+            }
             // Not cached: the next event retries the lookup.
             Err(e) => return EnvelopeSchemaLookup::Unavailable(e.to_string()),
         };
 
-        // Build the envelope schema
-        let Some(result) = self.build_for_table(db, table, &table_schema)
+        let Some((json, schema)) =
+            self.build_for_table(db, table, &table_schema)
         else {
             return EnvelopeSchemaLookup::Absent;
         };
+        self.cache
+            .write()
+            .insert(key, (identity.sequence, json.clone(), schema.clone()));
+        EnvelopeSchemaLookup::Found(json, schema)
+    }
 
-        // Cache it
-        {
-            let mut cache = self.cache.write();
-            cache.insert(key, result.clone());
-        }
-
-        EnvelopeSchemaLookup::Found(result.0, result.1)
+    fn mapping_id(&self) -> &str {
+        &self.mapping_id
     }
 }
 
@@ -797,6 +874,14 @@ mod tests {
             }
             Ok(Some(self.schema.clone()))
         }
+        async fn get_table_schema_version(
+            &self,
+            table: &str,
+            _fingerprint: &str,
+            _sequence: Option<u64>,
+        ) -> Result<Option<TableSchemaInfo>, SchemaLookupError> {
+            self.get_table_schema(table).await
+        }
         async fn list_schemas(&self) -> Vec<TableSchemaInfo> {
             vec![]
         }
@@ -874,13 +959,162 @@ mod tests {
             "mysql",
             TypeConversionOpts::default(),
         );
+        let v1 = SchemaIdentity::of(Some("h1"), Some(1)).unwrap();
         assert!(matches!(
-            avro.get_envelope_schema("mysql", "shop", "orders"),
+            avro.get_envelope_schema("mysql", "shop", "orders", &v1),
             EnvelopeSchemaLookup::Unavailable(_)
         ));
         assert!(matches!(
-            avro.get_envelope_schema("mysql", "shop", "orders"),
+            avro.get_envelope_schema("mysql", "shop", "orders", &v1),
             EnvelopeSchemaLookup::Found(..)
+        ));
+    }
+
+    /// Serves registered versions of `shop.orders` by fingerprint, checking
+    /// the sequence as the durable registry does, and counts lookups.
+    struct Versions {
+        versions: HashMap<String, (u64, TableSchemaInfo)>,
+        lookups: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SchemaProvider for Versions {
+        async fn get_table_schema(
+            &self,
+            _table: &str,
+        ) -> Result<Option<TableSchemaInfo>, SchemaLookupError> {
+            panic!("the latest schema must never be used for an event");
+        }
+        async fn get_table_schema_version(
+            &self,
+            table: &str,
+            fingerprint: &str,
+            sequence: Option<u64>,
+        ) -> Result<Option<TableSchemaInfo>, SchemaLookupError> {
+            self.lookups
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let Some((registered, ts)) = self.versions.get(fingerprint) else {
+                return Ok(None);
+            };
+            match sequence {
+                Some(s) if s != *registered => {
+                    Err(SchemaLookupError::VersionConflict {
+                        table: table.to_string(),
+                        reason: format!("registered {registered}, stamped {s}"),
+                    })
+                }
+                _ => Ok(Some(ts.clone())),
+            }
+        }
+        async fn list_schemas(&self) -> Vec<TableSchemaInfo> {
+            vec![]
+        }
+    }
+
+    fn two_versions() -> Arc<Versions> {
+        let v1 = orders_schema();
+        let mut v2 = orders_schema();
+        v2.columns.push(ColumnSchemaInfo {
+            name: "extra".into(),
+            data_type: "int".into(),
+            full_type: "int".into(),
+            nullable: true,
+            ..Default::default()
+        });
+        Arc::new(Versions {
+            versions: HashMap::from([
+                ("h1".to_string(), (1, v1)),
+                ("h2".to_string(), (2, v2)),
+            ]),
+            lookups: Default::default(),
+        })
+    }
+
+    fn columns_of(lookup: EnvelopeSchemaLookup) -> Vec<String> {
+        let EnvelopeSchemaLookup::Found(json, _) = lookup else {
+            panic!("expected a schema, got {lookup:?}");
+        };
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let after = v["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == "after")
+            .unwrap();
+        after["type"][1]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn avro_provider_builds_each_events_own_version() {
+        let versions = two_versions();
+        let avro = AvroSchemaProviderImpl::new(
+            versions.clone(),
+            "mysql",
+            TypeConversionOpts::default(),
+        );
+        let v1 = SchemaIdentity::of(Some("h1"), Some(1)).unwrap();
+        let v2 = SchemaIdentity::of(Some("h2"), Some(2)).unwrap();
+        // Old, new, old: each request gets exactly its version.
+        for (id, cols) in [
+            (&v1, vec!["id"]),
+            (&v2, vec!["id", "extra"]),
+            (&v1, vec!["id"]),
+        ] {
+            assert_eq!(
+                columns_of(
+                    avro.get_envelope_schema("mysql", "shop", "orders", id)
+                ),
+                cols
+            );
+        }
+        assert_eq!(
+            versions.lookups.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one lookup per version"
+        );
+        // Evicted and reloaded: still exactly the requested version.
+        avro.invalidate_all();
+        assert_eq!(
+            columns_of(
+                avro.get_envelope_schema("mysql", "shop", "orders", &v1)
+            ),
+            vec!["id"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn avro_provider_fails_closed_on_a_conflicting_or_unknown_version() {
+        let avro = AvroSchemaProviderImpl::new(
+            two_versions(),
+            "mysql",
+            TypeConversionOpts::default(),
+        );
+        // The registry's own sequence check.
+        let stale = SchemaIdentity::of(Some("h1"), Some(7)).unwrap();
+        assert!(matches!(
+            avro.get_envelope_schema("mysql", "shop", "orders", &stale),
+            EnvelopeSchemaLookup::Conflict(_)
+        ));
+        // A cached fingerprint requested under another sequence.
+        let v1 = SchemaIdentity::of(Some("h1"), Some(1)).unwrap();
+        assert!(matches!(
+            avro.get_envelope_schema("mysql", "shop", "orders", &v1),
+            EnvelopeSchemaLookup::Found(..)
+        ));
+        assert!(matches!(
+            avro.get_envelope_schema("mysql", "shop", "orders", &stale),
+            EnvelopeSchemaLookup::Conflict(m) if m.contains("sequence 1")
+        ));
+        // A fingerprint the registry does not know.
+        let unknown = SchemaIdentity::of(Some("h9"), Some(9)).unwrap();
+        assert!(matches!(
+            avro.get_envelope_schema("mysql", "shop", "orders", &unknown),
+            EnvelopeSchemaLookup::Conflict(_)
         ));
     }
 
