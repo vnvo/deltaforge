@@ -35,7 +35,7 @@ pub struct ReconcileReport {
     pub referenced: usize,
     /// Objects seen in the listing.
     pub listed: usize,
-    /// Referenced data (`/wm-` + `/compacted/`) objects - committed durable content.
+    /// Referenced data (`/wm-`, `/wm2-` and `/compacted/`) objects - committed durable content.
     pub committed_objects: usize,
     /// Unreferenced objects deleted (past the grace period).
     pub orphans_deleted: usize,

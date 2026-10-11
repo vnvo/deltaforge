@@ -25,6 +25,39 @@ sinks:
     # durability: durable_v2   # the default; may be omitted
 ```
 
+## Object keys
+
+Each batch writes one immutable object per table at
+
+```text
+{prefix}/{pipeline}/{table}/wm2-{watermark digest}/{content hash}.{ext}
+```
+
+- The watermark digest (64 hex digits) is a SHA-256 of the batch's canonical
+  source position: its position type (MySQL GTID set, MySQL binlog coordinate,
+  PostgreSQL LSN, snapshot progress), its lineage and the position itself. Two
+  encodings of one position share the digest (a GTID set is canonicalized:
+  lowercase UUIDs, merged intervals), so a retry, restart or replay writes the
+  same key.
+- The full position never enters a key. It is in the manifest entry, and the
+  sink logs it at `debug` with the digest.
+- Every key stays within backend limits however large the position (a fleet
+  `gtid_executed` set names many UUIDs): no path segment longer than 200 bytes
+  and no key longer than 900 bytes. At startup the sink refuses a `prefix` and
+  pipeline name that would leave no room for a table name of the longest
+  segment. A table whose encoded name is longer than a segment stops the sink
+  with an error rather than being shortened.
+- On recovery, an object whose `wm2-` digest does not match its manifest
+  entry's position stops the sink (a conflicting object, never accepted).
+
+**Upgrade.** Releases before this layout wrote `wm-{hex position}` keys, whose
+position segment grows with the GTID set; RustFS, MinIO and other
+file-backed stores reject such keys (about 450 bytes for a modest MySQL GTID
+set). Existing `wm-` objects stay readable: manifests record every key
+verbatim, and recovery, compaction, garbage collection and reconciliation
+handle both layouts. New batches always use `wm2-`. No migration step is
+needed; compaction rewrites both layouts into `compacted/` objects as usual.
+
 ## Rollout
 
 1. Provision an S3-compatible bucket. The provider MUST honor `If-None-Match: *`

@@ -1024,6 +1024,22 @@ pub enum CheckpointOrder {
     Incomparable,
 }
 
+/// The canonical identity of a durable watermark: the logical position, not
+/// its encoding. Two encodings of the same position share it; different
+/// positions never do (under SHA-256 of the canonical bytes). The durable S3
+/// sink derives bounded object keys from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatermarkIdentity {
+    /// The position type (`mysql_gtid`, `mysql_binlog`, `pg_lsn`, ...):
+    /// domain-separates the digest across position types.
+    pub kind: &'static str,
+    /// Canonical bytes of the logical position, lineage included.
+    pub canonical: Vec<u8>,
+    /// A human-readable description of the position, for logs (never part
+    /// of a key).
+    pub summary: String,
+}
+
 /// Compares source checkpoints with [`CheckpointOrder`] semantics. Used by the
 /// durable S3 sink to enforce that a published watermark only ever advances,
 /// even when a valid new-epoch writer receives replayed older batches after a
@@ -1052,6 +1068,12 @@ pub trait CheckpointComparator: Send + Sync {
     /// never.
     fn start_follows(&self, _prev: Option<&[u8]>, _next: &[u8]) -> bool {
         false
+    }
+
+    /// The canonical identity of watermark `raw`, or `None` when it cannot
+    /// be established (the sink then refuses to publish). Default: none.
+    fn identity(&self, _raw: &[u8]) -> Option<WatermarkIdentity> {
+        None
     }
 }
 

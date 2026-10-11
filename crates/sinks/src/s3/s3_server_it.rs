@@ -54,6 +54,17 @@ const PIPE: &str = "pipe";
 
 struct MonoCmp;
 impl CheckpointComparator for MonoCmp {
+    fn identity(
+        &self,
+        raw: &[u8],
+    ) -> Option<deltaforge_core::WatermarkIdentity> {
+        Some(deltaforge_core::WatermarkIdentity {
+            kind: "test",
+            canonical: raw.to_vec(),
+            summary: String::from_utf8_lossy(raw).into_owned(),
+        })
+    }
+
     fn order(&self, a: &[u8], b: &[u8]) -> CheckpointOrder {
         fn parse(x: &[u8]) -> Option<u64> {
             (x.len() == 9).then(|| {
@@ -266,7 +277,7 @@ async fn data_count(store: &ObjectStoreConditional, prefix: &str) -> usize {
         .await
         .unwrap()
         .iter()
-        .filter(|p| p.to_string().contains("/wm-"))
+        .filter(|p| crate::s3::keys::is_batch_object_key(p.as_ref()))
         .count()
 }
 
@@ -432,4 +443,134 @@ async fn s3_server_reconcile_deletes_orphan_after_grace() {
     assert!(report.stopped.is_none(), "{:?}", report.stopped);
     assert_eq!(report.orphans_deleted, 1);
     assert_eq!(data_count(&store, &prefix).await, before - 1);
+}
+
+/// The pinned (file-backed) server, or an AWS-compatible one: a fleet-sized
+/// MySQL GTID position (500 server UUIDs, ~25 KB) under the longest prefix
+/// the sink accepts, with a table name of the longest segment, is stored
+/// with bounded keys; a restart that replays the batch writes nothing new.
+/// (Layout v1 put the hex position in one segment: rejected by RustFS.)
+#[tokio::test]
+#[ignore = "live S3 server: the pinned one, or DELTAFORGE_IT_S3_*"]
+async fn s3_server_fleet_gtid_keys_at_the_longest_prefix() {
+    use super::keys::{
+        MAX_KEY_SEGMENT_BYTES, check_key_bounds, check_prefix_capacity,
+        is_batch_object_key,
+    };
+    use sources::durable_checkpoint::{
+        DurableWatermark, SourceCheckpointComparator,
+    };
+    use sources::snapshot_generation::PersistedLineage;
+    let store = it_store().await;
+    let base = unique_prefix();
+    let pad = (1..=MAX_KEY_SEGMENT_BYTES)
+        .rev()
+        .find(|n| {
+            check_prefix_capacity(&format!("{base}/{}", "p".repeat(*n)), PIPE)
+                .is_ok()
+        })
+        .expect("some prefix fits");
+    let prefix = format!("{base}/{}", "p".repeat(pad));
+    assert!(
+        pad == MAX_KEY_SEGMENT_BYTES
+            || check_prefix_capacity(
+                &format!("{base}/{}", "p".repeat(pad + 1)),
+                PIPE
+            )
+            .is_err(),
+        "the longest accepted prefix"
+    );
+    let table = "t".repeat(MAX_KEY_SEGMENT_BYTES);
+    let gtid = |n: u64| {
+        let set = (0..500u64)
+            .map(|i| format!("{i:08x}-0000-4000-8000-{i:012x}:1-{n}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        DurableWatermark::mysql_gtid_commit(
+            PersistedLineage::MysqlGtid {
+                source_uuid: [1; 16],
+            },
+            set,
+        )
+        .to_bytes()
+    };
+    assert!(gtid(10).len() > 20_000);
+    let real: Arc<dyn CheckpointComparator> =
+        Arc::new(SourceCheckpointComparator);
+    let open = || {
+        DurableWriter::acquire(
+            Arc::clone(&store),
+            &prefix,
+            PIPE,
+            "src",
+            "sink",
+            Arc::clone(&real),
+        )
+    };
+
+    let w = open().await.unwrap();
+    w.publish(&gtid(10), vec![tobj_jsonl(&table, &[1])], 1)
+        .await
+        .unwrap();
+    let keys: Vec<Path> = store
+        .list(&Path::from(prefix.clone()))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|p| is_batch_object_key(p.as_ref()))
+        .collect();
+    assert_eq!(keys.len(), 1);
+    for k in &keys {
+        check_key_bounds(k.as_ref()).unwrap();
+        let (bytes, _) = store.get_with_etag(k).await.unwrap().unwrap();
+        assert_eq!(bytes, tobj_jsonl(&table, &[1]).bytes);
+    }
+    drop(w);
+
+    let w = open().await.unwrap();
+    w.publish(&gtid(10), vec![tobj_jsonl(&table, &[1])], 1)
+        .await
+        .unwrap();
+    w.publish(&gtid(11), vec![tobj_jsonl(&table, &[2])], 1)
+        .await
+        .unwrap();
+    assert_eq!(w.metrics().await.unwrap().seq, 2);
+    assert_eq!(data_count(&store, &prefix).await, 2);
+}
+
+/// A chain an older release wrote (key layout v1) on a live server: a new
+/// writer recovers it, publishes layout v2 objects, compacts across both
+/// layouts, deletes the superseded originals, and recovers again.
+#[tokio::test]
+#[ignore = "live S3 server: the pinned one, or DELTAFORGE_IT_S3_*"]
+async fn s3_server_mixed_key_layouts_compact_and_recover() {
+    let store = it_store().await;
+    let prefix = unique_prefix();
+    drop(acquire(Arc::clone(&store), &prefix).await.unwrap());
+    super::fault_matrix::publish_v1_at(&store, &prefix, 1, &[1]).await;
+
+    let w = acquire(Arc::clone(&store), &prefix).await.unwrap();
+    w.publish(&wm(2), vec![tobj_jsonl("orders", &[2])], 1)
+        .await
+        .unwrap();
+    let originals = all_objects(&store, &prefix).await;
+    assert_eq!(originals.len(), 2);
+    assert_eq!(
+        originals
+            .iter()
+            .filter(|o| super::keys::key_watermark_digest(&o.key).is_some())
+            .count(),
+        1,
+        "one v1 and one v2 object: {originals:?}"
+    );
+    w.compact(originals).await.unwrap();
+    let del = w.gc_delete_originals().await.unwrap();
+    assert!(del.stopped.is_none(), "{:?}", del.stopped);
+    drop(w);
+
+    let w = acquire(Arc::clone(&store), &prefix).await.unwrap();
+    w.publish(&wm(3), vec![tobj_jsonl("orders", &[3])], 1)
+        .await
+        .unwrap();
+    assert_eq!(w.metrics().await.unwrap().seq, 3);
 }

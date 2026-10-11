@@ -94,9 +94,195 @@ pub fn content_hash(bytes: &[u8], domain: &EncodingDomain) -> String {
     s
 }
 
+/// Version of the durable data-object key layout.
+///
+/// - v1: `{prefix}/{pipeline}/{table}/wm-{hex(watermark)}/{content}.{ext}`.
+///   The watermark segment grows with the position (a MySQL GTID set), past
+///   backend name limits. Still read: manifests record every key verbatim.
+/// - v2: `.../wm2-{digest}/{content}.{ext}`, the digest a bounded identity of
+///   the canonical watermark ([`watermark_key_digest`]). A v2 key can never
+///   equal a v1 key (`wm2-` vs `wm-`).
+pub const KEY_LAYOUT_VERSION: u16 = 2;
+
+/// The v2 watermark segment tag.
+pub const WATERMARK_SEGMENT_V2: &str = "wm2-";
+
+/// Domain-separation tag of the watermark key digest.
+const WATERMARK_KEY_DOMAIN: &[u8] = b"deltaforge:s3:watermark-key";
+
+/// The longest path segment (as stored, percent-encoded) a key may have:
+/// below the 255-byte file-name limit of file-backed stores (RustFS, local
+/// file systems) with margin.
+pub const MAX_KEY_SEGMENT_BYTES: usize = 200;
+
+/// The longest object key: below the 1024-byte S3 key limit with margin.
+pub const MAX_OBJECT_KEY_BYTES: usize = 900;
+
+/// The bounded key identity of a durable watermark: lowercase hex SHA-256
+/// over the length-prefixed domain tag, key layout version, position kind and
+/// canonical position bytes. Same logical position, same digest (restart,
+/// retry, replay); the kind separates position types.
+pub fn watermark_key_digest(id: &deltaforge_core::WatermarkIdentity) -> String {
+    let mut h = Sha256::new();
+    for part in [
+        WATERMARK_KEY_DOMAIN,
+        &KEY_LAYOUT_VERSION.to_be_bytes()[..],
+        id.kind.as_bytes(),
+        id.canonical.as_slice(),
+    ] {
+        h.update((part.len() as u64).to_be_bytes());
+        h.update(part);
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The watermark digest a v2 data-object key carries (its second-to-last
+/// segment), or `None` for any other key (v1 `wm-`, compacted, manifest).
+pub fn key_watermark_digest(key: &str) -> Option<&str> {
+    let mut segs = key.rsplit('/');
+    segs.next()?;
+    segs.next()?.strip_prefix(WATERMARK_SEGMENT_V2)
+}
+
+/// Whether `key` is an uncompacted data object (either layout).
+pub fn is_batch_object_key(key: &str) -> bool {
+    let mut segs = key.rsplit('/');
+    segs.next();
+    segs.next().is_some_and(|s| {
+        s.starts_with("wm-") || s.starts_with(WATERMARK_SEGMENT_V2)
+    })
+}
+
+/// Check a stored key against [`MAX_KEY_SEGMENT_BYTES`] and
+/// [`MAX_OBJECT_KEY_BYTES`]: the offending part when it exceeds them.
+pub fn check_key_bounds(key: &str) -> Result<(), String> {
+    if key.len() > MAX_OBJECT_KEY_BYTES {
+        return Err(format!(
+            "key is {} bytes (limit {MAX_OBJECT_KEY_BYTES})",
+            key.len()
+        ));
+    }
+    if let Some(seg) = key.split('/').find(|s| s.len() > MAX_KEY_SEGMENT_BYTES)
+    {
+        return Err(format!(
+            "segment of {} bytes (limit {MAX_KEY_SEGMENT_BYTES}): {}...",
+            seg.len(),
+            &seg[..seg.floor_char_boundary(40)]
+        ));
+    }
+    Ok(())
+}
+
+/// Whether every data-object key of `pipeline` under `prefix` stays within
+/// [`check_key_bounds`] for any table whose encoded name fits a segment: the
+/// longest such key, checked once when the sink is built.
+pub fn check_prefix_capacity(
+    prefix: &str,
+    pipeline: &str,
+) -> Result<(), String> {
+    let digest = "0".repeat(64);
+    let worst = object_store::path::Path::from_iter(
+        prefix
+            .split('/')
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .chain([
+                pipeline.to_string(),
+                "t".repeat(MAX_KEY_SEGMENT_BYTES),
+                format!("{WATERMARK_SEGMENT_V2}{digest}"),
+                format!("{digest}.parquet"),
+            ]),
+    );
+    check_key_bounds(worst.as_ref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wm(
+        kind: &'static str,
+        canonical: &[u8],
+    ) -> deltaforge_core::WatermarkIdentity {
+        deltaforge_core::WatermarkIdentity {
+            kind,
+            canonical: canonical.to_vec(),
+            summary: String::new(),
+        }
+    }
+
+    #[test]
+    fn watermark_digests_are_bounded_stable_and_domain_separated() {
+        let a = watermark_key_digest(&wm("mysql_gtid", b"x"));
+        assert_eq!(a, watermark_key_digest(&wm("mysql_gtid", b"x")));
+        assert_eq!(a.len(), 64);
+        // A position type and its bytes are separate inputs.
+        assert_ne!(a, watermark_key_digest(&wm("pg_lsn", b"x")));
+        assert_ne!(
+            watermark_key_digest(&wm("mysql_gtidx", b"")),
+            watermark_key_digest(&wm("mysql_gtid", b"x"))
+        );
+        // Bounded however large the position.
+        let huge = vec![b'u'; 1 << 20];
+        assert_eq!(watermark_key_digest(&wm("mysql_gtid", &huge)).len(), 64);
+    }
+
+    /// The digest is part of every stored key, so it is pinned: a key a
+    /// release wrote must be recomputed identically by the next release
+    /// (restart and replay across an upgrade). The vector was computed
+    /// independently: SHA-256 over each part as 8-byte big-endian length then
+    /// bytes, for the domain tag, the layout version (u16 BE 2), the kind and
+    /// the canonical bytes.
+    #[test]
+    fn the_watermark_digest_is_pinned() {
+        assert_eq!(
+            watermark_key_digest(&wm("mysql_gtid", br#"{"pos":1}"#)),
+            "4a5b1609339d431ef9eeb80a784035e34580c6d9b7591eea5219dc7697c52902"
+        );
+    }
+
+    #[test]
+    fn key_layouts_are_told_apart() {
+        let d = "ab".repeat(32);
+        let v2 = format!("p/pipe/orders/wm2-{d}/c.parquet");
+        assert_eq!(key_watermark_digest(&v2), Some(d.as_str()));
+        assert!(is_batch_object_key(&v2));
+        let v1 = "p/pipe/orders/wm-0a0b/c.parquet";
+        assert_eq!(key_watermark_digest(v1), None);
+        assert!(is_batch_object_key(v1));
+        // A table named like the tag is not the watermark segment.
+        let t = "p/pipe/wm2-orders/wm-0a/c.jsonl";
+        assert_eq!(key_watermark_digest(t), None);
+        assert!(!is_batch_object_key("p/pipe/orders/compacted/h.parquet"));
+        assert!(!is_batch_object_key("p/pipe/_manifest/entries/1-h.json"));
+    }
+
+    #[test]
+    fn a_prefix_leaves_room_for_the_longest_key_or_is_refused() {
+        assert!(check_prefix_capacity("lake/cdc", "orders-pipeline").is_ok());
+        // A prefix segment, or a pipeline, longer than a segment.
+        let seg = "s".repeat(MAX_KEY_SEGMENT_BYTES + 1);
+        assert!(check_prefix_capacity(&seg, "p").is_err());
+        assert!(check_prefix_capacity("lake", &seg).is_err());
+        // Short segments that together leave no room for a longest key.
+        let many = vec!["s".repeat(MAX_KEY_SEGMENT_BYTES); 3].join("/");
+        assert!(check_prefix_capacity(&many, "p").is_err());
+        // The largest prefix that still fits is accepted.
+        let fits = "s".repeat(MAX_KEY_SEGMENT_BYTES);
+        assert!(check_prefix_capacity(&fits, "p").is_ok());
+    }
+
+    #[test]
+    fn key_bounds_are_enforced_per_segment_and_overall() {
+        assert!(check_key_bounds("a/b/c").is_ok());
+        let long_seg = format!("a/{}/c", "s".repeat(MAX_KEY_SEGMENT_BYTES + 1));
+        assert!(check_key_bounds(&long_seg).is_err());
+        let ok_seg = format!("a/{}/c", "s".repeat(MAX_KEY_SEGMENT_BYTES));
+        assert!(check_key_bounds(&ok_seg).is_ok());
+        let long_key = vec!["s".repeat(150); 7].join("/");
+        assert!(long_key.len() > MAX_OBJECT_KEY_BYTES);
+        assert!(check_key_bounds(&long_key).is_err());
+    }
 
     fn dom() -> EncodingDomain {
         EncodingDomain::new("parquet", 1, "schema-abc", "none", "table", 1)

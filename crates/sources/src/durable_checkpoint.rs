@@ -843,11 +843,109 @@ impl SnapshotVector {
     }
 }
 
+/// A GTID set in canonical text: UUIDs lowercase and sorted, each with its
+/// merged intervals (`uuid:1-5:7`). `None` when it does not parse.
+fn canonical_gtid_set(s: &str) -> Option<String> {
+    let mut map: BTreeMap<String, Intervals> = BTreeMap::new();
+    for (uuid, ivs) in parse_gtid_set(s)? {
+        let e = map.entry(uuid.to_ascii_lowercase()).or_default();
+        e.extend(ivs);
+        merge_intervals(e);
+    }
+    let entries: Vec<String> = map
+        .into_iter()
+        .map(|(uuid, ivs)| {
+            let mut out = uuid;
+            for (lo, hi) in ivs {
+                if lo == hi {
+                    out.push_str(&format!(":{lo}"));
+                } else {
+                    out.push_str(&format!(":{lo}-{hi}"));
+                }
+            }
+            out
+        })
+        .collect();
+    Some(entries.join(","))
+}
+
+/// The canonical identity of a watermark (see
+/// [`CheckpointComparator::identity`]): the parsed watermark, its GTID set
+/// canonicalized, serialized as key-sorted compact JSON. Never the raw bytes
+/// or a debug rendering.
+pub fn watermark_identity(
+    raw: &[u8],
+) -> Option<deltaforge_core::WatermarkIdentity> {
+    let mut w = DurableWatermark::parse(raw)?;
+    if let WmPos::MysqlGtid { gtid_set } = &mut w.pos {
+        *gtid_set = canonical_gtid_set(gtid_set)?;
+    }
+    let (kind, summary) = match &w.pos {
+        WmPos::PgLsn { lsn, tx_id, .. } => (
+            "pg_lsn",
+            format!("lsn {:X}/{:X} tx {tx_id:?}", lsn >> 32, lsn & 0xffff_ffff),
+        ),
+        WmPos::MysqlGtid { gtid_set } => {
+            ("mysql_gtid", format!("gtid_set {gtid_set}"))
+        }
+        WmPos::MysqlBinlog {
+            file_base,
+            file_index,
+            pos,
+        } => (
+            "mysql_binlog",
+            format!("{file_base}.{file_index:06} pos {pos}"),
+        ),
+        WmPos::Snapshot {
+            generation,
+            completed,
+            ..
+        } => (
+            "snapshot",
+            format!("generation {generation} completed {completed}"),
+        ),
+        WmPos::SnapshotSeq {
+            snapshot_chain,
+            generation,
+            seq,
+            completed,
+        } => (
+            "snapshot_seq",
+            format!(
+                "chain {snapshot_chain} generation {generation} seq {seq} completed {completed}"
+            ),
+        ),
+        WmPos::SnapshotGenerationAdopted {
+            snapshot_chain,
+            generation,
+            ..
+        } => (
+            "snapshot_generation_adopted",
+            format!("chain {snapshot_chain} generation {generation}"),
+        ),
+    };
+    let canonical = deltaforge_core::canonical_json::canonical_json_bytes(
+        &serde_json::to_value(&w).ok()?,
+    );
+    Some(deltaforge_core::WatermarkIdentity {
+        kind,
+        canonical,
+        summary,
+    })
+}
+
 /// [`CheckpointComparator`] over serialized [`DurableWatermark`] bytes. Unparseable
 /// input on either side is `Incomparable` (fail closed).
 pub struct SourceCheckpointComparator;
 
 impl CheckpointComparator for SourceCheckpointComparator {
+    fn identity(
+        &self,
+        raw: &[u8],
+    ) -> Option<deltaforge_core::WatermarkIdentity> {
+        watermark_identity(raw)
+    }
+
     fn order(&self, proposed: &[u8], reference: &[u8]) -> CheckpointOrder {
         match (
             DurableWatermark::parse(proposed),
@@ -941,6 +1039,129 @@ mod tests {
     use super::*;
     use crate::mysql::MySqlCheckpoint;
     use crate::postgres::PostgresCheckpoint;
+
+    // ── canonical identity (bounded S3 keys) ──────────────────────────────
+
+    const U1: &str = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+    const U2: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    fn gtid_raw(set: &str) -> Vec<u8> {
+        DurableWatermark::mysql_gtid_commit(
+            PersistedLineage::MysqlGtid {
+                source_uuid: [7; 16],
+            },
+            set.to_string(),
+        )
+        .to_bytes()
+    }
+
+    fn id(raw: &[u8]) -> deltaforge_core::WatermarkIdentity {
+        watermark_identity(raw).expect("an identity")
+    }
+
+    /// One logical GTID set, however written, has one identity: UUID case
+    /// and order, interval splitting and whitespace do not change it.
+    #[test]
+    fn a_logical_gtid_set_has_one_identity() {
+        let canonical = id(&gtid_raw(&format!("{U1}:1-5:7,{U2}:1-3")));
+        for written in [
+            format!("{U2}:1-3,{U1}:1-5:7"),
+            format!("{}:1-2:3-5:7,{U2}:1:2-3", U1.to_uppercase()),
+            format!(" {U1}:1-5:7 , {U2}:1-3 "),
+            format!("{U1}:1-3,{U2}:1-3,{U1}:4-5:7"),
+        ] {
+            assert_eq!(id(&gtid_raw(&written)), canonical, "{written}");
+        }
+        assert_eq!(canonical.kind, "mysql_gtid");
+        // The encoding of the watermark itself does not matter either.
+        let raw = gtid_raw(&format!("{U1}:1-5:7,{U2}:1-3"));
+        let mut v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        let reordered = {
+            let obj = v.as_object_mut().unwrap();
+            let mut out = serde_json::Map::new();
+            for k in ["pos", "lineage", "version"] {
+                out.insert(k.to_string(), obj.remove(k).unwrap());
+            }
+            serde_json::to_vec_pretty(&serde_json::Value::Object(out)).unwrap()
+        };
+        assert_ne!(reordered, raw);
+        assert_eq!(id(&reordered), canonical);
+    }
+
+    /// Different positions have different identities, across GTID sets,
+    /// lineages, binlog coordinates and LSNs, and across position types.
+    #[test]
+    fn different_positions_have_different_identities() {
+        let mysql = |n: u32| {
+            DurableWatermark::mysql_binlog_commit(
+                PersistedLineage::MysqlServer {
+                    server_id: 1,
+                    file: "mysql-bin.000001".into(),
+                },
+                &format!("mysql-bin.{n:06}"),
+                4,
+            )
+            .unwrap()
+            .to_bytes()
+        };
+        let pos = |p: u64| {
+            DurableWatermark::mysql_binlog_commit(
+                PersistedLineage::MysqlServer {
+                    server_id: 1,
+                    file: "mysql-bin.000001".into(),
+                },
+                "mysql-bin.000001",
+                p,
+            )
+            .unwrap()
+            .to_bytes()
+        };
+        let pg =
+            |lsn: u64| DurableWatermark::pg_commit(42, lsn, None).to_bytes();
+        let other_lineage = DurableWatermark::mysql_gtid_commit(
+            PersistedLineage::MysqlGtid {
+                source_uuid: [8; 16],
+            },
+            format!("{U1}:1-5"),
+        )
+        .to_bytes();
+        let all = [
+            gtid_raw(&format!("{U1}:1-5")),
+            gtid_raw(&format!("{U1}:1-6")),
+            gtid_raw(&format!("{U1}:1-5,{U2}:1")),
+            other_lineage,
+            mysql(1),
+            mysql(2),
+            pos(5),
+            pos(6),
+            pg(0x1_0000_0000),
+            pg(0x1_0000_0001),
+            DurableWatermark::pg_commit(43, 0x1_0000_0000, None).to_bytes(),
+        ];
+        let ids: Vec<_> = all.iter().map(|w| id(w)).collect();
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        let kinds: Vec<&str> = ids.iter().map(|i| i.kind).collect();
+        assert_eq!(&kinds[..4], ["mysql_gtid"; 4]);
+        assert_eq!(&kinds[4..8], ["mysql_binlog"; 4]);
+        assert_eq!(&kinds[8..], ["pg_lsn"; 3]);
+    }
+
+    /// Anything that is not a parseable watermark has no identity (the sink
+    /// refuses to publish it).
+    #[test]
+    fn unparseable_watermarks_have_no_identity() {
+        assert!(watermark_identity(b"not json").is_none());
+        assert!(watermark_identity(b"{}").is_none());
+        assert!(watermark_identity(&gtid_raw("not-a-gtid-set:x")).is_none());
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&gtid_raw(&format!("{U1}:1"))).unwrap();
+        v["version"] = 99.into();
+        assert!(watermark_identity(&serde_json::to_vec(&v).unwrap()).is_none());
+    }
 
     fn pg_lineage(id: u64) -> PersistedLineage {
         PersistedLineage::Postgres {
