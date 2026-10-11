@@ -337,6 +337,9 @@ struct Walk {
     current_gtid: Option<String>,
     ordinal: u32,
     in_explicit_txn: bool,
+    /// The version of the server that wrote the binlog (its format
+    /// description): it evaluated versioned executable comments.
+    server_version: Option<u32>,
     file: String,
     statements: Vec<Statement>,
     reached: bool,
@@ -410,7 +413,11 @@ impl Walk {
                 } else if upper == "COMMIT" || upper == "ROLLBACK" {
                     self.complete_txn()?;
                 } else {
-                    let effect = classify(&q.query, Some(&q.schema));
+                    let effect = classify(
+                        &q.query,
+                        Some(&q.schema),
+                        self.server_version,
+                    );
                     if effect != DdlEffect::None {
                         let event = self.identity(header);
                         self.statements.push(Statement { event, effect });
@@ -449,8 +456,13 @@ impl Walk {
                     ));
                 }
             }
-            EventData::FormatDescription(_)
-            | EventData::PreviousGtids(_)
+            EventData::FormatDescription(fde) => {
+                self.server_version =
+                    super::mysql_ddl_attribution::parse_server_version(
+                        &fde.server_version,
+                    );
+            }
+            EventData::PreviousGtids(_)
             | EventData::HeartBeat
             | EventData::TableMap(_)
             | EventData::WriteRows(_)
@@ -661,6 +673,7 @@ async fn scan(
         current_gtid: None,
         ordinal: 0,
         in_explicit_txn: false,
+        server_version: None,
         file: from.file.clone(),
         statements: Vec::new(),
         reached: false,
@@ -1337,6 +1350,7 @@ mod tests {
             current_gtid: None,
             ordinal: 0,
             in_explicit_txn: false,
+            server_version: None,
             file: "binlog.000001".into(),
             statements: Vec::new(),
             reached: false,
@@ -1376,6 +1390,51 @@ mod tests {
                 end_pos: 4321,
                 ordinal: 0,
             }
+        );
+    }
+
+    /// The scan classifies versioned executable comments with the version
+    /// of the server that wrote the binlog (its format description), as the
+    /// streaming source does.
+    #[test]
+    fn versioned_comments_use_the_binlog_writers_version() {
+        use super::super::mysql_ddl_attribution::{
+            BarrierScopeOf, DdlEffect, TableName,
+        };
+        use mysql_binlog_connector_rust::event::{
+            checksum_type::ChecksumType,
+            format_description_event::FormatDescriptionEvent,
+        };
+        let fde = |version: &str| {
+            EventData::FormatDescription(FormatDescriptionEvent {
+                binlog_version: 4,
+                server_version: version.into(),
+                create_timestamp: 0,
+                header_length: 19,
+                checksum_type: ChecksumType::None,
+            })
+        };
+        let sql = "/*!80036 ALTER TABLE d.t ADD COLUMN c INT */";
+        let effect_under = |version: Option<&str>| {
+            let mut w = walk(false);
+            if let Some(v) = version {
+                w.event(&header(15, 120), &fde(v)).unwrap();
+            }
+            w.event(&header(2, 200), &query(sql)).unwrap();
+            w.statements.first().map(|s| s.effect.clone())
+        };
+        let t = DdlEffect::Tables(vec![TableName {
+            db: "d".into(),
+            table: "t".into(),
+        }]);
+        assert_eq!(effect_under(Some("8.0.36-log")), Some(t.clone()));
+        assert_eq!(effect_under(Some("8.4.2")), Some(t));
+        // Not executed by an older server: no table change.
+        assert_eq!(effect_under(Some("8.0.35")), None);
+        // Unknown writer version: a lineage barrier.
+        assert_eq!(
+            effect_under(None),
+            Some(DdlEffect::Barrier(BarrierScopeOf::Lineage))
         );
     }
 
@@ -3090,12 +3149,11 @@ mod tests {
                             "CREATE PROCEDURE {db}.p() BEGIN SELECT 1; SELECT 2; END"
                         ),
                     ],
-                    // A versioned comment cannot be interpreted.
+                    // A possible ANSI_QUOTES identifier cannot be
+                    // interpreted.
                     vec![
                         format!("DROP TABLE IF EXISTS {db}.w"),
-                        format!(
-                            "CREATE TABLE {db}.w (id INT) /*!50100 ENGINE=InnoDB */"
-                        ),
+                        format!("CREATE TABLE {db}.w (id INT) COMMENT \"w\""),
                     ],
                 ] {
                     capture_table(&dsn, db).await;

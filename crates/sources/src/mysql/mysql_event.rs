@@ -201,8 +201,14 @@ async fn dispatch_kind(
             Ok(())
         }
 
-        EventData::FormatDescription(_)
-        | EventData::PreviousGtids(_)
+        EventData::FormatDescription(fde) => {
+            ctx.binlog_server_version =
+                super::mysql_ddl_attribution::parse_server_version(
+                    &fde.server_version,
+                );
+            Ok(())
+        }
+        EventData::PreviousGtids(_)
         | EventData::RowsQuery(_)
         | EventData::TransactionPayload(_)
         | EventData::XaPrepare(_)
@@ -909,24 +915,45 @@ fn bareword_tokens(sql: &str, limit: usize) -> Vec<String> {
 /// downstream sinks, journals, replay, and the DLQ would otherwise persist the
 /// secret. Callers emit only the operation label plus non-sensitive context (the
 /// database), never the statement text.
-fn credential_ddl_operation(sql: &str) -> Option<&'static str> {
-    // The first two barewords settle CREATE/ALTER USER and SET PASSWORD; a GRANT
-    // needs the whole statement scanned for a bareword IDENTIFIED.
-    let head = bareword_tokens(sql, 2);
+fn credential_ddl_operation(
+    sql: &str,
+    server_version: Option<u32>,
+) -> Option<&'static str> {
+    use super::mysql_ddl_attribution::{
+        executable_words, words_including_comments,
+    };
+    // The statement as the server executed it (an applicable executable
+    // comment is part of it) and its plain barewords; when it cannot be
+    // lexed with certainty, also every word including comment contents. A
+    // credential in any of them is redacted.
+    let executed = executable_words(sql, server_version);
+    let uncertain = executed.is_none().then(|| {
+        words_including_comments(sql)
+            .into_iter()
+            .filter(|w| !w.chars().all(|c| c.is_ascii_digit()))
+            .collect()
+    });
+    [executed, Some(bareword_tokens(sql, 4096)), uncertain]
+        .into_iter()
+        .flatten()
+        .find_map(|words| credential_operation(&words))
+}
+
+/// The credential operation `words` (a statement's barewords, uppercase)
+/// begin with: CREATE/ALTER USER and SET PASSWORD by their first two words;
+/// a GRANT with an `IDENTIFIED` keyword anywhere.
+fn credential_operation(words: &[String]) -> Option<&'static str> {
     match (
-        head.first().map(String::as_str),
-        head.get(1).map(String::as_str),
+        words.first().map(String::as_str),
+        words.get(1).map(String::as_str),
     ) {
         (Some("CREATE"), Some("USER")) => Some("CREATE USER"),
         (Some("ALTER"), Some("USER")) => Some("ALTER USER"),
         (Some("SET"), Some("PASSWORD")) => Some("SET PASSWORD"),
-        (Some("GRANT"), _) => {
-            // Bounded scan; IDENTIFIED here is a real keyword (literals excluded).
-            let all = bareword_tokens(sql, 4096);
-            all.iter()
-                .any(|w| w == "IDENTIFIED")
-                .then_some("GRANT ... IDENTIFIED")
-        }
+        (Some("GRANT"), _) => words
+            .iter()
+            .any(|w| w == "IDENTIFIED")
+            .then_some("GRANT ... IDENTIFIED"),
         _ => None,
     }
 }
@@ -1030,18 +1057,23 @@ async fn handle_query(
     let classified = super::mysql_ddl_attribution::classify_statement(
         &q.query,
         Some(q.schema.as_str()).filter(|d| !d.is_empty()),
+        ctx.binlog_server_version,
     );
+
+    // A credential-bearing statement's text is never logged or emitted.
+    let credential =
+        credential_ddl_operation(&q.query, ctx.binlog_server_version);
 
     // The activation records this statement implies are durable before its
     // DDL event or its commit boundary is emitted.
-    record_query(ctx, &q, &classified).await?;
+    record_query(ctx, &q, &classified, credential.is_none()).await?;
 
     // Credential-bearing account statements first: never log or emit their raw
     // SQL (it can carry a password, token, or verifier). Emit a fixed redacted DDL
     // payload with only the operation type and database. Credential rotation
     // naturally exercises these (ALTER USER / SET PASSWORD), so this must precede
     // the generic DDL handling below and is intentionally lossy.
-    if let Some(op) = credential_ddl_operation(&q.query) {
+    if let Some(op) = credential {
         info!(
             source_id=%ctx.source_id,
             db=%q.schema,
@@ -1060,12 +1092,12 @@ async fn handle_query(
     }
 
     // Ordinary (non-credential) DDL.
-    if sql_upper.starts_with("ALTER")
-        || sql_upper.starts_with("CREATE")
-        || sql_upper.starts_with("DROP")
-        || sql_upper.starts_with("TRUNCATE")
-        || sql_upper.starts_with("RENAME")
-    {
+    // DDL as the server executed it: an executable comment counts, and a
+    // leading comment does not hide the statement.
+    if super::mysql_ddl_attribution::is_ddl_statement(
+        &q.query,
+        ctx.binlog_server_version,
+    ) {
         info!(
             source_id=%ctx.source_id,
             db=%q.schema,
@@ -1112,6 +1144,7 @@ async fn record_query(
     ctx: &mut RunCtx,
     q: &mysql_binlog_connector_rust::event::query_event::QueryEvent,
     classified: &super::mysql_ddl_attribution::Classified,
+    sql_loggable: bool,
 ) -> SourceResult<()> {
     use super::mysql_activation::{
         BarrierScope, EventIdentity, record_barrier, record_ddl,
@@ -1192,7 +1225,10 @@ async fn record_query(
     let registry = ctx.schema.registry();
     // Tracked tables get a forward proof of their post-DDL shape (a DROP
     // gets none: a later CREATE is its own DDL).
-    let prove_after = !super::mysql_ddl_attribution::is_drop_table(&q.query);
+    let prove_after = !super::mysql_ddl_attribution::is_drop_table(
+        &q.query,
+        ctx.binlog_server_version,
+    );
     let mut pending = Vec::new();
     let mut invalidated = Vec::new();
     let barrier_written = barrier.is_some();
@@ -1214,10 +1250,15 @@ async fn record_query(
     }
     let cache_barrier = barrier.clone();
     if let Some(barrier) = barrier {
+        let sql = if sql_loggable {
+            short_sql(&q.query, 80)
+        } else {
+            "<credential statement redacted>".into()
+        };
         info!(
             source_id = %ctx.source_id,
             scope = ?barrier,
-            sql = %short_sql(&q.query, 80),
+            sql = %sql,
             "statement not attributable to tables: activation barrier"
         );
         let key = scope.key("", "");
@@ -1378,13 +1419,20 @@ mod tests {
 
     const TABLE_ID: u64 = 42;
 
+    /// The next event, or `None` when the channel closes or none arrives
+    /// within 10 s (a missing event fails its test instead of hanging it).
     async fn recv_event(rx: &mut mpsc::Receiver<SourceItem>) -> Option<Event> {
-        while let Some(item) = rx.recv().await {
-            if let SourceItem::Event(ev) = item {
-                return Some(ev);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(item) = rx.recv().await {
+                if let SourceItem::Event(ev) = item {
+                    return Some(ev);
+                }
             }
-        }
-        None
+            None
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     fn make_runctx(tx: mpsc::Sender<SourceItem>) -> RunCtx {
@@ -1448,6 +1496,7 @@ mod tests {
                 "3e11fa47-71ca-11e1-9e33-c80aa9429562:5".to_string(),
             ),
             in_explicit_txn: true,
+            binlog_server_version: None,
             message_ordinal: 0,
             query_ordinal: 0,
             rows_ordinal: 0,
@@ -2526,6 +2575,8 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
         let mut ctx = make_runctx(tx);
         with_scope(&mut ctx).await;
+        // The binlog was written by 8.0.36 (its format description).
+        ctx.binlog_server_version = Some(80036);
         let mut q = query_event(sql);
         q.schema = session.to_string();
         handle_query(&mut ctx, &make_header(), q).await.unwrap();
@@ -2658,6 +2709,95 @@ mod tests {
                 json!([]),
                 Value::Null,
             ),
+            // Executable comments: attributed as executed, emitted with the
+            // original SQL.
+            (
+                "/*!50100 ALTER TABLE shop.orders ADD COLUMN x INT */",
+                "",
+                "tables",
+                "shop",
+                json!([obj("table", "shop", "orders")]),
+                json!("shop"),
+            ),
+            (
+                "/*! RENAME TABLE shop.a TO archive.b */",
+                "",
+                "tables",
+                "",
+                json!([
+                    obj("table", "shop", "a"),
+                    obj("table", "archive", "b")
+                ]),
+                Value::Null,
+            ),
+            (
+                "ALTER TABLE shop.orders ADD y INT /*!80036 , RENAME TO shop.o2 */",
+                "",
+                "tables",
+                "shop",
+                json!([
+                    obj("table", "shop", "orders"),
+                    obj("table", "shop", "o2")
+                ]),
+                json!("shop"),
+            ),
+            (
+                "ALTER TABLE shop.orders ADD z INT /*!80037 , RENAME TO shop.o2 */",
+                "",
+                "tables",
+                "shop",
+                json!([obj("table", "shop", "orders")]),
+                json!("shop"),
+            ),
+            (
+                "/* audit */ ALTER TABLE shop.orders ADD w INT",
+                "",
+                "tables",
+                "shop",
+                json!([obj("table", "shop", "orders")]),
+                json!("shop"),
+            ),
+            (
+                "/*!5010 ALTER TABLE shop.orders ADD v INT */",
+                "",
+                "lineage",
+                "",
+                json!([]),
+                Value::Null,
+            ),
+            // Database DDL: one scope and object for CREATE, ALTER and DROP.
+            (
+                "CREATE DATABASE IF NOT EXISTS `new db`",
+                "app",
+                "database",
+                "new db",
+                json!([obj("database", "new db", "new db")]),
+                json!("new db"),
+            ),
+            (
+                "/*!40101 CREATE DATABASE d4 */",
+                "",
+                "database",
+                "d4",
+                json!([obj("database", "d4", "d4")]),
+                json!("d4"),
+            ),
+            (
+                "ALTER DATABASE `shop` CHARACTER SET utf8mb4",
+                "",
+                "database",
+                "shop",
+                json!([obj("database", "shop", "shop")]),
+                json!("shop"),
+            ),
+            (
+                "DROP SCHEMA IF EXISTS `shop`",
+                "app",
+                "database",
+                "shop",
+                json!([obj("database", "shop", "shop")]),
+                json!("shop"),
+            ),
         ];
         for (sql, session, scope, db, objects, database) in cases {
             let (source_db, p) = ddl_of(sql, session).await;
@@ -2697,6 +2837,7 @@ mod tests {
     fn ddl_identity_serializes_deterministically() {
         let c = super::super::mysql_ddl_attribution::classify_statement(
             "RENAME TABLE `b`.`y` TO a.x, b.z TO b.w",
+            None,
             None,
         );
         let (db, payload) = ddl_identity(&c, 0, "s");
@@ -2756,7 +2897,7 @@ mod tests {
 
     #[test]
     fn credential_ddl_operation_classifies_account_statements() {
-        let cred = |s: &str| credential_ddl_operation(s).is_some();
+        let cred = |s: &str| credential_ddl_operation(s, Some(80036)).is_some();
         // Credential-bearing account statements (mixed case too).
         assert!(cred("CREATE USER 'df'@'%' IDENTIFIED BY 'pw'"));
         assert!(cred("alter user 'df'@'%' IDENTIFIED WITH x AS '$A$..'"));
@@ -2783,7 +2924,7 @@ mod tests {
         ];
         for s in bypass {
             assert!(
-                credential_ddl_operation(s).is_some(),
+                credential_ddl_operation(s, Some(80036)).is_some(),
                 "must classify as credential DDL: {s:?}"
             );
         }
@@ -2791,14 +2932,16 @@ mod tests {
         // trigger a GRANT misclassification; an ordinary GRANT is not credential.
         assert!(
             credential_ddl_operation(
-                "GRANT SELECT ON `identified`.* TO 'df'@'%'"
+                "GRANT SELECT ON `identified`.* TO 'df'@'%'",
+                Some(80036),
             )
             .is_none(),
             "IDENTIFIED inside a backtick identifier is not a keyword"
         );
         assert!(
             credential_ddl_operation(
-                "GRANT SELECT ON db.* TO 'x' /* not identified */"
+                "GRANT SELECT ON db.* TO 'x' /* not identified */",
+                Some(80036),
             )
             .is_none(),
             "IDENTIFIED inside a comment is not a keyword"
@@ -2847,9 +2990,27 @@ mod tests {
                 "# rotate\nGRANT ALL ON *.* TO 'df'@'%' IDENTIFIED BY \
                  '{PLAINTEXT}'"
             ),
+            // Executable comments: the statement as executed.
+            format!(
+                "/*!80000 CREATE USER 'df'@'%' IDENTIFIED BY '{PLAINTEXT}' */"
+            ),
+            format!(
+                "/*! ALTER USER 'df'@'%' IDENTIFIED WITH caching_sha2_password \
+                 AS '{VERIFIER}' */"
+            ),
+            format!(
+                "/*!50700 GRANT ALL ON *.* TO 'df'@'%' */ /*!50700 IDENTIFIED BY \
+                 '{PLAINTEXT}' */"
+            ),
+            // Uncertain executable comments are redacted too.
+            format!("/*!5010 SET PASSWORD FOR 'df'@'%' = '{VERIFIER}' */"),
         ];
 
-        for sql in statements {
+        // With the binlog writer's version unknown and known.
+        let runs = [None, Some(80036)]
+            .into_iter()
+            .flat_map(|v| statements.iter().map(move |s| (v, s.clone())));
+        for (version, sql) in runs {
             let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
             let writer = VecWriter(buf.clone());
             let subscriber = tracing_subscriber::fmt()
@@ -2860,6 +3021,10 @@ mod tests {
 
             let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
             let mut ctx = make_runctx(tx);
+            // An uncertain statement is a lineage barrier: recorded in the
+            // registry scope, as in production.
+            with_scope(&mut ctx).await;
+            ctx.binlog_server_version = version;
             // An account statement is its own autocommit GTID transaction.
             ctx.in_explicit_txn = false;
             handle_query(&mut ctx, &make_header(), query_event(&sql))

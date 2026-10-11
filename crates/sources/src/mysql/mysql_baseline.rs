@@ -1032,7 +1032,9 @@ mod tests {
                 &[
                     format!("INSERT INTO {t} VALUES (1, 1)"),
                     String::new(),
-                    format!("/*!50100 ALTER TABLE {t} ADD COLUMN w INT */"),
+                    // Unattributable (a possible ANSI_QUOTES identifier):
+                    // a lineage barrier.
+                    format!("ALTER TABLE {t} ADD COLUMN w INT COMMENT \"w\""),
                     format!("INSERT INTO {t} VALUES (2, 2, 2)"),
                 ],
             )

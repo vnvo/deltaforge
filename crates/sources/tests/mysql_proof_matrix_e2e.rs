@@ -792,9 +792,10 @@ async fn two_ddls_while_stopped_fail_closed_full() {
 // Barriers and the FULL fallback
 // ---------------------------------------------------------------------------
 
-/// A versioned-comment DDL: executed by the server, but not attributable,
-/// so a lineage barrier (and here it changes the shape).
-const OPAQUE_DDL: &str = "/*!50100 ALTER TABLE t ADD COLUMN x INT */";
+/// A DDL that is executed but not attributable, so a lineage barrier (and
+/// here it changes the shape): its double-quoted comment could be an
+/// ANSI_QUOTES identifier.
+const OPAQUE_DDL: &str = "ALTER TABLE t ADD COLUMN x INT COMMENT \"x\"";
 
 fn full_observations(records: &[Value]) -> Vec<&Value> {
     records
@@ -839,7 +840,7 @@ async fn a_barrier_is_recovered_by_a_lazy_baseline_or_fails_closed() {
         db,
         &stmts(&[
             "INSERT INTO t VALUES (3, 'A3', 'B3', 8)",
-            "/*!50100 ALTER TABLE t ADD COLUMN y INT */",
+            "ALTER TABLE t ADD COLUMN y INT COMMENT \"y\"",
             "INSERT INTO t VALUES (4, 'A4', 'B4', 8, 9)",
             "ALTER TABLE t ADD COLUMN z INT",
         ]),
@@ -888,9 +889,9 @@ async fn a_proven_version_that_contradicts_the_rows_fails_closed() {
     assert_eq!(st.ckpt.get_raw(db).await.unwrap().unwrap(), committed);
 }
 
-/// A versioned-comment DDL that keeps the shape: still unattributable (a
-/// lineage barrier).
-const KEEPING_BARRIER: &str = "/*!50100 ALTER TABLE t COMMENT 'c' */";
+/// A DDL that keeps the shape and is unattributable (a lineage barrier):
+/// its double-quoted literal could be an ANSI_QUOTES identifier.
+const KEEPING_BARRIER: &str = "ALTER TABLE t COMMENT \"c\"";
 
 /// While stopped: a row, `barrier`, two rows in separate transactions, then a
 /// DDL of the table (so no lazy baseline can prove the rows after the
@@ -1123,7 +1124,7 @@ async fn rows_event_identity(gtid: bool) {
         "INSERT INTO t VALUES (2, 'A2', 'B2')",
     ]));
     steps.extend(stmts(&[
-        "/*!50100 ALTER TABLE t COMMENT 'd' */",
+        "ALTER TABLE t COMMENT \"d\"",
         "INSERT INTO t VALUES (3, 'A3', 'B3')",
         "ALTER TABLE t ADD COLUMN x INT",
     ]));

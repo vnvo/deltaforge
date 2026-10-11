@@ -938,8 +938,9 @@ async fn ddl_events_reach_avro_as_lossless_ddl_records() {
     sql(
         i,
         &[
-            format!("CREATE DATABASE {x}"),
+            format!("CREATE DATABASE IF NOT EXISTS `{x}`"),
             format!("ALTER TABLE {db}.t ADD COLUMN extra INT"),
+            format!("/*!50100 ALTER TABLE {db}.t ADD COLUMN c1 INT */"),
             format!("USE {db}"),
             "RENAME TABLE a TO a2".into(),
             format!("RENAME TABLE {db}.b TO {x}.b2"),
@@ -956,23 +957,43 @@ async fn ddl_events_reach_avro_as_lossless_ddl_records() {
                 SECRETS[1]
             ),
             "DROP USER 'ua_ddl_user'@'%'".into(),
-            format!("DROP DATABASE {x}"),
-            format!("INSERT INTO {db}.t (id, extra) VALUES (1, 5)"),
         ],
+    )
+    .await;
+
+    // While the pipeline is stopped, then caught up after resume.
+    mgr.stop(&name).await.expect("stop");
+    until_status(&mgr, &name, "stopped").await;
+    sql(
+        i,
+        &[
+            format!("/*!40101 DROP DATABASE IF EXISTS `{x}` */"),
+            format!("/*! ALTER TABLE {db}.t ADD COLUMN c2 INT */"),
+            format!("ALTER DATABASE `{db}` CHARACTER SET utf8mb4"),
+        ],
+    )
+    .await;
+    mgr.resume(&name).await.expect("resume");
+    until_status(&mgr, &name, "running").await;
+    sql(
+        i,
+        &[format!(
+            "INSERT INTO {db}.t (id, extra, c1, c2) VALUES (1, 5, 6, 7)"
+        )],
     )
     .await;
 
     // The source's own DDL events (JSON sink), in order.
     let quiet = Duration::from_secs(5);
     let max = Duration::from_secs(120);
-    let json_raw = consume_raw(&format!("{db}_json"), 12, quiet, max).await;
+    let json_raw = consume_raw(&format!("{db}_json"), 15, quiet, max).await;
     let source: Vec<serde_json::Value> = json_raw
         .iter()
         .map(|b| serde_json::from_slice(b).unwrap())
         .filter(|e: &serde_json::Value| e.get("ddl").is_some())
         .collect();
     // The Avro topic, decoded by schema ID alone.
-    let avro_raw = consume_raw(db, 12, quiet, max).await;
+    let avro_raw = consume_raw(db, 15, quiet, max).await;
     let mut avro = Vec::new();
     for bytes in &avro_raw {
         avro.push(avro_json(&decode_any(i, bytes).await));
@@ -981,7 +1002,7 @@ async fn ddl_events_reach_avro_as_lossless_ddl_records() {
     let ddl: Vec<&serde_json::Value> =
         avro.iter().filter(|r| r.get("ddl").is_some()).collect();
     assert_eq!(ddl.len(), source.len(), "status {status}: {avro:#?}");
-    assert!(ddl.len() >= 10, "every statement: {source:#?}");
+    assert_eq!(ddl.len(), 13, "every statement: {source:#?}");
 
     // Each Avro DDL record equals the source's event, field by field.
     for (a, s) in ddl.iter().zip(&source) {
@@ -1040,6 +1061,34 @@ async fn ddl_events_reach_avro_as_lossless_ddl_records() {
         drop["ddl"]["objects"],
         serde_json::json!([obj(db, "c"), obj(db, "a2")])
     );
+    // Executable comments, as executed and with their original SQL; live
+    // and on catch-up.
+    for (sql_text, objects) in [
+        (
+            format!("/*!50100 ALTER TABLE {db}.t ADD COLUMN c1 INT */"),
+            serde_json::json!([obj(db, "t")]),
+        ),
+        (
+            format!("/*! ALTER TABLE {db}.t ADD COLUMN c2 INT */"),
+            serde_json::json!([obj(db, "t")]),
+        ),
+    ] {
+        let r = by_sql(&sql_text);
+        assert_eq!(r["ddl"]["scope"], "tables", "{sql_text}");
+        assert_eq!(r["ddl"]["objects"], objects, "{sql_text}");
+    }
+    // CREATE, ALTER and DROP DATABASE: one scope, the database object.
+    let database = |d: &str| serde_json::json!([{"kind": "database", "database": d, "name": d}]);
+    for (sql_text, d) in [
+        (format!("CREATE DATABASE IF NOT EXISTS `{x}`"), x),
+        (format!("/*!40101 DROP DATABASE IF EXISTS `{x}` */"), x),
+        (format!("ALTER DATABASE `{db}` CHARACTER SET utf8mb4"), db),
+    ] {
+        let r = by_sql(&sql_text);
+        assert_eq!(r["ddl"]["scope"], "database", "{sql_text}");
+        assert_eq!(r["ddl"]["objects"], database(d), "{sql_text}");
+        assert_eq!(r["source"]["db"], d, "{sql_text}");
+    }
     let redacted: Vec<_> = ddl
         .iter()
         .filter(|r| r["ddl"]["redacted"] == true)
@@ -1060,6 +1109,8 @@ async fn ddl_events_reach_avro_as_lossless_ddl_records() {
         .find(|r| r["after"]["id"] == 1)
         .expect("the row after the DDL");
     assert_eq!(row["after"]["extra"], 5);
+    assert_eq!(row["after"]["c1"], 6);
+    assert_eq!(row["after"]["c2"], 7);
     mgr.delete(&name).await.ok();
 }
 

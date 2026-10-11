@@ -222,6 +222,10 @@ pub(crate) struct RunCtx {
     /// The server's `lower_case_table_names` (read at startup on a verified
     /// connection): how DDL table names map to registry keys.
     lower_case_table_names: u8,
+    /// The version of the server that wrote the binlog being read (its
+    /// format description), which evaluated the statements' versioned
+    /// executable comments. `None` until a format description is read.
+    binlog_server_version: Option<u32>,
     /// Evaluation position of rows (spec 7.3): the executed state immediately
     /// before the current transaction - the stream position after the last
     /// commit boundary (or the position the stream (re)started from).
@@ -1621,6 +1625,7 @@ impl MySqlSource {
             last_gtid: init_gtid,
             current_gtid: None,
             in_explicit_txn: false,
+            binlog_server_version: None,
             message_ordinal: 0,
             query_ordinal: 0,
             rows_ordinal: 0,

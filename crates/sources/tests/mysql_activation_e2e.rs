@@ -317,11 +317,23 @@ async fn records_precede_events_and_replay_identically(gtid: bool) {
     assert_eq!(other.len(), 1, "{other:?}");
     assert_eq!(other[0]["scope"]["scope"], "database");
 
-    // A versioned comment cannot be interpreted: a lineage barrier.
+    // An applicable versioned comment is part of the executed statement:
+    // attributed to its table, no barrier.
     sql(
         port,
         db,
-        &["CREATE TABLE u (id INT PRIMARY KEY) /*!50100 ENGINE=InnoDB */"],
+        &["CREATE TABLE v (id INT PRIMARY KEY) /*!50100 ENGINE=InnoDB */"],
+    )
+    .await;
+    ddl_event(&mut r.rx, "CREATE TABLE v").await;
+    assert_eq!(st.lineage_barriers(id, &hash).await.len(), 1);
+
+    // A statement that cannot be interpreted (a double-quoted token may be
+    // an ANSI_QUOTES identifier): a lineage barrier.
+    sql(
+        port,
+        db,
+        &["CREATE TABLE u (id INT PRIMARY KEY) COMMENT \"u\""],
     )
     .await;
     ddl_event(&mut r.rx, "CREATE TABLE u").await;

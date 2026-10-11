@@ -704,9 +704,7 @@ mod tests {
                 port,
                 &[
                     &format!("ALTER TABLE {db}.u ADD COLUMN q INT"),
-                    &format!(
-                        "CREATE TABLE {db}.w (id INT) /*!50100 ENGINE=InnoDB */"
-                    ),
+                    &format!("CREATE TABLE {db}.w (id INT) COMMENT \"w\""),
                 ],
             )
             .await;
