@@ -106,7 +106,7 @@ fn classify_delete(key: &Path) -> Option<Op> {
     let k = key.to_string();
     if k.contains("_manifest/entries") {
         Some(Op::EntryDelete)
-    } else if k.contains("/wm-") && !k.contains("/compacted/") {
+    } else if crate::s3::keys::is_batch_object_key(&k) {
         Some(Op::OriginalDelete)
     } else {
         None
@@ -116,7 +116,7 @@ fn classify_delete(key: &Path) -> Option<Op> {
 /// A data-object read is the compaction "read originals" step; other reads pass.
 fn classify_get(key: &Path) -> Option<Op> {
     let k = key.to_string();
-    if k.contains("/wm-") && !k.contains("/compacted/") {
+    if crate::s3::keys::is_batch_object_key(&k) {
         Some(Op::GetData)
     } else if k.contains("_manifest/HEAD") {
         Some(Op::HeadGet)
@@ -303,6 +303,17 @@ impl ConditionalStore for FaultStore {
 /// Watermark = `[lineage, 8-byte BE pos]`; different lineage is Incomparable.
 struct MonoCmp;
 impl CheckpointComparator for MonoCmp {
+    fn identity(
+        &self,
+        raw: &[u8],
+    ) -> Option<deltaforge_core::WatermarkIdentity> {
+        Some(deltaforge_core::WatermarkIdentity {
+            kind: "test",
+            canonical: raw.to_vec(),
+            summary: String::from_utf8_lossy(raw).into_owned(),
+        })
+    }
+
     fn order(&self, a: &[u8], b: &[u8]) -> CheckpointOrder {
         fn parse(x: &[u8]) -> Option<(u8, u64)> {
             if x.len() != 9 {
@@ -386,7 +397,7 @@ async fn data_count(inner: &ObjectStoreConditional) -> usize {
         .await
         .unwrap()
         .iter()
-        .filter(|p| p.to_string().contains("/wm-"))
+        .filter(|p| crate::s3::keys::is_batch_object_key(p.as_ref()))
         .count()
 }
 
@@ -3174,7 +3185,8 @@ async fn reconcile_missing_referenced_object_is_a_hard_alarm() {
         .unwrap()
         .into_iter()
         .find(|p| {
-            p.to_string().contains("/wm-") && !p.to_string().contains("9999")
+            crate::s3::keys::is_batch_object_key(p.as_ref())
+                && !p.to_string().contains("9999")
         })
         .unwrap();
     inner.delete(&referenced_obj).await.unwrap();
@@ -3419,4 +3431,277 @@ async fn metrics_counts_cas_conflicts() {
         "cas conflict counted: {}",
         m.cas_conflicts
     );
+}
+
+// ── Key layout v2: bounded watermark segments, mixed layouts ────────────────
+
+/// Publish `rows` as a key-layout-v1 batch (`wm-<hex watermark>`), exactly
+/// as a release before layout v2 wrote one: the data object, the manifest
+/// entry and the HEAD compare-and-swap.
+async fn publish_v1(
+    inner: &Arc<ObjectStoreConditional>,
+    pos: u64,
+    rows: &[u32],
+) {
+    publish_v1_at(inner, PFX, pos, rows).await
+}
+
+/// [`publish_v1`] under `prefix` (shared with the live S3-server tests).
+pub(super) async fn publish_v1_at(
+    inner: &Arc<ObjectStoreConditional>,
+    prefix: &str,
+    pos: u64,
+    rows: &[u32],
+) {
+    use super::keys::content_hash;
+    use super::manifest::{MANIFEST_ENTRY_VERSION, PrevRef, write_entry};
+    let obj = tobj_jsonl("orders", rows);
+    let ch = content_hash(&obj.bytes, &obj.domain);
+    let key = format!("{prefix}/{PIPE}/orders/wm-{}/{ch}.jsonl", hex(&wm(pos)));
+    inner
+        .put_if_absent(&Path::from(key.clone()), obj.bytes.clone())
+        .await
+        .unwrap();
+    let hkey = head_key_for(prefix, PIPE);
+    let (raw, etag) = inner.get_with_etag(&hkey).await.unwrap().unwrap();
+    let mut head: Head = serde_json::from_slice(&raw).unwrap();
+    let entry = ManifestEntry {
+        version: MANIFEST_ENTRY_VERSION,
+        pipeline: PIPE.into(),
+        source_id: "src".into(),
+        sink_id: "sink".into(),
+        epoch: head.epoch,
+        seq: head.seq + 1,
+        watermark_hex: hex(&wm(pos)),
+        event_count: rows.len() as u64,
+        objects: vec![ManifestObject {
+            key,
+            table: "orders".into(),
+            content_hash: ch,
+            byte_len: obj.bytes.len() as u64,
+            format: "jsonl".into(),
+            format_version: 1,
+            schema_id: "s1".into(),
+            compression: "none".into(),
+            partition_spec: "table".into(),
+            partition_version: 1,
+        }],
+        prev: head.head_entry_key.clone().map(|key| PrevRef {
+            key,
+            hash: head.head_entry_hash.clone().unwrap(),
+        }),
+    };
+    let written = write_entry(inner.as_ref(), prefix, &entry).await.unwrap();
+    head.seq += 1;
+    head.head_entry_key = Some(written.key.to_string());
+    head.head_entry_hash = Some(written.hash);
+    head.watermark_hex = Some(hex(&wm(pos)));
+    inner
+        .cas_put(&hkey, head.canonical_bytes(), etag.as_deref().unwrap())
+        .await
+        .unwrap();
+}
+
+/// A chain written by an older release (layout v1) stays readable: a new
+/// writer recovers it, publishes layout v2 objects on top, compacts across
+/// both layouts and reconciles without touching referenced objects.
+#[tokio::test]
+async fn layout_v1_and_v2_objects_coexist_in_one_chain() {
+    use super::keys::{is_batch_object_key, key_watermark_digest};
+    let inner = inmem();
+    let (_fs, old) = genesis(&inner, vec![]).await;
+    drop(old);
+    publish_v1(&inner, 1, &[1]).await;
+
+    // Upgrade: recovery accepts the v1 chain.
+    let (_fs, w) = genesis(&inner, vec![]).await;
+    w.publish(&wm(2), vec![tobj_jsonl("orders", &[2])], 1)
+        .await
+        .unwrap();
+    let originals = all_manifest_objects(&inner).await;
+    let layouts: Vec<bool> = originals
+        .iter()
+        .map(|o| key_watermark_digest(&o.key).is_some())
+        .collect();
+    assert_eq!(layouts.iter().filter(|v2| **v2).count(), 1, "{originals:?}");
+    assert!(originals.iter().all(|o| is_batch_object_key(&o.key)));
+
+    // Compaction across both layouts: rows in acknowledgement order.
+    w.compact(originals).await.unwrap();
+    assert_eq!(
+        compacted_bytes(&inner).await,
+        tobj_jsonl("orders", &[1, 2]).bytes
+    );
+
+    // Reconcile counts both layouts as committed; nothing referenced goes.
+    let data_before = data_count(&inner).await;
+    let report = w
+        .reconcile(recon(now_ms_test() + 1_000_000, 0))
+        .await
+        .unwrap();
+    assert!(report.stopped.is_none(), "{:?}", report.stopped);
+    assert_eq!(report.orphans_deleted, 0);
+    assert_eq!(data_count(&inner).await, data_before);
+
+    // And a later writer recovers the mixed chain.
+    drop(w);
+    let (_fs, again) = genesis(&inner, vec![]).await;
+    assert_eq!(read_head(&inner).await.unwrap().seq, 2);
+    drop(again);
+}
+
+/// A layout-v2 object whose key names another watermark than its entry's
+/// is a conflicting object: recovery fails closed.
+#[tokio::test]
+async fn a_v2_key_naming_another_watermark_fails_recovery() {
+    use super::manifest::{MANIFEST_ENTRY_VERSION, PrevRef, write_entry};
+    let inner = inmem();
+    let (_fs, w) = genesis(&inner, vec![]).await;
+    w.publish(&wm(1), vec![tobj_jsonl("orders", &[1])], 1)
+        .await
+        .unwrap();
+    drop(w);
+    // An entry at position 2 that references position 1's object.
+    let reused = all_manifest_objects(&inner).await;
+    let hkey = head_key_for(PFX, PIPE);
+    let (raw, etag) = inner.get_with_etag(&hkey).await.unwrap().unwrap();
+    let mut head: Head = serde_json::from_slice(&raw).unwrap();
+    let entry = ManifestEntry {
+        version: MANIFEST_ENTRY_VERSION,
+        pipeline: PIPE.into(),
+        source_id: "src".into(),
+        sink_id: "sink".into(),
+        epoch: head.epoch,
+        seq: 2,
+        watermark_hex: hex(&wm(2)),
+        event_count: 1,
+        objects: reused,
+        prev: Some(PrevRef {
+            key: head.head_entry_key.clone().unwrap(),
+            hash: head.head_entry_hash.clone().unwrap(),
+        }),
+    };
+    let written = write_entry(inner.as_ref(), PFX, &entry).await.unwrap();
+    head.seq = 2;
+    head.head_entry_key = Some(written.key.to_string());
+    head.head_entry_hash = Some(written.hash);
+    head.watermark_hex = Some(hex(&wm(2)));
+    inner
+        .cas_put(&hkey, head.canonical_bytes(), etag.as_deref().unwrap())
+        .await
+        .unwrap();
+
+    let fs = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let err = expect_err(acquire(fs).await);
+    assert!(
+        matches!(&err, HeadError::Integrity(m) if m.contains("names watermark digest")),
+        "{err:?}"
+    );
+}
+
+/// A table whose key would exceed a backend limit is refused (fatal),
+/// never shortened, and nothing is written for the batch.
+#[tokio::test]
+async fn an_over_long_key_is_refused_without_writing() {
+    let inner = inmem();
+    let (_fs, w) = genesis(&inner, vec![]).await;
+    let table = "t".repeat(super::keys::MAX_KEY_SEGMENT_BYTES + 1);
+    let err =
+        expect_err(w.publish(&wm(1), vec![tobj_jsonl(&table, &[1])], 1).await);
+    assert!(
+        matches!(&err, HeadError::Integrity(m) if m.contains("exceeds a backend limit")),
+        "{err:?}"
+    );
+    assert_eq!(data_count(&inner).await, 0);
+    assert_eq!(read_head(&inner).await.unwrap().seq, 0);
+}
+
+/// A fleet-sized GTID set (500 server UUIDs) with the real source
+/// comparator: every key stays bounded, its watermark segment is the digest
+/// of the canonical watermark, and a restart that replays the same batch
+/// writes nothing new; the next position gets its own keys.
+#[tokio::test]
+async fn fleet_gtid_sets_give_bounded_keys_idempotent_across_restart() {
+    use super::keys::{
+        check_key_bounds, key_watermark_digest, watermark_key_digest,
+    };
+    use sources::durable_checkpoint::{
+        DurableWatermark, SourceCheckpointComparator,
+    };
+    use sources::snapshot_generation::PersistedLineage;
+    let set = |n: u64| {
+        (0..500u64)
+            .map(|i| format!("{i:08x}-0000-4000-8000-{i:012x}:1-{n}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let gtid = |n: u64| {
+        DurableWatermark::mysql_gtid_commit(
+            PersistedLineage::MysqlGtid {
+                source_uuid: [1; 16],
+            },
+            set(n),
+        )
+        .to_bytes()
+    };
+    assert!(gtid(10).len() > 20_000, "a fleet-sized position");
+    let real: Arc<dyn CheckpointComparator> =
+        Arc::new(SourceCheckpointComparator);
+    let inner = inmem();
+    let acquire_real = |inner: &Arc<ObjectStoreConditional>| {
+        DurableWriter::acquire(
+            Arc::clone(inner),
+            PFX,
+            PIPE,
+            "src",
+            "sink",
+            Arc::clone(&real),
+        )
+    };
+    let batch = || vec![tobj_jsonl("orders", &[1]), tobj_jsonl("users", &[2])];
+
+    let w = acquire_real(&inner).await.unwrap();
+    w.publish(&gtid(10), batch(), 2).await.unwrap();
+    let keys = data_keys(&inner).await;
+    assert_eq!(keys.len(), 2);
+    let digest = watermark_key_digest(&real.identity(&gtid(10)).unwrap());
+    for k in &keys {
+        check_key_bounds(k).unwrap();
+        assert_eq!(key_watermark_digest(k), Some(digest.as_str()), "{k}");
+    }
+    drop(w);
+
+    // Restart and replay the same batch: no new object, entry or key.
+    let w = acquire_real(&inner).await.unwrap();
+    w.publish(&gtid(10), batch(), 2).await.unwrap();
+    assert_eq!(data_keys(&inner).await, keys);
+    assert_eq!(entry_count(&inner).await, 1);
+
+    // The next position: its own bounded keys.
+    w.publish(&gtid(11), vec![tobj_jsonl("orders", &[3])], 1)
+        .await
+        .unwrap();
+    let after = data_keys(&inner).await;
+    assert_eq!(after.len(), 3);
+    let next = watermark_key_digest(&real.identity(&gtid(11)).unwrap());
+    assert_ne!(next, digest);
+    assert!(
+        after
+            .iter()
+            .any(|k| key_watermark_digest(k) == Some(next.as_str()))
+    );
+}
+
+/// The data-object keys under the pipeline, sorted.
+async fn data_keys(inner: &ObjectStoreConditional) -> Vec<String> {
+    let mut keys: Vec<String> = inner
+        .list(&Path::from(format!("{PFX}/{PIPE}")))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| p.to_string())
+        .filter(|k| super::keys::is_batch_object_key(k))
+        .collect();
+    keys.sort();
+    keys
 }

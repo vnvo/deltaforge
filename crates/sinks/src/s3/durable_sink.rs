@@ -109,6 +109,17 @@ impl DurableS3Sink {
             ));
         }
 
+        // Every object key stays within backend limits, whatever the table
+        // (a longer table segment is refused at publish, never shortened).
+        super::keys::check_prefix_capacity(&args.prefix, &args.pipeline)
+            .map_err(|e| {
+                fatal(format!(
+                    "durable_v2 prefix {:?} and pipeline {:?} leave no room for \
+                     a bounded object key: {e}",
+                    args.prefix, args.pipeline
+                ))
+            })?;
+
         let cond: Arc<dyn ConditionalStore> =
             Arc::new(ObjectStoreConditional::new(args.store));
 
@@ -487,6 +498,17 @@ mod tests {
     /// (stands in for a lineage/generation mismatch).
     struct NumCmp;
     impl CheckpointComparator for NumCmp {
+        fn identity(
+            &self,
+            raw: &[u8],
+        ) -> Option<deltaforge_core::WatermarkIdentity> {
+            Some(deltaforge_core::WatermarkIdentity {
+                kind: "test",
+                canonical: raw.to_vec(),
+                summary: String::from_utf8_lossy(raw).into_owned(),
+            })
+        }
+
         fn order(&self, proposed: &[u8], reference: &[u8]) -> CheckpointOrder {
             let parse = |b: &[u8]| {
                 std::str::from_utf8(b)
@@ -528,6 +550,32 @@ mod tests {
             comparator: Arc::new(NumCmp),
         })
         .await
+    }
+
+    /// A prefix that leaves no room for a bounded object key is refused at
+    /// construction, before the store is touched.
+    #[tokio::test]
+    async fn a_prefix_without_room_for_a_bounded_key_is_refused() {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let prefix = vec!["s".repeat(200); 3].join("/");
+        let err = DurableS3Sink::create(DurableS3Args {
+            id: "s3".into(),
+            pipeline: "pipe".into(),
+            source_id: "src".into(),
+            required: true,
+            prefix,
+            store: Arc::clone(&store),
+            format: DurableFormat::Jsonl,
+            compression: Compression::None,
+            schema_resolver: dummy_resolver(),
+            comparator: Arc::new(NumCmp),
+        })
+        .await
+        .err()
+        .expect("refused");
+        assert!(err.to_string().contains("no room for"), "{err}");
+        assert!(keys(&store).await.is_empty(), "nothing written");
     }
 
     fn row(schema: Option<&str>, db: &str, table: &str, id: i64) -> Event {

@@ -17,7 +17,9 @@
 use bytes::Bytes;
 use object_store::path::Path;
 
-use super::keys::{EncodingDomain, content_hash};
+use super::keys::{
+    EncodingDomain, WATERMARK_SEGMENT_V2, check_key_bounds, content_hash,
+};
 use super::store_cond::{CondError, ConditionalStore, PutOutcome};
 
 /// An encoded, ready-to-upload object for one table in a batch.
@@ -65,6 +67,11 @@ pub enum DurableError {
         expected: String,
         found: String,
     },
+    /// The object key would exceed a backend limit (a path segment or the
+    /// whole key, see `keys::check_key_bounds`). Fatal: retrying cannot
+    /// shorten it, and no shortened key is ever substituted.
+    #[error("object key for table {table} exceeds a backend limit: {reason}")]
+    KeyBound { table: String, reason: String },
 }
 
 impl From<CondError> for DurableError {
@@ -77,39 +84,36 @@ impl DurableError {
     /// Integrity failures are fatal (stop the pipeline); store failures are
     /// retryable (the coordinator replays the batch).
     pub fn is_fatal(&self) -> bool {
-        matches!(self, DurableError::Integrity { .. })
+        matches!(
+            self,
+            DurableError::Integrity { .. } | DurableError::KeyBound { .. }
+        )
     }
 }
 
-/// Lowercase hex of arbitrary bytes (used for the opaque watermark component).
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
-/// Build the deterministic object key.
+/// Build the deterministic object key (key layout v2, see
+/// `keys::KEY_LAYOUT_VERSION`).
 ///
-/// `{prefix}/{pipeline}/{table}/wm-{watermark_hex}/{content_hash}.{ext}`
+/// `{prefix}/{pipeline}/{table}/wm2-{watermark_digest}/{content_hash}.{ext}`
 ///
 /// `pipeline` and `table` are passed as raw parts to `Path::from_iter`, which
 /// percent-encodes each single part (the `/` delimiter, `.`/`..`, `%` and other
 /// unsafe bytes), so a hostile identifier can never inject an extra path segment
-/// or a traversal - and there is no double-encoding. The watermark is treated as
-/// opaque bytes and hex-encoded; it is NOT assumed to be path-safe or lexically
-/// sortable, and ordering never depends on it (the manifest sequence is
-/// authoritative).
+/// or a traversal - and there is no double-encoding. The watermark segment is
+/// the bounded digest of the canonical watermark (`keys::watermark_key_digest`),
+/// never the position itself; the full position is in the manifest entry.
+/// Ordering never depends on keys (the manifest sequence is authoritative).
+///
+/// A key whose segments or length exceed `keys::check_key_bounds` is refused
+/// ([`DurableError::KeyBound`]), never shortened.
 fn build_object_key(
     prefix: &str,
     pipeline: &str,
     table: &str,
-    watermark: &[u8],
+    watermark_digest: &str,
     content_hash_hex: &str,
     ext: &str,
-) -> Path {
+) -> Result<Path, DurableError> {
     let mut parts: Vec<String> = Vec::new();
     // `prefix` is operator-configured; honor a multi-segment prefix, each segment
     // still encoded as its own part.
@@ -118,10 +122,17 @@ fn build_object_key(
     }
     parts.push(pipeline.to_string());
     parts.push(table.to_string());
-    parts.push(format!("wm-{}", hex(watermark)));
+    parts.push(format!("{WATERMARK_SEGMENT_V2}{watermark_digest}"));
     // content_hash is lowercase hex and ext a fixed literal - both already safe.
     parts.push(format!("{content_hash_hex}.{ext}"));
-    Path::from_iter(parts.iter().map(String::as_str))
+    let key = Path::from_iter(parts.iter().map(String::as_str));
+    check_key_bounds(key.as_ref()).map_err(|reason| {
+        DurableError::KeyBound {
+            table: table.to_string(),
+            reason,
+        }
+    })?;
+    Ok(key)
 }
 
 /// Upload every table object create-only and return their durable records.
@@ -136,15 +147,20 @@ pub async fn upload_batch<S: ConditionalStore + ?Sized>(
     store: &S,
     prefix: &str,
     pipeline: &str,
-    watermark: &[u8],
+    watermark_digest: &str,
     objects: Vec<TableObject>,
 ) -> Result<BatchUpload, DurableError> {
     let mut out = BatchUpload::default();
     for obj in objects {
         let ch = content_hash(&obj.bytes, &obj.domain);
         let key = build_object_key(
-            prefix, pipeline, &obj.table, watermark, &ch, obj.ext,
-        );
+            prefix,
+            pipeline,
+            &obj.table,
+            watermark_digest,
+            &ch,
+            obj.ext,
+        )?;
         let byte_len = obj.bytes.len() as u64;
 
         let etag = match store.put_if_absent(&key, obj.bytes.clone()).await? {
@@ -214,6 +230,11 @@ mod tests {
         }
     }
 
+    /// A watermark key digest (64 hex digits).
+    fn wmd() -> String {
+        "d".repeat(64)
+    }
+
     fn store() -> ObjectStoreConditional {
         ObjectStoreConditional::new(Arc::new(InMemory::new()))
     }
@@ -224,37 +245,41 @@ mod tests {
             "root/pfx",
             "pipe",
             "public.orders",
-            b"\x01\x02",
+            &wmd(),
             "abc123",
             "parquet",
-        );
+        )
+        .unwrap();
         let k2 = build_object_key(
             "root/pfx",
             "pipe",
             "public.orders",
-            b"\x01\x02",
+            &wmd(),
             "abc123",
             "parquet",
-        );
+        )
+        .unwrap();
         assert_eq!(k1, k2, "key must be deterministic");
         assert_eq!(
             k1.to_string(),
-            "root/pfx/pipe/public.orders/wm-0102/abc123.parquet"
+            format!("root/pfx/pipe/public.orders/wm2-{}/abc123.parquet", wmd())
         );
 
         // A '/' inside an identifier must not create extra path segments.
-        let k = build_object_key("p", "a/b", "c/d", b"", "h", "jsonl");
+        let k =
+            build_object_key("p", "a/b", "c/d", &wmd(), "h", "jsonl").unwrap();
         let s = k.to_string();
         assert!(
             s.contains("a%2Fb") && s.contains("c%2Fd"),
             "embedded '/' must be encoded, not split: {s}"
         );
-        // parts: prefix(p), pipeline, table, wm-, filename = 5 - the hostile
+        // parts: prefix(p), pipeline, table, wm2-, filename = 5 - the hostile
         // '/'s did not add segments.
         assert_eq!(k.parts().count(), 5, "injection changed the segment count");
 
         // A whole-component ".." (traversal) must be encoded, never literal.
-        let dots = build_object_key("p", "pipe", "..", b"", "h", "jsonl");
+        let dots =
+            build_object_key("p", "pipe", "..", &wmd(), "h", "jsonl").unwrap();
         assert!(
             dots.to_string().contains("%2E%2E")
                 && !dots.parts().any(|p| p.as_ref() == ".."),
@@ -269,7 +294,7 @@ mod tests {
             &s,
             "pfx",
             "pipe",
-            b"wm1",
+            &wmd(),
             vec![obj("orders", b"orders-bytes"), obj("users", b"users-bytes")],
         )
         .await
@@ -280,7 +305,7 @@ mod tests {
         for o in &up.objects {
             assert!(o.etag.is_some(), "InMemory returns an ETag");
             assert!(o.byte_len > 0);
-            assert!(o.key.contains("/wm-"));
+            assert!(o.key.contains("/wm2-"));
         }
     }
 
@@ -288,9 +313,9 @@ mod tests {
     async fn retry_is_idempotent_same_keys() {
         let s = store();
         let mk = || vec![obj("orders", b"same-bytes")];
-        let a = upload_batch(&s, "pfx", "pipe", b"wm", mk()).await.unwrap();
+        let a = upload_batch(&s, "pfx", "pipe", &wmd(), mk()).await.unwrap();
         // Second run hits AlreadyExists and verifies content: idempotent success.
-        let b = upload_batch(&s, "pfx", "pipe", b"wm", mk()).await.unwrap();
+        let b = upload_batch(&s, "pfx", "pipe", &wmd(), mk()).await.unwrap();
         assert_eq!(a.objects[0].key, b.objects[0].key);
         assert_eq!(a.objects[0].content_hash, b.objects[0].content_hash);
     }
@@ -302,7 +327,8 @@ mod tests {
         // Pre-place DIFFERENT bytes at exactly the key this upload will target.
         let ch = content_hash(&table.bytes, &table.domain);
         let key =
-            build_object_key("pfx", "pipe", "orders", b"wm", &ch, "jsonl");
+            build_object_key("pfx", "pipe", "orders", &wmd(), &ch, "jsonl")
+                .unwrap();
         let inner: Arc<dyn object_store::ObjectStore> =
             Arc::new(InMemory::new());
         inner
@@ -314,7 +340,7 @@ mod tests {
             .unwrap();
         let s2 = ObjectStoreConditional::new(inner);
 
-        let err = upload_batch(&s2, "pfx", "pipe", b"wm", vec![table])
+        let err = upload_batch(&s2, "pfx", "pipe", &wmd(), vec![table])
             .await
             .unwrap_err();
         assert!(err.is_fatal(), "integrity error must be fatal: {err:?}");
@@ -332,10 +358,18 @@ mod tests {
         let bad = obj("users", b"users-real");
         let bad_ch = content_hash(&bad.bytes, &bad.domain);
         let bad_key =
-            build_object_key("pfx", "pipe", "users", b"wm", &bad_ch, "jsonl");
+            build_object_key("pfx", "pipe", "users", &wmd(), &bad_ch, "jsonl")
+                .unwrap();
         let good_ch = content_hash(&good.bytes, &good.domain);
-        let good_key =
-            build_object_key("pfx", "pipe", "orders", b"wm", &good_ch, "jsonl");
+        let good_key = build_object_key(
+            "pfx",
+            "pipe",
+            "orders",
+            &wmd(),
+            &good_ch,
+            "jsonl",
+        )
+        .unwrap();
 
         let inner: Arc<dyn object_store::ObjectStore> =
             Arc::new(InMemory::new());
@@ -348,7 +382,7 @@ mod tests {
             .unwrap();
         let s = ObjectStoreConditional::new(Arc::clone(&inner));
 
-        let err = upload_batch(&s, "pfx", "pipe", b"wm", vec![good, bad])
+        let err = upload_batch(&s, "pfx", "pipe", &wmd(), vec![good, bad])
             .await
             .unwrap_err();
         assert!(matches!(err, DurableError::Integrity { .. }));

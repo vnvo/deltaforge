@@ -35,7 +35,7 @@ use super::gc::{
     HeadBinding, InventoryRef, OriginalRef, SkipReason, horizon_seq, mark_key,
     marks_prefix,
 };
-use super::keys::content_hash;
+use super::keys::{content_hash, key_watermark_digest, watermark_key_digest};
 use super::manifest::{
     ManifestEntry, ManifestObject, PrevRef, WrittenEntry, entry_key,
     propose_seq, write_entry,
@@ -132,7 +132,7 @@ impl Head {
         }
     }
 
-    fn canonical_bytes(&self) -> bytes::Bytes {
+    pub(crate) fn canonical_bytes(&self) -> bytes::Bytes {
         bytes::Bytes::from(serde_json::to_vec(self).expect("head serializes"))
     }
 
@@ -515,7 +515,31 @@ async fn walk_retained_entries<S: ConditionalStore + ?Sized>(
                     "HEAD watermark does not match its selected entry".into(),
                 ));
             }
-            // 6. Collect every referenced data object into the ack inventory as its
+            // 6. A key-layout-v2 object carries the bounded identity of this
+            // entry's watermark: a digest that does not match it is a
+            // conflicting object (never accepted). v1 (`wm-`) keys predate it.
+            let mut entry_digest: Option<String> = None;
+            for mobj in &entry.objects {
+                let Some(digest) = key_watermark_digest(&mobj.key) else {
+                    continue;
+                };
+                if entry_digest.is_none() {
+                    let id = comparator.identity(&cur_wm).ok_or_else(|| {
+                        HeadError::Integrity(format!(
+                            "entry {cur_key} watermark has no canonical identity"
+                        ))
+                    })?;
+                    entry_digest = Some(watermark_key_digest(&id));
+                }
+                if entry_digest.as_deref() != Some(digest) {
+                    return Err(HeadError::Integrity(format!(
+                        "object {} names watermark digest {digest}, but entry \
+                         {cur_key} has another watermark",
+                        mobj.key
+                    )));
+                }
+            }
+            // 7. Collect every referenced data object into the ack inventory as its
             // COMPLETE authoritative ManifestObject. The same key appearing twice
             // with different metadata is corruption. Object EXISTENCE is verified
             // later (in `verify_state`, after the compaction index is known), because
@@ -1702,12 +1726,29 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
             }
         }
 
-        // 1. Make the data objects durable (idempotent; integrity is fatal).
+        // 1. Make the data objects durable (idempotent; integrity is fatal),
+        // keyed by the bounded identity of the canonical watermark.
+        let identity =
+            self.comparator.identity(watermark).ok_or_else(|| {
+                HeadError::Integrity(format!(
+                    "the durable watermark of pipeline {} has no canonical \
+                 identity; refusing to publish",
+                    self.pipeline
+                ))
+            })?;
+        let watermark_digest = watermark_key_digest(&identity);
+        tracing::debug!(
+            pipeline = %self.pipeline,
+            kind = identity.kind,
+            watermark_digest = %watermark_digest,
+            position = %summary_for_log(&identity.summary),
+            "durable batch position"
+        );
         let uploaded = upload_batch(
             self.store.as_ref(),
             &self.prefix,
             &self.pipeline,
-            watermark,
+            &watermark_digest,
             objects,
         )
         .await
@@ -3365,7 +3406,10 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
         }
         let committed = referenced
             .iter()
-            .filter(|k| k.contains("/wm-") || k.contains("/compacted/"))
+            .filter(|k| {
+                crate::s3::keys::is_batch_object_key(k)
+                    || k.contains("/compacted/")
+            })
             .count();
         Ok((referenced, committed, lag))
     }
@@ -3597,9 +3641,17 @@ fn map_equivalence(e: super::equivalence::EquivalenceError) -> HeadError {
     }
 }
 
+/// A position summary for a log line: bounded (a fleet GTID set can be very
+/// long; the full position is in the manifest entry).
+fn summary_for_log(s: &str) -> &str {
+    &s[..s.floor_char_boundary(512)]
+}
+
 fn map_durable(e: DurableError) -> HeadError {
     match e {
-        DurableError::Integrity { .. } => HeadError::Integrity(e.to_string()),
+        DurableError::Integrity { .. } | DurableError::KeyBound { .. } => {
+            HeadError::Integrity(e.to_string())
+        }
         DurableError::Store(s) => HeadError::Store(s),
     }
 }
@@ -3642,6 +3694,17 @@ mod tests {
     /// position orders. Unparseable input is Incomparable (fail closed).
     struct MonoCmp;
     impl CheckpointComparator for MonoCmp {
+        fn identity(
+            &self,
+            raw: &[u8],
+        ) -> Option<deltaforge_core::WatermarkIdentity> {
+            Some(deltaforge_core::WatermarkIdentity {
+                kind: "test",
+                canonical: raw.to_vec(),
+                summary: String::from_utf8_lossy(raw).into_owned(),
+            })
+        }
+
         fn order(&self, a: &[u8], b: &[u8]) -> CheckpointOrder {
             fn parse(x: &[u8]) -> Option<(u8, u64)> {
                 if x.len() != 9 {
