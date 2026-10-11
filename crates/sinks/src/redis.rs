@@ -38,7 +38,9 @@ use common::{RetryOutcome, RetryPolicy, redact_url_password, retry_async};
 use deltaforge_config::EncodingCfg;
 use deltaforge_config::RedisSinkCfg;
 use deltaforge_core::encoding::EncodingType;
-use deltaforge_core::encoding::avro::{AvroEncoder, SourceSchemaProvider};
+use deltaforge_core::encoding::avro::{
+    AvroEncoder, SchemaIdentity, SourceSchemaProvider,
+};
 use deltaforge_core::envelope::Envelope;
 use deltaforge_core::{BatchResult, Event, Sink, SinkError, SinkResult};
 use metrics::counter;
@@ -314,6 +316,16 @@ impl RedisSink {
             .map_err(Into::into);
         }
 
+        // A DDL event is its own record under the topic's DDL subject,
+        // never a row of the envelope's row schema.
+        if event.ddl.is_some() {
+            let bytes = encoder
+                .encode_ddl(dest, event)
+                .await
+                .map_err(|e| e.into_sink_error_for(&self.id))?;
+            return Ok(bytes.to_vec());
+        }
+
         let envelope = self.envelope.wrap(event).map_err(|e| {
             SinkError::Serialization {
                 details: e.to_string().into(),
@@ -327,9 +339,14 @@ impl RedisSink {
                 &event.source.connector,
                 &event.source.db,
                 &event.source.table,
+                SchemaIdentity::of(
+                    event.schema_version.as_deref(),
+                    event.schema_sequence,
+                )
+                .as_ref(),
             )
             .await
-            .map_err(|e| e.into_sink_error())?;
+            .map_err(|e| e.into_sink_error_for(&self.id))?;
 
         Ok(bytes.to_vec())
     }

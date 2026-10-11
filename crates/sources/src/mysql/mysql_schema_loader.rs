@@ -867,6 +867,25 @@ impl SourceSchemaLoader for MySqlSchemaLoader {
         self.scope.generation() != 0
     }
 
+    async fn load_version(
+        &self,
+        db: &str,
+        table: &str,
+        fingerprint: &str,
+        sequence: Option<u64>,
+    ) -> anyhow::Result<Option<ApiLoadedSchema>> {
+        let key = self.current_scope()?.key(db, table);
+        crate::schema_loader::load_registered_version(
+            &self.registry,
+            &key,
+            db,
+            table,
+            fingerprint,
+            sequence,
+        )
+        .await
+    }
+
     async fn list_cached(&self) -> Vec<SchemaListEntry> {
         let published = self.scope.generation();
         self.cache

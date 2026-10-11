@@ -986,6 +986,32 @@ impl DurableSchemaRegistry {
         Ok(Some(v))
     }
 
+    /// The version of `key` whose content hash is `hash` (the version an event
+    /// stamped with that fingerprint was decoded with), read through the hash
+    /// and version indexes (no history scan). A hash index entry whose version
+    /// records another hash is a corrupt record.
+    pub async fn get_by_hash(
+        &self,
+        key: &SchemaKey,
+        hash: &str,
+    ) -> Result<Option<SchemaVersion>> {
+        let bkey = key.backend_key();
+        let Some(version) = self.hash_index(&bkey, hash).await? else {
+            return Ok(None);
+        };
+        let Some(v) = self.get_version(key, version).await? else {
+            return Err(anyhow::Error::new(CorruptRecord(format!(
+                "schema registry: hash {hash} of {bkey} indexes missing version {version}"
+            ))));
+        };
+        if v.hash != hash {
+            return Err(anyhow::Error::new(CorruptRecord(format!(
+                "schema registry: hash {hash} of {bkey} indexes version {version} of another hash"
+            ))));
+        }
+        Ok(Some(v))
+    }
+
     /// Whether a whole-stream migration marker exists for `key`.
     pub async fn is_migrated(&self, key: &SchemaKey) -> Result<bool> {
         let Some(bytes) = self

@@ -90,6 +90,87 @@ pub trait SourceSchemaLoader: Send + Sync {
     fn lineage_established(&self) -> bool {
         true
     }
+
+    /// The registered version of `db.table` whose fingerprint is
+    /// `fingerprint`: the schema an event stamped with that fingerprint (and,
+    /// when given, registry `sequence`) was decoded with, never the table's
+    /// latest. `None` when no such version is registered (or the source keeps
+    /// no versions); a version whose sequence differs from `sequence` is a
+    /// [`SchemaVersionConflict`].
+    async fn load_version(
+        &self,
+        db: &str,
+        table: &str,
+        fingerprint: &str,
+        sequence: Option<u64>,
+    ) -> Result<Option<LoadedSchema>> {
+        let _ = (db, table, fingerprint, sequence);
+        Ok(None)
+    }
+}
+
+/// A registered fingerprint whose registry sequence differs from the one an
+/// event was stamped with: the event's schema cannot be identified.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "schema of {table}: fingerprint {fingerprint} is registered at sequence \
+     {registered}, but the event was stamped with sequence {stamped}"
+)]
+pub struct SchemaVersionConflict {
+    pub table: String,
+    pub fingerprint: String,
+    pub registered: u64,
+    pub stamped: u64,
+}
+
+/// [`SourceSchemaLoader::load_version`] over a durable registry: the version
+/// of `key` with content hash `fingerprint`, checked against `sequence`.
+pub(crate) async fn load_registered_version(
+    registry: &storage::DurableSchemaRegistry,
+    key: &storage::adapters::SchemaKey,
+    db: &str,
+    table: &str,
+    fingerprint: &str,
+    sequence: Option<u64>,
+) -> Result<Option<LoadedSchema>> {
+    let Some(v) = registry.get_by_hash(key, fingerprint).await? else {
+        return Ok(None);
+    };
+    if let Some(stamped) = sequence
+        && stamped != v.sequence
+    {
+        return Err(SchemaVersionConflict {
+            table: format!("{db}.{table}"),
+            fingerprint: fingerprint.to_string(),
+            registered: v.sequence,
+            stamped,
+        }
+        .into());
+    }
+    let names = |field: &str| -> Vec<String> {
+        v.schema_json[field]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| {
+                        c.as_str()
+                            .or_else(|| c["name"].as_str())
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Ok(Some(LoadedSchema {
+        database: db.to_string(),
+        table: table.to_string(),
+        columns: names("columns"),
+        primary_key: names("primary_key"),
+        schema_json: v.schema_json.clone(),
+        fingerprint: v.hash.clone(),
+        registry_version: v.version,
+        loaded_at: Utc::now(),
+    }))
 }
 
 /// Arc-wrapped schema loader.

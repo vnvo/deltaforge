@@ -2314,20 +2314,26 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
 
         for (sink_id, required, elapsed, result) in raw_outcomes {
             match result {
-                Ok(batch_result) => {
+                Ok(mut batch_result) => {
                     // A sink returning Ok can still have isolated per-row
                     // failures. Route each to the DLQ and track whether EVERY
                     // one was durably captured. A row that has no DLQ, or whose
                     // DLQ write was dropped (overflow/reject/serialize/backend
                     // error), is not durably accounted for.
                     let mut all_captured = true;
+                    // The first row not durably captured: its typed error is
+                    // the failure that stops the pipeline (its incident).
+                    let mut first_unrouted: Option<usize> = None;
                     if !batch_result.dlq_failures.is_empty() {
-                        for &(idx, ref err) in &batch_result.dlq_failures {
+                        for (pos, &(idx, ref err)) in
+                            batch_result.dlq_failures.iter().enumerate()
+                        {
                             // A failure index outside the batch is corruption:
                             // the row cannot be identified, so it cannot be
                             // durably captured. Never treat it as handled.
                             if idx >= frozen.events.len() {
                                 all_captured = false;
+                                first_unrouted.get_or_insert(pos);
                                 warn!(
                                     pipeline = %self.pipeline_name,
                                     sink = %sink_id,
@@ -2349,11 +2355,15 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                                         == crate::dlq::DlqWrite::Dropped
                                     {
                                         all_captured = false;
+                                        first_unrouted.get_or_insert(pos);
                                     }
                                 }
                                 // No DLQ configured: the failed row has no
                                 // durable home.
-                                None => all_captured = false,
+                                None => {
+                                    all_captured = false;
+                                    first_unrouted.get_or_insert(pos);
+                                }
                             }
                         }
                     }
@@ -2385,6 +2395,21 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                              checkpoint is held (configure a DLQ to isolate \
                              poison rows and let the sink advance)"
                         );
+                        if let Some(pos) = first_unrouted
+                            && first_failure.as_ref().is_none_or(
+                                |(was_required, _)| required && !was_required,
+                            )
+                        {
+                            let (_, error) =
+                                batch_result.dlq_failures.swap_remove(pos);
+                            first_failure = Some((
+                                required,
+                                SinkDeliveryError {
+                                    sink_id: sink_id.clone(),
+                                    error,
+                                },
+                            ));
+                        }
                         continue;
                     }
 
@@ -6419,6 +6444,12 @@ mod tests {
         bad_indices: Vec<usize>,
         required: bool,
         delivered: AtomicUsize,
+        /// Fail with the encoder's conversion error (its incident) instead
+        /// of a plain serialization error.
+        conversion: bool,
+        /// Fail with this encoder error, triaged as the Kafka sink does: a
+        /// DLQ-eligible error is reported per row, any other fails the batch.
+        encode_error: Option<fn(&str) -> SinkError>,
     }
 
     impl DlqMockSink {
@@ -6429,6 +6460,8 @@ mod tests {
                 bad_indices: Vec::new(),
                 required: true,
                 delivered: AtomicUsize::new(0),
+                conversion: false,
+                encode_error: None,
             })
         }
 
@@ -6439,6 +6472,38 @@ mod tests {
                 bad_indices: Vec::new(),
                 required: false,
                 delivered: AtomicUsize::new(0),
+                conversion: false,
+                encode_error: None,
+            })
+        }
+
+        /// Required sink whose failures are Avro conversion failures.
+        fn new_conversion(id: &str, fail_indices: Vec<usize>) -> Arc<Self> {
+            Arc::new(Self {
+                id: id.to_string(),
+                fail_indices,
+                bad_indices: Vec::new(),
+                required: true,
+                delivered: AtomicUsize::new(0),
+                conversion: true,
+                encode_error: None,
+            })
+        }
+
+        /// Required sink whose failing rows raise `error` from the encoder.
+        fn new_encode_error(
+            id: &str,
+            fail_indices: Vec<usize>,
+            error: fn(&str) -> SinkError,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                id: id.to_string(),
+                fail_indices,
+                bad_indices: Vec::new(),
+                required: true,
+                delivered: AtomicUsize::new(0),
+                conversion: false,
+                encode_error: Some(error),
             })
         }
 
@@ -6450,6 +6515,8 @@ mod tests {
                 bad_indices,
                 required: true,
                 delivered: AtomicUsize::new(0),
+                conversion: false,
+                encode_error: None,
             })
         }
 
@@ -6480,7 +6547,28 @@ mod tests {
             let mut delivered = 0usize;
 
             for (i, _) in events.iter().enumerate() {
-                if self.fail_indices.contains(&i) {
+                if let Some(error) = self.encode_error
+                    && self.fail_indices.contains(&i)
+                {
+                    let e = error(&self.id);
+                    if !e.is_dlq_eligible() {
+                        return Err(e);
+                    }
+                    dlq_failures.push((i, e));
+                } else if self.fail_indices.contains(&i) && self.conversion {
+                    dlq_failures.push((
+                        i,
+                        deltaforge_core::encoding::EncodingError::Conversion(
+                            deltaforge_core::encoding::ConversionFailure {
+                                column: "after.b".into(),
+                                source_type: "bigint unsigned".into(),
+                                target_type: "Avro long".into(),
+                                reason: "not an integer in the signed 64-bit range",
+                            },
+                        )
+                        .into_sink_error_for(&self.id),
+                    ));
+                } else if self.fail_indices.contains(&i) {
                     dlq_failures.push((
                         i,
                         SinkError::Serialization {
@@ -6631,6 +6719,233 @@ mod tests {
             "checkpoint should be committed despite DLQ events"
         );
         assert_eq!(cp.unwrap(), b"{\"pos\":100}");
+    }
+
+    /// Run one committed transaction of three rows through a required sink
+    /// whose row 1 fails its Avro conversion, with `dlq` (or none). Returns
+    /// the run's result, the sink's committed checkpoint and the sink.
+    async fn run_conversion_failure(
+        dlq: Option<Arc<crate::dlq::DlqWriter>>,
+    ) -> (anyhow::Result<()>, Option<Vec<u8>>, Arc<DlqMockSink>) {
+        run_failing_sink(DlqMockSink::new_conversion("kafka", vec![1]), dlq)
+            .await
+    }
+
+    /// Three events (the last a transaction end with a checkpoint) through
+    /// `sink`, whose second row fails.
+    async fn run_failing_sink(
+        sink: Arc<DlqMockSink>,
+        dlq: Option<Arc<crate::dlq::DlqWriter>>,
+    ) -> (anyhow::Result<()>, Option<Vec<u8>>, Arc<DlqMockSink>) {
+        use checkpoints::MemCheckpointStore;
+        let ckpt_store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+        let cp_fn =
+            build_commit_fn(ckpt_store.clone(), "src::sink::kafka".to_string());
+        let processors: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![]);
+        let mut builder = Coordinator::builder("test-conversion")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(10),
+                max_bytes: None,
+                max_ms: Some(100),
+                respect_source_tx: None,
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_fn("kafka", cp_fn)
+            .process_fn(build_batch_processor(processors, "test".to_string()));
+        if let Some(d) = dlq {
+            builder = builder.dlq_writer(d);
+        }
+        let coord = builder.build();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
+        let source = deltaforge_core::SourceInfo {
+            version: "test".into(),
+            connector: "mysql".into(),
+            name: "test".into(),
+            db: "db".into(),
+            schema: None,
+            table: "table".into(),
+            ts_ms: 0,
+            snapshot: None,
+            position: deltaforge_core::SourcePosition::default(),
+        };
+        for i in 0..3 {
+            let mut ev = Event::new_row(
+                deltaforge_core::EventId::mysql_row_server(1, "t", 1, i),
+                source.clone(),
+                deltaforge_core::Op::Create,
+                None,
+                Some(serde_json::json!({"id": i, "b": u64::MAX})),
+                0,
+                0,
+            );
+            if i == 2 {
+                ev.set_checkpoint(CheckpointMeta::from_vec(
+                    b"{\"pos\":30}".to_vec(),
+                ));
+                ev.tx_end = true;
+            }
+            tx.send(SourceItem::Event(ev)).await.unwrap();
+        }
+        drop(tx);
+        let result = coord.run(rx, cancel, pause_rx).await;
+        let cp = ckpt_store.get_raw("src::sink::kafka").await.unwrap();
+        (result, cp, sink)
+    }
+
+    /// A conversion failure without a DLQ stops the pipeline with its own
+    /// `sink_conversion_failed` incident (column and types, no value) and
+    /// the sink's checkpoint stays before the event.
+    #[tokio::test]
+    async fn conversion_failure_without_a_dlq_halts_with_its_incident() {
+        let (result, cp, _) = run_conversion_failure(None).await;
+        let err =
+            result.expect_err("an unrouted conversion failure fails closed");
+        assert!(cp.is_none(), "the checkpoint did not pass the failed event");
+        let draft = crate::incidents::classify_coordinator_exit(&err, 0);
+        assert_eq!(
+            draft.reason_code,
+            deltaforge_core::incident::ReasonCode::SinkConversionFailed
+        );
+        let json = serde_json::to_string(&draft).unwrap();
+        for want in ["after.b", "bigint_unsigned", "avro_long"] {
+            assert!(json.contains(want), "{want}: {json}");
+        }
+        assert!(!json.contains("18446744073709551615"), "{json}");
+    }
+
+    /// With a DLQ that durably acknowledges, the failed event and its
+    /// conversion failure are captured and only then the checkpoint
+    /// advances past it.
+    #[tokio::test]
+    async fn conversion_failure_advances_only_after_the_dlq_acknowledges() {
+        use deltaforge_config::DlqStreamConfig;
+        let backend: storage::ArcStorageBackend =
+            Arc::new(storage::MemoryStorageBackend::new());
+        let dlq = Arc::new(crate::dlq::DlqWriter::new(
+            backend,
+            "test-conversion-dlq".to_string(),
+            DlqStreamConfig::default(),
+            256 * 1024,
+        ));
+        let (result, cp, sink) =
+            run_conversion_failure(Some(dlq.clone())).await;
+        result.expect("the DLQ captured the failed event");
+        assert_eq!(sink.delivery_count(), 2);
+        assert_eq!(cp.as_deref(), Some(&b"{\"pos\":30}"[..]));
+        let entries = dlq.peek(10).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        let meta =
+            deltaforge_core::journal::DlqMeta::from_json(&entries[0].meta)
+                .expect("DLQ meta");
+        assert_eq!(meta.sink_id, "kafka");
+        // The incident explanation: column and types, never the value.
+        for want in ["after.b", "bigint_unsigned", "avro_long"] {
+            assert!(
+                meta.error_message.contains(want),
+                "{want}: {}",
+                meta.error_message
+            );
+        }
+        assert!(!meta.error_message.contains("18446744073709551615"));
+    }
+
+    fn accepting_dlq(name: &str) -> Arc<crate::dlq::DlqWriter> {
+        Arc::new(crate::dlq::DlqWriter::new(
+            Arc::new(storage::MemoryStorageBackend::new()),
+            name.to_string(),
+            deltaforge_config::DlqStreamConfig::default(),
+            256 * 1024,
+        ))
+    }
+
+    /// A Schema Registry outage is retryable infrastructure failure: even
+    /// with a DLQ, the otherwise-valid event is never dead-lettered and the
+    /// checkpoint does not pass it.
+    #[tokio::test]
+    async fn a_registry_outage_is_never_dead_lettered() {
+        let dlq = accepting_dlq("test-registry-outage-dlq");
+        let sink = DlqMockSink::new_encode_error("kafka", vec![1], |id| {
+            deltaforge_core::encoding::EncodingError::SchemaRegistryUnavailable(
+                "connection refused".into(),
+            )
+            .into_sink_error_for(id)
+        });
+        let (result, cp, _) = run_failing_sink(sink, Some(dlq.clone())).await;
+        let err = result.expect_err("the batch is not acknowledged");
+        assert!(cp.is_none(), "the checkpoint did not pass the event");
+        assert!(
+            dlq.peek(10).await.unwrap().is_empty(),
+            "nothing dead-lettered"
+        );
+        assert_eq!(
+            crate::incidents::classify_coordinator_exit(&err, 0).cause_code,
+            deltaforge_core::incident::CauseCode::SinkBackpressure
+        );
+    }
+
+    /// A 409 compatibility rejection is a schema/configuration failure:
+    /// even with a DLQ, the pipeline stops with `sink_schema_rejected` and
+    /// nothing is dead-lettered or checkpointed past the event.
+    #[tokio::test]
+    async fn a_schema_rejection_halts_with_its_incident_and_no_dlq() {
+        let dlq = accepting_dlq("test-schema-rejected-dlq");
+        let sink = DlqMockSink::new_encode_error("kafka", vec![1], |id| {
+            deltaforge_core::encoding::EncodingError::SchemaRejected {
+                subject: "orders-value".into(),
+                details: "incompatible (code: 409)".into(),
+            }
+            .into_sink_error_for(id)
+        });
+        let (result, cp, _) = run_failing_sink(sink, Some(dlq.clone())).await;
+        let err = result.expect_err("a rejected schema fails closed");
+        assert!(cp.is_none(), "the checkpoint did not pass the event");
+        assert!(
+            dlq.peek(10).await.unwrap().is_empty(),
+            "nothing dead-lettered"
+        );
+        let draft = crate::incidents::classify_coordinator_exit(&err, 0);
+        assert_eq!(
+            draft.reason_code,
+            deltaforge_core::incident::ReasonCode::SinkSchemaRejected
+        );
+        assert!(
+            serde_json::to_string(&draft)
+                .unwrap()
+                .contains("orders-value")
+        );
+    }
+
+    /// A DLQ that cannot durably capture the event (full, rejecting) never
+    /// lets the checkpoint pass it.
+    #[tokio::test]
+    async fn conversion_failure_dlq_rejection_holds_the_checkpoint() {
+        use deltaforge_config::{DlqStreamConfig, OverflowPolicy};
+        let backend: storage::ArcStorageBackend =
+            Arc::new(storage::MemoryStorageBackend::new());
+        let dlq = Arc::new(crate::dlq::DlqWriter::new(
+            backend,
+            "test-conversion-dlq-full".to_string(),
+            DlqStreamConfig {
+                max_entries: 0,
+                max_age_secs: 0,
+                overflow_policy: OverflowPolicy::Reject,
+            },
+            256 * 1024,
+        ));
+        let (result, cp, _) = run_conversion_failure(Some(dlq)).await;
+        let err = result.expect_err("an unacknowledged DLQ write fails closed");
+        assert!(cp.is_none(), "the checkpoint did not pass the failed event");
+        assert_eq!(
+            crate::incidents::classify_coordinator_exit(&err, 0).reason_code,
+            deltaforge_core::incident::ReasonCode::SinkConversionFailed
+        );
     }
 
     /// R3-C1: when the DLQ cannot durably capture a required sink's failed row

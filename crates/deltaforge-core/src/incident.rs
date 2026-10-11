@@ -46,6 +46,12 @@ pub enum ReasonCode {
     SchemaDriftBlocked,
     /// A sink write was submitted but its outcome is unknown.
     SinkAckUncertain,
+    /// A sink could not represent an event's value exactly in its target
+    /// encoding (for example an Avro field): no record was produced.
+    SinkConversionFailed,
+    /// A sink's schema registry rejected a schema as incompatible with the
+    /// subject's registered versions: no record was produced.
+    SinkSchemaRejected,
     /// A failure no mapping classifies yet.
     UnclassifiedFailure,
     /// The pipeline's open-incident limit was reached; this record counts the
@@ -85,13 +91,15 @@ pub enum ReasonCode {
 
 impl ReasonCode {
     /// Every reason (bounded metric label values).
-    pub const ALL: [ReasonCode; 19] = [
+    pub const ALL: [ReasonCode; 21] = [
         Self::PgDifferentCluster,
         Self::PgContinuityUnproven,
         Self::PgFailoverSlotUnavailable,
         Self::MysqlGtidPositionUnavailable,
         Self::SchemaDriftBlocked,
         Self::SinkAckUncertain,
+        Self::SinkConversionFailed,
+        Self::SinkSchemaRejected,
         Self::UnclassifiedFailure,
         Self::IncidentOverflow,
         Self::SinkSnapshotIncomplete,
@@ -117,6 +125,8 @@ impl ReasonCode {
             }
             Self::SchemaDriftBlocked => "schema_drift_blocked",
             Self::SinkAckUncertain => "sink_ack_uncertain",
+            Self::SinkConversionFailed => "sink_conversion_failed",
+            Self::SinkSchemaRejected => "sink_schema_rejected",
             Self::UnclassifiedFailure => "unclassified_failure",
             Self::IncidentOverflow => "incident_overflow",
             Self::SinkSnapshotIncomplete => "sink_snapshot_incomplete",
@@ -402,6 +412,10 @@ pub enum EvidenceKey {
     SnapshotChain,
     TargetPosition,
     Publication,
+    Column,
+    SourceType,
+    TargetType,
+    Subject,
 }
 
 impl EvidenceKey {
@@ -442,6 +456,10 @@ impl EvidenceKey {
             Self::SnapshotChain => "snapshot_chain",
             Self::TargetPosition => "target_position",
             Self::Publication => "publication",
+            Self::Column => "column",
+            Self::SourceType => "source_type",
+            Self::TargetType => "target_type",
+            Self::Subject => "subject",
         }
     }
 }
@@ -796,6 +814,23 @@ pub fn explain(
                 ),
                 None => String::new(),
             },
+        ),
+        ReasonCode::SinkConversionFailed => format!(
+            "{component} cannot represent the value of column {} ({}) exactly \
+             as {}. No record was produced for the event; without a DLQ that \
+             acknowledged it, the sink's checkpoint was not advanced.",
+            ev.show(K::Column),
+            ev.show(K::SourceType),
+            ev.show(K::TargetType),
+        ),
+        ReasonCode::SinkSchemaRejected => format!(
+            "{component}'s schema registry rejected the schema for subject {} \
+             as incompatible with the subject's registered versions. No \
+             record was produced, the event was not dead-lettered and the \
+             sink's checkpoint was not advanced. Make the subject's \
+             compatibility setting or the schema mapping compatible, then \
+             restart the pipeline.",
+            ev.show(K::Subject),
         ),
         ReasonCode::SinkSnapshotIncomplete => format!(
             "{component} is behind completed snapshot generation {} of chain \

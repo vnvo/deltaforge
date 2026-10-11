@@ -220,6 +220,80 @@ pub fn build_envelope_schema(
     Ok((schema_str, schema))
 }
 
+/// Version of the DDL event record (the `-v2` in its subject). Bump it, and
+/// the subject suffix with it, whenever the record changes incompatibly.
+pub const DDL_MAPPING_VERSION: u32 = 2;
+
+/// The record schema of a DDL event: its source metadata, operation,
+/// timestamp, event ID and transaction, the record's mapping version, and
+/// the complete DDL payload.
+///
+/// The payload record covers MySQL format-2 payloads (`ddl_format`, `scope`,
+/// ordered `objects`, `database`, `session_database`, and either `sql` or
+/// the redacted `operation` / `redacted` / `note`) and PostgreSQL TRUNCATE
+/// payloads (`sql`, `cascade`, `restart_identity`), with the payload's own
+/// field names. A null and an empty string stay distinct. The payload and
+/// its objects are strict (`deltaforge.strict`): a key the record does not
+/// define fails the conversion, never dropped.
+pub fn build_ddl_schema(
+    connector: &str,
+) -> Result<(String, AvroSchema), EncodingError> {
+    let nullable = |name: &str, ty: serde_json::Value| json!({"name": name, "type": ["null", ty], "default": null});
+    let object = json!({
+        "type": "record",
+        "name": "DdlObject",
+        "namespace": "deltaforge.ddl",
+        "deltaforge.strict": true,
+        "fields": [
+            {"name": "kind", "type": "string"},
+            {"name": "database", "type": "string"},
+            {"name": "name", "type": "string"}
+        ]
+    });
+    let payload = json!({
+        "type": "record",
+        "name": "DdlPayload",
+        "namespace": "deltaforge.ddl",
+        "deltaforge.strict": true,
+        "fields": [
+            nullable("ddl_format", json!("long")),
+            nullable("scope", json!("string")),
+            nullable("objects", json!({"type": "array", "items": object})),
+            nullable("database", json!("string")),
+            nullable("session_database", json!("string")),
+            nullable("sql", json!("string")),
+            nullable("operation", json!("string")),
+            nullable("redacted", json!("boolean")),
+            nullable("note", json!("string")),
+            nullable("cascade", json!("boolean")),
+            nullable("restart_identity", json!("boolean"))
+        ]
+    });
+    let record = json!({
+        "type": "record",
+        "name": "DdlEvent",
+        "namespace": "deltaforge.ddl",
+        "doc": format!("DeltaForge DDL event ({connector}), mapping version {DDL_MAPPING_VERSION}."),
+        "fields": [
+            {"name": "mapping_version", "type": "int"},
+            {"name": "ddl", "type": payload},
+            {"name": "source", "type": source_schema(connector)},
+            {"name": "op", "type": "string"},
+            {"name": "ts_ms", "type": "long"},
+            nullable("event_id", json!("string")),
+            nullable("tenant_id", json!("string")),
+            nullable("transaction", transaction_schema())
+        ]
+    });
+    let schema_str = serde_json::to_string(&record).map_err(|e| {
+        EncodingError::Avro(format!("failed to serialize DDL schema: {e}"))
+    })?;
+    let schema = AvroSchema::parse_str(&schema_str).map_err(|e| {
+        EncodingError::Avro(format!("invalid DDL schema for {connector}: {e}"))
+    })?;
+    Ok((schema_str, schema))
+}
+
 /// Build a simple `Value` record schema from field definitions.
 ///
 /// This is the Path C fallback — used when no source DDL is available.

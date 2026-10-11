@@ -431,6 +431,7 @@ pub(crate) async fn copy_generation(ctx: MyCopyCtx<'_>) -> Result<()> {
     for conn in ctx.workers {
         let (plan, stop) = (Arc::clone(&plan), stop.clone());
         let shape = RowShape {
+            version: None,
             db: String::new(),
             table: String::new(),
             pipeline: ctx.pipeline.to_string(),
@@ -460,6 +461,7 @@ pub(crate) async fn copy_generation(ctx: MyCopyCtx<'_>) -> Result<()> {
                 let worker = TableWorker {
                     conn,
                     shape: RowShape {
+                        version: None,
                         db: planned.qualifier.clone(),
                         table: planned.table.clone(),
                         identity: planned.identity.clone(),
@@ -800,6 +802,9 @@ struct RowShape {
     identity: Vec<String>,
     /// Loaded schema, populated in `run` before any scan.
     schema: Option<super::MySqlTableSchema>,
+    /// Its registered version (fingerprint, registry sequence), stamped on
+    /// every snapshot event.
+    version: Option<(String, u64)>,
 }
 
 impl TableWorker {
@@ -819,6 +824,8 @@ impl TableWorker {
             .with_context(|| format!("load schema for {table_fqn}"))?;
         // Retain the schema for schema-directed native identity extraction.
         self.shape.schema = Some(loaded.schema.clone());
+        self.shape.version =
+            Some((loaded.fingerprint.to_string(), loaded.sequence));
 
         let pk = loaded.schema.primary_key.clone();
         let rows_sent = if pk.len() == 1
@@ -1129,6 +1136,10 @@ impl RowShape {
             size,
         );
         ev.tenant_id = Some(self.tenant.clone());
+        if let Some((fingerprint, sequence)) = &self.version {
+            ev.schema_version = Some(fingerprint.clone());
+            ev.schema_sequence = Some(*sequence);
+        }
         ev
     }
 }
