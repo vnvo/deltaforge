@@ -53,3 +53,13 @@ the connection it is called on.
 `SO_LINGER`, so callers and tests can verify the abortive close is armed.
 DeltaForge arms it right after the TCP connection is established, before
 any other awaited step, so a cancelled open also resets the connection.
+
+## Structured temporal values and YEAR 0
+
+`ColumnValue::Date`, `Time` and `DateTime` carry the stored parts
+(`MysqlDate`, `MysqlTime`, `MysqlDateTime`) instead of formatted strings, so
+DeltaForge's schema-driven decoder reads the exact value without parsing
+text: zero date parts, a signed TIME duration with its microseconds, and
+DATETIME's microseconds. The pre-5.6.4 TIME format is read as the signed
+`HHMMSS` integer it is. YEAR's stored byte 0 is the zero year (MySQL shows
+`0000`), not 1900. File: `src/column/column_value.rs`.

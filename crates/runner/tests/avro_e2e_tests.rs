@@ -16,7 +16,9 @@ use anyhow::Result;
 use bytes::Bytes;
 use ctor::dtor;
 use gate_ownership::GateOwned;
-use mysql_binlog_connector_rust::column::column_value::ColumnValue;
+use mysql_binlog_connector_rust::column::column_value::{
+    ColumnValue, MysqlDate, MysqlDateTime, MysqlTime,
+};
 use serde_json::json;
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
@@ -650,17 +652,37 @@ async fn e2e_mysql_all_types() -> Result<()> {
             ColumnValue::String(b"USD".to_vec()), // CHAR
             ColumnValue::Blob(b"long text content".to_vec()), // TEXT (as Blob!)
             ColumnValue::Blob(b"\x00\x01\x02\x03".to_vec()), // BLOB (binary)
-            ColumnValue::Date("2026-04-04".to_string()), // DATE
-            ColumnValue::DateTime("2026-04-04 10:30:00".to_string()), // DATETIME
+            ColumnValue::Date(MysqlDate {
+                year: 2026,
+                month: 4,
+                day: 4,
+            }), // DATE
+            ColumnValue::DateTime(MysqlDateTime {
+                date: MysqlDate {
+                    year: 2026,
+                    month: 4,
+                    day: 4,
+                },
+                hour: 10,
+                minute: 30,
+                second: 0,
+                micros: 0,
+            }), // DATETIME
             ColumnValue::Timestamp(1700000000000000), // TIMESTAMP (micros)
-            ColumnValue::Time("10:30:00".to_string()), // TIME
-            ColumnValue::Year(2026),                  // YEAR
-            ColumnValue::Tiny(1),                     // BOOLEAN (as TINYINT)
+            ColumnValue::Time(MysqlTime {
+                negative: false,
+                hours: 10,
+                minutes: 30,
+                seconds: 0,
+                micros: 0,
+            }), // TIME
+            ColumnValue::Year(2026),    // YEAR
+            ColumnValue::Tiny(1),       // BOOLEAN (as TINYINT)
             ColumnValue::Json(br#"{"key":"value"}"#.to_vec()), // JSON
-            ColumnValue::Enum(2),                     // ENUM index
-            ColumnValue::Set(3),                      // SET bitmask
-            ColumnValue::None,                        // NULL TEXT
-            ColumnValue::None,                        // NULL INT
+            ColumnValue::Enum(2),       // ENUM index
+            ColumnValue::Set(3),        // SET bitmask
+            ColumnValue::None,          // NULL TEXT
+            ColumnValue::None,          // NULL INT
         ],
     );
 

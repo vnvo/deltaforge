@@ -604,7 +604,7 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-pub(crate) const MICROS_PER_DAY: i64 = 86_400_000_000;
+pub const MICROS_PER_DAY: i64 = 86_400_000_000;
 
 /// A DATE value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

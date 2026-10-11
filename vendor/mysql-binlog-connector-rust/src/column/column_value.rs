@@ -21,13 +21,13 @@ pub enum ColumnValue {
     Double(f64),
     // A decimal value
     Decimal(String),
-    // A datatype to store a time value
-    Time(String),
-    // A datatype to store a date value
-    Date(String),
+    // A datatype to store a time value (a signed duration)
+    Time(MysqlTime),
+    // A datatype to store a date value (zero parts kept as stored)
+    Date(MysqlDate),
     // A datatype containing timestamp values ranging from
     // '1000-01-01 00:00:00' to '9999-12-31 23:59:59'.
-    DateTime(String),
+    DateTime(MysqlDateTime),
     // A datatype containing timestamp values ranging from
     // 1970-01-01 00:00:01' UTC to '2038-01-19 03:14:07' UTC.
     // MySQL converts TIMESTAMP values from the current time zone to UTC for storage,
@@ -53,6 +53,34 @@ pub enum ColumnValue {
     // An ENUM column can have a maximum of 65,535 distinct elements.
     Enum(u32),
     Json(Vec<u8>),
+}
+
+/// A DATE as stored: zero year, month or day parts are kept.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+pub struct MysqlDate {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+}
+
+/// A TIME as stored: a signed duration.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+pub struct MysqlTime {
+    pub negative: bool,
+    pub hours: u32,
+    pub minutes: u8,
+    pub seconds: u8,
+    pub micros: u32,
+}
+
+/// A DATETIME as stored.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+pub struct MysqlDateTime {
+    pub date: MysqlDate,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+    pub micros: u32,
 }
 
 const DIG_PER_DEC: usize = 9;
@@ -107,7 +135,11 @@ impl ColumnValue {
                 ColumnValue::DateTime(Self::parse_datetime2(cursor, column_meta)?)
             }
 
-            ColumnType::Year => ColumnValue::Year(cursor.read_u8()? as u16 + 1900),
+            // 0 is the zero year '0000', not 1900.
+            ColumnType::Year => ColumnValue::Year(match cursor.read_u8()? {
+                0 => 0,
+                y => y as u16 + 1900,
+            }),
 
             ColumnType::VarChar | ColumnType::VarString => {
                 ColumnValue::String(Self::parse_string(cursor, column_meta)?)
@@ -153,26 +185,32 @@ impl ColumnValue {
         Ok(result)
     }
 
-    fn parse_date(cursor: &mut Cursor<&Vec<u8>>) -> Result<String, BinlogError> {
+    fn parse_date(cursor: &mut Cursor<&Vec<u8>>) -> Result<MysqlDate, BinlogError> {
         // Stored as a 3 byte value where bits 1 to 5 store the day,
         // bits 6 to 9 store the month and the remaining bits store the year.
         let date_val = cursor.read_u24::<LittleEndian>()?;
-        let day = date_val % 32;
-        let month = (date_val >> 5) % 16;
-        let year = date_val >> 9;
-        Ok(format!("{}-{:02}-{:02}", year, month, day))
+        Ok(MysqlDate {
+            year: (date_val >> 9) as u16,
+            month: ((date_val >> 5) % 16) as u8,
+            day: (date_val % 32) as u8,
+        })
     }
 
-    fn parse_time(cursor: &mut Cursor<&Vec<u8>>) -> Result<String, BinlogError> {
+    fn parse_time(cursor: &mut Cursor<&Vec<u8>>) -> Result<MysqlTime, BinlogError> {
         // refer: https://dev.mysql.com/doc/refman/8.0/en/time.html
-        let time_val = cursor.read_u24::<LittleEndian>()?;
-        let hour = (time_val / 100) / 100;
-        let minute = (time_val / 100) % 100;
-        let second = time_val % 100;
-        Ok(format!("{:02}:{:02}:{:02}", hour, minute, second))
+        // A signed 3-byte HHMMSS.
+        let time_val = cursor.read_i24::<LittleEndian>()?;
+        let abs = time_val.unsigned_abs();
+        Ok(MysqlTime {
+            negative: time_val < 0,
+            hours: abs / 10000,
+            minutes: ((abs / 100) % 100) as u8,
+            seconds: (abs % 100) as u8,
+            micros: 0,
+        })
     }
 
-    fn parse_time2(cursor: &mut Cursor<&Vec<u8>>, column_meta: u16) -> Result<String, BinlogError> {
+    fn parse_time2(cursor: &mut Cursor<&Vec<u8>>, column_meta: u16) -> Result<MysqlTime, BinlogError> {
         // (in big endian)
 
         // 1 bit sign (1= non-negative, 0= negative)
@@ -208,17 +246,13 @@ impl ColumnValue {
             micro_second = fraction * 10_000 / u64::pow(100, fraction_bytes as u32 - 1);
         }
 
-        if negative {
-            Ok(format!(
-                "-{:02}:{:02}:{:02}.{:06}",
-                hour, minute, second, micro_second
-            ))
-        } else {
-            Ok(format!(
-                "{:02}:{:02}:{:02}.{:06}",
-                hour, minute, second, micro_second
-            ))
-        }
+        Ok(MysqlTime {
+            negative,
+            hours: hour as u32,
+            minutes: minute as u8,
+            seconds: second as u8,
+            micros: micro_second as u32,
+        })
     }
 
     fn parse_fraction(cursor: &mut Cursor<&Vec<u8>>, column_meta: u16) -> Result<u32, BinlogError> {
@@ -245,26 +279,28 @@ impl ColumnValue {
         Ok(1000000 * second as i64 + micros as i64)
     }
 
-    fn parse_datetime(cursor: &mut Cursor<&Vec<u8>>) -> Result<String, BinlogError> {
-        let datetime_val = cursor.read_u64::<LittleEndian>()? * 1000;
+    fn parse_datetime(cursor: &mut Cursor<&Vec<u8>>) -> Result<MysqlDateTime, BinlogError> {
+        // An 8-byte YYYYMMDDHHMMSS.
+        let datetime_val = cursor.read_u64::<LittleEndian>()?;
         let date_val = datetime_val / 1000000;
         let time_val = datetime_val % 1000000;
-        let year = ((date_val / 100) / 100) as u32;
-        let month = ((date_val / 100) % 100) as u32;
-        let day = (date_val % 100) as u32;
-        let hour = ((time_val / 100) / 100) as u32;
-        let minute = ((time_val / 100) % 100) as u32;
-        let second = (time_val % 100) as u32;
-        Ok(format!(
-            "{}-{:02}-{:02} {:02}:{:02}:{:02}",
-            year, month, day, hour, minute, second,
-        ))
+        Ok(MysqlDateTime {
+            date: MysqlDate {
+                year: (date_val / 10000) as u16,
+                month: ((date_val / 100) % 100) as u8,
+                day: (date_val % 100) as u8,
+            },
+            hour: (time_val / 10000) as u8,
+            minute: ((time_val / 100) % 100) as u8,
+            second: (time_val % 100) as u8,
+            micros: 0,
+        })
     }
 
     fn parse_datetime2(
         cursor: &mut Cursor<&Vec<u8>>,
         column_meta: u16,
-    ) -> Result<String, BinlogError> {
+    ) -> Result<MysqlDateTime, BinlogError> {
         // Stored as 4-byte value,
         // The number of decimals for the fractional part is stored in the table metadata as a one byte value.
         // The number of bytes that follow the 5 byte datetime value can be calculated
@@ -273,16 +309,17 @@ impl ColumnValue {
         let micros = Self::parse_fraction(cursor, column_meta)?;
         let d_val = val >> 17;
         let t_val = val % (1 << 17);
-        let year = ((d_val >> 5) / 13) as u32;
-        let month = ((d_val >> 5) % 13) as u32;
-        let day = (d_val % (1 << 5)) as u32;
-        let hour = ((val >> 12) % (1 << 5)) as u32;
-        let minute = ((t_val >> 6) % (1 << 6)) as u32;
-        let second = (t_val % (1 << 6)) as u32;
-        Ok(format!(
-            "{}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
-            year, month, day, hour, minute, second, micros,
-        ))
+        Ok(MysqlDateTime {
+            date: MysqlDate {
+                year: ((d_val >> 5) / 13) as u16,
+                month: ((d_val >> 5) % 13) as u8,
+                day: (d_val % (1 << 5)) as u8,
+            },
+            hour: ((val >> 12) % (1 << 5)) as u8,
+            minute: ((t_val >> 6) % (1 << 6)) as u8,
+            second: (t_val % (1 << 6)) as u8,
+            micros,
+        })
     }
 
     fn parse_string(

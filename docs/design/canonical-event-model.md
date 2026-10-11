@@ -49,7 +49,7 @@ A SQL JSON column is `Db(Json)`, never `Document`. A binary column is
 | `Timestamp` | UTC instant in microseconds with precision, MySQL zero, or +/-infinity | |
 | `Year` | 0 or 1901..2155 | |
 | `Uuid` | 16 bytes | |
-| `Array { element_type, items }` | PostgreSQL array, one dimension level per nesting, lower bound 1 | items typed by the declared element type; arrays with other bounds are `Opaque` |
+| `Array { element_type, items }` | PostgreSQL array of a mapped builtin element type, one dimension level per nesting, lower bound 1 | items typed by the declared element type; a value with other lower bounds is a source decoding failure (it has no canonical form, and the column's representation never changes by value); arrays of an unmapped element type are `Opaque` as a whole |
 
 Precision is `Fixed(0..=6)` (declared) or `Variable` (PostgreSQL without a
 typmod: rendered with trailing fractional zeros removed).

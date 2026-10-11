@@ -42,6 +42,8 @@ mod mysql_session;
 mod mysql_signature;
 use mysql_helpers::{checkpoint_lineage, prepare_client};
 
+pub mod mysql_decode;
+pub mod mysql_jsonb;
 pub mod mysql_object;
 
 mod mysql_schema_loader;

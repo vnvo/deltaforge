@@ -97,7 +97,7 @@ fn unsigned(c: &MySqlColumn) -> bool {
 }
 
 /// The quoted values of `enum('a','b')` / `set(...)`.
-fn quoted_values(column_type: &str) -> Option<Vec<String>> {
+pub(crate) fn quoted_values(column_type: &str) -> Option<Vec<String>> {
     let open = column_type.find('(')?;
     let close = column_type.rfind(')')?;
     let inner: Vec<char> = column_type[open + 1..close].chars().collect();

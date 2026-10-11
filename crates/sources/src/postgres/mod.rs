@@ -54,6 +54,7 @@ pub mod postgres_publication;
 
 mod postgres_builtin_types;
 mod postgres_catalog_capture;
+pub mod postgres_decode;
 pub mod postgres_event_schema;
 mod postgres_relation_binding;
 mod postgres_schema_loader;
