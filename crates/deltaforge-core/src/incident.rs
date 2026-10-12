@@ -87,11 +87,19 @@ pub enum ReasonCode {
     PgPublicationChanged,
     /// The database's publication enforcement is missing or tampered with.
     PgPublicationEnforcement,
+    /// A source value cannot be decoded exactly by its column's declared
+    /// type: no event of its transaction is delivered.
+    SourceDecodeFailed,
+    /// A sink destination written by key (a ClickHouse table, an
+    /// Elasticsearch index) is bound to another source relation, was
+    /// replaced since it was bound, or holds rows without a binding: nothing
+    /// of the batch was delivered.
+    SinkDestinationConflict,
 }
 
 impl ReasonCode {
     /// Every reason (bounded metric label values).
-    pub const ALL: [ReasonCode; 21] = [
+    pub const ALL: [ReasonCode; 23] = [
         Self::PgDifferentCluster,
         Self::PgContinuityUnproven,
         Self::PgFailoverSlotUnavailable,
@@ -113,6 +121,8 @@ impl ReasonCode {
         Self::PgTableUnsupported,
         Self::PgPublicationChanged,
         Self::PgPublicationEnforcement,
+        Self::SourceDecodeFailed,
+        Self::SinkDestinationConflict,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -142,6 +152,8 @@ impl ReasonCode {
             Self::PgTableUnsupported => "pg_table_unsupported",
             Self::PgPublicationChanged => "pg_publication_changed",
             Self::PgPublicationEnforcement => "pg_publication_enforcement",
+            Self::SourceDecodeFailed => "source_decode_failed",
+            Self::SinkDestinationConflict => "sink_destination_conflict",
         }
     }
 }
@@ -416,6 +428,12 @@ pub enum EvidenceKey {
     SourceType,
     TargetType,
     Subject,
+    /// A sink destination (an index, a table), as the sink names it.
+    Destination,
+    /// A source relation's canonical identity.
+    Relation,
+    /// The relation a destination is bound to.
+    BoundRelation,
 }
 
 impl EvidenceKey {
@@ -460,6 +478,9 @@ impl EvidenceKey {
             Self::SourceType => "source_type",
             Self::TargetType => "target_type",
             Self::Subject => "subject",
+            Self::Destination => "destination",
+            Self::Relation => "relation",
+            Self::BoundRelation => "bound_relation",
         }
     }
 }
@@ -822,6 +843,26 @@ pub fn explain(
             ev.show(K::Column),
             ev.show(K::SourceType),
             ev.show(K::TargetType),
+        ),
+        ReasonCode::SourceDecodeFailed => format!(
+            "{component} cannot decode a value of column {} ({}) of table {} \
+             exactly ({}). It stopped before the value's transaction; the \
+             checkpoint stays before it.",
+            ev.show(K::Column),
+            ev.show(K::SourceType),
+            ev.show(K::Table),
+            ev.show(K::ReasonClass),
+        ),
+        ReasonCode::SinkDestinationConflict => format!(
+            "{component} refused to write source table {} to destination {} \
+             ({}; bound to {}). Nothing of the batch was delivered and the \
+             sink's checkpoint was not advanced. Give each source table its \
+             own destination, or bind a replaced destination again, then \
+             restart the pipeline.",
+            ev.show(K::Relation),
+            ev.show(K::Destination),
+            ev.show(K::ReasonClass),
+            ev.show(K::BoundRelation),
         ),
         ReasonCode::SinkSchemaRejected => format!(
             "{component}'s schema registry rejected the schema for subject {} \

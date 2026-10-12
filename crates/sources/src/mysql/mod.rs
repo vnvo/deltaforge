@@ -42,7 +42,8 @@ mod mysql_session;
 mod mysql_signature;
 use mysql_helpers::{checkpoint_lineage, prepare_client};
 
-pub mod mysql_object;
+pub mod mysql_decode;
+pub mod mysql_jsonb;
 
 mod mysql_schema_loader;
 pub use mysql_schema_loader::{LoadedSchema, MySqlSchemaLoader};
@@ -154,6 +155,8 @@ pub struct MySqlSource {
     pub registry_scope: crate::registry_scope::SharedRegistryScope,
     pub backend: ArcStorageBackend,
     pub outbox_tables: AllowList,
+    /// The type-mapping version stamped on every event this source emits.
+    pub type_mapping: deltaforge_core::TypeMapping,
     pub snapshot_cfg: deltaforge_config::SnapshotCfg,
     pub on_schema_drift: deltaforge_config::OnSchemaDrift,
     /// Per-table options (identity_columns, assume_unique), keyed by
@@ -253,6 +256,8 @@ pub(crate) struct RunCtx {
     checkpoint_gtid: Option<String>,
     checkpoint_file: String,
     outbox_tables: AllowList,
+    /// The type-mapping version stamped on every event.
+    type_mapping: deltaforge_core::TypeMapping,
     identity_store: IdentityStore,
     reconciler: SchemaReconciler,
     /// Verified-lineage registry scope (shared with the pipeline's loaders).
@@ -1052,6 +1057,7 @@ impl MySqlSource {
                 publisher: Arc::clone(&publisher),
                 generation: control.generation,
                 lineage: control.lineage.clone(),
+                type_mapping: self.type_mapping,
             })
             .await;
         crate::snapshot_probe::record_phase(
@@ -1067,10 +1073,11 @@ impl MySqlSource {
             return Err(SourceError::Cancelled);
         }
         if let Err(e) = copied {
+            // A typed failure (a value the decoder refuses) stays typed.
             return Err(self
                 .concurrent_owner(control.generation, &run)
                 .await
-                .unwrap_or_else(|| other(e)));
+                .unwrap_or_else(|| typed(e, "snapshot copy")));
         }
         drop(extras);
         drop(permits);
@@ -1648,6 +1655,7 @@ impl MySqlSource {
             checkpoint_gtid,
             checkpoint_file,
             outbox_tables: self.outbox_tables.clone(),
+            type_mapping: self.type_mapping,
             on_schema_drift: self.on_schema_drift.clone(),
             // Verified once above, before the stream opens.
             durable_lineage: Some(durable_lineage),

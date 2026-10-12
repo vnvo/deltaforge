@@ -194,11 +194,14 @@ async fn phase1e_abandoned_writer_produces_no_visible_object() -> Result<()> {
         is_array: false,
         element_type: None,
     }];
-    let schema = Arc::new(build_envelope_arrow_schema(
-        Connector::Mysql,
-        &cols,
-        &TypeConversionOpts::default(),
-    ));
+    let schema = Arc::new(
+        build_envelope_arrow_schema(
+            Connector::Mysql,
+            &cols,
+            &TypeConversionOpts::default(),
+        )
+        .unwrap(),
+    );
 
     let format: Arc<dyn sinks::s3::FileFormat> =
         Arc::new(ParquetFormat::default());
@@ -222,7 +225,9 @@ async fn phase1e_abandoned_writer_produces_no_visible_object() -> Result<()> {
     let events: Vec<Event> = (0..50_000)
         .map(|i| Event {
             before: None,
-            after: Some(json!({"id": i as i64})),
+            after: Some(deltaforge_core::canonical::fixture::row(
+                json!({"id": i as i64}),
+            )),
             source: SourceInfo {
                 version: "1".into(),
                 connector: "mysql".into(),
@@ -237,6 +242,7 @@ async fn phase1e_abandoned_writer_produces_no_visible_object() -> Result<()> {
             op: Op::Create,
             ts_ms,
             transaction: None,
+            type_mapping: deltaforge_core::TypeMapping::V2,
             event_id: None,
             tenant_id: None,
             schema_version: None,

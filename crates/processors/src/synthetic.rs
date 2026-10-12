@@ -71,8 +71,9 @@ impl Processor for SyntheticMarkingProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deltaforge_core::canonical::fixture;
     use deltaforge_core::{
-        BatchContext, Event, Op, SourceInfo, SourcePosition,
+        BatchContext, Event, Op, SourceInfo, SourcePosition, TypeMapping,
     };
     use serde_json::json;
 
@@ -92,7 +93,8 @@ mod tests {
             },
             Op::Create,
             None,
-            Some(json!({"id": 1})),
+            Some(fixture::row(json!({"id": 1}))),
+            TypeMapping::V2,
             0,
             64,
         )
@@ -143,7 +145,8 @@ mod tests {
                     e.source.clone(),
                     Op::Create,
                     None,
-                    Some(json!({"derived": true})),
+                    Some(fixture::row(json!({"derived": true}))),
+                    TypeMapping::V2,
                     0,
                     32,
                 ));
@@ -174,7 +177,8 @@ mod tests {
                     e.source.clone(),
                     Op::Create,
                     None,
-                    Some(json!({"alert": true})),
+                    Some(fixture::row(json!({"alert": true}))),
+                    TypeMapping::V2,
                     0,
                     32,
                 );

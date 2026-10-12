@@ -10,6 +10,7 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use deltaforge_config::{ElasticsearchSinkCfg, EsVersionSource};
+use deltaforge_core::SourceRelationIdentity;
 use deltaforge_core::{BatchResult, Event, Op, Sink, SinkError, SinkResult};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -38,21 +39,22 @@ pub struct ElasticsearchSink {
     version_source: EsVersionSource,
     transport: Arc<dyn EsTransport>,
     resolver: Option<EsSchemaResolver>,
-    resolved: RwLock<HashMap<String, Arc<TableColumns>>>,
+    resolved: RwLock<HashMap<SourceRelationIdentity, Arc<TableColumns>>>,
+    /// Each index holds one source relation (`_id`s are per relation),
+    /// durably bound.
+    guard: crate::destination::DestinationGuard,
+    /// The cluster's UUID (read once per session): part of each index's
+    /// destination name, so the same index name on two clusters is two
+    /// destinations.
+    cluster: tokio::sync::OnceCell<String>,
     ensured: RwLock<HashSet<String>>,
 }
 
 impl ElasticsearchSink {
-    /// Source table key: `"{namespace}.{table}"` (PG schema if present else db) —
-    /// the same qualification the schema registry uses.
+    /// The source table as the schema resolver names it: `namespace.table`
+    /// within the pipeline's database.
     fn source_key(ev: &Event) -> String {
-        let ns = ev
-            .source
-            .schema
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&ev.source.db);
-        format!("{ns}.{}", ev.source.table)
+        ev.source.full_table_name()
     }
 
     /// True when the sink must know the source schema: for the PK (when no
@@ -63,10 +65,11 @@ impl ElasticsearchSink {
 
     /// Resolve (and cache) the source columns + PK for an event's table.
     fn schema_for(&self, ev: &Event) -> Result<Arc<TableColumns>, SinkError> {
-        let key = Self::source_key(ev);
-        if let Some(tc) = self.resolved.read().unwrap().get(&key) {
+        let relation = SourceRelationIdentity::of(&ev.source);
+        if let Some(tc) = self.resolved.read().unwrap().get(&relation) {
             return Ok(tc.clone());
         }
+        let key = Self::source_key(ev);
         let resolver = self.resolver.as_ref().ok_or_else(|| {
             SinkError::Other(anyhow::anyhow!(
                 "elasticsearch sink has no schema resolver (source schema unavailable)"
@@ -80,8 +83,38 @@ impl ElasticsearchSink {
                 ))
             })?;
         let tc = Arc::new(tc);
-        self.resolved.write().unwrap().insert(key, tc.clone());
+        self.resolved.write().unwrap().insert(relation, tc.clone());
         Ok(tc)
+    }
+
+    /// The index's durable binding admits the event's relation (verified
+    /// once per session per index, before anything is written to it).
+    async fn verify_destination(
+        &self,
+        index: &str,
+        ev: &Event,
+    ) -> Result<(), SinkError> {
+        let cluster = self
+            .cluster
+            .get_or_try_init(|| async {
+                let v = self.transport.get_json("").await?;
+                v["cluster_uuid"].as_str().map(str::to_string).ok_or_else(|| {
+                    SinkError::Io(std::io::Error::other(
+                        "elasticsearch: the cluster reports no cluster_uuid",
+                    ))
+                })
+            })
+            .await?;
+        let destination = format!("elasticsearch/{cluster}/{index}");
+        let transport = Arc::clone(&self.transport);
+        let index = index.to_string();
+        self.guard
+            .verify(
+                &destination,
+                &SourceRelationIdentity::of(&ev.source),
+                || async move { index_state(transport.as_ref(), &index).await },
+            )
+            .await
     }
 
     /// Ensure the index exists (once), creating it with a generated mapping.
@@ -156,6 +189,7 @@ impl Sink for ElasticsearchSink {
             if self.auto_create_index {
                 self.ensure_index(&index, &tc.columns).await?;
             }
+            self.verify_destination(&index, ev).await?;
 
             let id = match derive_id(
                 ev,
@@ -174,10 +208,14 @@ impl Sink for ElasticsearchSink {
                 None
             } else {
                 match ev.after.as_ref() {
-                    // Normalize source value shapes (base64-wrapped binary/text,
-                    // microsecond timestamps) to what the generated mapping and
-                    // Elasticsearch accept.
-                    Some(d) => Some(normalize_doc(&tc.columns, d)),
+                    // The document from the row's canonical values, by type.
+                    Some(d) => match normalize_doc(&tc.columns, d) {
+                        Ok(doc) => Some(doc),
+                        Err(e) => {
+                            dlq.push((i, e));
+                            continue;
+                        }
+                    },
                     None => {
                         dlq.push((
                             i,
@@ -245,6 +283,36 @@ impl Sink for ElasticsearchSink {
     }
 }
 
+/// An index's own identity (its UUID) and whether it holds documents.
+async fn index_state(
+    transport: &dyn EsTransport,
+    index: &str,
+) -> Result<crate::destination::TargetState, SinkError> {
+    let settings = transport
+        .get_json(&format!("{index}/_settings/index.uuid"))
+        .await?;
+    // Keyed by the concrete index name (an alias resolves to one index).
+    let uid = settings
+        .as_object()
+        .and_then(|o| {
+            let mut uids = o
+                .values()
+                .filter_map(|v| v["settings"]["index"]["uuid"].as_str());
+            let first = uids.next()?;
+            uids.next().is_none().then(|| first.to_string())
+        })
+        .ok_or_else(|| {
+            SinkError::Io(std::io::Error::other(format!(
+                "elasticsearch: {index} is not exactly one index with a uuid"
+            )))
+        })?;
+    let count = transport.get_json(&format!("{index}/_count")).await?;
+    Ok(crate::destination::TargetState {
+        uid,
+        has_rows: count["count"].as_u64().unwrap_or(1) > 0,
+    })
+}
+
 /// Build an `ElasticsearchSink` from config. `resolver` supplies source-table
 /// columns + PK (built by the runner).
 pub fn build_elasticsearch_sink(
@@ -252,6 +320,7 @@ pub fn build_elasticsearch_sink(
     _cancel: CancellationToken,
     pipeline: &str,
     resolver: Option<EsSchemaResolver>,
+    bindings: Arc<dyn deltaforge_core::destination::DestinationBindingStore>,
     creds: &crate::ResolvedSinkCreds,
 ) -> anyhow::Result<ElasticsearchSink> {
     // Expand ${ENV} in the URL. Auth is resolved (references win over inline).
@@ -282,6 +351,8 @@ pub fn build_elasticsearch_sink(
         transport: Arc::new(client),
         resolver,
         resolved: RwLock::new(HashMap::new()),
+        guard: crate::destination::DestinationGuard::new(&cfg.id, bindings),
+        cluster: Default::default(),
         ensured: RwLock::new(HashSet::new()),
     })
 }
@@ -335,6 +406,18 @@ mod tests {
                 .push((index.to_string(), mapping.clone()));
             Ok(())
         }
+        /// One cluster; every index has a UUID; documents after any bulk.
+        async fn get_json(&self, path: &str) -> Result<Value, SinkError> {
+            if path.is_empty() {
+                return Ok(json!({"cluster_uuid": "c1"}));
+            }
+            if let Some(index) = path.strip_suffix("/_settings/index.uuid") {
+                return Ok(
+                    json!({ index: {"settings": {"index": {"uuid": format!("u-{index}")}}}}),
+                );
+            }
+            Ok(json!({"count": self.bulk_bodies.lock().unwrap().len()}))
+        }
     }
 
     fn resolver() -> EsSchemaResolver {
@@ -368,6 +451,16 @@ mod tests {
     }
 
     fn sink_with(fake: Arc<FakeTransport>) -> ElasticsearchSink {
+        sink_over(
+            fake,
+            Arc::new(deltaforge_core::destination::MemoryDestinationBindings::default()),
+        )
+    }
+
+    fn sink_over(
+        fake: Arc<FakeTransport>,
+        store: Arc<dyn deltaforge_core::destination::DestinationBindingStore>,
+    ) -> ElasticsearchSink {
         ElasticsearchSink {
             id: "es".into(),
             pipeline: "p".into(),
@@ -380,6 +473,8 @@ mod tests {
             transport: fake,
             resolver: Some(resolver()),
             resolved: RwLock::new(HashMap::new()),
+            guard: crate::destination::DestinationGuard::new("es", store),
+            cluster: Default::default(),
             ensured: RwLock::new(HashSet::new()),
         }
     }
@@ -440,6 +535,60 @@ mod tests {
         let bodies = fake.bulk_bodies.lock().unwrap();
         assert_eq!(bodies.len(), 1);
         assert_eq!(count_actions(&bodies[0]), (2, 1));
+    }
+
+    /// Two schemas' same-named tables rendered into one index: the second
+    /// relation is refused before any bulk request, also after a restart in
+    /// which it comes first, naming both relations.
+    #[tokio::test]
+    async fn an_index_holds_one_relation_across_restarts() {
+        let ok =
+            json!({"errors": false, "items": [{"index": {"status": 200}}]});
+        let store: Arc<
+            dyn deltaforge_core::destination::DestinationBindingStore,
+        > = Arc::new(
+            deltaforge_core::destination::MemoryDestinationBindings::default(),
+        );
+        let row = |schema: &str| {
+            mk_event(
+                Op::Create,
+                json!({"id": 1, "amount": "1.00"}),
+                json!(null),
+                "shop",
+                Some(schema),
+                "orders",
+                1,
+                None,
+            )
+        };
+        let mut sink = sink_over(
+            Arc::new(FakeTransport::new(ok.clone())),
+            Arc::clone(&store),
+        );
+        sink.index_template = "cdc-{table}".into();
+        sink.send_batch(&[row("a")]).await.unwrap();
+
+        let fake = Arc::new(FakeTransport::new(ok.clone()));
+        let mut restarted = sink_over(fake.clone(), Arc::clone(&store));
+        restarted.index_template = "cdc-{table}".into();
+        let e = restarted.send_batch(&[row("b")]).await.unwrap_err();
+        let d = e.draft().expect("an incident");
+        assert_eq!(
+            d.reason_code,
+            deltaforge_core::incident::ReasonCode::SinkDestinationConflict
+        );
+        let text = format!("{e:?}");
+        assert!(
+            text.contains("shop/a/orders") && text.contains("shop/b/orders"),
+            "{text}"
+        );
+        assert!(!text.contains("1.00"), "no row data: {text}");
+        assert!(
+            fake.bulk_bodies.lock().unwrap().is_empty(),
+            "nothing delivered"
+        );
+        // The bound relation still writes after the restart.
+        restarted.send_batch(&[row("a")]).await.unwrap();
     }
 
     #[tokio::test]

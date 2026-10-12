@@ -9,8 +9,9 @@ use anyhow::Result;
 use criterion::{
     Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
+use deltaforge_core::canonical::fixture;
 use deltaforge_core::{
-    BatchContext, Event, Op, Processor, SourceInfo, SourcePosition,
+    BatchContext, Event, Op, Processor, SourceInfo, SourcePosition, TypeMapping,
 };
 use once_cell::sync::Lazy;
 use processors::JsProcessor;
@@ -40,7 +41,8 @@ fn make_small_event() -> Event {
         make_source_info(),
         Op::Create,
         None,
-        Some(json!({"id": 1, "sku": "ABC-1", "qty": 2})),
+        Some(fixture::row(json!({"id": 1, "sku": "ABC-1", "qty": 2}))),
+        TypeMapping::V2,
         1_700_000_000_000,
         64,
     )
@@ -53,12 +55,13 @@ fn make_large_event(bytes: usize) -> Event {
         make_source_info(),
         Op::Create,
         None,
-        Some(json!({
+        Some(fixture::row(json!({
             "id": 1,
             "desc": big,
             "tags": ["a", "b", "c"],
             "nested": {"k": [1, 2, 3, 4, 5]}
-        })),
+        }))),
+        TypeMapping::V2,
         1_700_000_000_000,
         bytes,
     )
@@ -68,11 +71,13 @@ fn make_batch(size: usize) -> Vec<Event> {
     (0..size)
         .map(|i| {
             Event::new_row(
-            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
+                // Distinct ids: a JS 1:1 output retains exactly one input id.
+                deltaforge_core::EventId::mysql_row_server(1, "t", 1, i as u32),
                 make_source_info(),
                 Op::Create,
                 None,
-                Some(json!({"id": i, "sku": format!("SKU-{}", i), "qty": i % 10})),
+                Some(fixture::row(json!({"id": i, "sku": format!("SKU-{}", i), "qty": i % 10}))),
+                TypeMapping::V2,
                 1_700_000_000_000,
                 64,
             )
@@ -214,7 +219,7 @@ fn bench_js_expansion(c: &mut Criterion) {
                 const clone = JSON.parse(JSON.stringify(ev));
                 clone.after = clone.after || {};
                 clone.after.is_audit = true;
-                out.push(clone);
+                out.push(derive(ev, clone));
             }
             return out;
         }

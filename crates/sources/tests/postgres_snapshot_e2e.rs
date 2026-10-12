@@ -78,6 +78,7 @@ async fn pg_source(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     })
 }
 
@@ -135,7 +136,7 @@ fn ids(events: &[Event]) -> std::collections::HashSet<i64> {
     events
         .iter()
         .filter_map(|e| {
-            let v = e.after.as_ref()?.get("id")?;
+            let v = test_common::row_view(e.after.as_ref()?).get("id")?.clone();
             v.as_i64()
                 .or_else(|| v.as_str().and_then(|x| x.parse().ok()))
         })
@@ -750,6 +751,7 @@ async fn snapshot_with_setup(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let chkpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     let backend = src.backend.clone();
@@ -910,6 +912,7 @@ async fn wildcard_legacy_progress_ambiguity_is_detected() -> Result<()> {
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let store = MemCheckpointStore::new()?;
     let put = |done: &[&str], finished: bool| {

@@ -1,18 +1,14 @@
 //! Render an index name from a template using an event's source identity.
 //!
-//! Placeholders: `{db}`, `{schema}` (PG schema, falls back to db), `{table}`.
+//! Placeholders: `{db}` (the database), `{schema}` (the table's namespace:
+//! the PostgreSQL schema, or the MySQL database), `{table}`.
 //! A template with no placeholders is a static index name. The result is
 //! lowercased — Elasticsearch index names must be lowercase.
 
 use deltaforge_core::Event;
 
 pub fn render_index(template: &str, ev: &Event) -> String {
-    let schema = ev
-        .source
-        .schema
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&ev.source.db);
+    let schema = ev.source.namespace();
     template
         .replace("{db}", &ev.source.db)
         .replace("{schema}", schema)

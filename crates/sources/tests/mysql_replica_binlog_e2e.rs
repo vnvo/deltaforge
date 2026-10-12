@@ -298,6 +298,7 @@ impl State {
             table_options: Default::default(),
             rotation: None,
             snapshot_cohort: Default::default(),
+            type_mapping: deltaforge_core::TypeMapping::V2,
         }
     }
 
@@ -368,7 +369,9 @@ async fn row(rx: &mut mpsc::Receiver<SourceItem>, id: i64) -> Event {
             .unwrap_or_else(|| panic!("no row {id}"));
         match timeout(left, rx.recv()).await {
             Ok(Some(SourceItem::Event(e)))
-                if e.after.as_ref().is_some_and(|a| a["id"] == id) =>
+                if e.after
+                    .as_ref()
+                    .is_some_and(|a| test_common::row_view(a)["id"] == id) =>
             {
                 return e;
             }
@@ -440,7 +443,10 @@ async fn replica_binlog(gtid: bool) {
     let (h, mut rx) = st.run(st.source("on", on, SnapshotMode::Never)).await;
     sleep(Duration::from_secs(3)).await;
     sql(primary, &[format!("INSERT INTO {DB}.t VALUES (2, 2, 2)")]).await;
-    assert_eq!(row(&mut rx, 2).await.after.unwrap()["w"], 2);
+    assert_eq!(
+        test_common::row_view(&row(&mut rx, 2).await.after.unwrap())["w"],
+        2
+    );
     h.stop();
     timeout(Duration::from_secs(30), h.join).await.ok();
 }
@@ -513,7 +519,10 @@ async fn a_channel_added_while_streaming(gtid: bool) {
     create_table(primary).await;
     sql(primary, &[format!("INSERT INTO {DB}.t VALUES (1, 1)")]).await;
     replicate(server, &ip, gtid).await;
-    assert_eq!(row(&mut rx, 1).await.after.unwrap()["v"], 1);
+    assert_eq!(
+        test_common::row_view(&row(&mut rx, 1).await.after.unwrap())["v"],
+        1
+    );
     h.stop();
     timeout(Duration::from_secs(30), h.join).await.ok();
 }
@@ -679,9 +688,11 @@ async fn a_restart_into_off(gtid: bool) {
     proxy.switch_to(port);
     let after = refused(h, &mut rx).await;
     assert!(
-        !after
-            .iter()
-            .any(|e| e.after.as_ref().is_some_and(|a| a["id"] == 2)),
+        !after.iter().any(|e| {
+            e.after
+                .as_ref()
+                .is_some_and(|a| test_common::row_view(a)["id"] == 2)
+        }),
         "a row after the restart was emitted"
     );
 }
@@ -762,10 +773,11 @@ async fn failover_at(
     let mut delivered: Vec<Event> = Vec::new();
     let mut open: Option<Vec<Event>> = None;
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !delivered
-        .iter()
-        .any(|e| e.after.as_ref().is_some_and(|a| a["id"] == 4))
-    {
+    while !delivered.iter().any(|e| {
+        e.after
+            .as_ref()
+            .is_some_and(|a| test_common::row_view(a)["id"] == 4)
+    }) {
         assert!(
             Instant::now() < deadline,
             "row 4 never delivered: {delivered:?}"
@@ -790,7 +802,7 @@ async fn failover_at(
     }
     let mut last = std::collections::BTreeMap::new();
     for e in &delivered {
-        let a = e.after.as_ref().unwrap();
+        let a = test_common::row_view(e.after.as_ref().unwrap());
         let (id, v) = (a["id"].as_i64().unwrap(), a["v"].as_i64().unwrap());
         if let Some(prev) = last.insert(id, v) {
             assert!(prev <= v, "row {id} went back from {prev} to {v}");

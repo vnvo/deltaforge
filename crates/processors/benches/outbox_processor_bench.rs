@@ -11,8 +11,9 @@ use criterion::{
 use deltaforge_config::{
     OUTBOX_SCHEMA_SENTINEL, OutboxColumns, OutboxProcessorCfg,
 };
+use deltaforge_core::canonical::fixture;
 use deltaforge_core::{
-    BatchContext, Event, Op, Processor, SourceInfo, SourcePosition,
+    BatchContext, Event, Op, Processor, SourceInfo, SourcePosition, TypeMapping,
 };
 use once_cell::sync::Lazy;
 use serde_json::json;
@@ -62,13 +63,14 @@ fn make_outbox_event(i: usize) -> Event {
         outbox_source_info("outbox"),
         Op::Create,
         None,
-        Some(json!({
+        Some(fixture::row(json!({
             "id": format!("evt-{i}"),
             "aggregate_type": "Order",
             "aggregate_id": format!("{i}"),
             "event_type": "OrderCreated",
             "payload": {"order_id": i, "total": 99.99, "currency": "USD"}
-        })),
+        }))),
+        TypeMapping::V2,
         1_700_000_000_000,
         256,
     )
@@ -84,13 +86,14 @@ fn make_large_outbox_event(payload_keys: usize) -> Event {
         outbox_source_info("outbox"),
         Op::Create,
         None,
-        Some(json!({
+        Some(fixture::row(json!({
             "id": "evt-large",
             "aggregate_type": "Order",
             "aggregate_id": "1",
             "event_type": "OrderCreated",
             "payload": payload
-        })),
+        }))),
+        TypeMapping::V2,
         1_700_000_000_000,
         payload_keys * 30,
     )
@@ -102,7 +105,10 @@ fn make_cdc_event(i: usize) -> Event {
         cdc_source_info(),
         Op::Create,
         None,
-        Some(json!({"id": i, "status": "active", "total": 42.0})),
+        Some(fixture::row(
+            json!({"id": i, "status": "active", "total": 42.0}),
+        )),
+        TypeMapping::V2,
         1_700_000_000_000,
         64,
     )
@@ -146,7 +152,7 @@ fn make_outbox_event_with_extra_headers(i: usize) -> Event {
         outbox_source_info("outbox"),
         Op::Create,
         None,
-        Some(json!({
+        Some(fixture::row(json!({
             "id": format!("evt-{i}"),
             "aggregate_type": "Order",
             "aggregate_id": format!("{i}"),
@@ -155,7 +161,8 @@ fn make_outbox_event_with_extra_headers(i: usize) -> Event {
             "tenant": "acme",
             "region": "us-east-1",
             "payload": {"order_id": i, "total": 99.99}
-        })),
+        }))),
+        TypeMapping::V2,
         1_700_000_000_000,
         256,
     )

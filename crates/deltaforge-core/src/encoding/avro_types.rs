@@ -21,7 +21,7 @@ use tracing::warn;
 /// Version of the column-to-Avro type mapping. Bump it whenever a column
 /// type maps to a different Avro type, so schemas built under the old
 /// mapping are never reused for the new one.
-pub const AVRO_MAPPING_VERSION: u32 = 2;
+pub const AVRO_MAPPING_VERSION: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct TypeConversionOpts {
@@ -165,23 +165,30 @@ fn mysql_type_to_avro(
         "varchar" | "char" | "text" | "tinytext" | "mediumtext"
         | "longtext" => json!("string"),
 
-        // Binary types
+        // Binary types (GEOMETRY values are their stored bytes)
         "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob"
-        | "longblob" => json!("bytes"),
+        | "longblob" | "geometry" | "point" | "linestring" | "polygon"
+        | "multipoint" | "multilinestring" | "multipolygon"
+        | "geometrycollection" | "geomcollection" => json!("bytes"),
 
         // Date/time types
         "date" => json!({"type": "int", "logicalType": "date"}),
         "datetime" => match opts.naive_timestamp_mode {
             NaiveTimestampMode::String => json!("string"),
+            // A civil date-time: local (zone-free) microseconds.
             NaiveTimestampMode::Timestamp => {
-                json!({"type": "long", "logicalType": "timestamp-millis"})
+                json!({"type": "long", "logicalType": "local-timestamp-micros"})
             }
         },
         // The value is epoch microseconds: declared as such.
         "timestamp" => {
             json!({"type": "long", "logicalType": "timestamp-micros"})
         }
-        "time" => json!({"type": "long", "logicalType": "time-millis"}),
+        // A signed duration (-838:59:59 to 838:59:59), not a time of day:
+        // microseconds without an Avro time logical type.
+        "time" => {
+            json!({"type": "long", "deltaforge.logical": "mysql-time-micros"})
+        }
         "year" => json!("int"),
 
         // Boolean
@@ -189,8 +196,12 @@ fn mysql_type_to_avro(
             json!("boolean")
         }
 
-        // BIT(n > 1)
-        "bit" => json!("bytes"),
+        // BIT(n > 1): exactly ceil(n/8) big-endian bytes.
+        "bit" => json!({
+            "type": "fixed",
+            "name": format!("{}_bits", col.name),
+            "size": (col.precision.unwrap_or(1).clamp(1, 64) as usize).div_ceil(8),
+        }),
 
         // JSON
         "json" => json!("string"),
@@ -259,10 +270,48 @@ pub fn postgres_column_to_avro(
 ) -> Value {
     if col.is_array {
         let element_type = col.element_type.as_deref().unwrap_or("text");
+        // An array of an element type without a canonical mapping is its
+        // text (an opaque value), never a guessed array.
+        if !matches!(
+            normalize_pg_type(element_type).as_str(),
+            "bool"
+                | "boolean"
+                | "int2"
+                | "smallint"
+                | "int4"
+                | "integer"
+                | "int"
+                | "int8"
+                | "bigint"
+                | "oid"
+                | "float4"
+                | "real"
+                | "float8"
+                | "double precision"
+                | "numeric"
+                | "decimal"
+                | "text"
+                | "varchar"
+                | "bpchar"
+                | "char"
+                | "name"
+                | "bytea"
+                | "uuid"
+                | "json"
+                | "jsonb"
+                | "date"
+                | "time"
+                | "timestamp"
+                | "timestamptz"
+        ) {
+            return wrap_field(col, json!("string"));
+        }
+        // Any PostgreSQL array element can be NULL, whatever the column's
+        // constraints.
         let item_avro = postgres_scalar_to_avro(element_type, col, opts);
         let array_type = json!({
             "type": "array",
-            "items": item_avro
+            "items": ["null", item_avro]
         });
         return wrap_field(col, array_type);
     }
@@ -321,8 +370,9 @@ fn postgres_scalar_to_avro(
         "timestamp" | "timestamp without time zone" => {
             match opts.naive_timestamp_mode {
                 NaiveTimestampMode::String => json!("string"),
+                // A civil date-time: local (zone-free) microseconds.
                 NaiveTimestampMode::Timestamp => {
-                    json!({"type": "long", "logicalType": "timestamp-micros"})
+                    json!({"type": "long", "logicalType": "local-timestamp-micros"})
                 }
             }
         }
@@ -352,8 +402,8 @@ fn postgres_scalar_to_avro(
             json!("string")
         }
 
-        // hstore
-        "hstore" => json!({"type": "map", "values": "string"}),
+        // hstore: its text (an opaque value)
+        "hstore" => json!("string"),
 
         // Range types
         "int4range" | "int8range" | "numrange" | "tsrange" | "tstzrange"
@@ -619,7 +669,8 @@ mod tests {
             &col("created", "datetime", "datetime", false),
             &o,
         );
-        assert_eq!(f["type"]["logicalType"], "timestamp-millis");
+        // A civil date-time is local (zone-free), in microseconds.
+        assert_eq!(f["type"]["logicalType"], "local-timestamp-micros");
     }
 
     #[test]
@@ -772,7 +823,7 @@ mod tests {
         let t = &f["type"];
         assert_eq!(t[0], "null");
         assert_eq!(t[1]["type"], "array");
-        assert_eq!(t[1]["items"], "int");
+        assert_eq!(t[1]["items"], json!(["null", "int"]));
     }
 
     #[test]
@@ -782,7 +833,8 @@ mod tests {
             &col("meta", "hstore", "hstore", false),
             &o,
         );
-        assert_eq!(f["type"]["type"], "map");
+        // hstore values are opaque text: a string, never a guessed map.
+        assert_eq!(f["type"], "string");
     }
 
     #[test]

@@ -42,6 +42,7 @@ chrono.workspace = true
 base64.workspace = true
 
 [dev-dependencies]
+deltaforge-core = { path = "../deltaforge-core", features = ["test-fixtures"] }
 s3-test-server = { path = "../s3-test-server" }
 gate-ownership = { path = "../gate-ownership" }
 # The real watermark comparator, for the durable HEAD generation start tests.

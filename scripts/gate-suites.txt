@@ -27,6 +27,9 @@ serial     sources/mysql_rotation_e2e       -p sources --test mysql_rotation_e2e
 serial     sources/postgres_rotation_e2e    -p sources --test postgres_rotation_e2e
 serial     runner/throughput_e2e            -p runner --test throughput_e2e
 serial     runner/mysql_throughput_e2e      -p runner --test mysql_throughput_e2e
+# Fixed Kafka host port; MySQL and PostgreSQL value parity across snapshot,
+# CDC and the JSON / Avro / Parquet sinks.
+serial     runner/type_parity_e2e           -p runner --test type_parity_e2e
 serial     runner/reliability_soak_e2e      -p runner --test reliability_soak_e2e
 serial     scale-harness/ci_tier            -p scale-harness --test ci_tier
 serial     scale-harness/live_ttfce         -p scale-harness --test live_ttfce
@@ -113,4 +116,3 @@ release    runner/s3_ministack_durable_canary -p runner --test s3_ministack_dura
 parallel   sources/mysql_proof_amplification -p sources --test mysql_proof_amplification -- --include-ignored --test-threads=1 bounded
 excluded   sources/snapshot_scale_measure   1K/10K acceptance measurement (about 20 min, asserts the scale gates): run once on the final candidate, not per gate
 excluded   gate-ownership/gate_probe        the gate self-test probe: run inside a real gate by scripts/gate-selftest.sh, fails or hangs on purpose
-excluded   runner/mysql_type_probe          measurement probe (MySQL, Kafka, Schema Registry, RustFS; about 5 min): records every MySQL type through every path for docs/design/mysql-canonical-types.md, asserts nothing

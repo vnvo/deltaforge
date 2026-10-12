@@ -904,3 +904,16 @@ impl TraceRecords {
             .collect()
     }
 }
+
+// ============================================================================
+// Row images - shared
+// ============================================================================
+
+/// A row image as its path view: column name to JSON value, integers as
+/// exact JSON numbers.
+pub fn row_view(row: &deltaforge_core::CanonicalRow) -> serde_json::Value {
+    serde_json::Value::Object(deltaforge_core::canonical::view::row_view(
+        row,
+        deltaforge_core::TypeMapping::V2,
+    ))
+}

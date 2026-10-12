@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::coordinator::{
     Coordinator, PauseState, SchemaSensorState, build_barrier_fn,
-    build_batch_processor, build_commit_fn,
+    build_commit_fn,
 };
 use crate::replay_controller::{
     CoordinatorReplayDelivery, PauseIngestionControl, ReplayController,
@@ -1070,6 +1070,11 @@ impl PipelineManager {
             arrow_schema_resolver.clone(),
             clickhouse_resolver,
             es_resolver,
+            Some(Arc::new(
+                crate::destination_bindings::StorageDestinationBindings::new(
+                    self.backend.clone(),
+                ),
+            )),
             &sink_secrets,
         )
         .context("build sinks")?;
@@ -1209,8 +1214,20 @@ impl PipelineManager {
             .map(|s| (s.id().to_string(), Arc::clone(s)))
             .collect();
 
+        // Processors type values against the events' own schema versions.
+        let schema_context = schema_loader.as_ref().map(|loader| {
+            Arc::new(crate::schema_context::LoaderSchemaContext::new(
+                loader.clone(),
+                crate::schema_context::DEFAULT_CAPACITY,
+            ))
+                as Arc<dyn deltaforge_core::canonical::schema::SchemaContext>
+        });
         let batch_processor =
-            build_batch_processor(processors, pipeline_name.clone());
+            crate::coordinator::build_batch_processor_with_schemas(
+                processors,
+                pipeline_name.clone(),
+                schema_context.clone(),
+            );
 
         // Build per-sink checkpoint commit functions.
         // Each sink gets its own checkpoint key: "{source_id}::sink::{sink_id}".
@@ -1426,9 +1443,11 @@ impl PipelineManager {
 
             let delivery: Arc<dyn ReplayDelivery> =
                 Arc::new(CoordinatorReplayDelivery::new(
-                    build_batch_processor(
+                    // Replay types values against the same schema context.
+                    crate::coordinator::build_batch_processor_with_schemas(
                         replay_processors,
                         pipeline_name.clone(),
+                        schema_context.clone(),
                     ),
                     sinks_by_id,
                     sensor_for_runtime.clone(),
@@ -3061,6 +3080,7 @@ mod tests {
                     snapshot: SnapshotCfg::default(),
                     on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
                     rotation: None,
+                    type_mapping: Default::default(),
                 }),
                 processors: vec![],
                 sinks: vec![SinkCfg::Redis(RedisSinkCfg {
@@ -3077,6 +3097,7 @@ mod tests {
                     envelope: deltaforge_config::EnvelopeCfg::Debezium,
                     encoding: deltaforge_config::EncodingCfg::Json,
                     filter: None,
+                    json_wide_integers: Default::default(),
                 })],
                 connection_policy: None,
                 batch: Some(BatchConfig::default()),
@@ -4175,6 +4196,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &sinks::ResolvedSinkSecrets::default(),
         );
         assert!(err.is_err(), "durable_v2 must not build via the public API");
@@ -4185,6 +4207,7 @@ mod tests {
             &spec,
             CancellationToken::new(),
             "p",
+            None,
             None,
             None,
             None,
@@ -4228,6 +4251,7 @@ mod tests {
                 envelope: deltaforge_config::EnvelopeCfg::Debezium,
                 encoding: deltaforge_config::EncodingCfg::Json,
                 filter: None,
+                json_wide_integers: Default::default(),
             }),
         ]);
         // Only one of the two configured sinks constructed -> fail closed.
@@ -5000,6 +5024,7 @@ mod tests {
             envelope: deltaforge_config::EnvelopeCfg::Debezium,
             encoding: deltaforge_config::EncodingCfg::Json,
             filter: None,
+            json_wide_integers: Default::default(),
         });
         assert_eq!(kafka.sink_id(), "my-redis");
     }

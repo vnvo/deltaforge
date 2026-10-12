@@ -228,6 +228,7 @@ async fn postgres_generation_operations_are_structurally_linear() -> Result<()>
             table_options: Default::default(),
             rotation: None,
             snapshot_cohort: Default::default(),
+            type_mapping: deltaforge_core::TypeMapping::V2,
         };
         runs.push(complete(&src, &id, n, &counting, &inner).await?);
         client
@@ -280,6 +281,7 @@ async fn mysql_generation_operations_are_structurally_linear() -> Result<()> {
             table_options: Default::default(),
             rotation: None,
             snapshot_cohort: Default::default(),
+            type_mapping: deltaforge_core::TypeMapping::V2,
         };
         runs.push(complete(&src, &id, n, &counting, &inner).await?);
         test_common::mysql_drop_db(&pool, &db).await;

@@ -414,6 +414,7 @@ mod tests {
                         snapshot: SnapshotCfg::default(),
                         on_schema_drift: Default::default(),
                         rotation: None,
+                        type_mapping: Default::default(),
                     }),
                     processors: vec![],
                     sinks: vec![],

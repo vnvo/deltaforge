@@ -41,8 +41,9 @@ struct MockSchemaRegistry {
     /// subject → Vec<(schema_id, schema_json)>
     schemas: SchemaStore,
     next_id: Arc<std::sync::atomic::AtomicU32>,
-    /// A registration whose schema contains the marker is answered only
-    /// after the delay (orders concurrent registrations).
+    /// A registration whose schema contains the marker (or, for a marker
+    /// `!text`, lacks `text`) is answered only after the delay (orders
+    /// concurrent registrations).
     delays: Arc<std::sync::Mutex<Vec<(String, Duration)>>>,
     /// When set, every registration is answered with this HTTP status.
     fail_status: Arc<std::sync::Mutex<Option<u16>>>,
@@ -120,7 +121,10 @@ async fn register_ok(
         .lock()
         .unwrap()
         .iter()
-        .find(|(marker, _)| schema_str.contains(marker.as_str()))
+        .find(|(marker, _)| match marker.strip_prefix('!') {
+            Some(absent) => !schema_str.contains(absent),
+            None => schema_str.contains(marker.as_str()),
+        })
         .map(|(_, d)| *d);
     if let Some(d) = delay {
         tokio::time::sleep(d).await;
@@ -2099,9 +2103,13 @@ async fn real_sr_ddl_per_table_subjects() -> Result<()> {
 // =============================================================================
 
 use apache_avro::types::Value as AvroValue;
+use deltaforge_core::canonical::{
+    CanonicalRow, CanonicalValue, DbValue, Document, IntWidth, fixture,
+};
 use deltaforge_core::encoding::avro::{
     EnvelopeSchemaLookup, SchemaIdentity, SourceSchemaProvider,
 };
+use deltaforge_core::{Event, TypeMapping};
 
 fn schema_id(bytes: &[u8]) -> u32 {
     u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]])
@@ -2306,7 +2314,8 @@ impl SourceSchemaProvider for VersionedOrders {
     fn get_envelope_schema(
         &self,
         _connector: &str,
-        _db: &str,
+        _database: &str,
+        _namespace: &str,
         _table: &str,
         identity: &SchemaIdentity,
     ) -> EnvelopeSchemaLookup {
@@ -2349,32 +2358,69 @@ fn ddl_encoder(url: &str) -> AvroEncoder {
 }
 
 fn v1_row(id: i64) -> serde_json::Value {
-    envelope("c", json!(null), json!({"id": id, "name": "n"}))
+    json!({"id": id, "name": "n"})
 }
 
 fn v2_row(id: i64) -> serde_json::Value {
-    envelope(
-        "c",
-        json!(null),
-        json!({"id": id, "name": "n", "extra": 42}),
-    )
+    json!({"id": id, "name": "n", "extra": 42})
 }
 
+/// The row subject of topic `orders` for the default (v2) mapping.
+const ROW_SUBJECT: &str = "orders-value-v2";
+
+/// A `shop.orders` insert of `after` under the schema version `identity`
+/// and mapping version `mapping`.
+fn row_event(
+    after: CanonicalRow,
+    identity: Option<SchemaIdentity>,
+    mapping: TypeMapping,
+) -> Event {
+    let mut e = Event::new_row(
+        deltaforge_core::EventId::mysql_row_server(1, "orders", 1, 0),
+        deltaforge_core::SourceInfo {
+            version: "t".into(),
+            connector: "mysql".into(),
+            name: "t".into(),
+            ts_ms: 1_700_000_000_000,
+            db: "shop".into(),
+            schema: None,
+            table: "orders".into(),
+            snapshot: None,
+            position: deltaforge_core::SourcePosition::default(),
+        },
+        deltaforge_core::Op::Create,
+        None,
+        Some(after),
+        mapping,
+        1_700_000_000_000,
+        0,
+    );
+    e.schema_version = identity.as_ref().map(|i| i.fingerprint.clone());
+    e.schema_sequence = identity.and_then(|i| i.sequence);
+    e
+}
+
+/// Encode an event as a sink does: its native envelope, then Avro.
+async fn encode_row_event(
+    encoder: &AvroEncoder,
+    event: &Event,
+) -> Result<bytes::Bytes, deltaforge_core::encoding::EncodingError> {
+    use deltaforge_core::envelope::{Envelope, Native};
+    let envelope = Native
+        .wrap(event, deltaforge_core::NativeOpts::default())
+        .unwrap();
+    encoder.encode_event("orders", event, &envelope).await
+}
+
+/// Encode a v2 `shop.orders` insert of the fixture row `after`.
 async fn encode_ddl(
     encoder: &AvroEncoder,
-    event: &serde_json::Value,
+    after: &serde_json::Value,
     identity: Option<SchemaIdentity>,
 ) -> Result<bytes::Bytes, deltaforge_core::encoding::EncodingError> {
-    encoder
-        .encode_event(
-            "orders",
-            event,
-            "mysql",
-            "shop",
-            "orders",
-            identity.as_ref(),
-        )
-        .await
+    let event =
+        row_event(fixture::row(after.clone()), identity, TypeMapping::V2);
+    encode_row_event(encoder, &event).await
 }
 
 #[tokio::test]
@@ -2459,7 +2505,7 @@ async fn a_conflicting_schema_sequence_stops_the_sink() {
     let sink_err = err.into_sink_error_for("k");
     assert!(!sink_err.is_dlq_eligible(), "never dead-lettered");
     assert!(matches!(sink_err, deltaforge_core::SinkError::Fatal { .. }));
-    assert_eq!(registry.versions("orders-value").await, 1);
+    assert_eq!(registry.versions(ROW_SUBJECT).await, 1);
 }
 
 #[tokio::test]
@@ -2482,16 +2528,13 @@ async fn cache_eviction_and_reload_never_select_another_version() {
 #[tokio::test]
 async fn concurrent_registration_of_two_versions_keeps_their_ids_apart() {
     let (url, registry) = start_mock_registry().await;
-    // v1's registration is answered last, so v2 is assigned the first ID.
-    let v1_marker = {
-        let p = VersionedOrders::new();
-        p.versions["h1"].1.clone()
-    };
+    // v1's registration (the schema without `extra`) is answered last, so
+    // v2 is assigned the first ID.
     registry
         .delays
         .lock()
         .unwrap()
-        .push((v1_marker.clone(), Duration::from_millis(300)));
+        .push(("!\"extra\"".to_string(), Duration::from_millis(300)));
     let encoder = Arc::new(ddl_encoder(&url));
 
     let (e1, e2) = (encoder.clone(), encoder.clone());
@@ -2506,7 +2549,8 @@ async fn concurrent_registration_of_two_versions_keeps_their_ids_apart() {
 
     assert_eq!(schema_id(&b), 1, "v2 registered first");
     assert_eq!(schema_id(&a), 2, "v1 registered second");
-    assert_eq!(registry.schema_by_id(schema_id(&a)).await, v1_marker);
+    let after_a = field(&decode(&registry, &a).await, "after").clone();
+    assert_eq!(field_names(&after_a), ["id", "name"], "v1's own schema");
     // Later events of each version keep their own ID.
     let a2 = encode_ddl(&encoder, &v1_row(3), v1()).await.unwrap();
     let b2 = encode_ddl(&encoder, &v2_row(4), v2()).await.unwrap();
@@ -2552,7 +2596,7 @@ async fn registry_failures_are_never_event_failures() {
     *registry.fail_status.lock().unwrap() = Some(409);
     let err = encode_ddl(&encoder, &v1_row(1), v1()).await.unwrap_err();
     assert!(
-        matches!(&err, E::SchemaRejected { subject, .. } if subject == "orders-value"),
+        matches!(&err, E::SchemaRejected { subject, .. } if subject == ROW_SUBJECT),
         "{err:?}"
     );
     let sink_err = err.into_sink_error_for("k");
@@ -2707,6 +2751,7 @@ fn ddl_event(db: &str, payload: serde_json::Value) -> deltaforge_core::Event {
         deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
         source,
         payload,
+        TypeMapping::V2,
         1_700_000_000_000,
         0,
     )
@@ -2809,7 +2854,9 @@ async fn ddl_events_are_lossless_records_under_their_own_subject() {
         1,
         "one explicit schema"
     );
-    assert_eq!(registry.versions("orders-value").await, 0, "no row subject");
+    for subject in ["orders-value", "orders-value-v1", ROW_SUBJECT] {
+        assert_eq!(registry.versions(subject).await, 0, "no row subject");
+    }
 }
 
 #[tokio::test]
@@ -2840,7 +2887,7 @@ async fn ddl_between_row_versions_selects_every_records_own_schema() {
     }
     let after_b = field(&decode(&registry, &b).await, "after").clone();
     assert_eq!(field(&after_b, "extra"), &AvroValue::Int(42));
-    assert_eq!(registry.versions("orders-value").await, 2);
+    assert_eq!(registry.versions(ROW_SUBJECT).await, 2);
     assert_eq!(registry.versions(DDL_SUBJECT).await, 1);
 }
 
@@ -2878,10 +2925,10 @@ async fn a_row_schema_rejection_is_never_a_ddl_schema_rejection() {
     let encoder = ddl_encoder(&url);
     let alter = ddl_event("shop", ddl_payloads()[0].1.clone());
 
-    *registry.reject_subject.lock().unwrap() = Some("orders-value".into());
+    *registry.reject_subject.lock().unwrap() = Some(ROW_SUBJECT.into());
     let row = encode_ddl(&encoder, &v1_row(1), v1()).await.unwrap_err();
     let row_evidence = subject_of(row);
-    assert!(row_evidence.contains("orders-value"), "{row_evidence}");
+    assert!(row_evidence.contains(ROW_SUBJECT), "{row_evidence}");
     encoder
         .encode_ddl("orders", &alter)
         .await
@@ -2933,7 +2980,8 @@ impl SourceSchemaProvider for SwitchableMapping {
     fn get_envelope_schema(
         &self,
         _connector: &str,
-        _db: &str,
+        _database: &str,
+        _namespace: &str,
         _table: &str,
         _identity: &SchemaIdentity,
     ) -> EnvelopeSchemaLookup {
@@ -2986,13 +3034,25 @@ async fn a_changed_type_mapping_never_reuses_the_cached_schema() {
         Some(provider.clone()),
     )
     .unwrap();
-    let row = envelope("c", json!(null), json!({"id": 1, "b": 5}));
+    // `b` is a BIGINT UNSIGNED value.
+    let row = row_event(
+        CanonicalRow::new(vec![
+            ("id".into(), fixture::value(&json!(1))),
+            (
+                "b".into(),
+                CanonicalValue::Db(DbValue::uint(5, IntWidth::W64).unwrap()),
+            ),
+        ])
+        .unwrap(),
+        v1(),
+        TypeMapping::V2,
+    );
 
-    let as_string = encode_ddl(&encoder, &row, v1()).await.unwrap();
+    let as_string = encode_row_event(&encoder, &row).await.unwrap();
     provider
         .long
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    let as_long = encode_ddl(&encoder, &row, v1()).await.unwrap();
+    let as_long = encode_row_event(&encoder, &row).await.unwrap();
 
     assert_ne!(schema_id(&as_string), schema_id(&as_long));
     let b = |v: &AvroValue| field(field(v, "after"), "b").clone();
@@ -3001,4 +3061,126 @@ async fn a_changed_type_mapping_never_reuses_the_cached_schema() {
         AvroValue::String("5".into())
     );
     assert_eq!(b(&decode(&registry, &as_long).await), AvroValue::Long(5));
+}
+
+// =============================================================================
+// Mapping versions and processor extensions
+// =============================================================================
+
+/// The schema JSON a record was encoded with.
+async fn schema_of(
+    registry: &MockSchemaRegistry,
+    bytes: &[u8],
+) -> serde_json::Value {
+    serde_json::from_str(&registry.schema_by_id(schema_id(bytes)).await)
+        .unwrap()
+}
+
+/// Events of one table under the v1 and v2 mappings never share a subject
+/// or a schema: each version registers under `<subject>-v1` / `-v2`, and
+/// the registered schema names its mapping version.
+#[tokio::test]
+async fn v1_and_v2_events_use_their_own_subjects() {
+    let (url, registry) = start_mock_registry().await;
+    let encoder = ddl_encoder(&url);
+    let row = || fixture::row(v1_row(1));
+    let v1_bytes =
+        encode_row_event(&encoder, &row_event(row(), v1(), TypeMapping::V1))
+            .await
+            .unwrap();
+    let v2_bytes =
+        encode_row_event(&encoder, &row_event(row(), v1(), TypeMapping::V2))
+            .await
+            .unwrap();
+
+    assert_eq!(registry.versions("orders-value-v1").await, 1);
+    assert_eq!(registry.versions("orders-value-v2").await, 1);
+    assert_eq!(
+        registry.versions("orders-value").await,
+        0,
+        "no unversioned subject"
+    );
+    assert_ne!(schema_id(&v1_bytes), schema_id(&v2_bytes));
+    assert_eq!(
+        schema_of(&registry, &v1_bytes).await["deltaforge.type_mapping"],
+        json!("v1")
+    );
+    assert_eq!(
+        schema_of(&registry, &v2_bytes).await["deltaforge.type_mapping"],
+        json!("v2")
+    );
+    // Both decode to the same row.
+    for bytes in [&v1_bytes, &v2_bytes] {
+        let after = field(&decode(&registry, bytes).await, "after").clone();
+        assert_eq!(field(&after, "id"), &AvroValue::Int(1));
+    }
+
+    // The inferred path (no schema version) is versioned the same way.
+    let inferred =
+        AvroEncoder::new(&url, SubjectStrategy::TopicName, None, None).unwrap();
+    for mapping in [TypeMapping::V1, TypeMapping::V2] {
+        encode_row_event(&inferred, &row_event(row(), None, mapping))
+            .await
+            .unwrap();
+    }
+    assert_eq!(registry.versions("orders-value-v1").await, 2);
+    assert_eq!(registry.versions("orders-value-v2").await, 2);
+}
+
+/// Processor-added extensions land in `after_extensions` as canonical JSON
+/// text by name, never in the row record; the schema (and its ID) is the
+/// same with or without extensions.
+#[tokio::test]
+async fn extensions_land_in_after_extensions_under_the_same_schema() {
+    let (url, registry) = start_mock_registry().await;
+    let encoder = ddl_encoder(&url);
+    let plain = row_event(fixture::row(v1_row(1)), v1(), TypeMapping::V2);
+    let mut extended =
+        row_event(fixture::row(v1_row(2)), v1(), TypeMapping::V2);
+    extended
+        .after
+        .as_mut()
+        .unwrap()
+        .set_extension("geo", Document::new(json!({"lon": 2.5, "lat": 1})))
+        .unwrap();
+
+    let a = encode_row_event(&encoder, &plain).await.unwrap();
+    let b = encode_row_event(&encoder, &extended).await.unwrap();
+    assert_eq!(schema_id(&a), schema_id(&b), "one schema for both");
+    assert_eq!(registry.versions(ROW_SUBJECT).await, 1);
+
+    let da = avro_json_ext(&decode(&registry, &a).await);
+    let db = avro_json_ext(&decode(&registry, &b).await);
+    assert_eq!(da["after_extensions"], json!(null));
+    assert_eq!(da["before_extensions"], json!(null));
+    assert_eq!(
+        db["after_extensions"],
+        json!({"geo": r#"{"lat":1,"lon":2.5}"#}),
+        "canonical JSON text by name"
+    );
+    assert_eq!(db["before_extensions"], json!(null));
+    assert_eq!(
+        db["after"],
+        json!({"id": 2, "name": "n"}),
+        "declared columns only"
+    );
+}
+
+/// [`avro_json`] with maps (the extension slots) as objects.
+fn avro_json_ext(v: &AvroValue) -> serde_json::Value {
+    match v {
+        AvroValue::Map(m) => serde_json::Value::Object(
+            m.iter()
+                .map(|(k, v)| (k.clone(), avro_json_ext(v)))
+                .collect(),
+        ),
+        AvroValue::Union(_, inner) => avro_json_ext(inner),
+        AvroValue::Record(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), avro_json_ext(v)))
+                .collect(),
+        ),
+        other => avro_json(other),
+    }
 }

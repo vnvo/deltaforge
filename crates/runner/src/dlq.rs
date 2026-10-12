@@ -100,8 +100,7 @@ impl DlqWriter {
                 serde_json::from_slice(cp.as_bytes())
                     .unwrap_or(serde_json::Value::Null)
             }),
-            event: serde_json::to_value(event)
-                .unwrap_or(serde_json::Value::Null),
+            event: event.to_durable(),
             payload_truncated: false,
             meta: DlqMeta {
                 sink_id: sink_id.to_string(),
@@ -457,6 +456,18 @@ mod tests {
     use std::sync::Arc;
     use storage::MemoryStorageBackend;
 
+    /// The `after.id` of a DLQ entry's durable event.
+    fn durable_after_id(durable: &serde_json::Value) -> i64 {
+        let ev = Event::from_durable(durable.clone()).expect("a durable event");
+        deltaforge_core::canonical::view::value_view(
+            ev.after.as_ref().unwrap().get("id").unwrap(),
+            deltaforge_core::TypeMapping::V2,
+        )
+        .unwrap()
+        .as_i64()
+        .unwrap()
+    }
+
     fn make_test_event(id: i64) -> Event {
         Event::new_row(
             deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
@@ -473,7 +484,8 @@ mod tests {
             },
             Op::Create,
             None,
-            Some(json!({"id": id})),
+            Some(deltaforge_core::canonical::fixture::row(json!({"id": id}))),
+            deltaforge_core::TypeMapping::V2,
             0,
             64,
         )
@@ -790,10 +802,8 @@ mod tests {
 
         let entries = dlq.peek(10).await.unwrap();
         // The remaining entries should be the 3 most recent.
-        let ids: Vec<_> = entries
-            .iter()
-            .map(|e| e.event["after"]["id"].as_i64().unwrap())
-            .collect();
+        let ids: Vec<_> =
+            entries.iter().map(|e| durable_after_id(&e.event)).collect();
         assert_eq!(ids, vec![2, 3, 4]);
     }
 
@@ -899,10 +909,8 @@ mod tests {
         assert_eq!(dlq.len().await.unwrap(), 2);
 
         let entries = dlq.peek(10).await.unwrap();
-        let ids: Vec<_> = entries
-            .iter()
-            .map(|e| e.event["after"]["id"].as_i64().unwrap())
-            .collect();
+        let ids: Vec<_> =
+            entries.iter().map(|e| durable_after_id(&e.event)).collect();
         assert_eq!(ids, vec![0, 1]);
     }
 

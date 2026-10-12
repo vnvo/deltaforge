@@ -245,6 +245,31 @@ impl SchemaProvider for SchemaLoaderAdapter {
 fn extract_column_infos(
     schema_json: &serde_json::Value,
 ) -> Vec<ColumnSchemaInfo> {
+    // PostgreSQL registers two shapes (the CDC event schema and the
+    // snapshot's catalog schema); both describe the same DDL identically.
+    // An unreadable PostgreSQL schema has no columns (the encoders refuse
+    // rows with undeclared columns, never guess).
+    if let Some(pg) =
+        sources::declared_types::postgres_encoder_columns(schema_json)
+    {
+        return pg
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| ColumnSchemaInfo {
+                is_json_like: is_json_type(&c.type_name)
+                    || might_be_json(&c.type_name),
+                data_type: c.type_name.clone(),
+                full_type: c.type_name,
+                name: c.name,
+                nullable: true,
+                numeric_precision: c.precision,
+                numeric_scale: c.scale,
+                unsigned: false,
+                is_array: c.is_array,
+                element_type: c.element_type,
+            })
+            .collect();
+    }
     let Some(cols) = schema_json.get("columns").and_then(|v| v.as_array())
     else {
         return vec![];
@@ -340,8 +365,9 @@ pub struct AvroSchemaProviderImpl {
     opts: TypeConversionOpts,
     /// The type mapping version and options (see `mapping_id`).
     mapping_id: String,
-    /// Cache: (db, table, fingerprint) → (sequence, schema_json, schema)
-    cache: RwLock<HashMap<(String, String, String), CachedAvroSchema>>,
+    /// Cache: (database, namespace, table, fingerprint) → (sequence,
+    /// schema_json, schema)
+    cache: RwLock<HashMap<(String, String, String, String), CachedAvroSchema>>,
 }
 
 impl AvroSchemaProviderImpl {
@@ -422,7 +448,8 @@ impl SourceSchemaProvider for AvroSchemaProviderImpl {
     fn get_envelope_schema(
         &self,
         connector: &str,
-        db: &str,
+        database: &str,
+        namespace: &str,
         table: &str,
         identity: &SchemaIdentity,
     ) -> EnvelopeSchemaLookup {
@@ -430,7 +457,8 @@ impl SourceSchemaProvider for AvroSchemaProviderImpl {
             return EnvelopeSchemaLookup::Absent;
         }
         let key = (
-            db.to_string(),
+            database.to_string(),
+            namespace.to_string(),
             table.to_string(),
             identity.fingerprint.clone(),
         );
@@ -449,7 +477,8 @@ impl SourceSchemaProvider for AvroSchemaProviderImpl {
 
         // The lookup is async but this path is sync (called from encode):
         // block in place. It runs once per (table, schema version).
-        let qualified = format!("{db}.{table}");
+        // Registries key a table by namespace within the source's database.
+        let qualified = format!("{namespace}.{table}");
         let table_schema = match tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(
                 self.schema_provider.get_table_schema_version(
@@ -473,8 +502,12 @@ impl SourceSchemaProvider for AvroSchemaProviderImpl {
             Err(e) => return EnvelopeSchemaLookup::Unavailable(e.to_string()),
         };
 
+        // Avro names carry the relation's escaped database, schema
+        // (PostgreSQL) and table: same-named tables never share a name.
+        let (avro_ns, avro_table) =
+            deltaforge_core::relation::avro_path(database, namespace, table);
         let Some((json, schema)) =
-            self.build_for_table(db, table, &table_schema)
+            self.build_for_table(&avro_ns, &avro_table, &table_schema)
         else {
             return EnvelopeSchemaLookup::Absent;
         };
@@ -545,7 +578,10 @@ pub fn build_arrow_schema_resolver(
     // dependency closure — we rely on arrow_schema being on the same major
     // version (58) as the sinks crate that consumes the returned closure.
     use ::arrow_schema::Schema as ArrowSchema;
-    let cache: Arc<RwLock<HashMap<String, Arc<ArrowSchema>>>> =
+    // Keyed by the relation's parts (database, namespace, table), never a
+    // joined string.
+    type RelationKey = (String, String, String);
+    let cache: Arc<RwLock<HashMap<RelationKey, Arc<ArrowSchema>>>> =
         Arc::new(RwLock::new(HashMap::new()));
     let fallback_logged: Arc<RwLock<HashMap<String, ()>>> =
         Arc::new(RwLock::new(HashMap::new()));
@@ -562,7 +598,12 @@ pub fn build_arrow_schema_resolver(
             format!("{}.{}", partition.namespace, partition.table)
         };
 
-        if let Some(cached) = cache.read().get(&lookup_key) {
+        let relation_key = (
+            partition.database.clone(),
+            partition.namespace.clone(),
+            partition.table.clone(),
+        );
+        if let Some(cached) = cache.read().get(&relation_key) {
             return Ok(cached.clone());
         }
 
@@ -584,6 +625,7 @@ pub fn build_arrow_schema_resolver(
                 let cols: Vec<ColumnDesc> =
                     ts.columns.iter().map(column_info_to_desc).collect();
                 build_envelope_arrow_schema_arc(arrow_connector, &cols, &opts)
+                    .map_err(|e| anyhow::anyhow!("{lookup_key}: {e}"))?
             }
             Ok(None) => {
                 // Log the fallback once per table.
@@ -591,16 +633,22 @@ pub fn build_arrow_schema_resolver(
                 if logged.insert(lookup_key.clone(), ()).is_none() {
                     warn!(
                         table = %lookup_key,
-                        "no schema registered for this table — S3 sink will write \
-                         envelope-only columns (meta only, no row data). Ensure the \
-                         source has loaded the table schema before events flow."
+                        "no schema registered for this table: its rows cannot \
+                         be encoded (they fail, never dropped) until the source \
+                         has loaded the table schema"
                     );
                 }
-                build_envelope_arrow_schema_arc(arrow_connector, &[], &opts)
+                // Not cached: the table's schema is used once it exists.
+                return build_envelope_arrow_schema_arc(
+                    arrow_connector,
+                    &[],
+                    &opts,
+                )
+                .map_err(|e| anyhow::anyhow!("{lookup_key}: {e}"));
             }
         };
 
-        cache.write().insert(lookup_key.clone(), schema.clone());
+        cache.write().insert(relation_key, schema.clone());
         Ok(schema)
     })
 }
@@ -779,11 +827,13 @@ mod tests {
         );
 
         let key = PartitionKey {
+            database: String::new(),
             namespace: String::new(),
             table: "orders".into(),
             year: 2026,
             month: 5,
             day: 19,
+            type_mapping: deltaforge_core::TypeMapping::V2,
         };
         let schema = resolver(&key).unwrap();
         let names: Vec<&str> =
@@ -838,11 +888,13 @@ mod tests {
 
         // Bare "orders" alone would miss the "shop.orders" registry key.
         let key = PartitionKey {
+            database: "shop".into(),
             namespace: "shop".into(),
             table: "orders".into(),
             year: 2026,
             month: 5,
             day: 19,
+            type_mapping: deltaforge_core::TypeMapping::V2,
         };
         let schema = resolver(&key).unwrap();
         let names: Vec<&str> =
@@ -923,11 +975,13 @@ mod tests {
             ),
         );
         let key = PartitionKey {
+            database: "shop".into(),
             namespace: "shop".into(),
             table: "orders".into(),
             year: 2026,
             month: 5,
             day: 19,
+            type_mapping: deltaforge_core::TypeMapping::V2,
         };
         // Unavailable: the writer fails (retried) instead of writing an
         // envelope-only file...
@@ -961,11 +1015,11 @@ mod tests {
         );
         let v1 = SchemaIdentity::of(Some("h1"), Some(1)).unwrap();
         assert!(matches!(
-            avro.get_envelope_schema("mysql", "shop", "orders", &v1),
+            avro.get_envelope_schema("mysql", "shop", "shop", "orders", &v1),
             EnvelopeSchemaLookup::Unavailable(_)
         ));
         assert!(matches!(
-            avro.get_envelope_schema("mysql", "shop", "orders", &v1),
+            avro.get_envelope_schema("mysql", "shop", "shop", "orders", &v1),
             EnvelopeSchemaLookup::Found(..)
         ));
     }
@@ -1066,9 +1120,9 @@ mod tests {
             (&v1, vec!["id"]),
         ] {
             assert_eq!(
-                columns_of(
-                    avro.get_envelope_schema("mysql", "shop", "orders", id)
-                ),
+                columns_of(avro.get_envelope_schema(
+                    "mysql", "shop", "shop", "orders", id
+                )),
                 cols
             );
         }
@@ -1081,7 +1135,9 @@ mod tests {
         avro.invalidate_all();
         assert_eq!(
             columns_of(
-                avro.get_envelope_schema("mysql", "shop", "orders", &v1)
+                avro.get_envelope_schema(
+                    "mysql", "shop", "shop", "orders", &v1
+                )
             ),
             vec!["id"]
         );
@@ -1097,23 +1153,25 @@ mod tests {
         // The registry's own sequence check.
         let stale = SchemaIdentity::of(Some("h1"), Some(7)).unwrap();
         assert!(matches!(
-            avro.get_envelope_schema("mysql", "shop", "orders", &stale),
+            avro.get_envelope_schema("mysql", "shop", "shop", "orders", &stale),
             EnvelopeSchemaLookup::Conflict(_)
         ));
         // A cached fingerprint requested under another sequence.
         let v1 = SchemaIdentity::of(Some("h1"), Some(1)).unwrap();
         assert!(matches!(
-            avro.get_envelope_schema("mysql", "shop", "orders", &v1),
+            avro.get_envelope_schema("mysql", "shop", "shop", "orders", &v1),
             EnvelopeSchemaLookup::Found(..)
         ));
         assert!(matches!(
-            avro.get_envelope_schema("mysql", "shop", "orders", &stale),
+            avro.get_envelope_schema("mysql", "shop", "shop", "orders", &stale),
             EnvelopeSchemaLookup::Conflict(m) if m.contains("sequence 1")
         ));
         // A fingerprint the registry does not know.
         let unknown = SchemaIdentity::of(Some("h9"), Some(9)).unwrap();
         assert!(matches!(
-            avro.get_envelope_schema("mysql", "shop", "orders", &unknown),
+            avro.get_envelope_schema(
+                "mysql", "shop", "shop", "orders", &unknown
+            ),
             EnvelopeSchemaLookup::Conflict(_)
         ));
     }
@@ -1167,11 +1225,13 @@ mod tests {
         );
 
         let key = PartitionKey {
+            database: String::new(),
             namespace: String::new(),
             table: "orders".into(),
             year: 2026,
             month: 5,
             day: 19,
+            type_mapping: deltaforge_core::TypeMapping::V2,
         };
         let s1 = resolver(&key).unwrap();
         let s2 = resolver(&key).unwrap(); // would unwrap None from OneShotProvider without cache
@@ -1191,18 +1251,26 @@ mod tests {
         );
 
         let key = PartitionKey {
+            database: String::new(),
             namespace: String::new(),
             table: "missing".into(),
             year: 2026,
             month: 5,
             day: 19,
+            type_mapping: deltaforge_core::TypeMapping::V2,
         };
         let schema = resolver(&key).unwrap();
         let names: Vec<&str> =
             schema.fields().iter().map(|f| f.name().as_str()).collect();
-        // Envelope meta only; no before_*/after_* user columns.
+        // Envelope meta and the stable extension slots only; no
+        // before_*/after_* user columns.
         assert!(names.contains(&"op"));
-        assert!(!names.iter().any(|n| n.starts_with("before_")));
-        assert!(!names.iter().any(|n| n.starts_with("after_")));
+        let user = |n: &&str| {
+            (n.starts_with("before_") || n.starts_with("after_"))
+                && !n.ends_with("_extensions")
+        };
+        assert!(!names.iter().any(user));
+        assert!(names.contains(&"before_extensions"));
+        assert!(names.contains(&"after_extensions"));
     }
 }

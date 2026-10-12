@@ -233,10 +233,15 @@ mod tests {
             snapshot: Some("true".into()),
             position: Default::default(),
         };
-        Event::new_snapshot(
+        Event::new_row(
             deltaforge_core::EventId::mysql_row_server(1, "orders", 1, 1),
             source,
-            serde_json::json!({ "id": 1 }),
+            deltaforge_core::Op::Read,
+            None,
+            Some(deltaforge_core::canonical::fixture::row(
+                serde_json::json!({ "id": 1 }),
+            )),
+            deltaforge_core::TypeMapping::V2,
             0,
             0,
         )

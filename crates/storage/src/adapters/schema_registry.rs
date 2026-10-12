@@ -623,6 +623,28 @@ impl DurableSchemaRegistry {
 
     // ---- register ---------------------------------------------------------
 
+    /// [`Self::register_with_checkpoint`], returning the registered version
+    /// itself: its number and its own sequence (an idempotent registration
+    /// returns the existing version, whose sequence predates the registry's
+    /// current one). Events are stamped with this sequence.
+    pub async fn register_version(
+        &self,
+        key: &SchemaKey,
+        hash: &str,
+        schema_json: &Value,
+        checkpoint: Option<&[u8]>,
+    ) -> Result<SchemaVersion> {
+        let version = self
+            .register_with_checkpoint(key, hash, schema_json, checkpoint)
+            .await?;
+        self.get_version(key, version).await?.ok_or_else(|| {
+            anyhow::Error::new(CorruptRecord(format!(
+                "schema registry: registered version {version} of {} is missing",
+                key.backend_key()
+            )))
+        })
+    }
+
     /// Register a schema version under a fully-qualified key. Idempotent by
     /// hash via the hash index (no history scan). A new version is numbered
     /// after `max(main head, legacy floor)`.
@@ -1528,6 +1550,32 @@ mod tests {
         assert_eq!((v2.version, v2.hash.as_str()), (2, "h2"));
         assert!(v1.sequence < v2.sequence);
         assert!(r.get_version(&k, 3).await.unwrap().is_none());
+    }
+
+    /// Registering a hash again (A, B, A) returns its existing version with
+    /// that version's own sequence, which is what events are stamped with:
+    /// never the registry's current sequence, which a later registration of
+    /// any table has moved.
+    #[tokio::test]
+    async fn a_repeated_registration_returns_the_versions_own_sequence() {
+        let (_f, b) = backend();
+        let r = reg(&b).await;
+        let k = skey("s", "lin", "t");
+        let other = skey("s", "lin", "u");
+        let a = r
+            .register_version(&k, "hA", &json!({ "h": "hA" }), None)
+            .await
+            .unwrap();
+        register(&r, &k, "hB").await;
+        register(&r, &other, "hC").await;
+        let again = r
+            .register_version(&k, "hA", &json!({ "h": "hA" }), None)
+            .await
+            .unwrap();
+        assert_eq!((again.version, again.sequence), (a.version, a.sequence));
+        assert!(again.sequence < r.current_sequence());
+        let by_hash = r.get_by_hash(&k, "hA").await.unwrap().unwrap();
+        assert_eq!(by_hash.sequence, again.sequence);
     }
 
     // ---- no scan / latest-only / bounded memory ---------------------------

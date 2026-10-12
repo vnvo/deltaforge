@@ -23,9 +23,11 @@ use ctor::dtor;
 use deltaforge_config::{
     S3Compression, S3Durability, S3FileFormat, S3FileRoll, S3SinkCfg, SinkCfg,
 };
+use deltaforge_core::canonical::{DbValue, Decimal, IntWidth};
 use deltaforge_core::encoding::avro_types::TypeConversionOpts;
 use deltaforge_core::{
-    BatchResult, Event, Op, Sink, SourceInfo, SourcePosition, Transaction,
+    BatchResult, CanonicalRow, CanonicalValue, Event, Op, Sink, SourceInfo,
+    SourcePosition, Transaction, TypeMapping,
 };
 use object_store::path::Path;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
@@ -34,7 +36,6 @@ use runner::{
     ArcSchemaProvider, ColumnSchemaInfo, SchemaLookupError, SchemaProvider,
     TableSchemaInfo, build_arrow_schema_resolver,
 };
-use serde_json::json;
 use sinks::s3::{ObjectStoreParams, build_object_store, build_s3_sink};
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
@@ -164,12 +165,27 @@ fn make_order(
         .and_utc()
         .timestamp_millis();
 
-    let after = json!({
-        "id": id,
-        "customer_email": email,
-        "amount": amount,
-        "paid": paid,
-    });
+    // Typed as the declared schema: bigint, varchar, decimal(12,2), boolean.
+    let after = CanonicalRow::new(vec![
+        (
+            "id".to_string(),
+            CanonicalValue::Db(DbValue::int(id, IntWidth::W64).unwrap()),
+        ),
+        (
+            "customer_email".to_string(),
+            email.map_or(CanonicalValue::Null, |e| {
+                CanonicalValue::Db(DbValue::Text(e.to_string()))
+            }),
+        ),
+        (
+            "amount".to_string(),
+            CanonicalValue::Db(DbValue::Decimal(
+                Decimal::parse(amount).unwrap(),
+            )),
+        ),
+        ("paid".to_string(), CanonicalValue::Db(DbValue::Bool(paid))),
+    ])
+    .unwrap();
 
     Event {
         before: None,
@@ -205,6 +221,7 @@ fn make_order(
         tags: None,
         synthetic: None,
         routing: None,
+        type_mapping: TypeMapping::V2,
         tx_end: false,
         boundary: None,
         size_bytes: 0,
@@ -516,7 +533,7 @@ async fn e2e_multi_day_partitions_produce_separate_files() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn e2e_envelope_only_fallback_when_no_resolver() -> Result<()> {
+async fn e2e_rows_are_refused_without_a_resolver() -> Result<()> {
     let infra = server().await;
     let SinkCfg::S3(cfg) = cfg_for_endpoint(
         s3_cfg(S3FileFormat::Parquet, "e2e/envonly", 2),
@@ -525,7 +542,9 @@ async fn e2e_envelope_only_fallback_when_no_resolver() -> Result<()> {
         unreachable!()
     };
 
-    // No schema resolver — should fall back to envelope-only Parquet.
+    // No schema resolver: the envelope-only schema declares no row column,
+    // so every row is refused (a conversion failure per row), never written
+    // without its columns.
     let sink = build_s3_sink(
         &cfg,
         CancellationToken::new(),
@@ -533,23 +552,22 @@ async fn e2e_envelope_only_fallback_when_no_resolver() -> Result<()> {
         None,
         &sinks::ResolvedSinkCreds::default(),
     )?;
-    sink.send_batch(&[
-        make_order(Op::Create, 25, 1, Some("a@x"), "1.00", true),
-        make_order(Op::Create, 25, 2, Some("b@x"), "2.00", true),
-    ])
-    .await?;
+    let result = sink
+        .send_batch(&[
+            make_order(Op::Create, 25, 1, Some("a@x"), "1.00", true),
+            make_order(Op::Create, 25, 2, Some("b@x"), "2.00", true),
+        ])
+        .await?;
+    assert_eq!(result.dlq_failures.len(), 2);
+    for (_, e) in &result.dlq_failures {
+        assert_eq!(
+            e.draft().map(|d| d.reason_code),
+            Some(deltaforge_core::incident::ReasonCode::SinkConversionFailed)
+        );
+    }
 
     let store = store_for(&infra.endpoint);
     let listed = list_under(store.clone(), "e2e/envonly").await?;
-    assert_eq!(listed.len(), 1);
-
-    let batches = read_parquet(store, &listed[0]).await?;
-    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
-    // Envelope-only: no before_*/after_* columns, only meta.
-    let schema = batches[0].schema();
-    let names: Vec<&str> =
-        schema.fields().iter().map(|f| f.name().as_str()).collect();
-    assert!(names.contains(&"op"));
-    assert!(!names.iter().any(|n| n.starts_with("after_")));
+    assert!(listed.is_empty(), "nothing written: {listed:?}");
     Ok(())
 }

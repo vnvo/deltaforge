@@ -229,7 +229,8 @@ mod tests {
             },
             Op::Create,
             None,
-            Some(json!({"id": 1})),
+            Some(deltaforge_core::canonical::fixture::row(json!({"id": 1}))),
+            deltaforge_core::TypeMapping::V2,
             0,
             64,
         )

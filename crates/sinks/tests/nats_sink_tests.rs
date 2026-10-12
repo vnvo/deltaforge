@@ -11,6 +11,7 @@ use anyhow::Result;
 use async_nats::jetstream::{self, stream::Config as StreamConfig};
 use ctor::dtor;
 use deltaforge_config::{EncodingCfg, EnvelopeCfg, NatsSinkCfg};
+use deltaforge_core::canonical::fixture;
 use deltaforge_core::{Event, EventRouting, Sink};
 use gate_ownership::GateOwned;
 use serde_json::json;
@@ -226,6 +227,7 @@ fn make_sink(
 ) -> Result<NatsSink> {
     NatsSink::new(
         &NatsSinkCfg {
+            json_wide_integers: Default::default(),
             id: id.into(),
             url: url.into(),
             subject: subject.into(),
@@ -282,8 +284,12 @@ async fn nats_sink_sends_single_event() -> Result<()> {
     let messages = read_stream_messages(&url, &stream, 1).await?;
     assert!(!messages.is_empty(), "should receive message");
 
-    let parsed: Event = serde_json::from_slice(&messages[0])?;
-    assert_eq!(parsed.event_id, event.event_id);
+    let parsed: serde_json::Value = serde_json::from_slice(&messages[0])?;
+    // The native envelope is the event's native rendering.
+    assert_eq!(
+        parsed,
+        event.native_value(deltaforge_core::NativeOpts::default())?
+    );
 
     info!("✓ single event sent successfully");
     cleanup_test_stream(&url, &stream).await?;
@@ -663,6 +669,7 @@ async fn nats_sink_large_payload() -> Result<()> {
 
     let sink = NatsSink::new(
         &NatsSinkCfg {
+            json_wide_integers: Default::default(),
             id: "test-large".into(),
             url: url.clone(),
             subject: subject.clone(),
@@ -717,6 +724,7 @@ async fn nats_sink_batch_large_payload() -> Result<()> {
 
     let sink = NatsSink::new(
         &NatsSinkCfg {
+            json_wide_integers: Default::default(),
             id: "test-batch-large".into(),
             url: url.clone(),
             subject: subject.clone(),
@@ -769,6 +777,7 @@ async fn nats_sink_concurrent_sends() -> Result<()> {
 
     let sink = Arc::new(NatsSink::new(
         &NatsSinkCfg {
+            json_wide_integers: Default::default(),
             id: "test-concurrent".into(),
             url: url.clone(),
             subject: subject.clone(),
@@ -835,6 +844,7 @@ async fn nats_sink_concurrent_batches() -> Result<()> {
 
     let sink = Arc::new(NatsSink::new(
         &NatsSinkCfg {
+            json_wide_integers: Default::default(),
             id: "test-concurrent-batch".into(),
             url: url.clone(),
             subject: subject.clone(),
@@ -1023,6 +1033,7 @@ async fn nats_sink_handles_rapid_sends() -> Result<()> {
 
     let sink = Arc::new(NatsSink::new(
         &NatsSinkCfg {
+            json_wide_integers: Default::default(),
             id: "test-rapid".into(),
             url: url.clone(),
             subject: subject.clone(),
@@ -1086,6 +1097,7 @@ async fn nats_sink_batch_resilience() -> Result<()> {
 
     let sink = NatsSink::new(
         &NatsSinkCfg {
+            json_wide_integers: Default::default(),
             id: "test-batch-resilience".into(),
             url: url.clone(),
             subject: subject.clone(),
@@ -1146,6 +1158,7 @@ async fn nats_sink_respects_cancellation() -> Result<()> {
     let cancel = CancellationToken::new();
     let sink = Arc::new(NatsSink::new(
         &NatsSinkCfg {
+            json_wide_integers: Default::default(),
             id: "test-cancel".into(),
             url: "nats://invalid-host:9999".into(),
             subject: "df.test.cancel".into(),
@@ -1276,6 +1289,7 @@ async fn nats_sink_optional() -> Result<()> {
 
     let sink = NatsSink::new(
         &NatsSinkCfg {
+            json_wide_integers: Default::default(),
             id: "test-optional".into(),
             url: nats_url(),
             subject: "df.test.optional".into(),
@@ -1566,7 +1580,8 @@ async fn nats_sink_raw_payload_bypasses_envelope() -> Result<()> {
 
     // Event with raw_payload flag (simulates outbox processor output)
     let mut raw_event = make_test_event(1);
-    raw_event.after = Some(json!({"order_id": 42, "total": 99.99}));
+    raw_event.after =
+        Some(fixture::row(json!({"order_id": 42, "total": 99.99})));
     raw_event.routing = Some(EventRouting {
         raw_payload: true,
         headers: Some(HashMap::from([(

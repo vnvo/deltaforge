@@ -153,6 +153,45 @@ pub fn is_batch_object_key(key: &str) -> bool {
     })
 }
 
+/// Domain-separation tag of the relation key digest.
+const RELATION_KEY_DOMAIN: &[u8] = b"deltaforge:s3:relation-key";
+
+/// The tag of a digest relation segment. A readable segment never contains
+/// `-` (its escaping turns `-` into `_2d`), so the two forms never collide.
+pub const RELATION_DIGEST_PREFIX: &str = "rel-";
+
+/// The object-key segment of a relation: its readable
+/// [`key_segment`](deltaforge_core::SourceRelationIdentity::key_segment)
+/// when that fits [`MAX_KEY_SEGMENT_BYTES`], otherwise `rel-` and the
+/// lowercase hex SHA-256 of the length-prefixed domain tag and the
+/// relation's canonical identity (68 bytes). Never truncated; the manifest
+/// keeps the readable identity either way.
+pub fn relation_key_segment(
+    relation: &deltaforge_core::SourceRelationIdentity,
+) -> String {
+    let readable = relation.key_segment();
+    if readable.len() <= MAX_KEY_SEGMENT_BYTES {
+        return readable;
+    }
+    let mut h = Sha256::new();
+    for part in [RELATION_KEY_DOMAIN, relation.canonical().as_bytes()] {
+        h.update((part.len() as u64).to_be_bytes());
+        h.update(part);
+    }
+    let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    format!("{RELATION_DIGEST_PREFIX}{hex}")
+}
+
+/// The object-key segment of a manifest table: the relation segment of a
+/// canonical relation identity; a table recorded before relation
+/// identities (`namespace.table`) is its own segment, as it was keyed.
+pub fn table_key_segment(table: &str) -> String {
+    match deltaforge_core::SourceRelationIdentity::from_canonical(table) {
+        Ok(relation) => relation_key_segment(&relation),
+        Err(_) => table.to_string(),
+    }
+}
+
 /// Check a stored key against [`MAX_KEY_SEGMENT_BYTES`] and
 /// [`MAX_OBJECT_KEY_BYTES`]: the offending part when it exceeds them.
 pub fn check_key_bounds(key: &str) -> Result<(), String> {
@@ -199,6 +238,91 @@ pub fn check_prefix_capacity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deltaforge_core::SourceRelationIdentity;
+
+    fn relation(
+        source: &str,
+        db: &str,
+        ns: &str,
+        table: &str,
+    ) -> SourceRelationIdentity {
+        SourceRelationIdentity {
+            connector: "postgresql".into(),
+            source: source.into(),
+            database: db.into(),
+            namespace: ns.into(),
+            table: table.into(),
+        }
+    }
+
+    /// The longest identifiers sources allow (MySQL: 64 characters of up to
+    /// 3 bytes; PostgreSQL: 63 bytes), escaped, never exceed a segment:
+    /// they take the digest form. A complete key with the longest pipeline
+    /// a prefix admits stays within both key limits.
+    #[test]
+    fn the_longest_relations_keep_bounded_keys() {
+        let mysql_max = "€".repeat(64); // 192 bytes, 576 escaped
+        let pg_max = "é".repeat(31); // 62 bytes
+        let source = "s".repeat(255);
+        for rel in [
+            relation(&source, &mysql_max, &mysql_max, &mysql_max),
+            relation(&source, &pg_max, &pg_max, &pg_max),
+            relation(&source, "d", "n", &"t".repeat(64)),
+        ] {
+            let seg = relation_key_segment(&rel);
+            assert!(seg.len() <= MAX_KEY_SEGMENT_BYTES, "{seg}");
+            let pipeline = "p".repeat(MAX_KEY_SEGMENT_BYTES);
+            check_prefix_capacity("a/b", &pipeline).unwrap();
+            let key = object_store::path::Path::from_iter([
+                "a".to_string(),
+                "b".to_string(),
+                pipeline,
+                seg,
+                format!("{WATERMARK_SEGMENT_V2}{}", "0".repeat(64)),
+                format!("{}.parquet", "0".repeat(64)),
+            ]);
+            check_key_bounds(key.as_ref()).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_relation_segment_is_readable_until_the_limit_then_a_digest() {
+        // `d.n.` + table: the readable form is 4 + table bytes.
+        let fits =
+            relation("s", "d", "n", &"t".repeat(MAX_KEY_SEGMENT_BYTES - 4));
+        assert_eq!(relation_key_segment(&fits), fits.key_segment());
+        let over =
+            relation("s", "d", "n", &"t".repeat(MAX_KEY_SEGMENT_BYTES - 3));
+        let seg = relation_key_segment(&over);
+        assert!(
+            seg.starts_with(RELATION_DIGEST_PREFIX) && seg.len() == 68,
+            "{seg}"
+        );
+        // Deterministic, and a function of the whole identity.
+        assert_eq!(relation_key_segment(&over), seg);
+        let other_source =
+            relation("s2", "d", "n", &"t".repeat(MAX_KEY_SEGMENT_BYTES - 3));
+        assert_ne!(relation_key_segment(&other_source), seg);
+        // A table literally named like a digest stays readable and distinct.
+        let named = relation("s", "d", "n", &seg);
+        assert!(
+            !relation_key_segment(&named).starts_with(RELATION_DIGEST_PREFIX)
+        );
+        // The manifest's canonical identity maps to the same segment.
+        assert_eq!(table_key_segment(&over.canonical()), seg);
+        assert_eq!(table_key_segment("shop.orders"), "shop.orders");
+    }
+
+    /// Pinned (computed independently: SHA-256 over the u64-BE
+    /// length-prefixed domain tag and canonical identity).
+    #[test]
+    fn the_relation_digest_is_pinned() {
+        let rel = relation("p", "d", "n", &"t".repeat(300));
+        assert_eq!(
+            relation_key_segment(&rel),
+            "rel-c8c7b2c20188e915d4f89ea2ea582b4ff0f84aa1b1c13c5f52b29b0c61c2ec65"
+        );
+    }
 
     fn wm(
         kind: &'static str,

@@ -22,6 +22,7 @@ deltaforge-config = { path = "../deltaforge-config" }
 deltaforge-core = { path = "../deltaforge-core" }
 
 [dev-dependencies]
+deltaforge-core = { path = "../deltaforge-core", features = ["test-fixtures"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 metrics-util = "0.19"

@@ -4,13 +4,21 @@
 //! When the message prefix matches the source's outbox AllowList, the event
 //! is tagged with `__outbox` sentinel for the OutboxProcessor.
 //! Otherwise uses `__wal_message` for generic passthrough.
+//!
+//! A message's content is arbitrary bytes: the event's row is one column,
+//! `content`, holding them as canonical [`CanonicalValue::Bytes`]. Only an
+//! outbox message, whose contract is a JSON object, is its fields, each an
+//! untyped [`CanonicalValue::Document`]; an outbox message that is not a JSON
+//! object keeps its bytes (the outbox processor then finds none of its
+//! fields).
 
 use bytes::Bytes;
 use common::AllowList;
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use deltaforge_core::{Event, Op, SourceInfo, SourcePosition};
+use deltaforge_core::canonical::{CanonicalRow, CanonicalValue, Document};
+use deltaforge_core::{Event, Op, SourceInfo, SourcePosition, TypeMapping};
 use pgwire_replication::Lsn;
 
 use deltaforge_config::OUTBOX_SCHEMA_SENTINEL;
@@ -18,12 +26,41 @@ use deltaforge_config::OUTBOX_SCHEMA_SENTINEL;
 /// Schema sentinel for non-outbox WAL messages.
 pub const WAL_MESSAGE_SCHEMA: &str = "__wal_message";
 
+/// The column holding a message's bytes.
+pub const CONTENT_COLUMN: &str = "content";
+
+/// The row of a message: an outbox message's JSON object fields, or the
+/// content bytes.
+fn message_row(content: &[u8], outbox: bool) -> CanonicalRow {
+    if outbox {
+        match serde_json::from_slice::<Value>(content) {
+            Ok(Value::Object(fields)) => {
+                return CanonicalRow::new(
+                    fields
+                        .into_iter()
+                        .map(|(k, v)| {
+                            (k, CanonicalValue::Document(Document::new(v)))
+                        })
+                        .collect(),
+                )
+                .expect("JSON object keys are unique");
+            }
+            _ => warn!(
+                "outbox message content is not a JSON object; kept as bytes"
+            ),
+        }
+    }
+    CanonicalRow::new(vec![(
+        CONTENT_COLUMN.to_string(),
+        CanonicalValue::Bytes(content.to_vec()),
+    )])
+    .expect("one column")
+}
+
 /// Build a DeltaForge Event from a logical decoding message.
 ///
 /// If `outbox_prefixes` is non-empty and the prefix matches,
 /// the event is tagged with `__outbox` sentinel.
-///
-/// Returns `None` if content is not valid JSON.
 #[allow(clippy::too_many_arguments)]
 pub fn to_event(
     event_id: deltaforge_core::EventId,
@@ -35,17 +72,11 @@ pub fn to_event(
     tx_id: Option<u32>,
     commit_time_micros: Option<i64>,
     outbox_prefixes: &AllowList,
-) -> Option<Event> {
-    let after: Value = match serde_json::from_slice(content) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(prefix = %prefix, error = %e, "WAL message content is not valid JSON, skipping");
-            return None;
-        }
-    };
-
+    type_mapping: TypeMapping,
+) -> Event {
     let is_outbox =
         !outbox_prefixes.is_empty() && outbox_prefixes.matches_name(prefix);
+    let after = message_row(content, is_outbox);
     let schema = if is_outbox {
         OUTBOX_SCHEMA_SENTINEL
     } else {
@@ -84,6 +115,7 @@ pub fn to_event(
         Op::Create,
         None,
         Some(after),
+        type_mapping,
         ts_ms,
         content.len(),
     );
@@ -99,7 +131,7 @@ pub fn to_event(
             data_collection_order: None,
         });
     }
-    Some(event)
+    event
 }
 
 #[cfg(test)]
@@ -132,8 +164,8 @@ mod tests {
             None,
             None,
             &allow(&["outbox"]),
-        )
-        .unwrap();
+            TypeMapping::V2,
+        );
         assert_eq!(ev.source.schema.as_deref(), Some(OUTBOX_SCHEMA_SENTINEL));
     }
 
@@ -149,8 +181,8 @@ mod tests {
             None,
             None,
             &allow(&["outbox_%"]),
-        )
-        .unwrap();
+            TypeMapping::V2,
+        );
         assert_eq!(ev.source.schema.as_deref(), Some(OUTBOX_SCHEMA_SENTINEL));
     }
 
@@ -170,8 +202,8 @@ mod tests {
             Some(4242),
             None,
             &allow(&["outbox"]),
-        )
-        .unwrap();
+            TypeMapping::V2,
+        );
         assert_eq!(
             ev.transaction.as_ref().map(|t| t.id.as_str()),
             Some("4242"),
@@ -193,8 +225,8 @@ mod tests {
             None,
             None,
             &allow(&["outbox"]),
-        )
-        .unwrap();
+            TypeMapping::V2,
+        );
         assert!(
             ev.transaction.is_none(),
             "non-transactional message must not carry a transaction id"
@@ -213,8 +245,8 @@ mod tests {
             None,
             None,
             &allow(&["outbox"]),
-        )
-        .unwrap();
+            TypeMapping::V2,
+        );
         assert_eq!(ev.source.schema.as_deref(), Some(WAL_MESSAGE_SCHEMA));
     }
 
@@ -230,26 +262,62 @@ mod tests {
             None,
             None,
             &AllowList::new(&[]),
-        )
-        .unwrap();
+            TypeMapping::V2,
+        );
         assert_eq!(ev.source.schema.as_deref(), Some(WAL_MESSAGE_SCHEMA));
     }
 
+    fn content(prefix: &str, bytes: &[u8], outbox: &[&str]) -> CanonicalRow {
+        to_event(
+            msg_id(),
+            prefix,
+            &Bytes::copy_from_slice(bytes),
+            Lsn::from(0u64),
+            "p",
+            "db",
+            None,
+            None,
+            &allow(outbox),
+            TypeMapping::V2,
+        )
+        .after
+        .unwrap()
+    }
+
     #[test]
-    fn invalid_json_returns_none() {
-        assert!(
-            to_event(
-                msg_id(),
-                "x",
-                &Bytes::from("nope"),
-                Lsn::from(0u64),
-                "p",
-                "db",
-                None,
-                None,
-                &AllowList::new(&[]),
-            )
-            .is_none()
+    fn any_message_content_is_kept_as_bytes() {
+        // Not JSON, or JSON: a non-outbox message is its bytes, never skipped.
+        for bytes in [&b"nope"[..], &b"\xff\x00"[..], &br#"{"a":1}"#[..]] {
+            let row = content("audit", bytes, &[]);
+            assert_eq!(
+                row.get(CONTENT_COLUMN),
+                Some(&CanonicalValue::Bytes(bytes.to_vec()))
+            );
+            assert_eq!(row.len(), 1);
+        }
+    }
+
+    #[test]
+    fn an_outbox_message_is_its_json_fields_as_documents() {
+        let row =
+            content("outbox", br#"{"payload":{"b":1},"id":"7"}"#, &["outbox"]);
+        assert_eq!(
+            row.get("payload"),
+            Some(&CanonicalValue::Document(Document::new(
+                serde_json::json!({"b": 1})
+            )))
+        );
+        assert_eq!(
+            row.get("id"),
+            Some(&CanonicalValue::Document(Document::new(serde_json::json!(
+                "7"
+            ))))
+        );
+        // Not a JSON object: its bytes, for the outbox processor to refuse.
+        let row = content("outbox", b"[1,2]", &["outbox"]);
+        assert_eq!(
+            row.get(CONTENT_COLUMN),
+            Some(&CanonicalValue::Bytes(b"[1,2]".to_vec()))
         );
     }
 }

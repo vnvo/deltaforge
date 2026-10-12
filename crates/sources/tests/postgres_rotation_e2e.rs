@@ -236,7 +236,8 @@ async fn collect_create_ids(
                 if let Some(id) = e
                     .after
                     .as_ref()
-                    .and_then(|v| v.get("id"))
+                    .map(test_common::row_view)
+                    .and_then(|v| v.get("id").cloned())
                     .and_then(|v| v.as_i64())
                 {
                     ids.push(id);
@@ -285,6 +286,7 @@ fn pg_rotation_cfg(
             max_secret_bytes: LIMIT,
             apply_timeout_ms: 30_000,
         }),
+        type_mapping: Default::default(),
     }
 }
 
@@ -424,6 +426,7 @@ async fn start_rotation_harness(
         table_options: Default::default(),
         rotation,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     };
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
@@ -842,6 +845,7 @@ fn cfg_with_file_creds(
             max_secret_bytes: LIMIT,
             apply_timeout_ms: 30_000,
         }),
+        type_mapping: Default::default(),
     }
 }
 

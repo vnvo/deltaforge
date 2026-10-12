@@ -88,28 +88,34 @@ fn mysql_type_to_arrow(
 
         // Binary types
         "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob"
-        | "longblob" => DataType::Binary,
+        | "longblob" | "geometry" | "point" | "linestring" | "polygon"
+        | "multipoint" | "multilinestring" | "multipolygon"
+        | "geometrycollection" | "geomcollection" => DataType::Binary,
 
         // Date/time types
         "date" => DataType::Date32,
         "datetime" => match opts.naive_timestamp_mode {
             NaiveTimestampMode::String => DataType::Utf8,
+            // A civil date-time: zone-free microseconds.
             NaiveTimestampMode::Timestamp => {
-                DataType::Timestamp(TimeUnit::Millisecond, None)
+                DataType::Timestamp(TimeUnit::Microsecond, None)
             }
         },
         "timestamp" => {
-            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
         }
-        "time" => DataType::Time32(TimeUnit::Millisecond),
+        // A signed duration, not a time of day.
+        "time" => DataType::Duration(TimeUnit::Microsecond),
         "year" => DataType::Int32,
 
         // Boolean (note: MySQL bool is tinyint(1) which arrives as data_type="tinyint")
         "boolean" | "bool" => DataType::Boolean,
         "bit" if col.precision == Some(1) => DataType::Boolean,
 
-        // BIT(n > 1)
-        "bit" => DataType::Binary,
+        // BIT(n > 1): exactly ceil(n/8) big-endian bytes.
+        "bit" => DataType::FixedSizeBinary(
+            (col.precision.unwrap_or(1).clamp(1, 64) as i32 + 7) / 8,
+        ),
 
         // JSON
         "json" => DataType::Utf8,
@@ -149,6 +155,42 @@ pub fn postgres_column_to_arrow(
 ) -> Field {
     if col.is_array {
         let element_type = col.element_type.as_deref().unwrap_or("text");
+        // An array of an element type without a canonical mapping is its
+        // text (an opaque value), never a guessed list.
+        if !matches!(
+            normalize_pg_type(element_type).as_str(),
+            "bool"
+                | "boolean"
+                | "int2"
+                | "smallint"
+                | "int4"
+                | "integer"
+                | "int"
+                | "int8"
+                | "bigint"
+                | "oid"
+                | "float4"
+                | "real"
+                | "float8"
+                | "double precision"
+                | "numeric"
+                | "decimal"
+                | "text"
+                | "varchar"
+                | "bpchar"
+                | "char"
+                | "name"
+                | "bytea"
+                | "uuid"
+                | "json"
+                | "jsonb"
+                | "date"
+                | "time"
+                | "timestamp"
+                | "timestamptz"
+        ) {
+            return Field::new(&col.name, DataType::Utf8, col.nullable);
+        }
         let item_dt = postgres_scalar_to_arrow(element_type, col, opts);
         // Arrow List takes a Field describing the element. Element nullability
         // mirrors PostgreSQL semantics (elements may be NULL inside an array).
@@ -185,6 +227,9 @@ fn postgres_scalar_to_arrow(
         "double precision" | "float8" => DataType::Float64,
 
         // Fixed-point decimal — FIXED for Parquet (TD-003).
+        // An unconstrained NUMERIC (any scale, NaN, infinities) is its exact
+        // text; a declared one fits Decimal128 when its precision does.
+        "numeric" | "decimal" if col.precision.is_none() => DataType::Utf8,
         "numeric" | "decimal" => decimal_data_type(col),
 
         // Boolean
@@ -232,22 +277,8 @@ fn postgres_scalar_to_arrow(
         "money" => DataType::Utf8,
         "xml" => DataType::Utf8,
 
-        // hstore — Arrow Map: <Utf8, Utf8>
-        "hstore" => DataType::Map(
-            Field::new(
-                "entries",
-                DataType::Struct(
-                    vec![
-                        Field::new("key", DataType::Utf8, false),
-                        Field::new("value", DataType::Utf8, true),
-                    ]
-                    .into(),
-                ),
-                false,
-            )
-            .into(),
-            false,
-        ),
+        // hstore: its text (an opaque value)
+        "hstore" => DataType::Utf8,
 
         // Catch-all
         other => {
@@ -524,7 +555,7 @@ mod tests {
                 &o
             )
             .data_type(),
-            &DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
         );
         // DATETIME defaults to string (naive timestamp).
         assert_eq!(
@@ -542,7 +573,7 @@ mod tests {
             mysql_column_to_arrow(&col("d", "datetime", "datetime", false), &o);
         assert_eq!(
             f.data_type(),
-            &DataType::Timestamp(TimeUnit::Millisecond, None)
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
         );
     }
 
@@ -560,8 +591,12 @@ mod tests {
     fn mysql_unknown_type_falls_back_to_string() {
         let o = opts();
         let f =
-            mysql_column_to_arrow(&col("g", "geometry", "geometry", false), &o);
+            mysql_column_to_arrow(&col("v", "vector", "vector(3)", false), &o);
         assert_eq!(f.data_type(), &DataType::Utf8);
+        // GEOMETRY values are their stored bytes.
+        let g =
+            mysql_column_to_arrow(&col("g", "geometry", "geometry", false), &o);
+        assert_eq!(g.data_type(), &DataType::Binary);
     }
 
     #[test]
@@ -573,11 +608,11 @@ mod tests {
     }
 
     #[test]
-    fn mysql_bit_n_is_binary() {
-        let mut c = col("mask", "bit", "bit(8)", false);
-        c.precision = Some(8);
+    fn mysql_bit_n_is_fixed_width_bytes() {
+        let mut c = col("mask", "bit", "bit(12)", false);
+        c.precision = Some(12);
         let f = mysql_column_to_arrow(&c, &opts());
-        assert_eq!(f.data_type(), &DataType::Binary);
+        assert_eq!(f.data_type(), &DataType::FixedSizeBinary(2));
     }
 
     #[test]
@@ -640,13 +675,13 @@ mod tests {
     }
 
     #[test]
-    fn pg_decimal_no_precision_falls_back_to_full_range() {
+    fn pg_decimal_no_precision_is_exact_text() {
         let f = postgres_column_to_arrow(
             &col("amount", "numeric", "numeric", true),
             &opts(),
         );
-        // 38, 0 — Decimal128 max
-        assert_eq!(f.data_type(), &DataType::Decimal128(38, 0));
+        // Any scale, NaN and infinities: only text holds them exactly.
+        assert_eq!(f.data_type(), &DataType::Utf8);
     }
 
     #[test]

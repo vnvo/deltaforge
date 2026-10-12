@@ -146,11 +146,13 @@ pub fn compacted_object_key(
     hash: &str,
     ext: &str,
 ) -> Path {
+    // The table's bounded relation segment, as its data objects use.
+    let table = super::keys::table_key_segment(table);
     Path::from_iter(
         prefix
             .split('/')
             .filter(|p| !p.is_empty())
-            .chain([pipeline, table, "compacted"])
+            .chain([pipeline, table.as_str(), "compacted"])
             .map(str::to_string)
             .chain([format!("{hash}.{ext}")]),
     )

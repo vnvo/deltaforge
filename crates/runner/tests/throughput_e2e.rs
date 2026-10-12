@@ -335,6 +335,7 @@ async fn pg_to_kafka_backlog_drain_throughput() -> Result<()> {
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let src: Arc<dyn Source> = Arc::new(src);
     let commit_signal = Arc::new(tokio::sync::Notify::new());
@@ -377,6 +378,7 @@ async fn pg_to_kafka_backlog_drain_throughput() -> Result<()> {
             ]),
             secret_refs: Default::default(),
             filter: None,
+            json_wide_integers: Default::default(),
         },
         cancel.clone(),
         "test",

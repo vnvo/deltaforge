@@ -1,7 +1,9 @@
 //! Generate `CREATE TABLE` DDL for auto table creation.
 //!
 //! The inserted row shape is: user columns (in declared order) then the meta
-//! columns `_op` / `_version` / `_deleted` / `_source_ts`. The target-table
+//! columns `_op` / `_version` / `_deleted` / `_source_ts`, then the
+//! configured extension column (the row's processor-added document
+//! extensions as a canonical JSON object, NULL when it has none). The target-table
 //! engine determines change-log vs current-state behaviour:
 //! - `upsert`    → `ReplacingMergeTree(_version, _deleted) ORDER BY (pk…)`
 //! - `changelog` → `MergeTree ORDER BY (pk…, _version)`
@@ -19,6 +21,7 @@ pub fn create_table_ddl(
     cols: &[(ColDesc, ChType)],
     pk: &[String],
     mode: ChMode,
+    extensions_column: &str,
 ) -> String {
     let mut lines: Vec<String> = Vec::with_capacity(cols.len() + 4);
     for (c, ty) in cols {
@@ -33,6 +36,7 @@ pub fn create_table_ddl(
     lines.push("  `_version` UInt64".into());
     lines.push("  `_deleted` UInt8".into());
     lines.push("  `_source_ts` DateTime64(3)".into());
+    lines.push(format!("  `{extensions_column}` Nullable(String)"));
 
     let (engine, order_by) = match mode {
         ChMode::Upsert => (
@@ -105,6 +109,7 @@ mod tests {
             &cols(),
             &["id".into()],
             ChMode::Upsert,
+            "_extensions",
         );
         assert!(
             sql.contains("CREATE TABLE IF NOT EXISTS `analytics`.`orders`")
@@ -116,6 +121,27 @@ mod tests {
             sql.contains("ENGINE = ReplacingMergeTree(_version, _deleted)")
         );
         assert!(sql.contains("ORDER BY (`id`)"), "got: {sql}");
+        // The extension column is the last column, after the meta columns.
+        assert!(
+            sql.contains(
+                "`_source_ts` DateTime64(3),\n  `_extensions` Nullable(String)\n)"
+            ),
+            "got: {sql}"
+        );
+    }
+
+    #[test]
+    fn extension_column_name_is_configurable() {
+        let sql = create_table_ddl(
+            "d",
+            "t",
+            &cols(),
+            &["id".into()],
+            ChMode::Upsert,
+            "proc_ext",
+        );
+        assert!(sql.contains("`proc_ext` Nullable(String)"), "got: {sql}");
+        assert!(!sql.contains("_extensions"), "got: {sql}");
     }
 
     #[test]
@@ -126,6 +152,7 @@ mod tests {
             &cols(),
             &["id".into()],
             ChMode::Changelog,
+            "_extensions",
         );
         assert!(sql.contains("ENGINE = MergeTree"));
         assert!(sql.contains("ORDER BY (`id`, `_version`)"), "got: {sql}");
@@ -133,7 +160,14 @@ mod tests {
 
     #[test]
     fn empty_pk_orders_by_tuple() {
-        let sql = create_table_ddl("d", "t", &cols(), &[], ChMode::Upsert);
+        let sql = create_table_ddl(
+            "d",
+            "t",
+            &cols(),
+            &[],
+            ChMode::Upsert,
+            "_extensions",
+        );
         assert!(sql.contains("ORDER BY tuple()"), "got: {sql}");
     }
 }

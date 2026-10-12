@@ -1,111 +1,122 @@
-//! Normalize a source `after` document so its values match the generated ES
-//! mapping and what Elasticsearch will accept.
+//! An Elasticsearch document from a row image's canonical values, by type
+//! (never by the value's shape):
 //!
-//! The MySQL source encodes some column types in shapes ES rejects verbatim,
-//! and the two source paths differ:
+//! | canonical value | document value |
+//! |---|---|
+//! | binary, untyped bytes, BIT(n>1) | base64 string (ES `binary`) |
+//! | BIT(1) | boolean |
+//! | integers (any width) | exact JSON number |
+//! | temporal values | their exact text (the `date` mapping parses it) |
+//! | JSON column | its JSON text |
+//! | document in a column the table does not have | the embedded JSON |
+//! | processor-added extension | merged in as embedded JSON (a name that is a column's is refused) |
+//! | everything else | its native rendering for the event's version |
 //!
-//! | type            | binlog stream            | snapshot                     |
-//! |-----------------|--------------------------|------------------------------|
-//! | TEXT/BLOB       | `{"_base64": "<b64>"}`   | UTF-8 string (b64 if binary) |
-//! | TIMESTAMP       | integer **microseconds** | ISO-8601 string (`…T…`)      |
-//! | DATETIME/DATE   | string                   | ISO-8601 string              |
-//! | DECIMAL         | string                   | string                       |
-//!
-//! So normalization is driven by the *value shape* (object/number/string), not
-//! by assuming a single encoding:
-//! - `{"_base64": s}` → for a binary column keep the base64 string (ES `binary`
-//!   stores base64); otherwise decode to UTF-8 text (fall back to the base64
-//!   string if not valid UTF-8).
-//! - a numeric temporal (binlog TIMESTAMP, microseconds) → milliseconds, which
-//!   the generated `date` mapping accepts as `epoch_millis`. String temporals
-//!   pass through (the mapping's `format` list accepts them).
+//! An unchanged TOAST value (its value is not in the event: indexing the
+//! document would drop it) or a document in a declared column is refused.
 
 use crate::clickhouse::types::ColDesc;
 use base64::Engine;
+use deltaforge_core::canonical::render::{
+    RenderOpts, WideIntegers, render_value,
+};
+use deltaforge_core::canonical::{CanonicalRow, CanonicalValue, DbValue};
+use deltaforge_core::{SinkError, TypeMapping};
 use serde_json::{Map, Value};
 
-fn is_binary_type(dt: &str) -> bool {
-    matches!(
-        dt,
-        "blob"
-            | "tinyblob"
-            | "mediumblob"
-            | "longblob"
-            | "binary"
-            | "varbinary"
-    )
+fn b64(b: &[u8]) -> Value {
+    Value::String(base64::engine::general_purpose::STANDARD.encode(b))
 }
 
-/// Temporal types whose binlog form is an integer microsecond count.
-fn is_numeric_temporal(dt: &str) -> bool {
-    matches!(dt, "timestamp" | "timestamptz" | "datetime")
+fn refuse(column: &str, why: &str) -> SinkError {
+    SinkError::Serialization {
+        details: format!("elasticsearch: column `{column}`: {why}").into(),
+    }
 }
 
-/// Normalize one column value given its source `data_type` (lowercased).
-pub fn normalize_value(data_type: &str, v: &Value) -> Value {
-    let dt = data_type.to_lowercase();
-    match v {
-        // Base64-wrapped binary/text (both `_base64` and the JSON fallback
-        // `_base64_json` the source may emit).
-        Value::Object(m)
-            if m.contains_key("_base64") || m.contains_key("_base64_json") =>
-        {
-            let b64 = m
-                .get("_base64")
-                .or_else(|| m.get("_base64_json"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if is_binary_type(&dt) {
-                // ES `binary` wants the base64 string as-is.
-                Value::String(b64.to_string())
-            } else {
-                // Character column: recover the text.
-                match base64::engine::general_purpose::STANDARD.decode(b64) {
-                    Ok(bytes) => match String::from_utf8(bytes) {
-                        Ok(s) => Value::String(s),
-                        Err(_) => Value::String(b64.to_string()),
-                    },
-                    Err(_) => Value::String(b64.to_string()),
-                }
-            }
+/// One column value as a document value.
+fn doc_value(
+    column: &str,
+    declared: bool,
+    v: &CanonicalValue,
+) -> Result<Value, SinkError> {
+    Ok(match v {
+        CanonicalValue::Null => Value::Null,
+        CanonicalValue::Unchanged => {
+            return Err(refuse(
+                column,
+                "PostgreSQL did not send the value (unchanged TOAST)",
+            ));
         }
-        // Binlog TIMESTAMP/DATETIME: integer microseconds → milliseconds.
-        Value::Number(n) if is_numeric_temporal(&dt) => match n.as_i64() {
-            Some(micros) => Value::Number((micros / 1_000).into()),
-            None => v.clone(),
-        },
-        _ => v.clone(),
-    }
+        CanonicalValue::Document(_) if declared => {
+            return Err(refuse(
+                column,
+                "an untyped document in a schema-typed column",
+            ));
+        }
+        CanonicalValue::Document(d) => d.value().clone(),
+        CanonicalValue::Bytes(b) => b64(b),
+        CanonicalValue::Opaque(o) => Value::String(o.text.clone()),
+        CanonicalValue::Db(DbValue::Binary(b)) => b64(b),
+        CanonicalValue::Db(DbValue::Bits(b)) if b.len() > 1 => b64(b.bytes()),
+        CanonicalValue::Db(DbValue::Int { value, .. }) => Value::from(*value),
+        CanonicalValue::Db(DbValue::UInt { value, .. }) => Value::from(*value),
+        CanonicalValue::Db(DbValue::Array(a)) => Value::Array(
+            a.items()
+                .iter()
+                .map(|i| doc_value(column, declared, i))
+                .collect::<Result<_, _>>()?,
+        ),
+        // Temporal text, JSON text, decimals, labels, UUIDs, floats, BIT(1):
+        // the v2 rendering (v1's epoch-number TIMESTAMP is not a document
+        // form: the date mapping reads text).
+        other => render_value(
+            other,
+            RenderOpts {
+                mapping: TypeMapping::V2,
+                wide_integers: WideIntegers::String,
+            },
+        )
+        .map_err(|e| refuse(column, &e.to_string()))?,
+    })
 }
 
-/// Normalize every field of an `after`/`before` object using the resolved
-/// column types. Fields with no matching column (or a non-object body) pass
-/// through unchanged.
-pub fn normalize_doc(columns: &[ColDesc], doc: &Value) -> Value {
-    let Value::Object(m) = doc else {
-        return doc.clone();
-    };
-    let mut out = Map::with_capacity(m.len());
-    for (k, v) in m {
-        let normalized = match columns.iter().find(|c| &c.name == k) {
-            Some(c) => normalize_value(&c.data_type, v),
-            None => v.clone(),
-        };
-        out.insert(k.clone(), normalized);
+/// The document of a row image, typed by the resolved column types. A
+/// document always uses the v2 rendering, whatever the event's mapping
+/// version (v1's epoch-number TIMESTAMP is not a document form).
+pub fn normalize_doc(
+    columns: &[ColDesc],
+    row: &CanonicalRow,
+) -> Result<Value, SinkError> {
+    let mut out = Map::with_capacity(row.len());
+    for (k, v) in row.iter() {
+        let declared = columns.iter().any(|c| c.name == k);
+        out.insert(k.to_string(), doc_value(k, declared, v)?);
     }
-    Value::Object(out)
+    // Processor-added extensions merge into the document; one that names a
+    // column (of the row or of the table) is refused, never overwritten.
+    for (k, d) in row.extensions() {
+        if out.contains_key(k) || columns.iter().any(|c| &c.name == k) {
+            return Err(refuse(k, "an extension has a column's name"));
+        }
+        out.insert(k.clone(), d.value().clone());
+    }
+    Ok(Value::Object(out))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deltaforge_core::canonical::{
+        Bits, Document, IntWidth, Precision, TimestampValue,
+    };
     use serde_json::json;
 
-    fn col(name: &str, dt: &str) -> ColDesc {
+    fn col(name: &str) -> ColDesc {
         ColDesc {
             name: name.into(),
-            data_type: dt.into(),
-            full_type: dt.into(),
+            data_type: "x".into(),
+            full_type: "x".into(),
             nullable: true,
             unsigned: false,
             precision: None,
@@ -113,69 +124,90 @@ mod tests {
         }
     }
 
-    fn b64(s: &str) -> String {
-        base64::engine::general_purpose::STANDARD.encode(s.as_bytes())
+    fn doc(cols: Vec<(&str, CanonicalValue)>) -> Result<Value, SinkError> {
+        let row = CanonicalRow::new(
+            cols.into_iter().map(|(n, v)| (n.to_string(), v)).collect(),
+        )
+        .unwrap();
+        normalize_doc(
+            &[col("bin"), col("big"), col("ts"), col("b1"), col("j")],
+            &row,
+        )
     }
 
     #[test]
-    fn text_column_base64_decodes_to_string() {
-        // binlog delivers TEXT as a base64-wrapped blob.
-        let v = json!({ "_base64": b64("backlog-123") });
-        assert_eq!(normalize_value("text", &v), json!("backlog-123"));
+    fn values_follow_their_type_not_their_shape() {
+        let d = doc(vec![
+            ("bin", CanonicalValue::Db(DbValue::Binary(b"ok".to_vec()))),
+            (
+                "big",
+                CanonicalValue::Db(
+                    DbValue::uint(u64::MAX, IntWidth::W64).unwrap(),
+                ),
+            ),
+            (
+                "ts",
+                CanonicalValue::Db(DbValue::Timestamp(
+                    TimestampValue::instant(1_500, Precision::Fixed(6))
+                        .unwrap(),
+                )),
+            ),
+            (
+                "b1",
+                CanonicalValue::Db(DbValue::Bits(
+                    Bits::new(1, vec![1]).unwrap(),
+                )),
+            ),
+            (
+                "j",
+                CanonicalValue::Db(DbValue::Json(
+                    deltaforge_core::canonical::JsonText::new(
+                        "{\"a\": 1}".into(),
+                    )
+                    .unwrap(),
+                )),
+            ),
+            (
+                "added",
+                CanonicalValue::Document(Document::new(json!({"k": 1}))),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(d["bin"], json!("b2s="));
+        assert_eq!(d["big"], json!(u64::MAX));
+        assert_eq!(d["ts"], json!("1970-01-01T00:00:00.001500Z"));
+        assert_eq!(d["b1"], json!(true));
+        assert_eq!(d["j"], json!("{\"a\": 1}"));
+        assert_eq!(d["added"], json!({"k": 1}));
     }
 
     #[test]
-    fn blob_column_keeps_base64_string() {
-        let raw = b64("\x00\x01binary");
-        let v = json!({ "_base64": raw });
-        // binary column → base64 string preserved (ES `binary`).
-        assert_eq!(normalize_value("blob", &v), json!(raw));
+    fn extensions_merge_unless_they_name_a_column() {
+        let row = CanonicalRow::with_extensions(
+            vec![("big".to_string(), CanonicalValue::Null)],
+            vec![("added".to_string(), Document::new(json!([1])))],
+        )
+        .unwrap();
+        let d = normalize_doc(&[col("big")], &row).unwrap();
+        assert_eq!(d["added"], json!([1]));
+        // An extension that names a table column the row does not carry.
+        let row = CanonicalRow::with_extensions(
+            vec![],
+            vec![("ts".to_string(), Document::new(json!(1)))],
+        )
+        .unwrap();
+        assert!(normalize_doc(&[col("ts")], &row).is_err());
     }
 
     #[test]
-    fn non_utf8_text_falls_back_to_base64() {
-        // 0xff 0xfe is not valid UTF-8.
-        let raw =
-            base64::engine::general_purpose::STANDARD.encode([0xff, 0xfe]);
-        let v = json!({ "_base64": raw });
-        assert_eq!(normalize_value("varchar", &v), json!(raw));
-    }
-
-    #[test]
-    fn timestamp_micros_to_millis() {
-        // binlog TIMESTAMP: 1789934706000000 µs → 1789934706000 ms.
-        let v = json!(1789934706000000i64);
-        assert_eq!(normalize_value("timestamp", &v), json!(1789934706000i64));
-    }
-
-    #[test]
-    fn string_temporal_passes_through() {
-        // snapshot ISO string is left for the mapping's date format to parse.
-        let v = json!("2026-09-20T20:06:51.000000");
-        assert_eq!(normalize_value("datetime", &v), v);
-    }
-
-    #[test]
-    fn scalars_and_decimal_pass_through() {
-        assert_eq!(normalize_value("bigint", &json!(42)), json!(42));
-        assert_eq!(
-            normalize_value("decimal", &json!("8150.7937")),
-            json!("8150.7937")
+    fn unchanged_and_documents_in_typed_columns_are_refused() {
+        assert!(doc(vec![("ts", CanonicalValue::Unchanged)]).is_err());
+        assert!(
+            doc(vec![(
+                "big",
+                CanonicalValue::Document(Document::new(json!(1)))
+            )])
+            .is_err()
         );
-        assert_eq!(normalize_value("json", &json!({"a": 1})), json!({"a": 1}));
-    }
-
-    #[test]
-    fn normalize_doc_uses_column_types_and_passes_unknowns() {
-        let cols = vec![col("data", "text"), col("created_at", "timestamp")];
-        let doc = json!({
-            "id": 7,                                   // no column → passthrough
-            "data": { "_base64": b64("hello") },
-            "created_at": 1789934706000000i64,
-        });
-        let out = normalize_doc(&cols, &doc);
-        assert_eq!(out["id"], json!(7));
-        assert_eq!(out["data"], json!("hello"));
-        assert_eq!(out["created_at"], json!(1789934706000i64));
     }
 }

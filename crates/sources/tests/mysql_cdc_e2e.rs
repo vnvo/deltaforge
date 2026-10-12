@@ -82,12 +82,14 @@ where
 fn event_has_id(e: &Event, id: i64) -> bool {
     e.after
         .as_ref()
-        .and_then(|v| v.get("id"))
+        .map(test_common::row_view)
+        .and_then(|v| v.get("id").cloned())
         .and_then(|v| v.as_i64())
         == Some(id)
         || e.before
             .as_ref()
-            .and_then(|v| v.get("id"))
+            .map(test_common::row_view)
+            .and_then(|v| v.get("id").cloned())
             .and_then(|v| v.as_i64())
             == Some(id)
 }
@@ -141,6 +143,7 @@ async fn make_source(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }
 
@@ -528,6 +531,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let (mut rx, handle) = start_source(src).await?;
 
@@ -578,7 +582,9 @@ async fn mysql_cdc_basic_events() -> Result<()> {
 
     // Verify INSERT payload
     let ins = by_id.iter().find(|e| e.op == Op::Create).unwrap();
-    let after = ins.after.as_ref().expect("INSERT must have after");
+    let after = test_common::row_view(
+        ins.after.as_ref().expect("INSERT must have after"),
+    );
     assert_eq!(after["id"], 1);
     assert_eq!(after["sku"], "sku-1");
     assert_eq!(after["payload"]["a"], 1);
@@ -590,8 +596,12 @@ async fn mysql_cdc_basic_events() -> Result<()> {
 
     // Verify UPDATE payload
     let upd = by_id.iter().find(|e| e.op == Op::Update).unwrap();
-    let upd_before = upd.before.as_ref().expect("UPDATE must have before");
-    let upd_after = upd.after.as_ref().expect("UPDATE must have after");
+    let upd_before = test_common::row_view(
+        upd.before.as_ref().expect("UPDATE must have before"),
+    );
+    let upd_after = test_common::row_view(
+        upd.after.as_ref().expect("UPDATE must have after"),
+    );
     assert_eq!(upd_before["sku"], "sku-1");
     assert_eq!(upd_after["sku"], "sku-1b");
     info!("✓ UPDATE payload correct");
@@ -600,7 +610,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
     let del = by_id.iter().find(|e| e.op == Op::Delete).unwrap();
     assert!(del.before.is_some(), "DELETE must have before");
     assert!(del.after.is_none(), "DELETE must not have after");
-    assert_eq!(del.before.as_ref().unwrap()["id"], 1);
+    assert_eq!(test_common::row_view(del.before.as_ref().unwrap())["id"], 1);
     info!("✓ DELETE payload correct");
 
     // Verify metadata on all events
@@ -659,6 +669,7 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let (mut rx, handle) = start_source(src).await?;
 
@@ -702,7 +713,7 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
         .expect("post-DDL event");
 
     // Verify new column present
-    let after = post_ddl.after.as_ref().unwrap();
+    let after = test_common::row_view(post_ddl.after.as_ref().unwrap());
     assert!(
         after.get("status").is_some(),
         "post-DDL event should have 'status' column"
@@ -909,12 +920,17 @@ async fn mysql_cdc_compressed_transaction() -> Result<()> {
     let ops: Vec<(Op, i64)> = rows
         .iter()
         .map(|e| {
-            let id = e.after.as_ref().unwrap()["id"].as_i64().unwrap();
+            let id = test_common::row_view(e.after.as_ref().unwrap())["id"]
+                .as_i64()
+                .unwrap();
             (e.op, id)
         })
         .collect();
     assert_eq!(ops, [(Op::Create, 1), (Op::Create, 2), (Op::Update, 2)]);
-    assert_eq!(rows[2].after.as_ref().unwrap()["sku"], "b2");
+    assert_eq!(
+        test_common::row_view(rows[2].after.as_ref().unwrap())["sku"],
+        "b2"
+    );
     let commit = commit.expect("the compressed transaction's commit boundary");
     assert_eq!((commit.file.as_str(), commit.pos), (file.as_str(), pos));
     assert_eq!(
@@ -943,7 +959,11 @@ async fn mysql_cdc_compressed_transaction() -> Result<()> {
     mysql_drop_db(&pool, &db_name).await;
     let ids: Vec<i64> = events
         .iter()
-        .filter_map(|e| e.after.as_ref().and_then(|a| a["id"].as_i64()))
+        .filter_map(|e| {
+            e.after
+                .as_ref()
+                .and_then(|a| test_common::row_view(a)["id"].as_i64())
+        })
         .collect();
     assert_eq!(ids, [3], "resume repeats or skips rows");
     Ok(())
@@ -1175,7 +1195,9 @@ async fn mysql_cdc_outbox_capture() -> Result<()> {
         "matching table should be tagged __outbox"
     );
     assert_eq!(outbox_ev.op, Op::Create);
-    let after = outbox_ev.after.as_ref().expect("should have payload");
+    let after = test_common::row_view(
+        outbox_ev.after.as_ref().expect("should have payload"),
+    );
     assert_eq!(after["aggregate_type"], "Order");
     assert_eq!(after["aggregate_id"], "42");
     assert_eq!(after["event_type"], "OrderCreated");
@@ -1191,7 +1213,10 @@ async fn mysql_cdc_outbox_capture() -> Result<()> {
         Some("__outbox"),
         "non-outbox table should not be tagged"
     );
-    assert_eq!(order_ev.after.as_ref().unwrap()["sku"], "sku-1");
+    assert_eq!(
+        test_common::row_view(order_ev.after.as_ref().unwrap())["sku"],
+        "sku-1"
+    );
     info!("✓ normal table CDC coexists with outbox capture");
 
     handle.stop();
@@ -1355,7 +1380,7 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
         outbox_ev.source.schema.is_none(),
         "sentinel should be cleared"
     );
-    let after = outbox_ev.after.as_ref().unwrap();
+    let after = test_common::row_view(outbox_ev.after.as_ref().unwrap());
     assert_eq!(after["order_id"], 42);
     assert_eq!(after["total"], 99.99);
     let headers = outbox_ev
@@ -1387,7 +1412,10 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
         table_ev.routing.is_none(),
         "table event should have no routing"
     );
-    assert_eq!(table_ev.after.as_ref().unwrap()["sku"], "sku-1");
+    assert_eq!(
+        test_common::row_view(table_ev.after.as_ref().unwrap())["sku"],
+        "sku-1"
+    );
     info!("✓ normal table event passes through processor unchanged");
 
     // --- raw_payload mode: re-process cloned raw events ---
@@ -1421,7 +1449,7 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
         "raw_payload flag should be set on outbox event"
     );
     assert_eq!(
-        raw_outbox_ev.after.as_ref().unwrap()["order_id"],
+        test_common::row_view(raw_outbox_ev.after.as_ref().unwrap())["order_id"],
         42,
         "payload should still be extracted"
     );
@@ -1870,6 +1898,7 @@ async fn startup_fails_closed_without_sink_checkpoints() -> Result<()> {
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let ckpt = test_common::unwritable_sink_checkpoints(
         Arc::new(src.clone()),

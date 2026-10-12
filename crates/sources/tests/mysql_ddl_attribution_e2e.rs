@@ -230,6 +230,7 @@ fn source(id: &str, port: u16, tables: &[String], st: &State) -> MySqlSource {
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }
 
@@ -278,8 +279,9 @@ async fn row_in(r: &mut Run, db: &str, table: &str, id: i64) -> Next {
                     && e.source.table == table
                     && e.after
                         .as_ref()
-                        .and_then(|a| a.get("id"))
-                        .and_then(Value::as_i64)
+                        .map(test_common::row_view)
+                        .and_then(|a| a.get("id").cloned())
+                        .and_then(|v| v.as_i64())
                         == Some(id)
                 {
                     return Next::Row(Box::new(e));
@@ -318,8 +320,7 @@ fn cols(e: &Event) -> Vec<String> {
     let mut v: Vec<String> = e
         .after
         .as_ref()
-        .and_then(Value::as_object)
-        .map(|o| o.keys().cloned().collect())
+        .map(|r| r.names().map(String::from).collect())
         .unwrap_or_default();
     v.sort();
     v

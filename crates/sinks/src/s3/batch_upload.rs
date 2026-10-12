@@ -121,7 +121,8 @@ fn build_object_key(
         parts.push(seg.to_string());
     }
     parts.push(pipeline.to_string());
-    parts.push(table.to_string());
+    // The relation's bounded segment (readable, or its digest).
+    parts.push(super::keys::table_key_segment(table));
     parts.push(format!("{WATERMARK_SEGMENT_V2}{watermark_digest}"));
     // content_hash is lowercase hex and ext a fixed literal - both already safe.
     parts.push(format!("{content_hash_hex}.{ext}"));

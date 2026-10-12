@@ -15,6 +15,7 @@ chrono.workspace = true
 deltaforge-core = { path = "../deltaforge-core" }
 
 [dev-dependencies]
+deltaforge-core = { path = "../deltaforge-core", features = ["test-fixtures"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
 [lints]

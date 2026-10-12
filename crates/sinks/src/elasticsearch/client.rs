@@ -81,6 +81,10 @@ pub trait EsTransport: Send + Sync {
         index: &str,
         mapping: &Value,
     ) -> Result<(), SinkError>;
+
+    /// GET `path` (relative to the cluster URL, e.g. `orders/_count`) as
+    /// JSON.
+    async fn get_json(&self, path: &str) -> Result<Value, SinkError>;
 }
 
 pub struct ElasticsearchClient {
@@ -183,6 +187,21 @@ impl ElasticsearchClient {
 
 #[async_trait]
 impl EsTransport for ElasticsearchClient {
+    async fn get_json(&self, path: &str) -> Result<Value, SinkError> {
+        let req = self.http.get(format!("{}/{path}", self.base));
+        let resp = self
+            .with_auth(req)
+            .send()
+            .await
+            .map_err(|e| self.send_err(e))?;
+        let code = resp.status();
+        if code.is_success() {
+            return resp.json().await.map_err(|e| self.send_err(e));
+        }
+        let text = resp.text().await.unwrap_or_default();
+        Err(Self::status_err(code, text))
+    }
+
     async fn bulk(&self, body: Vec<u8>) -> Result<Vec<u8>, SinkError> {
         let req = self
             .http

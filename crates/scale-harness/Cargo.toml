@@ -34,6 +34,7 @@ mysql_async = "0.36"
 tokio-util.workspace = true
 
 [dev-dependencies]
+deltaforge-core = { path = "../deltaforge-core", features = ["test-fixtures"] }
 tempfile = "3"
 
 [lints]

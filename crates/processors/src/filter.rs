@@ -3,7 +3,14 @@
 //! Evaluates three independent gate checks in order:
 //! 1. **Op gate** - keep only specified operation types
 //! 2. **Table gate** - include/exclude by `db.table` glob patterns
-//! 3. **Field gate** - predicates on `event.after` values
+//! 3. **Field gate** - predicates on `event.after` values, read through the
+//!    path view of the canonical values
+//!    ([`deltaforge_core::canonical::view`]): integers are exact numbers
+//!    (compared exactly, whatever their width), a path can descend into a
+//!    JSON column, and every other value is its native rendering for the
+//!    event's mapping version. A predicate on a PostgreSQL column whose
+//!    value was not sent (unchanged TOAST) fails the batch: its value is
+//!    not in the event. `changed` treats such a column as unchanged.
 //!
 //! An event must pass all three gates to be forwarded. Omitting a gate
 //! config skips that check entirely (pass-through).
@@ -32,7 +39,8 @@ use async_trait::async_trait;
 use deltaforge_config::{
     FieldOp, FieldPredicate, FilterProcessorCfg, MatchMode, OpFilter,
 };
-use deltaforge_core::{BatchContext, Event, Op, Processor};
+use deltaforge_core::canonical::view::row_view;
+use deltaforge_core::{BatchContext, CanonicalValue, Event, Op, Processor};
 use metrics::counter;
 use regex::Regex;
 use serde_json::Value;
@@ -120,24 +128,38 @@ impl FilterProcessor {
     // Gate: fields
     // -----------------------------------------------------------------------
 
-    fn fields_match(&self, event: &Event) -> bool {
+    fn fields_match(&self, event: &Event) -> Result<bool> {
         if self.cfg.fields.is_empty() {
-            return true;
+            return Ok(true);
         }
-        match self.cfg.match_mode {
-            MatchMode::All => self
-                .cfg
-                .fields
-                .iter()
-                .enumerate()
-                .all(|(i, p)| self.eval_predicate(i, p, event)),
-            MatchMode::Any => self
-                .cfg
-                .fields
-                .iter()
-                .enumerate()
-                .any(|(i, p)| self.eval_predicate(i, p, event)),
-        }
+        let view = event
+            .after
+            .as_ref()
+            .map(|r| Value::Object(row_view(r, event.type_mapping)));
+        let mut results = self
+            .cfg
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(i, p)| self.eval_predicate(i, p, event, view.as_ref()));
+        Ok(match self.cfg.match_mode {
+            MatchMode::All => {
+                for r in results.by_ref() {
+                    if !r? {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
+            MatchMode::Any => {
+                for r in results.by_ref() {
+                    if r? {
+                        return Ok(true);
+                    }
+                }
+                false
+            }
+        })
     }
 
     fn eval_predicate(
@@ -145,18 +167,29 @@ impl FilterProcessor {
         idx: usize,
         pred: &FieldPredicate,
         event: &Event,
-    ) -> bool {
+        after_view: Option<&Value>,
+    ) -> Result<bool> {
         // `changed` compares before vs after — handled before resolving after.
         if pred.op == FieldOp::Changed {
-            return eval_changed(event, &pred.path);
+            return Ok(eval_changed(event, &pred.path));
+        }
+        let column = pred.path.split('.').next().unwrap_or_default();
+        if let Some(CanonicalValue::Unchanged) =
+            event.after.as_ref().and_then(|r| r.get(column))
+        {
+            anyhow::bail!(
+                "filter {}: column `{column}` of {} was not sent by \
+                 PostgreSQL (unchanged TOAST value): predicate `{}` cannot be \
+                 evaluated",
+                self.id,
+                event.source.full_table_name(),
+                pred.path
+            );
         }
 
-        let field_val = event
-            .after
-            .as_ref()
-            .and_then(|v| resolve_path(v, &pred.path));
+        let field_val = after_view.and_then(|v| resolve_path(v, &pred.path));
 
-        match pred.op {
+        Ok(match pred.op {
             FieldOp::Exists => field_val.is_some(),
             FieldOp::NotExists => field_val.is_none(),
             FieldOp::Eq => match (field_val, pred.value.as_ref()) {
@@ -217,7 +250,7 @@ impl FilterProcessor {
             },
             // Already handled above.
             FieldOp::Changed => unreachable!(),
-        }
+        })
     }
 }
 
@@ -241,21 +274,20 @@ impl Processor for FilterProcessor {
         _ctx: &BatchContext,
     ) -> Result<Vec<Event>> {
         let in_len = events.len();
-        let out: Vec<Event> = events
-            .into_iter()
-            .filter(|ev| {
-                let pass = self.op_allowed(&ev.op)
-                    && self.table_allowed(&ev.source.db, &ev.source.table)
-                    && self.fields_match(ev);
-                if !pass {
-                    counter!("deltaforge_filter_dropped_total",
-                        "processor" => self.id.clone()
-                    )
-                    .increment(1);
-                }
-                pass
-            })
-            .collect();
+        let mut out: Vec<Event> = Vec::with_capacity(in_len);
+        for ev in events {
+            let pass = self.op_allowed(&ev.op)
+                && self.table_allowed(ev.source.namespace(), &ev.source.table)
+                && self.fields_match(&ev)?;
+            if pass {
+                out.push(ev);
+            } else {
+                counter!("deltaforge_filter_dropped_total",
+                    "processor" => self.id.clone()
+                )
+                .increment(1);
+            }
+        }
 
         let dropped = in_len - out.len();
         if dropped > 0 {
@@ -287,12 +319,18 @@ fn resolve_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
 
 /// `changed` — passes if the field value differs between before and after,
 /// or if either image is missing (Create has no before; Delete has no after).
+/// A column PostgreSQL did not send in the after image (unchanged TOAST) is
+/// unchanged by definition.
 fn eval_changed(event: &Event, path: &str) -> bool {
     match (&event.before, &event.after) {
         (Some(b), Some(a)) => {
-            let bv = resolve_path(b, path);
-            let av = resolve_path(a, path);
-            match (bv, av) {
+            let column = path.split('.').next().unwrap_or_default();
+            if let Some(CanonicalValue::Unchanged) = a.get(column) {
+                return false;
+            }
+            let bv = Value::Object(row_view(b, event.type_mapping));
+            let av = Value::Object(row_view(a, event.type_mapping));
+            match (resolve_path(&bv, path), resolve_path(&av, path)) {
                 (Some(b), Some(a)) => !json_eq(b, a),
                 (None, None) => false,
                 _ => true, // one side missing = field appeared or disappeared
@@ -303,15 +341,25 @@ fn eval_changed(event: &Event, path: &str) -> bool {
     }
 }
 
-/// Equality that handles JSON number comparison correctly (int vs float).
+/// Equality that compares integers exactly (whatever their width) and
+/// other numbers numerically (42 == 42.0).
 fn json_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(an), Value::Number(bn)) => {
-            // Compare via f64 to handle 42 == 42.0
-            an.as_f64() == bn.as_f64()
+            match (as_integer(an), as_integer(bn)) {
+                (Some(x), Some(y)) => x == y,
+                _ => an.as_f64() == bn.as_f64(),
+            }
         }
         _ => a == b,
     }
+}
+
+/// An integral JSON number as an i128 (exact for every i64 and u64).
+fn as_integer(n: &serde_json::Number) -> Option<i128> {
+    n.as_i64()
+        .map(i128::from)
+        .or_else(|| n.as_u64().map(i128::from))
 }
 
 /// Numeric and string ordering comparison.
@@ -322,9 +370,10 @@ fn cmp_values(
 ) -> Option<std::cmp::Ordering> {
     match (field?, predicate?) {
         (Value::Number(a), Value::Number(b)) => {
-            let af = a.as_f64()?;
-            let bf = b.as_f64()?;
-            af.partial_cmp(&bf)
+            match (as_integer(a), as_integer(b)) {
+                (Some(x), Some(y)) => Some(x.cmp(&y)),
+                _ => a.as_f64()?.partial_cmp(&b.as_f64()?),
+            }
         }
         (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
         _ => None,

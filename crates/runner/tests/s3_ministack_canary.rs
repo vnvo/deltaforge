@@ -22,8 +22,12 @@ use async_trait::async_trait;
 use deltaforge_config::{
     S3Compression, S3Durability, S3FileFormat, S3FileRoll, S3SinkCfg, SinkCfg,
 };
+use deltaforge_core::canonical::{DbValue, Decimal, IntWidth};
 use deltaforge_core::encoding::avro_types::TypeConversionOpts;
-use deltaforge_core::{Event, Op, Sink, SourceInfo, SourcePosition};
+use deltaforge_core::{
+    CanonicalRow, CanonicalValue, Event, Op, Sink, SourceInfo, SourcePosition,
+    TypeMapping,
+};
 use object_store::path::Path;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_reader::ParquetObjectReader;
@@ -31,7 +35,6 @@ use runner::{
     ArcSchemaProvider, ColumnSchemaInfo, SchemaLookupError, SchemaProvider,
     TableSchemaInfo, build_arrow_schema_resolver,
 };
-use serde_json::json;
 use sinks::s3::{ObjectStoreParams, build_object_store, build_s3_sink};
 use tokio_util::sync::CancellationToken;
 
@@ -118,12 +121,29 @@ fn make_event(id: i64, name: &str, amount: &str, paid: bool) -> Event {
         .timestamp_millis();
     Event {
         before: None,
-        after: Some(json!({
-            "id": id,
-            "name": name,
-            "amount": amount,
-            "paid": paid,
-        })),
+        // Typed as the declared schema: bigint, varchar, decimal(10,2), boolean.
+        after: Some(
+            CanonicalRow::new(vec![
+                (
+                    "id".to_string(),
+                    CanonicalValue::Db(
+                        DbValue::int(id, IntWidth::W64).unwrap(),
+                    ),
+                ),
+                (
+                    "name".to_string(),
+                    CanonicalValue::Db(DbValue::Text(name.to_string())),
+                ),
+                (
+                    "amount".to_string(),
+                    CanonicalValue::Db(DbValue::Decimal(
+                        Decimal::parse(amount).unwrap(),
+                    )),
+                ),
+                ("paid".to_string(), CanonicalValue::Db(DbValue::Bool(paid))),
+            ])
+            .unwrap(),
+        ),
         source: SourceInfo {
             version: "1".into(),
             connector: "mysql".into(),
@@ -147,6 +167,7 @@ fn make_event(id: i64, name: &str, amount: &str, paid: bool) -> Event {
         tags: None,
         synthetic: None,
         routing: None,
+        type_mapping: TypeMapping::V2,
         tx_end: false,
         boundary: None,
         size_bytes: 0,

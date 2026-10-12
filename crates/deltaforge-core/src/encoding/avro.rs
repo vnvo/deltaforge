@@ -30,6 +30,11 @@ use tracing::debug;
 
 use super::EncodingError;
 use super::avro_infer::Inferred;
+use crate::canonical::CanonicalRow;
+use crate::envelope::EnvelopeData;
+
+#[path = "avro_canonical.rs"]
+mod canonical_rows;
 
 // =============================================================================
 // Source schema provider trait
@@ -66,12 +71,15 @@ impl SchemaIdentity {
 /// The returned schema string is a complete Avro envelope schema JSON
 /// (built by [`super::avro_schema::build_envelope_schema`]).
 pub trait SourceSchemaProvider: Send + Sync {
-    /// The Avro envelope schema of `db.table` at exactly the registered
-    /// version `identity` names, never the table's latest schema.
+    /// The Avro envelope schema of table `table` in `namespace` (see
+    /// [`crate::SourceInfo::namespace`]) of `database` at exactly the
+    /// registered version `identity` names, never the table's latest
+    /// schema.
     fn get_envelope_schema(
         &self,
         connector: &str,
-        db: &str,
+        database: &str,
+        namespace: &str,
         table: &str,
         identity: &SchemaIdentity,
     ) -> EnvelopeSchemaLookup;
@@ -424,9 +432,7 @@ fn registry_error(
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ResolvedKey {
     subject: String,
-    connector: String,
-    db: String,
-    table: String,
+    relation: crate::SourceRelationIdentity,
     identity: SchemaIdentity,
     mapping: String,
 }
@@ -598,75 +604,126 @@ impl AvroEncoder {
         self.encode_inferred(&subject, name, &json_value).await
     }
 
-    /// Encode a CDC event with the schema it requires.
+    /// Encode a CDC event with the schema it requires, under the subject
+    /// of its mapping version (`<subject>-v1` / `<subject>-v2`: records of
+    /// different versions never share a subject or a cached schema).
     ///
-    /// An event carrying its source schema version (`identity`) is encoded
-    /// with the DDL-derived schema of exactly that version (Path A); an
-    /// event without one, or from a source the provider does not serve,
-    /// with the subject's inferred schema (Path C).
+    /// An event carrying its source schema version is encoded with the
+    /// DDL-derived schema of exactly that version (Path A), its row images
+    /// converted from their canonical values; an event without one, or from
+    /// a source the provider does not serve, with the subject's inferred
+    /// schema (Path C).
     ///
     /// # Arguments
     ///
     /// * `topic` - Destination topic/stream/subject (used for SR subject naming)
-    /// * `value` - Serializable envelope data
-    /// * `connector` - Source connector type ("mysql", "postgresql", etc.)
-    /// * `db` - Source database name
-    /// * `table` - Source table name
-    /// * `identity` - The event's source schema version, if it carries one
-    pub async fn encode_event<T: Serialize>(
+    /// * `event` - The event (its rows, mapping version and schema version)
+    /// * `envelope` - The event's envelope (its non-row fields are encoded
+    ///   from it)
+    pub async fn encode_event(
         &self,
         topic: &str,
-        value: &T,
-        connector: &str,
-        db: &str,
-        table: &str,
-        identity: Option<&SchemaIdentity>,
+        event: &crate::Event,
+        envelope: &EnvelopeData<'_>,
     ) -> Result<Bytes, EncodingError> {
-        let subject = self.resolve_subject(topic);
-        let json_value = serde_json::to_value(value)
+        let mapping = event.type_mapping;
+        let subject =
+            format!("{}-{}", self.resolve_subject(topic), mapping.as_str());
+        let json_value = serde_json::to_value(envelope)
             .map_err(|e| EncodingError::Avro(e.to_string()))?;
+        let (connector, database, namespace, table) = (
+            event.source.connector.as_str(),
+            event.source.db.as_str(),
+            event.source.namespace(),
+            event.source.table.as_str(),
+        );
+        // The relation's full identity: caches key on it, and Avro names
+        // carry its escaped parts, so same-named tables of other databases
+        // or schemas never share a name.
+        let relation = crate::SourceRelationIdentity::of(&event.source);
+        let (avro_ns, avro_table) = relation.avro_path();
+        let identity = SchemaIdentity::of(
+            event.schema_version.as_deref(),
+            event.schema_sequence,
+        );
+        let rows = row_paths(event);
+        // The row images' extensions fill their stable sibling slots (null
+        // when a row has none); the rows' own records hold declared columns
+        // only.
+        let mut json_value = json_value;
+        if let serde_json::Value::Object(o) = &mut json_value {
+            for (key, row) in [
+                ("before_extensions", &event.before),
+                ("after_extensions", &event.after),
+            ] {
+                let ext = row
+                    .as_ref()
+                    .filter(|r| !r.extensions().is_empty())
+                    .map(|r| {
+                        serde_json::Value::Object(
+                            r.extensions()
+                                .iter()
+                                .map(|(n, d)| {
+                                    (
+                                        n.clone(),
+                                        serde_json::Value::String(
+                                            d.canonical_text(),
+                                        ),
+                                    )
+                                })
+                                .collect(),
+                        )
+                    })
+                    .unwrap_or(serde_json::Value::Null);
+                o.insert(key.to_string(), ext);
+            }
+        }
 
         if let (Some(provider), Some(identity)) =
-            (self.source_schemas.as_ref(), identity)
+            (self.source_schemas.as_ref(), identity.as_ref())
         {
             let key = ResolvedKey {
                 subject: subject.clone(),
-                connector: connector.to_string(),
-                db: db.to_string(),
-                table: table.to_string(),
+                relation: relation.clone(),
                 identity: identity.clone(),
-                mapping: provider.mapping_id().to_string(),
+                mapping: format!(
+                    "{}:{}",
+                    provider.mapping_id(),
+                    mapping.as_str()
+                ),
             };
             let cached = self.resolved.read().get(&key).cloned();
             if let Some((schema_id, schema)) = cached {
-                return encode_with(schema_id, &schema, &json_value);
+                return encode_with(schema_id, &schema, &json_value, &rows);
             }
-            match provider.get_envelope_schema(connector, db, table, identity) {
+            match provider.get_envelope_schema(
+                connector, database, namespace, table, identity,
+            ) {
                 EnvelopeSchemaLookup::Found(schema_json, _) => {
                     debug!(
-                        connector,
-                        db,
-                        table,
+                        relation = %relation.canonical(),
                         fingerprint = %identity.fingerprint,
                         "using DDL-derived Avro schema (Path A)"
                     );
                     counter!("deltaforge_avro_encode_total", "path" => "ddl")
                         .increment(1);
+                    let (schema_json, _) =
+                        with_mapping_attr(&schema_json, mapping)?;
                     let (schema_id, schema) =
                         self.register(&key.subject, &schema_json, None).await?;
                     self.resolved
                         .write()
                         .insert(key, (schema_id, schema.clone()));
-                    return encode_with(schema_id, &schema, &json_value);
+                    return encode_with(schema_id, &schema, &json_value, &rows);
                 }
                 EnvelopeSchemaLookup::Unavailable(reason) => {
                     return Err(EncodingError::SchemaUnavailable(format!(
-                        "{connector} {db}.{table}: {reason}"
+                        "{connector} {database}.{namespace}.{table}: {reason}"
                     )));
                 }
                 EnvelopeSchemaLookup::Conflict(reason) => {
                     return Err(EncodingError::SchemaConflict(format!(
-                        "{connector} {db}.{table}: {reason}"
+                        "{connector} {database}.{namespace}.{table}: {reason}"
                     )));
                 }
                 EnvelopeSchemaLookup::Absent => {}
@@ -674,14 +731,19 @@ impl AvroEncoder {
         }
 
         debug!(
-            connector,
-            db,
-            table,
+            relation = %relation.canonical(),
             "no DDL schema version for the event: JSON inference (Path C)"
         );
         counter!("deltaforge_avro_encode_total", "path" => "inferred")
             .increment(1);
-        let record_name = format!("deltaforge.{connector}.{db}.{table}.Value");
+        let record_name =
+            format!("deltaforge.{connector}.{avro_ns}.{avro_table}.Value");
+        if let serde_json::Value::Object(o) = &mut json_value {
+            // An inferred schema carries extensions as row fields.
+            o.remove("before_extensions");
+            o.remove("after_extensions");
+        }
+        let json_value = inference_json(json_value, event)?;
         self.encode_inferred(&subject, &record_name, &json_value)
             .await
     }
@@ -744,7 +806,7 @@ impl AvroEncoder {
         };
         counter!("deltaforge_avro_encode_total", "path" => "ddl_event")
             .increment(1);
-        encode_with(schema_id, &schema, &record)
+        encode_with(schema_id, &schema, &record, &[])
     }
 
     /// Path C: widen the inferred schema of `(subject, record_name)` to
@@ -799,7 +861,7 @@ impl AvroEncoder {
         };
         let (schema_id, schema) =
             self.register(subject, &schema_json, Some(&hash)).await?;
-        encode_with(schema_id, &schema, json_value)
+        encode_with(schema_id, &schema, json_value, &[])
     }
 
     /// Register a schema (cached per subject and canonical hash).
@@ -854,14 +916,16 @@ fn encode_with(
     schema_id: u32,
     schema: &AvroSchema,
     json_value: &serde_json::Value,
+    rows: &[(&str, &CanonicalRow)],
 ) -> Result<Bytes, EncodingError> {
-    let avro_value = json_to_avro(json_value, schema).inspect_err(|_| {
-        counter!(
-            "deltaforge_avro_encode_failure_total",
-            "reason" => "schema_mismatch"
-        )
-        .increment(1);
-    })?;
+    let avro_value =
+        json_to_avro_rows(json_value, schema, rows).inspect_err(|_| {
+            counter!(
+                "deltaforge_avro_encode_failure_total",
+                "reason" => "schema_mismatch"
+            )
+            .increment(1);
+        })?;
     let avro_bytes =
         apache_avro::to_avro_datum(schema, avro_value).map_err(|e| {
             EncodingError::Avro(format!("Avro encoding failed: {e}"))
@@ -886,9 +950,21 @@ fn encode_with(
 /// field, its source type (`deltaforge.source_type` on the field, else the
 /// JSON kind) and the target type, never the value. Nothing is substituted,
 /// rounded, truncated or defaulted.
+#[cfg(test)]
 fn json_to_avro(
     json: &serde_json::Value,
     schema: &AvroSchema,
+) -> Result<AvroValue, EncodingError> {
+    json_to_avro_rows(json, schema, &[])
+}
+
+/// [`json_to_avro`], with the event's row images (by envelope path)
+/// converted from their canonical values wherever the schema has a row
+/// image record.
+fn json_to_avro_rows(
+    json: &serde_json::Value,
+    schema: &AvroSchema,
+    rows: &[(&str, &CanonicalRow)],
 ) -> Result<AvroValue, EncodingError> {
     let resolved = apache_avro::schema::ResolvedSchema::try_from(schema)
         .map_err(|e| {
@@ -898,8 +974,110 @@ fn json_to_avro(
         names: resolved.get_names(),
         path: String::new(),
         source: None,
+        rows,
     };
     convert(json, schema, &cx)
+}
+
+/// The envelope paths of an event's row images, for every envelope.
+fn row_paths(event: &crate::Event) -> Vec<(&'static str, &CanonicalRow)> {
+    let mut rows = Vec::new();
+    if let Some(b) = &event.before {
+        rows.extend([("before", b), ("payload.before", b), ("data.before", b)]);
+    }
+    if let Some(a) = &event.after {
+        rows.extend([("after", a), ("payload.after", a), ("data.after", a)]);
+    }
+    rows
+}
+
+/// The JSON an inferred (Path C) schema is built from and encoded with:
+/// the envelope with each row image as exact JSON (integers as numbers,
+/// JSON columns and documents as their canonical text). An unchanged TOAST
+/// value has no value to infer from: a conversion failure.
+fn inference_json(
+    mut envelope: serde_json::Value,
+    event: &crate::Event,
+) -> Result<serde_json::Value, EncodingError> {
+    use crate::canonical::view::value_view;
+    use crate::canonical::{CanonicalValue, DbValue};
+    let row_json = |image: &str,
+                    row: &CanonicalRow|
+     -> Result<serde_json::Value, EncodingError> {
+        let mut m = serde_json::Map::new();
+        for (name, v) in row.iter() {
+            let j = match v {
+                CanonicalValue::Unchanged => {
+                    return Err(EncodingError::Conversion(
+                        super::ConversionFailure {
+                            column: format!("{image}.{name}"),
+                            source_type: "unchanged TOAST".into(),
+                            target_type: "Avro (inferred)".into(),
+                            reason: "PostgreSQL did not send the value",
+                        },
+                    ));
+                }
+                CanonicalValue::Db(DbValue::Json(j)) => {
+                    serde_json::Value::String(j.as_str().to_string())
+                }
+                CanonicalValue::Document(d) => {
+                    serde_json::Value::String(d.canonical_text())
+                }
+                other => value_view(other, event.type_mapping)
+                    .expect("not unchanged"),
+            };
+            m.insert(name.to_string(), j);
+        }
+        for (name, d) in row.extensions() {
+            if m.contains_key(name) {
+                return Err(EncodingError::Conversion(
+                    super::ConversionFailure {
+                        column: format!("{image}.{name}"),
+                        source_type: "processor extension".into(),
+                        target_type: "Avro (inferred)".into(),
+                        reason: "an extension has a column's name",
+                    },
+                ));
+            }
+            m.insert(
+                name.clone(),
+                serde_json::Value::String(d.canonical_text()),
+            );
+        }
+        Ok(serde_json::Value::Object(m))
+    };
+    for (path, row) in row_paths(event) {
+        let (parent, image) = match path.split_once('.') {
+            Some((p, i)) => (Some(p), i),
+            None => (None, path),
+        };
+        let target = match parent {
+            Some(p) => envelope.get_mut(p),
+            None => Some(&mut envelope),
+        };
+        if let Some(serde_json::Value::Object(obj)) = target
+            && obj.contains_key(image)
+        {
+            obj.insert(image.to_string(), row_json(image, row)?);
+        }
+    }
+    Ok(envelope)
+}
+
+/// `schema_json` with `deltaforge.type_mapping` on its top-level record.
+fn with_mapping_attr(
+    schema_json: &str,
+    mapping: crate::TypeMapping,
+) -> Result<(String, Arc<AvroSchema>), EncodingError> {
+    let mut v: serde_json::Value = serde_json::from_str(schema_json)
+        .map_err(|e| EncodingError::Avro(format!("schema JSON: {e}")))?;
+    if let serde_json::Value::Object(o) = &mut v {
+        o.insert("deltaforge.type_mapping".into(), mapping.as_str().into());
+    }
+    let json = v.to_string();
+    let schema = AvroSchema::parse_str(&json)
+        .map_err(|e| EncodingError::Avro(format!("schema: {e}")))?;
+    Ok((json, Arc::new(schema)))
 }
 
 /// Where a conversion is: the named types, the field path and the field's
@@ -908,11 +1086,22 @@ struct Cx<'a> {
     names: &'a apache_avro::schema::NamesRef<'a>,
     path: String,
     source: Option<String>,
+    /// The event's canonical row images by envelope path (`after`,
+    /// `payload.after`, ...): converted from their values, never from JSON.
+    rows: &'a [(&'a str, &'a CanonicalRow)],
 }
 
 impl Cx<'_> {
+    fn row(&self) -> Option<&CanonicalRow> {
+        self.rows
+            .iter()
+            .find(|(p, _)| *p == self.path)
+            .map(|(_, r)| *r)
+    }
+
     fn field(&self, name: &str, source: Option<String>) -> Cx<'_> {
         Cx {
+            rows: self.rows,
             names: self.names,
             path: if self.path.is_empty() {
                 name.to_string()
@@ -925,6 +1114,7 @@ impl Cx<'_> {
 
     fn item(&self) -> Cx<'_> {
         Cx {
+            rows: self.rows,
             names: self.names,
             path: format!("{}[]", self.path),
             source: self.source.clone(),
@@ -988,6 +1178,14 @@ fn convert(
                     cx.fail(json, "named type", "unresolved named reference")
                 })?;
             convert(json, target, cx)
+        }
+        // A row image the event carries canonically.
+        (AvroSchema::Record(r), _)
+            if r.fields.iter().any(|f| {
+                f.custom_attributes.contains_key(SOURCE_TYPE_ATTR)
+            }) && cx.row().is_some() =>
+        {
+            canonical_rows::convert_row(cx.row().expect("checked"), r, cx)
         }
         (_, J::Null) => {
             Err(cx.fail(json, kind_of(schema), "null for a non-nullable field"))
@@ -1258,7 +1456,9 @@ fn convert_union(
     cx: &Cx<'_>,
 ) -> Result<AvroValue, EncodingError> {
     let variants = union.variants();
-    if json.is_null() {
+    // A row image the event carries canonically is present whatever its
+    // JSON rendering.
+    if json.is_null() && cx.row().is_none() {
         return variants
             .iter()
             .position(|v| matches!(v, AvroSchema::Null))
@@ -1512,7 +1712,8 @@ mod tests {
         fn get_envelope_schema(
             &self,
             _connector: &str,
-            _db: &str,
+            _database: &str,
+            _namespace: &str,
             _table: &str,
             _identity: &SchemaIdentity,
         ) -> EnvelopeSchemaLookup {
@@ -1550,15 +1751,33 @@ mod tests {
             Some(Arc::new(UnavailableSchemas)),
         )
         .unwrap();
+        let mut event = crate::Event::new_row(
+            crate::EventId::mysql_row_server(1, "t", 1, 0),
+            crate::SourceInfo {
+                version: "t".into(),
+                connector: "mysql".into(),
+                name: "p".into(),
+                ts_ms: 1,
+                db: "shop".into(),
+                schema: None,
+                table: "orders".into(),
+                snapshot: None,
+                position: Default::default(),
+            },
+            crate::Op::Create,
+            None,
+            Some(crate::canonical::fixture::row(json!({"id": 1}))),
+            crate::TypeMapping::V2,
+            1,
+            1,
+        );
+        event.schema_version = Some("h1".into());
+        event.schema_sequence = Some(1);
+        let native = crate::envelope::EnvelopeType::Native.build();
+        let envelope =
+            native.wrap(&event, crate::NativeOpts::default()).unwrap();
         let err = encoder
-            .encode_event(
-                "orders",
-                &json!({"id": 1}),
-                "mysql",
-                "shop",
-                "orders",
-                SchemaIdentity::of(Some("h1"), Some(1)).as_ref(),
-            )
+            .encode_event("orders", &event, &envelope)
             .await
             .unwrap_err();
         assert!(

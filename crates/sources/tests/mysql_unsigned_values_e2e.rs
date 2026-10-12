@@ -1,7 +1,8 @@
 //! Unsigned integer columns keep their values: a `* UNSIGNED` value above
 //! the signed range of its width is emitted as that unsigned value (never
 //! negative) by the snapshot, by inserts, by both images of an update and by deletes,
-//! in the event JSON a sink serializes, under both `binlog_row_metadata`
+//! as the same typed value from the snapshot and the stream, and in the
+//! native JSON a sink serializes, under both `binlog_row_metadata`
 //! settings; and the registered schema records the columns as unsigned.
 //!
 //! ```bash
@@ -15,7 +16,10 @@ use checkpoints::{CheckpointStore, MemCheckpointStore};
 use common::AllowList;
 use ctor::dtor;
 use deltaforge_config::{OnSchemaDrift, SnapshotCfg, SnapshotMode};
-use deltaforge_core::{Event, Op, Source, SourceItem};
+use deltaforge_core::canonical::{DbValue, IntWidth};
+use deltaforge_core::{
+    CanonicalValue, Event, NativeOpts, Op, Source, SourceItem,
+};
 use gate_ownership::GateOwned;
 use mysql_async::prelude::Queryable;
 use serde_json::{Value, json};
@@ -109,31 +113,37 @@ fn insert(db: &str, id: u32, v: [u64; 5]) -> String {
     )
 }
 
-/// How a value is represented: the stream emits JSON numbers; the
-/// snapshot (MySQL's text protocol) emits every column value as a string,
-/// a separate snapshot/stream representation difference recorded with
-/// this check, not an unsigned defect.
-#[derive(Clone, Copy)]
-enum Repr {
-    Number,
-    Text,
-}
+/// The unsigned columns' widths, in `NAMES` order.
+const WIDTHS: [IntWidth; 5] = [
+    IntWidth::W8,
+    IntWidth::W16,
+    IntWidth::W24,
+    IntWidth::W32,
+    IntWidth::W64,
+];
 
-/// The image's unsigned columns equal `v`, in the event and in the JSON a
-/// sink serializes from it.
-fn assert_image(e: &Event, image: &str, v: [u64; 5], repr: Repr, what: &str) {
-    let serialized: Value = serde_json::to_value(e).unwrap();
-    for (n, want) in NAMES.iter().zip(v) {
-        let want = match repr {
-            Repr::Number => json!(want),
-            Repr::Text => json!(want.to_string()),
+/// The image's unsigned columns equal `v` exactly (typed unsigned values of
+/// the column's width, identical from the snapshot and the stream), and in
+/// the native JSON a sink serializes from it: narrower widths as JSON
+/// numbers, 64-bit values as exact decimal strings (v2 default).
+fn assert_image(e: &Event, image: &str, v: [u64; 5], what: &str) {
+    let serialized: Value = e.native_value(NativeOpts::default()).unwrap();
+    for ((n, want), width) in NAMES.iter().zip(v).zip(WIDTHS) {
+        let row = match image {
+            "after" => e.after.as_ref().unwrap(),
+            _ => e.before.as_ref().unwrap(),
         };
-        let got = match image {
-            "after" => &e.after.as_ref().unwrap()[n],
-            _ => &e.before.as_ref().unwrap()[n],
+        assert_eq!(
+            row.get(n),
+            Some(&CanonicalValue::Db(DbValue::uint(want, width).unwrap())),
+            "{what}: {image}.{n}: {e:?}"
+        );
+        let want_json = if width == IntWidth::W64 {
+            json!(want.to_string())
+        } else {
+            json!(want)
         };
-        assert_eq!(got, &want, "{what}: {image}.{n}: {e:?}");
-        assert_eq!(serialized[image][n], want, "{what}: serialized");
+        assert_eq!(serialized[image][n], want_json, "{what}: serialized");
     }
 }
 
@@ -166,6 +176,7 @@ async fn run(port: u16, id: &str, db: &str, snapshot: SnapshotMode) -> Run {
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let (tx, rx) = test_common::acked_channel(&src, &ckpt, &src.id, 1024);
     let handle = src.run(tx, ckpt.clone()).await;
@@ -188,11 +199,8 @@ async fn next(r: &mut Run, op: Op, id: i64) -> Event {
                     && e.after
                         .as_ref()
                         .or(e.before.as_ref())
-                        .map(|a| &a["id"])
-                        .is_some_and(|v| {
-                            v.as_i64() == Some(id)
-                                || v.as_str() == Some(&id.to_string())
-                        }) =>
+                        .map(|a| test_common::row_view(a)["id"].clone())
+                        .is_some_and(|v| v.as_i64() == Some(id)) =>
             {
                 return e;
             }
@@ -254,21 +262,9 @@ async fn stream_case(row_metadata: &str) {
     let mut r = run(port, &id, &db, SnapshotMode::Never).await;
     sql(port, &[insert(&db, 1, LOW), insert(&db, 2, HIGH)]).await;
     let e = next(&mut r, Op::Create, 1).await;
-    assert_image(
-        &e,
-        "after",
-        LOW,
-        Repr::Number,
-        "insert at the signed boundary",
-    );
+    assert_image(&e, "after", LOW, "insert at the signed boundary");
     let e = next(&mut r, Op::Create, 2).await;
-    assert_image(
-        &e,
-        "after",
-        HIGH,
-        Repr::Number,
-        "insert at the unsigned maximum",
-    );
+    assert_image(&e, "after", HIGH, "insert at the unsigned maximum");
     sql(
         port,
         &[format!(
@@ -278,11 +274,11 @@ async fn stream_case(row_metadata: &str) {
     )
     .await;
     let e = next(&mut r, Op::Update, 1).await;
-    assert_image(&e, "before", LOW, Repr::Number, "update");
-    assert_image(&e, "after", HIGH, Repr::Number, "update");
+    assert_image(&e, "before", LOW, "update");
+    assert_image(&e, "after", HIGH, "update");
     sql(port, &[format!("DELETE FROM {db}.t WHERE id=2")]).await;
     let e = next(&mut r, Op::Delete, 2).await;
-    assert_image(&e, "before", HIGH, Repr::Number, "delete");
+    assert_image(&e, "before", HIGH, "delete");
     assert_schema(&r, port, &id, &db).await;
     r.handle.stop();
 }
@@ -317,21 +313,9 @@ async fn unsigned_values_snapshot_unchanged() {
     .await;
     let mut r = run(port, id, db, SnapshotMode::Initial).await;
     let e = next(&mut r, Op::Read, 1).await;
-    assert_image(
-        &e,
-        "after",
-        LOW,
-        Repr::Text,
-        "snapshot at the signed boundary",
-    );
+    assert_image(&e, "after", LOW, "snapshot at the signed boundary");
     let e = next(&mut r, Op::Read, 2).await;
-    assert_image(
-        &e,
-        "after",
-        HIGH,
-        Repr::Text,
-        "snapshot at the unsigned maximum",
-    );
+    assert_image(&e, "after", HIGH, "snapshot at the unsigned maximum");
     assert_schema(&r, port, id, db).await;
     r.handle.stop();
 }

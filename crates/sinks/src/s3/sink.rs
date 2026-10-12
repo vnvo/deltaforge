@@ -342,12 +342,24 @@ impl Sink for S3Sink {
             .into_iter()
             .map(|(idx, err)| {
                 self.observe_encode_failure("per_row");
-                (
-                    idx,
-                    SinkError::Serialization {
+                // A value its column cannot hold is a
+                // `sink_conversion_failed` incident, as in every typed sink.
+                let err = match err
+                    .downcast::<deltaforge_core::encoding::EncodingError>()
+                {
+                    Ok(
+                        enc @ deltaforge_core::encoding::EncodingError::Conversion(
+                            _,
+                        ),
+                    ) => enc.into_sink_error_for(&self.id),
+                    Ok(other) => SinkError::Serialization {
+                        details: other.to_string().into(),
+                    },
+                    Err(err) => SinkError::Serialization {
                         details: format!("{err:#}").into(),
                     },
-                )
+                };
+                (idx, err)
             })
             .collect();
 
@@ -494,16 +506,18 @@ pub(crate) fn fallback_envelope_resolver() -> SchemaResolver {
 
     warn!(
         "S3 sink starting without a schema resolver - only envelope-meta \
-         columns will be written; user data will be dropped. Wire a \
-         DDL-derived resolver from the runner for production use."
+         columns are defined, so a row with columns fails to encode (it is \
+         never dropped). Wire a DDL-derived resolver from the runner for \
+         production use."
     );
     Arc::new(move |_| {
-        // Empty columns slice → only meta columns are emitted.
-        Ok(build_envelope_arrow_schema_arc(
+        // Empty columns slice → only meta (and extension) columns.
+        build_envelope_arrow_schema_arc(
             Connector::Mysql,
             &[],
             &TypeConversionOpts::default(),
-        ))
+        )
+        .map_err(|e| anyhow::anyhow!(e))
     })
 }
 
@@ -550,7 +564,7 @@ mod tests {
             .timestamp_millis();
         Event {
             before: None,
-            after: Some(after),
+            after: Some(deltaforge_core::canonical::fixture::row(after)),
             source: SourceInfo {
                 version: "1".into(),
                 connector: "mysql".into(),
@@ -565,6 +579,7 @@ mod tests {
             op: Op::Create,
             ts_ms,
             transaction: None,
+            type_mapping: deltaforge_core::TypeMapping::V2,
             event_id: None,
             tenant_id: None,
             schema_version: None,
@@ -605,11 +620,14 @@ mod tests {
             ObjectStoreParams::local(tmp.to_string_lossy().to_string());
         let store = build_object_store(&params).unwrap();
         let cols = [col("id", "bigint")];
-        let schema = Arc::new(build_envelope_arrow_schema(
-            Connector::Mysql,
-            &cols,
-            &TypeConversionOpts::default(),
-        ));
+        let schema = Arc::new(
+            build_envelope_arrow_schema(
+                Connector::Mysql,
+                &cols,
+                &TypeConversionOpts::default(),
+            )
+            .unwrap(),
+        );
         let format: Arc<dyn FileFormat> =
             Arc::new(ParquetFormat::new(Compression::Snappy));
         let schema_resolver: SchemaResolver =
@@ -796,19 +814,27 @@ mod tests {
     async fn encoding_failure_isolated_as_per_row_dlq() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let sink = build_sink(tmp.path(), RollingConfig::default()).await;
-        // `id` declared bigint; sending a string that's not a parseable
-        // integer must trip the encoder for that row.
+        // `id` declared bigint; a text value is never parsed into an
+        // integer, so it must trip the encoder for that row.
         let bad = event_with("orders", json!({"id": "not-a-number"}));
         let result = sink.send_batch(&[bad]).await.unwrap();
         // Phase 2: the batch returns Ok with one DLQ failure isolated.
         assert_eq!(result.dlq_failures.len(), 1);
         assert_eq!(result.dlq_failures[0].0, 0);
-        match &result.dlq_failures[0].1 {
+        assert_eq!(
+            result.dlq_failures[0].1.draft().map(|d| d.reason_code),
+            Some(deltaforge_core::incident::ReasonCode::SinkConversionFailed)
+        );
+        match result.dlq_failures[0].1.root() {
             SinkError::Serialization { details } => {
+                // The column and the reason, never the value.
                 assert!(
-                    details.contains("not-a-number")
-                        || details.contains("parse"),
+                    details.contains("after.id"),
                     "expected encoder details, got: {details}"
+                );
+                assert!(
+                    !details.contains("not-a-number"),
+                    "the value must not leak into the error: {details}"
                 );
             }
             other => panic!("expected Serialization, got {other:?}"),
@@ -935,11 +961,14 @@ mod tests {
             ObjectStoreParams::local(tmp.path().to_string_lossy().to_string());
         let store = build_object_store(&params).unwrap();
         let cols = [col("id", "bigint")];
-        let schema = Arc::new(build_envelope_arrow_schema(
-            Connector::Mysql,
-            &cols,
-            &TypeConversionOpts::default(),
-        ));
+        let schema = Arc::new(
+            build_envelope_arrow_schema(
+                Connector::Mysql,
+                &cols,
+                &TypeConversionOpts::default(),
+            )
+            .unwrap(),
+        );
         let format: Arc<dyn FileFormat> = Arc::new(SlowFormat);
         let schema_resolver: SchemaResolver =
             Arc::new(move |_| Ok(schema.clone()));
@@ -1058,8 +1087,10 @@ mod tests {
         use metrics_util::debugging::DebuggingRecorder;
         let file = |namespace: &str| CommittedFile {
             partition: crate::s3::router::PartitionKey {
+                database: namespace.into(),
                 namespace: namespace.into(),
                 table: "orders".into(),
+                type_mapping: deltaforge_core::TypeMapping::V2,
                 year: 2026,
                 month: 10,
                 day: 7,

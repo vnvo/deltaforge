@@ -158,13 +158,15 @@ async fn next_event(
 fn has_id(e: &Event, id: i32) -> bool {
     e.after
         .as_ref()
-        .and_then(|v| v.get("id"))
+        .map(test_common::row_view)
+        .and_then(|v| v.get("id").cloned())
         .and_then(|v| v.as_i64())
         .map(|v| v == id as i64)
         .unwrap_or(false)
         || e.before
             .as_ref()
-            .and_then(|v| v.get("id"))
+            .map(test_common::row_view)
+            .and_then(|v| v.get("id").cloned())
             .and_then(|v| v.as_i64())
             .map(|v| v == id as i64)
             .unwrap_or(false)
@@ -252,6 +254,7 @@ async fn make_source(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }
 
@@ -627,7 +630,7 @@ async fn postgres_cdc_basic_events() -> Result<()> {
     if let Some(create_ev) = by_id.iter().find(|e| is_create_op(e)) {
         assert!(create_ev.before.is_none(), "CREATE should not have before");
         assert!(create_ev.after.is_some(), "CREATE should have after");
-        let after = create_ev.after.as_ref().unwrap();
+        let after = test_common::row_view(create_ev.after.as_ref().unwrap());
         assert_eq!(after["id"], 1);
         assert_eq!(after["sku"], "sku-1");
         info!("✓ CREATE event payload verified");
@@ -637,8 +640,8 @@ async fn postgres_cdc_basic_events() -> Result<()> {
     if let Some(update_ev) = by_id.iter().find(|e| matches!(e.op, Op::Update)) {
         assert!(update_ev.before.is_some(), "UPDATE should have before");
         assert!(update_ev.after.is_some(), "UPDATE should have after");
-        let before = update_ev.before.as_ref().unwrap();
-        let after = update_ev.after.as_ref().unwrap();
+        let before = test_common::row_view(update_ev.before.as_ref().unwrap());
+        let after = test_common::row_view(update_ev.after.as_ref().unwrap());
         assert_eq!(before["sku"], "sku-1");
         assert_eq!(after["sku"], "sku-1b");
         info!("✓ UPDATE event payload verified");
@@ -997,7 +1000,8 @@ fn assert_only_pre_drift(items: &[SourceItem], before_drift: u64) {
         match item {
             SourceItem::Event(e) => {
                 assert!(has_id(e, 300), "only the pre-drift row: {e:?}");
-                let after = e.after.as_ref().expect("an insert");
+                let after =
+                    test_common::row_view(e.after.as_ref().expect("an insert"));
                 assert!(
                     after.get("status").is_none(),
                     "decoded with the old schema: {after}"
@@ -1391,7 +1395,10 @@ async fn pg_dropped_table_altered_while_down_is_drift() -> Result<()> {
         .iter()
         .find(|e| has_id(e, 2))
         .expect("row 2 delivered under adapt");
-    assert_eq!(row2.after.as_ref().unwrap()["status"], "active");
+    assert_eq!(
+        test_common::row_view(row2.after.as_ref().unwrap())["status"],
+        "active"
+    );
     let fingerprint = row2.schema_version.clone().expect("stamped");
     let found =
         registered_versions(&client, &registry, "dropmis", "public", "orders")
@@ -2062,7 +2069,7 @@ async fn postgres_cdc_extended_types() -> Result<()> {
     })
     .await;
     let ins = events.iter().find(|e| is_create_op(e)).unwrap();
-    let after = ins.after.as_ref().unwrap();
+    let after = test_common::row_view(ins.after.as_ref().unwrap());
     assert!(after.get("uuid_col").is_some());
     assert!(after.get("tags").is_some());
     assert!(after.get("metadata").is_some());
@@ -2578,7 +2585,9 @@ async fn postgres_cdc_replica_identity_modes() -> Result<()> {
         .iter()
         .find(|e| e.op == Op::Update && e.source.table.contains("ri_full"));
     if let Some(upd) = full_update {
-        let before = upd.before.as_ref().expect("FULL should have before");
+        let before = test_common::row_view(
+            upd.before.as_ref().expect("FULL should have before"),
+        );
         assert_eq!(before["id"], 1);
         assert_eq!(before["data"], "original");
         info!("✓ ri_full UPDATE has full before image");
@@ -2826,7 +2835,7 @@ async fn postgres_cdc_null_handling() -> Result<()> {
     // Verify NULL handling in INSERT (using is_create_op for Debezium compatibility)
     let null_insert = events.iter().find(|e| is_create_op(e) && has_id(e, 1));
     if let Some(ins) = null_insert {
-        let after = ins.after.as_ref().unwrap();
+        let after = test_common::row_view(ins.after.as_ref().unwrap());
         assert!(after["text_col"].is_null());
         assert!(after["int_col"].is_null());
         info!("✓ NULL values in CREATE handled correctly");
@@ -2837,7 +2846,7 @@ async fn postgres_cdc_null_handling() -> Result<()> {
     let null_update =
         events.iter().find(|e| e.op == Op::Update && has_id(e, 2));
     if let Some(upd) = null_update {
-        let after = upd.after.as_ref().unwrap();
+        let after = test_common::row_view(upd.after.as_ref().unwrap());
         assert!(after["text_col"].is_null());
         info!("✓ NULL values in UPDATE handled correctly");
 
@@ -2933,7 +2942,9 @@ async fn postgres_cdc_outbox_capture() -> Result<()> {
         "matching prefix should be tagged __outbox"
     );
     assert_eq!(outbox_ev.op, Op::Create);
-    let after = outbox_ev.after.as_ref().expect("should have payload");
+    let after = test_common::row_view(
+        outbox_ev.after.as_ref().expect("should have payload"),
+    );
     assert_eq!(after["aggregate_type"], "Order");
     assert_eq!(after["aggregate_id"], "42");
     assert_eq!(after["event_type"], "OrderCreated");
@@ -2950,7 +2961,13 @@ async fn postgres_cdc_outbox_capture() -> Result<()> {
         Some("__wal_message"),
         "non-matching prefix should be tagged __wal_message"
     );
-    assert_eq!(audit_ev.after.as_ref().unwrap()["action"], "login");
+    // A non-outbox message is its content bytes, exactly as sent.
+    assert_eq!(
+        audit_ev.after.as_ref().unwrap().get("content"),
+        Some(&deltaforge_core::CanonicalValue::Bytes(
+            br#"{"action":"login"}"#.to_vec()
+        ))
+    );
     info!("✓ non-matching WAL message tagged __wal_message");
 
     // --- Normal table event coexists ---
@@ -3141,8 +3158,14 @@ async fn postgres_cdc_outbox_full_pipeline() -> Result<()> {
         outbox_ev.source.schema.is_none(),
         "sentinel should be cleared"
     );
-    assert_eq!(outbox_ev.after.as_ref().unwrap()["order_id"], 42);
-    assert_eq!(outbox_ev.after.as_ref().unwrap()["total"], 99.99);
+    assert_eq!(
+        test_common::row_view(outbox_ev.after.as_ref().unwrap())["order_id"],
+        42
+    );
+    assert_eq!(
+        test_common::row_view(outbox_ev.after.as_ref().unwrap())["total"],
+        99.99
+    );
     let headers = outbox_ev
         .routing
         .as_ref()
@@ -3176,7 +3199,10 @@ async fn postgres_cdc_outbox_full_pipeline() -> Result<()> {
         table_ev.routing.is_none(),
         "table event should have no routing"
     );
-    assert_eq!(table_ev.after.as_ref().unwrap()["sku"], "sku-1");
+    assert_eq!(
+        test_common::row_view(table_ev.after.as_ref().unwrap())["sku"],
+        "sku-1"
+    );
     info!("✓ normal table event passes through processor unchanged");
 
     // --- raw_payload mode: re-process cloned raw events ---
@@ -3210,7 +3236,7 @@ async fn postgres_cdc_outbox_full_pipeline() -> Result<()> {
         "raw_payload flag should be set on outbox event"
     );
     assert_eq!(
-        raw_outbox_ev.after.as_ref().unwrap()["order_id"],
+        test_common::row_view(raw_outbox_ev.after.as_ref().unwrap())["order_id"],
         42,
         "payload should still be extracted"
     );
@@ -3393,6 +3419,7 @@ async fn make_snap_source(
         table_options,
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }
 
@@ -3675,7 +3702,7 @@ async fn pg_interrupted_snapshot_is_replaced_by_the_next_generation()
     let before: std::collections::HashMap<_, _> = snap_reads(&partial)
         .iter()
         .filter_map(|e| {
-            let id = e.after.as_ref()?.get("id")?.as_i64()?;
+            let id = test_common::row_view(e.after.as_ref()?)["id"].as_i64()?;
             Some((id, e.event_id?))
         })
         .collect();
@@ -3719,7 +3746,8 @@ async fn pg_interrupted_snapshot_is_replaced_by_the_next_generation()
         if let (Some(id), Some(new_id)) = (
             e.after
                 .as_ref()
-                .and_then(|v| v.get("id"))
+                .map(test_common::row_view)
+                .and_then(|v| v.get("id").cloned())
                 .and_then(|v| v.as_i64()),
             e.event_id,
         ) && let Some(old_id) = before.get(&id)
@@ -3886,7 +3914,8 @@ async fn pg_parallel_and_sequential_pk_produce_identical_ids() -> Result<()> {
             snap_reads(&events)
                 .iter()
                 .filter_map(|e| {
-                    let k = e.after.as_ref()?.get("id")?.as_i64()?;
+                    let k = test_common::row_view(e.after.as_ref()?)["id"]
+                        .as_i64()?;
                     Some((k, e.event_id?))
                 })
                 .collect::<std::collections::HashMap<_, _>>()
@@ -4326,18 +4355,12 @@ mod event_schema_identity {
         .await?;
         let (ev, _) = es.run(OnSchemaDrift::Adapt, &[], 3).await;
         assert_eq!(row(&ev, 2).schema_version.clone().unwrap(), f_old);
-        assert_eq!(
-            row(&ev, 2)
-                .after
-                .as_ref()
-                .unwrap()
-                .as_object()
-                .unwrap()
-                .len(),
-            2
-        );
+        assert_eq!(row(&ev, 2).after.as_ref().unwrap().len(), 2);
         assert_ne!(row(&ev, 3).schema_version.clone().unwrap(), f_old);
-        assert_eq!(row(&ev, 3).after.as_ref().unwrap()["note"], "n");
+        assert_eq!(
+            test_common::row_view(row(&ev, 3).after.as_ref().unwrap())["note"],
+            "n"
+        );
         let b = es.bindings().await?;
         assert_eq!(b.len(), 2);
         assert_eq!(b[0]["oid"].as_u64().unwrap(), oid_old as u64);

@@ -155,11 +155,20 @@ pub fn build_envelope_schema(
     // they don't carry the full record schema. Inlining both copies means
     // the parser sees two independent records (with different namespaces
     // to avoid name collision).
+    // Named types inside them (BIT `fixed`, ENUM `enum`) take the record's
+    // namespace: one namespace per copy, so each is defined once (a
+    // registry refuses a redefined name).
+    let value_ns = value_schema["namespace"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| envelope_ns.clone());
     let mut before_value = value_schema.clone();
     before_value["name"] = json!("BeforeValue");
+    before_value["namespace"] = json!(format!("{value_ns}.before"));
 
     let mut after_value = value_schema;
     after_value["name"] = json!("AfterValue");
+    after_value["namespace"] = json!(format!("{value_ns}.after"));
 
     let envelope_json = json!({
         "type": "record",
@@ -175,6 +184,19 @@ pub fn build_envelope_schema(
             {
                 "name": "after",
                 "type": ["null", after_value],
+                "default": null
+            },
+            // Processor-added document extensions of each row image, as
+            // canonical JSON text by name: a stable slot of every row
+            // schema, so added fields never register a new schema.
+            {
+                "name": "before_extensions",
+                "type": ["null", {"type": "map", "values": "string"}],
+                "default": null
+            },
+            {
+                "name": "after_extensions",
+                "type": ["null", {"type": "map", "values": "string"}],
                 "default": null
             },
             {
@@ -327,6 +349,73 @@ pub fn build_value_schema(
 mod tests {
     use super::*;
 
+    /// Every named type (record, fixed, enum) of `v` by full name, as a
+    /// registry resolves names: an unqualified name takes the enclosing
+    /// namespace.
+    fn named_types(v: &serde_json::Value, ns: &str, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(o) => {
+                let mut ns = ns.to_string();
+                if let (Some(t), Some(name)) = (
+                    o.get("type").and_then(|t| t.as_str()),
+                    o.get("name").and_then(|n| n.as_str()),
+                ) && matches!(t, "record" | "fixed" | "enum")
+                {
+                    if let Some(n) = o.get("namespace").and_then(|n| n.as_str())
+                    {
+                        ns = n.to_string();
+                    }
+                    out.push(if name.contains('.') {
+                        name.to_string()
+                    } else {
+                        format!("{ns}.{name}")
+                    });
+                }
+                for x in o.values() {
+                    named_types(x, &ns, out);
+                }
+            }
+            serde_json::Value::Array(a) => {
+                for x in a {
+                    named_types(x, ns, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Both row images hold the same columns; a named column type (BIT's
+    /// `fixed`, an ENUM's `enum`) is still defined once per full name, as a
+    /// schema registry requires ("can't redefine").
+    #[test]
+    fn named_column_types_are_defined_once() {
+        let value = build_value_schema(
+            "mysql",
+            "db",
+            "t",
+            vec![
+                json!({"name": "b8", "type": ["null", {"type": "fixed", "name": "b8_bits", "size": 1}], "default": null}),
+                json!({"name": "e", "type": ["null", {"type": "enum", "name": "e_enum", "symbols": ["a", "b"]}], "default": null}),
+            ],
+        );
+        let (text, _) =
+            build_envelope_schema("mysql", "db", "t", value).unwrap();
+        let mut names = Vec::new();
+        named_types(&serde_json::from_str(&text).unwrap(), "", &mut names);
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "{names:?}");
+        assert!(
+            names.iter().any(|n| n.ends_with(".before.b8_bits")),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.ends_with(".after.b8_bits")),
+            "{names:?}"
+        );
+    }
+
     #[test]
     fn build_mysql_envelope_schema_parses() {
         let value = build_value_schema(
@@ -397,6 +486,8 @@ mod tests {
             vec![
                 "before",
                 "after",
+                "before_extensions",
+                "after_extensions",
                 "source",
                 "op",
                 "ts_ms",

@@ -62,6 +62,17 @@ pub enum EventSchemaError {
     UnknownReplicaIdentity(char),
 }
 
+/// The name the event schema gives a column of type `oid`: the builtin
+/// type's name, or [`USER_DEFINED`] (an unknown builtin OID, which the event
+/// schema refuses, also reads as user defined here).
+pub(crate) fn type_name_of(oid: u32) -> &'static str {
+    if oid < FIRST_GENBKI_OBJECT_ID {
+        builtin_type_name(oid).unwrap_or(USER_DEFINED)
+    } else {
+        USER_DEFINED
+    }
+}
+
 impl PgEventSchema {
     /// The event schema proven by `columns` and `replica_identity` of one
     /// Relation message.

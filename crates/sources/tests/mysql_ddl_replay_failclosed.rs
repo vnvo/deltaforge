@@ -105,6 +105,7 @@ async fn replay(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     };
 
     let (tx, mut rx) = test_common::acked_channel(&src, &store, &src.id, 128);
@@ -286,6 +287,7 @@ async fn replay_without_ddl_decodes_normally() -> Result<()> {
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let (tx, mut rx) = test_common::acked_channel(&src, &store, &src.id, 128);
     let handle = src.run(tx, store).await;
@@ -307,7 +309,7 @@ async fn replay_without_ddl_decodes_normally() -> Result<()> {
 
     assert_eq!(rows.len(), 2, "both rows must be decoded");
     for (e, (a, b)) in rows.iter().zip([("A1", "B1"), ("A2", "B2")]) {
-        let after = e.after.as_ref().unwrap();
+        let after = test_common::row_view(e.after.as_ref().unwrap());
         assert_eq!(after["a"], a);
         assert_eq!(after["b"], b);
     }

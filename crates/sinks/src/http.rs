@@ -13,10 +13,7 @@ use common::retry::{RetryOutcome, RetryPolicy, retry_async};
 use common::routing::CompiledTemplate;
 use deltaforge_config::EncodingCfg;
 use deltaforge_config::HttpSinkCfg;
-use deltaforge_core::encoding::EncodingType;
-use deltaforge_core::encoding::avro::{
-    AvroEncoder, SchemaIdentity, SourceSchemaProvider,
-};
+use deltaforge_core::encoding::avro::{AvroEncoder, SourceSchemaProvider};
 use deltaforge_core::envelope::Envelope;
 use deltaforge_core::{BatchResult, Event, Sink, SinkError, SinkResult};
 use metrics::counter;
@@ -41,7 +38,8 @@ pub struct HttpSink {
     headers: reqwest::header::HeaderMap,
     batch_mode: bool,
     envelope: Box<dyn Envelope>,
-    encoding: EncodingType,
+    /// Native-JSON rendering settings (`json_wide_integers`).
+    json_opts: deltaforge_core::NativeOpts,
     avro_encoder: Option<AvroEncoder>,
     required: bool,
     send_timeout: Duration,
@@ -188,7 +186,9 @@ impl HttpSink {
             headers,
             batch_mode: cfg.batch_mode,
             envelope: envelope_type.build(),
-            encoding: encoding_type,
+            json_opts: deltaforge_core::NativeOpts {
+                wide_integers: cfg.json_wide_integers,
+            },
             avro_encoder,
             required: cfg.required.unwrap_or(true),
             send_timeout,
@@ -209,11 +209,7 @@ impl HttpSink {
             return Ok(self.url.clone());
         }
         // Resolve template against event JSON.
-        let event_json = serde_json::to_value(event).map_err(|e| {
-            SinkError::Serialization {
-                details: e.to_string().into(),
-            }
-        })?;
+        let event_json = crate::payload::route_view(event);
         self.url_template.resolve_strict(&event_json).map_err(|e| {
             SinkError::Routing {
                 details: e.to_string().into(),
@@ -224,23 +220,19 @@ impl HttpSink {
     fn serialize_event(&self, event: &Event) -> SinkResult<Vec<u8>> {
         // Outbox raw mode: write event.after directly.
         if event.routing.as_ref().is_some_and(|r| r.raw_payload) {
-            return serde_json::to_vec(
-                event.after.as_ref().unwrap_or(&Value::Null),
-            )
-            .map_err(Into::into);
+            return crate::payload::raw_payload(
+                event,
+                self.json_opts,
+                &self.id,
+            );
         }
         // Wrap with envelope and encode.
-        let envelope = self.envelope.wrap(event).map_err(|e| {
-            SinkError::Serialization {
-                details: e.to_string().into(),
-            }
-        })?;
-        self.encoding
-            .encode(&envelope)
-            .map(|b| b.to_vec())
-            .map_err(|e| SinkError::Serialization {
-                details: e.to_string().into(),
-            })
+        crate::payload::native_json(
+            self.envelope.as_ref(),
+            event,
+            self.json_opts,
+            &self.id,
+        )
     }
 
     /// Serialize event using Avro encoding (async — requires Schema Registry).
@@ -255,10 +247,11 @@ impl HttpSink {
             .expect("avro_encoder must be set");
 
         if event.routing.as_ref().is_some_and(|r| r.raw_payload) {
-            return serde_json::to_vec(
-                event.after.as_ref().unwrap_or(&Value::Null),
-            )
-            .map_err(Into::into);
+            return crate::payload::raw_payload(
+                event,
+                self.json_opts,
+                &self.id,
+            );
         }
 
         // A DDL event is its own record under the topic's DDL subject,
@@ -271,25 +264,14 @@ impl HttpSink {
             return Ok(bytes.to_vec());
         }
 
-        let envelope = self.envelope.wrap(event).map_err(|e| {
-            SinkError::Serialization {
-                details: e.to_string().into(),
-            }
-        })?;
+        let envelope =
+            self.envelope.wrap(event, self.json_opts).map_err(|e| {
+                deltaforge_core::encoding::EncodingError::from(e)
+                    .into_sink_error_for(&self.id)
+            })?;
 
         let bytes = encoder
-            .encode_event(
-                dest,
-                &envelope,
-                &event.source.connector,
-                &event.source.db,
-                &event.source.table,
-                SchemaIdentity::of(
-                    event.schema_version.as_deref(),
-                    event.schema_sequence,
-                )
-                .as_ref(),
-            )
+            .encode_event(dest, event, &envelope)
             .await
             .map_err(|e| e.into_sink_error_for(&self.id))?;
 

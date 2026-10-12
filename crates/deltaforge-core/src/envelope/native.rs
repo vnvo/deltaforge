@@ -5,7 +5,7 @@
 //! the outer `{"payload": ...}` wrapper.
 
 use super::{Envelope, EnvelopeData, EnvelopeError};
-use crate::Event;
+use crate::{Event, NativeOpts};
 
 /// Native envelope - serializes Event directly.
 ///
@@ -31,8 +31,9 @@ impl Envelope for Native {
     fn wrap<'a>(
         &'a self,
         event: &'a Event,
+        opts: NativeOpts,
     ) -> Result<EnvelopeData<'a>, EnvelopeError> {
-        Ok(EnvelopeData::Native(event))
+        Ok(EnvelopeData::Native(event.native(opts)?))
     }
 }
 
@@ -59,13 +60,14 @@ mod tests {
             },
             Op::Create,
             None,
-            Some(json!({"id": 1})),
+            Some(crate::canonical::fixture::row(json!({"id": 1}))),
+            crate::TypeMapping::V2,
             1000,
             64,
         );
 
         let envelope = Native;
-        let data = envelope.wrap(&event).unwrap();
+        let data = envelope.wrap(&event, crate::NativeOpts::default()).unwrap();
         let json = serde_json::to_value(&data).unwrap();
 
         assert_eq!(json["op"], "c");

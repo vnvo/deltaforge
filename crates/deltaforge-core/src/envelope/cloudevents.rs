@@ -6,7 +6,7 @@
 use serde::Serialize;
 
 use super::{Envelope, EnvelopeData, EnvelopeError};
-use crate::{Event, Op};
+use crate::{Event, NativeOpts, Op, TypeMapping};
 
 /// CloudEvents envelope - restructures Event to CloudEvents 1.0.
 ///
@@ -50,16 +50,23 @@ pub struct CloudEventsWrapper<'a> {
     datacontenttype: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     subject: Option<String>,
-    data: CloudEventsData<'a>,
+    data: CloudEventsData,
+    #[serde(skip)]
+    _event: std::marker::PhantomData<&'a Event>,
 }
 
 #[derive(Serialize)]
-pub(crate) struct CloudEventsData<'a> {
+pub(crate) struct CloudEventsData {
     #[serde(skip_serializing_if = "Option::is_none")]
-    before: Option<&'a serde_json::Value>,
+    before: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    after: Option<&'a serde_json::Value>,
+    after: Option<serde_json::Map<String, serde_json::Value>>,
     op: &'static str,
+    /// The mapping version the values are rendered with.
+    type_mapping: TypeMapping,
+    /// After-image columns PostgreSQL did not send (unchanged TOAST).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unchanged_columns: Vec<String>,
 }
 
 impl Envelope for CloudEvents {
@@ -70,7 +77,9 @@ impl Envelope for CloudEvents {
     fn wrap<'a>(
         &'a self,
         event: &'a Event,
+        opts: NativeOpts,
     ) -> Result<EnvelopeData<'a>, EnvelopeError> {
+        let rows = event.native(opts)?;
         let op_suffix = match event.op {
             Op::Create => "created",
             Op::Update => "updated",
@@ -96,10 +105,13 @@ impl Envelope for CloudEvents {
             datacontenttype: "application/json",
             subject: Some(event.source.full_table_name()),
             data: CloudEventsData {
-                before: event.before.as_ref(),
-                after: event.after.as_ref(),
+                before: rows.before,
+                after: rows.after,
                 op: event.op.as_str(),
+                type_mapping: event.type_mapping,
+                unchanged_columns: rows.unchanged_columns,
             },
+            _event: std::marker::PhantomData,
         };
 
         Ok(EnvelopeData::CloudEvents(wrapper))
@@ -129,13 +141,16 @@ mod tests {
             },
             Op::Create,
             None,
-            Some(json!({"id": 1, "name": "Alice"})),
+            Some(crate::canonical::fixture::row(
+                json!({"id": 1, "name": "Alice"}),
+            )),
+            crate::TypeMapping::V2,
             1700000000000,
             64,
         );
 
         let envelope = CloudEvents::new("com.example.cdc");
-        let data = envelope.wrap(&event).unwrap();
+        let data = envelope.wrap(&event, crate::NativeOpts::default()).unwrap();
         let json = serde_json::to_value(&data).unwrap();
 
         // Verify CloudEvents structure

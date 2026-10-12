@@ -76,12 +76,31 @@ fn column_to_arrow_field(
 /// `after_<name>`. Both are always nullable in the envelope: DELETE events
 /// have a null `after.*`, INSERT events have a null `before.*`, and even a
 /// non-nullable source column can be `before_*` null on insert.
+///
+/// Two more columns carry each row image's processor-added document
+/// extensions, `before_extensions` and `after_extensions` (canonical JSON
+/// objects, null when a row has none): a stable part of every schema, so
+/// added fields never change it. A table with a column named `extensions`
+/// would collide with them and is refused.
 pub fn build_envelope_arrow_schema(
     connector: Connector,
     columns: &[ColumnDesc],
     opts: &TypeConversionOpts,
-) -> Schema {
+) -> Result<Schema, String> {
+    if columns.iter().any(|c| c.name == EXTENSIONS) {
+        return Err(format!(
+            "column `{EXTENSIONS}` collides with the extension columns \
+             before_{EXTENSIONS}/after_{EXTENSIONS}"
+        ));
+    }
     let mut fields = envelope_meta_fields();
+    for image in ["before", "after"] {
+        fields.push(Field::new(
+            format!("{image}_{EXTENSIONS}"),
+            DataType::Utf8,
+            true,
+        ));
+    }
 
     for col in columns {
         let f = column_to_arrow_field(connector, col, opts);
@@ -105,8 +124,12 @@ pub fn build_envelope_arrow_schema(
         );
     }
 
-    Schema::new(fields)
+    Ok(Schema::new(fields))
 }
+
+/// The suffix of the extension columns (`before_extensions`,
+/// `after_extensions`).
+pub const EXTENSIONS: &str = "extensions";
 
 /// Per-field Arrow metadata used to retain source-side type info for
 /// downstream consumers (e.g. recovery, schema evolution, debugging).
@@ -141,8 +164,8 @@ pub fn build_envelope_arrow_schema_arc(
     connector: Connector,
     columns: &[ColumnDesc],
     opts: &TypeConversionOpts,
-) -> Arc<Schema> {
-    Arc::new(build_envelope_arrow_schema(connector, columns, opts))
+) -> Result<Arc<Schema>, String> {
+    build_envelope_arrow_schema(connector, columns, opts).map(Arc::new)
 }
 
 #[cfg(test)]
@@ -174,7 +197,8 @@ mod tests {
             Connector::Mysql,
             &[col("id", "bigint", "bigint", false)],
             &TypeConversionOpts::default(),
-        );
+        )
+        .unwrap();
         let names: Vec<&str> =
             schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert!(names.contains(&"op"));
@@ -198,10 +222,11 @@ mod tests {
             Connector::Mysql,
             &cols,
             &TypeConversionOpts::default(),
-        );
+        )
+        .unwrap();
 
         // 10 envelope meta + 2 * 3 user = 16
-        assert_eq!(schema.fields().len(), 10 + 2 * cols.len());
+        assert_eq!(schema.fields().len(), 12 + 2 * cols.len());
 
         let before_id = schema.field_with_name("before_id").unwrap();
         let after_id = schema.field_with_name("after_id").unwrap();
@@ -221,7 +246,8 @@ mod tests {
             Connector::Mysql,
             &[c],
             &TypeConversionOpts::default(),
-        );
+        )
+        .unwrap();
         let before = schema.field_with_name("before_price").unwrap();
         assert_eq!(before.data_type(), &DataType::Decimal128(12, 2));
         let after = schema.field_with_name("after_price").unwrap();
@@ -237,7 +263,8 @@ mod tests {
             Connector::Postgres,
             &[c],
             &TypeConversionOpts::default(),
-        );
+        )
+        .unwrap();
         let f = schema.field_with_name("after_tags").unwrap();
         match f.data_type() {
             DataType::List(item) => {
@@ -254,7 +281,8 @@ mod tests {
             Connector::Mysql,
             &[c],
             &TypeConversionOpts::default(),
-        );
+        )
+        .unwrap();
         let before = schema.field_with_name("before_status").unwrap();
         let md = before.metadata();
         assert_eq!(
@@ -268,12 +296,38 @@ mod tests {
     }
 
     #[test]
-    fn empty_table_only_emits_meta_columns() {
+    fn empty_table_only_emits_meta_and_extension_columns() {
         let schema = build_envelope_arrow_schema(
             Connector::Postgres,
             &[],
             &TypeConversionOpts::default(),
+        )
+        .unwrap();
+        // 10 envelope meta columns + before/after extensions.
+        assert_eq!(schema.fields().len(), 12);
+    }
+
+    #[test]
+    fn extension_columns_are_stable_and_a_colliding_column_is_refused() {
+        let schema = build_envelope_arrow_schema(
+            Connector::Mysql,
+            &[col("id", "bigint", "bigint", false)],
+            &TypeConversionOpts::default(),
+        )
+        .unwrap();
+        for f in ["before_extensions", "after_extensions"] {
+            assert_eq!(
+                schema.field_with_name(f).unwrap().data_type(),
+                &DataType::Utf8
+            );
+        }
+        assert!(
+            build_envelope_arrow_schema(
+                Connector::Mysql,
+                &[col("extensions", "json", "json", true)],
+                &TypeConversionOpts::default(),
+            )
+            .is_err()
         );
-        assert_eq!(schema.fields().len(), 10);
     }
 }

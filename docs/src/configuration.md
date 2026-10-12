@@ -91,6 +91,7 @@ source:
 | `snapshot.max_anchor_age_secs` | int | How long a snapshot generation may hold its anchor before it blocks (default: `86400`) |
 | `snapshot.max_plan_bytes` / `snapshot.max_plan_items` | int | Bounds of a generation's durable table plan; discovery blocks before sealing at either (default: 256 MiB / `1000000`). See [Initial Snapshots](snapshots.md#bounds-and-blocking) |
 | `on_schema_drift` | string | `adapt` (default) - reload schema and continue after failover drift; `halt` — stop and require operator intervention. See [Failover Handling](failover.md). |
+| `type_mapping` | string | `v2` (default) or the deprecated `v1`, stamped on every event. See [Data Types](types.md). |
 
 </td>
 </tr>
@@ -149,6 +150,7 @@ source:
 | `snapshot.max_anchor_age_secs` | int | How long a snapshot generation may hold its anchor before it blocks (default: `86400`) |
 | `snapshot.max_plan_bytes` / `snapshot.max_plan_items` | int | Bounds of a generation's durable table plan; discovery blocks before sealing at either (default: 256 MiB / `1000000`). See [Initial Snapshots](snapshots.md#bounds-and-blocking) |
 | `on_schema_drift` | string | `adapt` (default) — reload schema and continue after failover drift; `halt` — stop and require operator intervention. See [Failover Handling](failover.md). |
+| `type_mapping` | string | `v2` only (the default); `v1` is refused. See [Data Types](types.md). |
 
 </td>
 </tr>
@@ -309,6 +311,7 @@ The Kafka, Redis, NATS, and HTTP sinks support these serialization options.
 |-------|------|---------|-------------|
 | `envelope` | object | `native` | Output structure format. See [Envelopes](envelopes.md). |
 | `encoding` | string | `json` | Wire encoding format |
+| `json_wide_integers` | string | `string` | Native JSON only: 64-bit integers as exact decimal strings (`string`) or JSON numbers (`number`). Under `number`, JavaScript, `jq` and every parser that reads numbers as doubles silently round values above 2^53, and an unsigned value above 2^63-1 is a conversion failure. See [Data Types](types.md). |
 
 **Envelope types:**
 - `native` - Direct Debezium payload structure (default, most efficient)

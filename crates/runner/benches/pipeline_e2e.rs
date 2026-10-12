@@ -26,8 +26,8 @@ use tokio_util::sync::CancellationToken;
 
 use deltaforge_config::{BatchConfig, SamplingConfig, SchemaSensingConfig};
 use deltaforge_core::{
-    ArcDynSink, CheckpointMeta, Event, Op, Sink, SinkResult, SourceInfo,
-    SourceItem, SourcePosition,
+    ArcDynSink, CheckpointMeta, Event, NativeOpts, Op, Sink, SinkResult,
+    SourceInfo, SourceItem, SourcePosition,
     encoding::EncodingType,
     envelope::{Envelope, EnvelopeType},
 };
@@ -125,7 +125,10 @@ impl Sink for SerializingSink {
     }
 
     async fn send(&self, event: &Event) -> SinkResult<()> {
-        let data = serde_json::to_vec(event)
+        let native = event
+            .native(NativeOpts::default())
+            .map_err(|e| deltaforge_core::SinkError::Other(e.into()))?;
+        let data = serde_json::to_vec(&native)
             .map_err(|e| deltaforge_core::SinkError::Other(e.into()))?;
         self.bytes_written
             .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -138,7 +141,10 @@ impl Sink for SerializingSink {
     ) -> SinkResult<deltaforge_core::BatchResult> {
         let mut total = 0u64;
         for event in events {
-            let data = serde_json::to_vec(event)
+            let native = event
+                .native(NativeOpts::default())
+                .map_err(|e| deltaforge_core::SinkError::Other(e.into()))?;
+            let data = serde_json::to_vec(&native)
                 .map_err(|e| deltaforge_core::SinkError::Other(e.into()))?;
             total += data.len() as u64;
         }
@@ -215,7 +221,7 @@ impl Sink for EnvelopeSink {
     async fn send(&self, event: &Event) -> SinkResult<()> {
         let data = self
             .envelope
-            .wrap(event)
+            .wrap(event, NativeOpts::default())
             .map_err(|e| deltaforge_core::SinkError::Other(e.into()))?;
         let data = self
             .encoding
@@ -235,7 +241,7 @@ impl Sink for EnvelopeSink {
         for event in events {
             let data = self
                 .envelope
-                .wrap(event)
+                .wrap(event, NativeOpts::default())
                 .map_err(|e| deltaforge_core::SinkError::Other(e.into()))?;
             let data = self
                 .encoding
@@ -278,11 +284,12 @@ fn make_events(count: usize) -> Vec<Event> {
                 make_source_info("benchdb", "events", "bench"),
                 Op::Create,
                 None,
-                Some(json!({
+                Some(deltaforge_core::canonical::fixture::row(json!({
                     "id": i,
                     "name": format!("event-{}", i),
                     "data": { "field1": "value1", "field2": 12345 }
-                })),
+                }))),
+                deltaforge_core::TypeMapping::V2,
                 1_700_000_000_000,
                 256,
             );
@@ -304,7 +311,7 @@ fn make_events_with_json(count: usize) -> Vec<Event> {
                 make_source_info("shop", "orders", "mysql"),
                 Op::Create,
                 None,
-                Some(json!({
+                Some(deltaforge_core::canonical::fixture::row(json!({
                     "id": i,
                     "customer_id": i % 1000,
                     "status": "pending",
@@ -322,7 +329,8 @@ fn make_events_with_json(count: usize) -> Vec<Event> {
                         {"sku": "SKU-001", "qty": 1, "price": 49.99},
                         {"sku": "SKU-002", "qty": 2, "price": 25.00}
                     ]
-                })),
+                }))),
+                deltaforge_core::TypeMapping::V2,
                 1_700_000_000_000,
                 512,
             );
@@ -365,7 +373,8 @@ fn make_events_heterogeneous(count: usize) -> Vec<Event> {
                 make_source_info("shop", "transactions", "mysql"),
                 Op::Create,
                 None,
-                Some(payload),
+                Some(deltaforge_core::canonical::fixture::row(payload)),
+                deltaforge_core::TypeMapping::V2,
                 1_700_000_000_000,
                 256,
             );
@@ -386,7 +395,10 @@ fn make_small_events(count: usize) -> Vec<Event> {
                 make_source_info("d", "t", "b"),
                 Op::Create,
                 None,
-                Some(json!({"id": i})),
+                Some(deltaforge_core::canonical::fixture::row(
+                    json!({"id": i}),
+                )),
+                deltaforge_core::TypeMapping::V2,
                 1_700_000_000_000,
                 32,
             )
@@ -402,8 +414,9 @@ fn make_medium_events(count: usize) -> Vec<Event> {
                 deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
                 make_source_info("shop", "orders", "mysql"),
                 Op::Update,
-                Some(json!({"id": i, "status": "pending", "amount": 99.99})),
-                Some(json!({"id": i, "status": "shipped", "amount": 99.99, "shipped_at": "2024-01-15"})),
+                Some(deltaforge_core::canonical::fixture::row(json!({"id": i, "status": "pending", "amount": 99.99}))),
+                Some(deltaforge_core::canonical::fixture::row(json!({"id": i, "status": "shipped", "amount": 99.99, "shipped_at": "2024-01-15"}))),
+                deltaforge_core::TypeMapping::V2,
                 1_700_000_000_000,
                 256,
             )
@@ -423,7 +436,10 @@ fn make_large_events(count: usize) -> Vec<Event> {
                 make_source_info("warehouse", "inventory", "mysql"),
                 Op::Create,
                 None,
-                Some(json!({"id": i, "items": big_data})),
+                Some(deltaforge_core::canonical::fixture::row(
+                    json!({"id": i, "items": big_data}),
+                )),
+                deltaforge_core::TypeMapping::V2,
                 1_700_000_000_000,
                 2048,
             )

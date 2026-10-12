@@ -2,7 +2,8 @@
 
 use std::sync::Once;
 
-use deltaforge_core::{Event, Op, SourceInfo, SourcePosition};
+use deltaforge_core::canonical::fixture;
+use deltaforge_core::{Event, Op, SourceInfo, SourcePosition, TypeMapping};
 use serde_json::json;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -41,7 +42,10 @@ pub fn make_test_event(id: i64) -> Event {
         },
         Op::Create,
         None,
-        Some(json!({"id": id, "name": format!("item-{}", id)})),
+        Some(fixture::row(
+            json!({"id": id, "name": format!("item-{}", id)}),
+        )),
+        TypeMapping::V2,
         1_700_000_000_000 + id,
         64,
     )
@@ -68,7 +72,8 @@ pub fn make_large_event(id: i64, size_bytes: usize) -> Event {
         },
         Op::Create,
         None,
-        Some(json!({"id": id, "payload": padding})),
+        Some(fixture::row(json!({"id": id, "payload": padding}))),
+        TypeMapping::V2,
         1_700_000_000_000 + id,
         64,
     )
@@ -93,7 +98,10 @@ pub fn make_event_for_table(id: i64, table: &str) -> Event {
         },
         Op::Create,
         None,
-        Some(json!({"id": id, "name": format!("item-{}", id)})),
+        Some(fixture::row(
+            json!({"id": id, "name": format!("item-{}", id)}),
+        )),
+        TypeMapping::V2,
         1_700_000_000_000 + id,
         64,
     )

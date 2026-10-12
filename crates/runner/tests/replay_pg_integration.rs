@@ -98,7 +98,10 @@ fn row_event(id: i64) -> Event {
         source,
         Op::Create,
         None,
-        Some(serde_json::json!({ "id": id })),
+        Some(deltaforge_core::canonical::fixture::row(
+            serde_json::json!({ "id": id }),
+        )),
+        deltaforge_core::TypeMapping::V2,
         0,
         10,
     )
@@ -118,7 +121,7 @@ fn envelope(incarnation: &str, id: i64, cp: &[u8]) -> ReplayEnvelopePayload {
             offset: 0,
             event_id: format!("e-{id}"),
             tx_id: None,
-            event: serde_json::to_value(row_event(id)).unwrap(),
+            event: row_event(id).to_durable(),
         }],
         schema_binding: SchemaBinding {
             source_tables: vec!["db.t".into()],
@@ -144,7 +147,12 @@ impl deltaforge_core::Sink for RecordingSink {
         let mut ids = self.ids.lock().unwrap();
         for e in events {
             if let Some(id) = e.after.as_ref().and_then(|a| a.get("id")) {
-                ids.push(id.as_i64().unwrap_or(-1));
+                let id = deltaforge_core::canonical::view::value_view(
+                    id,
+                    deltaforge_core::TypeMapping::V2,
+                )
+                .and_then(|v| v.as_i64());
+                ids.push(id.unwrap_or(-1));
             }
         }
         Ok(BatchResult::ok())

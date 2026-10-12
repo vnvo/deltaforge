@@ -42,6 +42,7 @@ async fn unverified_lineage_prevents_stream_opening() {
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     };
 
     reset_streams_opened();
