@@ -1742,9 +1742,21 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                                             if replay_on {
                                                 capture_accum.push(ev.clone());
                                             }
+                                            // A snapshot chunk is one unit, like a
+                                            // transaction: only its final row carries
+                                            // the chunk's boundary, and the rows before
+                                            // it commit with that row. Neither a limit
+                                            // nor the timer cuts a chunk, so every
+                                            // delivered batch ends at a boundary (a
+                                            // durable sink refuses one without its
+                                            // watermark).
+                                            let open_chunk_row = ev.source.snapshot.is_some()
+                                                && ev.boundary.is_none();
                                             b.bytes += event_size_hint(&ev);
                                             b.raw.push(ev);
-                                            commit_standalone(&mut b);
+                                            if !open_chunk_row {
+                                                commit_standalone(&mut b);
+                                            }
                                             // Close the replay unit at the boundary event,
                                             // before any flush that could commit its
                                             // checkpoint (fail-closed).
@@ -8084,6 +8096,113 @@ mod tests {
         let mut ev = tx_event(id, "unused", b"unused");
         ev.transaction = None;
         SourceItem::Event(ev)
+    }
+
+    /// Snapshot rows of one chunk; only the last carries the chunk's
+    /// boundary (as the snapshot publisher sends them).
+    fn snapshot_chunk(
+        first_id: i64,
+        rows: i64,
+        cp: &[u8],
+        wm: &[u8],
+    ) -> Vec<SourceItem> {
+        (0..rows)
+            .map(|i| {
+                let mut ev = tx_event(first_id + i, "unused", b"unused");
+                ev.transaction = None;
+                ev.source.snapshot = Some("true".into());
+                ev.boundary = None;
+                if i == rows - 1 {
+                    ev.set_boundary(deltaforge_core::SourceBoundary {
+                        checkpoint: CheckpointMeta::from_vec(cp.to_vec()),
+                        durable_watermark: Some(std::sync::Arc::from(
+                            wm.to_vec(),
+                        )),
+                    });
+                }
+                SourceItem::Event(ev)
+            })
+            .collect()
+    }
+
+    /// A snapshot chunk is one unit: a batch limit below the chunk size never
+    /// cuts it, so every delivered batch ends at a chunk boundary and carries
+    /// its durable watermark (a durable sink refuses a batch without one).
+    #[tokio::test]
+    async fn the_batch_limit_never_cuts_a_snapshot_chunk() {
+        let (coord, sink) = boundary_coord(2);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_p, pause_rx) = tokio::sync::watch::channel(PauseState::default());
+        for item in snapshot_chunk(1, 3, b"cp-1", b"WM-1")
+            .into_iter()
+            .chain(snapshot_chunk(4, 3, b"cp-2", b"WM-2"))
+        {
+            tx.send(item).await.unwrap();
+        }
+        drop(tx);
+        coord.run(rx, cancel, pause_rx).await.unwrap();
+
+        let d = sink.deliveries();
+        let got: Vec<(usize, Vec<u8>, Option<Vec<u8>>)> = d
+            .iter()
+            .map(|(n, cp, wm)| {
+                (*n, cp.clone(), wm.as_ref().map(|w| w.to_vec()))
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (3, b"cp-1".to_vec(), Some(b"WM-1".to_vec())),
+                (3, b"cp-2".to_vec(), Some(b"WM-2".to_vec())),
+            ]
+        );
+    }
+
+    /// The batch timer never flushes part of a snapshot chunk either.
+    #[tokio::test]
+    async fn the_batch_timer_never_cuts_a_snapshot_chunk() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = CtxSink::new();
+        let coord = Coordinator::builder("test-timer-chunk")
+            .sinks(vec![Arc::clone(&sink) as ArcDynSink])
+            .batch_config(Some(BatchConfig {
+                max_events: Some(1000),
+                max_ms: Some(5),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_fn(
+                "ctx",
+                build_commit_fn(store, "src::sink::ctx".to_string()),
+            )
+            .process_fn(build_batch_processor(
+                Arc::from(vec![]),
+                "test".to_string(),
+            ))
+            .build();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_p, pause_rx) = tokio::sync::watch::channel(PauseState::default());
+        let run =
+            tokio::spawn(async move { coord.run(rx, cancel, pause_rx).await });
+        let mut chunk = snapshot_chunk(1, 3, b"cp-1", b"WM-1");
+        let last = chunk.pop().unwrap();
+        for item in chunk {
+            tx.send(item).await.unwrap();
+        }
+        // Many timer ticks pass mid-chunk.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        tx.send(last).await.unwrap();
+        drop(tx);
+        run.await.unwrap().unwrap();
+
+        let d = sink.deliveries();
+        assert_eq!(d.len(), 1, "one batch: the whole chunk");
+        assert_eq!(d[0].0, 3);
+        assert_eq!(d[0].2.as_deref(), Some(&b"WM-1"[..]));
     }
 
     /// A boundary item applies to a pending snapshot batch: the buffered rows and
