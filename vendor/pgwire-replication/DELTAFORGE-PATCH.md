@@ -37,3 +37,17 @@ the stream starts, so nothing can change between the proof and the stream.
 A server error answer leaves the session usable; any other failure ends it.
 Files: `src/client/worker.rs`, `src/client/tokio_client.rs`,
 `src/client/mod.rs`.
+
+Change: standby status updates on applied-LSN changes (upstream-first; mirrors
+vnvo/pgwire-replication commit 4b9f39d, PR #13, not yet released). Before, an
+idle stream reported a raised applied LSN only at the next
+`idle_wakeup_interval` wakeup, server message or keepalive reply request.
+`update_applied_lsn` now wakes the worker, which sends the newest position
+once `status_interval` has passed since its last status update. Updates
+coalesce; `update_applied_lsn` stays a compare-and-swap plus one atomic load
+except for the first raise after the worker last looked. Source and unit tests
+are identical to upstream; the upstream changelog entry and live integration
+test stay upstream. Replace this patch with the released dependency once a
+release includes it. Files: `src/client/worker.rs`,
+`src/client/tokio_client.rs`, `src/config.rs`, `Cargo.toml` (tokio
+`test-util` dev-dependency).
