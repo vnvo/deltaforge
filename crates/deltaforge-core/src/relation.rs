@@ -293,6 +293,20 @@ mod tests {
         );
     }
 
+    /// MySQL (namespace = database) paths have two parts, PostgreSQL paths
+    /// three.
+    #[test]
+    fn avro_paths_are_pinned() {
+        assert_eq!(
+            avro_path("shop", "shop", "orders"),
+            ("shop".to_string(), "orders".to_string())
+        );
+        assert_eq!(
+            avro_path("postgres", "public", "t_1"),
+            ("postgres.public".to_string(), "t__1".to_string())
+        );
+    }
+
     #[test]
     fn avro_names_escape_deterministically_and_never_collide() {
         assert_eq!(avro_name("orders"), "orders");
