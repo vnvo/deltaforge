@@ -207,14 +207,14 @@ async fn start(
     store: Arc<dyn CheckpointStore>,
     sink: Arc<ProbeSink>,
 ) -> Running {
-    let commit = Arc::new(Notify::new());
+    let commit = checkpoints::CheckpointGeneration::new();
     let proxy: Arc<dyn CheckpointStore> = Arc::new(
         PerSinkCheckpointProxy::for_source(
             store.clone(),
             SOURCE.to_string(),
             &src,
         )
-        .with_commit_signal(commit.clone()),
+        .with_checkpoint_generation(commit.clone()),
     );
     let (tx, rx) = mpsc::channel::<SourceItem>(8192);
     let handle = src.run(tx, proxy).await;
@@ -231,7 +231,7 @@ async fn start(
             SINK,
             build_commit_fn(store, format!("{SOURCE}::sink::{SINK}")),
         )
-        .commit_notify(commit)
+        .checkpoint_generation(commit)
         .process_fn(build_batch_processor(processors, "scale".to_string()))
         .build();
     let (pause_tx, pause_rx) = watch::channel(PauseState::default());

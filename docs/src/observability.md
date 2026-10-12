@@ -59,6 +59,8 @@ The sections below call out concrete metrics and log events to add per component
 | ✅ Implemented | `deltaforge_source_reconnects_total{pipeline,source}` counter when binlog reads reconnect. | Makes retry storms visible. |
 | ✅ Implemented | `deltaforge_source_lag_seconds{pipeline}` gauge — replication lag based on last event timestamp vs. wall clock. | Alert when sources fall behind. |
 | ✅ Implemented | `deltaforge_source_table_lag_seconds{pipeline,table,table_scope}` gauge - per-table replication lag within each batch, only with per-table detail enabled. | Identify which tables are lagging. |
+| ✅ Implemented | `deltaforge_wal_feedback_reads_total{pipeline,source}` counter (PostgreSQL) of durable-checkpoint reads for WAL feedback. The source re-reads after each persisted sink checkpoint commit, on resume, reconnect and credential rotation, and at least every 30 s, not per event. | A rate near the event rate means feedback has regressed to per-event state-store reads. |
+| ✅ Implemented | `deltaforge_wal_feedback_store_unavailable{pipeline,source}` gauge (PostgreSQL): 1 while the checkpoint store cannot be read for WAL feedback. Feedback holds at the last durable position, retries every second, and the source stops after 60 s. | Alert before retained WAL grows or the source stops. |
 | 🚧 Gap | `deltaforge_source_idle_seconds{pipeline,source}` gauge updated when no events arrive within the inactivity window. | Catch stuck readers before downstream backlogs form. |
 
 ### Coordinator and batching

@@ -802,7 +802,9 @@ pub async fn await_adoption<E: EngineOrder>(
     input: &StartInput<'_, E>,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(u64, GenerationControl), DriverError> {
+    let mut changes = checkpoints::CheckpointChanges::new(input.checkpoints);
     loop {
+        changes.mark_seen();
         let Some(Stored::Current { version, control }) =
             input.store.read().await?
         else {
@@ -829,7 +831,7 @@ pub async fn await_adoption<E: EngineOrder>(
             return Ok((v, c));
         }
         tokio::select! {
-            _ = input.checkpoints.await_checkpoint_change() => {}
+            _ = changes.changed() => {}
             _ = cancel.cancelled() => return Err(DriverError::Cancelled),
         }
     }
@@ -1881,7 +1883,10 @@ pub fn spawn_completion_watch<E>(
     E::Anchor: Send + Sync,
 {
     tokio::spawn(async move {
+        let mut changes =
+            checkpoints::CheckpointChanges::new(inputs.checkpoints.as_ref());
         loop {
+            changes.mark_seen();
             let input = inputs.input();
             match inputs.queue.read().await {
                 Ok(Some(Stored::Current { version, control }))
@@ -1902,7 +1907,7 @@ pub fn spawn_completion_watch<E>(
                             shared
                                 .lock()
                                 .expect("not poisoned")
-                                .resume_exclusions = behind.clone();
+                                .set_resume_exclusions(behind.clone());
                             report_start(
                                 &incidents,
                                 &inputs.source_id,
@@ -1930,7 +1935,7 @@ pub fn spawn_completion_watch<E>(
                 _ => return,
             }
             tokio::select! {
-                _ = inputs.checkpoints.await_checkpoint_change() => {}
+                _ = changes.changed() => {}
                 _ = cancel.cancelled() => return,
             }
         }
@@ -1978,7 +1983,10 @@ pub async fn decide<E: EngineOrder>(
         StartOutcome::Stream { .. } => resume_exclusions(&input).await?,
         StartOutcome::Snapshot { .. } => Vec::new(),
     };
-    shared.lock().expect("not poisoned").resume_exclusions = exclusions;
+    shared
+        .lock()
+        .expect("not poisoned")
+        .set_resume_exclusions(exclusions);
     Ok(match outcome {
         StartOutcome::Stream { .. } => Decided::Stream { completed },
         StartOutcome::Snapshot {

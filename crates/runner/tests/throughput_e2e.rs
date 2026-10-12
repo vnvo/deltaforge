@@ -338,14 +338,14 @@ async fn pg_to_kafka_backlog_drain_throughput() -> Result<()> {
         type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let src: Arc<dyn Source> = Arc::new(src);
-    let commit_signal = Arc::new(tokio::sync::Notify::new());
+    let checkpoint_generation = checkpoints::CheckpointGeneration::new();
     let proxy: Arc<dyn CheckpointStore> = Arc::new(
         PerSinkCheckpointProxy::for_source(
             store.clone(),
             SID.to_string(),
             &src,
         )
-        .with_commit_signal(commit_signal.clone()),
+        .with_checkpoint_generation(checkpoint_generation.clone()),
     );
     let (event_tx, event_rx) = mpsc::channel::<SourceItem>(8192);
     let src_handle = src.run(event_tx, proxy).await;
@@ -402,7 +402,7 @@ async fn pg_to_kafka_backlog_drain_throughput() -> Result<()> {
             ..BatchConfig::default()
         }))
         .commit_fn("kafka", cp_fn)
-        .commit_notify(commit_signal.clone())
+        .checkpoint_generation(checkpoint_generation.clone())
         .process_fn(batch_processor)
         .build();
 

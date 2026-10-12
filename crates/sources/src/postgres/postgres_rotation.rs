@@ -261,6 +261,7 @@ impl RotationRuntime {
         let publication = self.publication.clone();
         let chkpt = Arc::clone(&self.chkpt);
         let repl_client = Arc::clone(&ctx.repl_client);
+        let repl_epoch = Arc::clone(&ctx.repl_epoch);
         let cancel = self.mgr.child_cancel();
 
         // recheck (gate 1 + gate 3): candidate not expired, fresh re-preflight
@@ -309,6 +310,7 @@ impl RotationRuntime {
         // open_new: replacement stream at the frozen position with the new creds.
         let open_new = {
             let repl_client = Arc::clone(&repl_client);
+            let epoch = Arc::clone(&repl_epoch);
             let new_dsn = new_dsn.clone();
             let proof = self.proof.clone();
             let publication = publication.clone();
@@ -328,6 +330,7 @@ impl RotationRuntime {
                 )
                 .await?;
                 *repl_client.lock().await = client;
+                epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok::<(), ()>(())
             }
         };
@@ -335,6 +338,7 @@ impl RotationRuntime {
         // open_old: bounded recovery to the old creds if the replacement fails.
         let open_old = {
             let repl_client = Arc::clone(&repl_client);
+            let epoch = Arc::clone(&repl_epoch);
             let old_dsn = old_dsn.clone();
             let proof = self.proof.clone();
             let publication = publication.clone();
@@ -350,6 +354,7 @@ impl RotationRuntime {
                 )
                 .await?;
                 *repl_client.lock().await = client;
+                epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok::<(), ()>(())
             }
         };
