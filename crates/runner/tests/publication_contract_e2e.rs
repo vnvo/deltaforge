@@ -206,21 +206,24 @@ async fn until_status(mgr: &PipelineManager, name: &str, want: &str) {
 }
 
 /// Until the source streams from its slot (a pipeline reports running
-/// before its source has opened the stream).
+/// before its source has opened the stream): a walsender holds the slot.
+/// The slot is also `active` while it is still being created, by an
+/// ordinary backend, and a row committed then is never decoded.
 async fn until_streaming(port: u16) {
     let pg = admin(port).await;
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let active: bool = pg
+        let streaming: bool = pg
             .query_one(
-                "SELECT coalesce(bool_or(active), false) FROM pg_replication_slots \
-                 WHERE slot_name = 'pc_slot'",
+                "SELECT EXISTS (SELECT 1 FROM pg_replication_slots s \
+                 JOIN pg_stat_replication r ON r.pid = s.active_pid \
+                 WHERE s.slot_name = 'pc_slot')",
                 &[],
             )
             .await
             .unwrap()
             .get(0);
-        if active {
+        if streaming {
             return;
         }
         assert!(Instant::now() < deadline, "the source never streamed");
