@@ -759,16 +759,16 @@ async fn temporal_text_and_json_values_encode_exactly() {
     assert_eq!(after["d"], Avro::Date(19_782));
     assert_eq!(after["ts"], Avro::TimestampMicros(1_711_841_400_654_321));
     assert_eq!(after["txt"], Avro::String("multi\nline 😀".into()));
-    assert_eq!(after["j"], Avro::String(r#"{"k":[1,2.5]}"#.into()));
+    // MySQL's own JSON text (its separators), never a re-serialization.
+    assert_eq!(after["j"], Avro::String(r#"{"k": [1, 2.5]}"#.into()));
     mgr.delete(&name).await.ok();
 }
 
-/// CDC delivers an ENUM as its index (labels come with the canonical
-/// decoder): the index is never written for the label; the pipeline stops
-/// with the conversion incident and no record of the row.
+/// CDC delivers an ENUM decoded by its declared labels: the label reaches
+/// Avro, never the stored index.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "docker: MySQL, Kafka and Schema Registry"]
-async fn an_enum_index_is_never_written_for_its_label() {
+async fn an_enum_reaches_avro_as_its_label() {
     let i = INFRA.get_or_init(start).await;
     let db = "ua_enum";
     sql(
@@ -786,16 +786,17 @@ async fn an_enum_index_is_never_written_for_its_label() {
     let name = pipeline_named(i, &mgr, "ua-enum", db, "string", false).await;
     until_streaming(i, db).await;
     sql(i, &[format!("INSERT INTO {db}.t VALUES (1, 'b')")]).await;
-    until_status(&mgr, &name, "failed").await;
-    let incidents = mgr.incidents(&name).await.unwrap().to_string();
-    for want in ["sink_conversion_failed", "after.e", "enum", "avro_string"] {
-        assert!(incidents.contains(want), "{want}: {incidents}");
-    }
     let got = rows(
-        consume(i, db, 1, Duration::from_secs(5), Duration::from_secs(30))
+        consume(i, db, 1, Duration::from_secs(5), Duration::from_secs(120))
             .await,
     );
-    assert!(got.is_empty(), "no record of the row: {got:?}");
+    let after = got[0].after.as_ref().expect("after");
+    assert_eq!(after["e"], Avro::String("b".into()));
+    assert!(
+        mgr.incidents(&name).await.unwrap()["incidents"]
+            .as_array()
+            .is_none_or(|a| a.is_empty())
+    );
     mgr.delete(&name).await.ok();
 }
 
