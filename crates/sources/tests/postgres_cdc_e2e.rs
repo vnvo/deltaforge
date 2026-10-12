@@ -2346,10 +2346,35 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
     .await;
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
+    // A separate superuser session on another database: reads statistics
+    // and slot state without adding sessions to the test database.
+    let (admin, admin_conn) = tokio_postgres::connect(
+        &pg_admin_dsn("postgres").await,
+        tokio_postgres::NoTls,
+    )
+    .await?;
+    tokio::spawn(async move {
+        admin_conn.await.ok();
+    });
+    let sessions_before = db_sessions(&admin, &db).await?;
+
     let handle = src.run(tx, ckpt).await;
 
-    sleep(Duration::from_secs(3)).await;
-
+    // The source retries its startup check while the publication is missing:
+    // wait (bounded) for two attempts, each a session on the test database.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let n = db_sessions(&admin, &db).await?;
+        if n >= sessions_before + 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the source made {} startup attempt(s) in 30 s, expected 2",
+            n - sessions_before
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
     let pub_exists: bool = client
         .query_one("SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = 'missing_pub')", &[])
         .await?
@@ -2359,6 +2384,22 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
         "publication should NOT be auto-created by source"
     );
     info!("✓ verified source does not auto-create publication");
+
+    // Hold a transaction with an xid open so the source's slot creation has
+    // to wait for it to reach a consistent point. While it waits the slot is
+    // already `active`: the readiness condition this test used to rely on,
+    // under which a row is written but never decoded.
+    let (blocker, blocker_conn) = tokio_postgres::connect(
+        &pg_admin_dsn(&db).await,
+        tokio_postgres::NoTls,
+    )
+    .await?;
+    tokio::spawn(async move {
+        blocker_conn.await.ok();
+    });
+    blocker
+        .batch_execute("BEGIN; SELECT pg_current_xact_id();")
+        .await?;
 
     // The admin creates and registers it; the source creates its slot
     // after the registration (a slot from before it would be retained WAL).
@@ -2370,12 +2411,10 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
     .await?;
     info!("✓ admin created publication");
 
-    // The source picks it up on its next retry and creates its slot then:
-    // write only once it streams from that slot (a row before the slot is
-    // not in its stream).
+    // The old readiness condition: the slot exists and is active.
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let active: bool = client
+        let active: bool = admin
             .query_one(
                 "SELECT coalesce(bool_or(active), false) FROM pg_replication_slots \
                  WHERE slot_name = 'slot_missing_pub'",
@@ -2388,19 +2427,88 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "the source never streamed after the publication was created"
+            "the source never began creating its slot: {}",
+            slot_diagnostics(&admin, "slot_missing_pub").await
         );
-        sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(50)).await;
     }
+    // Written under the old condition, while the slot is still being
+    // created: it commits before the consistent point and is never decoded.
+    const EARLY_ID: i32 = 1;
     client
-        .execute("INSERT INTO orders (id, name) VALUES (1, 'test')", &[])
+        .execute(
+            "INSERT INTO orders (id, name) VALUES ($1, 'early')",
+            &[&EARLY_ID],
+        )
         .await?;
+    blocker.batch_execute("COMMIT").await?;
 
-    let event = next_event(&mut rx, Duration::from_secs(15))
-        .await
-        .expect("should receive create event after publication created");
+    // Readiness: a probe row delivered through the stream.
+    let mut seen: Vec<i64> = Vec::new();
+    let mut ready = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut probe = 1000;
+    while !ready {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no probe row was delivered within 60 s (delivered ids {seen:?}): {}",
+            slot_diagnostics(&admin, "slot_missing_pub").await
+        );
+        probe += 1;
+        client
+            .execute(
+                "INSERT INTO orders (id, name) VALUES ($1, 'probe')",
+                &[&probe],
+            )
+            .await?;
+        while let Some(ev) = next_event(&mut rx, Duration::from_secs(2)).await {
+            let id = ev
+                .after
+                .as_ref()
+                .map(test_common::row_view)
+                .and_then(|v| v.get("id").and_then(|v| v.as_i64()));
+            seen.extend(id);
+            if id.is_some_and(|id| id > 1000) {
+                ready = true;
+                break;
+            }
+        }
+    }
+    info!(
+        probes = probe - 1000,
+        "✓ the source streams: a probe row was delivered"
+    );
+
+    // The row under test.
+    client
+        .execute("INSERT INTO orders (id, name) VALUES (2, 'test')", &[])
+        .await?;
+    let event = loop {
+        let Some(ev) = next_event(&mut rx, Duration::from_secs(15)).await
+        else {
+            panic!(
+                "the row written after readiness was not delivered (delivered ids \
+                 {seen:?}): {}",
+                slot_diagnostics(&admin, "slot_missing_pub").await
+            );
+        };
+        if has_id(&ev, 2) {
+            break ev;
+        }
+        seen.extend(
+            ev.after
+                .as_ref()
+                .map(test_common::row_view)
+                .and_then(|v| v.get("id").and_then(|v| v.as_i64())),
+        );
+    };
     assert!(is_create_op(&event), "should be CREATE op");
     info!("✓ captured create event after admin created publication");
+    assert!(
+        !seen.contains(&(EARLY_ID as i64)),
+        "the row written while the slot was still being created was delivered \
+         (delivered ids {seen:?}): the injected delay did not take effect"
+    );
 
     verify_event_envelope(&event, "postgresql");
 
@@ -2418,6 +2526,57 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
         .await?;
     pg_drop_db(&db).await;
     Ok(())
+}
+
+/// Sessions ever established to `db` (fresh statistics snapshot).
+async fn db_sessions(admin: &tokio_postgres::Client, db: &str) -> Result<i64> {
+    admin
+        .batch_execute("SELECT pg_stat_clear_snapshot()")
+        .await?;
+    Ok(admin
+        .query_one(
+            "SELECT sessions FROM pg_stat_database WHERE datname = $1",
+            &[&db],
+        )
+        .await?
+        .get(0))
+}
+
+/// A slot's state and the walsender holding it, for a bounded wait's
+/// failure message.
+async fn slot_diagnostics(
+    admin: &tokio_postgres::Client,
+    slot: &str,
+) -> String {
+    let rows = admin
+        .query(
+            "SELECT s.active, s.active_pid, s.confirmed_flush_lsn::text, \
+             r.state, r.sent_lsn::text \
+             FROM pg_replication_slots s \
+             LEFT JOIN pg_stat_replication r ON r.pid = s.active_pid \
+             WHERE s.slot_name = $1",
+            &[&slot],
+        )
+        .await;
+    match rows {
+        Ok(rows) if rows.is_empty() => format!("slot {slot} does not exist"),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| {
+                format!(
+                    "slot={slot} active={} pid={:?} confirmed_flush={:?} \
+                     walsender_state={:?} sent={:?}",
+                    r.get::<_, bool>(0),
+                    r.get::<_, Option<i32>>(1),
+                    r.get::<_, Option<String>>(2),
+                    r.get::<_, Option<String>>(3),
+                    r.get::<_, Option<String>>(4),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+        Err(e) => format!("slot diagnostics unavailable: {e}"),
+    }
 }
 
 /// Test error handling: invalid DSN format.
