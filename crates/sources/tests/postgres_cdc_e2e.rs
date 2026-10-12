@@ -2528,6 +2528,156 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
     Ok(())
 }
 
+/// A delivery acknowledged while the stream is idle reaches the slot's
+/// confirmed_flush_lsn within about a status interval (plus the source's
+/// checkpoint reread), not at the replication client's next idle wakeup.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_idle_acknowledgement_reaches_the_slot_promptly() -> Result<()> {
+    let (db, client) = pg_setup("idle_ack").await?;
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE orders (id INT PRIMARY KEY, name TEXT); \
+             ALTER TABLE orders REPLICA IDENTITY FULL; \
+             GRANT SELECT ON orders TO {PG_CDC_USER};"
+        ))
+        .await?;
+    sources::postgres::postgres_publication::fixtures::recreate_registered(
+        &client,
+        "idle_ack_pub",
+        &["orders"],
+    )
+    .await?;
+    let (admin, admin_conn) = tokio_postgres::connect(
+        &pg_admin_dsn("postgres").await,
+        tokio_postgres::NoTls,
+    )
+    .await?;
+    tokio::spawn(async move {
+        admin_conn.await.ok();
+    });
+
+    let src = make_source(
+        "idle-ack",
+        &db,
+        "slot_idle_ack",
+        "idle_ack_pub",
+        vec!["public.orders".into()],
+        AllowList::default(),
+    )
+    .await;
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
+    let handle = src.run(tx, Arc::clone(&ckpt)).await;
+
+    // Readiness: a probe row delivered through the stream.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut probe = 1000;
+    'ready: loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no probe row was delivered within 60 s: {}",
+            slot_diagnostics(&admin, "slot_idle_ack").await
+        );
+        probe += 1;
+        client
+            .execute(
+                "INSERT INTO orders (id, name) VALUES ($1, 'probe')",
+                &[&probe],
+            )
+            .await?;
+        while let Some(ev) = next_event(&mut rx, Duration::from_secs(2)).await {
+            if has_id(&ev, probe) {
+                break 'ready;
+            }
+        }
+    }
+
+    // One row, then the stream stays idle.
+    let before_row =
+        query_lsn(&admin, "SELECT pg_current_wal_insert_lsn()::text")
+            .await?
+            .expect("wal position");
+    client
+        .execute("INSERT INTO orders (id, name) VALUES (2, 'row')", &[])
+        .await?;
+    let mut saw_row = false;
+    let commit = loop {
+        let item = timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| panic!("the row's commit was not delivered"));
+        match item {
+            SourceItem::Event(e) if has_id(&e, 2) => saw_row = true,
+            SourceItem::TxCommit { boundary, .. } if saw_row => {
+                break boundary.checkpoint;
+            }
+            _ => {}
+        }
+    };
+
+    // The delivery is acknowledged: its commit checkpoint is durable.
+    ckpt.put_raw(&src.id, commit.as_bytes()).await?;
+    let acked = std::time::Instant::now();
+    let slot_lsn = "SELECT confirmed_flush_lsn::text FROM pg_replication_slots \
+                    WHERE slot_name = 'slot_idle_ack'";
+    loop {
+        if query_lsn(&admin, slot_lsn)
+            .await?
+            .is_some_and(|l| l > before_row)
+        {
+            break;
+        }
+        assert!(
+            acked.elapsed() < Duration::from_millis(2500),
+            "confirmed_flush_lsn did not pass the acknowledged row within 2.5 s: {}",
+            slot_diagnostics(&admin, "slot_idle_ack").await
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+    let delay = acked.elapsed();
+    let retained: i64 = admin
+        .query_one(
+            "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint \
+             FROM pg_replication_slots WHERE slot_name = 'slot_idle_ack'",
+            &[],
+        )
+        .await?
+        .get(0);
+    info!(
+        ?delay,
+        retained_wal_bytes = retained,
+        "✓ idle acknowledgement reached the slot"
+    );
+
+    handle.stop();
+    let _ = timeout(Duration::from_secs(5), handle.join()).await;
+    client
+        .batch_execute("SELECT pg_drop_replication_slot('slot_idle_ack')")
+        .await
+        .ok();
+    sources::postgres::postgres_publication::fixtures::release_all(&client)
+        .await?;
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+/// A query returning one LSN as text, as a number (`None` for NULL).
+async fn query_lsn(
+    admin: &tokio_postgres::Client,
+    sql: &str,
+) -> Result<Option<u64>> {
+    let text: Option<String> = admin.query_one(sql, &[]).await?.get(0);
+    Ok(text.and_then(|t| {
+        let (hi, lo) = t.split_once('/')?;
+        Some(
+            (u64::from_str_radix(hi, 16).ok()? << 32)
+                | u64::from_str_radix(lo, 16).ok()?,
+        )
+    }))
+}
+
 /// Sessions ever established to `db` (fresh statistics snapshot).
 async fn db_sessions(admin: &tokio_postgres::Client, db: &str) -> Result<i64> {
     admin

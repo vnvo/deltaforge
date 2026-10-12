@@ -171,3 +171,7 @@ version = "3"
 
 [dev-dependencies.tokio-postgres]
 version = "0.7"
+
+[dev-dependencies.tokio]
+version = "1"
+features = ["test-util"]
