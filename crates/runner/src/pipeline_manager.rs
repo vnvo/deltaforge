@@ -116,20 +116,15 @@ pub struct PerSinkCheckpointProxy {
     /// The sinks left out of the fold while they hold a snapshot position
     /// (`Source::resume_exclusions`: behind a durably completed generation).
     exclusions: ExclusionsFn,
-    /// Notified by the coordinator after each per-sink checkpoint commit, so the source
-    /// advances WAL feedback change-driven (on commit) rather than by fixed polling. A
-    /// long fallback still re-confirms during long idle. Defaults to an unshared handle
-    /// (never signaled) so a proxy built without wiring falls back to the interval.
-    commit_signal: Arc<tokio::sync::Notify>,
+    /// Bumped by the coordinator after each persisted per-sink checkpoint
+    /// commit, so the source refreshes WAL feedback change-driven rather than
+    /// reading the store per event. Defaults to an unshared generation (never
+    /// bumped), leaving a proxy built without wiring to the source's fallback.
+    generation: checkpoints::CheckpointGeneration,
     /// The pipeline's configured sinks: each gets a checkpoint at the start
     /// position before the source delivers (`initialize_sink_checkpoints`).
     sinks: Vec<String>,
 }
-
-/// Fallback re-confirmation interval when no commit notification arrives (long, so idle
-/// sources at fleet scale generate negligible control-store load).
-const FEEDBACK_FALLBACK_INTERVAL: std::time::Duration =
-    std::time::Duration::from_secs(30);
 
 impl PerSinkCheckpointProxy {
     /// Build the proxy for a source, wiring the fold to the source's own
@@ -149,7 +144,7 @@ impl PerSinkCheckpointProxy {
             cmp_fn: Arc::new(move |a, b| cmp.compare_checkpoints(a, b)),
             is_snapshot: Arc::new(move |raw| snap.checkpoint_is_snapshot(raw)),
             exclusions: Arc::new(move || excl.resume_exclusions()),
-            commit_signal: Arc::new(tokio::sync::Notify::new()),
+            generation: checkpoints::CheckpointGeneration::new(),
             sinks: Vec::new(),
         }
     }
@@ -161,26 +156,22 @@ impl PerSinkCheckpointProxy {
         self
     }
 
-    /// Wire the coordinator's commit signal so WAL-feedback refreshes are change-driven.
+    /// Wire the coordinator's checkpoint generation so WAL-feedback refreshes
+    /// are change-driven.
     #[must_use]
-    pub fn with_commit_signal(
+    pub fn with_checkpoint_generation(
         mut self,
-        signal: Arc<tokio::sync::Notify>,
+        generation: checkpoints::CheckpointGeneration,
     ) -> Self {
-        self.commit_signal = signal;
+        self.generation = generation;
         self
     }
 }
 
 #[async_trait]
 impl CheckpointStore for PerSinkCheckpointProxy {
-    async fn await_checkpoint_change(&self) {
-        // Change-driven: wake on the coordinator's commit signal, with a long fallback so
-        // a missed signal or a long idle still re-confirms without high-frequency polling.
-        tokio::select! {
-            _ = self.commit_signal.notified() => {}
-            _ = tokio::time::sleep(FEEDBACK_FALLBACK_INTERVAL) => {}
-        }
+    fn checkpoint_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.generation.subscribe())
     }
 
     fn manages_per_sink_checkpoints(&self) -> bool {
@@ -1116,7 +1107,7 @@ impl PipelineManager {
         let (event_tx, event_rx) = mpsc::channel::<SourceItem>(32_768);
         // Signal the source (change-driven) after each per-sink commit so it refreshes
         // WAL feedback from the newly persisted durable minimum instead of polling.
-        let commit_signal = Arc::new(tokio::sync::Notify::new());
+        let checkpoint_generation = checkpoints::CheckpointGeneration::new();
         // Wrap checkpoint store so the source reads the minimum per-sink
         // checkpoint - it replays from the position the slowest sink needs.
         let source_ckpt: Arc<dyn CheckpointStore> = Arc::new(
@@ -1125,7 +1116,7 @@ impl PipelineManager {
                 spec.spec.source.source_id().to_string(),
                 &source,
             )
-            .with_commit_signal(commit_signal.clone())
+            .with_checkpoint_generation(checkpoint_generation.clone())
             // The keys the coordinator commits to (`build_commit_fn` below).
             .with_sinks(sinks.iter().map(|s| s.id().to_string()).collect()),
         );
@@ -1255,7 +1246,7 @@ impl PipelineManager {
                     .sink_batch_deadline_secs
                     .map(|s| std::time::Duration::from_secs(s.into())),
             )
-            .commit_notify(commit_signal.clone())
+            .checkpoint_generation(checkpoint_generation.clone())
             .process_fn(batch_processor);
 
         for sink in &sinks {
@@ -4402,7 +4393,7 @@ mod tests {
             cmp_fn: test_cmp_fn(),
             is_snapshot: Arc::new(|_| false),
             exclusions: Arc::new(Vec::new),
-            commit_signal: Arc::new(tokio::sync::Notify::new()),
+            generation: checkpoints::CheckpointGeneration::new(),
             sinks: Vec::new(),
         };
         assert_eq!(
@@ -4427,7 +4418,7 @@ mod tests {
             cmp_fn: test_cmp_fn(),
             is_snapshot: Arc::new(|_| false),
             exclusions: Arc::new(Vec::new),
-            commit_signal: Arc::new(tokio::sync::Notify::new()),
+            generation: checkpoints::CheckpointGeneration::new(),
             sinks: Vec::new(),
         };
         // No per-sink checkpoints and no legacy key - fresh start.
@@ -4446,12 +4437,62 @@ mod tests {
             cmp_fn: test_cmp_fn(),
             is_snapshot: Arc::new(|_| false),
             exclusions: Arc::new(Vec::new),
-            commit_signal: Arc::new(tokio::sync::Notify::new()),
+            generation: checkpoints::CheckpointGeneration::new(),
             sinks: Vec::new(),
         };
         // No per-sink keys exist, so it should fall back to the legacy key.
         let result = proxy.get_raw("mysql").await.unwrap().unwrap();
         assert_eq!(result, b"{\"pos\":500}");
+    }
+
+    /// The WAL-feedback reader's view through the proxy: it learns of each
+    /// persisted per-sink commit from the coordinator's generation, and what it
+    /// then reads is the slowest sink's checkpoint, never the fastest's.
+    #[tokio::test]
+    async fn per_sink_proxy_publishes_commits_and_folds_to_the_slowest_sink() {
+        let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+        let generation = checkpoints::CheckpointGeneration::new();
+        let proxy = PerSinkCheckpointProxy {
+            inner: store.clone(),
+            source_id: "pg".to_string(),
+            cmp_fn: test_cmp_fn(),
+            is_snapshot: Arc::new(|_| false),
+            exclusions: Arc::new(Vec::new),
+            generation: generation.clone(),
+            sinks: Vec::new(),
+        };
+        let mut changes = checkpoints::CheckpointChanges::new(&proxy);
+        changes.mark_seen();
+        assert!(!changes.has_changed());
+
+        // The coordinator persists both sinks' checkpoints, then publishes.
+        store
+            .put_raw("pg::sink::fast", b"{\"pos\":300}")
+            .await
+            .unwrap();
+        store
+            .put_raw("pg::sink::slow", b"{\"pos\":100}")
+            .await
+            .unwrap();
+        generation.bump();
+        assert!(changes.has_changed());
+        changes.mark_seen();
+        assert_eq!(
+            proxy.get_raw("pg").await.unwrap().unwrap(),
+            b"{\"pos\":100}"
+        );
+
+        // Only the fast sink advances: published, the minimum holds.
+        store
+            .put_raw("pg::sink::fast", b"{\"pos\":400}")
+            .await
+            .unwrap();
+        generation.bump();
+        assert!(changes.has_changed());
+        assert_eq!(
+            proxy.get_raw("pg").await.unwrap().unwrap(),
+            b"{\"pos\":100}"
+        );
     }
 
     #[tokio::test]
@@ -4479,7 +4520,7 @@ mod tests {
             cmp_fn: test_cmp_fn(),
             is_snapshot: Arc::new(|_| false),
             exclusions: Arc::new(Vec::new),
-            commit_signal: Arc::new(tokio::sync::Notify::new()),
+            generation: checkpoints::CheckpointGeneration::new(),
             sinks: Vec::new(),
         };
 
@@ -4512,7 +4553,7 @@ mod tests {
                     cmp_fn: Arc::new(sources::postgres::compare_pg_checkpoints),
                     is_snapshot: Arc::new(|_| false),
                     exclusions: Arc::new(Vec::new),
-                    commit_signal: Arc::new(tokio::sync::Notify::new()),
+                    generation: checkpoints::CheckpointGeneration::new(),
                     sinks: Vec::new(),
                 }
             }
@@ -4551,7 +4592,7 @@ mod tests {
                 cmp_fn: Arc::new(cmp),
                 is_snapshot: Arc::new(|_| false),
                 exclusions: Arc::new(Vec::new),
-                commit_signal: Arc::new(tokio::sync::Notify::new()),
+                generation: checkpoints::CheckpointGeneration::new(),
                 sinks: Vec::new(),
             };
             proxy
@@ -4640,7 +4681,7 @@ mod tests {
                     sources::postgres::pg_checkpoint_is_snapshot,
                 ),
                 exclusions: Arc::new(move || excluded.clone()),
-                commit_signal: Arc::new(tokio::sync::Notify::new()),
+                generation: checkpoints::CheckpointGeneration::new(),
                 sinks: Vec::new(),
             };
             proxy
@@ -4684,7 +4725,7 @@ mod tests {
             cmp_fn: test_cmp_fn(),
             is_snapshot: Arc::new(|_| false),
             exclusions: Arc::new(Vec::new),
-            commit_signal: Arc::new(tokio::sync::Notify::new()),
+            generation: checkpoints::CheckpointGeneration::new(),
             sinks: Vec::new(),
         };
 
@@ -4707,7 +4748,7 @@ mod tests {
             cmp_fn: test_cmp_fn(),
             is_snapshot: Arc::new(|_| false),
             exclusions: Arc::new(Vec::new),
-            commit_signal: Arc::new(tokio::sync::Notify::new()),
+            generation: checkpoints::CheckpointGeneration::new(),
             sinks: Vec::new(),
         };
 
@@ -4787,7 +4828,7 @@ mod tests {
             cmp_fn: test_cmp_fn(),
             is_snapshot: Arc::new(|_| false),
             exclusions: Arc::new(Vec::new),
-            commit_signal: Arc::new(tokio::sync::Notify::new()),
+            generation: checkpoints::CheckpointGeneration::new(),
             sinks: Vec::new(),
         };
         proxy
@@ -4862,7 +4903,7 @@ mod tests {
             cmp_fn: test_cmp_fn(),
             is_snapshot: Arc::new(|_| false),
             exclusions: Arc::new(Vec::new),
-            commit_signal: Arc::new(tokio::sync::Notify::new()),
+            generation: checkpoints::CheckpointGeneration::new(),
             sinks: Vec::new(),
         };
         let got = proxy.get_raw("src").await.unwrap().unwrap();
@@ -4890,7 +4931,7 @@ mod tests {
             }),
             is_snapshot: Arc::new(|_| false),
             exclusions: Arc::new(Vec::new),
-            commit_signal: Arc::new(tokio::sync::Notify::new()),
+            generation: checkpoints::CheckpointGeneration::new(),
             sinks: Vec::new(),
         };
         let got = proxy.get_raw("pg").await.unwrap().unwrap();
@@ -4908,7 +4949,7 @@ mod tests {
             cmp_fn: Arc::new(|_, _| CheckpointOrder::Equal),
             is_snapshot: Arc::new(|_| false),
             exclusions: Arc::new(Vec::new),
-            commit_signal: Arc::new(tokio::sync::Notify::new()),
+            generation: checkpoints::CheckpointGeneration::new(),
             sinks: sinks.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -4993,7 +5034,7 @@ mod tests {
             }),
             is_snapshot: Arc::new(|_| false),
             exclusions: Arc::new(Vec::new),
-            commit_signal: Arc::new(tokio::sync::Notify::new()),
+            generation: checkpoints::CheckpointGeneration::new(),
             sinks: Vec::new(),
         };
         let err = proxy

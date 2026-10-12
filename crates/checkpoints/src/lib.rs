@@ -22,6 +22,104 @@ pub use snapshot_state::assert_snapshot_state_contract;
 #[cfg(feature = "cp-sqlite")]
 pub use sqlite_store::SqliteCheckpointStore;
 
+/// A monotonic counter of durable checkpoint changes. The delivery layer bumps
+/// it after each successful checkpoint persistence; readers subscribe and mark
+/// the current generation seen *before* reading the store, so a change that
+/// lands during the read is still observed afterwards. Changes coalesce, and
+/// the newest generation is always the one a reader sees next.
+#[derive(Clone, Debug)]
+pub struct CheckpointGeneration(
+    std::sync::Arc<tokio::sync::watch::Sender<u64>>,
+);
+
+impl CheckpointGeneration {
+    pub fn new() -> Self {
+        Self(std::sync::Arc::new(tokio::sync::watch::Sender::new(0)))
+    }
+
+    /// Record that durable checkpoint state changed.
+    pub fn bump(&self) {
+        self.0.send_modify(|g| *g = g.wrapping_add(1));
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.0.subscribe()
+    }
+}
+
+impl Default for CheckpointGeneration {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// How long a reader waits for a published change before re-reading anyway: a
+/// long bound when the store publishes changes (a lost or coalesced change is
+/// still read eventually), a short one when it publishes none.
+pub const CHANGE_FALLBACK_PUBLISHED: std::time::Duration =
+    std::time::Duration::from_secs(30);
+pub const CHANGE_FALLBACK_UNPUBLISHED: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
+/// A reader's subscription to a store's durable checkpoint changes. Call
+/// [`Self::mark_seen`] immediately before reading the store; a change that
+/// lands after it is then reported by [`Self::has_changed`] and
+/// [`Self::changed`], never lost between the read and the wait.
+pub struct CheckpointChanges {
+    rx: Option<tokio::sync::watch::Receiver<u64>>,
+    fallback: std::time::Duration,
+}
+
+impl CheckpointChanges {
+    pub fn new(store: &dyn CheckpointStore) -> Self {
+        let rx = store.checkpoint_changes();
+        let fallback = if rx.is_some() {
+            CHANGE_FALLBACK_PUBLISHED
+        } else {
+            CHANGE_FALLBACK_UNPUBLISHED
+        };
+        Self { rx, fallback }
+    }
+
+    /// The longest a reader goes without re-reading the store.
+    pub fn fallback(&self) -> std::time::Duration {
+        self.fallback
+    }
+
+    /// Mark the newest generation seen. Call before reading the store.
+    pub fn mark_seen(&mut self) {
+        if let Some(rx) = &mut self.rx {
+            rx.mark_unchanged();
+        }
+    }
+
+    /// Whether a generation newer than the last seen one was published.
+    pub fn has_changed(&self) -> bool {
+        self.rx
+            .as_ref()
+            .is_some_and(|rx| rx.has_changed().unwrap_or(false))
+    }
+
+    /// Resolves once a newer generation is published, or after the fallback.
+    /// Cancellation-safe.
+    pub async fn changed(&mut self) {
+        let fallback = tokio::time::sleep(self.fallback);
+        tokio::pin!(fallback);
+        if let Some(rx) = &mut self.rx {
+            tokio::select! {
+                r = rx.changed() => match r {
+                    Ok(()) => return,
+                    // The publisher is gone: no further changes will be
+                    // published, so only the fallback re-reads.
+                    Err(_) => self.rx = None,
+                },
+                _ = &mut fallback => return,
+            }
+        }
+        fallback.await;
+    }
+}
+
 /// Checkpoint storage trait.
 /// Backends may optionally support versioning - check `supports_versioning()`.
 #[async_trait]
@@ -39,13 +137,12 @@ pub trait CheckpointStore: Send + Sync {
         false
     }
 
-    /// Wait until the durable checkpoint set may have changed, so a source can advance
-    /// WAL feedback change-driven rather than by fixed high-frequency polling. A
-    /// change-driven store (the per-sink proxy) resolves on the next commit with a long
-    /// safety fallback; the default resolves on a short fixed interval for plain
-    /// single-writer stores.
-    async fn await_checkpoint_change(&self) {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    /// Changes to the durable checkpoint set, when this store publishes them
+    /// (the per-sink proxy, fed by the coordinator after each persisted
+    /// commit). `None`: the store publishes no changes and a reader must
+    /// re-read on its own schedule.
+    fn checkpoint_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
     }
 
     /// Before a source delivers anything: give every configured sink that
@@ -229,4 +326,70 @@ pub struct VersionInfo {
     pub version: u64,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub size_bytes: usize,
+}
+
+#[cfg(test)]
+mod change_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A store publishing a generation, and the store state it stands for.
+    struct Published(CheckpointGeneration);
+
+    #[async_trait]
+    impl CheckpointStore for Published {
+        fn checkpoint_changes(
+            &self,
+        ) -> Option<tokio::sync::watch::Receiver<u64>> {
+            Some(self.0.subscribe())
+        }
+        async fn get_raw(&self, _: &str) -> CheckpointResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn put_raw(&self, _: &str, _: &[u8]) -> CheckpointResult<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &str) -> CheckpointResult<bool> {
+            Ok(false)
+        }
+        async fn list(&self) -> CheckpointResult<Vec<String>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn a_change_between_the_read_and_the_wait_is_not_lost() {
+        let generation = CheckpointGeneration::new();
+        let mut changes =
+            CheckpointChanges::new(&Published(generation.clone()));
+        assert_eq!(changes.fallback(), CHANGE_FALLBACK_PUBLISHED);
+        changes.mark_seen();
+        // ... the reader reads the store; a commit is published meanwhile ...
+        generation.bump();
+        generation.bump();
+        assert!(changes.has_changed());
+        tokio::time::timeout(Duration::from_secs(1), changes.changed())
+            .await
+            .expect("the coalesced change is still pending");
+        assert!(!changes.has_changed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_a_publisher_the_reader_falls_back_to_the_interval() {
+        let mut gone = {
+            let generation = CheckpointGeneration::new();
+            CheckpointChanges::new(&Published(generation))
+        };
+        let t0 = tokio::time::Instant::now();
+        gone.changed().await;
+        assert!(t0.elapsed() >= CHANGE_FALLBACK_PUBLISHED);
+
+        let mut unpublished =
+            CheckpointChanges::new(&MemCheckpointStore::new().unwrap());
+        assert_eq!(unpublished.fallback(), CHANGE_FALLBACK_UNPUBLISHED);
+        assert!(!unpublished.has_changed());
+        let t0 = tokio::time::Instant::now();
+        unpublished.changed().await;
+        assert!(t0.elapsed() >= CHANGE_FALLBACK_UNPUBLISHED);
+    }
 }

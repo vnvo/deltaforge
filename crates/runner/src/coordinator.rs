@@ -955,9 +955,10 @@ pub struct Coordinator<Tok> {
     /// in response to a replay pause, and `false` when it resumes. The handoff waits on it
     /// so `H` is read against a genuinely frozen tail.
     quiesce_ack: Option<watch::Sender<bool>>,
-    /// Notified after each successful per-sink checkpoint commit so the source can
-    /// refresh its WAL feedback change-driven instead of polling the checkpoint store.
-    commit_notify: Option<Arc<tokio::sync::Notify>>,
+    /// Bumped after each persisted per-sink checkpoint commit so the source
+    /// refreshes its WAL feedback change-driven instead of reading the
+    /// checkpoint store per event.
+    checkpoint_generation: Option<checkpoints::CheckpointGeneration>,
     /// The pipeline's incident store: a run starts by settling its sinks'
     /// open acknowledgement-uncertainty incidents, each by its own boundary.
     incidents: Option<storage::adapters::incidents::IncidentStore>,
@@ -988,7 +989,7 @@ pub struct CoordinatorBuilder<Tok> {
     replay_capture: Option<ReplayCapture>,
     replay_gate: Option<Arc<crate::replay_gate::ReplaySinkGate>>,
     quiesce_ack: Option<watch::Sender<bool>>,
-    commit_notify: Option<Arc<tokio::sync::Notify>>,
+    checkpoint_generation: Option<checkpoints::CheckpointGeneration>,
     incidents: Option<storage::adapters::incidents::IncidentStore>,
 }
 
@@ -1011,7 +1012,7 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static>
             replay_capture: None,
             replay_gate: None,
             quiesce_ack: None,
-            commit_notify: None,
+            checkpoint_generation: None,
             incidents: None,
         }
     }
@@ -1028,8 +1029,11 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static>
         self
     }
 
-    pub fn commit_notify(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
-        self.commit_notify = Some(notify);
+    pub fn checkpoint_generation(
+        mut self,
+        generation: checkpoints::CheckpointGeneration,
+    ) -> Self {
+        self.checkpoint_generation = Some(generation);
         self
     }
 
@@ -1142,7 +1146,7 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static>
             replay_capture: self.replay_capture,
             replay_gate: self.replay_gate,
             quiesce_ack: self.quiesce_ack,
-            commit_notify: self.commit_notify,
+            checkpoint_generation: self.checkpoint_generation,
             incidents: self.incidents,
         }
     }
@@ -2537,6 +2541,15 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                 }
             }
 
+            // Any persisted commit changed the durable checkpoint set, even
+            // when another sink's commit failed: publish it before failing so
+            // the source's WAL feedback reads it promptly (the minimum it reads
+            // is still bounded by the sink that did not advance).
+            if committed > 0
+                && let Some(g) = &self.checkpoint_generation
+            {
+                g.bump();
+            }
             if let Some(e) = first_err {
                 return Err(e).context("commit checkpoint");
             }
@@ -2566,15 +2579,6 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                         .map(|d| d.as_secs_f64())
                         .unwrap_or(0.0),
                 );
-
-                // Wake the source so it refreshes WAL feedback from the newly persisted
-                // durable minimum (change-driven, not polled). `notify_one` retains a
-                // permit if the source is not currently awaiting, so a commit is never
-                // lost; multiple commits coalesce because the source rereads the
-                // authoritative minimum on wake.
-                if let Some(n) = &self.commit_notify {
-                    n.notify_one();
-                }
             }
         }
 
@@ -2731,11 +2735,16 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
             };
             commits.push(f(commit.clone()));
         }
-        for result in join_all(commits).await {
-            result.context("commit a checkpoint barrier")?;
+        let results = join_all(commits).await;
+        // As for batch commits: publish any persisted barrier commit, even when
+        // another sink's failed.
+        if results.iter().any(Result::is_ok)
+            && let Some(g) = &self.checkpoint_generation
+        {
+            g.bump();
         }
-        if let Some(n) = &self.commit_notify {
-            n.notify_one();
+        for result in results {
+            result.context("commit a checkpoint barrier")?;
         }
         Ok(())
     }
@@ -6118,6 +6127,98 @@ mod tests {
         assert!(open(a).await);
         assert!(open(c).await);
         assert!(open(b).await, "another sink's boundary is not ours to read");
+    }
+
+    /// Run one committed event through two delivering sinks whose checkpoint
+    /// persistence succeeds or fails as given; returns the published
+    /// checkpoint generation and the store.
+    async fn publish_after(
+        persist: [bool; 2],
+    ) -> (u64, Arc<checkpoints::MemCheckpointStore>) {
+        use futures::FutureExt;
+        let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+        let generation = checkpoints::CheckpointGeneration::new();
+        let seen = generation.subscribe();
+        let mut builder = Coordinator::builder("test")
+            .sinks(vec![
+                MockSink::new("a", true) as ArcDynSink,
+                MockSink::new("b", true) as ArcDynSink,
+            ])
+            .batch_config(Some(BatchConfig {
+                max_events: Some(10),
+                max_ms: Some(100),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .checkpoint_generation(generation)
+            .process_fn(build_batch_processor(
+                Arc::from(vec![]),
+                "test".to_string(),
+            ));
+        for (sink, ok) in ["a", "b"].into_iter().zip(persist) {
+            let f: CommitCpFn<CheckpointMeta> = if ok {
+                build_commit_fn(store.clone(), format!("src::sink::{sink}"))
+            } else {
+                Box::new(|_| {
+                    async { Err(anyhow::anyhow!("persist failed")) }.boxed()
+                })
+            };
+            builder = builder.commit_fn(sink, f);
+        }
+        let coord = builder.build();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
+        let source = deltaforge_core::SourceInfo {
+            version: "test".into(),
+            connector: "mysql".into(),
+            name: "test".into(),
+            db: "db".into(),
+            schema: None,
+            table: "t".into(),
+            ts_ms: 0,
+            snapshot: None,
+            position: deltaforge_core::SourcePosition::default(),
+        };
+        let mut event = Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
+            source,
+            deltaforge_core::Op::Create,
+            None,
+            Some(deltaforge_core::canonical::fixture::row(
+                serde_json::json!({"id": 1}),
+            )),
+            deltaforge_core::TypeMapping::V2,
+            0,
+            0,
+        );
+        event.set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":7}".to_vec()));
+        event.tx_end = true;
+        tx.send(SourceItem::Event(event)).await.unwrap();
+        drop(tx);
+        let _ = coord
+            .run(rx, tokio_util::sync::CancellationToken::new(), pause_rx)
+            .await;
+        let published = *seen.borrow();
+        (published, store)
+    }
+
+    #[tokio::test]
+    async fn the_checkpoint_generation_is_published_only_after_persistence() {
+        // Persisted: published once for the commit.
+        let (published, store) = publish_after([true, true]).await;
+        assert_eq!(published, 1);
+        assert!(store.get_raw("src::sink::a").await.unwrap().is_some());
+        // Nothing persisted: delivery alone publishes nothing.
+        let (published, store) = publish_after([false, false]).await;
+        assert_eq!(published, 0);
+        assert!(store.get_raw("src::sink::a").await.unwrap().is_none());
+        // One sink persisted, the other failed: the persisted change is
+        // published (the minimum still waits on the sink that failed).
+        let (published, store) = publish_after([true, false]).await;
+        assert_eq!(published, 1);
+        assert!(store.get_raw("src::sink::a").await.unwrap().is_some());
+        assert!(store.get_raw("src::sink::b").await.unwrap().is_none());
     }
 
     #[tokio::test]

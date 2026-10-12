@@ -40,6 +40,18 @@ pub struct SnapshotShared {
     pub cohort: Option<deltaforge_core::SnapshotCohort>,
     /// Set only from a durably completed generation; empty otherwise.
     pub resume_exclusions: Vec<String>,
+    /// Bumped on every change of `resume_exclusions`, so a reader holding a
+    /// fold computed under the previous set knows to recompute it.
+    pub exclusions_version: u64,
+}
+
+impl SnapshotShared {
+    pub fn set_resume_exclusions(&mut self, exclusions: Vec<String>) {
+        if self.resume_exclusions != exclusions {
+            self.resume_exclusions = exclusions;
+            self.exclusions_version = self.exclusions_version.wrapping_add(1);
+        }
+    }
 }
 
 /// [`SnapshotShared`], shared by a source and its clones.

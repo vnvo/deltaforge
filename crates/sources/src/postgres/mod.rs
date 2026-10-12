@@ -389,6 +389,10 @@ pub(crate) struct RunCtx {
     /// filtered message never renumbers a retained one.
     pub message_ordinal: u32,
     pub repl_client: Arc<Mutex<ReplicationClient>>,
+    /// Bumped whenever `repl_client` is replaced (reconnect, credential
+    /// rotation): a new client starts without the applied WAL feedback, so the
+    /// cached durable frontier is re-applied to it.
+    pub repl_epoch: Arc<std::sync::atomic::AtomicU64>,
     pub outbox_prefixes: AllowList,
     pub identity_store: IdentityStore,
     /// Verified-lineage registry scope (shared with the pipeline's loaders).
@@ -1763,6 +1767,7 @@ impl PostgresSource {
             system_identifier,
             message_ordinal: 0,
             repl_client: Arc::new(Mutex::new(client)),
+            repl_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             outbox_prefixes: self.outbox_prefixes.clone(),
             identity_store: IdentityStore::new(Arc::clone(&backend)),
             registry_scope: self.registry_scope.clone(),
@@ -1838,22 +1843,27 @@ impl PostgresSource {
         info!("entering replication loop");
         // Durable delivery frontier (separate from `ctx.last_lsn`, the read position):
         // the acknowledged LSN reported to PostgreSQL as flushed, sourced only from the
-        // per-sink checkpoint store. Refreshed change-driven via
-        // `CheckpointStore::await_checkpoint_change` (the coordinator signals after each
-        // per-sink commit; a long fallback re-confirms during idle) so idle sources do
-        // not poll the control store. Idle keepalives are emitted by the replication
-        // worker, carrying whatever frontier is set.
-        let mut wal_feedback = WalFeedback::new();
+        // per-sink checkpoint store. Re-read change-driven (`WalFeedback`): the
+        // coordinator publishes a generation after each persisted per-sink commit, and
+        // a long fallback re-confirms during idle, so neither steady traffic nor idle
+        // sources read the control store per event. Idle keepalives are emitted by the
+        // replication worker, carrying whatever frontier is set.
+        let mut wal_feedback =
+            WalFeedback::new(chkpt_store.as_ref(), &self.pipeline, &self.id);
         // The loop runs inside an async block so its result can be captured and the
         // rotation runtime cancelled+joined before teardown, on both the normal and
         // fatal exit paths. A fatal result (including gate-6 rotation failures) is
         // re-propagated after join and before the teardown checkpoint put.
         let loop_result: SourceResult<()> = async {
         loop {
+            let was_paused = ctx.paused.load(std::sync::atomic::Ordering::SeqCst);
             if !pause_until_resumed(&ctx.cancel, &ctx.paused, &ctx.pause_notify)
                 .await
             {
                 break;
+            }
+            if was_paused {
+                wal_feedback.invalidate();
             }
 
             // Rotation: schedule Stage-A preflight concurrently with the stream,
@@ -1873,11 +1883,22 @@ impl PostgresSource {
             }
 
             // Report the durable delivery frontier to PostgreSQL before blocking on the
-            // next read. Runs after every processed event and on each idle ticker wake,
-            // so WAL is released only up to what the sinks have durably acknowledged.
-            // Fails closed (stops the source before the teardown put) on a malformed
-            // checkpoint or prolonged checkpoint-store unavailability.
-            advance_wal_feedback(&ctx, &chkpt_store, &mut wal_feedback).await?;
+            // next read, re-reading it only when it may have changed, so WAL is released
+            // only up to what the sinks have durably acknowledged. Fails closed (stops
+            // the source before the teardown put) on a malformed checkpoint or prolonged
+            // checkpoint-store unavailability.
+            let exclusions_version = self
+                .snapshot_cohort
+                .lock()
+                .expect("not poisoned")
+                .exclusions_version;
+            advance_wal_feedback(
+                &ctx,
+                &chkpt_store,
+                &mut wal_feedback,
+                exclusions_version,
+            )
+            .await?;
 
             debug!(source_id = %self.id, "reading next event");
 
@@ -1900,7 +1921,7 @@ impl PostgresSource {
                             Err(ctrl) => Err(ctrl),
                         },
                         _ = rt.wait_activity() => continue,
-                        _ = chkpt_store.await_checkpoint_change() => continue,
+                        _ = wal_feedback.wait_due() => continue,
                     }
                 }
                 None => {
@@ -1915,7 +1936,7 @@ impl PostgresSource {
                             }
                             Err(ctrl) => Err(ctrl),
                         },
-                        _ = chkpt_store.await_checkpoint_change() => continue,
+                        _ = wal_feedback.wait_due() => continue,
                     }
                 }
             };
@@ -2038,6 +2059,8 @@ impl PostgresSource {
                     {
                         Ok(new_client) => {
                             *ctx.repl_client.lock().await = new_client;
+                            ctx.repl_epoch
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             ctx.refresh_stamp();
                             ctx.retry.reset();
                             info!(source_id = %self.id, "reconnected successfully");
@@ -2112,22 +2135,167 @@ impl PostgresSource {
 /// (and unbounded retained WAL).
 const FEEDBACK_STORE_UNAVAILABLE_STOP: Duration = Duration::from_secs(60);
 
-/// Mutable state for WAL feedback across loop iterations: the last durable frontier, the
-/// start of a transient store-unavailability window, and an edge latch so a persistent
-/// storage failure warns once, not every poll.
+/// How soon a transiently failed durable-frontier read is retried. The prior
+/// frontier holds meanwhile, bounded by [`FEEDBACK_STORE_UNAVAILABLE_STOP`].
+const FEEDBACK_RETRY_AFTER_FAILURE: Duration = Duration::from_secs(1);
+
+/// WAL feedback across loop iterations: the last durable frontier read, when it
+/// must be read again, and a transient store-unavailability window.
+///
+/// The frontier is re-read only when it may have changed: the store published a
+/// checkpoint change (marked seen before each read, so a change landing during
+/// the read is read next), the resume fold's exclusions changed, the
+/// replication client was replaced (a new one starts without applied feedback),
+/// at start and on resume, and after the fallback. Between reads the cached
+/// frontier stands. It only ever lags durable state, which holds WAL longer and
+/// never reports more than every required sink acknowledged.
 struct WalFeedback {
     frontier: Option<Lsn>,
     unavailable_since: Option<Instant>,
+    /// Edge latch so a persistent storage failure warns once, not every read.
     warned_unavailable: bool,
+    changes: checkpoints::CheckpointChanges,
+    /// The next poll reads regardless of published changes.
+    stale: bool,
+    /// The latest the next read happens: the fallback, or the retry after a
+    /// transient failure.
+    next_read: Instant,
+    exclusions_version: u64,
+    repl_epoch: u64,
+    pipeline: String,
+    source_id: String,
 }
 
 impl WalFeedback {
-    fn new() -> Self {
+    fn new(
+        store: &dyn CheckpointStore,
+        pipeline: &str,
+        source_id: &str,
+    ) -> Self {
         Self {
             frontier: None,
             unavailable_since: None,
             warned_unavailable: false,
+            changes: checkpoints::CheckpointChanges::new(store),
+            stale: true,
+            next_read: Instant::now(),
+            exclusions_version: 0,
+            repl_epoch: 0,
+            pipeline: pipeline.to_string(),
+            source_id: source_id.to_string(),
         }
+    }
+
+    /// Read on the next poll whatever was published (a resume after a pause).
+    fn invalidate(&mut self) {
+        self.stale = true;
+    }
+
+    /// Note the resume fold's exclusion version and the replication client's
+    /// epoch: a change of either forces the next poll to read.
+    fn observe(&mut self, exclusions_version: u64, repl_epoch: u64) {
+        if exclusions_version != self.exclusions_version
+            || repl_epoch != self.repl_epoch
+        {
+            self.exclusions_version = exclusions_version;
+            self.repl_epoch = repl_epoch;
+            self.stale = true;
+        }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.stale || now >= self.next_read || self.changes.has_changed()
+    }
+
+    /// Resolves once a poll must read. Cancellation-safe. Waiting consumes the
+    /// published change, so a wake marks the frontier stale for the next poll.
+    async fn wait_due(&mut self) {
+        if self.stale {
+            return;
+        }
+        let deadline = tokio::time::Instant::from_std(self.next_read);
+        tokio::select! {
+            _ = self.changes.changed() => {}
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
+        self.stale = true;
+    }
+
+    /// When due, read and classify the durable frontier; returns the frontier
+    /// to report (the newly read one, or the prior one held), or `None` when
+    /// not due or nothing is durable yet.
+    ///
+    /// Fails closed on a malformed/incomparable durable checkpoint, or once the
+    /// store has been transiently unavailable for longer than
+    /// [`FEEDBACK_STORE_UNAVAILABLE_STOP`], so the source never keeps consuming
+    /// indefinitely against unavailable recovery authority.
+    async fn poll(
+        &mut self,
+        chkpt: &Arc<dyn CheckpointStore>,
+        now: Instant,
+    ) -> SourceResult<Option<Lsn>> {
+        if !self.due(now) {
+            return Ok(None);
+        }
+        self.changes.mark_seen();
+        self.stale = false;
+        self.next_read = now + self.changes.fallback();
+        metrics::counter!(
+            "deltaforge_wal_feedback_reads_total",
+            "pipeline" => self.pipeline.clone(),
+            "source" => self.source_id.clone(),
+        )
+        .increment(1);
+        match classify_durable_frontier(chkpt, &self.source_id, self.frontier)
+            .await
+        {
+            FeedbackOutcome::Frontier(lsn) => {
+                self.frontier = Some(lsn);
+                self.store_available();
+            }
+            FeedbackOutcome::Hold => self.store_available(),
+            FeedbackOutcome::Transient(detail) => {
+                let since = *self.unavailable_since.get_or_insert(now);
+                if !self.warned_unavailable {
+                    warn!(source_id = %self.source_id, error = %detail,
+                        "durable checkpoint store unavailable; holding WAL feedback");
+                    self.warned_unavailable = true;
+                    self.unavailable_gauge(1.0);
+                }
+                if now.duration_since(since) >= FEEDBACK_STORE_UNAVAILABLE_STOP
+                {
+                    return Err(SourceError::Other(anyhow::anyhow!(
+                        "durable checkpoint store unavailable for {}s for source '{}'; \
+                         stopping fail-closed to avoid unbounded WAL retention ({detail})",
+                        FEEDBACK_STORE_UNAVAILABLE_STOP.as_secs(),
+                        self.source_id
+                    )));
+                }
+                // Hold the prior frontier and retry soon, never guessing ahead.
+                self.next_read = now + FEEDBACK_RETRY_AFTER_FAILURE;
+            }
+            FeedbackOutcome::FailClosed(detail) => {
+                return Err(SourceError::Other(anyhow::anyhow!(detail)));
+            }
+        }
+        Ok(self.frontier)
+    }
+
+    fn store_available(&mut self) {
+        self.unavailable_since = None;
+        if self.warned_unavailable {
+            self.warned_unavailable = false;
+            self.unavailable_gauge(0.0);
+        }
+    }
+
+    fn unavailable_gauge(&self, v: f64) {
+        metrics::gauge!(
+            "deltaforge_wal_feedback_store_unavailable",
+            "pipeline" => self.pipeline.clone(),
+            "source" => self.source_id.clone(),
+        )
+        .set(v);
     }
 }
 
@@ -2209,56 +2377,20 @@ fn classify_store_error(e: &checkpoints::CheckpointError) -> FeedbackOutcome {
 /// minimum per-sink checkpoint every required sink has acknowledged - never the
 /// read/enqueued position. The store only ever holds committed, acknowledged checkpoints
 /// at transaction boundaries, so the reported LSN can never be inside an open transaction
-/// or ahead of an unacknowledged/backpressured batch.
-///
-/// Fails closed (returns `Err`, stopping the source before the teardown checkpoint put)
-/// on a malformed/incomparable durable checkpoint, or when the store has been transiently
-/// unavailable for longer than [`FEEDBACK_STORE_UNAVAILABLE_STOP`] - so the source never
-/// keeps consuming indefinitely against unavailable recovery authority.
+/// or ahead of an unacknowledged/backpressured batch. Reads the store only when
+/// [`WalFeedback`] says the frontier may have changed.
 async fn advance_wal_feedback(
     ctx: &RunCtx,
     chkpt: &Arc<dyn CheckpointStore>,
     state: &mut WalFeedback,
+    exclusions_version: u64,
 ) -> SourceResult<()> {
-    match classify_durable_frontier(chkpt, &ctx.source_id, state.frontier).await
-    {
-        FeedbackOutcome::Frontier(lsn) => {
-            state.frontier = Some(lsn);
-            state.unavailable_since = None;
-            state.warned_unavailable = false;
-            ctx.repl_client.lock().await.update_applied_lsn(lsn);
-        }
-        FeedbackOutcome::Hold => {
-            state.unavailable_since = None;
-            state.warned_unavailable = false;
-            if let Some(f) = state.frontier {
-                ctx.repl_client.lock().await.update_applied_lsn(f);
-            }
-        }
-        FeedbackOutcome::Transient(detail) => {
-            let now = Instant::now();
-            let since = *state.unavailable_since.get_or_insert(now);
-            if !state.warned_unavailable {
-                warn!(source_id = %ctx.source_id, error = %detail,
-                    "durable checkpoint store unavailable; holding WAL feedback");
-                state.warned_unavailable = true; // edge-latched
-            }
-            if now.duration_since(since) >= FEEDBACK_STORE_UNAVAILABLE_STOP {
-                return Err(SourceError::Other(anyhow::anyhow!(
-                    "durable checkpoint store unavailable for {}s for source '{}'; \
-                     stopping fail-closed to avoid unbounded WAL retention ({detail})",
-                    FEEDBACK_STORE_UNAVAILABLE_STOP.as_secs(),
-                    ctx.source_id
-                )));
-            }
-            // Hold at the prior frontier while unavailability is within bounds.
-            if let Some(f) = state.frontier {
-                ctx.repl_client.lock().await.update_applied_lsn(f);
-            }
-        }
-        FeedbackOutcome::FailClosed(detail) => {
-            return Err(SourceError::Other(anyhow::anyhow!(detail)));
-        }
+    state.observe(
+        exclusions_version,
+        ctx.repl_epoch.load(std::sync::atomic::Ordering::SeqCst),
+    );
+    if let Some(lsn) = state.poll(chkpt, Instant::now()).await? {
+        ctx.repl_client.lock().await.update_applied_lsn(lsn);
     }
     Ok(())
 }
@@ -3597,6 +3729,309 @@ mod wal_feedback_tests {
             classify_durable_frontier(&store, "s", None).await,
             FeedbackOutcome::FailClosed(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod wal_feedback_cache_tests {
+    use super::{Lsn, WalFeedback};
+    use checkpoints::{
+        CheckpointError, CheckpointGeneration, CheckpointResult,
+        CheckpointStore, MemCheckpointStore,
+    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    fn cp(lsn: u64) -> Vec<u8> {
+        format!(r#"{{"lsn":"0/{lsn:X}","tx_id":null}}"#).into_bytes()
+    }
+
+    fn lsn(v: u64) -> Lsn {
+        Lsn::parse(&format!("0/{v:X}")).unwrap()
+    }
+
+    /// The per-sink proxy as the source sees it: durable checkpoints, a
+    /// published generation the coordinator bumps after persisting, a read
+    /// counter, and switches to fail reads or to land a commit mid-read.
+    struct Durable {
+        inner: MemCheckpointStore,
+        generation: CheckpointGeneration,
+        reads: AtomicU64,
+        failing: AtomicBool,
+        /// A commit (put + bump) of this LSN lands after the next read
+        /// returned its bytes, before the reader waits again.
+        commit_during_read: AtomicU64,
+    }
+
+    impl Durable {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: MemCheckpointStore::new().unwrap(),
+                generation: CheckpointGeneration::new(),
+                reads: AtomicU64::new(0),
+                failing: AtomicBool::new(false),
+                commit_during_read: AtomicU64::new(0),
+            })
+        }
+
+        /// The coordinator's persisted commit: write, then publish.
+        async fn commit(&self, at: u64) {
+            self.inner.put_raw("s", &cp(at)).await.unwrap();
+            self.generation.bump();
+        }
+
+        /// A persisted commit whose publication was lost.
+        async fn commit_unpublished(&self, at: u64) {
+            self.inner.put_raw("s", &cp(at)).await.unwrap();
+        }
+
+        fn reads(&self) -> u64 {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CheckpointStore for Durable {
+        fn checkpoint_changes(
+            &self,
+        ) -> Option<tokio::sync::watch::Receiver<u64>> {
+            Some(self.generation.subscribe())
+        }
+        async fn get_raw(
+            &self,
+            key: &str,
+        ) -> CheckpointResult<Option<Vec<u8>>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.failing.load(Ordering::SeqCst) {
+                return Err(CheckpointError::Database("store down".into()));
+            }
+            let got = self.inner.get_raw(key).await;
+            let racing = self.commit_during_read.swap(0, Ordering::SeqCst);
+            if racing != 0 {
+                self.commit(racing).await;
+            }
+            got
+        }
+        async fn put_raw(
+            &self,
+            key: &str,
+            bytes: &[u8],
+        ) -> CheckpointResult<()> {
+            self.inner.put_raw(key, bytes).await
+        }
+        async fn delete(&self, key: &str) -> CheckpointResult<bool> {
+            self.inner.delete(key).await
+        }
+        async fn list(&self) -> CheckpointResult<Vec<String>> {
+            self.inner.list().await
+        }
+    }
+
+    fn feedback(
+        store: &Arc<Durable>,
+    ) -> (WalFeedback, Arc<dyn CheckpointStore>) {
+        let dynstore: Arc<dyn CheckpointStore> = store.clone();
+        (WalFeedback::new(dynstore.as_ref(), "p", "s"), dynstore)
+    }
+
+    #[tokio::test]
+    async fn steady_traffic_reads_the_store_once_per_published_change() {
+        let store = Durable::new();
+        store.commit(0x100).await;
+        let (mut fb, chk) = feedback(&store);
+        let now = Instant::now();
+        assert_eq!(fb.poll(&chk, now).await.unwrap(), Some(lsn(0x100)));
+        // Thousands of events with no commit between them: no read.
+        for _ in 0..10_000 {
+            assert_eq!(fb.poll(&chk, now).await.unwrap(), None);
+        }
+        assert_eq!(store.reads(), 1);
+        // One commit: one read, then quiet again.
+        store.commit(0x200).await;
+        assert_eq!(fb.poll(&chk, now).await.unwrap(), Some(lsn(0x200)));
+        for _ in 0..1_000 {
+            fb.poll(&chk, now).await.unwrap();
+        }
+        assert_eq!(store.reads(), 2);
+    }
+
+    #[tokio::test]
+    async fn coalesced_changes_are_read_once_at_the_newest() {
+        let store = Durable::new();
+        let (mut fb, chk) = feedback(&store);
+        let now = Instant::now();
+        fb.poll(&chk, now).await.unwrap();
+        for at in 1..=100u64 {
+            store.commit(at * 0x10).await;
+        }
+        assert_eq!(fb.poll(&chk, now).await.unwrap(), Some(lsn(100 * 0x10)));
+        assert_eq!(fb.poll(&chk, now).await.unwrap(), None);
+        assert_eq!(store.reads(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_commit_landing_during_the_read_is_read_next() {
+        let store = Durable::new();
+        store.commit(0x100).await;
+        let (mut fb, chk) = feedback(&store);
+        let now = Instant::now();
+        // The read returns 0x100; 0x300 is persisted and published before
+        // the reader would wait.
+        store.commit_during_read.store(0x300, Ordering::SeqCst);
+        assert_eq!(fb.poll(&chk, now).await.unwrap(), Some(lsn(0x100)));
+        // The wait does not swallow it...
+        tokio::time::timeout(Duration::from_secs(1), fb.wait_due())
+            .await
+            .expect("the published change wakes the reader");
+        // ...and the next poll reads it.
+        assert_eq!(fb.poll(&chk, now).await.unwrap(), Some(lsn(0x300)));
+    }
+
+    #[tokio::test]
+    async fn a_lost_publication_is_read_at_the_fallback() {
+        let store = Durable::new();
+        store.commit(0x100).await;
+        let (mut fb, chk) = feedback(&store);
+        let now = Instant::now();
+        fb.poll(&chk, now).await.unwrap();
+        store.commit_unpublished(0x400).await;
+        assert_eq!(
+            fb.poll(&chk, now + Duration::from_secs(29)).await.unwrap(),
+            None
+        );
+        assert_eq!(store.reads(), 1);
+        assert_eq!(
+            fb.poll(&chk, now + Duration::from_secs(30)).await.unwrap(),
+            Some(lsn(0x400))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restart_reads_the_newer_durable_checkpoint_before_reporting() {
+        let store = Durable::new();
+        store.commit(0x100).await;
+        let (mut fb, chk) = feedback(&store);
+        assert_eq!(
+            fb.poll(&chk, Instant::now()).await.unwrap(),
+            Some(lsn(0x100))
+        );
+        // Persisted while the source was down; nothing published to the new run.
+        store.commit_unpublished(0x900).await;
+        let (mut restarted, chk) = feedback(&store);
+        assert_eq!(
+            restarted.poll(&chk, Instant::now()).await.unwrap(),
+            Some(lsn(0x900))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_changed_fold_or_replaced_client_forces_a_read() {
+        let store = Durable::new();
+        store.commit(0x100).await;
+        let (mut fb, chk) = feedback(&store);
+        let now = Instant::now();
+        fb.poll(&chk, now).await.unwrap();
+        // The resume fold's exclusions changed (a snapshot generation
+        // completed): the minimum may have moved without a commit.
+        store.commit_unpublished(0x200).await;
+        fb.observe(1, 0);
+        assert_eq!(fb.poll(&chk, now).await.unwrap(), Some(lsn(0x200)));
+        // A replaced replication client starts without applied feedback:
+        // the held frontier is reported to it again.
+        fb.observe(1, 1);
+        assert_eq!(fb.poll(&chk, now).await.unwrap(), Some(lsn(0x200)));
+        // A resume after a pause.
+        fb.invalidate();
+        assert_eq!(fb.poll(&chk, now).await.unwrap(), Some(lsn(0x200)));
+        assert_eq!(fb.poll(&chk, now).await.unwrap(), None);
+        assert_eq!(store.reads(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_store_outage_holds_the_prior_frontier_then_recovers() {
+        let store = Durable::new();
+        store.commit(0x100).await;
+        let (mut fb, chk) = feedback(&store);
+        let now = Instant::now();
+        fb.poll(&chk, now).await.unwrap();
+        store.failing.store(true, Ordering::SeqCst);
+        store.commit_unpublished(0x500).await;
+        store.generation.bump();
+        // The failed read holds the prior frontier, never guessing ahead.
+        assert_eq!(fb.poll(&chk, now).await.unwrap(), Some(lsn(0x100)));
+        // Retried after the bounded delay, not per event.
+        assert_eq!(
+            fb.poll(&chk, now + Duration::from_millis(500))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.reads(), 2);
+        assert_eq!(
+            fb.poll(&chk, now + Duration::from_secs(1)).await.unwrap(),
+            Some(lsn(0x100))
+        );
+        store.failing.store(false, Ordering::SeqCst);
+        assert_eq!(
+            fb.poll(&chk, now + Duration::from_secs(2)).await.unwrap(),
+            Some(lsn(0x500))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prolonged_store_outage_stops_the_source() {
+        let store = Durable::new();
+        let (mut fb, chk) = feedback(&store);
+        store.failing.store(true, Ordering::SeqCst);
+        let t0 = Instant::now();
+        assert!(fb.poll(&chk, t0).await.is_ok());
+        assert!(fb.poll(&chk, t0 + Duration::from_secs(30)).await.is_ok());
+        assert!(fb.poll(&chk, t0 + Duration::from_secs(60)).await.is_err());
+    }
+
+    /// Whatever interleaving of commits (published or not) and polls, the
+    /// reported frontier never passes the durable checkpoint and never moves
+    /// back.
+    #[tokio::test]
+    async fn feedback_never_passes_durable_state() {
+        let store = Durable::new();
+        let (mut fb, chk) = feedback(&store);
+        let t0 = Instant::now();
+        let mut durable = 0u64;
+        let mut reported = 0u64;
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for step in 0..5_000u64 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            match x % 4 {
+                0 => {
+                    durable += 1 + x % 64;
+                    store.commit(durable).await;
+                }
+                1 => {
+                    durable += 1 + x % 64;
+                    store.commit_unpublished(durable).await;
+                }
+                _ => {
+                    let now = t0 + Duration::from_millis(step * 20);
+                    if let Some(l) = fb.poll(&chk, now).await.unwrap() {
+                        let l = u64::from(l);
+                        assert!(
+                            l <= durable,
+                            "reported {l:X} past durable {durable:X}"
+                        );
+                        assert!(
+                            l >= reported,
+                            "reported {l:X} behind {reported:X}"
+                        );
+                        reported = l;
+                    }
+                }
+            }
+        }
+        assert!(reported > 0);
     }
 }
 

@@ -223,14 +223,14 @@ async fn run_pipeline(
     };
     let src: Arc<dyn Source> = Arc::new(src);
     // Change-driven feedback: the coordinator signals this on each per-sink commit.
-    let commit_signal = Arc::new(tokio::sync::Notify::new());
+    let checkpoint_generation = checkpoints::CheckpointGeneration::new();
     let proxy: Arc<dyn CheckpointStore> = Arc::new(
         PerSinkCheckpointProxy::for_source(
             store.clone(),
             SID.to_string(),
             &src,
         )
-        .with_commit_signal(commit_signal.clone()),
+        .with_checkpoint_generation(checkpoint_generation.clone()),
     );
     let (event_tx, event_rx) = mpsc::channel::<SourceItem>(1024);
     let src_handle = src.run(event_tx, proxy).await;
@@ -273,7 +273,7 @@ async fn run_pipeline(
             ..BatchConfig::default()
         }))
         .commit_fn("kafka", cp_fn)
-        .commit_notify(commit_signal.clone())
+        .checkpoint_generation(checkpoint_generation.clone())
         .process_fn(batch_processor)
         .build();
 
