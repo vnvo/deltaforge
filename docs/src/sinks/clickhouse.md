@@ -95,6 +95,16 @@ are not transactional with the DeltaForge checkpoint.
 makes `ReplacingMergeTree` replacement correct. Only fall back to `ts_ms` when the
 source lacks a usable position (millisecond ties per key are undefined).
 
+## One source table per target table
+
+A ClickHouse sink writes one target table, which holds one source table: rows of a second source table would mix two tables' rows. The target table (identified by the server's `serverUUID()`, database and table) is bound to the first source table written to it (its full identity: connector, pipeline, database, schema, table). The binding lives in DeltaForge's state store and is made atomically, so it survives restarts and concurrent pipelines sharing that store agree on one source table. Before a sink first writes to a destination after a start, it checks:
+
+- the destination is bound to this source table (an unbound, empty destination is bound now);
+- it is the same table it was bound as (its UUID): one dropped and recreated is refused as replaced;
+- an unbound destination that already holds rows is refused (data from elsewhere, or a removed binding).
+
+A refusal is the `sink_destination_conflict` incident: nothing of the batch is written, the checkpoint stays, and the incident names the destination and both source tables (never row data). Bindings are per state store: deployments with separate state stores writing to one destination are not coordinated.
+
 ## Requirements
 
 The sink needs the **source table's column types + primary key** (RowBinary is

@@ -490,13 +490,14 @@ async fn source(proxy: &Proxy, d: &Durable) -> PostgresSource {
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }
 
 fn ids(events: &[Event]) -> Vec<i64> {
     events
         .iter()
-        .filter_map(|e| e.after.as_ref()?.get("id")?.as_i64())
+        .filter_map(|e| test_common::row_view(e.after.as_ref()?)["id"].as_i64())
         .collect()
 }
 

@@ -114,6 +114,16 @@ batch and the `required` policy is honored.
 End-to-end exactly-once is **not** claimed — Elasticsearch writes are not
 transactional with the DeltaForge checkpoint.
 
+## One source table per index
+
+Documents are keyed by their source table's primary key, so an index holds one source table: rows of two tables in one index would overwrite each other's documents. Give each source table its own index (an `index` template with `{schema}` and `{table}`, or `{db}` when several databases share a cluster). Each index (identified by the cluster's `cluster_uuid` and the index name) is bound to the first source table written to it (its full identity: connector, pipeline, database, schema, table). The binding lives in DeltaForge's state store and is made atomically, so it survives restarts and concurrent pipelines sharing that store agree on one source table. Before a sink first writes to a destination after a start, it checks:
+
+- the destination is bound to this source table (an unbound, empty destination is bound now);
+- it is the same index it was bound as (its UUID): one dropped and recreated is refused as replaced;
+- an unbound destination that already holds documents is refused (data from elsewhere, or a removed binding).
+
+A refusal is the `sink_destination_conflict` incident: nothing of the batch is written, the checkpoint stays, and the incident names the destination and both source tables (never row data). Bindings are per state store: deployments with separate state stores writing to one destination are not coordinated.
+
 ## Requirements
 
 The sink needs the **source column types + primary key**. It loads these **on

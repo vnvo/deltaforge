@@ -119,7 +119,10 @@ fn row(id: u64) -> Event {
         },
         Op::Create,
         None,
-        Some(json!({"id": id, "marker": format!("canary-row-{id}")})),
+        Some(deltaforge_core::canonical::fixture::row(
+            json!({"id": id, "marker": format!("canary-row-{id}")}),
+        )),
+        deltaforge_core::TypeMapping::V2,
         1_700_000_000_000,
         64,
     )

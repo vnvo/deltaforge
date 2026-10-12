@@ -251,6 +251,7 @@ async fn make_mysql_source(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }
 
@@ -278,6 +279,7 @@ async fn make_pg_source(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }
 
@@ -340,7 +342,7 @@ fn has_id(e: &Event, id: i64) -> bool {
     [e.after.as_ref(), e.before.as_ref()]
         .into_iter()
         .flatten()
-        .any(|v| v.get("id").and_then(|v| v.as_i64()) == Some(id))
+        .any(|v| test_common::row_view(v)["id"].as_i64() == Some(id))
 }
 
 // ============================================================================
@@ -572,6 +574,7 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
             table_options: Default::default(),
             rotation: None,
             snapshot_cohort: Default::default(),
+            type_mapping: deltaforge_core::TypeMapping::V2,
         };
         let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -628,6 +631,7 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
             table_options: Default::default(),
             rotation: None,
             snapshot_cohort: Default::default(),
+            type_mapping: deltaforge_core::TypeMapping::V2,
         };
         let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -648,7 +652,11 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
             .find(|e| has_id(e, 2))
             .expect("must receive post-failover event");
         assert!(
-            ev.after.as_ref().and_then(|v| v.get("status")).is_some(),
+            ev.after
+                .as_ref()
+                .map(test_common::row_view)
+                .and_then(|v| v.get("status").cloned())
+                .is_some(),
             "event must include 'status' after schema reload"
         );
         info!("✓ drifted column present in event");
@@ -708,6 +716,7 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
             table_options: Default::default(),
             rotation: None,
             snapshot_cohort: Default::default(),
+            type_mapping: deltaforge_core::TypeMapping::V2,
         };
         let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -761,6 +770,7 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
             table_options: Default::default(),
             rotation: None,
             snapshot_cohort: Default::default(),
+            type_mapping: deltaforge_core::TypeMapping::V2,
         };
         let (tx, _rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -862,6 +872,7 @@ async fn mysql_failover_schema_drift_halt_no_drift_continues() -> Result<()> {
             table_options: Default::default(),
             rotation: None,
             snapshot_cohort: Default::default(),
+            type_mapping: deltaforge_core::TypeMapping::V2,
         };
         let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -1696,7 +1707,8 @@ async fn recv_until(
                 let id = e
                     .after
                     .as_ref()
-                    .and_then(|v| v.get("id"))
+                    .map(test_common::row_view)
+                    .and_then(|v| v.get("id").cloned())
                     .and_then(|v| v.as_i64())
                     .expect("row id");
                 r.rows += 1;

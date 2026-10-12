@@ -65,8 +65,8 @@ Events from `shop.orders` -> subject `cdc.shop.orders`. The `key` value appears 
 | Variable | Description | Example value |
 |----------|-------------|---------------|
 | `${source.table}` | Table name | `orders` |
-| `${source.db}` | Database name | `shop` |
-| `${source.schema}` | Schema name (PostgreSQL) | `public` |
+| `${source.db}` | Database name (PostgreSQL: the database, never the schema) | `shop` |
+| `${source.schema}` | Schema name (PostgreSQL; absent for MySQL). Same-named tables of two schemas need it in a topic or subject to stay apart | `public` |
 | `${source.connector}` | Source type | `mysql` |
 | `${op}` | Operation code | `c`, `u`, `d`, `r`, `t` |
 | `${after.<field>}` | Field from after image | `42`, `cust-abc` |

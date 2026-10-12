@@ -51,7 +51,26 @@ JavaScript processing adds a fixed overhead per batch plus linear scaling per ev
 
 - Return an empty array to drop all events in a batch.
 - Return multiple copies of an event to fan out.
-- JavaScript numbers are `f64` — integer columns wider than 53 bits may lose precision. Use string representation for such values.
+- 64-bit integers (BIGINT, bigint) reach scripts as exact decimal strings, so no value passes through a JavaScript number.
+
+### Values and types
+
+Scripts see each event's native JSON rendering (see [Data Types](types.md)).
+Column types stay outside the script, from the event's schema version, and
+each returned row is typed again:
+
+- a value the script left as it was comes back exactly as it was;
+- a changed value of a table column (including one that was NULL or a
+  PostgreSQL unchanged TOAST value) must be a valid value of the column's
+  declared type (ENUM and SET values must be declared labels), or the batch
+  fails;
+- a removed field is removed;
+- a field the table does not have becomes a document extension: native JSON
+  shows it in the row; typed sinks carry it in their extension slot
+  (`after_extensions`, ClickHouse `_extensions`), never as a column.
+
+If the event's schema version cannot be resolved, a changed or added value
+fails the batch rather than losing its type.
 
 ## Outbox
 
@@ -165,6 +184,12 @@ A collision occurs when two input paths produce the same flattened key - typical
 - `last` - the last path to write a key wins (default, never fails)
 - `first` - the first path to write a key wins, subsequent writes are ignored
 - `error` - the batch fails immediately, useful in strict pipelines where collisions indicate a schema problem
+
+### What flattens
+
+Flatten expands JSON documents: outbox payload fields and values a processor
+added (document extensions, which flatten into extensions). A table's own
+columns, a JSON column included, are typed values and are never expanded.
 
 ### Working with outbox payloads
 
@@ -283,7 +308,7 @@ The `path` field is a dot-separated path into `event.after`, e.g. `"status"` or 
  
 ### Notes
  
-**Numeric equality** — `eq` and `in` compare integers and floats by value, so `42` and `42.0` are considered equal. This matters when events have passed through the JavaScript processor, which converts all numbers to `f64`.
+**Numeric equality** — integers compare exactly at any width (BIGINT included, though native JSON renders it as a string); an integer and a float compare by value, so `42` and `42.0` are equal. A path can descend into a JSON column (`payload.status`). A predicate on a PostgreSQL column whose value an update did not send (unchanged TOAST) fails the batch; `changed` treats it as unchanged.
  
 **`not_in` with a missing field** — if the field is absent from the event, the event passes. Absence is not membership in any set.
  

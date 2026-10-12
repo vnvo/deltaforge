@@ -201,6 +201,7 @@ fn source(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }
 
@@ -413,7 +414,10 @@ async fn proven_drift_adapts_wildcard_tables() {
     assert!(ended.is_none(), "still streaming: {ended:?}");
     let got = rows(&items);
     assert_eq!(got.len(), 1);
-    assert_eq!(got[0].after.as_ref().unwrap()["status"], "x");
+    assert_eq!(
+        test_common::row_view(got[0].after.as_ref().unwrap())["status"],
+        "x"
+    );
     let m = st
         .marker(b, sc.id, sc.db, "orders")
         .await
@@ -522,7 +526,10 @@ async fn a_first_event_ddl_is_unprovable() {
             assert!(ended.is_none(), "still streaming: {ended:?}");
             let got = rows(&items);
             assert_eq!(got.len(), 1);
-            assert_eq!(got[0].after.as_ref().unwrap()["status"], "x");
+            assert_eq!(
+                test_common::row_view(got[0].after.as_ref().unwrap())["status"],
+                "x"
+            );
             let m = st.marker(b, id, id, "orders").await.expect("recorded");
             assert_eq!(m["outcome"], "adapted_unprovable", "{m}");
             assert!(m["current_schema_hash"].is_null(), "{m}");

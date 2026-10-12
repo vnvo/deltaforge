@@ -219,6 +219,7 @@ async fn run_pipeline(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let src: Arc<dyn Source> = Arc::new(src);
     // Change-driven feedback: the coordinator signals this on each per-sink commit.
@@ -250,6 +251,7 @@ async fn run_pipeline(
             client_conf: HashMap::new(),
             secret_refs: Default::default(),
             filter: None,
+            json_wide_integers: Default::default(),
         },
         cancel.clone(),
         "test",

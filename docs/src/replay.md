@@ -154,6 +154,10 @@ already received.
   after the frozen tail `H`.
 - **No checkpoint mutation.** Replay does not touch the source or per-sink checkpoints during
   the historical and catch-up phases.
+- **Typed captures only.** Envelopes hold each event's typed values and mapping version
+  (capture format 2). A job first checks every envelope of its range; a capture of format 1
+  (untyped JSON, written before typed values) is refused there, before any event is
+  delivered or the cursor moves: start a new capture.
 
 ## Limitations (current release)
 

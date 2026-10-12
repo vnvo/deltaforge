@@ -127,6 +127,7 @@ async fn start(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let (tx, mut rx) = test_common::acked_channel(&src, &store, &src.id, 128);
     let handle = src.run(tx, store).await;
@@ -365,7 +366,8 @@ async fn verified_predecessor_gtids_are_carried_over_and_stream() -> Result<()>
         s.events.iter().any(|e| e
             .after
             .as_ref()
-            .and_then(|a| a.get("id"))
+            .map(test_common::row_view)
+            .and_then(|a| a.get("id").cloned())
             .and_then(|v| v.as_i64())
             == Some(42)),
         "the source must stream after the carry-over"

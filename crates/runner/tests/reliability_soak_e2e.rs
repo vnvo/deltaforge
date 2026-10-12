@@ -327,6 +327,7 @@ async fn start_pipe(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let src: Arc<dyn Source> = Arc::new(src);
     let commit_signal = Arc::new(tokio::sync::Notify::new());
@@ -356,6 +357,7 @@ async fn start_pipe(
             client_conf: Default::default(),
             secret_refs: Default::default(),
             filter: None,
+            json_wide_integers: Default::default(),
         },
         cancel.clone(),
         "soak",

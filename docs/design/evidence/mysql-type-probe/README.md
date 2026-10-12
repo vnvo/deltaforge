@@ -1,6 +1,6 @@
 # MySQL type probe evidence
 
-Produced by `crates/runner/tests/mysql_type_probe.rs`, which pins every container image by digest, and reported by `scripts/type-probe-report.py`. The analysis is in `docs/design/mysql-canonical-types.md`.
+Produced by `crates/runner/tests/mysql_type_probe.rs` (since replaced by the parity suite `crates/runner/tests/type_parity_e2e.rs`), which pins every container image by digest, and reported by `scripts/type-probe-report.py`. The analysis is in `docs/design/mysql-canonical-types.md`.
 
 | Directory | Run | S3 sink |
 |---|---|---|
@@ -16,7 +16,7 @@ Each directory holds:
 | `SHA256SUMS` | SHA-256 of every raw file of the run: records, schemas, SQL log, pipeline outcomes, warnings log. The raw files are kept by the author, not committed. |
 | `CODE-SHA256SUMS` | SHA-256 of the probe and the report script used, identifying the exact code independently of commits |
 
-**To reproduce,** run `cargo test -p runner --test mysql_type_probe -- --include-ignored --nocapture` (Docker required), then `python3 scripts/type-probe-report.py target/type-probe/<run>`.
+**To reproduce,** check out the run's base commit (`deltaforge_revision` in `env.json`), run `cargo test -p runner --test mysql_type_probe -- --include-ignored --nocapture` (Docker required), then `python3 scripts/type-probe-report.py target/type-probe/<run>`.
 
 - **What changes between runs:** timestamps, server UUIDs and GTID sets, so the raw-file checksums differ.
 - **What stays the same:** the per-value tables.

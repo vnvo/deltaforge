@@ -105,6 +105,7 @@ fn pg_cfg(
         snapshot: Default::default(),
         on_schema_drift: Default::default(),
         rotation: None,
+        type_mapping: Default::default(),
     }
 }
 
@@ -124,6 +125,7 @@ fn my_cfg(
         snapshot: Default::default(),
         on_schema_drift: Default::default(),
         rotation: None,
+        type_mapping: Default::default(),
     }
 }
 

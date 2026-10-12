@@ -255,7 +255,7 @@ impl State {
                 .collect();
             for image in [&e.before, &e.after].into_iter().flatten() {
                 let keys: BTreeSet<String> =
-                    image.as_object().unwrap().keys().cloned().collect();
+                    image.names().map(String::from).collect();
                 assert_eq!(keys, columns, "row decoded with another shape");
             }
             out.push(v);
@@ -289,6 +289,7 @@ fn source(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }
 
@@ -434,7 +435,7 @@ async fn live_then_replay(
 }
 
 fn after(e: &Event, col: &str) -> Value {
-    e.after.as_ref().unwrap()[col].clone()
+    test_common::row_view(e.after.as_ref().unwrap())[col].clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -470,7 +471,10 @@ async fn replay_across(
     assert_eq!(after(&rows[1], "b"), "B1u");
     assert_eq!(after(&rows[2], "b"), "B2");
     assert_eq!(after(&rows[3], "b"), "B2u");
-    assert_eq!(rows[4].before.as_ref().unwrap()["b"], "B2u");
+    assert_eq!(
+        test_common::row_view(rows[4].before.as_ref().unwrap())["b"],
+        "B2u"
+    );
     let names = |v: &SchemaVersion| -> Vec<String> {
         v.schema_json["columns"]
             .as_array()
@@ -637,9 +641,7 @@ async fn a_same_signature_swap_needs_positional_proof() {
         live_then_replay(port, &st, db, db, &["t", "u"], db, &[(steps, 4)])
             .await;
     let cols = |e: &Event| -> BTreeSet<String> {
-        e.after
-            .as_ref()
-            .unwrap()
+        test_common::row_view(e.after.as_ref().unwrap())
             .as_object()
             .unwrap()
             .keys()

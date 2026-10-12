@@ -26,6 +26,7 @@
     - [ClickHouse](sinks/clickhouse.md)
     - [Elasticsearch](sinks/elasticsearch.md)
 - [Envelopes and Encodings](envelopes.md)
+- [Data Types](types.md)
 - [Dynamic Routing](routing.md)
 - [Outbox Pattern Support](outbox.md)
 - [Guarantees & Correctness](guarantees.md)

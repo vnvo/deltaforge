@@ -488,6 +488,7 @@ fn source(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }
 
@@ -508,7 +509,12 @@ async fn rows_until(
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
         match timeout(left, rx.recv()).await {
             Ok(Some(SourceItem::Event(e))) => {
-                if let Some(row) = e.after.as_ref().or(e.before.as_ref()) {
+                if let Some(row) = e
+                    .after
+                    .as_ref()
+                    .or(e.before.as_ref())
+                    .map(test_common::row_view)
+                {
                     let id = row.get("id").and_then(|v| v.as_i64());
                     let src = row.get("src").and_then(|v| v.as_str());
                     if let (Some(id), Some(src)) = (id, src) {
@@ -1614,6 +1620,7 @@ async fn rotation_connections_prove_the_server() {
             max_secret_bytes: 1 << 20,
             apply_timeout_ms: 30_000,
         }),
+        type_mapping: Default::default(),
     };
     let resolver: Arc<dyn SecretResolver> =
         Arc::new(FileResolver::new(FilePolicy {

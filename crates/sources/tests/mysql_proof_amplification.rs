@@ -270,6 +270,7 @@ async fn amplification(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let ckpt: Arc<dyn CheckpointStore> =
         Arc::new(MemCheckpointStore::new().unwrap());
@@ -289,7 +290,7 @@ async fn amplification(
         while let Some(item) = rx.recv().await {
             if let SourceItem::Event(e) = item
                 && e.source.table.starts_with('t')
-                && let Some(a) = e.after.as_ref()
+                && let Some(a) = e.after.as_ref().map(test_common::row_view)
             {
                 seen.lock().unwrap().insert(
                     e.source.table.clone(),

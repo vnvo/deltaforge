@@ -246,6 +246,7 @@ async fn postgres_snapshot_scale() -> Result<()> {
             table_options: Default::default(),
             rotation: None,
             snapshot_cohort: Default::default(),
+            type_mapping: deltaforge_core::TypeMapping::V2,
         };
         let id = src.id.clone();
         runs.push(measure("postgres", src, &id, n, &backend).await);
@@ -305,6 +306,7 @@ async fn mysql_snapshot_scale() -> Result<()> {
             table_options: Default::default(),
             rotation: None,
             snapshot_cohort: Default::default(),
+            type_mapping: deltaforge_core::TypeMapping::V2,
         };
         let id = src.id.clone();
         runs.push(measure("mysql", src, &id, n, &backend).await);

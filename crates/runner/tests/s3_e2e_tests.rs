@@ -23,9 +23,11 @@ use ctor::dtor;
 use deltaforge_config::{
     S3Compression, S3Durability, S3FileFormat, S3FileRoll, S3SinkCfg, SinkCfg,
 };
+use deltaforge_core::canonical::{DbValue, Decimal, IntWidth};
 use deltaforge_core::encoding::avro_types::TypeConversionOpts;
 use deltaforge_core::{
-    BatchResult, Event, Op, Sink, SourceInfo, SourcePosition, Transaction,
+    BatchResult, CanonicalRow, CanonicalValue, Event, Op, Sink, SourceInfo,
+    SourcePosition, Transaction, TypeMapping,
 };
 use object_store::path::Path;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
@@ -34,7 +36,6 @@ use runner::{
     ArcSchemaProvider, ColumnSchemaInfo, SchemaLookupError, SchemaProvider,
     TableSchemaInfo, build_arrow_schema_resolver,
 };
-use serde_json::json;
 use sinks::s3::{ObjectStoreParams, build_object_store, build_s3_sink};
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
@@ -164,12 +165,27 @@ fn make_order(
         .and_utc()
         .timestamp_millis();
 
-    let after = json!({
-        "id": id,
-        "customer_email": email,
-        "amount": amount,
-        "paid": paid,
-    });
+    // Typed as the declared schema: bigint, varchar, decimal(12,2), boolean.
+    let after = CanonicalRow::new(vec![
+        (
+            "id".to_string(),
+            CanonicalValue::Db(DbValue::int(id, IntWidth::W64).unwrap()),
+        ),
+        (
+            "customer_email".to_string(),
+            email.map_or(CanonicalValue::Null, |e| {
+                CanonicalValue::Db(DbValue::Text(e.to_string()))
+            }),
+        ),
+        (
+            "amount".to_string(),
+            CanonicalValue::Db(DbValue::Decimal(
+                Decimal::parse(amount).unwrap(),
+            )),
+        ),
+        ("paid".to_string(), CanonicalValue::Db(DbValue::Bool(paid))),
+    ])
+    .unwrap();
 
     Event {
         before: None,
@@ -205,6 +221,7 @@ fn make_order(
         tags: None,
         synthetic: None,
         routing: None,
+        type_mapping: TypeMapping::V2,
         tx_end: false,
         boundary: None,
         size_bytes: 0,

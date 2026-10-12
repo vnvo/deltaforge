@@ -102,7 +102,7 @@ impl Hook {
                     if v["op"] == "r" {
                         reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
-                    // MySQL snapshot rows carry integers as strings.
+                    // A 64-bit id renders as an exact decimal string (v2).
                     let id = &v["after"]["id"];
                     if let Some(id) =
                         id.as_i64().or_else(|| id.as_str()?.parse().ok())

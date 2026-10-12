@@ -146,7 +146,9 @@ impl Delivered {
     fn versions(&self) -> BTreeMap<(String, i64), Vec<i64>> {
         let mut out: BTreeMap<_, Vec<i64>> = BTreeMap::new();
         for e in &self.rows {
-            let img = e.after.as_ref().or(e.before.as_ref()).unwrap();
+            let img = test_common::row_view(
+                e.after.as_ref().or(e.before.as_ref()).unwrap(),
+            );
             let id = img["id"].as_i64().unwrap();
             let v = if e.after.is_some() {
                 img["v"].as_i64().unwrap()
@@ -214,6 +216,7 @@ impl Case {
             table_options: Default::default(),
             rotation: None,
             snapshot_cohort: Default::default(),
+            type_mapping: deltaforge_core::TypeMapping::V2,
         };
         let ckpt: Arc<dyn CheckpointStore> =
             Arc::new(MemCheckpointStore::new().unwrap());

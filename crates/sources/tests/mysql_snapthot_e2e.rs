@@ -61,6 +61,7 @@ async fn make_source(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }
 
@@ -91,7 +92,8 @@ where
 fn has_id(e: &Event, id: i64) -> bool {
     e.after
         .as_ref()
-        .and_then(|v| v.get("id"))
+        .map(test_common::row_view)
+        .and_then(|v| v.get("id").cloned())
         .and_then(|v| v.as_i64())
         .map(|v| v == id)
         .unwrap_or(false)
@@ -681,6 +683,7 @@ async fn make_source_on(
         table_options,
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }
 

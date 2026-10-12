@@ -335,7 +335,8 @@ async fn collect_create_ids(
                 if let Some(id) = e
                     .after
                     .as_ref()
-                    .and_then(|v| v.get("id"))
+                    .map(test_common::row_view)
+                    .and_then(|v| v.get("id").cloned())
                     .and_then(|v| v.as_i64())
                 {
                     ids.push(id);
@@ -375,6 +376,7 @@ fn mysql_rotation_cfg(db: &str, port: u16, proj: &Projected) -> MysqlSrcCfg {
             max_secret_bytes: LIMIT,
             apply_timeout_ms: 30_000,
         }),
+        type_mapping: Default::default(),
     }
 }
 
@@ -473,6 +475,7 @@ async fn start_rotation_harness(
         table_options: Default::default(),
         rotation,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     };
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
@@ -623,7 +626,10 @@ async fn committed_create_ids(
                 ids.extend(open.take().unwrap_or_default())
             }
             Ok(Some(SourceItem::Event(e))) if matches!(e.op, Op::Create) => {
-                let id = e.after.as_ref().and_then(|v| v["id"].as_i64());
+                let id = e
+                    .after
+                    .as_ref()
+                    .and_then(|v| test_common::row_view(v)["id"].as_i64());
                 if let Some(id) = id {
                     match open.as_mut() {
                         Some(o) => o.push(id),

@@ -26,13 +26,13 @@ DDL work, T1a, the release gate and rc.1 stay held until this proposal is review
 
 | Item | Location |
 |---|---|
-| Probe | `crates/runner/tests/mysql_type_probe.rs`. An excluded measurement tool: it asserts nothing until it becomes the parity suite (slice 4). |
+| Probe | `crates/runner/tests/mysql_type_probe.rs` at the base commit in each run's `env.json` (identified by `CODE-SHA256SUMS`). It has since become the asserting parity suite `crates/runner/tests/type_parity_e2e.rs`, which writes the same raw files. |
 | Report generator | `scripts/type-probe-report.py <dir>` |
 | Committed evidence | `docs/design/evidence/mysql-type-probe/`: for each run, the sanitized `report.md`, the environment manifest `env.json` and `SHA256SUMS` of every raw file the run produced. The raw files themselves are kept by the author; rerunning the pinned probe regenerates equivalent files. |
 | Main run | `main/` (S3 `legacy_rolling`, so the Parquet encoder is observable) |
 | Durable S3 run | `durable-s3/` (`TYPE_PROBE_S3_DURABILITY=durable_v2`; every Parquet pipeline fails, section 8.2) |
 
-**Reproducing:** `cargo test -p runner --test mysql_type_probe -- --include-ignored --nocapture` (Docker). Output goes to `target/type-probe/<UTC time>/`, then run `scripts/type-probe-report.py` on it. All container images are pinned by digest in the probe and recorded in `env.json`:
+**Reproducing:** check out the run's base commit and run `cargo test -p runner --test mysql_type_probe -- --include-ignored --nocapture` (Docker); on later commits, `cargo test -p runner --test type_parity_e2e -- --include-ignored --nocapture --test-threads=1` produces the same files with the canonical decoders. Output goes to `target/type-probe/<UTC time>/`, then run `scripts/type-probe-report.py` on it. All container images are pinned by digest in the probe and recorded in `env.json`:
 
 | Image | Pinned reference |
 |---|---|

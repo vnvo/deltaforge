@@ -98,10 +98,12 @@ curl -s -X DELETE http://localhost:8080/pipelines/my-pipeline/journal/dlq
   "source_cursor": {"file": "mysql-bin.000005", "pos": 12345},
   "payload_truncated": false,
   "event": {
-    "id": "01961234-5678-7abc-def0-123456789abc",
+    "event_id": "01961234-5678-7abc-def0-123456789abc",
     "source": {"db": "orders", "table": "events"},
     "op": "c",
-    "after": {"id": 99, "metadata": "<invalid bytes>"}
+    "type_mapping": "v2",
+    "after": {"c": [["id", {"t": "int", "w": 32, "v": "99"}],
+                    ["big", {"t": "uint", "w": 64, "v": "18446744073709551615"}]]}
   },
   "meta": {
     "sink_id": "kafka-primary",
@@ -111,6 +113,12 @@ curl -s -X DELETE http://localhost:8080/pipelines/my-pipeline/journal/dlq
   }
 }
 ```
+
+The `event` is the event's lossless typed form: each value with its type
+(integers as exact decimal text, bytes in base64, documents as canonical
+JSON text) and the event's `type_mapping`, so an entry can be inspected or
+re-delivered without guessing types. Entries written by earlier releases
+(untyped JSON) stay readable as they are.
 
 ## Metrics
 

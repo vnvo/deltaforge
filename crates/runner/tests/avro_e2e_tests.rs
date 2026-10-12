@@ -1,11 +1,11 @@
-//! End-to-end Avro encoding tests using REAL source serializers.
+//! End-to-end Avro encoding tests using REAL source decoders.
 //!
 //! These tests exercise the full production path:
-//!   MySQL ColumnValue → mysql_object::build_object() → JSON → Avro encoder → Schema Registry
-//!   PostgreSQL PgColumnValue → postgres_object::build_object() → JSON → Avro encoder → SR
+//!   MySQL ColumnValue → mysql_decode::TableDecoder → CanonicalRow → native JSON → Avro encoder → Schema Registry
+//!   PostgreSQL tuple text → postgres_decode::PgRowDecoder → CanonicalRow → native JSON → Avro encoder → SR
 //!
-//! NO hand-crafted JSON. The JSON is produced by the actual source serializers
-//! with the exact same ColumnValue types that the binlog/WAL parsers produce.
+//! NO hand-crafted rows. The rows are produced by the actual source decoders
+//! from the exact same wire values that the binlog/WAL parsers produce.
 //!
 //! Requires Docker for Schema Registry (testcontainers). Run with:
 //!   cargo test -p runner --test avro_e2e_tests -- --include-ignored --nocapture --test-threads=1
@@ -13,13 +13,11 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use bytes::Bytes;
 use ctor::dtor;
 use gate_ownership::GateOwned;
 use mysql_binlog_connector_rust::column::column_value::{
     ColumnValue, MysqlDate, MysqlDateTime, MysqlTime,
 };
-use serde_json::json;
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
@@ -36,8 +34,15 @@ use deltaforge_core::encoding::avro_types::{
     ColumnDesc, TypeConversionOpts, mysql_column_to_avro,
     postgres_column_to_avro,
 };
-use sources::mysql::mysql_object;
-use sources::postgres::postgres_object::{PgColumnValue, RelationColumn};
+use deltaforge_core::{
+    CanonicalRow, Event, EventId, NativeOpts, Op, SourceInfo, SourcePosition,
+    TypeMapping,
+};
+use sources::mysql::mysql_decode::TableDecoder;
+use sources::mysql::{MySqlColumn, MySqlTableSchema};
+use sources::postgres::postgres_decode::{
+    Image, PgColumnDecoder, PgRowDecoder, TupleValue,
+};
 use sources::postgres::postgres_table_schema::type_oids;
 
 // =============================================================================
@@ -244,7 +249,7 @@ async fn avro_roundtrip(
     connector: &str,
     table: &str,
     columns: &[ColumnDesc],
-    after_json: serde_json::Value,
+    after: CanonicalRow,
 ) -> Result<()> {
     let _ = get_sr().await;
     let opts = TypeConversionOpts::default();
@@ -266,26 +271,28 @@ async fn avro_roundtrip(
     let encoder =
         AvroEncoder::new(&sr_url(), SubjectStrategy::TopicName, None, None)?;
 
-    let event = json!({
-        "before": null,
-        "after": after_json,
-        "source": {
-            "version": "e2e-test",
-            "connector": connector,
-            "name": "e2e",
-            "ts_ms": 1700000000000_i64,
-            "db": "e2e_test",
-            "schema": null,
-            "table": table,
-            "snapshot": null,
-            "position": null
+    // The event as the sinks render it: its native (Debezium-style) JSON.
+    let event = Event::new_row(
+        EventId::mysql_row_server(1, table, 1, 0),
+        SourceInfo {
+            version: "e2e-test".into(),
+            connector: connector.into(),
+            name: "e2e".into(),
+            ts_ms: 1_700_000_000_000,
+            db: "e2e_test".into(),
+            schema: None,
+            table: table.into(),
+            snapshot: None,
+            position: SourcePosition::default(),
         },
-        "op": "c",
-        "ts_ms": 1700000000000_i64,
-        "event_id": null,
-        "schema_version": null,
-        "transaction": null
-    });
+        Op::Create,
+        None,
+        Some(after),
+        TypeMapping::V2,
+        1_700_000_000_000,
+        0,
+    )
+    .native_value(NativeOpts::default())?;
 
     let topic = format!("e2e.{connector}.{table}");
     let bytes = encoder.encode(&topic, &event, None).await?;
@@ -317,17 +324,57 @@ async fn avro_roundtrip(
 }
 
 // =============================================================================
-// MySQL: build_object with real ColumnValues
+// MySQL: TableDecoder with real ColumnValues
 // =============================================================================
 
-/// Simulate what mysql_object::build_object produces for a given set of columns.
+/// The MySQL table schema the source loads for `columns` (BOOLEAN is
+/// `tinyint(1)`; character columns are utf8mb4).
+fn mysql_schema(columns: &[ColumnDesc]) -> MySqlTableSchema {
+    MySqlTableSchema::new(
+        columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let data_type = match c.data_type.as_str() {
+                    "boolean" => "tinyint",
+                    other => other,
+                };
+                let mut col = MySqlColumn::new(
+                    &c.name,
+                    &c.column_type,
+                    data_type,
+                    c.nullable,
+                    i as u32 + 1,
+                );
+                col.numeric_precision = c.precision;
+                col.numeric_scale = c.scale;
+                if matches!(
+                    data_type,
+                    "char"
+                        | "varchar"
+                        | "text"
+                        | "tinytext"
+                        | "mediumtext"
+                        | "longtext"
+                ) {
+                    col.collation_id = Some(255); // utf8mb4_0900_ai_ci
+                }
+                col
+            })
+            .collect(),
+    )
+}
+
+/// Decode a binlog row image (every column included) with the source's
+/// real decoder for `columns`.
 fn mysql_build_row(
-    col_names: &[&str],
+    columns: &[ColumnDesc],
     values: Vec<ColumnValue>,
-) -> serde_json::Value {
-    let cols: Vec<String> = col_names.iter().map(|s| s.to_string()).collect();
-    let included: Vec<bool> = vec![true; cols.len()];
-    mysql_object::build_object(&cols, &[], &included, &values)
+) -> CanonicalRow {
+    let included = vec![true; columns.len()];
+    TableDecoder::new(&mysql_schema(columns))
+        .decode_binlog_row(&included, &values)
+        .expect("the source decoder decodes the row")
 }
 
 // ── MySQL payment domain (the table that kept failing) ──────────────────────
@@ -337,24 +384,25 @@ fn mysql_build_row(
 async fn e2e_mysql_payment_domain() -> Result<()> {
     tracing_subscriber::fmt::try_init().ok();
 
+    let columns = [
+        col("id", "int", "int", false),
+        col("tag", "varchar", "varchar(100)", false),
+        col("data", "text", "text", true),
+        decimal_col("value", 10, 4),
+        col("status", "tinyint", "tinyint", true),
+        col("currency", "char", "char(3)", true),
+        col("method", "varchar", "varchar(32)", true),
+        col("reference", "varchar", "varchar(128)", true),
+        decimal_col("fee", 8, 4),
+        decimal_col("net_amount", 12, 4),
+        col("refunded", "boolean", "tinyint(1)", true),
+        col("processed_at", "datetime", "datetime", true),
+        col("metadata", "json", "json", true),
+        col("created_at", "timestamp", "timestamp", true),
+        col("updated_at", "timestamp", "timestamp", true),
+    ];
     let after = mysql_build_row(
-        &[
-            "id",
-            "tag",
-            "data",
-            "value",
-            "status",
-            "currency",
-            "method",
-            "reference",
-            "fee",
-            "net_amount",
-            "refunded",
-            "processed_at",
-            "metadata",
-            "created_at",
-            "updated_at",
-        ],
+        &columns,
         vec![
             ColumnValue::Long(9205),
             ColumnValue::String(b"drain-26-1775260448196-52".to_vec()),
@@ -374,29 +422,7 @@ async fn e2e_mysql_payment_domain() -> Result<()> {
         ],
     );
 
-    avro_roundtrip(
-        "mysql",
-        "e2e_payment",
-        &[
-            col("id", "int", "int", false),
-            col("tag", "varchar", "varchar(100)", false),
-            col("data", "text", "text", true),
-            decimal_col("value", 10, 4),
-            col("status", "tinyint", "tinyint", true),
-            col("currency", "char", "char(3)", true),
-            col("method", "varchar", "varchar(32)", true),
-            col("reference", "varchar", "varchar(128)", true),
-            decimal_col("fee", 8, 4),
-            decimal_col("net_amount", 12, 4),
-            col("refunded", "boolean", "tinyint(1)", true),
-            col("processed_at", "datetime", "datetime", true),
-            col("metadata", "json", "json", true),
-            col("created_at", "timestamp", "timestamp", true),
-            col("updated_at", "timestamp", "timestamp", true),
-        ],
-        after,
-    )
-    .await
+    avro_roundtrip("mysql", "e2e_payment", &columns, after).await
 }
 
 // ── MySQL customer domain ───────────────────────────────────────────────────
@@ -406,25 +432,26 @@ async fn e2e_mysql_payment_domain() -> Result<()> {
 async fn e2e_mysql_customer_domain() -> Result<()> {
     tracing_subscriber::fmt::try_init().ok();
 
+    let columns = [
+        col("id", "int", "int", false),
+        col("tag", "varchar", "varchar(100)", false),
+        col("data", "text", "text", true),
+        decimal_col("value", 10, 4),
+        col("status", "tinyint", "tinyint", true),
+        col("name", "varchar", "varchar(255)", true),
+        col("email", "varchar", "varchar(255)", true),
+        col("phone", "varchar", "varchar(32)", true),
+        col("active", "boolean", "tinyint(1)", true),
+        col("loyalty_points", "int", "int", true),
+        col("credit_score", "float", "float", true),
+        col("preferences", "json", "json", true),
+        col("dob", "date", "date", true),
+        col("last_login", "datetime", "datetime", true),
+        col("created_at", "timestamp", "timestamp", true),
+        col("updated_at", "timestamp", "timestamp", true),
+    ];
     let after = mysql_build_row(
-        &[
-            "id",
-            "tag",
-            "data",
-            "value",
-            "status",
-            "name",
-            "email",
-            "phone",
-            "active",
-            "loyalty_points",
-            "credit_score",
-            "preferences",
-            "dob",
-            "last_login",
-            "created_at",
-            "updated_at",
-        ],
+        &columns,
         vec![
             ColumnValue::Long(10241),
             ColumnValue::String(b"drain-19-1775260449024-0".to_vec()),
@@ -445,30 +472,7 @@ async fn e2e_mysql_customer_domain() -> Result<()> {
         ],
     );
 
-    avro_roundtrip(
-        "mysql",
-        "e2e_customer",
-        &[
-            col("id", "int", "int", false),
-            col("tag", "varchar", "varchar(100)", false),
-            col("data", "text", "text", true),
-            decimal_col("value", 10, 4),
-            col("status", "tinyint", "tinyint", true),
-            col("name", "varchar", "varchar(255)", true),
-            col("email", "varchar", "varchar(255)", true),
-            col("phone", "varchar", "varchar(32)", true),
-            col("active", "boolean", "tinyint(1)", true),
-            col("loyalty_points", "int", "int", true),
-            col("credit_score", "float", "float", true),
-            col("preferences", "json", "json", true),
-            col("dob", "date", "date", true),
-            col("last_login", "datetime", "datetime", true),
-            col("created_at", "timestamp", "timestamp", true),
-            col("updated_at", "timestamp", "timestamp", true),
-        ],
-        after,
-    )
-    .await
+    avro_roundtrip("mysql", "e2e_customer", &columns, after).await
 }
 
 // ── MySQL order domain ──────────────────────────────────────────────────────
@@ -478,24 +482,25 @@ async fn e2e_mysql_customer_domain() -> Result<()> {
 async fn e2e_mysql_order_domain() -> Result<()> {
     tracing_subscriber::fmt::try_init().ok();
 
+    let columns = [
+        col("id", "int", "int", false),
+        col("tag", "varchar", "varchar(100)", false),
+        col("data", "text", "text", true),
+        decimal_col("value", 10, 4),
+        col("status", "tinyint", "tinyint", true),
+        col("currency", "char", "char(3)", true),
+        col("items_count", "smallint", "smallint", true),
+        decimal_col("shipping_cost", 8, 4),
+        decimal_col("gross_amount", 12, 4),
+        col("is_gift", "boolean", "tinyint(1)", true),
+        col("placed_at", "datetime", "datetime", true),
+        col("dispatched_at", "datetime", "datetime", true),
+        col("notes", "text", "text", true),
+        col("created_at", "timestamp", "timestamp", true),
+        col("updated_at", "timestamp", "timestamp", true),
+    ];
     let after = mysql_build_row(
-        &[
-            "id",
-            "tag",
-            "data",
-            "value",
-            "status",
-            "currency",
-            "items_count",
-            "shipping_cost",
-            "gross_amount",
-            "is_gift",
-            "placed_at",
-            "dispatched_at",
-            "notes",
-            "created_at",
-            "updated_at",
-        ],
+        &columns,
         vec![
             ColumnValue::Long(5001),
             ColumnValue::String(b"drain-10-1775260449000-0".to_vec()),
@@ -515,29 +520,7 @@ async fn e2e_mysql_order_domain() -> Result<()> {
         ],
     );
 
-    avro_roundtrip(
-        "mysql",
-        "e2e_order",
-        &[
-            col("id", "int", "int", false),
-            col("tag", "varchar", "varchar(100)", false),
-            col("data", "text", "text", true),
-            decimal_col("value", 10, 4),
-            col("status", "tinyint", "tinyint", true),
-            col("currency", "char", "char(3)", true),
-            col("items_count", "smallint", "smallint", true),
-            decimal_col("shipping_cost", 8, 4),
-            decimal_col("gross_amount", 12, 4),
-            col("is_gift", "boolean", "tinyint(1)", true),
-            col("placed_at", "datetime", "datetime", true),
-            col("dispatched_at", "datetime", "datetime", true),
-            col("notes", "text", "text", true),
-            col("created_at", "timestamp", "timestamp", true),
-            col("updated_at", "timestamp", "timestamp", true),
-        ],
-        after,
-    )
-    .await
+    avro_roundtrip("mysql", "e2e_order", &columns, after).await
 }
 
 // ── MySQL event domain ──────────────────────────────────────────────────────
@@ -547,23 +530,24 @@ async fn e2e_mysql_order_domain() -> Result<()> {
 async fn e2e_mysql_event_domain() -> Result<()> {
     tracing_subscriber::fmt::try_init().ok();
 
+    let columns = [
+        col("id", "int", "int", false),
+        col("tag", "varchar", "varchar(100)", false),
+        col("data", "text", "text", true),
+        decimal_col("value", 10, 4),
+        col("status", "tinyint", "tinyint", true),
+        col("event_type", "varchar", "varchar(32)", true),
+        col("source_ip", "varchar", "varchar(45)", true),
+        col("session_id", "varchar", "varchar(64)", true),
+        col("severity", "smallint", "smallint", true),
+        col("duration_ms", "bigint", "bigint", true),
+        col("occurred_at", "datetime", "datetime", true),
+        col("payload", "text", "text", true),
+        col("created_at", "timestamp", "timestamp", true),
+        col("updated_at", "timestamp", "timestamp", true),
+    ];
     let after = mysql_build_row(
-        &[
-            "id",
-            "tag",
-            "data",
-            "value",
-            "status",
-            "event_type",
-            "source_ip",
-            "session_id",
-            "severity",
-            "duration_ms",
-            "occurred_at",
-            "payload",
-            "created_at",
-            "updated_at",
-        ],
+        &columns,
         vec![
             ColumnValue::Long(9281),
             ColumnValue::String(b"drain-29-1775260449022-0".to_vec()),
@@ -582,28 +566,7 @@ async fn e2e_mysql_event_domain() -> Result<()> {
         ],
     );
 
-    avro_roundtrip(
-        "mysql",
-        "e2e_event",
-        &[
-            col("id", "int", "int", false),
-            col("tag", "varchar", "varchar(100)", false),
-            col("data", "text", "text", true),
-            decimal_col("value", 10, 4),
-            col("status", "tinyint", "tinyint", true),
-            col("event_type", "varchar", "varchar(32)", true),
-            col("source_ip", "varchar", "varchar(45)", true),
-            col("session_id", "varchar", "varchar(64)", true),
-            col("severity", "smallint", "smallint", true),
-            col("duration_ms", "bigint", "bigint", true),
-            col("occurred_at", "datetime", "datetime", true),
-            col("payload", "text", "text", true),
-            col("created_at", "timestamp", "timestamp", true),
-            col("updated_at", "timestamp", "timestamp", true),
-        ],
-        after,
-    )
-    .await
+    avro_roundtrip("mysql", "e2e_event", &columns, after).await
 }
 
 // ── MySQL: every column type in one table ───────────────────────────────────
@@ -613,32 +576,33 @@ async fn e2e_mysql_event_domain() -> Result<()> {
 async fn e2e_mysql_all_types() -> Result<()> {
     tracing_subscriber::fmt::try_init().ok();
 
+    let columns = [
+        col("c_tinyint", "tinyint", "tinyint", false),
+        col("c_smallint", "smallint", "smallint", true),
+        col("c_mediumint", "mediumint", "mediumint", true),
+        col("c_int", "int", "int", false),
+        col("c_bigint", "bigint", "bigint", true),
+        col("c_float", "float", "float", true),
+        col("c_double", "double", "double", true),
+        decimal_col("c_decimal", 10, 2),
+        col("c_varchar", "varchar", "varchar(255)", true),
+        col("c_char", "char", "char(3)", true),
+        col("c_text", "text", "text", true),
+        col("c_blob", "blob", "blob", true),
+        col("c_date", "date", "date", true),
+        col("c_datetime", "datetime", "datetime", true),
+        col("c_timestamp", "timestamp", "timestamp", true),
+        col("c_time", "time", "time", true),
+        col("c_year", "year", "year", true),
+        col("c_bool", "boolean", "tinyint(1)", true),
+        col("c_json", "json", "json", true),
+        col("c_enum", "enum", "enum('a','b','c')", true),
+        col("c_set", "set", "set('x','y','z')", true),
+        col("c_null_text", "text", "text", true),
+        col("c_null_int", "int", "int", true),
+    ];
     let after = mysql_build_row(
-        &[
-            "c_tinyint",
-            "c_smallint",
-            "c_mediumint",
-            "c_int",
-            "c_bigint",
-            "c_float",
-            "c_double",
-            "c_decimal",
-            "c_varchar",
-            "c_char",
-            "c_text",
-            "c_blob",
-            "c_date",
-            "c_datetime",
-            "c_timestamp",
-            "c_time",
-            "c_year",
-            "c_bool",
-            "c_json",
-            "c_enum",
-            "c_set",
-            "c_null_text",
-            "c_null_int",
-        ],
+        &columns,
         vec![
             ColumnValue::Tiny(127),                          // TINYINT
             ColumnValue::Short(32000),                       // SMALLINT
@@ -678,71 +642,52 @@ async fn e2e_mysql_all_types() -> Result<()> {
             }), // TIME
             ColumnValue::Year(2026),    // YEAR
             ColumnValue::Tiny(1),       // BOOLEAN (as TINYINT)
-            ColumnValue::Json(br#"{"key":"value"}"#.to_vec()), // JSON
-            ColumnValue::Enum(2),       // ENUM index
-            ColumnValue::Set(3),        // SET bitmask
-            ColumnValue::None,          // NULL TEXT
-            ColumnValue::None,          // NULL INT
+            // JSON: {"key":"value"} in MySQL's binary JSON (small object),
+            // as the binlog carries it.
+            ColumnValue::Json(vec![
+                0x00, 0x01, 0x00, 0x14,
+                0x00, // small object: 1 entry, 20 bytes
+                0x0b, 0x00, 0x03, 0x00, // key entry: offset 11, length 3
+                0x0c, 0x0e, 0x00, // value entry: string at offset 14
+                b'k', b'e', b'y', 0x05, b'v', b'a', b'l', b'u', b'e',
+            ]),
+            ColumnValue::Enum(2), // ENUM index
+            ColumnValue::Set(3),  // SET bitmask
+            ColumnValue::None,    // NULL TEXT
+            ColumnValue::None,    // NULL INT
         ],
     );
 
-    avro_roundtrip(
-        "mysql",
-        "e2e_all_mysql",
-        &[
-            col("c_tinyint", "tinyint", "tinyint", false),
-            col("c_smallint", "smallint", "smallint", true),
-            col("c_mediumint", "mediumint", "mediumint", true),
-            col("c_int", "int", "int", false),
-            col("c_bigint", "bigint", "bigint", true),
-            col("c_float", "float", "float", true),
-            col("c_double", "double", "double", true),
-            decimal_col("c_decimal", 10, 2),
-            col("c_varchar", "varchar", "varchar(255)", true),
-            col("c_char", "char", "char(3)", true),
-            col("c_text", "text", "text", true),
-            col("c_blob", "blob", "blob", true),
-            col("c_date", "date", "date", true),
-            col("c_datetime", "datetime", "datetime", true),
-            col("c_timestamp", "timestamp", "timestamp", true),
-            col("c_time", "time", "time", true),
-            col("c_year", "year", "year", true),
-            col("c_bool", "boolean", "tinyint(1)", true),
-            col("c_json", "json", "json", true),
-            col("c_enum", "enum", "enum('a','b','c')", true),
-            col("c_set", "set", "set('x','y','z')", true),
-            col("c_null_text", "text", "text", true),
-            col("c_null_int", "int", "int", true),
-        ],
-        after,
-    )
-    .await
+    avro_roundtrip("mysql", "e2e_all_mysql", &columns, after).await
 }
 
 // =============================================================================
-// PostgreSQL: build_object with real PgColumnValues
+// PostgreSQL: PgRowDecoder over real pgoutput text values
 // =============================================================================
 
-/// Build a PG row using the real postgres_object::build_object.
-fn pg_build_row(
-    named_values: Vec<(&str, PgColumnValue, u32)>,
-) -> serde_json::Value {
-    let columns: Vec<RelationColumn> = named_values
+/// Decode a pgoutput tuple (each value in text format, `None` for NULL)
+/// with the source's real decoder for the relation's columns.
+fn pg_build_row(named_values: Vec<(&str, Option<&str>, u32)>) -> CanonicalRow {
+    let decoder = PgRowDecoder {
+        columns: named_values
+            .iter()
+            .map(|(name, _, oid)| PgColumnDecoder::new(name, *oid, -1, None))
+            .collect(),
+    };
+    let values: Vec<TupleValue<'_>> = named_values
         .iter()
-        .map(|(name, _, oid)| RelationColumn {
-            name: name.to_string(),
-            type_oid: *oid,
-            type_modifier: -1,
-            flags: 0,
+        .map(|(_, v, _)| match v {
+            Some(t) => TupleValue::Text(t.as_bytes()),
+            None => TupleValue::Null,
         })
         .collect();
-    let values: Vec<PgColumnValue> =
-        named_values.into_iter().map(|(_, v, _)| v).collect();
-    sources::postgres::postgres_object::build_object(&columns, &values)
+    decoder
+        .decode_tuple(&values, Image::Other)
+        .expect("the source decoder decodes the tuple")
 }
 
-fn pg_text_val(s: &str) -> PgColumnValue {
-    PgColumnValue::Text(Bytes::from(s.to_string()))
+fn pg_text_val(s: &str) -> Option<&str> {
+    Some(s)
 }
 
 // ── PostgreSQL: every type ──────────────────────────────────────────────────
@@ -794,7 +739,7 @@ async fn e2e_pg_all_types() -> Result<()> {
             pg_text_val("{\"nested\":{\"a\":1}}"),
             type_oids::JSONB,
         ),
-        ("c_null", PgColumnValue::Null, type_oids::INT4),
+        ("c_null", None, type_oids::INT4),
         ("c_int_arr", pg_text_val("{1,2,3}"), 1007), // int4[]
         ("c_text_arr", pg_text_val("{hello,world}"), 1009), // text[]
     ]);

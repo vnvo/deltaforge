@@ -83,7 +83,8 @@ impl RecordingSink {
 fn event_id(e: &Event) -> Option<i64> {
     e.after
         .as_ref()
-        .and_then(|v| v.get("id"))
+        .map(test_common::row_view)
+        .and_then(|v| v.get("id").cloned())
         .and_then(|v| v.as_i64())
 }
 
@@ -300,6 +301,7 @@ async fn mysql_source(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }
 
@@ -400,6 +402,7 @@ async fn pg_source(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }
 
