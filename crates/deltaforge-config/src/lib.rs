@@ -453,6 +453,25 @@ pub struct PostgresSrcCfg {
     /// Opt-in controlled credential rotation (file-backed credentials only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rotation: Option<CredentialRotationCfg>,
+    /// The type-mapping version stamped on every event. PostgreSQL sources
+    /// support only `v2`: there is no lossless legacy rendering to keep.
+    #[serde(default, deserialize_with = "postgres_type_mapping")]
+    pub type_mapping: deltaforge_core::TypeMapping,
+}
+
+/// A PostgreSQL source's `type_mapping`: `v2` only.
+fn postgres_type_mapping<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<deltaforge_core::TypeMapping, D::Error> {
+    match deltaforge_core::TypeMapping::deserialize(d)? {
+        deltaforge_core::TypeMapping::V2 => {
+            Ok(deltaforge_core::TypeMapping::V2)
+        }
+        deltaforge_core::TypeMapping::V1 => Err(serde::de::Error::custom(
+            "type_mapping v1 exists only for MySQL sources (PostgreSQL had \
+             no lossless legacy output to keep); use v2",
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -495,6 +514,11 @@ pub struct MysqlSrcCfg {
     /// Requires the server to run in GTID mode; startup fails otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rotation: Option<CredentialRotationCfg>,
+    /// The type-mapping version stamped on every event: `v2` (default) or
+    /// the deprecated `v1`, which keeps only the legacy renderings that were
+    /// lossless.
+    #[serde(default)]
+    pub type_mapping: deltaforge_core::TypeMapping,
 }
 
 /// Redacted rendering of an optional inline DSN for `Debug`. `Some` values have
@@ -521,6 +545,7 @@ impl std::fmt::Debug for PostgresSrcCfg {
             .field("outbox", &self.outbox)
             .field("snapshot", &self.snapshot)
             .field("on_schema_drift", &self.on_schema_drift)
+            .field("type_mapping", &self.type_mapping)
             .finish()
     }
 }
@@ -537,6 +562,7 @@ impl std::fmt::Debug for MysqlSrcCfg {
             .field("outbox", &self.outbox)
             .field("snapshot", &self.snapshot)
             .field("on_schema_drift", &self.on_schema_drift)
+            .field("type_mapping", &self.type_mapping)
             .finish()
     }
 }

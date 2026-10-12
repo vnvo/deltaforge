@@ -83,7 +83,20 @@ impl Source for FakeSource {
                     source_info,
                     Op::Create,
                     None,
-                    Some(serde_json::json!({ "n": n })),
+                    Some(
+                        deltaforge_core::CanonicalRow::new(vec![(
+                            "n".to_string(),
+                            deltaforge_core::CanonicalValue::Db(
+                                deltaforge_core::canonical::DbValue::int(
+                                    n as i64,
+                                    deltaforge_core::canonical::IntWidth::W64,
+                                )
+                                .expect("fits"),
+                            ),
+                        )])
+                        .expect("unique columns"),
+                    ),
+                    deltaforge_core::TypeMapping::V2,
                     ts_ms,
                     10_usize,
                 )

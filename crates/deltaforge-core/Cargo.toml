@@ -26,5 +26,9 @@ sha2.workspace = true
 hex.workspace = true
 arrow-schema = "58"
 
+[features]
+# Canonical rows built from JSON literals, for test fixtures only.
+test-fixtures = []
+
 [lints]
 workspace = true

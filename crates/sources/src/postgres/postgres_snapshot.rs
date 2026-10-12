@@ -94,7 +94,7 @@ pub struct IdentitySpec {
 }
 
 /// The `, t."col"...` suffix that adds native identity columns to a snapshot
-/// SELECT (column 0 is always the `row_to_json` payload).
+/// SELECT, after the payload columns.
 fn identity_select_suffix(specs: &[IdentitySpec]) -> String {
     specs
         .iter()
@@ -102,22 +102,68 @@ fn identity_select_suffix(specs: &[IdentitySpec]) -> String {
         .collect()
 }
 
+/// How a table's rows are read and decoded: the payload select list and the
+/// schema version's decoder (by column type, as CDC decodes).
+pub(crate) struct SnapshotRead {
+    /// One text column per schema column: its type's output text, NULL
+    /// kept NULL (the payload columns of every scan's SELECT).
+    pub payload: String,
+    pub decoder: super::postgres_decode::PgRowDecoder,
+}
+
+impl SnapshotRead {
+    /// The read of `schema`'s columns, or why a column cannot be read.
+    pub(crate) fn of(
+        schema: &super::PostgresTableSchema,
+    ) -> Result<SnapshotRead> {
+        let mut decoders = Vec::with_capacity(schema.columns.len());
+        let mut payload = Vec::with_capacity(schema.columns.len());
+        for c in &schema.columns {
+            let oid = c.type_oid.ok_or_else(|| {
+                anyhow!("column {:?} has no recorded type OID", c.name)
+            })?;
+            decoders.push(super::postgres_decode::PgColumnDecoder::new(
+                &c.name,
+                oid,
+                c.type_modifier.unwrap_or(-1),
+                c.udt_name.as_deref(),
+            ));
+            // `format('%s', x)` calls x's type output function (as pgoutput
+            // does); NULL stays NULL.
+            let q = format!("t.{}", quote_ident(&c.name));
+            payload.push(format!(
+                "CASE WHEN {q} IS NULL THEN NULL ELSE format('%s', {q}) END"
+            ));
+        }
+        Ok(SnapshotRead {
+            payload: payload.join(", "),
+            decoder: super::postgres_decode::PgRowDecoder { columns: decoders },
+        })
+    }
+
+    fn width(&self) -> usize {
+        self.decoder.columns.len()
+    }
+}
+
 /// The single, shared identity-extraction path used by **all** scan strategies
 /// (PK sequential, PK parallel, ctid). Reads the native binary identity columns
-/// (indices `1..=specs.len()`) and mints the provisional snapshot id.
+/// (after the `payload_width` payload columns) and mints the provisional
+/// snapshot id.
 fn provisional_snapshot_id(
     row: &tokio_postgres::Row,
+    payload_width: usize,
     specs: &[IdentitySpec],
     lineage: &PersistedLineage,
     generation: u64,
     schema: &str,
     table: &str,
 ) -> Result<EventId> {
-    let expected = 1 + specs.len();
+    let expected = payload_width + specs.len();
     if row.len() != expected {
         bail!(
-            "snapshot row has {} columns, expected {expected} (payload + {} \
-             identity columns)",
+            "snapshot row has {} columns, expected {expected} ({payload_width} \
+             payload + {} identity columns)",
             row.len(),
             specs.len()
         );
@@ -126,7 +172,7 @@ fn provisional_snapshot_id(
     for (i, spec) in specs.iter().enumerate() {
         // ctid is never an identity input; identity columns are explicit.
         let raw: Option<PgIdentityRaw> = row
-            .try_get(1 + i)
+            .try_get(payload_width + i)
             .with_context(|| format!("read identity column {:?}", spec.name))?;
         let cell = match raw {
             Some(r) => pg_identity_cell(&r)
@@ -169,6 +215,8 @@ pub struct PgCopyCtx<'a> {
     pub snapshot_id: &'a str,
     pub generation: u64,
     pub lineage: PersistedLineage,
+    /// The type-mapping version stamped on every snapshot event.
+    pub type_mapping: deltaforge_core::TypeMapping,
 }
 
 /// How often a table whose worker failed is copied again while the
@@ -202,6 +250,14 @@ fn planned(item: &PlanItem) -> Result<super::PgPlannedTable> {
 /// [`TABLE_RETRIES`] times; otherwise the copy fails and the generation is
 /// lost.
 pub async fn copy_generation(ctx: &PgCopyCtx<'_>) -> Result<()> {
+    // `source.db` of every snapshot event, as of CDC events: the database
+    // (the table's schema is `source.schema`).
+    let database: String = ctx
+        .coord
+        .query_one("SELECT current_database()::text", &[])
+        .await
+        .context("read the database name")?
+        .get(0);
     let max_parallel = ctx.cfg.max_parallel_tables.max(1);
     let page = ctx.cfg.discovery_page_size.max(1);
     let workers_cancel = ctx.cancel.child_token();
@@ -231,6 +287,7 @@ pub async fn copy_generation(ctx: &PgCopyCtx<'_>) -> Result<()> {
         let worker = TableWorker {
             version: None,
             dsn: crate::credentials::ProtectedDsn::from(ctx.dsn),
+            database: database.clone(),
             schema: table.qualifier.clone(),
             table: table.table.clone(),
             snapshot_id: ctx.snapshot_id.to_string(),
@@ -245,6 +302,8 @@ pub async fn copy_generation(ctx: &PgCopyCtx<'_>) -> Result<()> {
             identity: table.identity.clone(),
             publisher: Arc::clone(&ctx.publisher),
             permits: Arc::clone(&ctx.permits),
+            type_mapping: ctx.type_mapping,
+            read: None,
         };
         let task = running.spawn(worker.run());
         tasks.insert(task.id(), (table, attempt, permit));
@@ -341,6 +400,14 @@ async fn finish_table(
         Ok((_, Ok(rows))) => {
             info!(table = %table.key(), rows, "snapshot table copied");
             return Ok(());
+        }
+        // A typed failure (a value the decoder refuses) is deterministic:
+        // copying again cannot change it, and it stays typed.
+        Ok((_, Err(e)))
+            if e.downcast_ref::<deltaforge_core::SourceError>().is_some() =>
+        {
+            error!(table = %table.key(), error = %format!("{e:#}"), "snapshot table failed");
+            return Err(e);
         }
         Ok((_, Err(e))) => format!("{e:#}"),
         Err(e) => format!("worker panicked: {e}"),
@@ -635,6 +702,8 @@ struct TableWorker {
     /// registry sequence), stamped on every snapshot event.
     version: Option<(String, u64)>,
     dsn: crate::credentials::ProtectedDsn,
+    /// The database the table belongs to (`source.db`).
+    database: String,
     schema: String,
     table: String,
     snapshot_id: String,
@@ -653,6 +722,10 @@ struct TableWorker {
     publisher: Arc<GenerationPublisher>,
     /// For intra-table readers, each on an extra permit.
     permits: Arc<SnapshotPermits>,
+    /// The type-mapping version stamped on every event.
+    type_mapping: deltaforge_core::TypeMapping,
+    /// How rows are read and decoded, set in `run` before any scan.
+    read: Option<Arc<SnapshotRead>>,
 }
 
 /// Open a connection that reads in the exported view `snapshot_id`.
@@ -669,6 +742,12 @@ async fn import_view(
             warn!(error = %e, "snapshot reader connection dropped");
         }
     });
+    // Values are read as their output text under the session settings
+    // pgoutput's session pins too.
+    client
+        .batch_execute(&super::postgres_decode::pinned_session_sql())
+        .await
+        .with_context(|| format!("pin the session for {what}"))?;
     client
         .batch_execute(&format!(
             "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ; \
@@ -695,6 +774,10 @@ impl TableWorker {
             .await
             .with_context(|| format!("load schema for {fqn}"))?;
         self.version = Some((loaded.fingerprint.to_string(), loaded.sequence));
+        self.read = Some(Arc::new(
+            SnapshotRead::of(&loaded.schema)
+                .with_context(|| format!("read plan for {fqn}"))?,
+        ));
 
         let pk = &loaded.schema.primary_key;
         let total = estimate_rows(&client, &self.schema, &self.table).await;
@@ -861,7 +944,11 @@ impl TableWorker {
 
     fn reader(&self) -> RangeReader {
         RangeReader {
+            read: Arc::clone(self.read.as_ref().expect("set before any scan")),
+            source_id: self.source_id.clone(),
+            type_mapping: self.type_mapping,
             version: self.version.clone(),
+            database: self.database.clone(),
             schema: self.schema.clone(),
             table: self.table.clone(),
             pipeline: self.pipeline.clone(),
@@ -912,11 +999,13 @@ impl TableWorker {
             let end_page = (page + pages_per_chunk).min(total_pages);
             // ctid drives pagination ONLY; identity comes from the explicit
             // native identity columns, never ctid.
+            let read = self.read.as_ref().expect("set before any scan");
             let sql = format!(
-                r#"SELECT row_to_json(t)::text{}
+                r#"SELECT {}{}
                    FROM (SELECT * FROM "{}"."{}"
                          WHERE ctid >= '({page},1)'::tid
                            AND ctid < '({end_page},1)'::tid) t"#,
+                read.payload,
                 identity_select_suffix(&self.identity),
                 self.schema,
                 self.table
@@ -928,17 +1017,7 @@ impl TableWorker {
 
             let mut events = Vec::with_capacity(rows.len());
             for row in rows {
-                events.push(build_pg_snapshot_event(
-                    &row,
-                    &self.identity,
-                    &self.lineage,
-                    self.generation,
-                    &self.schema,
-                    &self.table,
-                    &self.pipeline,
-                    &self.tenant,
-                    self.version.as_ref(),
-                )?);
+                events.push(self.reader().build_event(&row)?);
             }
 
             total_sent += events.len() as u64;
@@ -955,7 +1034,12 @@ impl TableWorker {
 
 /// Reads PK ranges of one table and publishes each as a chunk.
 struct RangeReader {
+    read: Arc<SnapshotRead>,
+    source_id: String,
+    type_mapping: deltaforge_core::TypeMapping,
     version: Option<(String, u64)>,
+    /// The database the table belongs to (`source.db`).
+    database: String,
     schema: String,
     table: String,
     pipeline: String,
@@ -999,13 +1083,14 @@ impl RangeReader {
         to: i64,
     ) -> Result<u64> {
         let fqn = fqn(&self.schema, &self.table);
-        // row_to_json (column 0) is the payload; native identity columns follow
-        // and are the ONLY identity input (schema-directed, never the JSON).
+        // The payload columns come first; native identity columns follow
+        // and are the ONLY identity input (schema-directed).
         let sql = format!(
-            r#"SELECT row_to_json(t)::text{}
+            r#"SELECT {}{}
                FROM (SELECT * FROM "{}"."{}"
                      WHERE "{pk_col}" >= $1::bigint AND "{pk_col}" < $2::bigint
                      ORDER BY "{pk_col}") t"#,
+            self.read.payload,
             identity_select_suffix(&self.identity),
             self.schema,
             self.table
@@ -1018,17 +1103,7 @@ impl RangeReader {
 
         let mut events = Vec::with_capacity(rows.len());
         for row in rows {
-            events.push(build_pg_snapshot_event(
-                &row,
-                &self.identity,
-                &self.lineage,
-                self.generation,
-                &self.schema,
-                &self.table,
-                &self.pipeline,
-                &self.tenant,
-                self.version.as_ref(),
-            )?);
+            events.push(self.build_event(&row)?);
         }
         let n = events.len() as u64;
         self.publisher
@@ -1041,51 +1116,69 @@ impl RangeReader {
 
 // Utility functions
 
-/// Build one snapshot event from a scanned row. Identity comes only from the
-/// explicit native identity columns (never ctid); column 0 is the row_to_json
-/// payload. Shared by the table worker and its intra-table chunk tasks.
-#[allow(clippy::too_many_arguments)]
-fn build_pg_snapshot_event(
-    row: &tokio_postgres::Row,
-    identity: &[IdentitySpec],
-    lineage: &PersistedLineage,
-    generation: u64,
-    schema: &str,
-    table: &str,
-    pipeline: &str,
-    tenant: &str,
-    version: Option<&(String, u64)>,
-) -> Result<Event> {
-    let id = provisional_snapshot_id(
-        row, identity, lineage, generation, schema, table,
-    )?;
-    let json_str: &str = row.get(0);
-    let after: serde_json::Value =
-        serde_json::from_str(json_str).context("parse row_to_json output")?;
-    let size = json_str.len();
-    let ts_ms = chrono::Utc::now().timestamp_millis();
-    let source = SourceInfo {
-        version: concat!("deltaforge-", env!("CARGO_PKG_VERSION")).to_string(),
-        connector: "postgresql".into(),
-        name: pipeline.to_string(),
-        ts_ms,
-        db: schema.to_string(),
-        schema: Some(schema.to_string()),
-        table: table.to_string(),
-        snapshot: Some("true".into()),
-        position: SourcePosition {
-            snapshot_generation: Some(generation),
-            ..Default::default()
-        },
-    };
-    let mut ev =
-        Event::new_row(id, source, Op::Read, None, Some(after), ts_ms, size)
-            .with_tenant(tenant.to_string());
-    if let Some((fingerprint, sequence)) = version {
-        ev.schema_version = Some(fingerprint.clone());
-        ev.schema_sequence = Some(*sequence);
+impl RangeReader {
+    /// Build one snapshot event from a scanned row: its payload columns
+    /// decoded by the schema version's decoder, its identity from the
+    /// explicit native identity columns (never ctid). Shared by the table
+    /// worker and its intra-table chunk tasks.
+    fn build_event(&self, row: &tokio_postgres::Row) -> Result<Event> {
+        let width = self.read.width();
+        let id = provisional_snapshot_id(
+            row,
+            width,
+            &self.identity,
+            &self.lineage,
+            self.generation,
+            &self.schema,
+            &self.table,
+        )?;
+        let texts = (0..width)
+            .map(|i| row.try_get::<_, Option<&str>>(i))
+            .collect::<Result<Vec<_>, _>>()
+            .context("read the payload columns")?;
+        let after = self.read.decoder.decode_texts(&texts).map_err(|e| {
+            anyhow::Error::new(crate::incident_drafts::source_decode_failed(
+                &self.source_id,
+                &fqn(&self.schema, &self.table),
+                &e.column,
+                &e.type_name,
+                &e.reason,
+            ))
+        })?;
+        let size = after.approx_size();
+        let ts_ms = chrono::Utc::now().timestamp_millis();
+        let source = SourceInfo {
+            version: concat!("deltaforge-", env!("CARGO_PKG_VERSION"))
+                .to_string(),
+            connector: "postgresql".into(),
+            name: self.pipeline.to_string(),
+            ts_ms,
+            db: self.database.clone(),
+            schema: Some(self.schema.to_string()),
+            table: self.table.to_string(),
+            snapshot: Some("true".into()),
+            position: SourcePosition {
+                snapshot_generation: Some(self.generation),
+                ..Default::default()
+            },
+        };
+        let mut ev = Event::new_row(
+            id,
+            source,
+            Op::Read,
+            None,
+            Some(after),
+            self.type_mapping,
+            ts_ms,
+            size,
+        )
+        .with_tenant(self.tenant.to_string());
+        if let Some((fingerprint, sequence)) = &self.version {
+            ev.schema_version = Some(fingerprint.clone());
+            ev.schema_sequence = Some(*sequence);
+        }
+        Ok(ev)
     }
-    Ok(ev)
 }
 
 /// The snapshot cursor kind for a table: a signed integer-PK range scan (PG

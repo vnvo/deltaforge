@@ -1,28 +1,7 @@
-//! PostgreSQL row value conversion to JSON objects.
-//!
-//! Handles pgoutput protocol tuple data conversion to JSON values,
-//! supporting PostgreSQL's type system including arrays, JSON/JSONB,
-//! binary data, and timestamps.
+//! pgoutput tuple data: the relation's columns and a strict tuple parser.
+//! Values are decoded by [`super::postgres_decode`].
 
-use base64::prelude::*;
-use bytes::Bytes;
-use serde_json::{Value, json};
-use tracing::debug;
-
-/// Column value from pgoutput tuple data.
-///
-/// Uses `Bytes` for zero-copy slicing from the WAL message buffer.
-#[derive(Debug, Clone)]
-pub enum PgColumnValue {
-    /// NULL value (n)
-    Null,
-    /// TOAST unchanged value (u) - placeholder
-    Unchanged,
-    /// Text value (t) — zero-copy slice from the WAL buffer.
-    Text(Bytes),
-    /// Binary value (b) — zero-copy slice from the WAL buffer.
-    Binary(Bytes),
-}
+use super::postgres_decode::TupleValue;
 
 /// Relation column metadata from pgoutput.
 #[derive(Debug, Clone)]
@@ -41,301 +20,56 @@ impl RelationColumn {
     }
 }
 
-/// Build a JSON object from pgoutput tuple data.
-///
-/// The `columns` vector contains column metadata from the relation message.
-/// The `values` vector contains the actual column values.
-pub fn build_object(
-    columns: &[RelationColumn],
-    values: &[PgColumnValue],
-) -> Value {
-    let mut obj = serde_json::Map::with_capacity(columns.len());
-
-    debug!(
-        columns = columns.len(),
-        values = values.len(),
-        "building object"
-    );
-
-    for (idx, col) in columns.iter().enumerate() {
-        let value = values.get(idx).unwrap_or(&PgColumnValue::Null);
-        let json_value = convert_value(value, col.type_oid);
-        obj.insert(col.name.clone(), json_value);
-    }
-
-    Value::Object(obj)
-}
-
-/// Build a JSON object with only key columns.
-#[cfg(test)]
-pub fn build_key_object(
-    columns: &[RelationColumn],
-    values: &[PgColumnValue],
-) -> Value {
-    let mut obj = serde_json::Map::new();
-
-    for (idx, col) in columns.iter().enumerate() {
-        if col.is_key() {
-            let value = values.get(idx).unwrap_or(&PgColumnValue::Null);
-            let json_value = convert_value(value, col.type_oid);
-            obj.insert(col.name.clone(), json_value);
-        }
-    }
-
-    Value::Object(obj)
-}
-
-/// Convert a pgoutput value to JSON based on type OID.
-fn convert_value(value: &PgColumnValue, type_oid: u32) -> Value {
-    match value {
-        PgColumnValue::Null => Value::Null,
-        PgColumnValue::Unchanged => json!({"_unchanged": true}),
-        PgColumnValue::Text(bytes) => {
-            // Zero-copy: borrow the Bytes slice as &str.
-            // pgoutput text mode always sends valid UTF-8.
-            let s = std::str::from_utf8(bytes).unwrap_or("");
-            convert_text_value(s, type_oid)
-        }
-        PgColumnValue::Binary(bytes) => convert_binary_value(bytes, type_oid),
-    }
-}
-
-/// Convert text representation to JSON based on type.
-fn convert_text_value(s: &str, type_oid: u32) -> Value {
-    use super::postgres_table_schema::type_oids::*;
-
-    match type_oid {
-        BOOL => match s.to_lowercase().as_str() {
-            "t" | "true" | "1" | "yes" | "on" => json!(true),
-            "f" | "false" | "0" | "no" | "off" => json!(false),
-            _ => json!(s),
-        },
-        INT2 | INT4 | INT8 | OID => {
-            s.parse::<i64>().map(|v| json!(v)).unwrap_or(json!(s))
-        }
-        FLOAT4 | FLOAT8 => {
-            s.parse::<f64>().map(|v| json!(v)).unwrap_or(json!(s))
-        }
-        NUMERIC => {
-            // Keep as string to preserve precision
-            json!(s)
-        }
-        JSON | JSONB => serde_json::from_str::<Value>(s).unwrap_or(json!(s)),
-        BYTEA => {
-            // bytea in text format is hex-escaped: \x...
-            if let Some(hex) = s.strip_prefix("\\x") {
-                if let Ok(bytes) = hex::decode(hex) {
-                    json!({ "_base64": BASE64_STANDARD.encode(&bytes) })
-                } else {
-                    json!(s)
-                }
-            } else {
-                json!(s)
-            }
-        }
-        // Array types (PostgreSQL array OIDs are base type + offset)
-        oid if is_array_type(oid) => parse_pg_array(s),
-        // UUID
-        UUID => json!(s),
-        // Timestamps - keep as string for ISO 8601 format
-        TIMESTAMP | TIMESTAMPTZ | DATE | TIME => json!(s),
-        // Default: keep as string
-        _ => json!(s),
-    }
-}
-
-/// Convert binary representation to JSON.
-fn convert_binary_value(bytes: &[u8], _type_oid: u32) -> Value {
-    // Binary mode: encode as base64
-    json!({ "_base64": BASE64_STANDARD.encode(bytes) })
-}
-
-/// Check if type OID is an array type.
-fn is_array_type(oid: u32) -> bool {
-    // PostgreSQL array type OIDs are typically in specific ranges
-    // or have the high bit set for user-defined array types
-    // Common array types:
-    matches!(
-        oid,
-        1000 |  // bool[]
-        1001 |  // bytea[]
-        1005 |  // int2[]
-        1007 |  // int4[]
-        1009 |  // text[]
-        1016 |  // int8[]
-        1021 |  // float4[]
-        1022 |  // float8[]
-        1014 |  // char[]
-        1015 |  // varchar[]
-        2951 |  // uuid[]
-        3802 |  // jsonb[]
-        199 // json[]
-    )
-}
-
-/// Parse PostgreSQL array literal to JSON array.
-fn parse_pg_array(s: &str) -> Value {
-    let s = s.trim();
-
-    // Empty array
-    if s == "{}" {
-        return json!([]);
-    }
-
-    // Simple parser for PostgreSQL array format: {elem1,elem2,elem3}
-    if !s.starts_with('{') || !s.ends_with('}') {
-        return json!(s);
-    }
-
-    let inner = &s[1..s.len() - 1];
-    let elements = parse_array_elements(inner);
-
-    Value::Array(elements)
-}
-
-/// Parse comma-separated array elements, handling quotes and escapes.
-fn parse_array_elements(s: &str) -> Vec<Value> {
-    let mut elements = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    let mut escape_next = false;
-    let chars = s.chars().peekable();
-
-    for c in chars {
-        if escape_next {
-            current.push(c);
-            escape_next = false;
-            continue;
-        }
-
-        match c {
-            '\\' => {
-                escape_next = true;
-            }
-            '"' => {
-                in_quotes = !in_quotes;
-            }
-            ',' if !in_quotes => {
-                elements.push(parse_array_element(&current));
-                current.clear();
-            }
-            _ => {
-                current.push(c);
-            }
-        }
-    }
-
-    // Last element
-    if !current.is_empty() || !elements.is_empty() {
-        elements.push(parse_array_element(&current));
-    }
-
-    elements
-}
-
-/// Parse a single array element.
-fn parse_array_element(s: &str) -> Value {
-    let s = s.trim();
-
-    if s.eq_ignore_ascii_case("null") {
-        return Value::Null;
-    }
-
-    // Handle booleans (PostgreSQL uses t/f in arrays)
-    match s.to_lowercase().as_str() {
-        "t" | "true" => return json!(true),
-        "f" | "false" => return json!(false),
-        _ => {}
-    }
-
-    // Try to parse as number
-    if let Ok(i) = s.parse::<i64>() {
-        return json!(i);
-    }
-    if let Ok(f) = s.parse::<f64>() {
-        return json!(f);
-    }
-
-    // Keep as string
-    json!(s)
-}
-
-/// Parse tuple data from pgoutput message.
-///
-/// Returns (values, bytes_consumed). Uses zero-copy `Bytes::slice()` to
-/// avoid allocating per column — the returned `PgColumnValue::Text` and
-/// `Binary` variants hold reference-counted slices of the input buffer.
-pub fn parse_tuple_data(
-    data: &Bytes,
-    column_count: usize,
-) -> (Vec<PgColumnValue>, usize) {
-    let mut values = Vec::with_capacity(column_count);
-    let mut offset = 0;
-    let raw = data.as_ref();
-
-    // First 2 bytes are number of columns
-    if raw.len() < 2 {
-        return (values, 0);
-    }
-    let col_count = u16::from_be_bytes([raw[0], raw[1]]) as usize;
-    offset += 2;
-
-    for _ in 0..col_count {
-        if offset >= raw.len() {
-            break;
-        }
-
-        let col_type = raw[offset];
+/// Parse one pgoutput TupleData: its column count, then per column `n`
+/// (NULL), `u` (unchanged TOAST), `t` (text) or `b` (binary) with a 4-byte
+/// length. Returns the values (borrowing `data`) and the bytes consumed.
+/// Anything malformed (truncated data, an unknown kind) is an error, never
+/// a guessed value.
+pub fn parse_tuple(
+    data: &[u8],
+) -> Result<(Vec<TupleValue<'_>>, usize), String> {
+    let count = data
+        .get(..2)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
+        .ok_or("truncated tuple: no column count")?;
+    let mut offset = 2;
+    let mut values = Vec::with_capacity(count);
+    for i in 0..count {
+        let kind = *data
+            .get(offset)
+            .ok_or_else(|| format!("truncated tuple at column {i}"))?;
         offset += 1;
-
-        let value = match col_type {
-            b'n' => PgColumnValue::Null,
-            b'u' => PgColumnValue::Unchanged,
-            b't' => {
-                if offset + 4 > raw.len() {
-                    break;
-                }
-                let len = u32::from_be_bytes([
-                    raw[offset],
-                    raw[offset + 1],
-                    raw[offset + 2],
-                    raw[offset + 3],
-                ]) as usize;
+        let value = match kind {
+            b'n' => TupleValue::Null,
+            b'u' => TupleValue::Unchanged,
+            b't' | b'b' => {
+                let len = data
+                    .get(offset..offset + 4)
+                    .map(|b| {
+                        u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize
+                    })
+                    .ok_or_else(|| format!("truncated length at column {i}"))?;
                 offset += 4;
-
-                if offset + len > raw.len() {
-                    break;
-                }
-                let slice = data.slice(offset..offset + len);
+                let bytes = data
+                    .get(offset..offset + len)
+                    .ok_or_else(|| format!("truncated value at column {i}"))?;
                 offset += len;
-                PgColumnValue::Text(slice)
-            }
-            b'b' => {
-                if offset + 4 > raw.len() {
-                    break;
+                if kind == b't' {
+                    TupleValue::Text(bytes)
+                } else {
+                    TupleValue::Binary
                 }
-                let len = u32::from_be_bytes([
-                    raw[offset],
-                    raw[offset + 1],
-                    raw[offset + 2],
-                    raw[offset + 3],
-                ]) as usize;
-                offset += 4;
-
-                if offset + len > raw.len() {
-                    break;
-                }
-                let slice = data.slice(offset..offset + len);
-                offset += len;
-                PgColumnValue::Binary(slice)
             }
-            _ => PgColumnValue::Null,
+            other => {
+                return Err(format!(
+                    "unknown tuple value kind {:?} at column {i}",
+                    char::from(other)
+                ));
+            }
         };
-
         values.push(value);
     }
-
-    (values, offset)
+    Ok((values, offset))
 }
 
 #[cfg(test)]
@@ -343,120 +77,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_build_object() {
-        let columns = vec![
-            RelationColumn {
-                name: "id".to_string(),
-                type_oid: 23, // INT4
-                type_modifier: -1,
-                flags: 1,
-            },
-            RelationColumn {
-                name: "name".to_string(),
-                type_oid: 25, // TEXT
-                type_modifier: -1,
-                flags: 0,
-            },
-        ];
-
-        let values = vec![
-            PgColumnValue::Text(Bytes::from_static(b"42")),
-            PgColumnValue::Text(Bytes::from_static(b"Alice")),
-        ];
-
-        let obj = build_object(&columns, &values);
-        assert_eq!(obj["id"], json!(42));
-        assert_eq!(obj["name"], json!("Alice"));
-    }
-
-    #[test]
-    fn test_build_key_object() {
-        let columns = vec![
-            RelationColumn {
-                name: "id".to_string(),
-                type_oid: 23,
-                type_modifier: -1,
-                flags: 1, // Key
-            },
-            RelationColumn {
-                name: "name".to_string(),
-                type_oid: 25,
-                type_modifier: -1,
-                flags: 0, // Not key
-            },
-        ];
-
-        let values = vec![
-            PgColumnValue::Text(Bytes::from_static(b"1")),
-            PgColumnValue::Text(Bytes::from_static(b"Bob")),
-        ];
-
-        let obj = build_key_object(&columns, &values);
-        assert!(obj.get("id").is_some());
-        assert!(obj.get("name").is_none());
-    }
-
-    #[test]
-    fn test_convert_bool() {
-        assert_eq!(convert_text_value("t", 16), json!(true));
-        assert_eq!(convert_text_value("f", 16), json!(false));
-        assert_eq!(convert_text_value("true", 16), json!(true));
-        assert_eq!(convert_text_value("false", 16), json!(false));
-    }
-
-    #[test]
-    fn test_convert_numbers() {
-        assert_eq!(convert_text_value("42", 23), json!(42));
-        assert_eq!(convert_text_value("-100", 20), json!(-100));
-        assert_eq!(convert_text_value("3.15", 701), json!(3.15));
-    }
-
-    #[test]
-    fn test_convert_json() {
-        let json_str = r#"{"key": "value", "num": 42}"#;
-        let result = convert_text_value(json_str, 114); // JSON
-        assert_eq!(result["key"], json!("value"));
-        assert_eq!(result["num"], json!(42));
-    }
-
-    #[test]
-    fn test_convert_jsonb() {
-        let json_str = r#"{"array": [1, 2, 3]}"#;
-        let result = convert_text_value(json_str, 3802); // JSONB
-        assert_eq!(result["array"], json!([1, 2, 3]));
-    }
-
-    #[test]
-    fn test_convert_bytea() {
-        let hex = "\\x48656c6c6f";
-        let result = convert_text_value(hex, 17); // BYTEA
-        assert!(result.get("_base64").is_some());
-    }
-
-    #[test]
-    fn test_parse_array() {
-        assert_eq!(parse_pg_array("{}"), json!([]));
-        assert_eq!(parse_pg_array("{1,2,3}"), json!([1, 2, 3]));
+    fn parses_every_kind_and_reports_what_it_consumed() {
+        let mut data = vec![0, 4, b'n', b'u', b't', 0, 0, 0, 2, b'4', b'2'];
+        data.extend([b'b', 0, 0, 0, 1, 7, 0xAA]);
+        let (values, used) = parse_tuple(&data).unwrap();
         assert_eq!(
-            parse_pg_array(r#"{"hello","world"}"#),
-            json!(["hello", "world"])
+            values,
+            vec![
+                TupleValue::Null,
+                TupleValue::Unchanged,
+                TupleValue::Text(b"42"),
+                TupleValue::Binary
+            ]
         );
-        assert_eq!(parse_pg_array("{1,NULL,3}"), json!([1, Value::Null, 3]));
+        assert_eq!(
+            used,
+            data.len() - 1,
+            "the trailing byte is not the tuple's"
+        );
     }
 
     #[test]
-    fn test_null_and_unchanged() {
-        let columns = vec![RelationColumn {
-            name: "col".to_string(),
-            type_oid: 25,
-            type_modifier: -1,
-            flags: 0,
-        }];
-
-        let null_obj = build_object(&columns, &[PgColumnValue::Null]);
-        assert_eq!(null_obj["col"], Value::Null);
-
-        let unchanged_obj = build_object(&columns, &[PgColumnValue::Unchanged]);
-        assert!(unchanged_obj["col"].get("_unchanged").is_some());
+    fn malformed_tuples_fail_closed() {
+        for bad in [
+            vec![],
+            vec![0],
+            vec![0, 1],
+            vec![0, 1, b'x'],
+            vec![0, 1, b't', 0, 0],
+            vec![0, 1, b't', 0, 0, 0, 5, b'a'],
+        ] {
+            assert!(parse_tuple(&bad).is_err(), "{bad:?}");
+        }
     }
 }

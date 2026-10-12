@@ -311,6 +311,8 @@ pub struct PostgresSource {
     pub registry_scope: crate::registry_scope::SharedRegistryScope,
     pub backend: ArcStorageBackend,
     pub outbox_prefixes: AllowList,
+    /// The type-mapping version stamped on every event (always v2).
+    pub type_mapping: deltaforge_core::TypeMapping,
     pub snapshot_cfg: deltaforge_config::SnapshotCfg,
     pub on_schema_drift: OnSchemaDrift,
     /// Per-table options (identity_columns, assume_unique), keyed by
@@ -335,7 +337,9 @@ pub(crate) struct RunCtx {
     pub tenant: String,
     #[allow(dead_code)]
     pub host: String,
-    pub default_schema: String,
+    /// The database the source reads: `source.db` of every event (the
+    /// table's schema is `source.schema`).
+    pub database: String,
     pub dsn: crate::credentials::ProtectedDsn,
     pub tx: mpsc::Sender<SourceItem>,
     #[allow(dead_code)]
@@ -352,6 +356,10 @@ pub(crate) struct RunCtx {
     pub retry: RetryPolicy,
     pub inactivity: Duration,
     pub relation_map: HashMap<u32, RelationInfo>,
+    /// Names of the non-builtin types the session's Type messages announced.
+    pub type_names: HashMap<u32, String>,
+    /// The type-mapping version stamped on every event.
+    pub type_mapping: deltaforge_core::TypeMapping,
     pub last_lsn: Lsn,
     /// Where an in-process reconnect resumes: the end of the last transaction
     /// whose commit was handed to the coordinator (or the start position).
@@ -1265,6 +1273,7 @@ impl PostgresSource {
                 snapshot_id: &snapshot_id,
                 generation: control.generation,
                 lineage: control.lineage.clone(),
+                type_mapping: self.type_mapping,
             })
             .await;
         crate::snapshot_probe::record_phase(
@@ -1280,10 +1289,13 @@ impl PostgresSource {
             return Err(SourceError::Cancelled);
         }
         if let Err(e) = copied {
+            // A typed failure (a value the decoder refuses) stays typed.
             return Err(self
                 .concurrent_owner(queue, control.generation, &run)
                 .await
-                .unwrap_or_else(|| other(e)));
+                .unwrap_or_else(|| {
+                    e.downcast::<SourceError>().unwrap_or_else(other)
+                }));
         }
 
         // 8. Final checks, then the rows are produced and the terminal
@@ -1711,13 +1723,16 @@ impl PostgresSource {
         )
         .await?;
 
+        let database = postgres_health::current_database(self.dsn.expose())
+            .await
+            .map_err(SourceError::Other)?;
         let backend = Arc::clone(&self.backend);
         let mut ctx = RunCtx {
             source_id: self.id.clone(),
             pipeline: self.pipeline.clone(),
             tenant: self.tenant.clone(),
             host: components.host.clone(),
-            default_schema: "public".to_string(),
+            database,
             dsn: self.dsn.clone(),
             tx,
             chkpt: chkpt_store.clone(),
@@ -1731,6 +1746,8 @@ impl PostgresSource {
             retry: RetryPolicy::default(),
             inactivity: Duration::from_secs(60),
             relation_map: HashMap::new(),
+            type_names: HashMap::new(),
+            type_mapping: self.type_mapping,
             last_lsn: start_lsn,
             resume_lsn: start_lsn,
             drift_resolver: crate::incident_drafts::DriftResolver::new(

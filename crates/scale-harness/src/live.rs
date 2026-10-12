@@ -133,7 +133,12 @@ impl Sink for ProbeSink {
             let mut ids = self.ids.lock().unwrap();
             for e in events {
                 if let Some(id) = e.after.as_ref().and_then(|a| a.get("id")) {
-                    let id = id.as_i64().unwrap_or(-1);
+                    let id = deltaforge_core::canonical::view::value_view(
+                        id,
+                        deltaforge_core::TypeMapping::V2,
+                    )
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(-1);
                     if id == KNOWN_ID
                         && let Some(counter) = &self.counter
                     {
@@ -534,6 +539,7 @@ fn source(
             table_options: Default::default(),
             rotation: None,
             snapshot_cohort: Default::default(),
+            type_mapping: deltaforge_core::TypeMapping::V2,
         }),
         Engine::Mysql => Arc::new(sources::mysql::MySqlSource {
             id: SOURCE.into(),
@@ -552,6 +558,7 @@ fn source(
             table_options: Default::default(),
             rotation: None,
             snapshot_cohort: Default::default(),
+            type_mapping: deltaforge_core::TypeMapping::V2,
         }),
     }
 }

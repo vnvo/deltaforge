@@ -220,8 +220,8 @@ impl ColumnKind {
         }
     }
 
-    /// Whether the snapshot selects the column as `col+0` (its stored ENUM
-    /// index or SET bitmask) rather than its text.
+    /// Whether the snapshot selects the column as `CAST(col AS UNSIGNED)`
+    /// (its stored ENUM index or SET bitmask) rather than its text.
     pub fn snapshot_selects_number(&self) -> bool {
         matches!(self, ColumnKind::Enum { .. } | ColumnKind::Set { .. })
     }
@@ -337,7 +337,7 @@ impl<'a> Raw<'a> {
     }
 
     /// A binary-protocol snapshot value of a column of `kind` (ENUM and SET
-    /// columns are selected as `col+0`).
+    /// columns are selected as `CAST(col AS UNSIGNED)`).
     pub fn from_snapshot(
         v: &'a mysql_async::Value,
         kind: &ColumnKind,
@@ -738,8 +738,11 @@ impl TableDecoder {
             .map(|c| {
                 let q = format!("`{}`", c.name.replace('`', "``"));
                 match &c.kind {
+                    // `CAST(.. AS UNSIGNED)`, never `col+0`: MySQL returns
+                    // `col+0` as a DOUBLE, which cannot hold a 64-member
+                    // SET's bitmask (it came back negative and rounded).
                     Ok(k) if k.snapshot_selects_number() => {
-                        format!("{q}+0 AS {q}")
+                        format!("CAST({q} AS UNSIGNED) AS {q}")
                     }
                     _ => q,
                 }

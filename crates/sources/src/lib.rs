@@ -9,6 +9,7 @@
 //! to be processed by the pipeline coordinator.
 
 pub mod credentials;
+pub mod declared_types;
 pub mod durable_checkpoint;
 pub mod failover;
 pub mod identity_resolution;
@@ -354,6 +355,7 @@ pub async fn build_source(
                     .as_ref()
                     .map(|o| o.allow_list())
                     .unwrap_or_default(),
+                type_mapping: c.type_mapping,
                 snapshot_cfg: c.snapshot.clone(),
                 on_schema_drift: c.on_schema_drift.clone(),
                 table_options: c.table_options.clone(),
@@ -366,6 +368,14 @@ pub async fn build_source(
             let rotation =
                 mysql::mysql_rotation::build_spec(c, Arc::clone(&resolver))
                     .await?;
+            if c.type_mapping == deltaforge_core::TypeMapping::V1 {
+                tracing::warn!(
+                    source_id = %c.id,
+                    "type_mapping v1 is deprecated and will be removed after \
+                     rc.1's support window; it keeps only the legacy \
+                     renderings that were lossless (see the migration guide)"
+                );
+            }
             Ok(Arc::new(mysql::MySqlSource {
                 id: c.id.clone(),
                 dsn,
@@ -380,6 +390,7 @@ pub async fn build_source(
                     .as_ref()
                     .map(|o| o.allow_list())
                     .unwrap_or_default(),
+                type_mapping: c.type_mapping,
                 snapshot_cfg: c.snapshot.clone(),
                 on_schema_drift: c.on_schema_drift.clone(),
                 table_options: c.table_options.clone(),

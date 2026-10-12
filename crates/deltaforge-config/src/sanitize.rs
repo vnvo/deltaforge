@@ -258,7 +258,7 @@ impl Serialize for SanitizedPgCfg<'_> {
         S: Serializer,
     {
         let c = self.0;
-        let mut st = serializer.serialize_struct("PostgresSrcCfg", 12)?;
+        let mut st = serializer.serialize_struct("PostgresSrcCfg", 13)?;
         st.serialize_field("id", &c.id)?;
         // dsn / dsn_secret / credentials skip when None, matching the config type.
         match redacted(&c.dsn) {
@@ -281,6 +281,7 @@ impl Serialize for SanitizedPgCfg<'_> {
         st.serialize_field("outbox", &c.outbox)?;
         st.serialize_field("snapshot", &c.snapshot)?;
         st.serialize_field("on_schema_drift", &c.on_schema_drift)?;
+        st.serialize_field("type_mapping", &c.type_mapping)?;
         st.end()
     }
 }
@@ -293,7 +294,7 @@ impl Serialize for SanitizedMyCfg<'_> {
         S: Serializer,
     {
         let c = self.0;
-        let mut st = serializer.serialize_struct("MysqlSrcCfg", 9)?;
+        let mut st = serializer.serialize_struct("MysqlSrcCfg", 10)?;
         st.serialize_field("id", &c.id)?;
         match redacted(&c.dsn) {
             Some(d) => st.serialize_field("dsn", &d)?,
@@ -312,6 +313,7 @@ impl Serialize for SanitizedMyCfg<'_> {
         st.serialize_field("outbox", &c.outbox)?;
         st.serialize_field("snapshot", &c.snapshot)?;
         st.serialize_field("on_schema_drift", &c.on_schema_drift)?;
+        st.serialize_field("type_mapping", &c.type_mapping)?;
         st.end()
     }
 }

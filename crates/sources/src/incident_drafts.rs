@@ -48,6 +48,48 @@ pub(crate) fn schema_drift_blocked(
     SourceError::incident(draft, cause)
 }
 
+/// The `source_decode_failed` incident: a value of `column` (declared
+/// `source_type`) of `qualified_table` that its type cannot decode exactly.
+/// `details` (never the value) explains why; the source stops before the
+/// value's transaction.
+pub(crate) fn source_decode_failed(
+    source_id: &str,
+    qualified_table: &str,
+    column: &str,
+    source_type: &str,
+    details: &str,
+) -> SourceError {
+    let draft = IncidentDraft::new(
+        ReasonCode::SourceDecodeFailed,
+        Component::Source {
+            id: source_id.to_string(),
+        },
+        Retryability::OperatorAction,
+        SafetyState::HaltedSafe,
+        CauseCode::SourceSchema,
+    )
+    .discriminate("table", qualified_table)
+    .discriminate("column", column)
+    .with_evidence(|e| {
+        e.text(K::SourceId, source_id)
+            .text(K::Table, qualified_table)
+            .text(K::Column, column)
+            .text(K::SourceType, source_type)
+            .text(K::ReasonClass, "value_not_decodable");
+    })
+    .with_actions(&[ActionCode::InspectLogs]);
+    SourceError::incident(
+        draft,
+        SourceError::Schema {
+            details: format!(
+                "{qualified_table}: cannot decode column `{column}` \
+                 ({source_type}): {details}"
+            )
+            .into(),
+        },
+    )
+}
+
 /// Record `draft`, a condition the source is retrying automatically, so the
 /// pipeline reports it while the source retries. It is bound to the current
 /// recovery epoch: the identity the supervisor gives the draft the source

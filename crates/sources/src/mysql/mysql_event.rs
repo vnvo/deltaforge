@@ -1,12 +1,13 @@
-use super::mysql_object::{build_object, int_signs};
 use crate::mysql::LoopControl;
 use crate::mysql::RunCtx;
 use common::{ts_sec_to_ms, watchdog};
+use deltaforge_core::CanonicalRow;
 use deltaforge_core::{
     Event, Op, SourceError, SourceInfo, SourceItem, SourcePosition,
     SourceResult, Transaction,
 };
 use metrics::counter;
+use mysql_binlog_connector_rust::column::column_value::ColumnValue;
 use mysql_binlog_connector_rust::{
     binlog_stream::BinlogStream,
     event::{
@@ -286,6 +287,35 @@ fn build_source_info(
     Ok((source, id))
 }
 
+/// Decode every row image of one rows event (`images`: the image bitmap and
+/// values of each row) before any of its events is sent, so a value that
+/// cannot be decoded emits nothing from the event. A failure is the
+/// `source_decode_failed` incident.
+fn decode_images<'a>(
+    ctx: &RunCtx,
+    tm: &TableMapEvent,
+    loaded: &super::mysql_schema_loader::LoadedSchema,
+    images: impl IntoIterator<Item = (&'a [bool], &'a [ColumnValue])>,
+) -> SourceResult<Vec<CanonicalRow>> {
+    images
+        .into_iter()
+        .map(|(included, values)| {
+            loaded
+                .decoder
+                .decode_binlog_row(included, values)
+                .map_err(|e| {
+                    crate::incident_drafts::source_decode_failed(
+                        &ctx.source_id,
+                        &format!("{}.{}", tm.database_name, tm.table_name),
+                        &e.column,
+                        &e.column_type,
+                        &e.reason,
+                    )
+                })
+        })
+        .collect()
+}
+
 async fn handle_write_rows(
     ctx: &mut RunCtx,
     header: &EventHeader,
@@ -297,7 +327,14 @@ async fn handle_write_rows(
             return Ok(());
         }
         let loaded = super::mysql_selection::select_for_rows(ctx, tm).await?;
-        let signs = int_signs(&loaded.schema);
+        let afters = decode_images(
+            ctx,
+            tm,
+            &loaded,
+            wr.rows
+                .iter()
+                .map(|r| (&wr.included_columns[..], &r.column_values[..])),
+        )?;
         let row_count = wr.rows.len();
         debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=row_count, "write_rows");
 
@@ -329,14 +366,7 @@ async fn handle_write_rows(
         let mut sent = 0u64;
         // Row ordinal resets per rows event and increments per row; combined
         // with the event's end_log_pos it uniquely identifies each row change.
-        for (row_ordinal, row) in wr.rows.into_iter().enumerate() {
-            let after = build_object(
-                &loaded.column_names,
-                &signs,
-                &wr.included_columns,
-                &row.column_values,
-            );
-
+        for (row_ordinal, after) in afters.into_iter().enumerate() {
             let (source_info, event_id) = build_source_info(
                 ctx,
                 header,
@@ -350,6 +380,7 @@ async fn handle_write_rows(
                 Op::Create,
                 None,
                 Some(after),
+                ctx.type_mapping,
                 ts_ms,
                 event_len,
             )
@@ -401,7 +432,22 @@ async fn handle_update_rows(
             return Ok(());
         }
         let loaded = super::mysql_selection::select_for_rows(ctx, tm).await?;
-        let signs = int_signs(&loaded.schema);
+        let befores = decode_images(
+            ctx,
+            tm,
+            &loaded,
+            ur.rows.iter().map(|(b, _)| {
+                (&ur.included_columns_before[..], &b.column_values[..])
+            }),
+        )?;
+        let afters = decode_images(
+            ctx,
+            tm,
+            &loaded,
+            ur.rows.iter().map(|(_, a)| {
+                (&ur.included_columns_after[..], &a.column_values[..])
+            }),
+        )?;
         debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=ur.rows.len(), "update_rows");
 
         let ts_ms = ts_sec_to_ms(header.timestamp);
@@ -431,22 +477,9 @@ async fn handle_update_rows(
         let mut sent = 0u64;
         // One ordinal per before/after pair - an update is a single row change,
         // not two images.
-        for (row_ordinal, (before_row, after_row)) in
-            ur.rows.into_iter().enumerate()
+        for (row_ordinal, (before, after)) in
+            befores.into_iter().zip(afters).enumerate()
         {
-            let before = build_object(
-                &loaded.column_names,
-                &signs,
-                &ur.included_columns_before,
-                &before_row.column_values,
-            );
-            let after = build_object(
-                &loaded.column_names,
-                &signs,
-                &ur.included_columns_after,
-                &after_row.column_values,
-            );
-
             let (source_info, event_id) = build_source_info(
                 ctx,
                 header,
@@ -460,6 +493,7 @@ async fn handle_update_rows(
                 Op::Update,
                 Some(before),
                 Some(after),
+                ctx.type_mapping,
                 ts_ms,
                 event_len,
             )
@@ -507,7 +541,14 @@ async fn handle_delete_rows(
             return Ok(());
         }
         let loaded = super::mysql_selection::select_for_rows(ctx, tm).await?;
-        let signs = int_signs(&loaded.schema);
+        let befores = decode_images(
+            ctx,
+            tm,
+            &loaded,
+            dr.rows
+                .iter()
+                .map(|r| (&dr.included_columns[..], &r.column_values[..])),
+        )?;
         debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=dr.rows.len(), "delete_rows");
 
         let ts_ms = ts_sec_to_ms(header.timestamp);
@@ -535,14 +576,7 @@ async fn handle_delete_rows(
         let sequence = loaded.sequence;
 
         let mut sent = 0u64;
-        for (row_ordinal, row) in dr.rows.into_iter().enumerate() {
-            let before = build_object(
-                &loaded.column_names,
-                &signs,
-                &dr.included_columns,
-                &row.column_values,
-            );
-
+        for (row_ordinal, before) in befores.into_iter().enumerate() {
             let (source_info, event_id) = build_source_info(
                 ctx,
                 header,
@@ -556,6 +590,7 @@ async fn handle_delete_rows(
                 Op::Delete,
                 Some(before),
                 None,
+                ctx.type_mapping,
                 ts_ms,
                 event_len,
             )
@@ -1000,6 +1035,7 @@ async fn emit_ddl_event(
         ddl_id,
         source_info,
         payload,
+        ctx.type_mapping,
         ts_sec_to_ms(header.timestamp),
         header.event_length as usize,
     )
@@ -1415,6 +1451,14 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
     use tokio::sync::{Notify, mpsc};
+
+    /// A row image as its path view (integers exact numbers).
+    fn view(row: &deltaforge_core::CanonicalRow) -> serde_json::Value {
+        serde_json::Value::Object(deltaforge_core::canonical::view::row_view(
+            row,
+            deltaforge_core::TypeMapping::V2,
+        ))
+    }
     use tokio_util::sync::CancellationToken;
 
     const TABLE_ID: u64 = 42;
@@ -1436,13 +1480,24 @@ mod tests {
     }
 
     fn make_runctx(tx: mpsc::Sender<SourceItem>) -> RunCtx {
-        // Use from_static to create a test schema loader
-        let cols: HashMap<(String, String), Arc<Vec<String>>> =
-            HashMap::from([(
-                ("shop".to_string(), "orders".to_string()),
-                Arc::new(vec!["id".to_string(), "sku".to_string()]),
-            )]);
-        let schema = MySqlSchemaLoader::from_static(cols);
+        // A static test schema: `id BIGINT`, `sku VARCHAR(255)` (utf8mb4).
+        let mut sku = crate::mysql::MySqlColumn::new(
+            "sku",
+            "varchar(255)",
+            "varchar",
+            true,
+            2,
+        );
+        sku.collation_id = Some(255);
+        let schema = MySqlSchemaLoader::from_static_schemas(HashMap::from([(
+            ("shop".to_string(), "orders".to_string()),
+            crate::mysql::MySqlTableSchema::new(vec![
+                crate::mysql::MySqlColumn::new(
+                    "id", "bigint", "bigint", true, 1,
+                ),
+                sku,
+            ]),
+        )]));
 
         let mut table_map = HashMap::new();
         table_map.insert(
@@ -1451,13 +1506,14 @@ mod tests {
                 table_id: TABLE_ID,
                 database_name: "shop".to_string(),
                 table_name: "orders".to_string(),
-                // Matches the from_static schema: two varchar columns.
+                // Matches the static schema: a BIGINT and a VARCHAR.
                 column_types: vec![
+                    mysql_binlog_connector_rust::column::column_type::ColumnType::LongLong
+                        as u8,
                     mysql_binlog_connector_rust::column::column_type::ColumnType::VarChar
-                        as u8;
-                    2
+                        as u8,
                 ],
-                column_metas: vec![255, 255],
+                column_metas: vec![0, 255],
                 null_bits: vec![true, true],
                 table_metadata: None,
             },
@@ -1485,6 +1541,7 @@ mod tests {
             allow: AllowList::new(&["shop.orders".to_string()]),
             retry: common::RetryPolicy::default(),
             inactivity: Duration::from_secs(60),
+            type_mapping: deltaforge_core::TypeMapping::V2,
             table_map,
             last_file: "mysql-bin.000001".to_string(),
             last_pos: 1234,
@@ -1689,7 +1746,7 @@ mod tests {
         let produced = recv_event(&mut rx).await.expect("expected one event");
         assert_eq!(produced.op, Op::Create);
         assert!(produced.before.is_none(), "insert must not have `before`");
-        let after = produced.after.expect("insert must have `after`");
+        let after = view(&produced.after.expect("insert must have `after`"));
         assert_eq!(after["id"], 1);
         assert_eq!(after["sku"], "sku-1");
 
@@ -1739,8 +1796,8 @@ mod tests {
         let produced = recv_event(&mut rx).await.expect("expected one event");
         assert_eq!(produced.op, Op::Update);
 
-        let before = produced.before.expect("update must have `before`");
-        let after = produced.after.expect("update must have `after`");
+        let before = view(&produced.before.expect("update must have `before`"));
+        let after = view(&produced.after.expect("update must have `after`"));
 
         assert_eq!(before["id"], 1);
         assert_eq!(before["sku"], "sku-1");
@@ -1779,7 +1836,7 @@ mod tests {
         let produced = recv_event(&mut rx).await.expect("expected one event");
         assert_eq!(produced.op, Op::Delete);
         assert!(produced.after.is_none(), "delete must not have `after`");
-        let before = produced.before.expect("delete must have `before`");
+        let before = view(&produced.before.expect("delete must have `before`"));
         assert_eq!(before["id"], 1);
         assert_eq!(before["sku"], "sku-1");
 
@@ -2260,9 +2317,9 @@ mod tests {
         prove_table(ctx, "orders").await;
     }
 
-    /// Register `shop.<table>` with the fixture's shape (two nullable
-    /// VARCHAR columns) and a valid baseline at the rows' evaluation
-    /// position (scope already established).
+    /// Register `shop.<table>` with the fixture's shape (a nullable BIGINT
+    /// `id` and a nullable utf8mb4 VARCHAR `sku`) and a valid baseline at
+    /// the rows' evaluation position (scope already established).
     async fn prove_table(ctx: &mut RunCtx, table: &str) {
         use crate::mysql::mysql_activation::{
             ACTIVATION_NS, Kind, Record, append, baseline_capture_id,
@@ -2270,18 +2327,14 @@ mod tests {
         };
         use crate::mysql::mysql_table_schema::{MySqlColumn, MySqlTableSchema};
         let r0 = ctx.txn_eval.clone().unwrap();
-        let col = |name: &str, ordinal| {
-            let mut c = MySqlColumn::new(
-                name,
-                "varchar(255)",
-                "varchar",
-                true,
-                ordinal,
-            );
-            c.char_octet_length = Some(255);
-            c
-        };
-        let schema = MySqlTableSchema::new(vec![col("id", 1), col("sku", 2)]);
+        let mut sku =
+            MySqlColumn::new("sku", "varchar(255)", "varchar", true, 2);
+        sku.char_octet_length = Some(255);
+        sku.collation_id = Some(255); // utf8mb4_0900_ai_ci
+        let schema = MySqlTableSchema::new(vec![
+            MySqlColumn::new("id", "bigint", "bigint", true, 1),
+            sku,
+        ]);
         let key = ctx.registry_scope.current().unwrap().key("shop", table);
         // Registered under the context's scope (the fixture's loader has its
         // own).
@@ -3043,7 +3096,12 @@ mod tests {
             // neither the secret, the complete original SQL, nor a raw fragment
             // (the account spec), and must mark redaction. (The non-sensitive
             // operation label may itself contain words like "PASSWORD".)
-            let ev_json = serde_json::to_string(&ev).expect("event serializes");
+            let ev_json = format!(
+                "{}\n{}",
+                ev.native_value(deltaforge_core::NativeOpts::default())
+                    .expect("event renders"),
+                ev.to_durable()
+            );
             assert!(
                 !ev_json.contains(VERIFIER),
                 "verifier leaked into event for: {sql}"

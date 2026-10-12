@@ -46,8 +46,19 @@ pub mod journal;
 pub use journal::{DlqMeta, JournalEntry};
 
 pub mod canonical;
+pub use canonical::{CanonicalRow, CanonicalValue, TypeMapping};
 pub mod canonical_json;
+
+/// Durable bindings between sink destinations and source relations.
+pub mod destination;
+
+/// The identity of a source relation (a table).
+pub mod relation;
 pub use canonical_json::canonical_json_bytes;
+pub use relation::SourceRelationIdentity;
+
+mod event_forms;
+pub use event_forms::{DurableEvent, NativeOpts, NativePayload};
 
 pub mod replay;
 
@@ -186,12 +197,19 @@ fn default_version() -> String {
 }
 
 impl SourceInfo {
-    /// Returns the fully-qualified table name (schema.table or db.table)
+    /// The namespace that holds the table inside its database: the
+    /// PostgreSQL schema. MySQL has no level between database and table, so
+    /// its namespace is the database. For display, table selection and
+    /// routing; a relation's identity is [`SourceRelationIdentity`].
+    pub fn namespace(&self) -> &str {
+        self.schema.as_deref().unwrap_or(&self.db)
+    }
+
+    /// `namespace.table`: the table within its source's database, as table
+    /// selections name it. Not a uniqueness key across sources (see
+    /// [`SourceRelationIdentity`]).
     pub fn full_table_name(&self) -> String {
-        match &self.schema {
-            Some(schema) => format!("{}.{}", schema, self.table),
-            None => format!("{}.{}", self.db, self.table),
-        }
+        format!("{}.{}", self.namespace(), self.table)
     }
 }
 
@@ -327,13 +345,21 @@ pub struct Transaction {
 
 /// CDC Event - Debezium-compatible at the payload level.
 ///
-/// The struct is designed so that `serde_json::to_vec(&event)` produces
-/// JSON that Debezium consumers can parse directly. DeltaForge-specific
-/// extensions are additive and ignored by standard Debezium consumers.
+/// Row images are [`CanonicalRow`]s: the single representation of the
+/// values. An event has two serialized forms, each chosen explicitly:
+/// - the **native** rendering ([`NativePayload`], via
+///   [`Event::native`]), which renders the values according to the event's
+///   own [`TypeMapping`] and the sink's [`NativeOpts`];
+/// - the lossless **durable** form ([`DurableEvent`]), kept by the replay
+///   journal, the DLQ and durable objects, which reads back to the
+///   identical event ([`Event::from_durable`]).
+///
+/// DeltaForge-specific extensions are additive and ignored by standard
+/// Debezium consumers.
 ///
 /// # Wire Format
 ///
-/// Native serialization produces Debezium's payload structure:
+/// The native rendering produces Debezium's payload structure:
 /// ```json
 /// {
 ///   "before": null,
@@ -345,7 +371,8 @@ pub struct Transaction {
 ///     "ts_ms": 1700000000000,
 ///     "db": "inventory",
 ///     "table": "customers",
-///     "gtid": "abc:123"
+///     "gtid": "abc:123",
+///     "type_mapping": "v2"
 ///   },
 ///   "op": "c",
 ///   "ts_ms": 1700000000000
@@ -354,16 +381,16 @@ pub struct Transaction {
 ///
 /// For full Debezium envelope format `{"payload": {...}}`, use the
 /// envelope module at serialization time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Event {
     // ========================================================================
     // Debezium-standard fields (ordered to match Debezium output)
     // ========================================================================
     /// Row image before the change (Update/Delete)
-    pub before: Option<Value>,
+    pub before: Option<CanonicalRow>,
 
     /// Row image after the change (Create/Update)
-    pub after: Option<Value>,
+    pub after: Option<CanonicalRow>,
 
     /// Source metadata (Debezium-compatible structure)
     pub source: SourceInfo,
@@ -375,8 +402,12 @@ pub struct Event {
     pub ts_ms: i64,
 
     /// Transaction metadata
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub transaction: Option<Transaction>,
+
+    /// The type-mapping version this event's values render with, stamped by
+    /// its source before batching, the replay journal or the DLQ. Every
+    /// consumer renders the event's own version, never a pipeline setting.
+    pub type_mapping: TypeMapping,
 
     // ========================================================================
     // DeltaForge extensions (Debezium consumers ignore unknown fields)
@@ -386,31 +417,24 @@ pub struct Event {
     /// leaves a source or processor carries one. `Option` only so the JS bridge
     /// can build a transient event before assigning the resolved id - such an
     /// event must never escape without it.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub event_id: Option<EventId>,
 
     /// Tenant ID for multi-tenant deployments
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
 
     /// Schema registry version/fingerprint
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<String>,
 
     /// Schema sequence number for replay correlation
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub schema_sequence: Option<u64>,
 
     /// DDL payload for schema change events
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub ddl: Option<Value>,
 
     /// Distributed tracing correlation ID
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
 
     /// Processing tags (e.g., ["pii:redacted", "transformed"])
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
 
     /// Processor ID that synthesized this event (`Some`), or `None` if it
@@ -421,17 +445,14 @@ pub struct Event {
     /// themselves; the framework detects new event IDs and fills it in.
     ///
     /// The value is the `id()` of the processor that first produced the event.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub synthetic: Option<String>,
 
     /// Routing overrides for sinks (topic, key, headers).
     /// Visible to processors but excluded from wire output by envelopes.
-    #[serde(skip)]
     pub routing: Option<EventRouting>,
 
     /// Transaction boundary marker (true = last event in transaction)
     /// Useful for batching decisions in the coordinator.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tx_end: bool,
 
     // ========================================================================
@@ -445,17 +466,14 @@ pub struct Event {
     /// [`Event::set_boundary`]/[`Event::with_boundary`]/[`Event::with_checkpoint`].
     /// `None` for events with no durable boundary; the durable sink fails closed
     /// when a boundary is required and absent. Internal - never serialized.
-    #[serde(skip)]
     pub boundary: Option<SourceBoundary>,
 
     /// Estimated event size in bytes for batching
-    #[serde(skip)]
     pub size_bytes: usize,
 
     /// Wall-clock time (ms since epoch) when this event was first parsed by
     /// the pipeline. Used for pipeline-internal latency tracking; always
     /// millisecond-precise regardless of source timestamp granularity.
-    #[serde(skip)]
     pub received_at_ms: i64,
 }
 
@@ -500,8 +518,9 @@ impl Event {
         event_id: EventId,
         source: SourceInfo,
         op: Op,
-        before: Option<Value>,
-        after: Option<Value>,
+        before: Option<CanonicalRow>,
+        after: Option<CanonicalRow>,
+        type_mapping: TypeMapping,
         ts_ms: i64,
         size_bytes: usize,
     ) -> Self {
@@ -512,6 +531,7 @@ impl Event {
             op,
             ts_ms,
             transaction: None,
+            type_mapping,
             event_id: Some(event_id),
             tenant_id: None,
             schema_version: None,
@@ -534,6 +554,7 @@ impl Event {
         event_id: EventId,
         source: SourceInfo,
         ddl: Value,
+        type_mapping: TypeMapping,
         ts_ms: i64,
         size_bytes: usize,
     ) -> Self {
@@ -544,43 +565,12 @@ impl Event {
             op: Op::Read, // DDL events use "r" in Debezium
             ts_ms,
             transaction: None,
+            type_mapping,
             event_id: Some(event_id),
             tenant_id: None,
             schema_version: None,
             schema_sequence: None,
             ddl: Some(ddl),
-            trace_id: None,
-            tags: None,
-            synthetic: None,
-            routing: None,
-            tx_end: true,
-            boundary: None,
-            size_bytes,
-
-            received_at_ms: now_ms(),
-        }
-    }
-
-    /// Create a snapshot read event. `event_id` is required.
-    pub fn new_snapshot(
-        event_id: EventId,
-        source: SourceInfo,
-        after: Value,
-        ts_ms: i64,
-        size_bytes: usize,
-    ) -> Self {
-        Self {
-            before: None,
-            after: Some(after),
-            source,
-            op: Op::Read,
-            ts_ms,
-            transaction: None,
-            event_id: Some(event_id),
-            tenant_id: None,
-            schema_version: None,
-            schema_sequence: None,
-            ddl: None,
             trace_id: None,
             tags: None,
             synthetic: None,
@@ -630,10 +620,9 @@ impl Event {
         let mut key = String::with_capacity(80);
         let _ = write!(
             key,
-            "{}|{}.{}|{}|",
+            "{}|{}|{}|",
             self.tenant_id.as_deref().unwrap_or("_"),
-            self.source.db,
-            self.source.table,
+            SourceRelationIdentity::of(&self.source).canonical(),
             self.transaction
                 .as_ref()
                 .map(|t| t.id.as_str())
@@ -1456,18 +1445,19 @@ mod tests {
     }
 
     #[test]
-    fn event_serializes_to_debezium_structure() {
+    fn event_renders_to_debezium_structure() {
         let event = Event::new_row(
             crate::EventId::mysql_row_server(1, "t", 1, 0),
             test_source(),
             Op::Create,
             None,
-            Some(json!({"id": 1, "name": "Alice"})),
+            Some(canonical::fixture::row(json!({"id": 1, "name": "Alice"}))),
+            TypeMapping::V2,
             1700000000000,
             128,
         );
 
-        let json = serde_json::to_value(&event).unwrap();
+        let json = event.native_value(NativeOpts::default()).unwrap();
 
         // Verify Debezium-standard fields
         assert_eq!(json["op"], "c");
@@ -1479,6 +1469,7 @@ mod tests {
         assert_eq!(json["source"]["connector"], "mysql");
         assert_eq!(json["source"]["db"], "inventory");
         assert_eq!(json["source"]["table"], "customers");
+        assert_eq!(json["source"]["type_mapping"], "v2");
 
         // Verify position fields are flattened into source
         assert_eq!(json["source"]["gtid"], "abc:123");
@@ -1487,25 +1478,30 @@ mod tests {
     }
 
     #[test]
-    fn event_roundtrip() {
+    fn event_durable_roundtrip() {
         let original = Event::new_row(
             crate::EventId::mysql_row_server(1, "t", 1, 0),
             test_source(),
             Op::Update,
-            Some(json!({"id": 1, "name": "Alice"})),
-            Some(json!({"id": 1, "name": "Alice Smith"})),
+            Some(canonical::fixture::row(json!({"id": 1, "name": "Alice"}))),
+            Some(canonical::fixture::row(
+                json!({"id": 1, "name": "Alice Smith"}),
+            )),
+            TypeMapping::V1,
             1700000000000,
             256,
         )
         .with_tenant("acme");
 
-        let json = serde_json::to_string(&original).unwrap();
-        let parsed: Event = serde_json::from_str(&json).unwrap();
+        let text = serde_json::to_string(&DurableEvent(&original)).unwrap();
+        let parsed =
+            Event::from_durable(serde_json::from_str(&text).unwrap()).unwrap();
 
         assert_eq!(parsed.op, Op::Update);
         assert_eq!(parsed.tenant_id, Some("acme".to_string()));
         assert_eq!(parsed.source.connector, "mysql");
-        assert_eq!(parsed.before.unwrap()["name"], "Alice");
-        assert_eq!(parsed.after.unwrap()["name"], "Alice Smith");
+        assert_eq!(parsed.type_mapping, TypeMapping::V1);
+        assert_eq!(parsed.before, original.before);
+        assert_eq!(parsed.after, original.after);
     }
 }

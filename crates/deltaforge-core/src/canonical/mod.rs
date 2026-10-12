@@ -11,7 +11,12 @@
 //! variants mean the same thing: see `docs/design/canonical-event-model.md`.
 
 pub mod durable;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod fixture;
+pub mod parse;
 pub mod render;
+pub mod schema;
+pub mod view;
 
 use serde::{Deserialize, Serialize};
 
@@ -22,7 +27,17 @@ use serde::{Deserialize, Serialize};
 /// The type-mapping version an event is stamped with at its source. Every
 /// encoder renders the event's own version.
 #[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
 )]
 pub enum TypeMapping {
     /// Legacy rendering, kept only where the old output was lossless.
@@ -118,6 +133,28 @@ impl CanonicalValue {
     pub fn is_null(&self) -> bool {
         matches!(self, CanonicalValue::Null)
     }
+
+    /// An estimate of the value's size in bytes (for batching).
+    pub fn approx_size(&self) -> usize {
+        match self {
+            CanonicalValue::Null | CanonicalValue::Unchanged => 4,
+            CanonicalValue::Opaque(o) => o.text.len(),
+            CanonicalValue::Document(d) => d.canonical_bytes().len(),
+            CanonicalValue::Bytes(b) => b.len(),
+            CanonicalValue::Db(db) => match db {
+                DbValue::Text(s) => s.len(),
+                DbValue::Binary(b) => b.len(),
+                DbValue::Json(j) => j.as_str().len(),
+                DbValue::Decimal(Decimal::Finite(s)) => s.len(),
+                DbValue::Set(s) => s.members().iter().map(String::len).sum(),
+                DbValue::Enum(e) => e.label.len(),
+                DbValue::Array(a) => {
+                    a.items().iter().map(Self::approx_size).sum()
+                }
+                _ => 8,
+            },
+        }
+    }
 }
 
 /// A source-typed value without a canonical mapping.
@@ -133,9 +170,31 @@ pub struct OpaqueText {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Document(serde_json::Value);
 
+/// `v` with object keys sorted at every level.
+fn sorted(v: serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            serde_json::Value::Object(
+                entries.into_iter().map(|(k, v)| (k, sorted(v))).collect(),
+            )
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(sorted).collect())
+        }
+        other => other,
+    }
+}
+
 impl Document {
+    /// A document with its object keys sorted at every level: one
+    /// representation whatever the insertion order, so a document renders
+    /// identically live and after the durable round trip (replay, DLQ),
+    /// even where `serde_json` preserves insertion order (a feature other
+    /// crates of a binary may enable).
     pub fn new(value: serde_json::Value) -> Self {
-        Document(value)
+        Document(sorted(value))
     }
 
     pub fn value(&self) -> &serde_json::Value {
@@ -756,10 +815,18 @@ impl ArrayValue {
 // Rows
 // ---------------------------------------------------------------------------
 
-/// A row image: column values in source order, names unique.
+/// A row image: its declared columns (values in source order, names
+/// unique) and its processor-added document extensions.
+///
+/// Extensions are not database columns: they hold JSON documents a
+/// processor added to an event whose columns its source schema declares.
+/// Typed sinks carry them in a stable extension slot of their own, never as
+/// a column. An extension name never equals a column name, and no extension
+/// name is a dotted path prefix of another.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct CanonicalRow {
     columns: Vec<(String, CanonicalValue)>,
+    extensions: std::collections::BTreeMap<String, Document>,
 }
 
 impl CanonicalRow {
@@ -772,7 +839,23 @@ impl CanonicalRow {
                 return invalid(format!("duplicate column {name}"));
             }
         }
-        Ok(CanonicalRow { columns })
+        Ok(CanonicalRow {
+            columns,
+            extensions: Default::default(),
+        })
+    }
+
+    /// A row with document extensions (checked like
+    /// [`Self::set_extension`]).
+    pub fn with_extensions(
+        columns: Vec<(String, CanonicalValue)>,
+        extensions: impl IntoIterator<Item = (String, Document)>,
+    ) -> Result<CanonicalRow, CanonicalError> {
+        let mut row = CanonicalRow::new(columns)?;
+        for (name, doc) in extensions {
+            row.set_extension(name, doc)?;
+        }
+        Ok(row)
     }
 
     pub fn get(&self, name: &str) -> Option<&CanonicalValue> {
@@ -787,15 +870,17 @@ impl CanonicalRow {
         self.columns.iter().map(|(n, _)| n.as_str())
     }
 
+    /// The number of declared columns.
     pub fn len(&self) -> usize {
         self.columns.len()
     }
 
+    /// No declared columns and no extensions.
     pub fn is_empty(&self) -> bool {
-        self.columns.is_empty()
+        self.columns.is_empty() && self.extensions.is_empty()
     }
 
-    /// Set `name` (replacing its value in place, or appending it).
+    /// Set column `name` (replacing its value in place, or appending it).
     pub fn set(&mut self, name: impl Into<String>, value: CanonicalValue) {
         let name = name.into();
         match self.columns.iter_mut().find(|(n, _)| *n == name) {
@@ -804,7 +889,7 @@ impl CanonicalRow {
         }
     }
 
-    /// Remove `name`, returning its value.
+    /// Remove column `name`, returning its value.
     pub fn remove(&mut self, name: &str) -> Option<CanonicalValue> {
         let i = self.columns.iter().position(|(n, _)| n == name)?;
         Some(self.columns.remove(i).1)
@@ -812,6 +897,71 @@ impl CanonicalRow {
 
     pub fn into_columns(self) -> Vec<(String, CanonicalValue)> {
         self.columns
+    }
+
+    /// The columns and the extensions.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<(String, CanonicalValue)>,
+        std::collections::BTreeMap<String, Document>,
+    ) {
+        (self.columns, self.extensions)
+    }
+
+    /// The document extensions, in name order.
+    pub fn extensions(&self) -> &std::collections::BTreeMap<String, Document> {
+        &self.extensions
+    }
+
+    /// Set extension `name` (replacing an extension of that name). A name
+    /// that is a column's, or whose dotted path conflicts with another
+    /// extension's (`a` and `a.b`), is refused.
+    pub fn set_extension(
+        &mut self,
+        name: impl Into<String>,
+        doc: Document,
+    ) -> Result<(), CanonicalError> {
+        let name = name.into();
+        if self.get(&name).is_some() {
+            return invalid(format!(
+                "extension `{name}` has a declared column's name"
+            ));
+        }
+        let conflicts = |a: &str, b: &str| {
+            a.len() > b.len()
+                && a.starts_with(b)
+                && a.as_bytes()[b.len()] == b'.'
+        };
+        if let Some(other) = self
+            .extensions
+            .keys()
+            .find(|k| conflicts(k, &name) || conflicts(&name, k))
+        {
+            return invalid(format!(
+                "extension `{name}` conflicts with extension `{other}`"
+            ));
+        }
+        self.extensions.insert(name, doc);
+        Ok(())
+    }
+
+    /// Remove extension `name`, returning it.
+    pub fn remove_extension(&mut self, name: &str) -> Option<Document> {
+        self.extensions.remove(name)
+    }
+
+    /// An estimate of the row's size in bytes (for batching).
+    pub fn approx_size(&self) -> usize {
+        self.columns
+            .iter()
+            .map(|(n, v)| n.len() + v.approx_size())
+            .sum::<usize>()
+            + self
+                .extensions
+                .iter()
+                .map(|(n, d)| n.len() + d.canonical_bytes().len())
+                .sum::<usize>()
     }
 
     /// Whether the row holds an [`CanonicalValue::Unchanged`] value.

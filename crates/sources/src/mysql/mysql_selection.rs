@@ -612,16 +612,13 @@ async fn loaded(
             timeline_error(anyhow::anyhow!("version {version} is missing"))
         })?;
     let schema = schema_of(&v.schema_json).map_err(timeline_error)?;
-    let column_names =
-        Arc::new(schema.columns.iter().map(|c| c.name.clone()).collect());
     Ok((
-        Arc::new(LoadedSchema {
-            schema: schema.clone(),
-            registry_version: v.version,
-            fingerprint: v.hash.as_str().into(),
-            sequence: v.sequence,
-            column_names,
-        }),
+        Arc::new(LoadedSchema::new(
+            schema.clone(),
+            v.version,
+            v.hash.as_str().into(),
+            v.sequence,
+        )),
         schema,
     ))
 }
@@ -930,13 +927,12 @@ mod tests {
                 records: Vec::new(),
                 barriers: Vec::new(),
             });
-            let loaded = Arc::new(LoadedSchema {
-                schema: MySqlTableSchema::new(Vec::new()),
-                registry_version: 1,
-                fingerprint: "h".into(),
-                sequence: 1,
-                column_names: Arc::new(Vec::new()),
-            });
+            let loaded = Arc::new(LoadedSchema::new(
+                MySqlTableSchema::new(Vec::new()),
+                1,
+                "h".into(),
+                1,
+            ));
             let mut puts = 0u64;
             for i in 0..2_000 {
                 let table = format!("t{}", i % 300);
@@ -977,13 +973,12 @@ mod tests {
             records: Vec::new(),
             barriers: Vec::new(),
         });
-        let loaded = Arc::new(LoadedSchema {
-            schema: MySqlTableSchema::new(Vec::new()),
-            registry_version: 1,
-            fingerprint: "h".into(),
-            sequence: 1,
-            column_names: Arc::new(Vec::new()),
-        });
+        let loaded = Arc::new(LoadedSchema::new(
+            MySqlTableSchema::new(Vec::new()),
+            1,
+            "h".into(),
+            1,
+        ));
         for table in ["a", "b"] {
             caches.put_timeline(table.into(), t.clone());
             caches.put_selection(

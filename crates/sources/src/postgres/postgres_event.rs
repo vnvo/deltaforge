@@ -17,13 +17,16 @@ use tracing::{debug, error, info, warn};
 use common::watchdog;
 
 use super::RunCtx;
+use super::postgres_decode::{
+    Image, PgColumnDecoder, PgDecodeError, PgRowDecoder, TupleValue,
+};
 use super::postgres_errors::{LoopControl, SchemaDrift};
 use super::postgres_event_schema::{PgEventSchema, RelationProjection};
 use super::postgres_helpers::{
     make_checkpoint_meta, make_checkpoint_meta_str, pg_timestamp_to_unix_ms,
 };
 use super::postgres_logical_message;
-use super::postgres_object::{RelationColumn, build_object, parse_tuple_data};
+use super::postgres_object::{RelationColumn, parse_tuple};
 use super::postgres_relation_binding::{
     self as postgres_relation_binding, FirstResolution, ResolvedEventSchema,
 };
@@ -43,6 +46,64 @@ pub struct RelationInfo {
     pub(crate) projection: RelationProjection,
     /// The event schema version its rows are stamped with, once resolved.
     pub(crate) resolved: Option<ResolvedEventSchema>,
+    /// The relation's value decoder (by column type OID and modifier).
+    pub(crate) decoder: Arc<PgRowDecoder>,
+}
+
+/// The value decoder of a relation's columns; non-builtin types are named
+/// by the session's Type messages.
+pub(crate) fn relation_decoder(
+    columns: &[RelationColumn],
+    type_names: &std::collections::HashMap<u32, String>,
+) -> PgRowDecoder {
+    PgRowDecoder {
+        columns: columns
+            .iter()
+            .map(|c| {
+                PgColumnDecoder::new(
+                    &c.name,
+                    c.type_oid,
+                    c.type_modifier,
+                    type_names.get(&c.type_oid).map(String::as_str),
+                )
+                .with_key(c.flags & 1 != 0)
+            })
+            .collect(),
+    }
+}
+
+/// A value its type cannot decode: the `source_decode_failed` incident.
+fn decode_failed(
+    ctx: &RunCtx,
+    qualified_name: &str,
+    e: PgDecodeError,
+) -> SourceError {
+    crate::incident_drafts::source_decode_failed(
+        &ctx.source_id,
+        qualified_name,
+        &e.column,
+        &e.type_name,
+        &e.reason,
+    )
+}
+
+/// Parse one tuple of a change message, failing closed on malformed data.
+fn tuple<'a>(
+    ctx: &RunCtx,
+    qualified_name: &str,
+    data: &'a [u8],
+) -> SourceResult<(Vec<TupleValue<'a>>, usize)> {
+    parse_tuple(data).map_err(|reason| {
+        decode_failed(
+            ctx,
+            qualified_name,
+            PgDecodeError {
+                column: String::new(),
+                type_name: "tuple".into(),
+                reason,
+            },
+        )
+    })
 }
 
 /// Build the commit boundary: the resume checkpoint plus, atomically, the
@@ -256,13 +317,13 @@ pub(super) async fn dispatch_event(
                 message_ordinal,
             );
 
-            if let Some(event) = postgres_logical_message::to_event(
+            let event = postgres_logical_message::to_event(
                 msg_id,
                 &prefix,
                 &content,
                 lsn,
-                &ctx.pipeline,       // pipeline name
-                &ctx.default_schema, // database name
+                &ctx.pipeline, // pipeline name
+                &ctx.database,
                 // Only a transactional message belongs to the open transaction; a
                 // non-transactional message is its own boundary and must stay
                 // unstamped so the coordinator keeps treating it as standalone.
@@ -273,13 +334,14 @@ pub(super) async fn dispatch_event(
                 },
                 ctx.current_tx_commit_time,
                 &ctx.outbox_prefixes,
-            ) {
-                ctx.tx.send(SourceItem::Event(event)).await.map_err(|e| {
-                    LoopControl::Fail(SourceError::Other(e.into()))
-                })?;
-                if transactional {
-                    ctx.open_tx_events += 1;
-                }
+                ctx.type_mapping,
+            );
+            ctx.tx
+                .send(SourceItem::Event(event))
+                .await
+                .map_err(|e| LoopControl::Fail(SourceError::Other(e.into())))?;
+            if transactional {
+                ctx.open_tx_events += 1;
             }
 
             ctx.last_lsn = lsn;
@@ -344,7 +406,18 @@ async fn handle_pgoutput_message(
             Ok(())
         }
         b'Y' => {
-            debug!("type message");
+            // Type OID, namespace, name: names the non-builtin types of the
+            // Relations that follow.
+            if payload.len() >= 4 {
+                let oid = u32::from_be_bytes([
+                    payload[0], payload[1], payload[2], payload[3],
+                ]);
+                let mut offset = 4;
+                let _namespace = read_cstring(payload, &mut offset);
+                let name = read_cstring(payload, &mut offset);
+                debug!(oid, name = %name, "type message");
+                ctx.type_names.insert(oid, name);
+            }
             Ok(())
         }
         b'M' => {
@@ -467,6 +540,7 @@ async fn handle_relation(
 
     // Update relation map with new column info
     let qualified_name: Arc<str> = format!("{schema}.{table}").into();
+    let decoder = Arc::new(relation_decoder(&columns, &ctx.type_names));
     ctx.relation_map.insert(
         relation_id,
         RelationInfo {
@@ -478,6 +552,7 @@ async fn handle_relation(
             replica_identity,
             projection: projection.clone(),
             resolved: carried,
+            decoder,
         },
     );
 
@@ -766,7 +841,7 @@ fn build_source_info(
         connector: "postgresql".to_string(),
         name: ctx.pipeline.clone(),
         ts_ms: timestamp_ms,
-        db: ctx.default_schema.clone(),
+        db: ctx.database.clone(),
         schema: Some(schema.to_string()),
         table: table.to_string(),
         snapshot: None,
@@ -826,16 +901,17 @@ async fn handle_insert(
     }
 
     // Extract all needed data from relation upfront to release the borrow.
-    let columns = Arc::clone(&relation.columns);
+    let decoder = Arc::clone(&relation.decoder);
     let qualified_name = Arc::clone(&relation.qualified_name);
     let schema = relation.schema.clone();
     let table = relation.table.clone();
 
     let loaded = resolve_event_schema(ctx, relation_id).await?;
 
-    let tuple_data = payload_bytes.slice(5..);
-    let (values, _) = parse_tuple_data(&tuple_data, columns.len());
-    let after = build_object(&columns, &values);
+    let (values, _) = tuple(ctx, &qualified_name, &payload[5..])?;
+    let after = decoder
+        .decode_tuple(&values, Image::Other)
+        .map_err(|e| decode_failed(ctx, &qualified_name, e))?;
 
     let timestamp_ms = ctx
         .current_tx_commit_time
@@ -863,6 +939,7 @@ async fn handle_insert(
         Op::Create,
         None,
         Some(after),
+        ctx.type_mapping,
         timestamp_ms,
         payload.len(),
     )
@@ -909,7 +986,7 @@ async fn handle_update(
         return Ok(());
     }
 
-    let columns = Arc::clone(&relation.columns);
+    let decoder = Arc::clone(&relation.decoder);
     let qualified_name = Arc::clone(&relation.qualified_name);
     let schema = relation.schema.clone();
     let table = relation.table.clone();
@@ -923,15 +1000,19 @@ async fn handle_update(
 
         match marker {
             b'K' | b'O' => {
-                let tuple_data = payload_bytes.slice(offset..);
                 let (values, consumed) =
-                    parse_tuple_data(&tuple_data, columns.len());
-                before_values = Some(values);
+                    tuple(ctx, &qualified_name, &payload[offset..])?;
+                let image = if marker == b'K' {
+                    Image::KeyOnly
+                } else {
+                    Image::Other
+                };
+                before_values = Some((values, image));
                 offset += consumed;
             }
             b'N' => {
-                let tuple_data = payload_bytes.slice(offset..);
-                let (values, _) = parse_tuple_data(&tuple_data, columns.len());
+                let (values, _) =
+                    tuple(ctx, &qualified_name, &payload[offset..])?;
                 after_values = Some(values);
                 break;
             }
@@ -946,8 +1027,13 @@ async fn handle_update(
 
     let loaded = resolve_event_schema(ctx, relation_id).await?;
 
-    let before = before_values.map(|v| build_object(&columns, &v));
-    let after = build_object(&columns, &after_vals);
+    let before = before_values
+        .map(|(v, image)| decoder.decode_tuple(&v, image))
+        .transpose()
+        .map_err(|e| decode_failed(ctx, &qualified_name, e))?;
+    let after = decoder
+        .decode_tuple(&after_vals, Image::UpdateAfter)
+        .map_err(|e| decode_failed(ctx, &qualified_name, e))?;
 
     let timestamp_ms = ctx
         .current_tx_commit_time
@@ -975,6 +1061,7 @@ async fn handle_update(
         Op::Update,
         before,
         Some(after),
+        ctx.type_mapping,
         timestamp_ms,
         payload.len(),
     )
@@ -1026,16 +1113,22 @@ async fn handle_delete(
         return Ok(());
     }
 
-    let columns = Arc::clone(&relation.columns);
+    let decoder = Arc::clone(&relation.decoder);
     let qualified_name = Arc::clone(&relation.qualified_name);
     let schema = relation.schema.clone();
     let table = relation.table.clone();
 
     let loaded = resolve_event_schema(ctx, relation_id).await?;
 
-    let tuple_data = payload_bytes.slice(5..);
-    let (values, _) = parse_tuple_data(&tuple_data, columns.len());
-    let before = build_object(&columns, &values);
+    let (values, _) = tuple(ctx, &qualified_name, &payload[5..])?;
+    let image = if tuple_marker == b'K' {
+        Image::KeyOnly
+    } else {
+        Image::Other
+    };
+    let before = decoder
+        .decode_tuple(&values, image)
+        .map_err(|e| decode_failed(ctx, &qualified_name, e))?;
 
     let timestamp_ms = ctx
         .current_tx_commit_time
@@ -1063,6 +1156,7 @@ async fn handle_delete(
         Op::Delete,
         Some(before),
         None,
+        ctx.type_mapping,
         timestamp_ms,
         payload.len(),
     )
@@ -1132,7 +1226,7 @@ async fn handle_truncate(
             connector: "postgresql".to_string(),
             name: ctx.pipeline.clone(),
             ts_ms: timestamp_ms,
-            db: ctx.default_schema.clone(),
+            db: ctx.database.clone(),
             schema: Some(schema.clone()),
             table: table.clone(),
             snapshot: None,
@@ -1172,6 +1266,7 @@ async fn handle_truncate(
             truncate_id,
             source_info,
             ddl_payload,
+            ctx.type_mapping,
             timestamp_ms,
             0,
         )

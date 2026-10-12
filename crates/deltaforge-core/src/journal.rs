@@ -34,7 +34,9 @@ pub struct JournalEntry {
     /// Examples: `{"file":"mysql-bin.000005","pos":12345}`, `{"lsn":"0/16B3748"}`.
     pub source_cursor: Option<serde_json::Value>,
 
-    /// The original event payload. May be truncated if it exceeds max_event_bytes.
+    /// The original event in its durable form (typed values and their
+    /// mapping version, see [`crate::DurableEvent`]). May be truncated if it
+    /// exceeds max_event_bytes.
     pub event: serde_json::Value,
 
     /// True if the event payload was truncated due to size limits.

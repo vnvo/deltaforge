@@ -341,9 +341,16 @@ pub fn verified_start_check(
         // the mapping or configures a DLQ, then restarts): settled when the
         // restarted pipeline is verified running; a recurrence reopens it.
         (
-            ReasonCode::SinkConversionFailed | ReasonCode::SinkSchemaRejected,
+            ReasonCode::SinkConversionFailed
+            | ReasonCode::SinkSchemaRejected
+            | ReasonCode::SinkDestinationConflict,
             Component::Sink { .. },
         ) => Some(PIPELINE_RECOVERED),
+        // A value the source could not decode (an operator fixes the data
+        // or the schema, then restarts): the same rule.
+        (ReasonCode::SourceDecodeFailed, Component::Source { .. }) => {
+            Some(PIPELINE_RECOVERED)
+        }
         _ => None,
     }
 }

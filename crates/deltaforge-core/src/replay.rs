@@ -11,7 +11,11 @@ use sha2::{Digest, Sha256};
 
 use crate::{SourceBoundary, canonical_json};
 
-pub const REPLAY_ENVELOPE_VERSION: u16 = 1;
+/// Version 2: each event is the durable canonical event
+/// ([`crate::DurableEvent`]: typed values and their mapping version).
+/// Version 1 held untyped JSON events and is refused (see
+/// [`ReplayLoadError::PreCanonicalCapture`]).
+pub const REPLAY_ENVELOPE_VERSION: u16 = 2;
 
 /// Backend-computed content digest over the exact stored bytes, domain-separated so it
 /// cannot collide with a hash taken for another purpose. Defined here (not in the
@@ -78,7 +82,8 @@ pub struct SchemaBinding {
 }
 
 /// One raw (pre-processing) event within an envelope. `offset` is a subordinate
-/// position for inspection; ordering is the array order.
+/// position for inspection; ordering is the array order. `event` is the
+/// event's durable form ([`crate::Event::to_durable`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayEventRecord {
     pub offset: u32,
@@ -170,6 +175,14 @@ pub enum ReplayLoadError {
     #[error("unsupported replay envelope version {got} (expected {expected})")]
     UnsupportedVersion { got: u16, expected: u16 },
     #[error(
+        "replay capture format version {version} predates canonical values: its \
+         events carry untyped JSON, from which replay cannot infer the source \
+         types safely, so nothing was replayed. Finish replaying (or discard) \
+         captures made before the upgrade with the previous DeltaForge version, \
+         then start a new capture"
+    )]
+    PreCanonicalCapture { version: u16 },
+    #[error(
         "replay envelope pipeline identity does not match the reading pipeline"
     )]
     IdentityMismatch,
@@ -199,6 +212,10 @@ impl StoredReplayEnvelope {
         value: &[u8],
         expected_identity: &PipelineIdentity,
     ) -> Result<Self, ReplayLoadError> {
+        let version = envelope_version(value)?;
+        if version < REPLAY_ENVELOPE_VERSION {
+            return Err(ReplayLoadError::PreCanonicalCapture { version });
+        }
         let payload: ReplayEnvelopePayload = serde_json::from_slice(value)
             .map_err(|e| ReplayLoadError::Decode(e.to_string()))?;
         if payload.version != REPLAY_ENVELOPE_VERSION {
@@ -233,6 +250,18 @@ impl StoredReplayEnvelope {
             payload,
         })
     }
+}
+
+/// The format version of stored envelope bytes, read before the payload
+/// (whose shape depends on it).
+pub fn envelope_version(value: &[u8]) -> Result<u16, ReplayLoadError> {
+    #[derive(Deserialize)]
+    struct Versioned {
+        version: u16,
+    }
+    serde_json::from_slice::<Versioned>(value)
+        .map(|v| v.version)
+        .map_err(|e| ReplayLoadError::Decode(e.to_string()))
 }
 
 fn feed(h: &mut Sha256, bytes: &[u8]) {
@@ -398,6 +427,48 @@ mod tests {
                 &identity()
             ),
             Err(ReplayLoadError::CaptureIdMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_pre_canonical_capture_is_refused_before_any_payload_is_read() {
+        let mut p = payload(vec![ev("e1", json!({"after": {"id": 1}}))]);
+        p.version = 1;
+        let bytes = p.canonical_bytes();
+        let cid = p.capture_id();
+        let ch = content_digest(&bytes);
+        let err = StoredReplayEnvelope::decode_verified(
+            1,
+            1,
+            &cid,
+            &ch,
+            &bytes,
+            &identity(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ReplayLoadError::PreCanonicalCapture { version: 1 }
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("version 1"), "{msg}");
+        assert!(msg.contains("predates canonical values"), "{msg}");
+        assert!(msg.contains("cannot infer the source types"), "{msg}");
+        assert!(msg.contains("start a new capture"), "{msg}");
+        // A future version is not mistaken for an old one.
+        let mut f = payload(vec![]);
+        f.version = REPLAY_ENVELOPE_VERSION + 1;
+        let bytes = f.canonical_bytes();
+        assert!(matches!(
+            StoredReplayEnvelope::decode_verified(
+                1,
+                1,
+                &f.capture_id(),
+                &content_digest(&bytes),
+                &bytes,
+                &identity()
+            ),
+            Err(ReplayLoadError::UnsupportedVersion { .. })
         ));
     }
 }

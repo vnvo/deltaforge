@@ -770,6 +770,7 @@ mod tests {
                 table_options: Default::default(),
                 rotation: None,
                 snapshot_cohort: Default::default(),
+                type_mapping: deltaforge_core::TypeMapping::V2,
             };
             // One required sink; its barriers commit through the runner's
             // own barrier commit, so a generation can start and complete.
@@ -1041,7 +1042,12 @@ mod tests {
             .await;
             res.unwrap();
             assert_eq!(rows.len(), 2);
-            assert_eq!(rows[1].after.as_ref().unwrap()["w"], 2);
+            assert_eq!(
+                rows[1].after.as_ref().unwrap().get("w"),
+                Some(&deltaforge_core::canonical::fixture::value(
+                    &serde_json::json!(2)
+                ))
+            );
             let (table, barriers) = timeline(&st, db, "t").await;
             let base = baselines(&table);
             assert_eq!(base.len(), 2, "{table:?}");

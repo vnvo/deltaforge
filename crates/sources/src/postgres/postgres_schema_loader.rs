@@ -537,9 +537,9 @@ impl PostgresSchemaLoader {
         );
         let schema_json = serde_json::to_value(&pg_schema)
             .map_err(|e| SourceError::Other(e.into()))?;
-        let version = self
+        let registered = self
             .registry
-            .register_with_checkpoint(
+            .register_version(
                 &scope.key(schema, table),
                 &fingerprint,
                 &schema_json,
@@ -549,9 +549,10 @@ impl PostgresSchemaLoader {
             .map_err(RegistryError::Storage)?;
         Ok(LoadedSchema {
             schema: Arc::new(pg_schema),
-            registry_version: version,
+            registry_version: registered.version,
             fingerprint: fingerprint.into(),
-            sequence: self.registry.current_sequence(),
+            // The version's own sequence, never the registry's current one.
+            sequence: registered.sequence,
             column_names,
         })
     }

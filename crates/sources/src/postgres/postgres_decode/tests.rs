@@ -198,10 +198,30 @@ fn unmapped_types_are_opaque_with_their_identity() {
 fn row() -> PgRowDecoder {
     PgRowDecoder {
         columns: vec![
-            PgColumnDecoder::new("id", 23, -1, None),
+            PgColumnDecoder::new("id", 23, -1, None).with_key(true),
             PgColumnDecoder::new("doc", 25, -1, None),
         ],
     }
+}
+
+#[test]
+fn a_key_only_image_holds_only_the_key() {
+    let r = row()
+        .decode_tuple(
+            &[TupleValue::Text(b"1"), TupleValue::Null],
+            Image::KeyOnly,
+        )
+        .unwrap();
+    assert_eq!(r.names().collect::<Vec<_>>(), ["id"]);
+    // Outside the key PostgreSQL sends nothing: a value there is malformed.
+    assert!(
+        row()
+            .decode_tuple(
+                &[TupleValue::Text(b"1"), TupleValue::Text(b"x")],
+                Image::KeyOnly
+            )
+            .is_err()
+    );
 }
 
 #[test]

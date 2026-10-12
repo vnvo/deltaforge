@@ -13,8 +13,18 @@ use super::{
 };
 
 /// How native JSON renders 64-bit integers (v2 only; v1 always renders
-/// numbers).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// numbers). Sink setting `json_wide_integers`.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum WideIntegers {
     /// Exact decimal strings (default): survive any JSON parser.
     #[default]
@@ -40,15 +50,28 @@ impl RenderOpts {
     }
 }
 
-/// A canonical value the native renderer cannot write under its settings.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum RenderError {
+/// Why a canonical value has no native rendering under the settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RenderFailure {
     #[error(
         "unsigned 64-bit value above i64::MAX cannot render as a JSON number (json_wide_integers: number)"
     )]
     WideUnsignedNumber,
     #[error("an unchanged TOAST value has no native rendering")]
     Unchanged,
+    /// A processor-added extension and a column render under one name.
+    #[error("an extension has the name of a rendered column")]
+    ExtensionCollision,
+}
+
+/// A column the native renderer cannot write under its settings. Never
+/// carries the value.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("column {column}: {failure}")]
+pub struct RenderError {
+    /// The column (`after.id` once the image is known).
+    pub column: String,
+    pub failure: RenderFailure,
 }
 
 /// A rendered row image: the present columns, and the columns PostgreSQL
@@ -71,8 +94,24 @@ pub fn render_row(
         if matches!(v, CanonicalValue::Unchanged) {
             unchanged.push(name.to_string());
         } else {
-            values.insert(name.to_string(), render_value(v, opts)?);
+            let rendered =
+                render_value(v, opts).map_err(|failure| RenderError {
+                    column: name.to_string(),
+                    failure,
+                })?;
+            values.insert(name.to_string(), rendered);
         }
+    }
+    // Extensions merge into the rendered row; a name a column already
+    // renders under (or lists as unchanged) is refused, never overwritten.
+    for (name, doc) in row.extensions() {
+        if values.contains_key(name) || unchanged.iter().any(|u| u == name) {
+            return Err(RenderError {
+                column: name.clone(),
+                failure: RenderFailure::ExtensionCollision,
+            });
+        }
+        values.insert(name.clone(), doc.value().clone());
     }
     Ok(RenderedRow { values, unchanged })
 }
@@ -81,10 +120,10 @@ pub fn render_row(
 pub fn render_value(
     v: &CanonicalValue,
     opts: RenderOpts,
-) -> Result<Value, RenderError> {
+) -> Result<Value, RenderFailure> {
     Ok(match v {
         CanonicalValue::Null => Value::Null,
-        CanonicalValue::Unchanged => return Err(RenderError::Unchanged),
+        CanonicalValue::Unchanged => return Err(RenderFailure::Unchanged),
         CanonicalValue::Db(db) => render_db(db, opts)?,
         CanonicalValue::Opaque(o) => Value::String(o.text.clone()),
         CanonicalValue::Document(d) => d.value().clone(),
@@ -111,7 +150,7 @@ pub fn parse_base64_wrapper(v: &Value) -> Option<Vec<u8>> {
     BASE64_STANDARD.decode(m.get("_base64")?.as_str()?).ok()
 }
 
-fn render_db(v: &DbValue, opts: RenderOpts) -> Result<Value, RenderError> {
+fn render_db(v: &DbValue, opts: RenderOpts) -> Result<Value, RenderFailure> {
     let v1 = opts.mapping == TypeMapping::V1;
     Ok(match v {
         DbValue::Int { value, width } => {
@@ -130,7 +169,7 @@ fn render_db(v: &DbValue, opts: RenderOpts) -> Result<Value, RenderError> {
             } else if opts.wide_integers == WideIntegers::String {
                 Value::String(value.to_string())
             } else if *value > i64::MAX as u64 {
-                return Err(RenderError::WideUnsignedNumber);
+                return Err(RenderFailure::WideUnsignedNumber);
             } else {
                 Value::from(*value)
             }

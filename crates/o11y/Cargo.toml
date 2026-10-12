@@ -17,3 +17,6 @@ deltaforge-core = { path = "../deltaforge-core" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+deltaforge-core = { path = "../deltaforge-core", features = ["test-fixtures"] }

@@ -449,6 +449,16 @@ pub struct ClickHouseSinkCfg {
     /// require a pre-created table (locked-down environments).
     #[serde(default = "default_true")]
     pub auto_create: bool,
+    /// The column holding each delivered row's processor-added document
+    /// extensions, as a canonical JSON object (`Nullable(String)`, NULL
+    /// when the row has none). A source column of this name is refused
+    /// before any row is delivered.
+    #[serde(default = "default_ch_extensions_column")]
+    pub extensions_column: String,
+}
+
+fn default_ch_extensions_column() -> String {
+    "_extensions".to_string()
 }
 
 impl std::fmt::Debug for ClickHouseSinkCfg {
@@ -468,6 +478,7 @@ impl std::fmt::Debug for ClickHouseSinkCfg {
             .field("send_timeout_secs", &self.send_timeout_secs)
             .field("required", &self.required)
             .field("auto_create", &self.auto_create)
+            .field("extensions_column", &self.extensions_column)
             .finish()
     }
 }
@@ -657,6 +668,14 @@ pub struct KafkaSinkCfg {
     #[serde(default)]
     pub encoding: EncodingCfg,
 
+    /// How native JSON renders 64-bit integers: `string` (default, exact
+    /// in every JSON parser) or `number` (exact only for parsers that read
+    /// 64-bit integers; JavaScript, `jq` and IEEE-double parsers silently
+    /// round values above 2^53). Under `number`, an unsigned value above
+    /// i64::MAX is a sink conversion failure. Avro is unaffected.
+    #[serde(default)]
+    pub json_wide_integers: deltaforge_core::canonical::render::WideIntegers,
+
     /// Whether this sink must succeed for checkpoint to proceed.
     /// Default: true
     #[serde(default)]
@@ -776,6 +795,14 @@ pub struct RedisSinkCfg {
     #[serde(default)]
     pub encoding: EncodingCfg,
 
+    /// How native JSON renders 64-bit integers: `string` (default, exact
+    /// in every JSON parser) or `number` (exact only for parsers that read
+    /// 64-bit integers; JavaScript, `jq` and IEEE-double parsers silently
+    /// round values above 2^53). Under `number`, an unsigned value above
+    /// i64::MAX is a sink conversion failure. Avro is unaffected.
+    #[serde(default)]
+    pub json_wide_integers: deltaforge_core::canonical::render::WideIntegers,
+
     /// Whether this sink must succeed for checkpoint to proceed.
     /// Default: true
     #[serde(default)]
@@ -862,6 +889,14 @@ pub struct NatsSinkCfg {
     /// Default: json
     #[serde(default)]
     pub encoding: EncodingCfg,
+
+    /// How native JSON renders 64-bit integers: `string` (default, exact
+    /// in every JSON parser) or `number` (exact only for parsers that read
+    /// 64-bit integers; JavaScript, `jq` and IEEE-double parsers silently
+    /// round values above 2^53). Under `number`, an unsigned value above
+    /// i64::MAX is a sink conversion failure. Avro is unaffected.
+    #[serde(default)]
+    pub json_wide_integers: deltaforge_core::canonical::render::WideIntegers,
 
     /// Optional JetStream stream name to verify exists.
     /// If provided, the sink will log a warning if the stream doesn't exist.
@@ -992,6 +1027,14 @@ pub struct HttpSinkCfg {
     #[serde(default)]
     pub encoding: EncodingCfg,
 
+    /// How native JSON renders 64-bit integers: `string` (default, exact
+    /// in every JSON parser) or `number` (exact only for parsers that read
+    /// 64-bit integers; JavaScript, `jq` and IEEE-double parsers silently
+    /// round values above 2^53). Under `number`, an unsigned value above
+    /// i64::MAX is a sink conversion failure. Avro is unaffected.
+    #[serde(default)]
+    pub json_wide_integers: deltaforge_core::canonical::render::WideIntegers,
+
     /// Whether this sink must succeed for checkpoint to proceed.
     #[serde(default)]
     pub required: Option<bool>,
@@ -1080,7 +1123,7 @@ pub struct S3SinkCfg {
     pub bucket: String,
 
     /// Prefix prepended to the Hive partition path. Trailing slashes are stripped.
-    /// Final layout: `{prefix}/table={t}/year={y}/month={m:02}/day={d:02}/<ulid>.{ext}`
+    /// Final layout: `{prefix}/namespace={n}/table={t}/year={y}/month={m:02}/day={d:02}/<ulid>.{ext}`
     #[serde(default)]
     pub prefix: String,
 
@@ -1411,6 +1454,7 @@ mod tests {
             Op::Create,
             None,
             None,
+            deltaforge_core::TypeMapping::V2,
             0,
             0,
         );

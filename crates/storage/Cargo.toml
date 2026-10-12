@@ -37,6 +37,7 @@ schema-registry = { path = "../schema-registry" }
 deltaforge-core = { path = "../deltaforge-core" }
 
 [dev-dependencies]
+deltaforge-core = { path = "../deltaforge-core", features = ["test-fixtures"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 # Reuse the shared SnapshotStateStore contract suite in adapter tests.
 checkpoints = { path = "../checkpoints", features = ["test-support"] }

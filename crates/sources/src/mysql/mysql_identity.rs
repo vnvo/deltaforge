@@ -11,8 +11,11 @@
 //! Unsupported identity types (float/double/set/json/bit/geometry/…) are
 //! rejected before allocation.
 
+use deltaforge_core::canonical::{
+    CanonicalValue, CivilDate, DateTimeValue, DateValue, DbValue, Decimal,
+    TimestampValue,
+};
 use deltaforge_core::{IdentityKind, TemporalKind};
-use mysql_async::Value;
 
 use super::MySqlColumn;
 use crate::snapshot_event_id::OwnedIdentityCell;
@@ -92,113 +95,75 @@ fn mismatch(col: &MySqlColumn, detail: &str) -> MysqlIdentityError {
     }
 }
 
-/// Extract the canonical identity cell for one column value, directed by the
+/// Extract the identity cell for one decoded column value, directed by the
 /// column's declared type. `NULL` yields `Null(kind)` carrying the declared
-/// type tag.
+/// type tag. The value comes from the shared decoder, so a snapshot row and a
+/// CDC row of the same stored value give the same cell.
 pub fn mysql_identity_cell(
     col: &MySqlColumn,
-    val: &Value,
+    val: &CanonicalValue,
 ) -> Result<OwnedIdentityCell, MysqlIdentityError> {
     let kind = mysql_identity_kind(col)?;
-    if matches!(val, Value::NULL) {
-        return Ok(OwnedIdentityCell::Null(kind));
-    }
-    let cell = match kind {
-        IdentityKind::Int => OwnedIdentityCell::Int(as_i64(col, val)?),
-        IdentityKind::UInt => OwnedIdentityCell::UInt(as_u64(col, val)?),
-        IdentityKind::Text => OwnedIdentityCell::Text(as_text(col, val)?),
-        IdentityKind::Bytes => OwnedIdentityCell::Bytes(as_bytes(col, val)?),
-        IdentityKind::Decimal => {
-            let (negative, unscaled, scale) = as_decimal(col, val)?;
+    let db = match val {
+        CanonicalValue::Null => return Ok(OwnedIdentityCell::Null(kind)),
+        CanonicalValue::Db(db) => db,
+        _ => return Err(mismatch(col, "not a database value")),
+    };
+    let cell = match (kind, db) {
+        (IdentityKind::Int, DbValue::Int { value, .. }) => {
+            OwnedIdentityCell::Int(*value)
+        }
+        (IdentityKind::Int, DbValue::Year(y)) => {
+            OwnedIdentityCell::Int(*y as i64)
+        }
+        (IdentityKind::UInt, DbValue::UInt { value, .. }) => {
+            OwnedIdentityCell::UInt(*value)
+        }
+        (IdentityKind::UInt, DbValue::Year(y)) => {
+            OwnedIdentityCell::UInt(*y as u64)
+        }
+        (IdentityKind::Text, DbValue::Text(t)) => {
+            OwnedIdentityCell::Text(t.clone())
+        }
+        (IdentityKind::Bytes, DbValue::Binary(b)) => {
+            OwnedIdentityCell::Bytes(b.clone())
+        }
+        (IdentityKind::Decimal, DbValue::Decimal(Decimal::Finite(text))) => {
+            let (negative, unscaled, scale) = decimal_parts(col, text)?;
             OwnedIdentityCell::Decimal {
                 negative,
                 unscaled,
                 scale,
             }
         }
-        IdentityKind::DateTime => OwnedIdentityCell::DateTime {
+        (IdentityKind::DateTime, v) => OwnedIdentityCell::DateTime {
             kind: temporal_kind(&col.data_type.to_lowercase()),
-            value: as_temporal_int(col, val)?,
+            value: temporal_int(col, v)?,
         },
-        IdentityKind::Enum => OwnedIdentityCell::Enum {
+        (IdentityKind::Enum, DbValue::Enum(e)) => OwnedIdentityCell::Enum {
             // MySQL enums are anonymous; the full column type (e.g.
             // "enum('a','b')") is the stable discriminator.
             enum_type: col.column_type.clone(),
-            label: as_text(col, val)?,
+            label: e.label.clone(),
         },
         // MySQL never maps a column to these kinds.
-        IdentityKind::Uuid | IdentityKind::Bool => {
+        (IdentityKind::Uuid | IdentityKind::Bool, _) => {
             return Err(mismatch(col, "unexpected kind for MySQL"));
         }
+        _ => return Err(mismatch(col, "value does not match the column type")),
     };
     Ok(cell)
 }
 
-fn as_i64(col: &MySqlColumn, val: &Value) -> Result<i64, MysqlIdentityError> {
-    match val {
-        Value::Int(n) => Ok(*n),
-        Value::UInt(n) => i64::try_from(*n)
-            .map_err(|_| mismatch(col, "unsigned value exceeds i64")),
-        Value::Bytes(b) => std::str::from_utf8(b)
-            .ok()
-            .and_then(|s| s.trim().parse::<i64>().ok())
-            .ok_or_else(|| mismatch(col, "not an integer")),
-        _ => Err(mismatch(col, "not an integer")),
-    }
-}
-
-fn as_u64(col: &MySqlColumn, val: &Value) -> Result<u64, MysqlIdentityError> {
-    match val {
-        Value::UInt(n) => Ok(*n),
-        Value::Int(n) => u64::try_from(*n)
-            .map_err(|_| mismatch(col, "negative value in unsigned column")),
-        Value::Bytes(b) => std::str::from_utf8(b)
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .ok_or_else(|| mismatch(col, "not an unsigned integer")),
-        _ => Err(mismatch(col, "not an unsigned integer")),
-    }
-}
-
-fn as_text(
-    col: &MySqlColumn,
-    val: &Value,
-) -> Result<String, MysqlIdentityError> {
-    match val {
-        Value::Bytes(b) => String::from_utf8(b.clone())
-            .map_err(|_| mismatch(col, "text column value is not valid UTF-8")),
-        _ => Err(mismatch(col, "not a text value")),
-    }
-}
-
-fn as_bytes(
-    col: &MySqlColumn,
-    val: &Value,
-) -> Result<Vec<u8>, MysqlIdentityError> {
-    match val {
-        Value::Bytes(b) => Ok(b.clone()),
-        _ => Err(mismatch(col, "not a byte value")),
-    }
-}
-
-/// Parse a MySQL decimal string (e.g. `"-123.45"`) into
+/// Split canonical decimal text (`-123.45`) into
 /// `(negative, big-endian unscaled magnitude, scale)`.
-fn as_decimal(
+fn decimal_parts(
     col: &MySqlColumn,
-    val: &Value,
+    s: &str,
 ) -> Result<(bool, Vec<u8>, i32), MysqlIdentityError> {
-    let s = match val {
-        Value::Bytes(b) => std::str::from_utf8(b)
-            .map_err(|_| mismatch(col, "decimal not UTF-8"))?
-            .trim()
-            .to_string(),
-        Value::Int(n) => n.to_string(),
-        Value::UInt(n) => n.to_string(),
-        _ => return Err(mismatch(col, "not a decimal")),
-    };
     let (negative, rest) = match s.strip_prefix('-') {
         Some(r) => (true, r),
-        None => (false, s.strip_prefix('+').unwrap_or(&s)),
+        None => (false, s),
     };
     let (int_part, frac_part) = match rest.split_once('.') {
         Some((i, f)) => (i, f),
@@ -237,7 +202,8 @@ fn decimal_digits_to_be_bytes(digits: &[u8]) -> Vec<u8> {
     bytes[first..].to_vec()
 }
 
-/// Days from the civil calendar epoch (1970-01-01), Howard Hinnant's algorithm.
+/// Days from the civil calendar epoch (1970-01-01), Howard Hinnant's algorithm
+/// (MySQL zero parts go through the same arithmetic).
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = (if y >= 0 { y } else { y - 399 }) / 400;
@@ -248,32 +214,30 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
-fn as_temporal_int(
+fn civil_days(d: &CivilDate) -> i64 {
+    days_from_civil(d.year() as i64, d.month() as i64, d.day() as i64)
+}
+
+/// DATE: days from the epoch; DATETIME and TIMESTAMP: microseconds from the
+/// epoch (TIMESTAMP: the UTC instant); TIME: signed microseconds.
+fn temporal_int(
     col: &MySqlColumn,
-    val: &Value,
+    v: &DbValue,
 ) -> Result<i64, MysqlIdentityError> {
-    match val {
-        Value::Date(y, mo, d, h, mi, s, us) => {
-            let days = days_from_civil(*y as i64, *mo as i64, *d as i64);
-            if col.data_type.eq_ignore_ascii_case("date") {
-                Ok(days)
-            } else {
-                // datetime / timestamp → microseconds from the epoch.
-                let secs = days * 86_400
-                    + *h as i64 * 3600
-                    + *mi as i64 * 60
-                    + *s as i64;
-                Ok(secs * 1_000_000 + *us as i64)
-            }
+    match v {
+        DbValue::Date(DateValue::Civil(d)) => Ok(civil_days(d)),
+        DbValue::DateTime(DateTimeValue::Civil {
+            date,
+            micros_of_day,
+            ..
+        }) => Ok(civil_days(date) * 86_400_000_000 + micros_of_day),
+        DbValue::Timestamp(TimestampValue::Instant { micros, .. }) => {
+            Ok(*micros)
         }
-        Value::Time(neg, days, h, mi, s, us) => {
-            let micros = ((*days as i64 * 24 + *h as i64) * 3600
-                + *mi as i64 * 60
-                + *s as i64)
-                * 1_000_000
-                + *us as i64;
-            Ok(if *neg { -micros } else { micros })
+        DbValue::Timestamp(TimestampValue::Zero { .. }) => {
+            Ok(days_from_civil(0, 0, 0) * 86_400_000_000)
         }
+        DbValue::Time(t) => Ok(t.micros()),
         _ => Err(mismatch(col, "not a date/time value")),
     }
 }
@@ -281,9 +245,24 @@ fn as_temporal_int(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mysql::mysql_decode::{ColumnDecoder, Raw};
+    use mysql_async::Value;
 
     fn col(name: &str, column_type: &str, data_type: &str) -> MySqlColumn {
-        MySqlColumn::new(name, column_type, data_type, false, 1)
+        let mut c = MySqlColumn::new(name, column_type, data_type, false, 1);
+        c.collation_id = Some(255);
+        c
+    }
+
+    /// The identity cell of a snapshot value, through the shared decoder.
+    fn cell(
+        c: &MySqlColumn,
+        v: Value,
+    ) -> Result<OwnedIdentityCell, MysqlIdentityError> {
+        let d = ColumnDecoder::new(c);
+        let kind = d.kind.clone().unwrap();
+        let decoded = d.decode(Raw::from_snapshot(&v, &kind)).unwrap();
+        mysql_identity_cell(c, &decoded)
     }
 
     #[test]
@@ -292,23 +271,34 @@ mod tests {
         let unsigned = col("b", "int(11) unsigned", "int");
         assert_eq!(mysql_identity_kind(&signed).unwrap(), IdentityKind::Int);
         assert_eq!(mysql_identity_kind(&unsigned).unwrap(), IdentityKind::UInt);
+        assert_eq!(
+            cell(&unsigned, Value::UInt(7)).unwrap(),
+            OwnedIdentityCell::UInt(7)
+        );
+        assert_eq!(
+            cell(&signed, Value::Int(-7)).unwrap(),
+            OwnedIdentityCell::Int(-7)
+        );
     }
 
     #[test]
     fn binary_column_stays_bytes_even_if_utf8() {
         // "42" is valid UTF-8, but a BINARY column must remain Bytes.
-        let c = col("id", "binary(2)", "binary");
-        let cell =
-            mysql_identity_cell(&c, &Value::Bytes(b"42".to_vec())).unwrap();
-        assert_eq!(cell, OwnedIdentityCell::Bytes(b"42".to_vec()));
+        let mut c = col("id", "binary(2)", "binary");
+        c.char_octet_length = Some(2);
+        assert_eq!(
+            cell(&c, Value::Bytes(b"42".to_vec())).unwrap(),
+            OwnedIdentityCell::Bytes(b"42".to_vec())
+        );
     }
 
     #[test]
     fn text_column_is_text() {
         let c = col("id", "varchar(8)", "varchar");
-        let cell =
-            mysql_identity_cell(&c, &Value::Bytes(b"42".to_vec())).unwrap();
-        assert_eq!(cell, OwnedIdentityCell::Text("42".into()));
+        assert_eq!(
+            cell(&c, Value::Bytes(b"42".to_vec())).unwrap(),
+            OwnedIdentityCell::Text("42".into())
+        );
     }
 
     #[test]
@@ -326,7 +316,7 @@ mod tests {
     fn null_carries_declared_kind() {
         let c = col("id", "varchar(8)", "varchar");
         assert_eq!(
-            mysql_identity_cell(&c, &Value::NULL).unwrap(),
+            cell(&c, Value::NULL).unwrap(),
             OwnedIdentityCell::Null(IdentityKind::Text)
         );
     }
@@ -334,11 +324,9 @@ mod tests {
     #[test]
     fn decimal_parses_sign_unscaled_scale() {
         let c = col("amt", "decimal(6,2)", "decimal");
-        let cell = mysql_identity_cell(&c, &Value::Bytes(b"-123.45".to_vec()))
-            .unwrap();
         // 12345 in base-256 is [0x30, 0x39].
         assert_eq!(
-            cell,
+            cell(&c, Value::Bytes(b"-123.45".to_vec())).unwrap(),
             OwnedIdentityCell::Decimal {
                 negative: true,
                 unscaled: vec![0x30, 0x39],
@@ -362,11 +350,8 @@ mod tests {
     fn date_is_days_from_epoch() {
         let c = col("d", "date", "date");
         // 1970-01-02 is day 1.
-        let cell =
-            mysql_identity_cell(&c, &Value::Date(1970, 1, 2, 0, 0, 0, 0))
-                .unwrap();
         assert_eq!(
-            cell,
+            cell(&c, Value::Date(1970, 1, 2, 0, 0, 0, 0)).unwrap(),
             OwnedIdentityCell::DateTime {
                 kind: TemporalKind::Date,
                 value: 1,
@@ -375,15 +360,22 @@ mod tests {
     }
 
     #[test]
-    fn datetime_is_micros_from_epoch() {
-        let c = col("ts", "datetime", "datetime");
-        let cell =
-            mysql_identity_cell(&c, &Value::Date(1970, 1, 1, 0, 0, 1, 500_000))
-                .unwrap();
+    fn datetime_and_timestamp_are_micros_from_epoch() {
+        let mut c = col("ts", "datetime(6)", "datetime");
+        c.datetime_precision = Some(6);
         assert_eq!(
-            cell,
+            cell(&c, Value::Date(1970, 1, 1, 0, 0, 1, 500_000)).unwrap(),
             OwnedIdentityCell::DateTime {
                 kind: TemporalKind::Timestamp,
+                value: 1_500_000,
+            }
+        );
+        let mut t = col("ts", "timestamp(6)", "timestamp");
+        t.datetime_precision = Some(6);
+        assert_eq!(
+            cell(&t, Value::Date(1970, 1, 1, 0, 0, 1, 500_000)).unwrap(),
+            OwnedIdentityCell::DateTime {
+                kind: TemporalKind::TimestampTz,
                 value: 1_500_000,
             }
         );
@@ -392,10 +384,9 @@ mod tests {
     #[test]
     fn enum_carries_type_and_label() {
         let c = col("mood", "enum('happy','sad')", "enum");
-        let cell =
-            mysql_identity_cell(&c, &Value::Bytes(b"happy".to_vec())).unwrap();
+        // The snapshot reads the stored index (`mood+0`).
         assert_eq!(
-            cell,
+            cell(&c, Value::Int(1)).unwrap(),
             OwnedIdentityCell::Enum {
                 enum_type: "enum('happy','sad')".into(),
                 label: "happy".into(),

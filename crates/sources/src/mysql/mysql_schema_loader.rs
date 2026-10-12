@@ -41,6 +41,29 @@ pub struct LoadedSchema {
     pub fingerprint: Arc<str>,
     pub sequence: u64,
     pub column_names: Arc<Vec<String>>,
+    /// The value decoder of this schema version (snapshot and CDC).
+    pub decoder: Arc<super::mysql_decode::TableDecoder>,
+}
+
+impl LoadedSchema {
+    /// A loaded schema version with its column names and value decoder.
+    pub fn new(
+        schema: MySqlTableSchema,
+        registry_version: i32,
+        fingerprint: Arc<str>,
+        sequence: u64,
+    ) -> LoadedSchema {
+        LoadedSchema {
+            column_names: Arc::new(
+                schema.columns.iter().map(|c| c.name.clone()).collect(),
+            ),
+            decoder: Arc::new(super::mysql_decode::TableDecoder::new(&schema)),
+            schema,
+            registry_version,
+            fingerprint,
+            sequence,
+        }
+    }
 }
 
 type ArcSchemaCache = Arc<RwLock<ScopedCache<Arc<LoadedSchema>>>>;
@@ -214,15 +237,12 @@ impl MySqlSchemaLoader {
                 )
                 .into(),
             })?;
-        let column_names: Arc<Vec<String>> =
-            Arc::new(schema.columns.iter().map(|c| c.name.clone()).collect());
-        Ok(Some(Arc::new(LoadedSchema {
+        Ok(Some(Arc::new(LoadedSchema::new(
             schema,
-            registry_version: pin.version,
-            fingerprint: pin.fingerprint,
-            sequence: pin.sequence,
-            column_names,
-        })))
+            pin.version,
+            pin.fingerprint,
+            pin.sequence,
+        ))))
     }
 
     /// The error after the lineage kept moving for every attempt.
@@ -336,20 +356,12 @@ impl MySqlSchemaLoader {
                         .into(),
                     })?;
             let fingerprint = schema.fingerprint();
-            let column_names = Arc::new(
-                schema
-                    .columns
-                    .iter()
-                    .map(|c| c.name.clone())
-                    .collect::<Vec<_>>(),
-            );
-            let loaded = Arc::new(LoadedSchema {
+            let loaded = Arc::new(LoadedSchema::new(
                 schema,
-                registry_version: sv.version,
-                fingerprint: fingerprint.into(),
-                sequence: sv.sequence,
-                column_names,
-            });
+                sv.version,
+                fingerprint.into(),
+                sv.sequence,
+            ));
             if !self.cache_insert(&scope, key, loaded).await {
                 return Err(self.scope_changed());
             }
@@ -471,16 +483,13 @@ impl MySqlSchemaLoader {
                 }
             };
             let fingerprint = schema.fingerprint();
-            let column_names: Arc<Vec<String>> = Arc::new(
-                schema.columns.iter().map(|c| c.name.clone()).collect(),
-            );
 
             // Register with checkpoint, under the verified lineage.
             let schema_json = serde_json::to_value(&schema)
                 .map_err(|e| SourceError::Other(e.into()))?;
-            let version = self
+            let registered = self
                 .registry
-                .register_with_checkpoint(
+                .register_version(
                     &scope.key(db, table),
                     &fingerprint,
                     &schema_json,
@@ -488,13 +497,13 @@ impl MySqlSchemaLoader {
                 )
                 .await
                 .map_err(RegistryError::Storage)?;
-            let loaded = Arc::new(LoadedSchema {
+            // The version's own sequence, never the registry's current one.
+            let loaded = Arc::new(LoadedSchema::new(
                 schema,
-                registry_version: version,
-                fingerprint: fingerprint.into(),
-                sequence: self.registry.current_sequence(),
-                column_names,
-            });
+                registered.version,
+                fingerprint.into(),
+                registered.sequence,
+            ));
             if !self
                 .cache_insert(&scope, key.clone(), Arc::clone(&loaded))
                 .await
@@ -506,7 +515,7 @@ impl MySqlSchemaLoader {
             if elapsed.as_millis() > 200 {
                 warn!(db = %db, table = %table, ms = elapsed.as_millis(), "slow schema load");
             } else {
-                debug!(db = %db, table = %table, version = version, ms = elapsed.as_millis(), "schema loaded");
+                debug!(db = %db, table = %table, version = registered.version, ms = elapsed.as_millis(), "schema loaded");
             }
             return Ok(loaded);
         }
@@ -708,38 +717,52 @@ impl MySqlSchemaLoader {
         Ok(Arc::clone(&loaded.column_names))
     }
 
-    /// Create a loader with pre-populated cache (for testing only).
-    /// Does not connect to any database.
+    /// Create a loader with pre-populated cache (for testing only): every
+    /// column a utf8mb4 `varchar(255)`. Does not connect to any database.
     #[cfg(test)]
     pub(crate) fn from_static(
         cols: HashMap<(String, String), Arc<Vec<String>>>,
     ) -> Self {
-        // Convert column-only map to Arc<LoadedSchema> map
-        let cache: HashMap<(String, String), Arc<LoadedSchema>> = cols
+        Self::from_static_schemas(
+            cols.into_iter()
+                .map(|(key, col_names)| {
+                    let columns: Vec<MySqlColumn> = col_names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| {
+                            let mut c = MySqlColumn::new(
+                                name,
+                                "varchar(255)",
+                                "varchar",
+                                true,
+                                i as u32 + 1,
+                            );
+                            c.collation_id = Some(255); // utf8mb4_0900_ai_ci
+                            c
+                        })
+                        .collect();
+                    (key, MySqlTableSchema::new(columns))
+                })
+                .collect(),
+        )
+    }
+
+    /// Create a loader with pre-populated table schemas (for testing
+    /// only). Does not connect to any database.
+    #[cfg(test)]
+    pub(crate) fn from_static_schemas(
+        schemas: HashMap<(String, String), MySqlTableSchema>,
+    ) -> Self {
+        let cache: HashMap<(String, String), Arc<LoadedSchema>> = schemas
             .into_iter()
-            .map(|((db, table), col_names)| {
-                let columns: Vec<MySqlColumn> = col_names
-                    .iter()
-                    .enumerate()
-                    .map(|(i, name)| {
-                        MySqlColumn::new(
-                            name,
-                            "varchar(255)",
-                            "varchar",
-                            true,
-                            i as u32 + 1,
-                        )
-                    })
-                    .collect();
-                let schema = MySqlTableSchema::new(columns);
+            .map(|((db, table), schema)| {
                 let fingerprint = schema.fingerprint();
-                let loaded = Arc::new(LoadedSchema {
+                let loaded = Arc::new(LoadedSchema::new(
                     schema,
-                    registry_version: 1,
-                    fingerprint: fingerprint.into(),
-                    sequence: 0,
-                    column_names: col_names,
-                });
+                    1,
+                    fingerprint.into(),
+                    0,
+                ));
                 ((db, table), loaded)
             })
             .collect();
@@ -1205,13 +1228,8 @@ mod tests {
             let schema = MySqlTableSchema::new(vec![MySqlColumn::new(
                 column, "int", "int", true, 1,
             )]);
-            Arc::new(LoadedSchema {
-                fingerprint: schema.fingerprint().into(),
-                schema,
-                registry_version: 1,
-                sequence: 0,
-                column_names: Arc::new(vec![column.to_string()]),
-            })
+            let fingerprint = schema.fingerprint().into();
+            Arc::new(LoadedSchema::new(schema, 1, fingerprint, 0))
         }
 
         fn key() -> (String, String) {

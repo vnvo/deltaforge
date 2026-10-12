@@ -607,6 +607,22 @@ pub async fn fetch_registry_lineage(dsn: &str) -> Result<Option<(i64, i64)>> {
     Ok(row.map(|r| (r.get::<_, i64>(0), r.get::<_, i64>(1))))
 }
 
+/// The name of the database `dsn` connects to: `source.db` of the source's
+/// events.
+pub async fn current_database(dsn: &str) -> Result<String> {
+    let (client, conn) = tokio_postgres::connect(dsn, NoTls)
+        .await
+        .context("current_database: connect failed")?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    Ok(client
+        .query_one("SELECT current_database()::text", &[])
+        .await
+        .context("current_database: query failed")?
+        .get(0))
+}
+
 /// Read the server's `wal_level`. Logical replication (all DeltaForge PostgreSQL
 /// CDC) requires `wal_level = logical`; a deployment preflight uses this to catch
 /// a misconfigured server before a pipeline is started.

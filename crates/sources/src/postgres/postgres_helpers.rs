@@ -354,6 +354,16 @@ impl StreamProof {
         };
         crate::stream_probe::after_slot_proof().await;
 
+        // pgoutput renders values with this session's output settings: pin
+        // them (the snapshot pins the same), so a value's text never depends
+        // on the server's or role's defaults.
+        for (name, value) in super::postgres_decode::PINNED_SESSION {
+            client
+                .simple_query(&format!("SET {name} = '{value}'"))
+                .await
+                .map_err(pgwire_error_to_source_error)?;
+        }
+
         client.start().await.map_err(pgwire_error_to_source_error)?;
         started(&self.source_id, &mut client).await?;
         crate::stream_probe::record_stream_opened();
@@ -1149,8 +1159,19 @@ pub(super) async fn ensure_slot_and_publication(
         super::postgres_slot_owner::create_logical_slot(&client, slot)
             .await
             .map_err(|e| {
-                error!(error = %e, slot = %slot, "failed to create replication slot");
-                error!("Ensure user has REPLICATION privilege: ALTER ROLE username REPLICATION;");
+                // The server's message (e.g. every replication slot in use),
+                // not tokio-postgres's bare "db error".
+                let db = e.as_db_error();
+                error!(
+                    error = %db.map(|d| d.to_string()).unwrap_or_else(|| e.to_string()),
+                    slot = %slot,
+                    "failed to create replication slot"
+                );
+                if db.is_some_and(|d| {
+                    *d.code() == tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE
+                }) {
+                    error!("Ensure user has REPLICATION privilege: ALTER ROLE username REPLICATION;");
+                }
                 LoopControl::from_tokio_postgres_error(&e)
             })?;
 

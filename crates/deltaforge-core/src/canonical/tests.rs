@@ -4,7 +4,7 @@ use super::durable::{
     row_from_durable, row_to_durable, value_from_durable, value_to_durable,
 };
 use super::render::{
-    RenderError, RenderOpts, WideIntegers, render_row, render_value,
+    RenderFailure, RenderOpts, WideIntegers, render_row, render_value,
 };
 use super::*;
 
@@ -208,7 +208,7 @@ fn wide_integers_render_as_strings_by_default_in_v2() {
     assert_eq!(r(&big, num), json!(i64::MIN));
     assert_eq!(
         render_value(&ubig, num),
-        Err(RenderError::WideUnsignedNumber)
+        Err(RenderFailure::WideUnsignedNumber)
     );
     let fits = db(DbValue::uint(i64::MAX as u64, IntWidth::W64).unwrap());
     assert_eq!(r(&fits, num), json!(i64::MAX));
@@ -356,7 +356,7 @@ fn unchanged_columns_are_listed_never_rendered() {
     assert_eq!(out.unchanged, ["big"]);
     assert_eq!(
         render_value(&CanonicalValue::Unchanged, v2()),
-        Err(RenderError::Unchanged)
+        Err(RenderFailure::Unchanged)
     );
 }
 
@@ -557,4 +557,78 @@ fn type_mapping_parses_only_known_versions() {
     assert_eq!(TypeMapping::parse("v3"), None);
     assert_eq!(serde_json::to_value(TypeMapping::V1).unwrap(), json!("v1"));
     assert!(serde_json::from_value::<TypeMapping>(json!("v3")).is_err());
+}
+
+// ----- extensions -----------------------------------------------------------
+
+fn ext_row() -> CanonicalRow {
+    CanonicalRow::with_extensions(
+        vec![("id".into(), db(DbValue::int(1, IntWidth::W32).unwrap()))],
+        vec![
+            ("tags".to_string(), Document::new(json!(["a"]))),
+            ("meta".to_string(), Document::new(json!({"b": 2, "a": 1}))),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn extensions_never_take_a_column_name_or_a_conflicting_path() {
+    let mut row = ext_row();
+    assert!(row.set_extension("id", Document::new(json!(1))).is_err());
+    assert!(
+        row.set_extension("meta.a", Document::new(json!(1)))
+            .is_err()
+    );
+    let mut row2 = CanonicalRow::with_extensions(
+        vec![],
+        vec![("a.b".to_string(), Document::new(json!(1)))],
+    )
+    .unwrap();
+    assert!(row2.set_extension("a", Document::new(json!(1))).is_err());
+    // "ab" is not a path under "a".
+    assert!(row2.set_extension("ab", Document::new(json!(1))).is_ok());
+    // Replacing an extension is a modification.
+    assert!(row.set_extension("tags", Document::new(json!([]))).is_ok());
+    assert_eq!(row.extensions()["tags"], Document::new(json!([])));
+}
+
+#[test]
+fn extensions_render_merged_and_round_trip_durably() {
+    let row = ext_row();
+    let out = render_row(&row, v2()).unwrap();
+    assert_eq!(
+        Value::Object(out.values),
+        json!({"id": 1, "tags": ["a"], "meta": {"a": 1, "b": 2}})
+    );
+    let back = row_from_durable(&row_to_durable(&row)).unwrap();
+    assert_eq!(back, row);
+    // Deterministic: canonical text, names in order; no extensions, no part.
+    assert_eq!(
+        row_to_durable(&row)["x"],
+        json!({"meta": "{\"a\":1,\"b\":2}", "tags": "[\"a\"]"})
+    );
+    let plain =
+        CanonicalRow::new(vec![("id".into(), CanonicalValue::Null)]).unwrap();
+    assert!(row_to_durable(&plain).get("x").is_none());
+    assert!(
+        row_from_durable(&json!({"c": [], "x": {}})).is_err(),
+        "one form for no extensions"
+    );
+}
+
+#[test]
+fn an_extension_never_overwrites_an_unchanged_column_in_rendering() {
+    let mut row =
+        CanonicalRow::new(vec![("doc".into(), CanonicalValue::Unchanged)])
+            .unwrap();
+    // set_extension refuses a column name outright...
+    assert!(row.set_extension("doc", Document::new(json!(1))).is_err());
+    // ...and the renderer refuses any collision it meets.
+    let row = CanonicalRow::with_extensions(
+        vec![],
+        vec![("x".to_string(), Document::new(json!(1)))],
+    )
+    .unwrap();
+    assert!(render_row(&row, v2()).is_ok());
 }

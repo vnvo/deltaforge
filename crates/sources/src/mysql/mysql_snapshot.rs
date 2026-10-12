@@ -32,7 +32,7 @@ use deltaforge_core::{
     Event, EventId, Op, SourceInfo, SourceItem, SourcePosition,
 };
 use metrics::counter;
-use mysql_async::{Conn, Opts, Row, Value, prelude::Queryable};
+use mysql_async::{Conn, Opts, Row, prelude::Queryable};
 use tokio::time::timeout;
 
 use super::mysql_identity::mysql_identity_cell;
@@ -414,6 +414,8 @@ pub(crate) struct MyCopyCtx<'a> {
     pub publisher: Arc<GenerationPublisher>,
     pub generation: u64,
     pub lineage: PersistedLineage,
+    /// The type-mapping version stamped on every snapshot event.
+    pub type_mapping: deltaforge_core::TypeMapping,
 }
 
 /// Copy every table of the generation's sealed plan. Each worker reads on
@@ -432,6 +434,7 @@ pub(crate) async fn copy_generation(ctx: MyCopyCtx<'_>) -> Result<()> {
         let (plan, stop) = (Arc::clone(&plan), stop.clone());
         let shape = RowShape {
             version: None,
+            source_id: ctx.source_id.to_string(),
             db: String::new(),
             table: String::new(),
             pipeline: ctx.pipeline.to_string(),
@@ -439,7 +442,8 @@ pub(crate) async fn copy_generation(ctx: MyCopyCtx<'_>) -> Result<()> {
             generation: ctx.generation,
             lineage: ctx.lineage.clone(),
             identity: Vec::new(),
-            schema: None,
+            loaded: None,
+            type_mapping: ctx.type_mapping,
         };
         let (cfg, schema_loader, publisher, source_id) = (
             ctx.cfg.clone(),
@@ -641,6 +645,10 @@ fn catalog_moved(detail: String) -> String {
     )
 }
 
+/// The snapshot workers' value-reading session settings.
+pub(crate) const SNAPSHOT_SESSION: &str =
+    "SET SESSION time_zone = '+00:00', character_set_results = binary";
+
 pub(crate) async fn acquire_locked_anchor(
     dsn: &str,
     expected_uuid: &str,
@@ -691,6 +699,12 @@ pub(crate) async fn acquire_locked_anchor(
             )
             .await
             .context("set repeatable read")?;
+            // Values are read as stored: TIMESTAMP in UTC (no session zone
+            // can move an instant), text as the column's own bytes (decoded
+            // by its character set, like the binlog's).
+            c.query_drop(SNAPSHOT_SESSION)
+                .await
+                .context("pin the snapshot session")?;
             c.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT")
                 .await
                 .context("start consistent snapshot")?;
@@ -790,6 +804,7 @@ struct TableWorker {
 /// from the connection, so rows stream while events are built).
 #[derive(Clone)]
 struct RowShape {
+    source_id: String,
     db: String,
     table: String,
     pipeline: String,
@@ -800,8 +815,11 @@ struct RowShape {
     lineage: PersistedLineage,
     /// Resolved identity column names (identity order).
     identity: Vec<String>,
-    /// Loaded schema, populated in `run` before any scan.
-    schema: Option<super::MySqlTableSchema>,
+    /// Loaded schema version with its decoder, populated in `run` before
+    /// any scan.
+    loaded: Option<Arc<super::mysql_schema_loader::LoadedSchema>>,
+    /// The type-mapping version stamped on every event.
+    type_mapping: deltaforge_core::TypeMapping,
     /// Its registered version (fingerprint, registry sequence), stamped on
     /// every snapshot event.
     version: Option<(String, u64)>,
@@ -822,8 +840,9 @@ impl TableWorker {
             .load_schema(&self.shape.db, &self.shape.table)
             .await
             .with_context(|| format!("load schema for {table_fqn}"))?;
-        // Retain the schema for schema-directed native identity extraction.
-        self.shape.schema = Some(loaded.schema.clone());
+        // Retain the schema version: its decoder reads the rows, and its
+        // columns direct identity extraction.
+        self.shape.loaded = Some(Arc::clone(&loaded));
         self.shape.version =
             Some((loaded.fingerprint.to_string(), loaded.sequence));
 
@@ -919,10 +938,15 @@ impl TableWorker {
             let end = cursor + chunk;
             let rows: Vec<Row> = self
                 .conn
-                .query(format!(
-                    "SELECT * FROM `{}`.`{}` WHERE `{pk_col}` >= {cursor} AND `{pk_col}` < {end}",
-                    self.shape.db, self.shape.table
-                ))
+                .exec(
+                    format!(
+                        "SELECT {} FROM `{}`.`{}` WHERE `{pk_col}` >= ? AND `{pk_col}` < ?",
+                        self.shape.select_list()?,
+                        self.shape.db,
+                        self.shape.table
+                    ),
+                    (cursor, end),
+                )
                 .await
                 .with_context(|| {
                     format!("PK range [{cursor},{end}) for {table_fqn}")
@@ -982,10 +1006,15 @@ impl TableWorker {
             let op = if cb.inclusive { "<=" } else { "<" };
             let rows: Vec<Row> = self
                 .conn
-                .query(format!(
-                    "SELECT * FROM `{}`.`{}` WHERE `{pk_col}` >= {cursor} AND `{pk_col}` {op} {}",
-                    self.shape.db, self.shape.table, cb.upper
-                ))
+                .exec(
+                    format!(
+                        "SELECT {} FROM `{}`.`{}` WHERE `{pk_col}` >= ? AND `{pk_col}` {op} ?",
+                        self.shape.select_list()?,
+                        self.shape.db,
+                        self.shape.table
+                    ),
+                    (cursor, cb.upper),
+                )
                 .await
                 .with_context(|| {
                     format!("PK range [{cursor},{}] for {table_fqn}", cb.upper)
@@ -1016,10 +1045,15 @@ impl TableWorker {
         let chunk = self.cfg.chunk_size.max(1);
         let mut result = self
             .conn
-            .query_iter(format!(
-                "SELECT * FROM `{}`.`{}`",
-                self.shape.db, self.shape.table
-            ))
+            .exec_iter(
+                format!(
+                    "SELECT {} FROM `{}`.`{}`",
+                    self.shape.select_list()?,
+                    self.shape.db,
+                    self.shape.table
+                ),
+                (),
+            )
             .await
             .with_context(|| format!("full scan of {table_fqn}"))?;
         let mut n = 0u64;
@@ -1055,41 +1089,61 @@ impl TableWorker {
 }
 
 impl RowShape {
-    /// Build snapshot events for a scanned chunk's rows.
+    fn loaded(&self) -> Result<&super::mysql_schema_loader::LoadedSchema> {
+        self.loaded
+            .as_deref()
+            .ok_or_else(|| anyhow!("schema not loaded before scan"))
+    }
+
+    /// The scan's select list: every column of the decoding schema in
+    /// order (ENUM and SET as their stored number).
+    fn select_list(&self) -> Result<String> {
+        Ok(self.loaded()?.decoder.snapshot_select_list())
+    }
+
+    /// Build snapshot events for a scanned chunk's rows, each decoded by the
+    /// schema version's decoder (the one CDC uses).
     fn rows_to_events(&self, rows: Vec<Row>) -> Result<Vec<Event>> {
+        let loaded = self.loaded()?;
         let mut events = Vec::with_capacity(rows.len());
         for row in rows {
-            // Derive identity from NATIVE values before the lossy JSON
-            // conversion, then build the event.
-            let id = self.provisional_id(&row)?;
-            let json = row_to_json(row)?;
-            events.push(self.make_event(json, id));
+            let after = loaded
+                .decoder
+                .decode_snapshot_row(&row.unwrap())
+                .map_err(|e| {
+                    anyhow::Error::new(
+                        crate::incident_drafts::source_decode_failed(
+                            &self.source_id,
+                            &fqn(&self.db, &self.table),
+                            &e.column,
+                            &e.column_type,
+                            &e.reason,
+                        ),
+                    )
+                })?;
+            let id = self.provisional_id(&loaded.schema, &after)?;
+            events.push(self.make_event(after, id));
         }
         Ok(events)
     }
 
-    /// Compute the provisional snapshot [`EventId`] from the row's **native**
+    /// Compute the provisional snapshot [`EventId`] from the row's decoded
     /// identity values (schema-directed) and the allocated generation.
-    fn provisional_id(&self, row: &Row) -> Result<EventId> {
-        let schema = self
-            .schema
-            .as_ref()
-            .ok_or_else(|| anyhow!("schema not loaded before scan"))?;
+    fn provisional_id(
+        &self,
+        schema: &super::MySqlTableSchema,
+        row: &deltaforge_core::CanonicalRow,
+    ) -> Result<EventId> {
         let mut values: Vec<OwnedIdentityValue> =
             Vec::with_capacity(self.identity.len());
         for name in &self.identity {
             let col = schema
                 .column(name)
                 .ok_or_else(|| anyhow!("identity column {name:?} missing"))?;
-            let idx = row
-                .columns_ref()
-                .iter()
-                .position(|c| c.name_str() == name.as_str())
-                .ok_or_else(|| {
-                    anyhow!("identity column {name:?} not present in row")
-                })?;
-            let val = row.as_ref(idx).cloned().unwrap_or(Value::NULL);
-            let cell = mysql_identity_cell(col, &val)
+            let val = row.get(name).ok_or_else(|| {
+                anyhow!("identity column {name:?} not present in row")
+            })?;
+            let cell = mysql_identity_cell(col, val)
                 .map_err(|e| anyhow!("{name}: {e}"))?;
             values.push(OwnedIdentityValue {
                 name: name.clone(),
@@ -1105,8 +1159,12 @@ impl RowShape {
         ))
     }
 
-    fn make_event(&self, after: serde_json::Value, event_id: EventId) -> Event {
-        let size = after.to_string().len();
+    fn make_event(
+        &self,
+        after: deltaforge_core::CanonicalRow,
+        event_id: EventId,
+    ) -> Event {
+        let size = after.approx_size();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1132,6 +1190,7 @@ impl RowShape {
             Op::Read,
             None,
             Some(after),
+            self.type_mapping,
             now,
             size,
         );
@@ -1222,66 +1281,6 @@ fn unsigned_chunk_bounds(cursor: u64, chunk: u64, max: u64) -> UnsignedChunk {
             next: max,
         },
     }
-}
-
-fn row_to_json(mut row: Row) -> Result<serde_json::Value> {
-    let columns = row.columns_ref().to_vec();
-    let mut map = serde_json::Map::with_capacity(columns.len());
-    for (i, col) in columns.iter().enumerate() {
-        let name = col.name_str().into_owned();
-        let val: Value = row.take(i).unwrap_or(Value::NULL);
-        map.insert(name, value_to_json(val));
-    }
-    Ok(serde_json::Value::Object(map))
-}
-
-fn value_to_json(val: Value) -> serde_json::Value {
-    match val {
-        Value::NULL => serde_json::Value::Null,
-        Value::Int(n) => serde_json::json!(n),
-        Value::UInt(n) => serde_json::json!(n),
-        Value::Float(f) => serde_json::json!(f),
-        Value::Double(d) => serde_json::json!(d),
-        Value::Bytes(b) => match String::from_utf8(b.clone()) {
-            Ok(s) => serde_json::Value::String(s),
-            Err(_) => serde_json::json!({ "_base64": base64_encode(&b) }),
-        },
-        Value::Date(y, mo, d, h, min, s, us) => serde_json::Value::String(
-            format!("{y:04}-{mo:02}-{d:02}T{h:02}:{min:02}:{s:02}.{us:06}"),
-        ),
-        Value::Time(neg, days, h, min, s, us) => {
-            let sign = if neg { "-" } else { "" };
-            let total_h = days as u64 * 24 + h as u64;
-            serde_json::Value::String(format!(
-                "{sign}{total_h:02}:{min:02}:{s:02}.{us:06}"
-            ))
-        }
-    }
-}
-
-fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHA: &[u8] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
-        out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHA[((n >> 6) & 0x3f) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHA[(n & 0x3f) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 #[cfg(test)]

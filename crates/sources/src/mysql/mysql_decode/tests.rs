@@ -208,7 +208,7 @@ fn enum_and_set_decode_from_the_stored_number() {
     assert!(
         TableDecoder { columns: vec![d] }
             .snapshot_select_list()
-            .contains("`c`+0 AS `c`")
+            .contains("CAST(`c` AS UNSIGNED) AS `c`")
     );
 }
 
@@ -384,7 +384,10 @@ fn rows_decode_by_ordinal_with_the_image_bitmap() {
         Some(&CanonicalValue::Db(DbValue::int(7, IntWidth::W32).unwrap()))
     );
     assert!(t.decode_binlog_row(&[true, true, true, true], &[]).is_err());
-    assert_eq!(t.snapshot_select_list(), "`id`, `e`+0 AS `e`, `n`");
+    assert_eq!(
+        t.snapshot_select_list(),
+        "`id`, CAST(`e` AS UNSIGNED) AS `e`, `n`"
+    );
     let snap_row = t
         .decode_snapshot_row(&[Snap::Int(7), Snap::Int(2), Snap::NULL])
         .unwrap();

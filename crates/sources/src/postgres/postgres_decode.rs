@@ -85,6 +85,11 @@ fn time_precision(typmod: i32) -> Precision {
     }
 }
 
+/// The OID of the builtin type named `name`.
+pub fn builtin_type_oid(name: &str) -> Option<u32> {
+    builtin_oid(name)
+}
+
 fn builtin_oid(name: &str) -> Option<u32> {
     BUILTIN_TYPES
         .iter()
@@ -465,6 +470,8 @@ impl ArrayParser<'_> {
 pub struct PgColumnDecoder {
     pub name: String,
     pub kind: PgKind,
+    /// Part of the relation's replica identity key.
+    pub key: bool,
 }
 
 impl PgColumnDecoder {
@@ -477,7 +484,13 @@ impl PgColumnDecoder {
         PgColumnDecoder {
             name: name.to_string(),
             kind: PgKind::of(oid, typmod, type_name),
+            key: false,
         }
+    }
+
+    pub fn with_key(mut self, key: bool) -> Self {
+        self.key = key;
+        self
     }
 
     pub fn type_name(&self) -> String {
@@ -519,10 +532,13 @@ pub enum TupleValue<'a> {
 }
 
 /// Which row image a tuple is: only an update's new image may hold
-/// unchanged TOAST values.
+/// unchanged TOAST values, and a key-only old image (`K`) holds only the
+/// key columns (PostgreSQL sends no value for the others, so they are not
+/// in the image rather than NULL).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Image {
     UpdateAfter,
+    KeyOnly,
     Other,
 }
 
@@ -552,6 +568,14 @@ impl PgRowDecoder {
         }
         let mut out = Vec::with_capacity(values.len());
         for (col, v) in self.columns.iter().zip(values) {
+            if image == Image::KeyOnly && !col.key {
+                if *v != TupleValue::Null {
+                    return Err(
+                        col.fail("a value outside the key in a key-only image")
+                    );
+                }
+                continue;
+            }
             let value = match v {
                 TupleValue::Null => CanonicalValue::Null,
                 TupleValue::Unchanged if image == Image::UpdateAfter => {

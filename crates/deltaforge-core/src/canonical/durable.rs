@@ -172,13 +172,32 @@ fn db_to_durable(v: &DbValue) -> Value {
     }
 }
 
-/// A row's durable form: `[[name, value], ...]` in column order.
+/// A row's durable form: `{"c": [[name, value], ...]}` in column order,
+/// with `"x": {name: canonical JSON text}` when it has extensions.
 pub fn row_to_durable(row: &CanonicalRow) -> Value {
-    Value::Array(
-        row.iter()
-            .map(|(n, v)| json!([n, value_to_durable(v)]))
-            .collect(),
-    )
+    let mut m = Map::new();
+    m.insert(
+        "c".into(),
+        Value::Array(
+            row.iter()
+                .map(|(n, v)| json!([n, value_to_durable(v)]))
+                .collect(),
+        ),
+    );
+    if !row.extensions().is_empty() {
+        m.insert(
+            "x".into(),
+            Value::Object(
+                row.extensions()
+                    .iter()
+                    .map(|(n, d)| {
+                        (n.clone(), Value::String(d.canonical_text()))
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    Value::Object(m)
 }
 
 // ---------------------------------------------------------------------------
@@ -419,8 +438,14 @@ pub fn value_from_durable(v: &Value) -> Result<CanonicalValue, DurableError> {
 
 /// Read a row's durable form.
 pub fn row_from_durable(v: &Value) -> Result<CanonicalRow, DurableError> {
-    let Some(pairs) = v.as_array() else {
-        return bad("a row is not a list");
+    let Some(m) = v.as_object() else {
+        return bad("a row is not an object");
+    };
+    if m.keys().any(|k| k != "c" && k != "x") {
+        return bad("a row has an unknown part");
+    }
+    let Some(pairs) = m.get("c").and_then(Value::as_array) else {
+        return bad("a row without its columns");
     };
     let mut columns = Vec::with_capacity(pairs.len());
     for pair in pairs {
@@ -431,7 +456,22 @@ pub fn row_from_durable(v: &Value) -> Result<CanonicalRow, DurableError> {
             _ => return bad("a row entry is not [name, value]"),
         }
     }
-    Ok(CanonicalRow::new(columns)?)
+    let mut extensions = Vec::new();
+    match m.get("x") {
+        None => {}
+        Some(Value::Object(x)) if !x.is_empty() => {
+            for (name, text) in x {
+                let Some(text) = text.as_str() else {
+                    return bad("an extension is not JSON text");
+                };
+                let doc: Value = serde_json::from_str(text)
+                    .or_else(|_| bad("an extension is not JSON text"))?;
+                extensions.push((name.clone(), Document::new(doc)));
+            }
+        }
+        Some(_) => return bad("a row's extensions are not a non-empty object"),
+    }
+    Ok(CanonicalRow::with_extensions(columns, extensions)?)
 }
 
 // ---------------------------------------------------------------------------
