@@ -42,14 +42,11 @@ use common::{RetryOutcome, RetryPolicy, retry_async};
 use deltaforge_config::EncodingCfg;
 use deltaforge_config::NatsSinkCfg;
 use deltaforge_core::encoding::EncodingType;
-use deltaforge_core::encoding::avro::{
-    AvroEncoder, SchemaIdentity, SourceSchemaProvider,
-};
+use deltaforge_core::encoding::avro::{AvroEncoder, SourceSchemaProvider};
 use deltaforge_core::envelope::Envelope;
 use deltaforge_core::{BatchResult, Event, Sink, SinkError, SinkResult};
 use futures::future::try_join_all;
 use metrics::counter;
-use serde_json::Value;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
@@ -93,6 +90,8 @@ pub struct NatsSink {
 
     /// Envelope for wrapping events (Native, Debezium, CloudEvents)
     envelope: Box<dyn Envelope>,
+    /// Native-JSON rendering settings (`json_wide_integers`).
+    json_opts: deltaforge_core::NativeOpts,
     /// Encoding type (currently just JSON)
     #[allow(dead_code)]
     encoding: EncodingType,
@@ -231,6 +230,9 @@ impl NatsSink {
             subject_template,
             key_template,
             envelope: envelope_type.build(),
+            json_opts: deltaforge_core::NativeOpts {
+                wide_integers: cfg.json_wide_integers,
+            },
             encoding: encoding_type,
             avro_encoder,
             client: RwLock::new(None),
@@ -254,11 +256,7 @@ impl NatsSink {
         if self.subject_template.is_static() {
             return Ok(self.subject.clone());
         }
-        let event_json = serde_json::to_value(event).map_err(|e| {
-            SinkError::Serialization {
-                details: e.to_string().into(),
-            }
-        })?;
+        let event_json = crate::payload::route_view(event);
         let resolved = self
             .subject_template
             .resolve_strict(&event_json)
@@ -298,7 +296,8 @@ impl NatsSink {
             return Some(k.to_string());
         }
         if let Some(ref tmpl) = self.key_template {
-            if let Ok(event_json) = serde_json::to_value(event) {
+            {
+                let event_json = crate::payload::route_view(event);
                 let resolved = tmpl.resolve_lenient(&event_json);
                 if !resolved.is_empty() {
                     return Some(resolved);
@@ -337,23 +336,18 @@ impl NatsSink {
     fn serialize_event(&self, event: &Event) -> SinkResult<Vec<u8>> {
         if event.routing.as_ref().is_some_and(|r| r.raw_payload) {
             // Outbox raw mode: write event.after directly
-            return serde_json::to_vec(
-                event.after.as_ref().unwrap_or(&Value::Null),
-            )
-            .map_err(Into::into);
+            return crate::payload::raw_payload(
+                event,
+                self.json_opts,
+                &self.id,
+            );
         }
-        let envelope = self.envelope.wrap(event).map_err(|e| {
-            SinkError::Serialization {
-                details: e.to_string().into(),
-            }
-        })?;
-
-        self.encoding
-            .encode(&envelope)
-            .map(|b| b.to_vec())
-            .map_err(|e| SinkError::Serialization {
-                details: e.to_string().into(),
-            })
+        crate::payload::native_json(
+            self.envelope.as_ref(),
+            event,
+            self.json_opts,
+            &self.id,
+        )
     }
 
     /// Serialize event using Avro encoding (async — requires Schema Registry).
@@ -368,10 +362,11 @@ impl NatsSink {
             .expect("avro_encoder must be set");
 
         if event.routing.as_ref().is_some_and(|r| r.raw_payload) {
-            return serde_json::to_vec(
-                event.after.as_ref().unwrap_or(&Value::Null),
-            )
-            .map_err(Into::into);
+            return crate::payload::raw_payload(
+                event,
+                self.json_opts,
+                &self.id,
+            );
         }
 
         // A DDL event is its own record under the topic's DDL subject,
@@ -384,25 +379,14 @@ impl NatsSink {
             return Ok(bytes.to_vec());
         }
 
-        let envelope = self.envelope.wrap(event).map_err(|e| {
-            SinkError::Serialization {
-                details: e.to_string().into(),
-            }
-        })?;
+        let envelope =
+            self.envelope.wrap(event, self.json_opts).map_err(|e| {
+                deltaforge_core::encoding::EncodingError::from(e)
+                    .into_sink_error_for(&self.id)
+            })?;
 
         let bytes = encoder
-            .encode_event(
-                dest,
-                &envelope,
-                &event.source.connector,
-                &event.source.db,
-                &event.source.table,
-                SchemaIdentity::of(
-                    event.schema_version.as_deref(),
-                    event.schema_sequence,
-                )
-                .as_ref(),
-            )
+            .encode_event(dest, event, &envelope)
             .await
             .map_err(|e| e.into_sink_error_for(&self.id))?;
 

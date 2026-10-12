@@ -6,7 +6,7 @@
 use serde::Serialize;
 
 use super::{Envelope, EnvelopeData, EnvelopeError};
-use crate::Event;
+use crate::{Event, NativeOpts, NativePayload};
 
 /// Debezium envelope - wraps Event in `{"payload": <event>}`.
 ///
@@ -29,7 +29,7 @@ pub struct Debezium;
 #[derive(Serialize)]
 pub struct DebeziumWrapper<'a> {
     schema: serde_json::Value,
-    payload: &'a Event,
+    payload: NativePayload<'a>,
 }
 
 impl Envelope for Debezium {
@@ -41,10 +41,11 @@ impl Envelope for Debezium {
     fn wrap<'a>(
         &'a self,
         event: &'a Event,
+        opts: NativeOpts,
     ) -> Result<EnvelopeData<'a>, EnvelopeError> {
         let wrapper = DebeziumWrapper {
             schema: serde_json::Value::Null,
-            payload: event,
+            payload: event.native(opts)?,
         };
         Ok(EnvelopeData::Debezium(wrapper))
     }
@@ -73,13 +74,14 @@ mod tests {
             },
             Op::Create,
             None,
-            Some(json!({"id": 1})),
+            Some(crate::canonical::fixture::row(json!({"id": 1}))),
+            crate::TypeMapping::V2,
             1000,
             64,
         );
 
         let envelope = Debezium;
-        let data = envelope.wrap(&event).unwrap();
+        let data = envelope.wrap(&event, crate::NativeOpts::default()).unwrap();
         let json = serde_json::to_value(&data).unwrap();
 
         // Verify wrapper structure

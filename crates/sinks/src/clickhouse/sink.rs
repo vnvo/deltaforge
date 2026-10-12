@@ -11,7 +11,9 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use deltaforge_config::{ChMode, ChVersionSource, ClickHouseSinkCfg};
-use deltaforge_core::{BatchResult, Event, Sink, SinkError, SinkResult};
+use deltaforge_core::{
+    BatchResult, Event, Sink, SinkError, SinkResult, SourceRelationIdentity,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -31,23 +33,23 @@ pub struct ClickHouseSink {
     mode: ChMode,
     version_source: ChVersionSource,
     auto_create: bool,
+    extensions_column: String,
     transport: Arc<dyn ChTransport>,
     resolver: Option<ClickHouseSchemaResolver>,
-    projections: RwLock<HashMap<String, Arc<TableProjection>>>,
+    projections: RwLock<HashMap<SourceRelationIdentity, Arc<TableProjection>>>,
+    /// The target table holds one source relation, durably bound.
+    guard: crate::destination::DestinationGuard,
+    /// The server's UUID (read once per session): part of the destination
+    /// name, so the same table name on two servers is two destinations.
+    server: tokio::sync::OnceCell<String>,
     table_ensured: AtomicBool,
 }
 
 impl ClickHouseSink {
-    /// Source table key: `"{namespace}.{table}"` where namespace is the PG schema
-    /// (if present) else the db — the same qualification the schema registry uses.
+    /// Source table key: `namespace.table`, the qualification the schema
+    /// registry uses (see `SourceInfo::namespace`).
     fn source_key(ev: &Event) -> String {
-        let ns = ev
-            .source
-            .schema
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&ev.source.db);
-        format!("{ns}.{}", ev.source.table)
+        ev.source.full_table_name()
     }
 
     /// Resolve (and cache) the projection for an event's source table, ensuring
@@ -56,10 +58,56 @@ impl ClickHouseSink {
         &self,
         ev: &Event,
     ) -> Result<Arc<TableProjection>, SinkError> {
+        let relation = SourceRelationIdentity::of(&ev.source);
+        let cached = self.projections.read().unwrap().get(&relation).cloned();
+        let proj = match cached {
+            Some(p) => p,
+            None => self.build_projection(ev, &relation).await?,
+        };
+        // The target table holds one source relation, durably bound.
+        self.verify_destination(&relation).await?;
+        Ok(proj)
+    }
+
+    /// The table's durable binding admits `relation` (verified once per
+    /// session, before anything is written).
+    async fn verify_destination(
+        &self,
+        relation: &SourceRelationIdentity,
+    ) -> Result<(), SinkError> {
+        let server = self
+            .server
+            .get_or_try_init(|| async {
+                let text =
+                    self.transport.query_text("SELECT serverUUID()").await?;
+                let uuid = text.trim().to_string();
+                if uuid.is_empty() {
+                    return Err(SinkError::Io(std::io::Error::other(
+                        "clickhouse: the server reports no serverUUID()",
+                    )));
+                }
+                Ok(uuid)
+            })
+            .await?;
+        let destination =
+            format!("clickhouse/{server}/{}.{}", self.database, self.table);
+        let transport = Arc::clone(&self.transport);
+        let (database, table) = (self.database.clone(), self.table.clone());
+        self.guard
+            .verify(&destination, relation, || async move {
+                table_state(transport.as_ref(), &database, &table).await
+            })
+            .await
+    }
+
+    /// Resolve the projection of `relation` (ensuring the target table
+    /// exists on first use) and cache it.
+    async fn build_projection(
+        &self,
+        ev: &Event,
+        relation: &SourceRelationIdentity,
+    ) -> Result<Arc<TableProjection>, SinkError> {
         let key = Self::source_key(ev);
-        if let Some(p) = self.projections.read().unwrap().get(&key) {
-            return Ok(p.clone());
-        }
 
         let resolver = self.resolver.as_ref().ok_or_else(|| SinkError::Other(
             anyhow::anyhow!("clickhouse sink has no schema resolver (source schema unavailable)"),
@@ -73,6 +121,22 @@ impl ClickHouseSink {
                 ))
             })?;
 
+        // A source column named like a meta or the extension column would
+        // collide in the target table: refused before any row is delivered.
+        if let Some(c) = resolved.columns.iter().find(|c| {
+            c.name == self.extensions_column
+                || super::project::META_COLUMNS.contains(&c.name.as_str())
+        }) {
+            return Err(SinkError::Fatal {
+                details: format!(
+                    "clickhouse sink {}: source table '{key}' has a column \
+                     `{}`, which collides with the sink's meta or extension \
+                     column (configure `extensions_column`)",
+                    self.id, c.name
+                )
+                .into(),
+            });
+        }
         let typed: Vec<_> = resolved
             .columns
             .iter()
@@ -87,6 +151,7 @@ impl ClickHouseSink {
                 &typed,
                 &resolved.primary_key,
                 self.mode.clone(),
+                &self.extensions_column,
             );
             self.transport.execute_ddl(&ddl).await?;
             self.table_ensured.store(true, Ordering::Release);
@@ -95,10 +160,53 @@ impl ClickHouseSink {
         let proj = Arc::new(TableProjection {
             columns: typed,
             version_source: self.version_source.clone(),
+            extensions_column: self.extensions_column.clone(),
         });
-        self.projections.write().unwrap().insert(key, proj.clone());
+        self.projections
+            .write()
+            .unwrap()
+            .insert(relation.clone(), proj.clone());
         Ok(proj)
     }
+}
+
+/// A ClickHouse string literal.
+fn literal(s: &str) -> String {
+    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// The table's own identity (its UUID) and whether it holds rows.
+async fn table_state(
+    transport: &dyn ChTransport,
+    database: &str,
+    table: &str,
+) -> Result<crate::destination::TargetState, SinkError> {
+    let uid = transport
+        .query_text(&format!(
+            "SELECT toString(uuid) FROM system.tables WHERE database = {} \
+             AND name = {} FORMAT TabSeparated",
+            literal(database),
+            literal(table)
+        ))
+        .await?
+        .trim()
+        .to_string();
+    if uid.is_empty() {
+        return Err(SinkError::Io(std::io::Error::other(format!(
+            "clickhouse: table {database}.{table} does not exist"
+        ))));
+    }
+    let rows = transport
+        .query_text(&format!(
+            "SELECT count() > 0 FROM `{}`.`{}` FORMAT TabSeparated",
+            database.replace('`', "``"),
+            table.replace('`', "``")
+        ))
+        .await?;
+    Ok(crate::destination::TargetState {
+        uid,
+        has_rows: rows.trim() != "0",
+    })
 }
 
 #[async_trait]
@@ -140,9 +248,15 @@ impl Sink for ClickHouseSink {
         let mut first_version: Option<u64> = None;
         let mut rows: u64 = 0;
 
+        // Preflight: every source table's projection (and its collision
+        // checks) before any row of the batch is encoded or delivered.
+        let mut projections = Vec::with_capacity(events.len());
+        for ev in events {
+            projections.push(self.projection_for(ev).await?);
+        }
         for (i, ev) in events.iter().enumerate() {
-            let proj = self.projection_for(ev).await?;
-            match project_row(&proj, ev) {
+            let proj = &projections[i];
+            match project_row(proj, ev) {
                 Ok(bytes) => {
                     first_version.get_or_insert_with(|| {
                         derive_version(ev, self.version_source.clone())
@@ -196,6 +310,7 @@ pub fn build_clickhouse_sink(
     _cancel: CancellationToken,
     pipeline: &str,
     resolver: Option<ClickHouseSchemaResolver>,
+    bindings: Arc<dyn deltaforge_core::destination::DestinationBindingStore>,
     creds: &crate::ResolvedSinkCreds,
 ) -> anyhow::Result<ClickHouseSink> {
     // Effective credential: a resolved reference (protected runtime value) wins; otherwise
@@ -231,9 +346,12 @@ pub fn build_clickhouse_sink(
         mode: cfg.mode.clone(),
         version_source: cfg.version_source.clone(),
         auto_create: cfg.auto_create,
+        extensions_column: cfg.extensions_column.clone(),
         transport: Arc::new(client),
         resolver,
         projections: RwLock::new(HashMap::new()),
+        guard: crate::destination::DestinationGuard::new(&cfg.id, bindings),
+        server: Default::default(),
         table_ensured: AtomicBool::new(false),
     })
 }
@@ -243,7 +361,8 @@ mod tests {
     use super::*;
     use crate::clickhouse::TableColumns;
     use crate::clickhouse::types::ColDesc;
-    use deltaforge_core::{Op, SourceInfo, SourcePosition};
+    use deltaforge_core::canonical::fixture;
+    use deltaforge_core::{Op, SourceInfo, SourcePosition, TypeMapping};
     use serde_json::{Value, json};
     use std::sync::Mutex;
 
@@ -271,6 +390,18 @@ mod tests {
             self.cap.ddls.lock().unwrap().push(sql.to_string());
             Ok(())
         }
+        /// One server; the table's UUID; rows after any insert.
+        async fn query_text(&self, sql: &str) -> Result<String, SinkError> {
+            Ok(if sql.contains("serverUUID") {
+                "srv\n".into()
+            } else if sql.contains("system.tables") {
+                "tbl-uuid\n".into()
+            } else if self.cap.inserts.lock().unwrap().is_empty() {
+                "0\n".into()
+            } else {
+                "1\n".into()
+            })
+        }
     }
 
     fn id_col() -> ColDesc {
@@ -286,9 +417,28 @@ mod tests {
     }
 
     fn sink_with(cap: Arc<Captured>) -> ClickHouseSink {
-        let resolver: ClickHouseSchemaResolver = Arc::new(|_key: &str| {
+        sink_with_columns(cap, vec![id_col()])
+    }
+
+    fn sink_with_columns(
+        cap: Arc<Captured>,
+        columns: Vec<ColDesc>,
+    ) -> ClickHouseSink {
+        sink_over(
+            cap,
+            columns,
+            Arc::new(deltaforge_core::destination::MemoryDestinationBindings::default()),
+        )
+    }
+
+    fn sink_over(
+        cap: Arc<Captured>,
+        columns: Vec<ColDesc>,
+        store: Arc<dyn deltaforge_core::destination::DestinationBindingStore>,
+    ) -> ClickHouseSink {
+        let resolver: ClickHouseSchemaResolver = Arc::new(move |_key: &str| {
             Ok(Some(TableColumns {
-                columns: vec![id_col()],
+                columns: columns.clone(),
                 primary_key: vec!["id".into()],
             }))
         });
@@ -301,9 +451,12 @@ mod tests {
             mode: ChMode::Upsert,
             version_source: ChVersionSource::TsMs,
             auto_create: true,
+            extensions_column: "_extensions".into(),
             transport: Arc::new(FakeTransport { cap }),
             resolver: Some(resolver),
             projections: RwLock::new(HashMap::new()),
+            guard: crate::destination::DestinationGuard::new("c", store),
+            server: Default::default(),
             table_ensured: AtomicBool::new(false),
         }
     }
@@ -311,7 +464,7 @@ mod tests {
     fn ev(after: Value) -> Event {
         Event {
             before: None,
-            after: Some(after),
+            after: Some(fixture::row(after)),
             source: SourceInfo {
                 version: "1".into(),
                 connector: "mysql".into(),
@@ -326,6 +479,7 @@ mod tests {
             op: Op::Create,
             ts_ms: 5,
             transaction: None,
+            type_mapping: TypeMapping::V2,
             event_id: None,
             tenant_id: None,
             schema_version: None,
@@ -341,6 +495,38 @@ mod tests {
 
             received_at_ms: 0,
         }
+    }
+
+    /// A second relation into the bound table is refused before any insert,
+    /// also when a restart sees it first; the bound one still writes.
+    #[tokio::test]
+    async fn the_target_table_holds_one_relation_across_restarts() {
+        let store: Arc<
+            dyn deltaforge_core::destination::DestinationBindingStore,
+        > = Arc::new(
+            deltaforge_core::destination::MemoryDestinationBindings::default(),
+        );
+        let of = |db: &str| {
+            let mut e = ev(json!({"id": 1}));
+            e.source.db = db.into();
+            e
+        };
+        let cap = Arc::new(Captured::default());
+        let sink = sink_over(cap.clone(), vec![id_col()], Arc::clone(&store));
+        sink.send_batch(&[of("d1")]).await.unwrap();
+
+        let cap2 = Arc::new(Captured::default());
+        let restarted =
+            sink_over(cap2.clone(), vec![id_col()], Arc::clone(&store));
+        let e = restarted.send_batch(&[of("d2")]).await.unwrap_err();
+        assert_eq!(
+            e.draft().map(|d| d.reason_code),
+            Some(
+                deltaforge_core::incident::ReasonCode::SinkDestinationConflict
+            )
+        );
+        assert!(cap2.inserts.lock().unwrap().is_empty(), "nothing inserted");
+        restarted.send_batch(&[of("d1")]).await.unwrap();
     }
 
     #[tokio::test]
@@ -364,5 +550,75 @@ mod tests {
             "auto-created the table once"
         );
         assert!(cap.ddls.lock().unwrap()[0].contains("ReplacingMergeTree"));
+    }
+
+    #[tokio::test]
+    async fn extension_column_collision_is_refused_before_any_insert() {
+        let cap = Arc::new(Captured::default());
+        let mut clash = id_col();
+        clash.name = "_extensions".into();
+        clash.data_type = "varchar".into();
+        clash.full_type = "varchar(10)".into();
+        let sink = sink_with_columns(cap.clone(), vec![id_col(), clash]);
+
+        let err = sink
+            .send_batch(&[ev(json!({"id": 1, "_extensions": "x"}))])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SinkError::Fatal { .. }), "got: {err:?}");
+        assert!(err.to_string().contains("_extensions"), "got: {err}");
+        assert!(cap.inserts.lock().unwrap().is_empty(), "nothing inserted");
+        assert!(cap.ddls.lock().unwrap().is_empty(), "no table created");
+    }
+
+    #[tokio::test]
+    async fn meta_column_collision_is_refused_before_any_insert() {
+        let cap = Arc::new(Captured::default());
+        let mut clash = id_col();
+        clash.name = "_version".into();
+        let sink = sink_with_columns(cap.clone(), vec![id_col(), clash]);
+
+        let err = sink
+            .send_batch(&[ev(json!({"id": 1, "_version": 2}))])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SinkError::Fatal { .. }), "got: {err:?}");
+        assert!(cap.inserts.lock().unwrap().is_empty(), "nothing inserted");
+    }
+
+    #[tokio::test]
+    async fn inserted_row_ends_with_the_extension_column() {
+        let cap = Arc::new(Captured::default());
+        let sink = sink_with(cap.clone());
+        let mut e = ev(json!({"id": 1}));
+        e.after
+            .as_mut()
+            .unwrap()
+            .set_extension(
+                "enriched",
+                deltaforge_core::canonical::Document::new(json!({"k": [1, 2]})),
+            )
+            .unwrap();
+        let res = sink.send_batch(&[e, ev(json!({"id": 2}))]).await.unwrap();
+        assert!(res.dlq_failures.is_empty());
+        let inserts = cap.inserts.lock().unwrap();
+        assert_eq!(inserts.len(), 1);
+        let body = &inserts[0];
+        // Row 1: id(8) _op(2) _version(8) _deleted(1) _source_ts(8), then
+        // Nullable(String) = 0, varuint len, canonical JSON.
+        let ext = br#"{"enriched":{"k":[1,2]}}"#;
+        let mut row1 = Vec::new();
+        row1.extend_from_slice(&1i64.to_le_bytes());
+        row1.extend_from_slice(&[1, b'c']);
+        row1.extend_from_slice(&5u64.to_le_bytes());
+        row1.push(0);
+        row1.extend_from_slice(&5i64.to_le_bytes());
+        row1.push(0);
+        row1.push(ext.len() as u8);
+        row1.extend_from_slice(ext);
+        assert_eq!(&body[..row1.len()], &row1[..]);
+        // Row 2 has no extensions: the column is NULL (one byte 1).
+        assert_eq!(body.len(), row1.len() + 27 + 1);
+        assert_eq!(*body.last().unwrap(), 1);
     }
 }

@@ -174,10 +174,26 @@ impl DurableS3Sink {
     ) -> SinkResult<TableObject> {
         let owned: Vec<Event> = events.iter().map(|e| (*e).clone()).collect();
         let compression = compression_label(self.inner.compression);
+        // One object holds one mapping version (the sink groups a batch's
+        // events by table and mapping version); the version is part of the
+        // encoding domain, so objects of different versions never share a
+        // domain, compaction or content identity.
+        let mapping = first.type_mapping;
+        if let Some(other) = owned.iter().find(|e| e.type_mapping != mapping) {
+            return Err(fatal(format!(
+                "{table}: one object would hold type_mapping {} and {} events",
+                mapping.as_str(),
+                other.type_mapping.as_str()
+            )));
+        }
         match self.inner.format {
             DurableFormat::Jsonl => {
                 let bytes = encode_jsonl(&owned).map_err(|e| {
-                    fatal(format!("jsonl encode for {table}: {e}"))
+                    encode_error(
+                        &self.inner.id,
+                        format!("jsonl encode for {table}"),
+                        e,
+                    )
                 })?;
                 Ok(TableObject {
                     table: table.to_string(),
@@ -185,7 +201,7 @@ impl DurableS3Sink {
                     domain: EncodingDomain::new(
                         "jsonl",
                         JSONL_ENCODER_VERSION,
-                        "jsonl",
+                        format!("jsonl;type_mapping={}", mapping.as_str()),
                         compression,
                         PARTITION_SPEC,
                         PARTITION_VERSION,
@@ -199,7 +215,11 @@ impl DurableS3Sink {
                 let bytes =
                     encode_parquet(&schema, &owned, self.inner.compression)
                         .map_err(|e| {
-                            fatal(format!("parquet encode for {table}: {e}"))
+                            encode_error(
+                                &self.inner.id,
+                                format!("parquet encode for {table}"),
+                                e,
+                            )
                         })?;
                 Ok(TableObject {
                     table: table.to_string(),
@@ -207,7 +227,11 @@ impl DurableS3Sink {
                     domain: EncodingDomain::new(
                         "parquet",
                         PARQUET_ENCODER_VERSION,
-                        schema_fingerprint(&schema),
+                        format!(
+                            "{};type_mapping={}",
+                            schema_fingerprint(&schema),
+                            mapping.as_str()
+                        ),
                         compression,
                         PARTITION_SPEC,
                         PARTITION_VERSION,
@@ -287,18 +311,30 @@ impl Sink for DurableS3Sink {
             return Err(fatal("durable_v2 batch is missing its checkpoint"));
         }
 
-        // Group by fully-qualified identity (namespace/db/schema + table) so
-        // equal table names in different databases/schemas never collide.
-        let mut groups: BTreeMap<String, Vec<&Event>> = BTreeMap::new();
+        // Group by the relation: the manifest records its readable canonical
+        // identity, the object key its bounded segment (readable, or a digest
+        // when too long), so same-named tables of other databases or schemas
+        // never share an object. And by mapping version: an object holds one
+        // version. All of a
+        // batch's objects publish under one manifest entry, so a batch of
+        // several versions is still acknowledged (or not) as one.
+        let mut groups: BTreeMap<
+            (String, deltaforge_core::TypeMapping),
+            Vec<&Event>,
+        > = BTreeMap::new();
         for e in events {
             groups
-                .entry(e.source.full_table_name())
+                .entry((
+                    deltaforge_core::SourceRelationIdentity::of(&e.source)
+                        .canonical(),
+                    e.type_mapping,
+                ))
                 .or_default()
                 .push(e);
         }
 
         let mut objects = Vec::with_capacity(groups.len());
-        for (table, group) in &groups {
+        for ((table, _), group) in &groups {
             let first = group[0];
             objects.push(self.encode_table(table, first, group)?);
         }
@@ -417,6 +453,19 @@ pub(super) async fn settle_on<S: ConditionalStore + ?Sized>(
     }
 }
 
+/// An encode failure as the sink's error: a value its column cannot hold is
+/// a `sink_conversion_failed` incident, as in every typed sink; anything
+/// else is fatal.
+fn encode_error(sink_id: &str, what: String, e: anyhow::Error) -> SinkError {
+    match e.downcast::<deltaforge_core::encoding::EncodingError>() {
+        Ok(enc @ deltaforge_core::encoding::EncodingError::Conversion(_)) => {
+            enc.into_sink_error_for(sink_id)
+        }
+        Ok(other) => fatal(format!("{what}: {other}")),
+        Err(e) => fatal(format!("{what}: {e:#}")),
+    }
+}
+
 fn fatal(msg: impl Into<String>) -> SinkError {
     SinkError::Fatal {
         details: msg.into().into(),
@@ -493,6 +542,32 @@ mod tests {
     use futures::StreamExt;
     use object_store::memory::InMemory;
     use object_store::{ObjectStore, ObjectStoreExt};
+
+    /// A conversion failure (however wrapped) is the shared
+    /// `sink_conversion_failed` incident; any other encode error is fatal.
+    #[test]
+    fn encode_errors_classify_conversion_failures() {
+        use deltaforge_core::encoding::{ConversionFailure, EncodingError};
+        let conversion =
+            anyhow::Error::new(EncodingError::Conversion(ConversionFailure {
+                column: "after.d".into(),
+                source_type: "date".into(),
+                target_type: "Arrow Date32".into(),
+                reason: "not a calendar date (an infinity)",
+            }))
+            .context(super::super::encoder::RowEncodeError);
+        let e = encode_error("s3", "parquet encode for t".into(), conversion);
+        assert_eq!(
+            e.draft().map(|d| d.reason_code),
+            Some(deltaforge_core::incident::ReasonCode::SinkConversionFailed)
+        );
+        let e = encode_error(
+            "s3",
+            "parquet encode for t".into(),
+            anyhow::anyhow!("writer closed"),
+        );
+        assert!(matches!(e, SinkError::Fatal { .. }), "{e:?}");
+    }
 
     /// Test comparator: watermarks are ASCII decimal; unparseable = Incomparable
     /// (stands in for a lineage/generation mismatch).
@@ -595,7 +670,10 @@ mod tests {
             source,
             Op::Read,
             None,
-            Some(serde_json::json!({ "id": id })),
+            Some(deltaforge_core::canonical::fixture::row(
+                serde_json::json!({ "id": id }),
+            )),
+            deltaforge_core::TypeMapping::V2,
             0,
             0,
         )
@@ -717,9 +795,33 @@ mod tests {
             ks.iter().filter(|k| k.ends_with(".jsonl")).collect();
         // Three distinct fully-qualified tables -> three data objects.
         assert_eq!(data.len(), 3, "one object per fq table: {ks:?}");
-        assert!(data.iter().any(|k| k.contains("a.orders")), "{data:?}");
-        assert!(data.iter().any(|k| k.contains("b.orders")), "{data:?}");
-        assert!(data.iter().any(|k| k.contains("a.users")), "{data:?}");
+        assert!(data.iter().any(|k| k.contains("/a.a.orders/")), "{data:?}");
+        assert!(data.iter().any(|k| k.contains("/b.b.orders/")), "{data:?}");
+        assert!(data.iter().any(|k| k.contains("/a.a.users/")), "{data:?}");
+    }
+
+    /// A table named with `/`, `%` and `=` (legal quoted identifiers)
+    /// gets one key segment that reads back unchanged: recovery finds its
+    /// object.
+    #[tokio::test]
+    async fn hostile_table_names_survive_recovery() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        {
+            let s1 = sink_over(Arc::clone(&store), "s").await.unwrap();
+            s1.send_batch_with_context(
+                &[row(Some("s/1"), "db", "a/b%2Fc=d", 1)],
+                &ctx("100"),
+            )
+            .await
+            .unwrap();
+        }
+        let s2 = sink_over(Arc::clone(&store), "s").await.unwrap();
+        s2.send_batch_with_context(
+            &[row(Some("s/1"), "db", "a/b%2Fc=d", 2)],
+            &ctx("200"),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

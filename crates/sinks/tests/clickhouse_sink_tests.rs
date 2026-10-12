@@ -7,7 +7,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use deltaforge_config::{ChMode, ChVersionSource, ClickHouseSinkCfg};
-use deltaforge_core::{Event, Op, Sink, SourceInfo, SourcePosition};
+use deltaforge_core::canonical::{
+    CanonicalRow, CanonicalValue, DbValue, Decimal, IntWidth,
+};
+use deltaforge_core::{
+    Event, Op, Sink, SourceInfo, SourcePosition, TypeMapping,
+};
 use gate_ownership::GateOwned;
 use serde_json::{Value, json};
 use sinks::clickhouse::types::ColDesc;
@@ -66,6 +71,7 @@ fn cfg(
     auto_create: bool,
 ) -> ClickHouseSinkCfg {
     ClickHouseSinkCfg {
+        extensions_column: "_extensions".into(),
         id: "ch-test".into(),
         url: url.into(),
         database: "default".into(),
@@ -83,6 +89,31 @@ fn cfg(
     }
 }
 
+/// A typed `orders` row from a JSON literal: `id` is a BIGINT, `amount` a
+/// DECIMAL given as its exact text (or null).
+fn orders_row(v: Value) -> Option<CanonicalRow> {
+    let Value::Object(m) = v else {
+        return None;
+    };
+    let cols = m
+        .into_iter()
+        .map(|(k, v)| {
+            let value = match (k.as_str(), v) {
+                (_, Value::Null) => CanonicalValue::Null,
+                ("id", Value::Number(n)) => CanonicalValue::Db(
+                    DbValue::int(n.as_i64().unwrap(), IntWidth::W64).unwrap(),
+                ),
+                ("amount", Value::String(s)) => CanonicalValue::Db(
+                    DbValue::Decimal(Decimal::parse(&s).unwrap()),
+                ),
+                (k, v) => panic!("no orders column {k} = {v}"),
+            };
+            (k, value)
+        })
+        .collect();
+    Some(CanonicalRow::new(cols).unwrap())
+}
+
 fn mk_event(
     op: Op,
     after: Value,
@@ -91,8 +122,8 @@ fn mk_event(
     ts: i64,
 ) -> Event {
     Event {
-        before: if before.is_null() { None } else { Some(before) },
-        after: if after.is_null() { None } else { Some(after) },
+        before: orders_row(before),
+        after: orders_row(after),
         source: SourceInfo {
             version: "1".into(),
             connector: "mysql".into(),
@@ -107,6 +138,7 @@ fn mk_event(
         op,
         ts_ms: ts,
         transaction: None,
+        type_mapping: TypeMapping::V2,
         event_id: None,
         tenant_id: None,
         schema_version: None,
@@ -188,6 +220,9 @@ async fn upsert_mode_auto_creates_and_reflects_current_state() {
         CancellationToken::new(),
         "p",
         Some(resolver()),
+        std::sync::Arc::new(
+            deltaforge_core::destination::MemoryDestinationBindings::default(),
+        ),
         &sinks::ResolvedSinkCreds::default(),
     )
     .unwrap();
@@ -269,6 +304,9 @@ async fn changelog_mode_retains_all_changes() {
         CancellationToken::new(),
         "p",
         Some(resolver()),
+        std::sync::Arc::new(
+            deltaforge_core::destination::MemoryDestinationBindings::default(),
+        ),
         &sinks::ResolvedSinkCreds::default(),
     )
     .unwrap();
@@ -328,7 +366,8 @@ async fn dedup_token_prevents_double_insert() {
         &format!(
             "CREATE TABLE default.{table} (`id` Int64, `amount` Nullable(Decimal(12,2)), \
              `_op` LowCardinality(String), `_version` UInt64, `_deleted` UInt8, \
-             `_source_ts` DateTime64(3)) ENGINE = MergeTree ORDER BY (`id`, `_version`) \
+             `_source_ts` DateTime64(3), `_extensions` Nullable(String)) \
+             ENGINE = MergeTree ORDER BY (`id`, `_version`) \
              SETTINGS non_replicated_deduplication_window = 1000"
         ),
     )
@@ -339,6 +378,9 @@ async fn dedup_token_prevents_double_insert() {
         CancellationToken::new(),
         "p",
         Some(resolver()),
+        std::sync::Arc::new(
+            deltaforge_core::destination::MemoryDestinationBindings::default(),
+        ),
         &sinks::ResolvedSinkCreds::default(),
     )
     .unwrap();
@@ -372,5 +414,69 @@ async fn dedup_token_prevents_double_insert() {
         n.trim(),
         "2",
         "dedup token prevented the replayed batch from doubling rows"
+    );
+}
+
+/// The target table's binding against a live server: a restarted sink
+/// whose first event is another relation is refused before inserting; a
+/// table dropped and recreated (another UUID) is refused as replaced; the
+/// refusal names both relations and no row data.
+#[tokio::test]
+#[ignore]
+async fn the_target_table_binding_holds_across_restart_and_recreation() {
+    let (_c, base) = start_clickhouse().await;
+    let table = "orders_bound";
+    let store: std::sync::Arc<
+        dyn deltaforge_core::destination::DestinationBindingStore,
+    > = std::sync::Arc::new(
+        deltaforge_core::destination::MemoryDestinationBindings::default(),
+    );
+    let sink = || {
+        build_clickhouse_sink(
+            &cfg(&base, table, ChMode::Changelog, true),
+            CancellationToken::new(),
+            "p",
+            Some(resolver()),
+            std::sync::Arc::clone(&store),
+            &sinks::ResolvedSinkCreds::default(),
+        )
+        .unwrap()
+    };
+    let row = |source_table: &str| {
+        mk_event(
+            Op::Create,
+            json!({"id": 7, "amount": "1.50"}),
+            json!(null),
+            source_table,
+            1,
+        )
+    };
+    sink().send_batch(&[row("orders")]).await.unwrap();
+    let count_sql = format!("SELECT count() FROM default.{table}");
+    let count = || ch(&base, &count_sql);
+    assert_eq!(count().await.trim(), "1");
+
+    // A restart: the other relation comes first.
+    let e = sink().send_batch(&[row("orders_v2")]).await.unwrap_err();
+    assert_eq!(
+        e.draft().map(|d| d.reason_code),
+        Some(deltaforge_core::incident::ReasonCode::SinkDestinationConflict)
+    );
+    let text = format!("{e:?}");
+    assert!(
+        text.contains("/orders") && text.contains("/orders_v2"),
+        "{text}"
+    );
+    assert!(!text.contains("1.50"), "no row data: {text}");
+    assert_eq!(count().await.trim(), "1", "nothing inserted");
+
+    // Recreated by hand: another table UUID.
+    ch(&base, &format!("DROP TABLE default.{table} SYNC")).await;
+    let e = sink().send_batch(&[row("orders")]).await.unwrap_err();
+    assert_eq!(
+        e.draft()
+            .and_then(|d| d.discriminator.get("class").cloned())
+            .as_deref(),
+        Some("target_replaced")
     );
 }

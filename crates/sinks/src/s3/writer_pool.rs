@@ -22,6 +22,7 @@ use object_store::{ObjectStore, path::Path};
 use tracing::{debug, warn};
 use ulid::Ulid;
 
+use super::encoder::RowEncodeError;
 use super::file_format::{FileFormat, FileWriter, WriteResult};
 use super::partition_for;
 use super::rolling::{RollReason, RollingConfig, should_roll};
@@ -52,21 +53,11 @@ pub struct AppendOutcome {
 }
 
 /// Returns true if an error from `FileWriter::append` is an encoding-side
-/// failure (per-row recoverable) rather than an object-store failure
-/// (batch-level fatal). Used to gate the per-row DLQ retry path.
+/// failure (per-row recoverable, marked [`RowEncodeError`]) rather than an
+/// object-store failure (batch-level fatal). Used to gate the per-row DLQ
+/// retry path.
 fn is_encoder_error(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        let msg = cause.to_string().to_lowercase();
-        msg.contains("convert rows to record batch")
-            || msg.contains("build recordbatch")
-            || msg.contains("decimal")
-            || msg.contains("parse")
-            || msg.contains("overflows")
-            || msg.contains("base64")
-            || msg.contains("expected ")
-            || msg.contains("number not")
-            || msg.contains("serialize event to jsonl")
-    })
+    err.downcast_ref::<RowEncodeError>().is_some()
 }
 
 /// One row in the pool — an open writer plus its lifecycle metadata.
@@ -425,27 +416,43 @@ mod tests {
     use serde_json::json;
     use std::time::Duration;
 
-    /// Each recoverable (per-row) cause must be classified as an encoder
-    /// error so it routes to the per-row DLQ rather than failing the batch.
-    /// Every message below matches exactly one clause of `is_encoder_error`,
-    /// so a dropped/`&&`-ed clause is caught.
+    /// The marker classifies, wherever it sits in the chain; a message
+    /// that merely looks like an encoding failure does not.
     #[test]
-    fn is_encoder_error_classifies_each_recoverable_cause() {
-        let recoverable = [
-            "convert rows to record batch: boom",
-            "build recordbatch failed",
-            "bad decimal digits",
-            "could not parse value",
-            "value overflows i128",
-            "invalid base64 input",
-            "expected array",
-            "number not representable",
-            "serialize event to jsonl",
-        ];
-        for msg in recoverable {
+    fn is_encoder_error_classifies_by_the_row_encode_marker() {
+        let marked = anyhow::anyhow!("not an integer").context(RowEncodeError);
+        assert!(is_encoder_error(&marked));
+        assert!(is_encoder_error(&marked.context("append parquet batch")));
+        assert!(!is_encoder_error(&anyhow::anyhow!("could not parse value")));
+    }
+
+    /// Every per-row failure of the canonical Arrow encoder (the real
+    /// errors `events_to_record_batch` returns) is classified as an encoder
+    /// error, so the bad row goes to the DLQ instead of failing the batch.
+    #[test]
+    fn canonical_encoder_failures_are_encoder_errors() {
+        let schema = build_schema(&[col("id", "bigint")]);
+        let row = |v: serde_json::Value| {
+            let mut e = make_event("orders", 19, 1);
+            e.after = Some(deltaforge_core::canonical::fixture::row(v));
+            e
+        };
+        for (what, event) in [
+            ("text in an integer column", row(json!({"id": "x"}))),
+            (
+                "a document in an integer column",
+                row(json!({"id": {"a": 1}})),
+            ),
+            ("an undeclared column", row(json!({"id": 1, "extra": 1}))),
+        ] {
+            let err = crate::s3::encoder::events_to_record_batch(
+                &schema,
+                std::slice::from_ref(&event),
+            )
+            .expect_err(what);
             assert!(
-                is_encoder_error(&anyhow::anyhow!("{msg}")),
-                "should be classified as encoder error: {msg}"
+                is_encoder_error(&err),
+                "{what} must be a per-row encoder error: {err:#}"
             );
         }
     }
@@ -476,11 +483,14 @@ mod tests {
     }
 
     fn build_schema(cols: &[ColumnDesc]) -> Arc<Schema> {
-        Arc::new(build_envelope_arrow_schema(
-            Connector::Mysql,
-            cols,
-            &TypeConversionOpts::default(),
-        ))
+        Arc::new(
+            build_envelope_arrow_schema(
+                Connector::Mysql,
+                cols,
+                &TypeConversionOpts::default(),
+            )
+            .unwrap(),
+        )
     }
 
     fn make_event(table: &str, day: u32, id: i64) -> Event {
@@ -492,7 +502,9 @@ mod tests {
             .timestamp_millis();
         Event {
             before: None,
-            after: Some(json!({"id": id})),
+            after: Some(deltaforge_core::canonical::fixture::row(
+                json!({"id": id}),
+            )),
             source: SourceInfo {
                 version: "1".into(),
                 connector: "mysql".into(),
@@ -507,6 +519,7 @@ mod tests {
             op: Op::Create,
             ts_ms,
             transaction: None,
+            type_mapping: deltaforge_core::TypeMapping::V2,
             event_id: None,
             tenant_id: None,
             schema_version: None,
@@ -592,7 +605,11 @@ mod tests {
         assert_eq!(committed.len(), 1, "should roll on event count");
         assert_eq!(committed[0].reason, RollReason::Events);
         assert_eq!(committed[0].partition.table, "orders");
-        assert!(committed[0].path.starts_with("lake/table=orders/"));
+        assert!(
+            committed[0]
+                .path
+                .starts_with("lake/database=shop/namespace=shop/table=orders/")
+        );
         assert!(committed[0].path.ends_with(".parquet"));
         assert_eq!(committed[0].result.rows_written, 5);
         assert_eq!(pool.open_writer_count(), 0);
@@ -733,9 +750,9 @@ mod tests {
         let committed = outcome.committed;
         assert_eq!(committed.len(), 1);
         let path = &committed[0].path;
-        // expected: deltaforge/orders/table=orders/year=2026/month=05/day=15/<ULID>.parquet
+        // expected: deltaforge/orders/database=shop/namespace=shop/table=orders/year=2026/month=05/day=15/<ULID>.parquet
         assert!(path.starts_with(
-            "deltaforge/orders/table=orders/year=2026/month=05/day=15/"
+            "deltaforge/orders/database=shop/namespace=shop/table=orders/year=2026/month=05/day=15/"
         ));
         assert!(path.ends_with(".parquet"));
         // ULID is 26 chars, validate the basename length is right.

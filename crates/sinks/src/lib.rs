@@ -34,6 +34,9 @@
 
 use std::sync::Arc;
 
+mod destination;
+mod payload;
+
 use deltaforge_config::{PipelineSpec, SinkCfg, SinkFilter};
 use deltaforge_core::ArcDynSink;
 use deltaforge_core::encoding::avro::SourceSchemaProvider;
@@ -114,6 +117,7 @@ pub fn build_sinks(
         None,
         None,
         None,
+        None,
         &ResolvedSinkSecrets::default(),
     )
 }
@@ -130,6 +134,9 @@ pub fn build_sinks_with_schemas(
     arrow_schema_resolver: Option<s3::SchemaResolver>,
     clickhouse_resolver: Option<clickhouse::ClickHouseSchemaResolver>,
     es_resolver: Option<elasticsearch::EsSchemaResolver>,
+    destination_bindings: Option<
+        Arc<dyn deltaforge_core::destination::DestinationBindingStore>,
+    >,
     secrets: &ResolvedSinkSecrets,
 ) -> anyhow::Result<Vec<ArcDynSink>> {
     // Public API: NEVER silently omit a configured sink. A durable_v2 S3 sink
@@ -143,6 +150,7 @@ pub fn build_sinks_with_schemas(
         arrow_schema_resolver,
         clickhouse_resolver,
         es_resolver,
+        destination_bindings.clone(),
         secrets,
         /* defer_durable_s3 */ false,
     )
@@ -161,6 +169,9 @@ pub fn build_sinks_deferring_durable_s3(
     arrow_schema_resolver: Option<s3::SchemaResolver>,
     clickhouse_resolver: Option<clickhouse::ClickHouseSchemaResolver>,
     es_resolver: Option<elasticsearch::EsSchemaResolver>,
+    destination_bindings: Option<
+        Arc<dyn deltaforge_core::destination::DestinationBindingStore>,
+    >,
     secrets: &ResolvedSinkSecrets,
 ) -> anyhow::Result<Vec<ArcDynSink>> {
     build_sinks_impl(
@@ -171,6 +182,7 @@ pub fn build_sinks_deferring_durable_s3(
         arrow_schema_resolver,
         clickhouse_resolver,
         es_resolver,
+        destination_bindings.clone(),
         secrets,
         /* defer_durable_s3 */ true,
     )
@@ -185,9 +197,19 @@ fn build_sinks_impl(
     arrow_schema_resolver: Option<s3::SchemaResolver>,
     clickhouse_resolver: Option<clickhouse::ClickHouseSchemaResolver>,
     es_resolver: Option<elasticsearch::EsSchemaResolver>,
+    destination_bindings: Option<
+        Arc<dyn deltaforge_core::destination::DestinationBindingStore>,
+    >,
     secrets: &ResolvedSinkSecrets,
     defer_durable_s3: bool,
 ) -> anyhow::Result<Vec<ArcDynSink>> {
+    // Destination bindings outlive the process only through the runner's
+    // durable store; without one (library use, tests) they are in memory.
+    let destination_bindings = destination_bindings.unwrap_or_else(|| {
+        Arc::new(
+            deltaforge_core::destination::MemoryDestinationBindings::default(),
+        )
+    });
     ps.spec
         .sinks
         .iter()
@@ -266,6 +288,7 @@ fn build_sinks_impl(
                             cancel.clone(),
                             pipeline,
                             clickhouse_resolver.clone(),
+                            Arc::clone(&destination_bindings),
                             secrets.for_sink(&cfg.id),
                         )?) as ArcDynSink,
                         // v1: ClickHouse sink does not support sink-level filters.
@@ -277,6 +300,7 @@ fn build_sinks_impl(
                             cancel.clone(),
                             pipeline,
                             es_resolver.clone(),
+                            Arc::clone(&destination_bindings),
                             secrets.for_sink(&cfg.id),
                         )?) as ArcDynSink,
                         // v1: Elasticsearch sink does not support sink-level filters.
@@ -351,6 +375,9 @@ pub fn build_sink(
                 cancel,
                 pipeline,
                 None,
+                Arc::new(
+                    deltaforge_core::destination::MemoryDestinationBindings::default(),
+                ),
                 &ResolvedSinkCreds::default(),
             )?) as ArcDynSink
         }
@@ -359,6 +386,9 @@ pub fn build_sink(
             cancel,
             pipeline,
             None,
+            Arc::new(
+                deltaforge_core::destination::MemoryDestinationBindings::default(),
+            ),
             &ResolvedSinkCreds::default(),
         )?) as ArcDynSink,
     };

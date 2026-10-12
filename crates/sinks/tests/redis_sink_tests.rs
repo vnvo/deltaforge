@@ -10,8 +10,9 @@
 use anyhow::Result;
 use ctor::dtor;
 use deltaforge_config::{EncodingCfg, EnvelopeCfg, RedisSinkCfg};
+use deltaforge_core::canonical::fixture;
 use deltaforge_core::{
-    Event, EventRouting, Op, Sink, SourceInfo, SourcePosition,
+    Event, EventRouting, Op, Sink, SourceInfo, SourcePosition, TypeMapping,
 };
 use gate_ownership::GateOwned;
 use redis::AsyncCommands;
@@ -175,6 +176,7 @@ fn make_sink(
 ) -> Result<RedisSink> {
     RedisSink::new(
         &RedisSinkCfg {
+            json_wide_integers: Default::default(),
             id: id.into(),
             uri: uri.into(),
             uri_secret: None,
@@ -569,7 +571,8 @@ async fn redis_sink_cloudevents_operations() -> Result<()> {
         },
         Op::Create,
         None,
-        Some(json!({"id": 1})),
+        Some(fixture::row(json!({"id": 1}))),
+        TypeMapping::V2,
         1_700_000_000_000,
         64,
     );
@@ -588,8 +591,9 @@ async fn redis_sink_cloudevents_operations() -> Result<()> {
             position: SourcePosition::default(),
         },
         Op::Update,
-        Some(json!({"id": 2, "name": "old"})),
-        Some(json!({"id": 2, "name": "new"})),
+        Some(fixture::row(json!({"id": 2, "name": "old"}))),
+        Some(fixture::row(json!({"id": 2, "name": "new"}))),
+        TypeMapping::V2,
         1_700_000_000_001,
         64,
     );
@@ -608,8 +612,9 @@ async fn redis_sink_cloudevents_operations() -> Result<()> {
             position: SourcePosition::default(),
         },
         Op::Delete,
-        Some(json!({"id": 3})),
+        Some(fixture::row(json!({"id": 3}))),
         None,
+        TypeMapping::V2,
         1_700_000_000_002,
         64,
     );
@@ -779,6 +784,7 @@ async fn redis_sink_respects_cancellation() -> Result<()> {
     let cancel = CancellationToken::new();
     let sink = Arc::new(RedisSink::new(
         &RedisSinkCfg {
+            json_wide_integers: Default::default(),
             id: "test-cancel".into(),
             uri: "redis://invalid-host:9999/0".into(),
             uri_secret: None,
@@ -828,6 +834,7 @@ async fn redis_sink_large_events() -> Result<()> {
 
     let sink = RedisSink::new(
         &RedisSinkCfg {
+            json_wide_integers: Default::default(),
             id: "test-large".into(),
             uri: uri.clone(),
             uri_secret: None,
@@ -868,6 +875,7 @@ async fn redis_sink_large_batch() -> Result<()> {
 
     let sink = RedisSink::new(
         &RedisSinkCfg {
+            json_wide_integers: Default::default(),
             id: "test-large-batch".into(),
             uri: uri.clone(),
             uri_secret: None,
@@ -913,6 +921,7 @@ async fn redis_sink_concurrent_sends() -> Result<()> {
 
     let sink = Arc::new(RedisSink::new(
         &RedisSinkCfg {
+            json_wide_integers: Default::default(),
             id: "test-concurrent".into(),
             uri: uri.clone(),
             uri_secret: None,
@@ -1148,6 +1157,7 @@ async fn redis_sink_optional() -> Result<()> {
 
     let sink = RedisSink::new(
         &RedisSinkCfg {
+            json_wide_integers: Default::default(),
             id: "test-optional".into(),
             uri: redis_uri(),
             uri_secret: None,
@@ -1291,7 +1301,8 @@ async fn redis_sink_raw_payload_bypasses_envelope() -> Result<()> {
 
     // Event with raw_payload flag (simulates outbox processor output)
     let mut raw_event = make_test_event(1);
-    raw_event.after = Some(json!({"order_id": 42, "total": 99.99}));
+    raw_event.after =
+        Some(fixture::row(json!({"order_id": 42, "total": 99.99})));
     raw_event.routing = Some(EventRouting {
         raw_payload: true,
         headers: Some(HashMap::from([(

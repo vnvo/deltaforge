@@ -178,7 +178,12 @@ impl FileWriter for JsonLinesFileWriter {
         // file buffering) is preserved.
         let mut buf = Vec::with_capacity(events.len() * 128);
         for e in events {
-            serde_json::to_writer(&mut buf, e)
+            // The event's native rendering for its own mapping version.
+            let native = e
+                .native(deltaforge_core::NativeOpts::default())
+                .map_err(|err| anyhow::anyhow!("render event for jsonl: {err}"))
+                .context(super::encoder::RowEncodeError)?;
+            serde_json::to_writer(&mut buf, &native)
                 .context("serialize event to jsonl buffer")?;
             buf.push(b'\n');
         }
@@ -373,7 +378,9 @@ mod tests {
 
         let make_event = |i: i64| Event {
             before: None,
-            after: Some(serde_json::json!({"id": i})),
+            after: Some(deltaforge_core::canonical::fixture::row(
+                serde_json::json!({"id": i}),
+            )),
             source: SourceInfo {
                 version: "1".into(),
                 connector: "mysql".into(),
@@ -388,6 +395,7 @@ mod tests {
             op: Op::Create,
             ts_ms: i,
             transaction: None,
+            type_mapping: deltaforge_core::TypeMapping::V2,
             event_id: None,
             tenant_id: None,
             schema_version: None,
@@ -442,7 +450,9 @@ mod tests {
 
         let make_event = |i: i64| Event {
             before: None,
-            after: Some(serde_json::json!({"id": i, "msg": "hello world"})),
+            after: Some(deltaforge_core::canonical::fixture::row(
+                serde_json::json!({"id": i, "msg": "hello world"}),
+            )),
             source: SourceInfo {
                 version: "1".into(),
                 connector: "mysql".into(),
@@ -457,6 +467,7 @@ mod tests {
             op: Op::Create,
             ts_ms: i,
             transaction: None,
+            type_mapping: deltaforge_core::TypeMapping::V2,
             event_id: None,
             tenant_id: None,
             schema_version: None,
@@ -520,7 +531,9 @@ mod tests {
 
         let event = Event {
             before: None,
-            after: Some(serde_json::json!({"id": 1})),
+            after: Some(deltaforge_core::canonical::fixture::row(
+                serde_json::json!({"id": 1}),
+            )),
             source: SourceInfo {
                 version: "1".into(),
                 connector: "mysql".into(),
@@ -535,6 +548,7 @@ mod tests {
             op: Op::Create,
             ts_ms: 0,
             transaction: None,
+            type_mapping: deltaforge_core::TypeMapping::V2,
             event_id: None,
             tenant_id: None,
             schema_version: None,
@@ -585,6 +599,87 @@ mod tests {
             .await?;
         assert_eq!(res.rows_written, 0);
         assert_eq!(res.bytes_written, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streaming_lines_are_the_native_rendering() -> Result<()> {
+        use crate::s3::file_format::Compression;
+        use crate::s3::object_writer::build_object_store;
+        use deltaforge_core::canonical::{
+            CanonicalRow, CanonicalValue, DbValue, Document, IntWidth,
+        };
+        use deltaforge_core::{Event, EventId, Op, SourceInfo, SourcePosition};
+
+        let tmp = tempfile::tempdir()?;
+        let params =
+            ObjectStoreParams::local(tmp.path().to_string_lossy().to_string());
+        let store = build_object_store(&params)?;
+        let format = JsonLinesFormat::new(Compression::None);
+        let path = Path::from("stream/native.jsonl");
+        let schema = Arc::new(arrow_schema::Schema::new(Vec::<
+            arrow_schema::Field,
+        >::new()));
+        let mut writer = format
+            .open_writer(store.clone(), path.clone(), schema)
+            .await?;
+
+        let after = CanonicalRow::with_extensions(
+            vec![
+                (
+                    "id".into(),
+                    CanonicalValue::Db(DbValue::int(i64::MAX, IntWidth::W64)?),
+                ),
+                (
+                    "blob".into(),
+                    CanonicalValue::Db(DbValue::Binary(b"hi".to_vec())),
+                ),
+            ],
+            [(
+                "tag".to_string(),
+                Document::new(serde_json::json!({"k": 1})),
+            )],
+        )?;
+        let source = SourceInfo {
+            version: "1".into(),
+            connector: "mysql".into(),
+            name: "t".into(),
+            ts_ms: 7,
+            db: "shop".into(),
+            schema: None,
+            table: "orders".into(),
+            snapshot: None,
+            position: SourcePosition::default(),
+        };
+        let event = Event::new_row(
+            EventId::mysql_row_server(1, "orders", 1, 0),
+            source,
+            Op::Create,
+            None,
+            Some(after),
+            deltaforge_core::TypeMapping::V2,
+            7,
+            64,
+        );
+        writer.append(std::slice::from_ref(&event)).await?;
+        writer.close().await?;
+
+        let got = store.get(&path).await?.bytes().await?;
+        let line: serde_json::Value =
+            serde_json::from_slice(got.strip_suffix(b"\n").unwrap())?;
+        assert_eq!(
+            line,
+            event.native_value(deltaforge_core::NativeOpts::default())?
+        );
+        assert_eq!(line["source"]["type_mapping"], "v2");
+        // A 64-bit integer is its exact decimal string; bytes are the
+        // base64 wrapper; an extension is a document in the row.
+        assert_eq!(line["after"]["id"], i64::MAX.to_string());
+        assert_eq!(
+            line["after"]["blob"],
+            serde_json::json!({"_base64": "aGk="})
+        );
+        assert_eq!(line["after"]["tag"], serde_json::json!({"k": 1}));
         Ok(())
     }
 }

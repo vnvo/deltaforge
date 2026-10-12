@@ -27,7 +27,7 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use arrow_schema::Schema;
 use bytes::Bytes;
 use deltaforge_core::Event;
@@ -45,9 +45,12 @@ const PARQUET_CREATED_BY: &str = "deltaforge-s3-durable";
 
 /// Encoder version for Parquet output. Bump if the byte layout of an unchanged
 /// input intentionally changes; it feeds the `EncodingDomain`.
-pub const PARQUET_ENCODER_VERSION: u16 = 1;
-/// Encoder version for JSON Lines output.
-pub const JSONL_ENCODER_VERSION: u16 = 1;
+/// Version 2: values from canonical rows (exact conversions; the v2 Arrow
+/// type table).
+pub const PARQUET_ENCODER_VERSION: u16 = 2;
+/// Encoder version for JSON Lines output. Version 2: each line is the
+/// event's native rendering for its mapping version.
+pub const JSONL_ENCODER_VERSION: u16 = 2;
 
 /// Map a durable-path compression codec to parquet's, rejecting any codec whose
 /// compressed bytes are not stable across build configurations. `Gzip` is
@@ -99,7 +102,10 @@ pub fn encode_parquet(
 pub fn encode_jsonl(events: &[Event]) -> Result<Bytes> {
     let mut buf: Vec<u8> = Vec::new();
     for e in events {
-        let v = serde_json::to_value(e)?;
+        let v = e
+            .native_value(deltaforge_core::NativeOpts::default())
+            .map_err(|err| anyhow::anyhow!("render event for jsonl: {err}"))
+            .context(super::encoder::RowEncodeError)?;
         write_canonical_json(&mut buf, &v);
         buf.push(b'\n');
     }
@@ -116,7 +122,13 @@ pub(crate) use deltaforge_core::canonical_json::{
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field};
-    use deltaforge_core::{Op, SourceInfo, SourcePosition, Transaction};
+    use deltaforge_core::canonical::{
+        ArrayValue, CanonicalRow, CanonicalValue, DbValue, Engine, SourceType,
+        fixture,
+    };
+    use deltaforge_core::{
+        Op, SourceInfo, SourcePosition, Transaction, TypeMapping,
+    };
     use serde_json::{Value, json};
 
     fn schema() -> Arc<Schema> {
@@ -150,7 +162,7 @@ mod tests {
         ]))
     }
 
-    fn golden_event(op: Op, after: Value) -> Event {
+    fn golden_event(op: Op, after: CanonicalRow) -> Event {
         Event {
             before: None,
             after: Some(after),
@@ -176,6 +188,7 @@ mod tests {
                 total_order: None,
                 data_collection_order: None,
             }),
+            type_mapping: TypeMapping::V2,
             event_id: Some(deltaforge_core::EventId::mysql_row_server(
                 1, "orders", 1, 0,
             )),
@@ -195,38 +208,81 @@ mod tests {
         }
     }
 
+    /// A golden row: `id` (BIGINT), `name` (TEXT), `blob` (bytes), `tags`
+    /// (a text array) and `active` (BOOL); `None` columns are absent.
+    fn golden_row(
+        id: i64,
+        name: Option<&str>,
+        blob: Option<&[u8]>,
+        tags: &[&str],
+        active: Option<bool>,
+    ) -> CanonicalRow {
+        let text_type = SourceType {
+            engine: Engine::Postgres,
+            name: "text".into(),
+            oid: None,
+            typmod: None,
+        };
+        let mut cols = vec![(
+            "id".to_string(),
+            CanonicalValue::Db(
+                DbValue::int(id, deltaforge_core::canonical::IntWidth::W64)
+                    .unwrap(),
+            ),
+        )];
+        if let Some(n) = name {
+            cols.push((
+                "name".into(),
+                CanonicalValue::Db(DbValue::Text(n.into())),
+            ));
+        }
+        if let Some(b) = blob {
+            cols.push((
+                "blob".into(),
+                CanonicalValue::Db(DbValue::Binary(b.to_vec())),
+            ));
+        }
+        let items = tags
+            .iter()
+            .map(|t| CanonicalValue::Db(DbValue::Text(t.to_string())))
+            .collect();
+        cols.push((
+            "tags".into(),
+            CanonicalValue::Db(DbValue::Array(
+                ArrayValue::new(text_type, items).unwrap(),
+            )),
+        ));
+        cols.push((
+            "active".into(),
+            active.map_or(CanonicalValue::Null, |a| {
+                CanonicalValue::Db(DbValue::Bool(a))
+            }),
+        ));
+        CanonicalRow::new(cols).unwrap()
+    }
+
     fn golden_events() -> Vec<Event> {
         vec![
             golden_event(
                 Op::Create,
-                json!({
-                    "id": 1,
-                    "name": "alpha",
-                    // binary via the {"_base64": ...} convention: bytes "hi"
-                    "blob": {"_base64": "aGk="},
-                    "tags": ["x", "y"],
-                    "active": true
-                }),
+                // blob: bytes "hi"
+                golden_row(
+                    1,
+                    Some("alpha"),
+                    Some(b"hi"),
+                    &["x", "y"],
+                    Some(true),
+                ),
             ),
+            // name/blob absent -> nulls
             golden_event(
                 Op::Update,
-                json!({
-                    "id": 2,
-                    // name/blob absent -> nulls
-                    "tags": [],
-                    "active": false
-                }),
+                golden_row(2, None, None, &[], Some(false)),
             ),
             golden_event(
                 Op::Delete,
-                json!({
-                    "id": 3,
-                    "name": "gamma",
-                    // bytes 0x00 0x01 0xff
-                    "blob": {"_base64": "AAH/"},
-                    "tags": ["z"],
-                    "active": null
-                }),
+                // blob: bytes 0x00 0x01 0xff; active SQL NULL
+                golden_row(3, Some("gamma"), Some(&[0, 1, 0xff]), &["z"], None),
             ),
         ]
     }
@@ -292,10 +348,12 @@ mod tests {
         // Canonical (recursively sorted keys): identical under isolated sinks
         // tests and the unified workspace graph (serde_json/preserve_order on).
         let j = encode_jsonl(&evs).unwrap();
-        assert_eq!(j.len(), 1200, "JSONL byte length drifted");
+        // v2 native rendering: BIGINT ids are exact decimal strings and the
+        // source block carries `type_mapping`.
+        assert_eq!(j.len(), 1266, "JSONL byte length drifted");
         assert_eq!(
             sha256_hex(&j),
-            "803f679b0fa3061165a83a28374a40b794a1d6713a4917b2bb77f231377e48de",
+            "24e41aa250f182500da580b015fd7ef25745c892d934cb564f6f0197c369dc82",
             "JSONL bytes drifted; see the change protocol"
         );
     }
@@ -317,7 +375,7 @@ mod tests {
     fn event(id: i64, after: Option<Value>) -> Event {
         Event {
             before: None,
-            after,
+            after: after.map(fixture::row),
             source: SourceInfo {
                 version: "1".into(),
                 connector: "mysql".into(),
@@ -340,6 +398,7 @@ mod tests {
                 total_order: None,
                 data_collection_order: None,
             }),
+            type_mapping: TypeMapping::V2,
             event_id: Some(deltaforge_core::EventId::mysql_row_server(
                 1, "orders", 1, id as u32,
             )),
@@ -365,6 +424,27 @@ mod tests {
             event(2, Some(json!({"id": 2, "name": "b"}))),
             event(3, Some(json!({"id": 3, "name": "c"}))),
         ]
+    }
+
+    /// A value its column cannot hold is a structured conversion failure
+    /// (column and types, never the value) marked as a row failure.
+    #[test]
+    fn a_value_its_column_cannot_hold_is_a_conversion_failure() {
+        let bad = event(1, Some(json!({"id": "secret-text", "name": "a"})));
+        let err = encode_parquet(&schema(), &[bad], Compression::None)
+            .expect_err("text in an Int64 column");
+        assert!(
+            err.downcast_ref::<super::super::encoder::RowEncodeError>()
+                .is_some()
+        );
+        match err.downcast_ref::<deltaforge_core::encoding::EncodingError>() {
+            Some(deltaforge_core::encoding::EncodingError::Conversion(f)) => {
+                assert_eq!(f.column, "after.id");
+                assert_eq!(f.target_type, "Arrow Int64");
+            }
+            other => panic!("expected a conversion failure, got {other:?}"),
+        }
+        assert!(!format!("{err:#}").contains("secret-text"));
     }
 
     #[test]

@@ -17,8 +17,16 @@ pub(crate) fn mk_event(
     lsn: Option<&str>,
 ) -> Event {
     Event {
-        before: if before.is_null() { None } else { Some(before) },
-        after: if after.is_null() { None } else { Some(after) },
+        before: if before.is_null() {
+            None
+        } else {
+            Some(deltaforge_core::canonical::fixture::row(before))
+        },
+        after: if after.is_null() {
+            None
+        } else {
+            Some(deltaforge_core::canonical::fixture::row(after))
+        },
         source: SourceInfo {
             version: "1".into(),
             connector: "mysql".into(),
@@ -36,6 +44,7 @@ pub(crate) fn mk_event(
         op,
         ts_ms,
         transaction: None,
+        type_mapping: deltaforge_core::TypeMapping::V2,
         event_id: None,
         tenant_id: None,
         schema_version: None,

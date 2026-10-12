@@ -6,6 +6,7 @@
 /// A ClickHouse column type in the v1 supported set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChType {
+    Int8,
     UInt8,
     Int16,
     Int32,
@@ -35,9 +36,14 @@ pub fn map_column(c: &ColDesc) -> ChType {
     let dt = c.data_type.to_lowercase();
     match dt.as_str() {
         "boolean" | "bool" => ChType::Bool,
-        "tinyint" => ChType::UInt8,
+        // Each integer type holds its column's whole range.
+        "tinyint" if c.unsigned => ChType::UInt8,
+        "tinyint" => ChType::Int8,
+        "smallint" if c.unsigned => ChType::Int32,
         "smallint" => ChType::Int16,
-        "int" | "integer" | "mediumint" => ChType::Int32,
+        "mediumint" => ChType::Int32,
+        "int" | "integer" if c.unsigned => ChType::Int64,
+        "int" | "integer" => ChType::Int32,
         "bigint" => {
             if c.unsigned {
                 ChType::UInt64
@@ -90,6 +96,7 @@ impl ChType {
     /// ClickHouse type name for `CREATE TABLE` DDL and validation messages.
     pub fn ddl_name(&self) -> String {
         match self {
+            ChType::Int8 => "Int8".into(),
             ChType::UInt8 => "UInt8".into(),
             ChType::Int16 => "Int16".into(),
             ChType::Int32 => "Int32".into(),

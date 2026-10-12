@@ -10,8 +10,9 @@
 use anyhow::Result;
 use ctor::dtor;
 use deltaforge_config::{EncodingCfg, EnvelopeCfg, KafkaSinkCfg};
+use deltaforge_core::canonical::fixture;
 use deltaforge_core::{
-    Event, EventRouting, Op, Sink, SourceInfo, SourcePosition,
+    Event, EventRouting, Op, Sink, SourceInfo, SourcePosition, TypeMapping,
 };
 use gate_ownership::GateOwned;
 use rdkafka::Message;
@@ -278,6 +279,7 @@ fn make_sink(
     envelope: EnvelopeCfg,
 ) -> Result<KafkaSink> {
     let cfg = KafkaSinkCfg {
+        json_wide_integers: Default::default(),
         id: id.into(),
         brokers: brokers.into(),
         topic: topic.into(),
@@ -330,8 +332,12 @@ async fn kafka_sink_sends_single_event() -> Result<()> {
 
     assert!(!messages.is_empty(), "should receive at least one message");
 
-    let parsed: Event = serde_json::from_slice(&messages[0])?;
-    assert_eq!(parsed.event_id, event.event_id);
+    let parsed: serde_json::Value = serde_json::from_slice(&messages[0])?;
+    // The native envelope is the event's native rendering.
+    assert_eq!(
+        parsed,
+        event.native_value(deltaforge_core::NativeOpts::default())?
+    );
 
     info!("✓ single event sent successfully");
     delete_topic(&brokers, &topic).await?;
@@ -728,7 +734,8 @@ async fn kafka_sink_cloudevents_operations() -> Result<()> {
         },
         Op::Create,
         None,
-        Some(json!({"id": 1})),
+        Some(fixture::row(json!({"id": 1}))),
+        TypeMapping::V2,
         1_700_000_000_000,
         64,
     );
@@ -747,8 +754,9 @@ async fn kafka_sink_cloudevents_operations() -> Result<()> {
             position: SourcePosition::default(),
         },
         Op::Update,
-        Some(json!({"id": 2, "name": "old"})),
-        Some(json!({"id": 2, "name": "new"})),
+        Some(fixture::row(json!({"id": 2, "name": "old"}))),
+        Some(fixture::row(json!({"id": 2, "name": "new"}))),
+        TypeMapping::V2,
         1_700_000_000_001,
         64,
     );
@@ -767,8 +775,9 @@ async fn kafka_sink_cloudevents_operations() -> Result<()> {
             position: SourcePosition::default(),
         },
         Op::Delete,
-        Some(json!({"id": 3})),
+        Some(fixture::row(json!({"id": 3}))),
         None,
+        TypeMapping::V2,
         1_700_000_000_002,
         64,
     );
@@ -855,6 +864,7 @@ async fn kafka_sink_idempotent_mode() -> Result<()> {
 
     let sink = KafkaSink::new(
         &KafkaSinkCfg {
+            json_wide_integers: Default::default(),
             id: "test-idempotent".into(),
             brokers: brokers.clone(),
             topic: topic.clone(),
@@ -899,6 +909,7 @@ async fn kafka_sink_exactly_once_mode() -> Result<()> {
 
     let sink = KafkaSink::new(
         &KafkaSinkCfg {
+            json_wide_integers: Default::default(),
             id: "test-exactly-once".into(),
             brokers: brokers.clone(),
             topic: topic.clone(),
@@ -1052,6 +1063,7 @@ async fn kafka_sink_custom_config() -> Result<()> {
     client_conf.insert("compression.type".to_string(), "gzip".to_string());
 
     let cfg = KafkaSinkCfg {
+        json_wide_integers: Default::default(),
         id: "test-custom".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
@@ -1126,6 +1138,7 @@ async fn kafka_sink_optional() -> Result<()> {
     get_kafka_container().await;
 
     let cfg = KafkaSinkCfg {
+        json_wide_integers: Default::default(),
         id: "test-optional".into(),
         brokers: brokers(),
         topic: "df-test-optional".into(),
@@ -1202,6 +1215,7 @@ async fn kafka_sink_recovers_after_restart() -> Result<()> {
     let cancel = CancellationToken::new();
     let sink = Arc::new(KafkaSink::new(
         &KafkaSinkCfg {
+            json_wide_integers: Default::default(),
             id: "test-restart".into(),
             brokers: brokers.clone(),
             topic: topic.into(),
@@ -1354,6 +1368,7 @@ async fn kafka_sink_respects_cancellation() -> Result<()> {
     let cancel = CancellationToken::new();
     let sink = Arc::new(KafkaSink::new(
         &KafkaSinkCfg {
+            json_wide_integers: Default::default(),
             id: "test-cancel".into(),
             brokers: "invalid-host:9999".into(),
             topic: "df-test-cancel".into(),
@@ -1603,6 +1618,7 @@ async fn kafka_sink_routing_key_and_headers() -> Result<()> {
     let (brokers, topic) = setup("route-key-headers", 1).await?;
 
     let cfg = KafkaSinkCfg {
+        json_wide_integers: Default::default(),
         id: "test-kh".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
@@ -1626,7 +1642,8 @@ async fn kafka_sink_routing_key_and_headers() -> Result<()> {
     )?;
 
     let mut event = make_event_for_table(1, "orders");
-    event.after = Some(json!({"id": 1, "customer_id": "cust-42"}));
+    event.after =
+        Some(fixture::row(json!({"id": 1, "customer_id": "cust-42"})));
     event.routing = Some(EventRouting {
         headers: Some(HashMap::from([
             ("trace-id".into(), "abc-123".into()),
@@ -1655,6 +1672,11 @@ async fn kafka_sink_routing_key_and_headers() -> Result<()> {
         msg.headers.get("x-source").map(|s| s.as_str()),
         Some("deltaforge")
     );
+    assert_eq!(
+        msg.headers.get("df-type-mapping").map(|s| s.as_str()),
+        Some("v2"),
+        "every message names its mapping version"
+    );
 
     info!("✓ key template + routing headers delivered correctly");
     delete_topic(&brokers, &topic).await?;
@@ -1678,7 +1700,8 @@ async fn kafka_sink_raw_payload_bypasses_envelope() -> Result<()> {
 
     // Event with raw_payload flag (simulates outbox processor output)
     let mut raw_event = make_test_event(1);
-    raw_event.after = Some(json!({"order_id": 42, "total": 99.99}));
+    raw_event.after =
+        Some(fixture::row(json!({"order_id": 42, "total": 99.99})));
     raw_event.routing = Some(EventRouting {
         raw_payload: true,
         headers: Some(HashMap::from([(
@@ -1769,6 +1792,7 @@ fn make_txn_sink(
     pipeline: &str,
 ) -> Result<KafkaSink> {
     let cfg = KafkaSinkCfg {
+        json_wide_integers: Default::default(),
         id: id.into(),
         brokers: brokers.into(),
         topic: topic.into(),
@@ -1836,9 +1860,9 @@ async fn kafka_sink_exactly_once_batch_atomic() -> Result<()> {
 
     // Verify event IDs are correct
     for (i, msg) in messages.iter().enumerate() {
-        let parsed: Event = serde_json::from_slice(msg)?;
+        let parsed: serde_json::Value = serde_json::from_slice(msg)?;
         assert_eq!(
-            parsed.after.as_ref().unwrap()["id"],
+            parsed["after"]["id"],
             json!(i as i64),
             "event {} should have correct id",
             i
@@ -1870,8 +1894,12 @@ async fn kafka_sink_exactly_once_single_event() -> Result<()> {
         1,
         "should receive exactly 1 committed event"
     );
-    let parsed: Event = serde_json::from_slice(&messages[0])?;
-    assert_eq!(parsed.event_id, event.event_id);
+    let parsed: serde_json::Value = serde_json::from_slice(&messages[0])?;
+    // The native envelope is the event's native rendering.
+    assert_eq!(
+        parsed,
+        event.native_value(deltaforge_core::NativeOpts::default())?
+    );
 
     info!("✓ single event via transactional send");
     delete_topic(&brokers, &topic).await?;
@@ -1946,9 +1974,9 @@ async fn kafka_sink_exactly_once_multiple_batches() -> Result<()> {
 
     // Verify ordering within partition (single partition topic)
     for (i, msg) in messages.iter().enumerate() {
-        let parsed: Event = serde_json::from_slice(msg)?;
+        let parsed: serde_json::Value = serde_json::from_slice(msg)?;
         assert_eq!(
-            parsed.after.as_ref().unwrap()["id"],
+            parsed["after"]["id"],
             json!(i as i64),
             "event {} out of order",
             i

@@ -6,10 +6,16 @@
 
 use deltaforge_core::{Event, SinkError};
 
-/// The row body carrying the id values: `after` for insert/update, `before`
-/// for deletes (which have no `after`).
-fn row(ev: &Event) -> Option<&serde_json::Value> {
-    ev.after.as_ref().or(ev.before.as_ref())
+/// The row body carrying the id values (`after` for insert/update,
+/// `before` for deletes, which have no `after`), as its path view (exact
+/// integers).
+fn row(ev: &Event) -> Option<serde_json::Value> {
+    ev.after.as_ref().or(ev.before.as_ref()).map(|r| {
+        serde_json::Value::Object(deltaforge_core::canonical::view::row_view(
+            r,
+            ev.type_mapping,
+        ))
+    })
 }
 
 /// Compute the `_id` for an event. `id_fields` overrides `pk` when non-empty.
@@ -32,6 +38,13 @@ pub fn derive_id(
     })?;
     let mut parts = Vec::with_capacity(fields.len());
     for f in fields {
+        if let Some(deltaforge_core::CanonicalValue::Unchanged) =
+            ev.after.as_ref().and_then(|r| r.get(f))
+        {
+            return Err(SinkError::Serialization {
+                details: format!("elasticsearch _id: field '{f}' was not sent (unchanged TOAST)").into(),
+            });
+        }
         let v = obj.get(f).ok_or_else(|| SinkError::Serialization {
             details: format!("elasticsearch _id: field '{f}' missing from row")
                 .into(),

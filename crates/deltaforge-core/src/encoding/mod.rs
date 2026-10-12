@@ -101,6 +101,41 @@ impl std::fmt::Display for ConversionFailure {
     }
 }
 
+impl From<crate::envelope::EnvelopeError> for EncodingError {
+    fn from(e: crate::envelope::EnvelopeError) -> Self {
+        use crate::canonical::render::RenderFailure;
+        use crate::envelope::EnvelopeError;
+        match e {
+            EnvelopeError::Render(r) => {
+                let (source_type, target_type, reason) = match r.failure {
+                    RenderFailure::WideUnsignedNumber => (
+                        "unsigned 64-bit integer",
+                        "JSON number",
+                        "above i64::MAX (json_wide_integers: number)",
+                    ),
+                    RenderFailure::Unchanged => (
+                        "unchanged TOAST",
+                        "native JSON value",
+                        "PostgreSQL did not send the value",
+                    ),
+                    RenderFailure::ExtensionCollision => (
+                        "processor extension",
+                        "native JSON field",
+                        "an extension has the name of a rendered column",
+                    ),
+                };
+                EncodingError::Conversion(ConversionFailure {
+                    column: r.column,
+                    source_type: source_type.into(),
+                    target_type: target_type.into(),
+                    reason,
+                })
+            }
+            EnvelopeError::Other(details) => EncodingError::Other(details),
+        }
+    }
+}
+
 impl EncodingError {
     /// The sink error for a failed encode: a temporarily unavailable source
     /// schema is retryable backpressure (never routed to the DLQ as a poison

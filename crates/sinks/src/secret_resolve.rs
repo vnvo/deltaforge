@@ -460,6 +460,7 @@ mod tests {
             send_timeout_secs: 30,
             required: Some(true),
             auto_create: true,
+            extensions_column: "_extensions".into(),
         }
     }
 

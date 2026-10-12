@@ -10,11 +10,12 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use arrow_array::RecordBatch;
+use deltaforge_core::canonical::fixture;
 use deltaforge_core::encoding::arrow_schema::{
     Connector, build_envelope_arrow_schema,
 };
 use deltaforge_core::encoding::avro_types::{ColumnDesc, TypeConversionOpts};
-use deltaforge_core::{Event, Op, SourceInfo, SourcePosition};
+use deltaforge_core::{Event, Op, SourceInfo, SourcePosition, TypeMapping};
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
@@ -48,7 +49,7 @@ fn event_on(day: u32, table: &str, id: i64, email: &str) -> Event {
         .timestamp_millis();
     Event {
         before: None,
-        after: Some(json!({"id": id, "email": email})),
+        after: Some(fixture::row(json!({"id": id, "email": email}))),
         source: SourceInfo {
             version: "1".into(),
             connector: "mysql".into(),
@@ -63,6 +64,7 @@ fn event_on(day: u32, table: &str, id: i64, email: &str) -> Event {
         op: Op::Create,
         ts_ms,
         transaction: None,
+        type_mapping: TypeMapping::V2,
         event_id: None,
         tenant_id: None,
         schema_version: None,
@@ -103,11 +105,14 @@ async fn e2e_writes_partitioned_parquet_to_local_fs() -> Result<()> {
     let store = build_object_store(&params)?;
 
     let cols = [col("id", "bigint"), col("email", "varchar")];
-    let schema = Arc::new(build_envelope_arrow_schema(
-        Connector::Mysql,
-        &cols,
-        &TypeConversionOpts::default(),
-    ));
+    let schema = Arc::new(
+        build_envelope_arrow_schema(
+            Connector::Mysql,
+            &cols,
+            &TypeConversionOpts::default(),
+        )
+        .unwrap(),
+    );
 
     let format: Arc<dyn FileFormat> =
         Arc::new(ParquetFormat::new(Compression::Snappy));
@@ -151,12 +156,16 @@ async fn e2e_close_all_flushes_in_progress_writers() -> Result<()> {
     let params =
         ObjectStoreParams::local(tmp.path().to_string_lossy().to_string());
     let store = build_object_store(&params)?;
-    let cols = [col("id", "bigint")];
-    let schema = Arc::new(build_envelope_arrow_schema(
-        Connector::Mysql,
-        &cols,
-        &TypeConversionOpts::default(),
-    ));
+    // Every row column is declared: an undeclared one is refused.
+    let cols = [col("id", "bigint"), col("email", "varchar")];
+    let schema = Arc::new(
+        build_envelope_arrow_schema(
+            Connector::Mysql,
+            &cols,
+            &TypeConversionOpts::default(),
+        )
+        .unwrap(),
+    );
     let format: Arc<dyn FileFormat> = Arc::new(ParquetFormat::default());
     let cfg = WriterPoolConfig {
         prefix: String::new(),
@@ -190,12 +199,16 @@ async fn e2e_separate_days_produce_separate_files() -> Result<()> {
     let params =
         ObjectStoreParams::local(tmp.path().to_string_lossy().to_string());
     let store = build_object_store(&params)?;
-    let cols = [col("id", "bigint")];
-    let schema = Arc::new(build_envelope_arrow_schema(
-        Connector::Mysql,
-        &cols,
-        &TypeConversionOpts::default(),
-    ));
+    // Every row column is declared: an undeclared one is refused.
+    let cols = [col("id", "bigint"), col("email", "varchar")];
+    let schema = Arc::new(
+        build_envelope_arrow_schema(
+            Connector::Mysql,
+            &cols,
+            &TypeConversionOpts::default(),
+        )
+        .unwrap(),
+    );
     let format: Arc<dyn FileFormat> = Arc::new(ParquetFormat::default());
     let mut pool = WriterPool::with_fixed_schema(
         store.clone(),
@@ -227,5 +240,76 @@ async fn e2e_separate_days_produce_separate_files() -> Result<()> {
         .collect();
     days.sort();
     assert_eq!(days, vec!["day=10", "day=11", "day=12"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn e2e_extensions_and_bytes_round_trip_through_parquet() -> Result<()> {
+    use arrow_array::{Array, BinaryArray, StringArray};
+    use deltaforge_core::canonical::{CanonicalRow, CanonicalValue, Document};
+
+    let tmp = tempfile::tempdir()?;
+    let params =
+        ObjectStoreParams::local(tmp.path().to_string_lossy().to_string());
+    let store = build_object_store(&params)?;
+    let cols = [col("id", "bigint"), col("payload", "blob")];
+    let schema = Arc::new(
+        build_envelope_arrow_schema(
+            Connector::Mysql,
+            &cols,
+            &TypeConversionOpts::default(),
+        )
+        .unwrap(),
+    );
+    let format: Arc<dyn FileFormat> = Arc::new(ParquetFormat::default());
+    let mut pool = WriterPool::with_fixed_schema(
+        store.clone(),
+        format,
+        schema,
+        WriterPoolConfig::default(),
+    );
+
+    let mut with_ext = event_on(10, "orders", 1, "unused");
+    with_ext.after = Some(CanonicalRow::with_extensions(
+        vec![
+            ("id".into(), fixture::value(&json!(1))),
+            ("payload".into(), CanonicalValue::Bytes(vec![0, 0xfe, 7])),
+        ],
+        [(
+            "geo".to_string(),
+            Document::new(json!({"lon": 2.5, "lat": 1})),
+        )],
+    )?);
+    let mut plain = event_on(10, "orders", 2, "unused");
+    plain.after = Some(fixture::row(json!({"id": 2})));
+    pool.append_batch(&[with_ext, plain]).await?;
+    let committed = pool.close_all().await;
+    assert_eq!(committed.len(), 1);
+
+    let meta = store.head(&Path::from(committed[0].path.clone())).await?;
+    let reader = ParquetObjectReader::new(store.clone(), meta.location)
+        .with_file_size(meta.size);
+    let stream = ParquetRecordBatchStreamBuilder::new(reader)
+        .await?
+        .build()?;
+    let batches: Vec<RecordBatch> =
+        futures::TryStreamExt::try_collect(stream).await?;
+    let b = &batches[0];
+    let ext = b
+        .column_by_name("after_extensions")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(ext.value(0), r#"{"geo":{"lat":1,"lon":2.5}}"#);
+    assert!(ext.is_null(1));
+    let payload = b
+        .column_by_name("after_payload")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+    assert_eq!(payload.value(0), &[0, 0xfe, 7]);
+    assert!(payload.is_null(1));
     Ok(())
 }

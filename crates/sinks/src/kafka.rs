@@ -41,9 +41,7 @@ use common::{RetryOutcome, RetryPolicy, retry_async};
 use deltaforge_config::EncodingCfg;
 use deltaforge_config::KafkaSinkCfg;
 use deltaforge_core::encoding::EncodingType;
-use deltaforge_core::encoding::avro::{
-    AvroEncoder, SchemaIdentity, SourceSchemaProvider,
-};
+use deltaforge_core::encoding::avro::{AvroEncoder, SourceSchemaProvider};
 use deltaforge_core::envelope::Envelope;
 use deltaforge_core::{BatchResult, Event, Sink, SinkError, SinkResult};
 use futures::future::try_join_all;
@@ -54,7 +52,6 @@ use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::util::Timeout;
 use rdkafka::{ClientContext, Statistics};
-use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
 
@@ -133,6 +130,8 @@ pub struct KafkaSink {
 
     /// Envelope for wrapping events (Native, Debezium, CloudEvents)
     envelope: Box<dyn Envelope>,
+    /// Native-JSON rendering settings (`json_wide_integers`).
+    json_opts: deltaforge_core::NativeOpts,
 
     /// Encoding type (used for content-type headers)
     #[allow(dead_code)]
@@ -376,6 +375,9 @@ impl KafkaSink {
             topic_template,
             key_template,
             envelope: envelope_type.build(),
+            json_opts: deltaforge_core::NativeOpts {
+                wide_integers: cfg.json_wide_integers,
+            },
             encoding: encoding_type,
             avro_encoder,
             cancel,
@@ -398,11 +400,7 @@ impl KafkaSink {
             return Ok(self.topic.clone());
         }
 
-        let event_json = serde_json::to_value(event).map_err(|e| {
-            SinkError::Serialization {
-                details: e.to_string().into(),
-            }
-        })?;
+        let event_json = crate::payload::route_view(event);
 
         let resolved = self
             .topic_template
@@ -435,7 +433,8 @@ impl KafkaSink {
             if tmpl.is_static() {
                 return tmpl.resolve_lenient(&serde_json::Value::Null);
             }
-            if let Ok(event_json) = serde_json::to_value(event) {
+            {
+                let event_json = crate::payload::route_view(event);
                 return tmpl.resolve_lenient(&event_json);
             }
         }
@@ -445,17 +444,22 @@ impl KafkaSink {
     }
 
     /// Build rdkafka OwnedHeaders from routing.headers.
+    /// Kafka headers: the event's routing headers, and `df-type-mapping`,
+    /// the mapping version its values are rendered with.
     fn build_headers(&self, event: &Event) -> Option<OwnedHeaders> {
-        let map = event.routing.as_ref()?.headers.as_ref()?;
-        if map.is_empty() {
-            return None;
-        }
-        let mut headers = OwnedHeaders::new();
-        for (k, v) in map {
-            headers = headers.insert(Header {
-                key: k,
-                value: Some(v.as_bytes()),
-            });
+        let mut headers = OwnedHeaders::new().insert(Header {
+            key: "df-type-mapping",
+            value: Some(event.type_mapping.as_str().as_bytes()),
+        });
+        if let Some(map) =
+            event.routing.as_ref().and_then(|r| r.headers.as_ref())
+        {
+            for (k, v) in map {
+                headers = headers.insert(Header {
+                    key: k,
+                    value: Some(v.as_bytes()),
+                });
+            }
         }
         Some(headers)
     }
@@ -464,23 +468,18 @@ impl KafkaSink {
     fn serialize_event(&self, event: &Event) -> SinkResult<Vec<u8>> {
         if event.routing.as_ref().is_some_and(|r| r.raw_payload) {
             // Outbox raw mode: write event.after directly
-            return serde_json::to_vec(
-                event.after.as_ref().unwrap_or(&Value::Null),
-            )
-            .map_err(Into::into);
+            return crate::payload::raw_payload(
+                event,
+                self.json_opts,
+                &self.id,
+            );
         }
-        let envelope = self.envelope.wrap(event).map_err(|e| {
-            SinkError::Serialization {
-                details: e.to_string().into(),
-            }
-        })?;
-
-        self.encoding
-            .encode(&envelope)
-            .map(|b| b.to_vec())
-            .map_err(|e| SinkError::Serialization {
-                details: e.to_string().into(),
-            })
+        crate::payload::native_json(
+            self.envelope.as_ref(),
+            event,
+            self.json_opts,
+            &self.id,
+        )
     }
 
     /// Serialize event using Avro encoding (async — requires Schema Registry).
@@ -495,10 +494,11 @@ impl KafkaSink {
             .expect("avro_encoder must be set");
 
         if event.routing.as_ref().is_some_and(|r| r.raw_payload) {
-            return serde_json::to_vec(
-                event.after.as_ref().unwrap_or(&Value::Null),
-            )
-            .map_err(Into::into);
+            return crate::payload::raw_payload(
+                event,
+                self.json_opts,
+                &self.id,
+            );
         }
 
         // A DDL event is its own record under the topic's DDL subject,
@@ -511,25 +511,14 @@ impl KafkaSink {
             return Ok(bytes.to_vec());
         }
 
-        let envelope = self.envelope.wrap(event).map_err(|e| {
-            SinkError::Serialization {
-                details: e.to_string().into(),
-            }
-        })?;
+        let envelope =
+            self.envelope.wrap(event, self.json_opts).map_err(|e| {
+                deltaforge_core::encoding::EncodingError::from(e)
+                    .into_sink_error_for(&self.id)
+            })?;
 
         let bytes = encoder
-            .encode_event(
-                topic,
-                &envelope,
-                &event.source.connector,
-                &event.source.db,
-                &event.source.table,
-                SchemaIdentity::of(
-                    event.schema_version.as_deref(),
-                    event.schema_sequence,
-                )
-                .as_ref(),
-            )
+            .encode_event(topic, event, &envelope)
             .await
             .map_err(|e| {
                 warn!(

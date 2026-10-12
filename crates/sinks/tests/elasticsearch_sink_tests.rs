@@ -7,7 +7,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use deltaforge_config::{ElasticsearchSinkCfg, EsVersionSource};
-use deltaforge_core::{Event, Op, Sink, SourceInfo, SourcePosition};
+use deltaforge_core::canonical::{
+    CanonicalRow, CanonicalValue, DbValue, Decimal, IntWidth, Precision,
+    TimestampValue, fixture,
+};
+use deltaforge_core::{
+    Event, Op, Sink, SourceInfo, SourcePosition, TypeMapping,
+};
 use gate_ownership::GateOwned;
 use serde_json::{Value, json};
 use sinks::clickhouse::types::ColDesc;
@@ -109,10 +115,46 @@ fn cfg(url: &str, index: &str, auto_create: bool) -> ElasticsearchSinkCfg {
     }
 }
 
+/// A typed `orders` row from a JSON literal: `id` is a BIGINT; an
+/// `amount` string is a DECIMAL when it is exact decimal text (else TEXT,
+/// for the per-document mapping-error test); other values are fixture
+/// values.
+fn orders_row(v: Value) -> Option<CanonicalRow> {
+    let Value::Object(m) = v else {
+        return None;
+    };
+    let cols = m
+        .into_iter()
+        .map(|(k, v)| {
+            let value = match (k.as_str(), &v) {
+                ("id", Value::Number(n)) => CanonicalValue::Db(
+                    DbValue::int(n.as_i64().unwrap(), IntWidth::W64).unwrap(),
+                ),
+                ("amount", Value::String(s)) => match Decimal::parse(s) {
+                    Ok(d) => CanonicalValue::Db(DbValue::Decimal(d)),
+                    Err(_) => fixture::value(&v),
+                },
+                _ => fixture::value(&v),
+            };
+            (k, value)
+        })
+        .collect();
+    Some(CanonicalRow::new(cols).unwrap())
+}
+
 fn mk_event(op: Op, after: Value, before: Value, ts: i64) -> Event {
+    mk_row_event(op, orders_row(after), orders_row(before), ts)
+}
+
+fn mk_row_event(
+    op: Op,
+    after: Option<CanonicalRow>,
+    before: Option<CanonicalRow>,
+    ts: i64,
+) -> Event {
     Event {
-        before: if before.is_null() { None } else { Some(before) },
-        after: if after.is_null() { None } else { Some(after) },
+        before,
+        after,
         source: SourceInfo {
             version: "1".into(),
             connector: "mysql".into(),
@@ -127,6 +169,7 @@ fn mk_event(op: Op, after: Value, before: Value, ts: i64) -> Event {
         op,
         ts_ms: ts,
         transaction: None,
+        type_mapping: TypeMapping::V2,
         event_id: None,
         tenant_id: None,
         schema_version: None,
@@ -227,6 +270,9 @@ async fn upsert_delete_and_typed_mapping() {
         CancellationToken::new(),
         "p",
         Some(resolver()),
+        std::sync::Arc::new(
+            deltaforge_core::destination::MemoryDestinationBindings::default(),
+        ),
         &sinks::ResolvedSinkCreds::default(),
     )
     .unwrap();
@@ -291,10 +337,10 @@ async fn upsert_delete_and_typed_mapping() {
 #[tokio::test]
 #[ignore]
 async fn real_cdc_value_shapes_land_and_map_correctly() {
-    // Regression guard for the DLQ-everything bug: real MySQL CDC payloads carry
-    // base64-wrapped TEXT/BLOB and microsecond TIMESTAMP integers, which ES
-    // rejected against the generated text/date mappings. Feed those exact shapes
-    // and assert the documents actually land, decoded/typed correctly.
+    // Regression guard for the DLQ-everything bug: TEXT, BLOB and TIMESTAMP
+    // columns must produce document values their generated text/binary/date
+    // mappings accept. Values are typed by the source decoder (TEXT is text,
+    // BLOB is bytes, TIMESTAMP is a microsecond instant), never guessed.
     let (_c, base) = start_elasticsearch().await;
     let index = "orders_shapes";
     let sink = build_elasticsearch_sink(
@@ -302,22 +348,42 @@ async fn real_cdc_value_shapes_land_and_map_correctly() {
         CancellationToken::new(),
         "p",
         Some(resolver()),
+        std::sync::Arc::new(
+            deltaforge_core::destination::MemoryDestinationBindings::default(),
+        ),
         &sinks::ResolvedSinkCreds::default(),
     )
     .unwrap();
 
-    let batch = vec![mk_event(
-        Op::Create,
-        json!({
-            "id": 1,
-            "amount": "20.50",
-            "data": { "_base64": b64("backlog-hello") },   // TEXT via binlog
-            "created_at": 1789934706000000i64,              // TIMESTAMP micros
-            "blobby": { "_base64": b64("\u{0}\u{1}raw") },  // BLOB
-        }),
-        json!(null),
-        1,
-    )];
+    let created_at =
+        TimestampValue::instant(1_789_934_706_000_000, Precision::Fixed(6))
+            .unwrap();
+    let row = CanonicalRow::new(vec![
+        (
+            "id".into(),
+            CanonicalValue::Db(DbValue::int(1, IntWidth::W64).unwrap()),
+        ),
+        (
+            "amount".into(),
+            CanonicalValue::Db(DbValue::Decimal(
+                Decimal::parse("20.50").unwrap(),
+            )),
+        ),
+        (
+            "data".into(),
+            CanonicalValue::Db(DbValue::Text("backlog-hello".into())),
+        ),
+        (
+            "created_at".into(),
+            CanonicalValue::Db(DbValue::Timestamp(created_at)),
+        ),
+        (
+            "blobby".into(),
+            CanonicalValue::Db(DbValue::Binary(b"\x00\x01raw".to_vec())),
+        ),
+    ])
+    .unwrap();
+    let batch = vec![mk_row_event(Op::Create, Some(row), None, 1)];
     let res = sink.send_batch(&batch).await.unwrap();
     assert!(
         res.dlq_failures.is_empty(),
@@ -326,20 +392,22 @@ async fn real_cdc_value_shapes_land_and_map_correctly() {
     );
     refresh(&base, index).await;
 
-    // Document landed with decoded text and a normalized timestamp.
+    // Document landed with the text, base64 bytes and the instant's text.
     let (status, doc) = es_get(&base, &format!("/{index}/_doc/1")).await;
     assert_eq!(status, reqwest::StatusCode::OK, "doc must land: {doc}");
     let d: Value = serde_json::from_str(&doc).unwrap();
-    assert_eq!(d["_source"]["data"], json!("backlog-hello"), "text decoded");
+    assert_eq!(d["_source"]["data"], json!("backlog-hello"), "text");
     assert_eq!(
         d["_source"]["blobby"],
         json!(b64("\u{0}\u{1}raw")),
         "blob b64"
     );
     assert_eq!(
-        d["_source"]["created_at"].as_i64().unwrap(),
-        1789934706000i64,
-        "timestamp micros normalized to millis"
+        d["_source"]["created_at"],
+        json!(deltaforge_core::canonical::render::timestamp_text(
+            &created_at
+        )),
+        "timestamp as its exact text"
     );
 
     // Mapping is correctly typed for the new columns.
@@ -361,6 +429,9 @@ async fn replay_and_out_of_order_are_idempotent() {
         CancellationToken::new(),
         "p",
         Some(resolver()),
+        std::sync::Arc::new(
+            deltaforge_core::destination::MemoryDestinationBindings::default(),
+        ),
         &sinks::ResolvedSinkCreds::default(),
     )
     .unwrap();
@@ -436,6 +507,9 @@ async fn per_document_error_routes_to_dlq() {
         CancellationToken::new(),
         "p",
         Some(resolver()),
+        std::sync::Arc::new(
+            deltaforge_core::destination::MemoryDestinationBindings::default(),
+        ),
         &sinks::ResolvedSinkCreds::default(),
     )
     .unwrap();
@@ -472,5 +546,78 @@ async fn per_document_error_routes_to_dlq() {
         status_bad,
         reqwest::StatusCode::NOT_FOUND,
         "row 0 must not have landed"
+    );
+}
+
+/// The index's binding against a live cluster: a restarted sink whose first
+/// event is another relation is refused before any bulk request; an index
+/// deleted and recreated (another UUID) is refused as replaced; the refusal
+/// names both relations and no row data.
+#[tokio::test]
+#[ignore]
+async fn the_index_binding_holds_across_restart_and_recreation() {
+    let (_c, base) = start_elasticsearch().await;
+    let index = "orders_bound";
+    let store: std::sync::Arc<
+        dyn deltaforge_core::destination::DestinationBindingStore,
+    > = std::sync::Arc::new(
+        deltaforge_core::destination::MemoryDestinationBindings::default(),
+    );
+    let sink = || {
+        build_elasticsearch_sink(
+            &cfg(&base, index, true),
+            CancellationToken::new(),
+            "p",
+            Some(resolver()),
+            std::sync::Arc::clone(&store),
+            &sinks::ResolvedSinkCreds::default(),
+        )
+        .unwrap()
+    };
+    let row = |db: &str| {
+        let mut e = mk_event(
+            Op::Create,
+            json!({"id": 7, "amount": "1.50"}),
+            json!(null),
+            1,
+        );
+        e.source.db = db.into();
+        e
+    };
+    sink().send_batch(&[row("shop")]).await.unwrap();
+    refresh(&base, index).await;
+    let count = || async {
+        let (_, body) = es_get(&base, &format!("/{index}/_count")).await;
+        serde_json::from_str::<Value>(&body).unwrap()["count"].as_u64()
+    };
+    assert_eq!(count().await, Some(1));
+
+    // A restart: the other relation comes first.
+    let e = sink().send_batch(&[row("shop2")]).await.unwrap_err();
+    assert_eq!(
+        e.draft().map(|d| d.reason_code),
+        Some(deltaforge_core::incident::ReasonCode::SinkDestinationConflict)
+    );
+    let text = format!("{e:?}");
+    assert!(
+        text.contains("/shop/") && text.contains("/shop2/"),
+        "{text}"
+    );
+    assert!(!text.contains("1.50"), "no row data: {text}");
+    refresh(&base, index).await;
+    assert_eq!(count().await, Some(1), "nothing written");
+
+    // Recreated by hand: another index UUID.
+    reqwest::Client::new()
+        .delete(format!("{base}/{index}"))
+        .send()
+        .await
+        .unwrap();
+    let e = sink().send_batch(&[row("shop")]).await.unwrap_err();
+    assert_eq!(
+        e.draft()
+            .and_then(|d| d.discriminator.get("class").cloned())
+            .as_deref(),
+        Some("target_replaced")
     );
 }

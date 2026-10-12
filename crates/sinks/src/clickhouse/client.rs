@@ -19,6 +19,9 @@ pub trait ChTransport: Send + Sync {
 
     /// Execute a DDL statement (e.g. `CREATE TABLE …`).
     async fn execute_ddl(&self, sql: &str) -> Result<(), SinkError>;
+
+    /// Run a query; its response text (`FORMAT TabSeparated` output).
+    async fn query_text(&self, sql: &str) -> Result<String, SinkError>;
 }
 
 pub struct ClickHouseClient {
@@ -57,14 +60,14 @@ impl ClickHouseClient {
         })
     }
 
-    /// POST a body with a `?query=…` (+ extra params); map the response to a
-    /// `SinkError` on failure.
+    /// POST a body with a `?query=…` (+ extra params); the response body,
+    /// or a `SinkError` on failure.
     async fn post(
         &self,
         query: String,
         extra: &[(&str, String)],
         body: Vec<u8>,
-    ) -> Result<(), SinkError> {
+    ) -> Result<String, SinkError> {
         let mut params: Vec<(String, String)> = Vec::new();
         // Only add ?query= when non-empty. DDL is sent as the request *body*
         // (see `execute_ddl`) — a query-in-URL with an empty body triggers
@@ -114,7 +117,9 @@ impl ClickHouseClient {
         })?;
 
         if resp.status().is_success() {
-            return Ok(());
+            return resp.text().await.map_err(|e| {
+                SinkError::Io(std::io::Error::other(e.to_string()))
+            });
         }
         let code = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -165,11 +170,18 @@ impl ChTransport for ClickHouseClient {
             body,
         )
         .await
+        .map(drop)
     }
 
     async fn execute_ddl(&self, sql: &str) -> Result<(), SinkError> {
         // Send the DDL as the request body (ClickHouse executes the POST body as
         // SQL). An empty body with the query in the URL returns HTTP 411.
+        self.post(String::new(), &[], sql.as_bytes().to_vec())
+            .await
+            .map(drop)
+    }
+
+    async fn query_text(&self, sql: &str) -> Result<String, SinkError> {
         self.post(String::new(), &[], sql.as_bytes().to_vec()).await
     }
 }
@@ -195,6 +207,7 @@ mod tests {
             send_timeout_secs: 30,
             required: Some(true),
             auto_create: true,
+            extensions_column: "_extensions".into(),
         }
     }
 

@@ -99,6 +99,7 @@ async fn start_test_server(
 
 fn make_http_cfg(id: &str, url: &str) -> HttpSinkCfg {
     HttpSinkCfg {
+        json_wide_integers: Default::default(),
         id: id.into(),
         url: url.into(),
         method: "POST".into(),
@@ -437,5 +438,86 @@ async fn http_sink_acknowledges_a_barrier_after_a_batch() -> Result<()> {
     sink.barrier(&deltaforge_core::BarrierKind::Terminal, &ctx)
         .await?;
     assert_eq!(server.received_events().await.len(), 1);
+    Ok(())
+}
+
+// =============================================================================
+// json_wide_integers
+// =============================================================================
+
+/// An event whose after row holds one 64-bit column `big`.
+fn wide_event(v: deltaforge_core::canonical::DbValue) -> Event {
+    use deltaforge_core::canonical::{CanonicalRow, CanonicalValue};
+    let mut e = make_test_event(1);
+    e.after = Some(
+        CanonicalRow::new(vec![("big".into(), CanonicalValue::Db(v))]).unwrap(),
+    );
+    e
+}
+
+async fn wide_sink(
+    wide: deltaforge_core::canonical::render::WideIntegers,
+) -> Result<(HttpSink, TestServer)> {
+    let server = TestServer::new();
+    let app = Router::new()
+        .route("/events", post(handle_event))
+        .with_state(server.clone());
+    let (port, _handle) = start_test_server(app).await;
+    let mut cfg =
+        make_http_cfg("test-wide", &format!("http://127.0.0.1:{port}/events"));
+    cfg.json_wide_integers = wide;
+    let sink = HttpSink::new(
+        &cfg,
+        CancellationToken::new(),
+        "test",
+        None,
+        &sinks::ResolvedSinkCreds::default(),
+    )?;
+    Ok((sink, server))
+}
+
+#[tokio::test]
+async fn http_sink_renders_wide_integers_as_strings_by_default() -> Result<()> {
+    use deltaforge_core::canonical::{DbValue, IntWidth};
+    init_test_tracing();
+    let (sink, server) = wide_sink(Default::default()).await?;
+    sink.send(&wide_event(DbValue::int(i64::MAX, IntWidth::W64)?))
+        .await?;
+    sink.send(&wide_event(DbValue::uint(u64::MAX, IntWidth::W64)?))
+        .await?;
+    let received = server.received_events().await;
+    assert_eq!(received[0]["after"]["big"], i64::MAX.to_string());
+    assert_eq!(received[1]["after"]["big"], u64::MAX.to_string());
+    assert_eq!(received[0]["source"]["type_mapping"], "v2");
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_sink_wide_integers_as_numbers() -> Result<()> {
+    use deltaforge_core::canonical::render::WideIntegers;
+    use deltaforge_core::canonical::{DbValue, IntWidth};
+    init_test_tracing();
+    let (sink, server) = wide_sink(WideIntegers::Number).await?;
+    sink.send(&wide_event(DbValue::int(i64::MIN, IntWidth::W64)?))
+        .await?;
+    let received = server.received_events().await;
+    assert_eq!(received[0]["after"]["big"], serde_json::json!(i64::MIN));
+
+    // An unsigned value above i64::MAX has no exact JSON number here: a
+    // conversion failure, and nothing is delivered.
+    let err = sink
+        .send(&wide_event(DbValue::uint(
+            i64::MAX as u64 + 1,
+            IntWidth::W64,
+        )?))
+        .await
+        .unwrap_err();
+    let draft = err.draft().expect("a conversion incident");
+    assert_eq!(
+        draft.reason_code,
+        deltaforge_core::incident::ReasonCode::SinkConversionFailed
+    );
+    assert!(err.to_string().contains("after.big"), "{err}");
+    assert_eq!(server.request_count(), 1, "the failed event was not sent");
     Ok(())
 }
