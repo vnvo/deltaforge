@@ -1,42 +1,27 @@
 //! JavaScript processor using Deno runtime.
 //!
-//! # Number Type Limitations
+//! # Values at the JavaScript boundary
 //!
-//! JavaScript represents all numbers as IEEE 754 double-precision floats (f64).
-//! When events pass through the JS processor, integer fields undergo conversion:
-//!
-//! ```text
-//! Rust i64 → serde_v8 → V8 Number (f64) → serde_v8 → Rust f64
-//! ```
-//!
-//! **This affects ALL numeric values**, even if the JS code doesn't modify them.
-//! Simply returning the input array causes integer→float conversion because
-//! V8 stores all numbers as f64 internally.
-//!
-//! ## Event Struct Fields
-//!
-//! Event metadata fields (`ts_ms`, `size_bytes`, etc.) use lenient deserialization
-//! that accepts both integers and whole-number floats, so they round-trip correctly.
-//!
-//! ## Payload Fields (before/after)
-//!
-//! Payload fields are NOT normalized to preserve user data schema. This means:
-//! - Integer values may become floats: `{"id": 1}` → `{"id": 1.0}`
-//! - Precision loss for large integers (>2^53-1): `9007199254740993` → `9007199254740992.0`
-//! - Original float values are preserved: `{"price": 10.5}` → `{"price": 10.5}`
-//!
-//! ## Recommendations
-//!
-//! - Use JS processor for routing, filtering, and metadata-based transforms
-//! - Avoid modifying numeric payload fields when downstream systems require strict types
-//! - For tables with BIGINT primary keys, consider filtering those events from JS processing
-//! - Use native Rust processors when numeric precision is critical
+//! Scripts see each event's native rendering for its own mapping version,
+//! with every 64-bit integer as its exact decimal string (JavaScript numbers
+//! are doubles). Column types never enter the script: each output's rows are
+//! re-typed against the input event it retains or derives from (see
+//! [`crate::js_boundary`]). An unchanged value comes back exactly; a changed
+//! value parses exactly as its column's type or fails the batch; a new
+//! column is an untyped document.
 
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use deltaforge_core::{BatchContext, Event, EventId, EventRouting, Processor};
+use deltaforge_core::{
+    BatchContext, Event, EventId, EventRouting, Op, Processor, SourceInfo,
+    Transaction,
+};
+use serde::Deserialize;
+
+use crate::js_boundary::{Authority, SchemaCtx, from_js_row, to_js};
 use deno_core::{JsRuntime, RuntimeOptions, extension};
 use deno_core::{serde_v8, v8};
 use serde_json::Value;
@@ -83,7 +68,8 @@ const DF_ID: &str = "__df_id";
 /// Reserved JS field set by `derive(parent, output)` naming the parent's id.
 const DF_PARENT: &str = "__df_parent";
 
-type JsJob = (Vec<Event>, oneshot::Sender<Result<Vec<Event>>>);
+/// A batch, each event with its schema context, and where to reply.
+type JsJob = (Vec<(Event, SchemaCtx)>, oneshot::Sender<Result<Vec<Event>>>);
 
 pub struct JsProcessor {
     id: String,
@@ -232,24 +218,23 @@ fn js_worker_thread(
 /// Runs one batch inside the JsRuntime (single-threaded).
 ///
 /// Flow:
-/// 1. Serialize events to JSON
-/// 2. Collect existing routing (since Event.routing is #[serde(skip)])
+/// 1. Render each event for the script (see [`crate::js_boundary`])
+/// 2. Collect existing routing (it is not part of the rendering)
 /// 3. Call __df_setup(events, existingRouting) to inject .route() methods
 /// 4. Call processBatch(events)
-/// 5. Extract __routing from output events, deserialize, reattach
-///
-/// Note: All numeric values pass through V8's f64 representation.
-/// Event struct fields are normalized back to i64, but payload fields
-/// (before/after) retain their JS-converted types. See module docs.
+/// 5. Re-type each output's rows against its input and schema context,
+///    and reattach its `__routing`
 fn process_batch_in_runtime(
     rt: &mut JsRuntime,
     id: &str,
     digest: &str,
-    events: Vec<Event>,
+    batch: Vec<(Event, SchemaCtx)>,
 ) -> Result<Vec<Event>> {
-    debug!(processor_id=%id, in_len=events.len(), "JS processing batch");
+    debug!(processor_id=%id, in_len=batch.len(), "JS processing batch");
+    let (events, schemas): (Vec<Event>, Vec<SchemaCtx>) =
+        batch.into_iter().unzip();
 
-    // Collect existing routing before serialization (routing is #[serde(skip)])
+    // Collect existing routing (it is not part of the rendering)
     let existing_routing: Vec<Value> = events
         .iter()
         .map(|e| {
@@ -265,19 +250,22 @@ fn process_batch_in_runtime(
     let input_ids: std::collections::HashSet<EventId> =
         events.iter().filter_map(|e| e.event_id).collect();
 
-    let mut json_events =
-        serde_json::to_value(&events).context("serialize events for JS")?;
-
-    // Inject each input's stable id as `__df_id` so scripts can pass it to
-    // derive() and so retained ids are visible (provisional_event_id is
-    // #[serde(skip)], hence not in the serialized form).
-    if let Value::Array(arr) = &mut json_events {
-        for (i, obj) in arr.iter_mut().enumerate() {
-            if let (Value::Object(o), Some(pid)) = (obj, events[i].event_id) {
-                o.insert(DF_ID.into(), Value::String(pid.to_string()));
-            }
+    // Each input's rendering for the script, and its typed rows (by id) to
+    // re-type the outputs with.
+    let mut rendered = Vec::with_capacity(events.len());
+    let mut authorities: std::collections::HashMap<EventId, Authority> =
+        std::collections::HashMap::new();
+    for (ev, schema) in events.iter().zip(schemas) {
+        let (mut v, authority) = to_js(ev, schema)?;
+        // Inject each input's stable id as `__df_id` so scripts can pass it
+        // to derive() and so retained ids are visible.
+        if let (Value::Object(o), Some(pid)) = (&mut v, ev.event_id) {
+            o.insert(DF_ID.into(), Value::String(pid.to_string()));
+            authorities.insert(pid, authority);
         }
+        rendered.push(v);
     }
+    let json_events = Value::Array(rendered);
 
     let scope = &mut rt.handle_scope();
     let ctx = scope.get_current_context();
@@ -341,7 +329,7 @@ fn process_batch_in_runtime(
     if result.is_null_or_undefined() {
         let mutated_val: Value = serde_v8::from_v8(&mut try_catch, arg)
             .context("failed to read mutated JS events arg")?;
-        return finalize_output(mutated_val, &input_ids, digest);
+        return finalize_output(mutated_val, &input_ids, &authorities, digest);
     }
 
     // Interpret return value
@@ -349,10 +337,15 @@ fn process_batch_in_runtime(
         .context("failed to convert JS return value to JSON")?;
 
     match ret_json {
-        Value::Array(_) => finalize_output(ret_json, &input_ids, digest),
-        Value::Object(_) => {
-            finalize_output(Value::Array(vec![ret_json]), &input_ids, digest)
+        Value::Array(_) => {
+            finalize_output(ret_json, &input_ids, &authorities, digest)
         }
+        Value::Object(_) => finalize_output(
+            Value::Array(vec![ret_json]),
+            &input_ids,
+            &authorities,
+            digest,
+        ),
         other => {
             bail!(
                 "JS processor returned unsupported type: {} (expected array, object, or null)",
@@ -368,14 +361,131 @@ fn process_batch_in_runtime(
 fn finalize_output(
     mut val: Value,
     input_ids: &std::collections::HashSet<EventId>,
+    authorities: &std::collections::HashMap<EventId, Authority>,
     digest: &str,
 ) -> Result<Vec<Event>> {
-    let ids = resolve_output_lineage(&mut val, input_ids, digest)?;
-    let mut events = deserialize_events_with_routing(val)?;
-    for (event, id) in events.iter_mut().zip(ids) {
+    let lineage = resolve_output_lineage(&mut val, input_ids, digest)?;
+    let routings = extract_routing(&mut val);
+    let Value::Array(outputs) = val else {
+        bail!("JS processor output must be an array of events");
+    };
+    let mut events = Vec::with_capacity(outputs.len());
+    for (i, out) in outputs.into_iter().enumerate() {
+        let (id, authority) = lineage.get(i).copied().unwrap_or((None, None));
+        let mut event =
+            event_from_js(out, authority.and_then(|a| authorities.get(&a)))?;
         event.event_id = id;
+        if let Some(Some(routing)) = routings.get(i) {
+            event.routing = Some(routing.clone());
+        }
+        events.push(event);
     }
     Ok(events)
+}
+
+/// The metadata of an event a script returned (its rows are re-typed
+/// separately).
+#[derive(Deserialize)]
+struct JsEventMeta {
+    source: SourceInfo,
+    op: Op,
+    ts_ms: i64,
+    #[serde(default)]
+    transaction: Option<Transaction>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(default)]
+    schema_version: Option<String>,
+    #[serde(default)]
+    schema_sequence: Option<u64>,
+    #[serde(default)]
+    ddl: Option<Value>,
+    #[serde(default)]
+    trace_id: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    synthetic: Option<String>,
+    #[serde(default)]
+    tx_end: bool,
+}
+
+/// An event from a script's output object, its rows re-typed against
+/// `authority` (the input it retains or derives from).
+fn event_from_js(out: Value, authority: Option<&Authority>) -> Result<Event> {
+    let Value::Object(mut obj) = out else {
+        bail!("JS processor output must be objects");
+    };
+    normalize_event_fields(&mut obj);
+    let row =
+        |v: Option<Value>| -> Result<Option<serde_json::Map<String, Value>>> {
+            match v {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::Object(m)) => Ok(Some(m)),
+                Some(_) => bail!("a row image must be an object or null"),
+            }
+        };
+    let before = row(obj.remove("before"))?;
+    let after = row(obj.remove("after"))?;
+    obj.remove("unchanged_columns");
+    obj.remove("event_id");
+    // The mapping version is the input's: a script cannot change how values
+    // are typed.
+    if let Some(Value::Object(src)) = obj.get_mut("source") {
+        src.remove("type_mapping");
+    }
+    let meta: JsEventMeta = serde_json::from_value(Value::Object(obj))
+        .context("failed to decode event metadata from JS")?;
+    let mapping = authority
+        .map(|a| a.mapping)
+        .unwrap_or(deltaforge_core::TypeMapping::V2);
+    // An output without an input (an id-less legacy batch) names no schema.
+    let no_schema = SchemaCtx::NoReference;
+    let schema = authority.map_or(&no_schema, |a| &a.schema);
+    let before = before
+        .map(|m| {
+            from_js_row(
+                "before",
+                authority.and_then(|a| a.before.as_ref()),
+                schema,
+                m,
+                mapping,
+            )
+        })
+        .transpose()?;
+    let after = after
+        .map(|m| {
+            from_js_row(
+                "after",
+                authority.and_then(|a| a.after.as_ref()),
+                schema,
+                m,
+                mapping,
+            )
+        })
+        .transpose()?;
+    Ok(Event {
+        before,
+        after,
+        source: meta.source,
+        op: meta.op,
+        ts_ms: meta.ts_ms,
+        transaction: meta.transaction,
+        type_mapping: mapping,
+        event_id: None,
+        tenant_id: meta.tenant_id,
+        schema_version: meta.schema_version,
+        schema_sequence: meta.schema_sequence,
+        ddl: meta.ddl,
+        trace_id: meta.trace_id,
+        tags: meta.tags,
+        synthetic: meta.synthetic,
+        routing: None,
+        tx_end: meta.tx_end,
+        boundary: None,
+        size_bytes: 0,
+        received_at_ms: 0,
+    })
 }
 
 /// For each output object: strip the reserved lineage fields and compute its
@@ -383,11 +493,12 @@ fn finalize_output(
 /// otherwise the output must retain an input's `__df_id` (a 1:1 transform).
 /// Missing lineage, an unknown/cross-batch parent, or a parent id retained by
 /// more than one output are all errors — never guessed.
+#[allow(clippy::type_complexity)]
 fn resolve_output_lineage(
     val: &mut Value,
     input_ids: &std::collections::HashSet<EventId>,
     digest: &str,
-) -> Result<Vec<Option<EventId>>> {
+) -> Result<Vec<(Option<EventId>, Option<EventId>)>> {
     let arr = match val {
         Value::Array(a) => a,
         _ => return Ok(vec![]),
@@ -402,7 +513,7 @@ fn resolve_output_lineage(
                 obj.remove(DF_ID);
             }
         }
-        return Ok(vec![None; arr.len()]);
+        return Ok(vec![(None, None); arr.len()]);
     }
     let mut ids = Vec::with_capacity(arr.len());
     let mut retained: std::collections::HashSet<EventId> =
@@ -435,7 +546,7 @@ fn resolve_output_lineage(
                 let ord = ordinals.entry(parent_id).or_insert(0);
                 let id = EventId::synthetic(&parent_id, digest, *ord);
                 *ord += 1;
-                id
+                (id, parent_id)
             }
             // 1:1 transform: the output must retain exactly one input id.
             None => {
@@ -462,48 +573,12 @@ fn resolve_output_lineage(
                          fan-out must derive() its additional outputs"
                     );
                 }
-                rid
+                (rid, rid)
             }
         };
-        ids.push(Some(id));
+        ids.push((Some(id.0), Some(id.1)));
     }
     Ok(ids)
-}
-
-/// Deserialize events with lenient number handling.
-///
-/// Event struct fields (ts_ms, size_bytes, etc.) accept both i64 and f64,
-/// converting whole-number floats back to integers. Payload fields (before/after)
-/// are left unchanged to preserve user data schema.
-fn deserialize_events_lenient(mut val: Value) -> Result<Vec<Event>> {
-    // Normalize only Event struct fields, not payloads
-    if let Value::Array(ref mut arr) = val {
-        for event in arr.iter_mut() {
-            if let Value::Object(obj) = event {
-                normalize_event_fields(obj);
-            }
-        }
-    }
-
-    serde_json::from_value(val).context("failed to decode events from JS")
-}
-
-/// Deserialize events and reattach routing from `__routing` fields.
-///
-/// 1. Extract and remove `__routing` from each event JSON object
-/// 2. Deserialize events normally (routing is #[serde(skip)], so ignored)
-/// 3. Reattach parsed routing to the deserialized Event structs
-fn deserialize_events_with_routing(mut val: Value) -> Result<Vec<Event>> {
-    let routings = extract_routing(&mut val);
-    let mut events = deserialize_events_lenient(val)?;
-
-    for (i, event) in events.iter_mut().enumerate() {
-        if let Some(Some(routing)) = routings.get(i) {
-            event.routing = Some(routing.clone());
-        }
-    }
-
-    Ok(events)
 }
 
 /// Extract and remove `__routing` from each event JSON object.
@@ -604,15 +679,48 @@ impl Processor for JsProcessor {
     async fn process(
         &self,
         events: Vec<Event>,
-        _ctx: &BatchContext,
+        ctx: &BatchContext,
     ) -> Result<Vec<Event>> {
         if !self.is_alive() {
             bail!("JS processor worker has crashed");
         }
 
+        // The batch's schema versions were resolved and validated before
+        // any processor ran; each event's types are looked up once per
+        // distinct version and shared.
+        let mut resolved: std::collections::HashMap<
+            deltaforge_core::canonical::schema::SchemaRef,
+            SchemaCtx,
+        > = std::collections::HashMap::new();
+        let mut batch = Vec::with_capacity(events.len());
+        for ev in events {
+            let schema = match deltaforge_core::canonical::schema::SchemaRef::of(
+                &ev,
+            ) {
+                None => SchemaCtx::NoReference,
+                Some(r) => match resolved.get(&r) {
+                    Some(s) => s.clone(),
+                    None => {
+                        let s = match ctx.schemas.as_ref().map(|s| s.get(&r)) {
+                            None => SchemaCtx::Missing(
+                                "the pipeline provides no schema context".into(),
+                            ),
+                            Some(None) => SchemaCtx::Missing(
+                                "the batch did not resolve the event's schema version".into(),
+                            ),
+                            Some(Some(types)) => SchemaCtx::Resolved(Arc::clone(types)),
+                        };
+                        resolved.insert(r, s.clone());
+                        s
+                    }
+                },
+            };
+            batch.push((ev, schema));
+        }
+
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send((events, reply_tx))
+            .send((batch, reply_tx))
             .await
             .context("send batch to JS worker failed")?;
 
@@ -627,6 +735,94 @@ impl Processor for JsProcessor {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A document (a column and an extension, objects nested in arrays at
+    /// several levels) renders the same bytes live, in the stored durable
+    /// form and after replay, here where `serde_json` keeps insertion order.
+    #[test]
+    fn documents_render_identically_live_stored_and_replayed() {
+        use deltaforge_core::canonical::{
+            CanonicalRow, CanonicalValue, Document,
+        };
+        let doc = || {
+            Document::new(
+                serde_json::from_str(
+                    r#"{"z":[{"y":{"b":[{"d":1,"c":2}],"a":0}}],"a":[[{"q":1,"p":2}]]}"#,
+                )
+                .unwrap(),
+            )
+        };
+        let row = CanonicalRow::with_extensions(
+            vec![
+                (
+                    "id".into(),
+                    CanonicalValue::Db(
+                        deltaforge_core::canonical::DbValue::int(
+                            7,
+                            deltaforge_core::canonical::IntWidth::W64,
+                        )
+                        .unwrap(),
+                    ),
+                ),
+                ("payload".into(), CanonicalValue::Document(doc())),
+            ],
+            [("added".to_string(), doc())],
+        )
+        .unwrap();
+        let live = deltaforge_core::Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 1),
+            deltaforge_core::SourceInfo {
+                version: "1".into(),
+                connector: "mysql".into(),
+                name: "p".into(),
+                ts_ms: 0,
+                db: "d".into(),
+                schema: None,
+                table: "t".into(),
+                snapshot: None,
+                position: Default::default(),
+            },
+            deltaforge_core::Op::Create,
+            None,
+            Some(row),
+            deltaforge_core::TypeMapping::V2,
+            0,
+            0,
+        );
+        let stored = serde_json::to_vec(&live.to_durable()).unwrap();
+        let replayed = deltaforge_core::Event::from_durable(
+            serde_json::from_slice(&stored).unwrap(),
+        )
+        .unwrap();
+        let render = |e: &deltaforge_core::Event| {
+            serde_json::to_vec(&e.native(Default::default()).unwrap()).unwrap()
+        };
+        assert_eq!(render(&live), render(&replayed));
+        let expected = r#"{"a":[[{"p":2,"q":1}]],"z":[{"y":{"a":0,"b":[{"c":2,"d":1}]}}]}"#;
+        let live_json = String::from_utf8(render(&live)).unwrap();
+        assert!(live_json.contains(expected), "{live_json}");
+        assert_eq!(
+            serde_json::to_vec(&replayed.to_durable()).unwrap(),
+            stored,
+            "the stored form is a fixed point"
+        );
+    }
+
+    /// This crate's JavaScript engine makes `serde_json` keep insertion
+    /// order; a document still has one key order (sorted), so it renders the
+    /// same live and after the durable round trip.
+    #[test]
+    fn documents_have_one_key_order_whatever_the_insertion() {
+        let inserted: serde_json::Value = serde_json::from_str(
+            r#"{"z":1,"a":{"y":[{"q":1,"b":2}],"b":true}}"#,
+        )
+        .unwrap();
+        let d = deltaforge_core::canonical::Document::new(inserted);
+        assert_eq!(
+            serde_json::to_string(d.value()).unwrap(),
+            r#"{"a":{"b":true,"y":[{"b":2,"q":1}]},"z":1}"#
+        );
+    }
 
     #[test]
     fn normalize_to_i64_converts_only_whole_in_range_numbers() {

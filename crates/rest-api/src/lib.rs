@@ -218,6 +218,7 @@ mod tests {
                         on_schema_drift:
                             deltaforge_config::OnSchemaDrift::Adapt,
                         rotation: None,
+                        type_mapping: Default::default(),
                     }),
                     processors: vec![],
                     sinks: vec![SinkCfg::Redis(RedisSinkCfg {
@@ -234,6 +235,7 @@ mod tests {
                         envelope: deltaforge_config::EnvelopeCfg::Debezium,
                         encoding: deltaforge_config::EncodingCfg::Json,
                         filter: None,
+                        json_wide_integers: Default::default(),
                     })],
                     connection_policy: None,
                     batch: Some(BatchConfig::default()),

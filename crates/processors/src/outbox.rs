@@ -34,7 +34,11 @@ use metrics::counter;
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use deltaforge_core::{BatchContext, Event, Op, Processor};
+use deltaforge_core::canonical::Document;
+use deltaforge_core::canonical::view::row_view;
+use deltaforge_core::{
+    BatchContext, CanonicalRow, CanonicalValue, Event, Op, Processor,
+};
 
 // Config types live in deltaforge-config to avoid circular deps
 use deltaforge_config::{
@@ -56,7 +60,7 @@ pub struct OutboxProcessor {
 }
 
 /// Bump when a code change alters this processor's output for identical config.
-const OUTBOX_IMPL_VERSION: u32 = 1;
+const OUTBOX_IMPL_VERSION: u32 = 2;
 
 impl OutboxProcessor {
     pub fn new(cfg: OutboxProcessorCfg, pipeline: String) -> Result<Self> {
@@ -126,18 +130,8 @@ impl OutboxProcessor {
             return Ok(false);
         }
 
-        let mut after = match event.after.take() {
-            Some(v) if v.is_object() => v,
-            Some(v) => {
-                warn!(
-                    table = %event.source.table,
-                    value_type = %value_type_name(&v),
-                    "outbox: dropping event with non-object payload"
-                );
-                counter!("deltaforge_outbox_dropped_total", "pipeline" => self.pipeline.clone(), "processor" => self.id.clone(), "reason" => "non_object").increment(1);
-                event.after = Some(v);
-                return Ok(false);
-            }
+        let mut row = match event.after.take() {
+            Some(row) => row,
             None => {
                 warn!(
                     table = %event.source.table,
@@ -149,6 +143,9 @@ impl OutboxProcessor {
         };
 
         let cols = &self.cfg.columns;
+        // Routing fields are read through the path view of the row (exact
+        // integers, JSON columns as documents).
+        let after = Value::Object(row_view(&row, event.type_mapping));
 
         // All immutable borrows of `after` in this block
         let topic = self.resolve_topic(&after, cols);
@@ -196,10 +193,7 @@ impl OutboxProcessor {
             }
         }
 
-        // Mutable: move payload out instead of cloning
-        let payload = after
-            .as_object_mut()
-            .and_then(|obj| obj.remove(cols.payload.as_str()));
+        let payload = row.remove(cols.payload.as_str());
 
         let mut routing = event.routing.take().unwrap_or_default();
         if let Some(t) = topic {
@@ -242,9 +236,25 @@ impl OutboxProcessor {
         headers.insert("df-source-kind".into(), "outbox".into());
         event.routing = Some(routing);
 
-        event.after = Some(payload.unwrap_or(after));
+        event.after = Some(match payload {
+            Some(p) => payload_row(&cols.payload, p, event.type_mapping),
+            // No payload column: the remaining columns, as documents.
+            None => CanonicalRow::new(
+                row_view(&row, event.type_mapping)
+                    .into_iter()
+                    .map(|(k, v)| {
+                        (k, CanonicalValue::Document(Document::new(v)))
+                    })
+                    .collect(),
+            )
+            .expect("view keys are unique"),
+        });
         event.before = None;
         event.source.schema = None;
+        // The row is the payload now, not a row of the outbox table: it
+        // names no schema version.
+        event.schema_version = None;
+        event.schema_sequence = None;
 
         counter!("deltaforge_outbox_transformed_total", "pipeline" => self.pipeline.clone(), "processor" => self.id.clone()).increment(1);
         Ok(true)
@@ -297,15 +307,37 @@ impl OutboxProcessor {
     }
 }
 
-/// Returns a human-readable JSON type name for diagnostics.
-fn value_type_name(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "null",
-        Value::Bool(_) => "bool",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
+/// The event's row after the transform, explicit schema-less data (the row
+/// is no longer the outbox table's, so typed sinks never read it as its
+/// columns): a payload that is a JSON object (a JSON column or a document)
+/// becomes its fields, each an untyped document; any other payload is one
+/// column, `name`, holding it as a document (its path view: exact integers,
+/// a JSON column as its document), or as bytes for logical-message bytes.
+fn payload_row(
+    name: &str,
+    payload: CanonicalValue,
+    mapping: deltaforge_core::TypeMapping,
+) -> CanonicalRow {
+    let json = match &payload {
+        CanonicalValue::Bytes(_) => None,
+        CanonicalValue::Document(d) => Some(d.value().clone()),
+        other => deltaforge_core::canonical::view::value_view(other, mapping),
+    };
+    match json {
+        Some(Value::Object(fields)) => CanonicalRow::new(
+            fields
+                .into_iter()
+                .map(|(k, v)| (k, CanonicalValue::Document(Document::new(v))))
+                .collect(),
+        )
+        .expect("JSON object keys are unique"),
+        Some(other) => CanonicalRow::new(vec![(
+            name.to_string(),
+            CanonicalValue::Document(Document::new(other)),
+        )])
+        .expect("one column"),
+        None => CanonicalRow::new(vec![(name.to_string(), payload)])
+            .expect("one column"),
     }
 }
 
@@ -362,10 +394,16 @@ impl Processor for OutboxProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deltaforge_core::SourceInfo;
+    use deltaforge_core::canonical::DbValue;
+    use deltaforge_core::canonical::{JsonText, fixture};
+    use deltaforge_core::{SourceInfo, TypeMapping};
     use serde_json::json;
 
     fn outbox_event(table: &str, after: Value) -> Event {
+        outbox_row_event(table, fixture::row(after))
+    }
+
+    fn outbox_row_event(table: &str, after: CanonicalRow) -> Event {
         Event::new_row(
             deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
             SourceInfo {
@@ -382,6 +420,7 @@ mod tests {
             Op::Create,
             None,
             Some(after),
+            TypeMapping::V2,
             1000,
             100,
         )
@@ -403,7 +442,8 @@ mod tests {
             },
             Op::Create,
             None,
-            Some(json!({"id": 1})),
+            Some(fixture::row(json!({"id": 1}))),
+            TypeMapping::V2,
             1000,
             50,
         )
@@ -441,7 +481,17 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         let ev = &result[0];
-        assert_eq!(ev.after.as_ref().unwrap()["order_id"], 42);
+        // The document payload's fields become the row's columns.
+        let after = ev.after.as_ref().unwrap();
+        assert_eq!(after.len(), 2);
+        assert_eq!(
+            after.get("order_id"),
+            Some(&CanonicalValue::Document(Document::new(json!(42))))
+        );
+        assert_eq!(
+            after.get("total"),
+            Some(&CanonicalValue::Document(Document::new(json!(99.99))))
+        );
         assert_eq!(
             ev.routing.as_ref().unwrap().topic.as_deref(),
             Some("events.default")
@@ -917,14 +967,120 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_object_payload_dropped() {
+    async fn non_object_payload_is_one_document_column() {
         let proc = OutboxProcessor::new(default_cfg(), String::new()).unwrap();
 
-        let ev = outbox_event("outbox", json!("just a string"));
+        let ev = outbox_event(
+            "outbox",
+            json!({
+                "aggregate_type": "Order",
+                "aggregate_id": "1",
+                "event_type": "Created",
+                "payload": "just a string"
+            }),
+        );
         let events = vec![ev];
         let ctx = BatchContext::from_batch(&events);
         let out = proc.process(events, &ctx).await.unwrap();
-        assert!(out.is_empty());
+        assert_eq!(out.len(), 1);
+        let after = out[0].after.as_ref().unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after.get("payload"),
+            Some(&CanonicalValue::Document(Document::new(json!(
+                "just a string"
+            ))))
+        );
+        // The row is no longer the outbox table's: no schema reference,
+        // while the mapping version and identity stay.
+        assert_eq!(out[0].schema_version, None);
+        assert_eq!(out[0].schema_sequence, None);
+        assert_eq!(out[0].type_mapping, deltaforge_core::TypeMapping::V2);
+        assert!(out[0].event_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn json_column_payload_object_becomes_document_columns() {
+        let proc = OutboxProcessor::new(default_cfg(), String::new()).unwrap();
+
+        let mut row = fixture::row(json!({
+            "aggregate_type": "Order",
+            "aggregate_id": "7",
+            "event_type": "Created",
+        }));
+        row.set(
+            "payload",
+            CanonicalValue::Db(DbValue::Json(
+                JsonText::new(r#"{"total": 5, "lines": [1, 2]}"#.into())
+                    .unwrap(),
+            )),
+        );
+        let events = vec![outbox_row_event("outbox", row)];
+        let ctx = BatchContext::from_batch(&events);
+        let out = proc.process(events, &ctx).await.unwrap();
+        let after = out[0].after.as_ref().unwrap();
+        let mut names: Vec<_> = after.names().collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["lines", "total"]);
+        assert_eq!(
+            after.get("total"),
+            Some(&CanonicalValue::Document(Document::new(json!(5))))
+        );
+        assert_eq!(
+            after.get("lines"),
+            Some(&CanonicalValue::Document(Document::new(json!([1, 2]))))
+        );
+    }
+
+    #[tokio::test]
+    async fn json_column_payload_scalar_stays_one_document_column() {
+        let proc = OutboxProcessor::new(default_cfg(), String::new()).unwrap();
+
+        let mut row = fixture::row(json!({
+            "aggregate_type": "Order",
+            "aggregate_id": "7",
+            "event_type": "Created",
+        }));
+        row.set(
+            "payload",
+            CanonicalValue::Db(DbValue::Json(
+                JsonText::new("[1, 2]".into()).unwrap(),
+            )),
+        );
+        let events = vec![outbox_row_event("outbox", row)];
+        let ctx = BatchContext::from_batch(&events);
+        let out = proc.process(events, &ctx).await.unwrap();
+        let after = out[0].after.as_ref().unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after.get("payload"),
+            Some(&CanonicalValue::Document(Document::new(json!([1, 2]))))
+        );
+    }
+
+    #[tokio::test]
+    async fn wide_integer_ids_exact_in_headers() {
+        let proc = OutboxProcessor::new(default_cfg(), String::new()).unwrap();
+
+        // 2^53 + 1: not representable as a double.
+        let ev = outbox_event(
+            "outbox",
+            json!({
+                "id": 9_007_199_254_740_993_i64,
+                "aggregate_type": "Order",
+                "aggregate_id": 9_007_199_254_740_993_i64,
+                "event_type": "Created",
+                "payload": {}
+            }),
+        );
+        let events = vec![ev];
+        let ctx = BatchContext::from_batch(&events);
+        let out = proc.process(events, &ctx).await.unwrap();
+        let routing = out[0].routing.as_ref().unwrap();
+        let headers = routing.headers.as_ref().unwrap();
+        assert_eq!(headers.get("df-event-id").unwrap(), "9007199254740993");
+        assert_eq!(headers.get("df-aggregate-id").unwrap(), "9007199254740993");
+        assert_eq!(routing.key.as_deref(), Some("9007199254740993"));
     }
 
     #[tokio::test]

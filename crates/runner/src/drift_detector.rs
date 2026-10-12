@@ -142,12 +142,11 @@ impl TableDriftTracker {
     }
 
     /// Observe a row and check for drift.
-    pub fn observe_row(&mut self, row: &serde_json::Value) {
-        let Some(obj) = row.as_object() else {
-            return;
-        };
-
-        // Collect column names we expect (owned to avoid borrow conflict)
+    /// Observe a row image's declared columns (extensions are not columns
+    /// and never drift). Values are compared by their canonical type, never
+    /// by a JSON rendering; an unchanged TOAST value carries no value and is
+    /// not observed.
+    pub fn observe_row(&mut self, row: &deltaforge_core::CanonicalRow) {
         let expected_columns: Vec<String> = self
             .expected_schema
             .columns
@@ -161,7 +160,13 @@ impl TableDriftTracker {
             .map(|name| (name.clone(), false))
             .collect();
 
-        for (col_name, value) in obj {
+        for (col_name, value) in row.iter() {
+            if matches!(value, deltaforge_core::CanonicalValue::Unchanged) {
+                if let Some(seen) = seen_columns.get_mut(col_name) {
+                    *seen = true;
+                }
+                continue;
+            }
             if let Some(seen) = seen_columns.get_mut(col_name) {
                 *seen = true;
                 self.observe_declared_column(col_name, value);
@@ -169,7 +174,7 @@ impl TableDriftTracker {
                 // Column not in schema
                 *self
                     .undeclared_columns
-                    .entry(col_name.clone())
+                    .entry(col_name.to_string())
                     .or_default() += 1;
             }
         }
@@ -191,7 +196,7 @@ impl TableDriftTracker {
     fn observe_declared_column(
         &mut self,
         col_name: &str,
-        value: &serde_json::Value,
+        value: &deltaforge_core::CanonicalValue,
     ) {
         let Some(col_info) = self.expected_schema.column(col_name) else {
             return;
@@ -222,14 +227,14 @@ impl TableDriftTracker {
             return;
         }
 
-        // Track observed type
-        let observed_type = json_type_name(value);
+        // Track observed canonical type
+        let observed_type = canonical_kind(value);
         *stats
             .observed_types
-            .entry(observed_type.clone())
+            .entry(observed_type.to_string())
             .or_default() += 1;
 
-        // Check for type mismatch
+        // Check for type mismatch (never sampling the value itself)
         if let Some(drift) = check_type_mismatch(col_info, value) {
             self.record_drift(DriftEvent {
                 table: self.expected_schema.table.clone(),
@@ -239,7 +244,7 @@ impl TableDriftTracker {
                 observed: drift,
                 first_seen: Utc::now(),
                 count: 1,
-                samples: vec![value.to_string().chars().take(100).collect()],
+                samples: vec![],
             });
         }
     }
@@ -324,91 +329,82 @@ pub struct DriftSummary {
     pub high_null_columns: usize,
 }
 
-/// Get JSON type name.
-fn json_type_name(value: &serde_json::Value) -> String {
+/// The canonical kind of a value.
+fn canonical_kind(value: &deltaforge_core::CanonicalValue) -> &'static str {
+    use deltaforge_core::CanonicalValue as C;
+    use deltaforge_core::canonical::DbValue as D;
     match value {
-        serde_json::Value::Null => "null".to_string(),
-        serde_json::Value::Bool(_) => "boolean".to_string(),
-        serde_json::Value::Number(n) => {
-            if n.is_i64() {
-                "integer".to_string()
-            } else {
-                "number".to_string()
-            }
-        }
-        serde_json::Value::String(_) => "string".to_string(),
-        serde_json::Value::Array(_) => "array".to_string(),
-        serde_json::Value::Object(_) => "object".to_string(),
+        C::Null => "null",
+        C::Unchanged => "unchanged",
+        C::Opaque(_) => "opaque",
+        C::Document(_) => "document",
+        C::Bytes(_) => "bytes",
+        C::Db(db) => match db {
+            D::Int { .. } | D::UInt { .. } => "integer",
+            D::Decimal(_) => "decimal",
+            D::Float32(_) | D::Float64(_) => "float",
+            D::Bool(_) => "boolean",
+            D::Text(_) => "text",
+            D::Binary(_) => "binary",
+            D::Bits(_) => "bits",
+            D::Enum(_) => "enum",
+            D::Set(_) => "set",
+            D::Json(_) => "json",
+            D::Date(_) => "date",
+            D::Time(_) => "time",
+            D::DateTime(_) => "datetime",
+            D::Timestamp(_) => "timestamp",
+            D::Year(_) => "year",
+            D::Uuid(_) => "uuid",
+            D::Array(_) => "array",
+        },
     }
 }
 
-/// Check if observed JSON value mismatches expected SQL type.
+/// The canonical kinds a declared SQL type's values decode to; `None` for
+/// a type this check does not know (never flagged).
+fn expected_kinds(sql_type: &str) -> Option<&'static [&'static str]> {
+    Some(match sql_type {
+        "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint"
+        | "int2" | "int4" | "int8" | "serial" | "bigserial" | "smallserial"
+        | "oid" => &["integer"],
+        "decimal" | "numeric" => &["decimal"],
+        "float" | "double" | "real" | "double precision" | "float4"
+        | "float8" => &["float"],
+        "bool" | "boolean" => &["boolean"],
+        "bit" => &["bits"],
+        "char" | "varchar" | "text" | "tinytext" | "mediumtext"
+        | "longtext" | "character varying" | "character" | "bpchar"
+        | "name" => &["text"],
+        "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob"
+        | "longblob" | "bytea" => &["binary"],
+        "enum" => &["enum", "opaque"],
+        "set" => &["set"],
+        "json" | "jsonb" => &["json"],
+        "date" => &["date"],
+        "time" | "time without time zone" => &["time"],
+        "datetime" | "timestamp without time zone" => &["datetime"],
+        "timestamp" => &["timestamp", "datetime"],
+        "timestamptz" | "timestamp with time zone" => &["timestamp"],
+        "year" => &["year"],
+        "uuid" => &["uuid"],
+        _ => return None,
+    })
+}
+
+/// Whether a canonical value's kind differs from its declared SQL type's
+/// (the observed kind, or `None`).
 fn check_type_mismatch(
     col: &ColumnSchemaInfo,
-    value: &serde_json::Value,
+    value: &deltaforge_core::CanonicalValue,
 ) -> Option<String> {
-    let sql_type = col.data_type.to_lowercase();
-
-    match value {
-        serde_json::Value::Bool(_) => {
-            if !matches!(
-                sql_type.as_str(),
-                "bool" | "boolean" | "tinyint" | "bit"
-            ) {
-                Some("boolean".to_string())
-            } else {
-                None
-            }
-        }
-        serde_json::Value::Number(n) => {
-            let is_int = n.is_i64() || n.is_u64();
-            let expects_int = matches!(
-                sql_type.as_str(),
-                "int"
-                    | "integer"
-                    | "bigint"
-                    | "smallint"
-                    | "tinyint"
-                    | "mediumint"
-                    | "serial"
-                    | "bigserial"
-            );
-            let expects_float = matches!(
-                sql_type.as_str(),
-                "float" | "double" | "real" | "decimal" | "numeric"
-            );
-
-            if is_int && !expects_int && !expects_float {
-                Some("integer".to_string())
-            } else if !is_int && expects_int {
-                Some("float".to_string())
-            } else {
-                None
-            }
-        }
-        serde_json::Value::String(_) => {
-            // Strings are compatible with most types (due to serialization)
-            // Only flag if column is strictly numeric
-            let strictly_numeric = matches!(
-                sql_type.as_str(),
-                "int" | "integer" | "bigint" | "float" | "double"
-            );
-            if strictly_numeric {
-                Some("string".to_string())
-            } else {
-                None
-            }
-        }
-        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            // Complex types should only go into JSON columns
-            if !col.is_json_like {
-                Some(json_type_name(value))
-            } else {
-                None
-            }
-        }
-        serde_json::Value::Null => None, // Handled separately
+    let observed = canonical_kind(value);
+    if col.is_array {
+        return (observed != "array" && observed != "opaque")
+            .then(|| observed.to_string());
     }
+    let expected = expected_kinds(&col.data_type.to_lowercase())?;
+    (!expected.contains(&observed)).then(|| observed.to_string())
 }
 
 /// Drift detector that manages multiple tables.
@@ -444,7 +440,11 @@ impl DriftDetector {
     }
 
     /// Observe a row for a table
-    pub fn observe(&mut self, table: &str, row: &serde_json::Value) {
+    pub fn observe(
+        &mut self,
+        table: &str,
+        row: &deltaforge_core::CanonicalRow,
+    ) {
         if let Some(tracker) = self.trackers.get_mut(table) {
             tracker.observe_row(row);
         }
@@ -474,7 +474,24 @@ impl DriftDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deltaforge_core::canonical::{DbValue, JsonText};
+    use deltaforge_core::{CanonicalRow, CanonicalValue};
     use serde_json::json;
+
+    /// A decoded `orders` row: fixture values, with the JSON column's
+    /// document as the typed JSON value its source decoder produces.
+    fn row(v: serde_json::Value) -> CanonicalRow {
+        let mut r = deltaforge_core::canonical::fixture::row(v.clone());
+        if let Some(doc) = v.get("metadata").filter(|d| !d.is_null()) {
+            r.set(
+                "metadata",
+                CanonicalValue::Db(DbValue::Json(
+                    JsonText::new(doc.to_string()).unwrap(),
+                )),
+            );
+        }
+        r
+    }
 
     fn test_schema() -> TableSchemaInfo {
         TableSchemaInfo {
@@ -519,12 +536,12 @@ mod tests {
     fn test_no_drift_on_valid_data() {
         let mut tracker = TableDriftTracker::new(test_schema());
 
-        tracker.observe_row(&json!({
+        tracker.observe_row(&row(json!({
             "id": 1,
             "customer_id": 100,
             "notes": "test",
             "metadata": {"key": "value"}
-        }));
+        })));
 
         assert!(tracker.drift_events.is_empty());
     }
@@ -533,12 +550,12 @@ mod tests {
     fn test_detects_unexpected_null() {
         let mut tracker = TableDriftTracker::new(test_schema());
 
-        tracker.observe_row(&json!({
+        tracker.observe_row(&row(json!({
             "id": 1,
             "customer_id": null,  // NOT NULL column!
             "notes": null,        // nullable, ok
             "metadata": null      // nullable, ok
-        }));
+        })));
 
         assert_eq!(tracker.drift_events.len(), 1);
         assert_eq!(tracker.drift_events[0].column, "customer_id");
@@ -552,12 +569,12 @@ mod tests {
     fn test_detects_type_mismatch() {
         let mut tracker = TableDriftTracker::new(test_schema());
 
-        tracker.observe_row(&json!({
+        tracker.observe_row(&row(json!({
             "id": "not_an_int",  // string in int column
             "customer_id": 100,
             "notes": "ok",
             "metadata": {}
-        }));
+        })));
 
         assert_eq!(tracker.drift_events.len(), 1);
         assert_eq!(tracker.drift_events[0].column, "id");
@@ -568,13 +585,13 @@ mod tests {
     fn test_tracks_undeclared_columns() {
         let mut tracker = TableDriftTracker::new(test_schema());
 
-        tracker.observe_row(&json!({
+        tracker.observe_row(&row(json!({
             "id": 1,
             "customer_id": 100,
             "notes": "test",
             "metadata": {},
             "unknown_col": "surprise!"  // not in schema
-        }));
+        })));
 
         assert_eq!(tracker.undeclared_columns.get("unknown_col"), Some(&1));
     }
@@ -583,13 +600,13 @@ mod tests {
     fn test_drift_summary() {
         let mut tracker = TableDriftTracker::new(test_schema());
 
-        tracker.observe_row(&json!({
+        tracker.observe_row(&row(json!({
             "id": 1,
             "customer_id": null,
             "notes": null,
             "metadata": {},
             "extra": "undeclared"
-        }));
+        })));
 
         let summary = tracker.summary();
         assert_eq!(summary.unexpected_nulls, 1);

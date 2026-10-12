@@ -24,6 +24,7 @@ sha2 = "0.10"
 hex = "0.4"
 
 [dev-dependencies]
+deltaforge-core = { path = "../deltaforge-core", features = ["test-fixtures"] }
 tempfile = "3"
 pretty_assertions = "1"
 serial_test = "3"

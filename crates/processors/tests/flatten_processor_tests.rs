@@ -8,8 +8,11 @@ use deltaforge_config::{
     CollisionPolicy, EmptyListPolicy, EmptyObjectPolicy, FlattenProcessorCfg,
     ListPolicy,
 };
+use deltaforge_core::canonical::view::row_view;
+use deltaforge_core::canonical::{DbValue, Document, JsonText, fixture};
 use deltaforge_core::{
-    BatchContext, Event, Op, Processor, SourceInfo, SourcePosition,
+    BatchContext, CanonicalRow, CanonicalValue, Event, Op, Processor,
+    SourceInfo, SourcePosition, TypeMapping,
 };
 use processors::FlattenProcessor;
 use serde_json::json;
@@ -19,6 +22,10 @@ fn default_cfg() -> FlattenProcessorCfg {
 }
 
 fn make_event(after: serde_json::Value) -> Event {
+    make_row_event(fixture::row(after))
+}
+
+fn make_row_event(after: CanonicalRow) -> Event {
     Event::new_row(
         deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
         SourceInfo {
@@ -35,17 +42,25 @@ fn make_event(after: serde_json::Value) -> Event {
         Op::Create,
         None,
         Some(after),
+        TypeMapping::V2,
         1700000000000,
         128,
     )
 }
 
+/// Flatten `after` (a fixture row: objects and arrays are documents) and
+/// return the output row's path view.
 fn flatten(
     cfg: FlattenProcessorCfg,
     after: serde_json::Value,
 ) -> serde_json::Value {
+    let row = flatten_row(cfg, fixture::row(after));
+    serde_json::Value::Object(row_view(&row, TypeMapping::V2))
+}
+
+fn flatten_row(cfg: FlattenProcessorCfg, after: CanonicalRow) -> CanonicalRow {
     let proc = FlattenProcessor::new(cfg).expect("init ok");
-    let ev = make_event(after);
+    let ev = make_row_event(after);
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
@@ -72,8 +87,8 @@ fn flattens_nested_object_with_default_separator() {
 
 #[test]
 fn already_flat_payload_is_idempotent() {
-    let input = json!({ "id": 1, "name": "Alice", "score": 9.5 });
-    let result = flatten(default_cfg(), input.clone());
+    let input = fixture::row(json!({ "id": 1, "name": "Alice", "score": 9.5 }));
+    let result = flatten_row(default_cfg(), input.clone());
     assert_eq!(result, input);
 }
 
@@ -136,8 +151,12 @@ fn empty_object_drop_removes_field() {
 fn empty_object_null_converts_field() {
     let mut cfg = default_cfg();
     cfg.empty_object = EmptyObjectPolicy::Null;
-    let result = flatten(cfg, json!({ "meta": {}, "id": 1 }));
-    assert_eq!(result["meta"], json!(null));
+    let result = flatten_row(cfg, fixture::row(json!({ "meta": {}, "id": 1 })));
+    // A JSON null document, not SQL NULL.
+    assert_eq!(
+        result.get("meta"),
+        Some(&CanonicalValue::Document(Document::new(json!(null))))
+    );
 }
 
 #[test]
@@ -240,16 +259,25 @@ fn collision_error_fails_batch() {
 fn flattens_both_before_and_after() {
     let proc = FlattenProcessor::new(default_cfg()).expect("init ok");
     let mut ev = make_event(json!({}));
-    ev.before = Some(json!({ "addr": { "city": "Old" } }));
-    ev.after = Some(json!({ "addr": { "city": "New" } }));
+    ev.before = Some(fixture::row(json!({ "addr": { "city": "Old" } })));
+    ev.after = Some(fixture::row(json!({ "addr": { "city": "New" } })));
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
     let events = vec![ev];
     let ctx = BatchContext::from_batch(&events);
     let out = rt.block_on(proc.process(events, &ctx)).unwrap();
-    assert_eq!(out[0].before.as_ref().unwrap()["addr__city"], "Old");
-    assert_eq!(out[0].after.as_ref().unwrap()["addr__city"], "New");
+    let city = |row: &Option<CanonicalRow>| {
+        row.as_ref().unwrap().get("addr__city").cloned()
+    };
+    assert_eq!(
+        city(&out[0].before),
+        Some(CanonicalValue::Document(Document::new(json!("Old"))))
+    );
+    assert_eq!(
+        city(&out[0].after),
+        Some(CanonicalValue::Document(Document::new(json!("New"))))
+    );
 }
 
 // ============================================================================
@@ -309,4 +337,48 @@ fn index_list_recursion_respects_max_depth() {
         result.get("arr__0__x").is_none(),
         "must not over-flatten past max_depth"
     );
+}
+
+// ============================================================================
+// Only untyped documents expand; schema-typed values are leaves
+// ============================================================================
+
+#[test]
+fn json_column_is_a_leaf_while_document_object_flattens() {
+    let json_col = CanonicalValue::Db(DbValue::Json(
+        JsonText::new(r#"{"city": "Berlin"}"#.into()).unwrap(),
+    ));
+    let row = CanonicalRow::new(vec![
+        ("j".into(), json_col.clone()),
+        (
+            "d".into(),
+            CanonicalValue::Document(Document::new(json!({ "city": "Paris" }))),
+        ),
+    ])
+    .unwrap();
+    let result = flatten_row(default_cfg(), row);
+    assert_eq!(result.get("j"), Some(&json_col), "JSON column kept as-is");
+    assert!(result.get("j__city").is_none());
+    assert!(result.get("d").is_none());
+    assert_eq!(
+        result.get("d__city"),
+        Some(&CanonicalValue::Document(Document::new(json!("Paris"))))
+    );
+}
+
+#[test]
+fn extensions_flatten_into_extensions_never_columns() {
+    let row = CanonicalRow::with_extensions(
+        vec![("id".into(), fixture::value(&json!(1)))],
+        vec![(
+            "meta".to_string(),
+            Document::new(json!({"a": {"b": 1}, "c": 2})),
+        )],
+    )
+    .unwrap();
+    let out = flatten_row(default_cfg(), row);
+    assert_eq!(out.names().collect::<Vec<_>>(), ["id"]);
+    let ext: Vec<_> = out.extensions().keys().cloned().collect();
+    assert_eq!(ext, ["meta__a__b", "meta__c"]);
+    assert_eq!(out.extensions()["meta__a__b"], Document::new(json!(1)));
 }

@@ -723,14 +723,17 @@ impl SchemaSensorState {
         self.drift_detector.lock().register_table(schema);
     }
 
-    /// Observe a batch of events with guided JSON-only sensing.
+    /// Observe a batch of events.
     ///
-    /// When `db_schemas` is provided, only JSON columns are deep-inspected,
-    /// and drift detection runs against expected types.
+    /// Schema sensing inspects document structures only: untyped document
+    /// columns and processor-added extensions. Declared relational columns
+    /// (a JSON column included) already have an authoritative schema; their
+    /// values are never sensed, and an event's `schema_version` (its source
+    /// schema reference) is never rewritten. When `db_schemas` is provided,
+    /// drift detection compares each declared column's canonical value with
+    /// its declared type.
     ///
-    /// When `db_schemas` is None (schemaless sources), observes entire payload.
-    ///
-    /// Returns the number of schema evolutions detected.
+    /// Returns the number of document schema evolutions detected.
     pub fn observe_and_enrich(
         &self,
         events: &mut [Event],
@@ -744,160 +747,91 @@ impl SchemaSensorState {
         let mut sensor = self.sensor.lock();
         let mut drift = self.drift_detector.lock();
 
-        for event in events.iter_mut() {
+        for event in events.iter() {
             let Some(after) = &event.after else { continue };
 
-            // Run drift detection if we have DB schema
+            // Tables are keyed `namespace.table`, as their schemas are: the
+            // sensor and drift detector belong to this pipeline, whose source
+            // reads one database, so that names a table uniquely here (never
+            // a key across sources; see `SourceRelationIdentity`).
+            let table = &event.source.full_table_name();
             if let Some(schemas) = db_schemas
-                && let Some(_schema) = schemas.get(&event.source.table)
+                && schemas.contains_key(table)
             {
-                drift.observe(&event.source.table, after);
+                drift.observe(table, after);
             }
 
-            // Guided vs full sensing
-            if let Some(schemas) = db_schemas {
-                if let Some(schema) = schemas.get(&event.source.table) {
-                    // Guided: only observe JSON columns
-                    evolutions += self.observe_json_columns(
-                        &mut sensor,
-                        &event.source.table,
-                        after,
-                        schema,
-                    );
-                } else {
-                    // No schema for this table - observe full payload
-                    evolutions += self.observe_full_payload(
-                        &mut sensor,
-                        &event.source.table,
-                        after,
-                    );
-                }
-            } else {
-                // No DB schemas at all - observe full payload
-                evolutions += self.observe_full_payload(
+            let documents = after
+                .iter()
+                .filter_map(|(n, v)| match v {
+                    deltaforge_core::CanonicalValue::Document(d) => {
+                        Some((n, d))
+                    }
+                    _ => None,
+                })
+                .chain(after.extensions().iter().map(|(n, d)| (n.as_str(), d)));
+            for (name, doc) in documents {
+                evolutions += self.observe_document(
                     &mut sensor,
-                    &event.source.table,
-                    after,
+                    table,
+                    name,
+                    doc.value(),
                 );
             }
-
-            // Enrich event with schema version info
-            if let Some(version) = sensor.get_version(&event.source.table) {
-                event.schema_version = Some(version.fingerprint.clone());
-                event.schema_sequence = Some(version.sequence);
-            }
         }
 
         evolutions
     }
 
-    /// Observe only JSON columns in a row.
-    fn observe_json_columns(
+    /// Observe one document (a document column or an extension) under
+    /// `table:name`.
+    fn observe_document(
         &self,
         sensor: &mut SchemaSensor,
         table: &str,
-        row: &serde_json::Value,
-        schema: &TableSchemaInfo,
+        name: &str,
+        value: &serde_json::Value,
     ) -> usize {
-        let Some(obj) = row.as_object() else {
+        if value.is_null() {
             return 0;
-        };
-
-        let mut evolutions = 0;
-
-        for col in schema.json_columns() {
-            if let Some(json_value) = obj.get(&col.name) {
-                // Skip null JSON columns
-                if json_value.is_null() {
-                    continue;
-                }
-
-                // Create a unique key for this table:column
-                let key = format!("{}:{}", table, col.name);
-
-                match sensor.observe_value(&key, json_value) {
-                    Ok(result) => match &result {
-                        ObserveResult::Evolved {
-                            new_fingerprint,
-                            new_sequence,
-                            ..
-                        } => {
-                            evolutions += 1;
-                            info!(
-                                table = %table,
-                                column = %col.name,
-                                fingerprint = %new_fingerprint,
-                                sequence = %new_sequence,
-                                "JSON column schema evolved"
-                            );
-                        }
-                        ObserveResult::NewSchema {
-                            fingerprint,
-                            sequence,
-                        } => {
-                            info!(
-                                table = %table,
-                                column = %col.name,
-                                fingerprint = %fingerprint,
-                                sequence = %sequence,
-                                "new JSON column schema discovered"
-                            );
-                        }
-                        _ => {}
-                    },
-                    Err(e) => {
-                        warn!(
-                            table = %table,
-                            column = %col.name,
-                            error = %e,
-                            "JSON column schema sensing failed"
-                        );
-                    }
-                }
-            }
         }
-
-        evolutions
-    }
-
-    /// Observe entire payload (for schemaless sources).
-    fn observe_full_payload(
-        &self,
-        sensor: &mut SchemaSensor,
-        table: &str,
-        row: &serde_json::Value,
-    ) -> usize {
-        match sensor.observe_value(table, row) {
-            Ok(result) => match &result {
-                ObserveResult::Evolved {
-                    new_fingerprint,
-                    new_sequence,
-                    ..
-                } => {
-                    info!(
-                        table = %table,
-                        fingerprint = %new_fingerprint,
-                        sequence = %new_sequence,
-                        "schema evolved"
-                    );
-                    1
-                }
-                ObserveResult::NewSchema {
-                    fingerprint,
-                    sequence,
-                } => {
-                    info!(
-                        table = %table,
-                        fingerprint = %fingerprint,
-                        sequence = %sequence,
-                        "new schema discovered"
-                    );
-                    0
-                }
-                _ => 0,
-            },
+        let key = format!("{table}:{name}");
+        match sensor.observe_value(&key, value) {
+            Ok(ObserveResult::Evolved {
+                new_fingerprint,
+                new_sequence,
+                ..
+            }) => {
+                info!(
+                    table = %table,
+                    column = %name,
+                    fingerprint = %new_fingerprint,
+                    sequence = %new_sequence,
+                    "document schema evolved"
+                );
+                1
+            }
+            Ok(ObserveResult::NewSchema {
+                fingerprint,
+                sequence,
+            }) => {
+                info!(
+                    table = %table,
+                    column = %name,
+                    fingerprint = %fingerprint,
+                    sequence = %sequence,
+                    "new document schema discovered"
+                );
+                0
+            }
+            Ok(_) => 0,
             Err(e) => {
-                warn!(table = %table, error = %e, "schema sensing failed");
+                warn!(
+                    table = %table,
+                    column = %name,
+                    error = %e,
+                    "document schema sensing failed"
+                );
                 0
             }
         }
@@ -1343,9 +1277,8 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                 .as_ref()
                 .ok_or(ReplayCaptureError::MissingEventId)?
                 .to_string();
-            let event = serde_json::to_value(ev).map_err(|e| {
-                ReplayCaptureError::SerializeFailed(e.to_string())
-            })?;
+            // The durable canonical form: typed values and their version.
+            let event = ev.to_durable();
             events.push(ReplayEventRecord {
                 offset: i as u32,
                 event_id,
@@ -2058,16 +1991,17 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
 
             // Build schema map for guided sensing (if we have a provider)
             let db_schemas = if self.schema_provider.is_some() {
-                // Collect unique table names in this batch
-                let tables: std::collections::HashSet<&str> =
-                    events.iter().map(|e| e.source.table.as_str()).collect();
+                // The batch's tables, by `namespace.table` (same-named
+                // tables of different schemas never share a schema).
+                let tables: std::collections::HashSet<String> =
+                    events.iter().map(|e| e.source.full_table_name()).collect();
 
                 // Fetch schemas for each table
                 let mut schema_map = HashMap::new();
                 for table in tables {
-                    if let Some(schema) = self.get_or_fetch_schema(table).await
+                    if let Some(schema) = self.get_or_fetch_schema(&table).await
                     {
-                        schema_map.insert(table.to_string(), schema);
+                        schema_map.insert(table, schema);
                     }
                 }
 
@@ -2881,10 +2815,22 @@ pub fn build_commit_fn(
     })
 }
 
-/// Build the batch processor function.
+/// Build the batch processor function (without a schema context).
 pub fn build_batch_processor(
     processors: Arc<[ArcDynProcessor]>,
     pipeline: String,
+) -> ProcessBatchFn<CheckpointMeta> {
+    build_batch_processor_with_schemas(processors, pipeline, None)
+}
+
+/// Build the batch processor function. With a schema context, every
+/// distinct schema reference of the batch is resolved and validated (a
+/// missing version, a fingerprint or sequence conflict, a value its version
+/// does not admit) before any processor sees, let alone mutates, the batch.
+pub fn build_batch_processor_with_schemas(
+    processors: Arc<[ArcDynProcessor]>,
+    pipeline: String,
+    schemas: Option<Arc<dyn deltaforge_core::canonical::schema::SchemaContext>>,
 ) -> ProcessBatchFn<CheckpointMeta> {
     use futures::FutureExt;
 
@@ -2893,6 +2839,7 @@ pub fn build_batch_processor(
     Arc::new(move |events: Vec<Event>| {
         let procs = Arc::clone(&processors);
         let pipeline = Arc::clone(&pipeline_name);
+        let schemas = schemas.clone();
 
         async move {
             let last_cp =
@@ -2905,8 +2852,18 @@ pub fn build_batch_processor(
                 });
             }
 
-            // snapshot IDs once before any processor runs
-            let ctx = BatchContext::from_batch(&events);
+            // snapshot IDs and resolve the batch's schema versions once,
+            // before any processor runs
+            let mut ctx = BatchContext::from_batch(&events);
+            if let Some(schemas) = &schemas {
+                let resolved = deltaforge_core::canonical::schema::ResolvedSchemas::resolve(
+                    schemas.as_ref(),
+                    &events,
+                )
+                .await
+                .context("resolve the batch's schema versions")?;
+                ctx = ctx.with_schemas(Arc::new(resolved));
+            }
 
             let mut batch = events;
             for p in procs.iter() {
@@ -3040,7 +2997,10 @@ mod tests {
             source,
             deltaforge_core::Op::Create,
             None,
-            Some(serde_json::json!({ "id": id })),
+            Some(deltaforge_core::canonical::fixture::row(
+                serde_json::json!({ "id": id }),
+            )),
+            deltaforge_core::TypeMapping::V2,
             0,
             10,
         );
@@ -4723,7 +4683,14 @@ mod tests {
             .payload
             .events
             .iter()
-            .filter_map(|e| e.event.get("after")?.get("id")?.as_i64())
+            .filter_map(|e| {
+                let ev = Event::from_durable(e.event.clone()).ok()?;
+                deltaforge_core::canonical::view::value_view(
+                    ev.after.as_ref()?.get("id")?,
+                    deltaforge_core::TypeMapping::V2,
+                )?
+                .as_i64()
+            })
             .collect();
         assert_eq!(ids, vec![10, 11], "the replay only, once");
     }
@@ -5714,7 +5681,10 @@ mod tests {
             source,
             deltaforge_core::Op::Create,
             None,
-            Some(serde_json::json!({"id": 1})),
+            Some(deltaforge_core::canonical::fixture::row(
+                serde_json::json!({"id": 1}),
+            )),
+            deltaforge_core::TypeMapping::V2,
             0,
             0,
         );
@@ -5966,11 +5936,16 @@ mod tests {
             self.delivered
                 .fetch_add(events.len(), std::sync::atomic::Ordering::Relaxed);
             self.batch_sizes.lock().unwrap().push(events.len());
-            self.ids.lock().unwrap().extend(
-                events
-                    .iter()
-                    .filter_map(|e| e.after.as_ref()?.get("id")?.as_i64()),
-            );
+            self.ids
+                .lock()
+                .unwrap()
+                .extend(events.iter().filter_map(|e| {
+                    deltaforge_core::canonical::view::value_view(
+                        e.after.as_ref()?.get("id")?,
+                        deltaforge_core::TypeMapping::V2,
+                    )?
+                    .as_i64()
+                }));
             Ok(deltaforge_core::BatchResult::ok())
         }
     }
@@ -6208,7 +6183,10 @@ mod tests {
             source,
             deltaforge_core::Op::Create,
             None,
-            Some(serde_json::json!({"id": 1})),
+            Some(deltaforge_core::canonical::fixture::row(
+                serde_json::json!({"id": 1}),
+            )),
+            deltaforge_core::TypeMapping::V2,
             0,
             0,
         );
@@ -6297,7 +6275,10 @@ mod tests {
             source,
             deltaforge_core::Op::Create,
             None,
-            Some(serde_json::json!({"id": 1})),
+            Some(deltaforge_core::canonical::fixture::row(
+                serde_json::json!({"id": 1}),
+            )),
+            deltaforge_core::TypeMapping::V2,
             0,
             0,
         );
@@ -6381,7 +6362,10 @@ mod tests {
                 source.clone(),
                 deltaforge_core::Op::Create,
                 None,
-                Some(serde_json::json!({"id": i})),
+                Some(deltaforge_core::canonical::fixture::row(
+                    serde_json::json!({"id": i}),
+                )),
+                deltaforge_core::TypeMapping::V2,
                 0,
                 0,
             );
@@ -6669,7 +6653,10 @@ mod tests {
                 source.clone(),
                 deltaforge_core::Op::Create,
                 None,
-                Some(serde_json::json!({"id": i})),
+                Some(deltaforge_core::canonical::fixture::row(
+                    serde_json::json!({"id": i}),
+                )),
+                deltaforge_core::TypeMapping::V2,
                 0,
                 0,
             );
@@ -6781,7 +6768,10 @@ mod tests {
                 source.clone(),
                 deltaforge_core::Op::Create,
                 None,
-                Some(serde_json::json!({"id": i, "b": u64::MAX})),
+                Some(deltaforge_core::canonical::fixture::row(
+                    serde_json::json!({"id": i, "b": u64::MAX}),
+                )),
+                deltaforge_core::TypeMapping::V2,
                 0,
                 0,
             );
@@ -7021,7 +7011,10 @@ mod tests {
             source,
             deltaforge_core::Op::Create,
             None,
-            Some(serde_json::json!({"id": 1})),
+            Some(deltaforge_core::canonical::fixture::row(
+                serde_json::json!({"id": 1}),
+            )),
+            deltaforge_core::TypeMapping::V2,
             0,
             0,
         );
@@ -7106,7 +7099,10 @@ mod tests {
             source,
             deltaforge_core::Op::Create,
             None,
-            Some(serde_json::json!({"id": 1})),
+            Some(deltaforge_core::canonical::fixture::row(
+                serde_json::json!({"id": 1}),
+            )),
+            deltaforge_core::TypeMapping::V2,
             0,
             0,
         );
@@ -7194,7 +7190,10 @@ mod tests {
             source,
             deltaforge_core::Op::Create,
             None,
-            Some(serde_json::json!({"id": 1})),
+            Some(deltaforge_core::canonical::fixture::row(
+                serde_json::json!({"id": 1}),
+            )),
+            deltaforge_core::TypeMapping::V2,
             0,
             0,
         );
@@ -7283,7 +7282,10 @@ mod tests {
                 source.clone(),
                 deltaforge_core::Op::Create,
                 None,
-                Some(serde_json::json!({"id": i})),
+                Some(deltaforge_core::canonical::fixture::row(
+                    serde_json::json!({"id": i}),
+                )),
+                deltaforge_core::TypeMapping::V2,
                 0,
                 0,
             );
@@ -7368,7 +7370,10 @@ mod tests {
             source,
             deltaforge_core::Op::Create,
             None,
-            Some(serde_json::json!({"id": 1})),
+            Some(deltaforge_core::canonical::fixture::row(
+                serde_json::json!({"id": 1}),
+            )),
+            deltaforge_core::TypeMapping::V2,
             0,
             0,
         );
@@ -7487,7 +7492,10 @@ mod tests {
             source,
             deltaforge_core::Op::Create,
             None,
-            Some(serde_json::json!({"id": 1})),
+            Some(deltaforge_core::canonical::fixture::row(
+                serde_json::json!({"id": 1}),
+            )),
+            deltaforge_core::TypeMapping::V2,
             0,
             0,
         );
@@ -7584,7 +7592,10 @@ mod tests {
             source,
             deltaforge_core::Op::Create,
             None,
-            Some(serde_json::json!({"id": 1})),
+            Some(deltaforge_core::canonical::fixture::row(
+                serde_json::json!({"id": 1}),
+            )),
+            deltaforge_core::TypeMapping::V2,
             0,
             0,
         );
@@ -7752,7 +7763,10 @@ mod tests {
                 source.clone(),
                 deltaforge_core::Op::Create,
                 None,
-                Some(serde_json::json!({ "id": i })),
+                Some(deltaforge_core::canonical::fixture::row(
+                    serde_json::json!({ "id": i }),
+                )),
+                deltaforge_core::TypeMapping::V2,
                 0,
                 0,
             );
@@ -8105,7 +8119,10 @@ mod tests {
             source,
             deltaforge_core::Op::Create,
             None,
-            Some(serde_json::json!({"id": 1})),
+            Some(deltaforge_core::canonical::fixture::row(
+                serde_json::json!({"id": 1}),
+            )),
+            deltaforge_core::TypeMapping::V2,
             0,
             0,
         );
@@ -8252,7 +8269,10 @@ mod barrier_tests {
             source,
             deltaforge_core::Op::Create,
             None,
-            Some(serde_json::json!({ "id": i })),
+            Some(deltaforge_core::canonical::fixture::row(
+                serde_json::json!({ "id": i }),
+            )),
+            deltaforge_core::TypeMapping::V2,
             0,
             0,
         );

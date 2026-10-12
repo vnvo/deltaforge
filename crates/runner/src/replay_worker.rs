@@ -137,6 +137,13 @@ impl ReplayWorker {
             let head = meta.head_seq;
             let end =
                 stored.job.through_seq.map(|t| t.min(head)).unwrap_or(head);
+            // Preflight: every envelope of the range must be of the current
+            // format before any event is delivered or the cursor moves (a
+            // capture made before canonical values is refused here, whole).
+            if let Err(e) = self.preflight(stored.job.cursor, end).await {
+                self.fail_job(&mut stored, format!("{e:#}")).await;
+                return Err(e);
+            }
             self.deliver_through(&mut stored, end).await?;
             if self.cancel.is_cancelled() {
                 return Ok(Some(stored.job.phase));
@@ -166,6 +173,23 @@ impl ReplayWorker {
         }
 
         Ok(Some(stored.job.phase))
+    }
+
+    /// Verify every envelope in `(from_seq, up_to_seq]` loads (format version,
+    /// identity, integrity) without delivering any of it or moving the cursor.
+    async fn preflight(&self, from_seq: u64, up_to_seq: u64) -> Result<()> {
+        let mut seq = from_seq;
+        while seq < up_to_seq {
+            let batch = self.journal.read_since(seq, self.batch_limit).await?;
+            let Some(last) = batch.last() else {
+                break;
+            };
+            seq = last.seq;
+            if batch.iter().any(|e| e.seq >= up_to_seq) {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Deliver every envelope in `(cursor, up_to_seq]` to the job's targets, advancing the

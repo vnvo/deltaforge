@@ -2,8 +2,10 @@ use common::TableFilter;
 use deltaforge_config::{
     FieldOp, FieldPredicate, FilterProcessorCfg, MatchMode, OpFilter,
 };
+use deltaforge_core::canonical::{DbValue, IntWidth, JsonText, fixture};
 use deltaforge_core::{
-    BatchContext, Event, Op, Processor, SourceInfo, SourcePosition,
+    BatchContext, CanonicalRow, CanonicalValue, Event, Op, Processor,
+    SourceInfo, SourcePosition, TypeMapping,
 };
 use processors::FilterProcessor;
 use serde_json::json;
@@ -32,12 +34,17 @@ fn make_event(
     op: Op,
     after: serde_json::Value,
 ) -> Event {
+    row_event(db, table, op, fixture::row(after))
+}
+
+fn row_event(db: &str, table: &str, op: Op, after: CanonicalRow) -> Event {
     Event::new_row(
         deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
         source(db, table),
         op,
         None,
         Some(after),
+        TypeMapping::V2,
         1_700_000_000_000,
         64,
     )
@@ -117,7 +124,7 @@ async fn table_exclude_takes_priority_over_include() {
 
 #[tokio::test]
 async fn field_eq_int_vs_float_normalised() {
-    // 42 == 42.0 - critical when a JS processor upstream converts integers to floats.
+    // A DOUBLE 42.0 equals the integer predicate 42 (numeric equality).
     let cfg = FilterProcessorCfg {
         fields: vec![pred("score", FieldOp::Eq, json!(42))],
         ..Default::default()
@@ -309,7 +316,7 @@ async fn changed_only_passes_when_field_actually_differs() {
 
     let mut ev_changed =
         make_event("db", "t", Op::Update, json!({"status": "active"}));
-    ev_changed.before = Some(json!({"status": "pending"}));
+    ev_changed.before = Some(fixture::row(json!({"status": "pending"})));
 
     // Same status, different unrelated field - must drop.
     let mut ev_same = make_event(
@@ -318,7 +325,8 @@ async fn changed_only_passes_when_field_actually_differs() {
         Op::Update,
         json!({"status": "active", "name": "new"}),
     );
-    ev_same.before = Some(json!({"status": "active", "name": "old"}));
+    ev_same.before =
+        Some(fixture::row(json!({"status": "active", "name": "old"})));
 
     let out = run(cfg, vec![ev_changed, ev_same]).await;
     assert_eq!(out.len(), 1);
@@ -392,8 +400,9 @@ fn update_event(before: serde_json::Value, after: serde_json::Value) -> Event {
         deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
         source("db", "t"),
         Op::Update,
-        Some(before),
-        Some(after),
+        Some(fixture::row(before)),
+        Some(fixture::row(after)),
+        TypeMapping::V2,
         1_700_000_000_000,
         64,
     )
@@ -530,4 +539,131 @@ async fn field_changed_detects_value_change() {
     )
     .await;
     assert!(out.is_empty(), "field absent in both → not changed");
+}
+
+// ============================================================================
+// Canonical values: exact wide integers, JSON columns, unchanged TOAST
+// ============================================================================
+
+fn one_col(name: &str, v: CanonicalValue) -> CanonicalRow {
+    CanonicalRow::new(vec![(name.into(), v)]).unwrap()
+}
+
+fn int64(v: i64) -> CanonicalValue {
+    CanonicalValue::Db(DbValue::int(v, IntWidth::W64).unwrap())
+}
+
+#[tokio::test]
+async fn eq_on_64_bit_columns_is_exact() {
+    // u64::MAX column vs u64::MAX number predicate.
+    let big =
+        CanonicalValue::Db(DbValue::uint(u64::MAX, IntWidth::W64).unwrap());
+    let out = run(
+        FilterProcessorCfg {
+            fields: vec![pred("big", FieldOp::Eq, json!(u64::MAX))],
+            ..Default::default()
+        },
+        vec![row_event("db", "t", Op::Create, one_col("big", big))],
+    )
+    .await;
+    assert_eq!(out.len(), 1, "u64::MAX == u64::MAX");
+
+    // 2^53 + 1 and 2^53 are the same double but different integers.
+    let two53p1 = 9_007_199_254_740_993_i64;
+    let eq = |v: i64| FilterProcessorCfg {
+        fields: vec![pred("n", FieldOp::Eq, json!(v))],
+        ..Default::default()
+    };
+    let out = run(
+        eq(two53p1 - 1),
+        vec![row_event(
+            "db",
+            "t",
+            Op::Create,
+            one_col("n", int64(two53p1)),
+        )],
+    )
+    .await;
+    assert!(out.is_empty(), "2^53+1 must not equal 2^53");
+    let out = run(
+        eq(two53p1),
+        vec![row_event(
+            "db",
+            "t",
+            Op::Create,
+            one_col("n", int64(two53p1)),
+        )],
+    )
+    .await;
+    assert_eq!(out.len(), 1, "2^53+1 equals itself");
+
+    // Ordering is exact too.
+    let out = run(
+        FilterProcessorCfg {
+            fields: vec![pred("n", FieldOp::Gt, json!(two53p1 - 1))],
+            ..Default::default()
+        },
+        vec![row_event(
+            "db",
+            "t",
+            Op::Create,
+            one_col("n", int64(two53p1)),
+        )],
+    )
+    .await;
+    assert_eq!(out.len(), 1, "2^53+1 > 2^53");
+}
+
+#[tokio::test]
+async fn path_descends_into_json_column() {
+    let j = CanonicalValue::Db(DbValue::Json(
+        JsonText::new(r#"{"a": {"b": 7}}"#.into()).unwrap(),
+    ));
+    let out = run(
+        FilterProcessorCfg {
+            fields: vec![pred("j.a.b", FieldOp::Eq, json!(7))],
+            ..Default::default()
+        },
+        vec![row_event("db", "t", Op::Create, one_col("j", j))],
+    )
+    .await;
+    assert_eq!(out.len(), 1);
+}
+
+#[tokio::test]
+async fn predicate_on_unchanged_toast_column_fails_batch() {
+    let proc = FilterProcessor::new(FilterProcessorCfg {
+        fields: vec![pred("doc", FieldOp::Eq, json!("x"))],
+        ..Default::default()
+    })
+    .unwrap();
+    let events = vec![row_event(
+        "db",
+        "t",
+        Op::Update,
+        one_col("doc", CanonicalValue::Unchanged),
+    )];
+    let ctx = BatchContext::from_batch(&events);
+    let err = proc.process(events, &ctx).await.unwrap_err();
+    assert!(err.to_string().contains("unchanged TOAST"), "{err}");
+}
+
+#[tokio::test]
+async fn changed_is_false_for_unchanged_toast_after_column() {
+    let mut ev = row_event(
+        "db",
+        "t",
+        Op::Update,
+        one_col("doc", CanonicalValue::Unchanged),
+    );
+    ev.before = Some(fixture::row(json!({"doc": "old"})));
+    let out = run(
+        FilterProcessorCfg {
+            fields: vec![pred_no_value("doc", FieldOp::Changed)],
+            ..Default::default()
+        },
+        vec![ev],
+    )
+    .await;
+    assert!(out.is_empty(), "an unchanged TOAST column is not changed");
 }

@@ -49,6 +49,7 @@ serde_yaml.workspace = true
 tikv-jemallocator = { version = "0.6", optional = true }
 
 [dev-dependencies]
+deltaforge-core = { path = "../deltaforge-core", features = ["test-fixtures"] }
 s3-test-server = { path = "../s3-test-server" }
 metrics-util = "0.19"
 gate-ownership = { path = "../gate-ownership" }

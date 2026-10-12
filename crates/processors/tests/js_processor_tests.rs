@@ -1,24 +1,109 @@
 //! JS Processor correctness tests.
 //!
-//! # Number Type Behavior
+//! # Values at the JS boundary
 //!
-//! JavaScript represents all numbers as f64. When events pass through the
-//! JS processor, numeric values undergo conversion even without modification:
-//!
-//! - Event struct fields (ts_ms, size_bytes): Normalized back to i64
-//! - Payload fields (before/after): Remain as floats after JS round-trip
-//!
-//! Tests marked with `// Note: payload integers become floats` demonstrate
-//! this expected behavior.
+//! Scripts see the native rendering of each event (64-bit integers as exact
+//! decimal strings). Outputs are re-typed against the input: an unchanged
+//! value comes back as its exact original canonical value, a changed value
+//! must parse as its column's declared type (from the batch's schema
+//! context), and a field the schema does not declare is an untyped document.
+//! Assertions read the native rendering through [`after`] / [`before`], or
+//! the canonical values directly.
 
+use deltaforge_core::canonical::schema::{
+    ColumnType, ColumnTypes, ResolvedSchemas, SchemaContext,
+    SchemaContextError, SchemaRef,
+};
+use deltaforge_core::canonical::{
+    DbValue, Document, IntWidth, JsonText, Precision, TimestampValue, fixture,
+};
 use deltaforge_core::{
-    BatchContext, Event, EventRouting, Op, Processor, SourceInfo,
-    SourcePosition,
+    BatchContext, CanonicalRow, CanonicalValue, Event, EventRouting,
+    NativeOpts, Op, Processor, SourceInfo, SourcePosition, TypeMapping,
 };
 use pretty_assertions::assert_eq;
 use processors::JsProcessor;
 use serde_json::json;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+/// The schema version every fixture event names.
+const ORDERS_V1: &str = "orders-v1";
+
+/// A schema context with one registered version, counting its lookups.
+#[derive(Default)]
+struct TestSchemas {
+    lookups: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl SchemaContext for TestSchemas {
+    async fn resolve(
+        &self,
+        r: &SchemaRef,
+    ) -> Result<Arc<ColumnTypes>, SchemaContextError> {
+        self.lookups.fetch_add(1, Ordering::Relaxed);
+        if r.fingerprint != ORDERS_V1 {
+            return Err(SchemaContextError::Conflict(format!(
+                "{} is not registered",
+                r.fingerprint
+            )));
+        }
+        let int = |w| ColumnType::Int {
+            width: w,
+            unsigned: false,
+        };
+        Ok(Arc::new(ColumnTypes::new(
+            ORDERS_V1.into(),
+            Some(1),
+            vec![
+                ("id".into(), int(IntWidth::W32)),
+                ("note".into(), ColumnType::Text),
+                ("big".into(), int(IntWidth::W64)),
+                ("n".into(), int(IntWidth::W32)),
+                ("j".into(), ColumnType::Json),
+                ("doc".into(), ColumnType::Text),
+                (
+                    "mood".into(),
+                    ColumnType::Enum {
+                        labels: vec!["happy".into(), "sad".into()],
+                    },
+                ),
+                (
+                    "tags".into(),
+                    ColumnType::Set {
+                        labels: vec!["a".into(), "b".into(), "c".into()],
+                    },
+                ),
+                ("bin".into(), ColumnType::Binary { fixed: None }),
+                (
+                    "ts".into(),
+                    ColumnType::Timestamp {
+                        precision: Precision::Fixed(6),
+                    },
+                ),
+            ],
+        )))
+    }
+}
+
+/// The batch context with the batch's schema versions resolved from the
+/// test schema context (an unresolvable version is left out, as if the
+/// pipeline could not resolve it).
+async fn ctx_with(schemas: &TestSchemas, events: &[Event]) -> BatchContext {
+    let mut versions = Vec::new();
+    for r in events.iter().filter_map(SchemaRef::of) {
+        if let Ok(t) = schemas.resolve(&r).await {
+            versions.push((r, t));
+        }
+    }
+    BatchContext::from_batch(events)
+        .with_schemas(Arc::new(ResolvedSchemas::from_versions(versions)))
+}
+
+async fn ctx_for(events: &[Event]) -> BatchContext {
+    ctx_with(&TestSchemas::default(), events).await
+}
 
 static TEST_ID: AtomicU32 = AtomicU32::new(1);
 /// Distinct stable id per call (real events never share an id).
@@ -31,8 +116,18 @@ fn next_test_id() -> deltaforge_core::EventId {
     )
 }
 
+/// The native rendering of an event's after image.
+fn after(ev: &Event) -> serde_json::Value {
+    ev.native_value(NativeOpts::default()).unwrap()["after"].clone()
+}
+
+/// The native rendering of an event's before image.
+fn before(ev: &Event) -> serde_json::Value {
+    ev.native_value(NativeOpts::default()).unwrap()["before"].clone()
+}
+
 fn new_event() -> Event {
-    Event::new_row(
+    let mut ev = Event::new_row(
         next_test_id(),
         SourceInfo {
             version: "1.0.0".into(),
@@ -47,14 +142,18 @@ fn new_event() -> Event {
         },
         Op::Create,
         None,
-        Some(json!({ "id": 1, "note": "original" })),
+        Some(fixture::row(json!({ "id": 1, "note": "original" }))),
+        TypeMapping::V2,
         1700000000000,
         128,
-    )
+    );
+    ev.schema_version = Some(ORDERS_V1.into());
+    ev.schema_sequence = Some(1);
+    ev
 }
 
 fn new_update_event() -> Event {
-    Event::new_row(
+    let mut ev = Event::new_row(
         next_test_id(),
         SourceInfo {
             version: "1.0.0".into(),
@@ -68,15 +167,19 @@ fn new_update_event() -> Event {
             position: SourcePosition::default(),
         },
         Op::Update,
-        Some(json!({ "id": 1, "note": "before" })),
-        Some(json!({ "id": 1, "note": "after" })),
+        Some(fixture::row(json!({ "id": 1, "note": "before" }))),
+        Some(fixture::row(json!({ "id": 1, "note": "after" }))),
+        TypeMapping::V2,
         1700000000000,
         256,
-    )
+    );
+    ev.schema_version = Some(ORDERS_V1.into());
+    ev.schema_sequence = Some(1);
+    ev
 }
 
 fn new_delete_event() -> Event {
-    Event::new_row(
+    let mut ev = Event::new_row(
         next_test_id(),
         SourceInfo {
             version: "1.0.0".into(),
@@ -90,11 +193,15 @@ fn new_delete_event() -> Event {
             position: SourcePosition::default(),
         },
         Op::Delete,
-        Some(json!({ "id": 1, "note": "deleted" })),
+        Some(fixture::row(json!({ "id": 1, "note": "deleted" }))),
         None,
+        TypeMapping::V2,
         1700000000000,
         64,
-    )
+    );
+    ev.schema_version = Some(ORDERS_V1.into());
+    ev.schema_sequence = Some(1);
+    ev
 }
 
 // ============================================================================
@@ -114,15 +221,16 @@ async fn js_passthrough_returns_events_unchanged() {
     let ev = new_event();
 
     let events = vec![ev.clone()];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].source.table, "orders");
     assert_eq!(out[0].op, Op::Create);
     // Event struct fields normalized correctly
     assert_eq!(out[0].ts_ms, 1700000000000_i64);
-    // Note: payload integers become floats after JS round-trip
-    assert_eq!(out[0].after.as_ref().unwrap()["note"], "original");
+    // Row values come back exactly as they went in.
+    assert_eq!(out[0].after, ev.after);
+    assert_eq!(after(&out[0])["note"], "original");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -142,12 +250,12 @@ async fn js_mutates_event_payload() {
     let proc =
         JsProcessor::new("mutate".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
 
     assert_eq!(out.len(), 1);
-    assert_eq!(out[0].after.as_ref().unwrap()["note"], "mutated");
-    assert_eq!(out[0].after.as_ref().unwrap()["processed"], true);
+    assert_eq!(after(&out[0])["note"], "mutated");
+    assert_eq!(after(&out[0])["processed"], true);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -167,10 +275,10 @@ async fn js_accesses_source_info_fields() {
     let proc = JsProcessor::new("source_access".into(), js.into(), None)
         .expect("init ok");
     let events = vec![new_event()];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
 
-    let after = out[0].after.as_ref().unwrap();
+    let after = after(&out[0]);
     assert_eq!(after["source_connector"], "mysql");
     assert_eq!(after["source_db"], "orders");
     assert_eq!(after["source_table"], "orders");
@@ -197,12 +305,12 @@ async fn js_handles_update_with_before_and_after() {
     let proc =
         JsProcessor::new("update".into(), js.into(), None).expect("init ok");
     let events = vec![new_update_event()];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
 
     assert_eq!(out[0].op, Op::Update);
     assert!(out[0].before.is_some());
-    assert_eq!(out[0].after.as_ref().unwrap()["had_before"], true);
+    assert_eq!(after(&out[0])["had_before"], true);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -221,12 +329,12 @@ async fn js_handles_delete_operation() {
     let proc =
         JsProcessor::new("delete".into(), js.into(), None).expect("init ok");
     let events = vec![new_delete_event()];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
 
     assert_eq!(out[0].op, Op::Delete);
     assert!(out[0].after.is_none());
-    assert_eq!(out[0].before.as_ref().unwrap()["tombstone"], true);
+    assert_eq!(before(&out[0])["tombstone"], true);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -258,12 +366,12 @@ async fn js_routes_by_op_type() {
     let delete = new_delete_event();
 
     let events = vec![create, update, delete];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
 
-    assert_eq!(out[0].after.as_ref().unwrap()["routed_to"], "inserts");
-    assert_eq!(out[1].after.as_ref().unwrap()["routed_to"], "updates");
-    assert_eq!(out[2].before.as_ref().unwrap()["routed_to"], "deletes");
+    assert_eq!(after(&out[0])["routed_to"], "inserts");
+    assert_eq!(after(&out[1])["routed_to"], "updates");
+    assert_eq!(before(&out[2])["routed_to"], "deletes");
 }
 
 // ============================================================================
@@ -291,12 +399,12 @@ async fn js_can_add_events_to_batch() {
         JsProcessor::new("expand".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
     let parent = events[0].event_id.unwrap();
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
 
     assert_eq!(out.len(), 2);
-    assert_eq!(out[0].after.as_ref().unwrap()["note"], "original");
-    assert_eq!(out[1].after.as_ref().unwrap()["is_audit"], true);
+    assert_eq!(after(&out[0])["note"], "original");
+    assert_eq!(after(&out[1])["is_audit"], true);
     // 1:1 output keeps the parent id; the derived audit event is synthetic.
     assert_eq!(out[0].event_id, Some(parent));
     assert_eq!(
@@ -316,7 +424,7 @@ async fn js_can_filter_events() {
     let proc =
         JsProcessor::new("filter".into(), js.into(), None).expect("init ok");
     let events = vec![new_event(), new_update_event(), new_delete_event()];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
 
     assert_eq!(out.len(), 1);
@@ -334,7 +442,7 @@ async fn js_empty_return_drops_all() {
     let proc =
         JsProcessor::new("drop".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
     assert_eq!(out.len(), 0);
 }
@@ -345,7 +453,7 @@ async fn js_empty_input_batch() {
     let proc =
         JsProcessor::new("empty".into(), js.into(), None).expect("init ok");
     let events = vec![];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
     assert_eq!(out.len(), 0);
 }
@@ -367,11 +475,11 @@ async fn js_single_object_return_wrapped() {
     let proc =
         JsProcessor::new("single".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
 
     assert_eq!(out.len(), 1);
-    assert_eq!(out[0].after.as_ref().unwrap()["single"], true);
+    assert_eq!(after(&out[0])["single"], true);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -385,7 +493,7 @@ async fn js_invalid_return_type_errors() {
     let proc =
         JsProcessor::new("invalid".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let err = proc.process(events, &ctx).await.expect_err("should fail");
     let msg = format!("{err:#}");
     assert!(
@@ -405,7 +513,7 @@ async fn js_throw_propagates_error() {
     let proc =
         JsProcessor::new("throw".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let err = proc.process(events, &ctx).await.expect_err("should fail");
     let msg = format!("{err:#}");
     assert!(
@@ -436,19 +544,19 @@ async fn js_runtime_persists_state_across_batches() {
         JsProcessor::new("stateful".into(), js.into(), None).expect("init ok");
 
     let events = vec![new_event()];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out1 = proc.process(events, &ctx).await.expect("batch1 ok");
     let events = vec![new_event()];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out2 = proc.process(events, &ctx).await.expect("batch2 ok");
     let events = vec![new_event()];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out3 = proc.process(events, &ctx).await.expect("batch3 ok");
 
-    // Note: batch_number is float due to JS number handling
-    assert_eq!(out1[0].after.as_ref().unwrap()["batch_number"], 1.0);
-    assert_eq!(out2[0].after.as_ref().unwrap()["batch_number"], 2.0);
-    assert_eq!(out3[0].after.as_ref().unwrap()["batch_number"], 3.0);
+    // A new field is a document holding the number V8 handed back.
+    assert_eq!(after(&out1[0])["batch_number"], 1.0);
+    assert_eq!(after(&out2[0])["batch_number"], 2.0);
+    assert_eq!(after(&out3[0])["batch_number"], 3.0);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -463,7 +571,7 @@ async fn js_calls_rust_op_log() {
     let proc =
         JsProcessor::new("op_log".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
     assert_eq!(out.len(), 1);
 }
@@ -491,12 +599,15 @@ async fn js_transforms_payload_structure() {
     let proc =
         JsProcessor::new("transform".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
 
-    let after = out[0].after.as_ref().unwrap();
+    let after = after(&out[0]);
     assert_eq!(after["_op"], "c");
     assert_eq!(after["_source"], "orders.orders");
+    // The spread original columns come back as their exact values.
+    assert_eq!(after["id"], 1);
+    assert_eq!(after["note"], "original");
 }
 
 // ============================================================================
@@ -504,9 +615,9 @@ async fn js_transforms_payload_structure() {
 // ============================================================================
 
 #[tokio::test(flavor = "current_thread")]
-async fn js_payload_integers_become_floats() {
-    // This test documents the expected behavior: payload integers become floats
-    // after JS round-trip because V8 represents all numbers as f64.
+async fn js_payload_numbers_round_trip_exactly() {
+    // An unmodified value comes back as its exact original canonical value:
+    // integers do not become floats, 64-bit integers are not rounded.
     let js = r#"
         function processBatch(events) {
             return events; // no modification
@@ -517,23 +628,25 @@ async fn js_payload_integers_become_floats() {
         .expect("init ok");
 
     let mut ev = new_event();
-    ev.after = Some(json!({
+    ev.after = Some(fixture::row(json!({
         "int_field": 42,
         "float_field": 3.17,
-        "big_int": 9007199254740991_i64  // JS MAX_SAFE_INTEGER
-    }));
+        "big_int": 9007199254740991_i64  // JS MAX_SAFE_INTEGER, a 64-bit column
+    })));
+    let original = ev.after.clone();
 
     let events = vec![ev];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
-    let after = out[0].after.as_ref().unwrap();
 
-    // Integers become floats (42 -> 42.0)
-    assert!(after["int_field"].is_number());
-    // Original floats preserved
+    assert_eq!(out[0].after, original, "canonical values are exact");
+    let after = after(&out[0]);
+    // A 32-bit integer renders as a JSON integer, not 42.0.
+    assert_eq!(after["int_field"], json!(42));
+    assert!(after["int_field"].is_i64());
     assert_eq!(after["float_field"], 3.17);
-    // Large integers within safe range preserved as floats
-    assert!(after["big_int"].is_number());
+    // A 64-bit integer renders as its exact decimal string in v2.
+    assert_eq!(after["big_int"], "9007199254740991");
 
     // Event struct fields are normalized back to i64
     assert_eq!(out[0].ts_ms, 1700000000000_i64);
@@ -601,7 +714,7 @@ async fn js_sets_routing_topic() {
     let proc =
         JsProcessor::new("route".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
 
     let routing = out[0].routing.as_ref().expect("routing should be set");
@@ -627,7 +740,7 @@ async fn js_sets_routing_key_and_headers() {
     let proc =
         JsProcessor::new("route_kh".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
 
     let r = out[0].routing.as_ref().unwrap();
@@ -648,7 +761,7 @@ async fn js_preserves_existing_routing() {
     });
 
     let events = vec![ev];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
     assert_eq!(
         out[0].routing.as_ref().unwrap().topic.as_deref(),
@@ -676,7 +789,7 @@ async fn js_clone_gets_separate_routing() {
     let proc = JsProcessor::new("clone_route".into(), js.into(), None)
         .expect("init ok");
     let events = vec![new_event()];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
 
     assert_eq!(out.len(), 2);
@@ -697,7 +810,7 @@ async fn js_no_route_call_means_no_routing() {
     let proc =
         JsProcessor::new("no_route".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
     assert!(out[0].routing.is_none());
 }
@@ -716,7 +829,7 @@ async fn js_filter_drops_routed_events() {
     let proc = JsProcessor::new("filter_drop".into(), js.into(), None)
         .expect("init ok");
     let events = vec![new_event()];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
     assert_eq!(out.len(), 0);
 }
@@ -742,7 +855,7 @@ async fn js_route_overwrites_existing_routing() {
     });
 
     let events = vec![ev];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
     let r = out[0].routing.as_ref().unwrap();
     assert_eq!(r.topic.as_deref(), Some("new-topic"));
@@ -769,12 +882,12 @@ async fn js_conditional_routing_by_payload() {
         JsProcessor::new("cond".into(), js.into(), None).expect("init ok");
 
     let mut low = new_event();
-    low.after = Some(json!({"id": 2}));
+    low.after = Some(fixture::row(json!({"id": 2})));
     let mut high = new_event();
-    high.after = Some(json!({"id": 10}));
+    high.after = Some(fixture::row(json!({"id": 10})));
 
     let events = vec![low, high];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
 
     assert_eq!(
@@ -804,7 +917,7 @@ async fn js_route_only_some_events() {
     let proc =
         JsProcessor::new("partial".into(), js.into(), None).expect("init ok");
     let events = vec![new_event(), new_delete_event()];
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     let out = proc.process(events, &ctx).await.expect("ok");
 
     assert!(out[0].routing.is_none()); // create: no route() call
@@ -833,7 +946,7 @@ fn parent_id(row: u32) -> EventId {
 
 async fn run(js: &str, events: Vec<Event>) -> anyhow::Result<Vec<Event>> {
     let proc = JsProcessor::new("t".into(), js.into(), None).unwrap();
-    let ctx = BatchContext::from_batch(&events);
+    let ctx = ctx_for(&events).await;
     proc.process(events, &ctx).await
 }
 
@@ -952,7 +1065,7 @@ async fn js_reserved_lineage_metadata_never_leaks() {
     let out = run(js, vec![event_with_id(p)]).await.unwrap();
     assert_eq!(out.len(), 2);
     for ev in &out {
-        let json = serde_json::to_string(ev).unwrap();
+        let json = ev.native_value(NativeOpts::default()).unwrap().to_string();
         assert!(!json.contains("__df_id"), "__df_id leaked: {json}");
         assert!(!json.contains("__df_parent"), "__df_parent leaked: {json}");
         if let Some(after) = ev.after.as_ref() {
@@ -978,4 +1091,406 @@ async fn js_forged_out_of_batch_retained_id_is_rejected() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("not an input event"), "{err}");
+}
+
+// ============================================================================
+// Typed boundary: re-typing script outputs against the input's columns
+// ============================================================================
+
+const IDENTITY: &str = "function processBatch(e){ return e; }";
+
+fn event_with_after(columns: Vec<(&str, CanonicalValue)>) -> Event {
+    let mut ev = new_event();
+    ev.after = Some(
+        CanonicalRow::new(
+            columns
+                .into_iter()
+                .map(|(n, v)| (n.to_string(), v))
+                .collect(),
+        )
+        .unwrap(),
+    );
+    ev
+}
+
+fn db(v: DbValue) -> CanonicalValue {
+    CanonicalValue::Db(v)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_64_bit_integer_beyond_2_pow_53_passes_through_exactly() {
+    // 2^53 + 1: a double would round it to 2^53.
+    let big = db(DbValue::int(9_007_199_254_740_993, IntWidth::W64).unwrap());
+    let ev = event_with_after(vec![("big", big.clone())]);
+    let out = run(IDENTITY, vec![ev]).await.unwrap();
+    assert_eq!(out[0].after.as_ref().unwrap().get("big"), Some(&big));
+    assert_eq!(after(&out[0])["big"], "9007199254740993");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_changed_int_column_must_parse_as_its_type() {
+    // A non-integer in a 32-bit int column fails the batch.
+    let err = run(
+        "function processBatch(e){ e[0].after.id = 1.5; return e; }",
+        vec![new_event()],
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("after.id"), "{err}");
+
+    // Another integer is re-typed as the column's type, exactly.
+    let out = run(
+        "function processBatch(e){ e[0].after.id = 7; return e; }",
+        vec![new_event()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out[0].after.as_ref().unwrap().get("id"),
+        Some(&db(DbValue::int(7, IntWidth::W32).unwrap()))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_new_field_is_an_extension_never_a_column() {
+    let out = run(
+        "function processBatch(e){ e[0].after.meta = { a: { b: 'x' } }; return e; }",
+        vec![new_event()],
+    )
+    .await
+    .unwrap();
+    let row = out[0].after.as_ref().unwrap();
+    assert_eq!(row.get("meta"), None, "never a database column");
+    assert_eq!(
+        row.extensions()["meta"],
+        Document::new(json!({ "a": { "b": "x" } }))
+    );
+    // The original columns are untouched, and the rendering merges both.
+    assert_eq!(
+        row.get("id"),
+        Some(&db(DbValue::int(1, IntWidth::W32).unwrap()))
+    );
+    assert_eq!(after(&out[0])["meta"]["a"]["b"], "x");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_new_field_of_a_schema_less_event_is_a_document_column() {
+    let mut ev = new_event();
+    ev.schema_version = None;
+    ev.after = Some(fixture::row(json!({"payload": {"k": 1}})));
+    let out = run(
+        "function processBatch(e){ e[0].after.extra = [1]; return e; }",
+        vec![ev],
+    )
+    .await
+    .unwrap();
+    let row = out[0].after.as_ref().unwrap();
+    assert_eq!(
+        row.get("extra"),
+        Some(&CanonicalValue::Document(Document::new(json!([1]))))
+    );
+    assert!(row.extensions().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_a_declared_column_the_image_lacks_is_retyped_not_an_extension() {
+    // `note` is declared but absent from this (minimal) image.
+    let ev = event_with_after(vec![(
+        "id",
+        db(DbValue::int(1, IntWidth::W32).unwrap()),
+    )]);
+    let out = run(
+        "function processBatch(e){ e[0].after.note = 'n'; return e; }",
+        vec![ev],
+    )
+    .await
+    .unwrap();
+    let row = out[0].after.as_ref().unwrap();
+    assert_eq!(row.get("note"), Some(&db(DbValue::Text("n".into()))));
+    assert!(row.extensions().is_empty());
+    // A declared column cannot take an untyped value.
+    let ev = event_with_after(vec![(
+        "id",
+        db(DbValue::int(1, IntWidth::W32).unwrap()),
+    )]);
+    assert!(
+        run(
+            "function processBatch(e){ e[0].after.n = {a: 1}; return e; }",
+            vec![ev]
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_extensions_survive_and_change_across_processor_chains() {
+    let first = run("function processBatch(e){ e[0].after.x = {v: 1}; e[0].after.y = 2; return e; }", vec![new_event()])
+        .await
+        .unwrap();
+    // A second chain sees the extensions, keeps one, changes one, adds one.
+    let second = run(
+        "function processBatch(e){ e[0].after.y = 3; e[0].after.z = 'new'; return e; }",
+        first,
+    )
+    .await
+    .unwrap();
+    let ext = second[0].after.as_ref().unwrap().extensions().clone();
+    assert_eq!(ext["x"], Document::new(json!({"v": 1})));
+    assert_eq!(ext["y"], Document::new(json!(3)));
+    assert_eq!(ext["z"], Document::new(json!("new")));
+    // Removing an extension removes it.
+    let third = run(
+        "function processBatch(e){ delete e[0].after.x; return e; }",
+        second,
+    )
+    .await
+    .unwrap();
+    assert!(
+        third[0]
+            .after
+            .as_ref()
+            .unwrap()
+            .extensions()
+            .get("x")
+            .is_none()
+    );
+    // A derived event keeps its parent's typing: its extensions are extensions.
+    let derived = run(
+        "function processBatch(e){ const d = derive(e[0], JSON.parse(JSON.stringify(e[0]))); d.after.w = true; return [e[0], d]; }",
+        vec![new_event()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        derived[1].after.as_ref().unwrap().extensions()["w"],
+        Document::new(json!(true))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_conflicting_extension_paths_fail() {
+    let err = run(
+        "function processBatch(e){ e[0].after['a'] = 1; e[0].after['a.b'] = 2; return e; }",
+        vec![new_event()],
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("conflicts"), "{err}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_a_new_field_with_missing_schema_context_fails() {
+    let mut ev = new_event();
+    ev.schema_version = Some("orders-unknown".into());
+    let err = run(
+        "function processBatch(e){ e[0].after.q = 1; return e; }",
+        vec![ev],
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("schema context is missing"),
+        "{err}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_a_null_column_takes_a_value_of_its_declared_type() {
+    let ev = event_with_after(vec![("n", CanonicalValue::Null)]);
+    let out = run(
+        "function processBatch(e){ e[0].after.n = 5; return e; }",
+        vec![ev],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out[0].after.as_ref().unwrap().get("n"),
+        Some(&db(DbValue::int(5, IntWidth::W32).unwrap()))
+    );
+    let ev = event_with_after(vec![("n", CanonicalValue::Null)]);
+    let err = run(
+        "function processBatch(e){ e[0].after.n = 'x'; return e; }",
+        vec![ev],
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("after.n"), "{err}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_an_unchanged_toast_column_takes_a_value_of_its_declared_type() {
+    let ev = event_with_after(vec![
+        ("id", db(DbValue::int(1, IntWidth::W32).unwrap())),
+        ("doc", CanonicalValue::Unchanged),
+    ]);
+    // Untouched, it stays unchanged.
+    let out = run(IDENTITY, vec![ev]).await.unwrap();
+    assert_eq!(
+        out[0].after.as_ref().unwrap().get("doc"),
+        Some(&CanonicalValue::Unchanged)
+    );
+    // Replaced, it is a value of the column's type.
+    let ev = event_with_after(vec![("doc", CanonicalValue::Unchanged)]);
+    let out = run(
+        "function processBatch(e){ e[0].after.doc = 'new text'; return e; }",
+        vec![ev],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out[0].after.as_ref().unwrap().get("doc"),
+        Some(&db(DbValue::Text("new text".into())))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_enum_and_set_changes_validate_against_their_definition() {
+    use deltaforge_core::canonical::{EnumValue, SetValue};
+    let def: Vec<String> = ["a", "b", "c"].map(String::from).to_vec();
+    let ev = event_with_after(vec![
+        (
+            "mood",
+            db(DbValue::Enum(EnumValue::mysql(1, "happy".into()).unwrap())),
+        ),
+        (
+            "tags",
+            db(DbValue::Set(SetValue::from_bitmask(1, &def).unwrap())),
+        ),
+    ]);
+    let out = run(
+        "function processBatch(e){ e[0].after.mood = 'sad'; e[0].after.tags = 'a,c'; return e; }",
+        vec![ev],
+    )
+    .await
+    .unwrap();
+    let row = out[0].after.as_ref().unwrap();
+    assert_eq!(
+        row.get("mood"),
+        Some(&db(DbValue::Enum(
+            EnumValue::mysql(2, "sad".into()).unwrap()
+        )))
+    );
+    assert_eq!(
+        row.get("tags"),
+        Some(&db(DbValue::Set(
+            SetValue::from_bitmask(0b101, &def).unwrap()
+        )))
+    );
+    for script in [
+        "function processBatch(e){ e[0].after.mood = 'angry'; return e; }",
+        "function processBatch(e){ e[0].after.tags = 'a,z'; return e; }",
+    ] {
+        let ev = event_with_after(vec![
+            (
+                "mood",
+                db(DbValue::Enum(EnumValue::mysql(1, "happy".into()).unwrap())),
+            ),
+            (
+                "tags",
+                db(DbValue::Set(SetValue::from_bitmask(1, &def).unwrap())),
+            ),
+        ]);
+        assert!(run(script, vec![ev]).await.is_err(), "{script}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_missing_or_conflicting_schema_context_fails_explicitly() {
+    let script = "function processBatch(e){ e[0].after.id = 2; return e; }";
+    // The event names a version that does not resolve.
+    let mut ev = new_event();
+    ev.schema_version = Some("orders-unknown".into());
+    let err = run(script, vec![ev]).await.unwrap_err();
+    assert!(err.to_string().contains("did not resolve"), "{err}");
+    // The pipeline provides no schema context.
+    let proc = JsProcessor::new("t".into(), script.into(), None).unwrap();
+    let events = vec![new_event()];
+    let ctx = BatchContext::from_batch(&events);
+    let err = proc.process(events, &ctx).await.unwrap_err();
+    assert!(err.to_string().contains("no schema context"), "{err}");
+    // The event's value is not of the declared type.
+    let ev = event_with_after(vec![("id", db(DbValue::Text("x".into())))]);
+    let err = run(script, vec![ev]).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("conflicts with its schema context"),
+        "{err}"
+    );
+    // A changed database column of an event naming no schema version.
+    let mut ev = new_event();
+    ev.schema_version = None;
+    assert!(run(script, vec![ev]).await.is_err());
+    // An undeclared column of a resolved version is a conflict, never a
+    // document.
+    let ev =
+        event_with_after(vec![("undeclared", db(DbValue::Text("x".into())))]);
+    let err = run(
+        "function processBatch(e){ e[0].after.undeclared = 'y'; return e; }",
+        vec![ev],
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("does not declare"), "{err}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn resolved_schemas_resolve_each_version_once_and_validate_values() {
+    let schemas = TestSchemas::default();
+    let events: Vec<Event> = (0..5).map(|_| new_event()).collect();
+    let r = ResolvedSchemas::resolve(&schemas, &events).await.unwrap();
+    assert_eq!(r.len(), 1);
+    assert_eq!(schemas.lookups.load(Ordering::Relaxed), 1);
+    // A missing version fails the batch before any processor runs.
+    let mut ev = new_event();
+    ev.schema_version = Some("orders-unknown".into());
+    assert!(ResolvedSchemas::resolve(&schemas, &[ev]).await.is_err());
+    // A value the version does not admit is a conflict.
+    let ev = event_with_after(vec![("id", db(DbValue::Text("x".into())))]);
+    assert!(ResolvedSchemas::resolve(&schemas, &[ev]).await.is_err());
+    // So is a column it does not declare (a document is not a column).
+    let ev = event_with_after(vec![("zzz", db(DbValue::Text("x".into())))]);
+    assert!(ResolvedSchemas::resolve(&schemas, &[ev]).await.is_err());
+    // Even a document: undeclared data belongs in the extensions.
+    let ev = event_with_after(vec![(
+        "zzz",
+        CanonicalValue::Document(Document::new(json!(1))),
+    )]);
+    assert!(ResolvedSchemas::resolve(&schemas, &[ev]).await.is_err());
+    let mut ev = new_event();
+    ev.after
+        .as_mut()
+        .unwrap()
+        .set_extension("zzz", Document::new(json!(1)))
+        .unwrap();
+    assert!(ResolvedSchemas::resolve(&schemas, &[ev]).await.is_ok());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_sql_null_and_json_null_stay_distinct() {
+    let json_null = db(DbValue::Json(JsonText::new("null".into()).unwrap()));
+    let ev = event_with_after(vec![
+        ("j", json_null.clone()),
+        ("n", CanonicalValue::Null),
+    ]);
+    let out = run(IDENTITY, vec![ev]).await.unwrap();
+    let row = out[0].after.as_ref().unwrap();
+    assert_eq!(row.get("j"), Some(&json_null));
+    assert_eq!(row.get("n"), Some(&CanonicalValue::Null));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_binary_and_temporal_values_pass_through_unchanged() {
+    let bin = db(DbValue::Binary(vec![0, 255]));
+    let ts = db(DbValue::Timestamp(
+        TimestampValue::instant(1_700_000_000_000_000, Precision::Fixed(6))
+            .unwrap(),
+    ));
+    let ev = event_with_after(vec![("bin", bin.clone()), ("ts", ts.clone())]);
+    let original = ev.after.clone();
+    let out = run(IDENTITY, vec![ev]).await.unwrap();
+    assert_eq!(out[0].after, original);
+    let row = out[0].after.as_ref().unwrap();
+    assert_eq!(row.get("bin"), Some(&bin));
+    assert_eq!(row.get("ts"), Some(&ts));
 }

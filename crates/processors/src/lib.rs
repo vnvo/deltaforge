@@ -10,6 +10,7 @@ pub mod synthetic;
 pub use synthetic::SyntheticMarkingProcessor;
 
 mod js;
+mod js_boundary;
 pub use js::JsProcessor;
 
 mod outbox;

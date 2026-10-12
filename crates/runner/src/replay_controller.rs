@@ -141,7 +141,7 @@ impl CoordinatorReplayDelivery {
         if let Some(sensor) = &self.sensor {
             let db_schemas = if self.provider.is_some() {
                 let tables: HashSet<String> =
-                    events.iter().map(|e| e.source.table.clone()).collect();
+                    events.iter().map(|e| e.source.full_table_name()).collect();
                 let mut map = HashMap::new();
                 for t in tables {
                     if let Some(s) = self.fetch_schema(&t).await {
@@ -203,7 +203,7 @@ impl ReplayDelivery for CoordinatorReplayDelivery {
         let mut events: Vec<Event> =
             Vec::with_capacity(envelope.payload.events.len());
         for rec in &envelope.payload.events {
-            let ev: Event = serde_json::from_value(rec.event.clone())
+            let ev: Event = Event::from_durable(rec.event.clone())
                 .with_context(|| {
                     format!(
                         "replay could not reconstruct event {} at seq {}",
@@ -1073,7 +1073,10 @@ mod tests {
             source,
             deltaforge_core::Op::Create,
             None,
-            Some(serde_json::json!({ "id": 1 })),
+            Some(deltaforge_core::canonical::fixture::row(
+                serde_json::json!({ "id": 1 }),
+            )),
+            deltaforge_core::TypeMapping::V2,
             0,
             10,
         );
@@ -1089,7 +1092,7 @@ mod tests {
                 offset: 0,
                 event_id: "e1".into(),
                 tx_id: None,
-                event: serde_json::to_value(&ev).unwrap(),
+                event: ev.to_durable(),
             }],
             schema_binding: SchemaBinding {
                 source_tables: vec!["db.t".into()],
