@@ -14,7 +14,8 @@
 #
 # Steps: manifest check; fmt; clippy -D warnings (also with the `vault`
 # feature); workspace tests; each vendored crate of scripts/vendor-crates.txt
-# built and tested on its own; with --release, the release images (both
+# built, linted and tested on its own (pre-existing rustfmt/clippy findings
+# in untouched upstream files of a `warn` crate are listed, not failing); with --release, the release images (both
 # Dockerfiles built from the committed tree and smoke-tested); every test
 # binary built once; then the
 # `serial-pg` and `serial` suites one at a time in one lane while the
@@ -100,10 +101,13 @@ check_manifest() {
 
 # Every vendored crate the workspace patches in is listed in the vendor
 # manifest; every listed crate has a manifest and a known level; every extra
-# command belongs to a listed crate.
+# command belongs to a listed crate; every `patched` file exists in a `warn`
+# crate, and every source file a `warn` crate's DELTAFORGE-PATCH.md names is
+# listed as `patched`.
 check_vendor_manifest() {
-  local ok=0 dir kind level listed
+  local ok=0 dir kind level listed warn f
   listed=$(awk '$1 == "crate" {print $2}' "$VENDOR_MANIFEST" | sort)
+  warn=$(awk '$1 == "crate" && $3 == "warn" {print $2}' "$VENDOR_MANIFEST")
   for dir in $(sed -n '/^\[patch\./,/^\[/p' Cargo.toml |
     grep -o 'path *= *"vendor/[^"]*"' | sed 's/.*"\(.*\)"/\1/'); do
     grep -qx "$dir" <<<"$listed" ||
@@ -122,9 +126,21 @@ check_vendor_manifest() {
         grep -qx "$dir" <<<"$listed" ||
           { echo "vendor: extra command for unlisted crate $dir"; ok=1; }
         ;;
+      patched)
+        grep -qx "$dir" <<<"$warn" ||
+          { echo "vendor: patched file for $dir, which is not a warn crate"; ok=1; }
+        [ -f "$dir/$level" ] || { echo "vendor: patched file $dir/$level does not exist"; ok=1; }
+        ;;
       *) echo "vendor: unknown entry '$kind'"; ok=1 ;;
     esac
   done < <(grep -Ev '^\s*(#|$)' "$VENDOR_MANIFEST")
+  for dir in $warn; do
+    for f in $(grep -o '`src/[^`]*\.rs`' "$dir/DELTAFORGE-PATCH.md" 2>/dev/null | tr -d '`' | sort -u); do
+      awk -v d="$dir" -v f="$f" '$1 == "patched" && $2 == d && $3 == f {found = 1} END {exit !found}' \
+        "$VENDOR_MANIFEST" ||
+        { echo "vendor: $dir/$f is named in its DELTAFORGE-PATCH.md but not listed as patched"; ok=1; }
+    done
+  done
   return $ok
 }
 
@@ -315,7 +331,12 @@ vendor_crates() {
       vendor_step "$name" clippy "$target" "$copy" cargo clippy --all-targets -- -D warnings
     else
       vendor_step "$name" check "$target" "$copy" cargo check --all-targets
-      vendor_step "$name" clippy "$target" "$copy" cargo clippy --all-targets
+      vendor_step "$name" lint "$target" "$copy" "$ROOT/scripts/vendor-lint.sh" \
+        "$OUT/vendor_${name}_findings.txt" \
+        $(awk -v d="$dir" '$1 == "patched" && $2 == d {print $3}' "$VENDOR_MANIFEST")
+      [ ! -s "$OUT/vendor_${name}_findings.txt" ] ||
+        echo "vendor/$name/upstream-findings (not failing): $(cat "$OUT/vendor_${name}_findings.txt")" \
+          >> "$OUT/summary"
     fi
     vendor_step "$name" test "$target" "$copy" cargo test
     while read -r xname xcmd; do

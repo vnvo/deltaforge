@@ -63,3 +63,16 @@ text: zero date parts, a signed TIME duration with its microseconds, and
 DATETIME's microseconds. The pre-5.6.4 TIME format is read as the signed
 `HHMMSS` integer it is. YEAR's stored byte 0 is the zero year (MySQL shows
 `0000`), not 1900. File: `src/column/column_value.rs`.
+
+## Files and lint policy
+
+Files changed from upstream 0.3.3 (each is listed as `patched` in
+`scripts/vendor-crates.txt`, so DeltaForge's gate holds it to rustfmt and
+clippy with no findings, while the rest of the crate stays as upstream ships
+it): `src/binlog_stream.rs`, `src/column/column_value.rs`,
+`src/event/table_map/default_charset.rs`,
+`src/event/table_map/table_metadata.rs`, `src/network/packet_channel.rs`.
+The patched files are formatted with rustfmt; `manual_div_ceil` and
+`bool_assert_comparison` findings in them are fixed (`div_ceil`, `assert!`),
+with no behavior change.
+

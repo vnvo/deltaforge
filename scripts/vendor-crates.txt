@@ -7,14 +7,24 @@
 #
 # crate <dir> <level>
 #   strict: cargo fmt --check, clippy --all-targets -D warnings, cargo test
-#   warn:   cargo check --all-targets, clippy --all-targets (warnings kept in
-#           the log, not failing: upstream code kept close to upstream),
-#           cargo test
+#   warn:   cargo check --all-targets and cargo test (fatal); rustfmt and
+#           clippy findings fatal in the crate's `patched` files and for any
+#           clippy error, listed in the gate summary but not failing in the
+#           untouched upstream files (scripts/vendor-lint.sh)
+# patched <dir> <file>
+#   a file of a `warn` crate changed by a DeltaForge patch, held to the
+#   strict rules; every `src/...rs` named in the crate's DELTAFORGE-PATCH.md
+#   must be listed
 # extra <dir> <name> <command...>
 #   another command run in the copy (its own target directory), for example
 #   a loom model.
 
 crate vendor/pgwire-replication strict
 crate vendor/mysql-binlog-connector-rust warn
+patched vendor/mysql-binlog-connector-rust src/binlog_stream.rs
+patched vendor/mysql-binlog-connector-rust src/column/column_value.rs
+patched vendor/mysql-binlog-connector-rust src/event/table_map/default_charset.rs
+patched vendor/mysql-binlog-connector-rust src/event/table_map/table_metadata.rs
+patched vendor/mysql-binlog-connector-rust src/network/packet_channel.rs
 
 extra vendor/pgwire-replication loom env RUSTFLAGS=--cfg=pgwire_loom cargo test --release --lib loom_model
