@@ -514,6 +514,7 @@ async fn build_durable_s3_sinks(
     if durable.is_empty() {
         return Ok(Vec::new());
     }
+    check_durable_batching(spec)?;
 
     // (2) Validate durable snapshot migration BEFORE any HEAD mutation.
     source
@@ -551,6 +552,21 @@ async fn build_durable_s3_sinks(
         out.push(sink);
     }
     Ok(out)
+}
+
+/// A durable sink acknowledges a batch at its source boundary, so every batch
+/// must end at one. Without transaction-aligned batching the soft limits cut
+/// transactions and snapshot chunks, and the sink would refuse those batches
+/// at run time: refused here, before the pipeline starts.
+fn check_durable_batching(spec: &PipelineSpec) -> Result<()> {
+    if spec.spec.batch.as_ref().and_then(|b| b.respect_source_tx) == Some(false)
+    {
+        anyhow::bail!(
+            "a durable_v2 S3 sink needs transaction-aligned batching: remove \
+             batch.respect_source_tx: false, or use durability: legacy_rolling"
+        );
+    }
+    Ok(())
 }
 
 /// Fail closed if the constructed sink set does not exactly match the configured
@@ -4225,6 +4241,36 @@ mod tests {
         ) -> deltaforge_core::SinkResult<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn durable_s3_refuses_non_aligned_batching() {
+        let mut spec: PipelineSpec = serde_yaml::from_str(
+            r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata: {name: p, tenant: t}
+spec:
+  source:
+    type: mysql
+    config: {id: m, dsn: "mysql://u:p@h/", tables: ["d.t"]}
+  processors: []
+  sinks: []
+"#,
+        )
+        .unwrap();
+        assert!(check_durable_batching(&spec).is_ok());
+        spec.spec.batch = Some(deltaforge_config::BatchConfig {
+            respect_source_tx: Some(false),
+            ..Default::default()
+        });
+        let e = check_durable_batching(&spec).unwrap_err().to_string();
+        assert!(e.contains("respect_source_tx"), "{e}");
+        spec.spec.batch = Some(deltaforge_config::BatchConfig {
+            respect_source_tx: Some(true),
+            ..Default::default()
+        });
+        assert!(check_durable_batching(&spec).is_ok());
     }
 
     #[test]

@@ -2859,3 +2859,81 @@ spec:
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// A snapshot larger than one batch (5,000 rows; default batching cuts at
+/// 2,000 events, snapshot chunks hold 10,000 rows) reaches the durable S3
+/// sink whole: a batch limit never cuts a chunk, so every batch ends at the
+/// chunk's boundary and carries its watermark.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "live: PostgreSQL and RustFS"]
+async fn a_snapshot_larger_than_a_batch_reaches_durable_s3() {
+    let _ = out_dir();
+    let i = infra().await;
+    let rows = 5_000;
+    let mut sql = Sql::new(Engine::Postgres).await;
+    sql.run("CREATE SCHEMA big_snap", false).await;
+    sql.run(
+        "CREATE TABLE big_snap.t (id BIGINT PRIMARY KEY, v TEXT)",
+        false,
+    )
+    .await;
+    sql.run(
+        &format!(
+            "INSERT INTO big_snap.t SELECT g, 'v' || g FROM generate_series(1, {rows}) g"
+        ),
+        false,
+    )
+    .await;
+    sql.run(
+        "CREATE PUBLICATION pub_big_snap FOR TABLE big_snap.t",
+        false,
+    )
+    .await;
+    sources::postgres::postgres_publication::register(
+        &pg_client().await,
+        &["pub_big_snap".to_string()],
+    )
+    .await
+    .expect("register");
+    let backend: storage::ArcStorageBackend =
+        Arc::new(storage::MemoryStorageBackend::new());
+    let mgr = Arc::new(PipelineManager::with_backend(backend).await.unwrap());
+    let prefix = "probe/big-snap";
+    let sinks = sink_yaml(i, Sink::Parquet, "", prefix).await;
+    let yaml = format!(
+        r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata: {{name: p-big-snap, tenant: {TENANT}}}
+spec:
+  source:
+    type: postgres
+    config:
+      id: p-big-snap
+      dsn: "{dsn}"
+      slot: p_big_snap
+      publication: pub_big_snap
+      tables: ["big_snap.t"]
+      snapshot: {{mode: initial}}
+  processors: []
+  sinks:{sinks}
+"#,
+        dsn = pg_dsn().await,
+    );
+    mgr.create(serde_yaml::from_str(&yaml).unwrap())
+        .await
+        .expect("create");
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let delivered = loop {
+        let n = parquet_records(i, prefix).await.0.len();
+        let failed = !reasons(&mgr, "p-big-snap").await.is_empty();
+        if n >= rows || failed || Instant::now() > deadline {
+            break n;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    let incidents = reasons(&mgr, "p-big-snap").await;
+    mgr.delete("p-big-snap").await.ok();
+    assert!(incidents.is_empty(), "incidents: {incidents:?}");
+    assert_eq!(delivered, rows);
+}
