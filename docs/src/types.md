@@ -48,8 +48,9 @@ epoch microseconds, TIME with six fractional digits, DATETIME as
 | Any other PostgreSQL type (inet, interval, ranges, enums, domains, ...) | its PostgreSQL text |
 
 A PostgreSQL column that an update did not send (an unchanged TOAST value) is
-never rendered as a value: it is left out of `after` and listed in
-`unchanged_columns`.
+filled from the old row when the table has `REPLICA IDENTITY FULL`.
+Otherwise it is never rendered as a value: it is left out of `after` and
+listed in `unchanged_columns`.
 
 Values a processor added to a row (see [Processors](processors.md)) appear
 as ordinary fields in native JSON.
@@ -92,10 +93,13 @@ object as text), ClickHouse `extensions_column` (default `_extensions`,
 `Nullable(String)`). A row column the schema does not define is refused,
 never dropped.
 
-**PostgreSQL limitation:** an unchanged TOAST value cannot be written to
-Avro, Parquet, ClickHouse or Elasticsearch: it is a conversion failure (never
-NULL). PostgreSQL Avro and Parquet output is not yet qualified for tables
-with large TOASTed columns updated without those columns.
+**PostgreSQL unchanged TOAST values:** Avro, Parquet, ClickHouse and
+Elasticsearch need every value. A pipeline with such a sink requires
+`REPLICA IDENTITY FULL` on every captured table with a TOAST-capable column,
+so each unchanged value is filled from the old row; otherwise the pipeline is
+refused before it streams (see
+[PostgreSQL: Unchanged TOAST values](sources/postgres.md#unchanged-toast-values)).
+A missing value is never written as NULL.
 
 ## Table identity
 

@@ -1147,6 +1147,10 @@ impl PipelineManager {
             snapshot_cohort(spec.spec.commit_policy.as_ref(), &sinks)
         );
         source.set_snapshot_cohort(snapshot_cohort_of(&spec));
+        // The strictest sink decides whether rows must be complete.
+        source.set_complete_rows_required(
+            sinks.iter().any(|s| s.requires_complete_rows()),
+        );
         let src_handle = source.run(event_tx, source_ckpt).await;
 
         // Supervise the source task: the moment it exits without an explicit

@@ -306,3 +306,87 @@ fn the_pinned_session_sets_every_output_setting() {
         assert!(sql.contains(k), "{k} missing from {sql}");
     }
 }
+
+// ── Unchanged-TOAST reconstruction ────────────────────────────────────────
+
+fn canon(cols: &[(&str, CanonicalValue)]) -> CanonicalRow {
+    CanonicalRow::new(
+        cols.iter()
+            .map(|(n, v)| (n.to_string(), v.clone()))
+            .collect(),
+    )
+    .unwrap()
+}
+
+fn text(s: &str) -> CanonicalValue {
+    CanonicalValue::Db(DbValue::Text(s.to_string()))
+}
+
+#[test]
+fn unchanged_values_are_copied_from_the_full_old_row() {
+    let big = "x".repeat(100_000);
+    let before = canon(&[
+        ("id", text("1")),
+        ("body", text(&big)),
+        ("blob", CanonicalValue::Db(DbValue::Binary(vec![7; 50_000]))),
+        ("small", text("old")),
+        ("gone", CanonicalValue::Null),
+    ]);
+    let mut after = canon(&[
+        ("id", text("1")),
+        ("body", CanonicalValue::Unchanged),
+        ("blob", CanonicalValue::Unchanged),
+        ("small", text("new")),
+        ("gone", CanonicalValue::Null),
+    ]);
+    let r = PgRowDecoder::reconstruct_unchanged(&mut after, Some(&before));
+    assert_eq!(
+        r,
+        Reconstruction {
+            reconstructed: 2,
+            unavailable: 0
+        }
+    );
+    assert_eq!(after.get("body"), Some(&text(&big)));
+    assert_eq!(after.get("blob"), before.get("blob"));
+    // A changed value and SQL NULL are the new row's own.
+    assert_eq!(after.get("small"), Some(&text("new")));
+    assert_eq!(after.get("gone"), Some(&CanonicalValue::Null));
+}
+
+#[test]
+fn an_old_null_is_copied_as_null() {
+    let before = canon(&[("v", CanonicalValue::Null)]);
+    let mut after = canon(&[("v", CanonicalValue::Unchanged)]);
+    let r = PgRowDecoder::reconstruct_unchanged(&mut after, Some(&before));
+    assert_eq!(r.reconstructed, 1);
+    assert_eq!(after.get("v"), Some(&CanonicalValue::Null));
+}
+
+#[test]
+fn without_a_usable_old_value_the_value_stays_unavailable() {
+    let unchanged = || canon(&[("v", CanonicalValue::Unchanged)]);
+    // No full old row (REPLICA IDENTITY DEFAULT or a key-only image).
+    let mut after = unchanged();
+    let r = PgRowDecoder::reconstruct_unchanged(&mut after, None);
+    assert_eq!(
+        r,
+        Reconstruction {
+            reconstructed: 0,
+            unavailable: 1
+        }
+    );
+    assert_eq!(after.get("v"), Some(&CanonicalValue::Unchanged));
+    // The old row lacks the column.
+    let mut after = unchanged();
+    let r = PgRowDecoder::reconstruct_unchanged(
+        &mut after,
+        Some(&canon(&[("w", text("1"))])),
+    );
+    assert_eq!(r.unavailable, 1);
+    // The old value is itself unavailable.
+    let mut after = unchanged();
+    let r = PgRowDecoder::reconstruct_unchanged(&mut after, Some(&unchanged()));
+    assert_eq!(r.unavailable, 1);
+    assert_eq!(after.get("v"), Some(&CanonicalValue::Unchanged));
+}

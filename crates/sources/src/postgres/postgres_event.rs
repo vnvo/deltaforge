@@ -529,6 +529,27 @@ async fn handle_relation(
             schema = %schema, table = %table, identity = %replica_identity,
             "table does not have REPLICA IDENTITY FULL - before images will be incomplete"
         );
+        // Revalidated on every Relation message (stream start, DDL,
+        // reconnect, failover): a pipeline that needs complete rows stops
+        // before this table's next row if a TOAST-capable column could go
+        // unsent.
+        if ctx.complete_rows && ctx.allow.matches(&schema, &table) {
+            let columns = ctx
+                .catalog
+                .toastable_columns(relation_id)
+                .await
+                .map_err(LoopControl::Fail)?;
+            if !columns.is_empty() {
+                return Err(LoopControl::Fail(super::postgres_toast::refusal(
+                    &ctx.source_id,
+                    &[super::postgres_toast::Incomplete {
+                        qualified: format!("{schema}.{table}"),
+                        identity: replica_identity.to_string(),
+                        columns,
+                    }],
+                )));
+            }
+        }
     }
 
     if offset + 2 > payload.len() {
@@ -1049,6 +1070,7 @@ async fn handle_update(
     let qualified_name = Arc::clone(&relation.qualified_name);
     let schema = relation.schema.clone();
     let table = relation.table.clone();
+    let full_identity = relation.replica_identity == 'f';
 
     let mut before_values = None;
     let mut after_values = None;
@@ -1086,13 +1108,37 @@ async fn handle_update(
 
     let loaded = resolve_event_schema(ctx, relation_id).await?;
 
+    // The old row is PostgreSQL's full image ('O' under REPLICA IDENTITY
+    // FULL), the source of unchanged TOAST values.
+    let full_before = full_identity
+        && before_values
+            .as_ref()
+            .is_some_and(|(_, image)| *image == Image::Other);
     let before = before_values
         .map(|(v, image)| decoder.decode_tuple(&v, image))
         .transpose()
         .map_err(|e| decode_failed(ctx, &qualified_name, e))?;
-    let after = decoder
+    let mut after = decoder
         .decode_tuple(&after_vals, Image::UpdateAfter)
         .map_err(|e| decode_failed(ctx, &qualified_name, e))?;
+    let toast = PgRowDecoder::reconstruct_unchanged(
+        &mut after,
+        before.as_ref().filter(|_| full_before),
+    );
+    for (outcome, n) in [
+        ("reconstructed", toast.reconstructed),
+        ("unavailable", toast.unavailable),
+    ] {
+        if n > 0 {
+            metrics::counter!(
+                "deltaforge_pg_unchanged_toast_total",
+                "pipeline" => ctx.pipeline.clone(),
+                "source" => ctx.source_id.clone(),
+                "outcome" => outcome,
+            )
+            .increment(n);
+        }
+    }
 
     let timestamp_ms = ctx
         .current_tx_commit_time

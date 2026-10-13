@@ -548,6 +548,11 @@ impl KafkaSink {
 
 #[async_trait]
 impl Sink for KafkaSink {
+    /// Avro carries no value for a column the source did not send.
+    fn requires_complete_rows(&self) -> bool {
+        self.encoding == EncodingType::Avro
+    }
+
     /// Nothing is buffered after an acknowledged batch: every record of an acknowledged batch had its delivery report (`acks=all`) before `send_batch` returned (and its transaction committed, in transactional mode), and a
     /// barrier is delivered only after every earlier batch was acknowledged.
     /// This sink keeps no watermark of its own.

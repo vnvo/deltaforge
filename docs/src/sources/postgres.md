@@ -147,6 +147,41 @@ Without this setting:
 
 DeltaForge warns at startup if tables don't have `REPLICA IDENTITY FULL`.
 
+### Unchanged TOAST values
+
+PostgreSQL stores large values out of line (TOAST). When an UPDATE leaves
+such a value unchanged, PostgreSQL does not send it in the new row.
+
+- **Under `REPLICA IDENTITY FULL`** PostgreSQL sends the complete old row,
+  including those values (verified on PostgreSQL 14 through 18). DeltaForge
+  fills each unchanged value from the old row, exactly. The event's `after`
+  is complete.
+- **Otherwise** the value is not available. Sinks that accept partial rows
+  (native JSON: Kafka, Redis, NATS, HTTP, S3 JSON Lines) leave it out of
+  `after` and list it in `unchanged_columns`.
+
+**Sinks that need complete rows** (Avro encoding on any sink, S3 Parquet,
+ClickHouse, Elasticsearch) cannot represent a missing value. A pipeline with
+at least one of them requires `REPLICA IDENTITY FULL` on every captured table
+that has a TOAST-capable column (any variable-length type stored with a
+strategy other than `PLAIN`, domains and arrays included, read from the
+catalog).
+
+- **At start:** a bulk check over the publication's tables, before anything is
+  snapshotted or streamed, refuses the pipeline with `pg_table_unsupported`
+  (class `toast_without_full_identity`), naming the tables and their columns.
+- **While running:** the check is repeated whenever PostgreSQL announces a
+  table's definition (stream start, after DDL, after reconnect or failover),
+  so changing a table's identity away from `FULL` stops the source before
+  that table's next row.
+
+A pipeline whose sinks all accept partial rows does not require `FULL`.
+`deltaforge_pg_unchanged_toast_total{pipeline,source,outcome}` counts values
+filled from the old row (`reconstructed`) and values left unavailable
+(`unavailable`). `REPLICA IDENTITY FULL` makes PostgreSQL write the complete
+old row to WAL for every UPDATE and DELETE: measure the WAL volume before
+enabling it on update-heavy tables.
+
 ## Configuration
 
 Set `spec.source.type` to `postgres` and provide a config object:
@@ -412,7 +447,7 @@ DeltaForge preserves PostgreSQL's native type semantics:
 | `uuid` | JSON string |
 | `timestamp`, `date`, `time` | ISO 8601 string |
 | Arrays (`int[]`, `text[]`, etc.) | JSON array |
-| TOAST unchanged | `{"_unchanged": true}` |
+| TOAST unchanged | filled from the old row under `REPLICA IDENTITY FULL`; otherwise left out of `after` and listed in `unchanged_columns` (see [Unchanged TOAST values](#unchanged-toast-values)) |
 
 ## Event Format
 

@@ -254,6 +254,11 @@ impl DurableS3Sink {
 
 #[async_trait]
 impl Sink for DurableS3Sink {
+    /// Parquet has a value for every column in every row.
+    fn requires_complete_rows(&self) -> bool {
+        matches!(self.inner.format, DurableFormat::Parquet)
+    }
+
     fn id(&self) -> &str {
         &self.inner.id
     }

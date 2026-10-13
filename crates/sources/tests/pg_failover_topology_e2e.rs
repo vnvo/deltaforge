@@ -245,9 +245,18 @@ async fn create_schema(port: u16) {
         .await
         .unwrap();
     let c = admin(port, DB).await;
+    // `toasty`: out-of-line values under REPLICA IDENTITY FULL, captured only
+    // by the TOAST tests.
     c.batch_execute(&format!(
         "CREATE TABLE orders (id INT PRIMARY KEY, sku TEXT);
-         CREATE PUBLICATION {PUBLICATION} FOR TABLE orders;"
+         CREATE TABLE toasty (id INT PRIMARY KEY, small INT, body TEXT, doc JSONB);
+         ALTER TABLE toasty ALTER body SET STORAGE EXTERNAL,
+             ALTER doc SET STORAGE EXTERNAL;
+         ALTER TABLE toasty REPLICA IDENTITY FULL;
+         INSERT INTO toasty SELECT 1, 0,
+             (SELECT string_agg(md5(g::text), '') FROM generate_series(1, 4000) g),
+             jsonb_build_object('k', (SELECT string_agg(md5(g::text), '') FROM generate_series(1, 4000) g));
+         CREATE PUBLICATION {PUBLICATION} FOR TABLE orders, toasty;"
     ))
     .await
     .unwrap();
@@ -314,7 +323,11 @@ async fn wait_replayed(t: &Topology) {
 /// source stopped, the durable checkpoint at the idle position and the
 /// standby's slot persistent, synced and at the primary's position.
 async fn sync_idle(t: &Topology, proxy: &Proxy, d: &Durable) {
-    let src_run = source(proxy, d).await;
+    sync_idle_with(t, proxy, d, false).await
+}
+
+async fn sync_idle_with(t: &Topology, proxy: &Proxy, d: &Durable, toast: bool) {
+    let src_run = source_with(proxy, d, toast).await;
     let (tx, _rx) =
         test_common::acked_channel(&src_run, &d.ckpt, &src_run.id, 256);
     let handle = src_run.run(tx, Arc::clone(&d.ckpt)).await;
@@ -466,7 +479,17 @@ impl Durable {
 }
 
 async fn source(proxy: &Proxy, d: &Durable) -> PostgresSource {
-    PostgresSource {
+    source_with(proxy, d, false).await
+}
+
+/// `toast`: also capture `toasty`, for a pipeline whose sinks need complete
+/// rows.
+async fn source_with(
+    proxy: &Proxy,
+    d: &Durable,
+    toast: bool,
+) -> PostgresSource {
+    let src = PostgresSource {
         max_message_size: None,
         id: SOURCE.into(),
         dsn: dsn(proxy.port, DB).into(),
@@ -492,7 +515,14 @@ async fn source(proxy: &Proxy, d: &Durable) -> PostgresSource {
         rotation: None,
         snapshot_cohort: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
+    };
+    if toast {
+        let mut src = src;
+        src.tables.push("public.toasty".into());
+        src.set_complete_rows_required(true);
+        return src;
     }
+    src
 }
 
 fn ids(events: &[Event]) -> Vec<i64> {
@@ -528,7 +558,17 @@ async fn collect(
 /// Run the source until it delivered `id` (inserted once it streams), then
 /// stop it: its durable checkpoint is then just after `id`.
 async fn run_until(proxy: &Proxy, port: u16, d: &Durable, id: i64) {
-    let src_run = source(proxy, d).await;
+    run_until_with(proxy, port, d, id, false).await
+}
+
+async fn run_until_with(
+    proxy: &Proxy,
+    port: u16,
+    d: &Durable,
+    id: i64,
+    toast: bool,
+) {
+    let src_run = source_with(proxy, d, toast).await;
     let (tx, mut rx) =
         test_common::acked_channel(&src_run, &d.ckpt, &src_run.id, 256);
     let handle = src_run.run(tx, Arc::clone(&d.ckpt)).await;
@@ -647,6 +687,81 @@ async fn a_promoted_standby_with_a_synced_slot_continues_at_the_checkpoint()
     assert_eq!(after["timeline"], 2);
     assert_eq!(after["chain"], chain);
     assert_eq!(after["transition"], 1);
+    drop(t.standby);
+    Ok(())
+}
+
+/// Unchanged TOAST values are reconstructed across a failover: an update on
+/// the promoted standby, streamed through the switched endpoint by a source
+/// whose sinks need complete rows, carries every large value from its old
+/// row (the new primary sends the full old row under REPLICA IDENTITY FULL).
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn unchanged_toast_values_are_reconstructed_after_a_failover()
+-> Result<()> {
+    init_test_tracing();
+    let t = start_topology("17").await;
+    create_schema(t.primary_port).await;
+    let root = admin(t.primary_port, "postgres").await;
+    root.batch_execute(
+        "ALTER SYSTEM SET synchronized_standby_slots = 'standby_slot'",
+    )
+    .await?;
+    root.batch_execute("SELECT pg_reload_conf()").await?;
+    // Complete rows are required for every captured table with a
+    // TOAST-capable column (`orders.sku` is text): FULL on both.
+    admin(t.primary_port, DB)
+        .await
+        .batch_execute("ALTER TABLE orders REPLICA IDENTITY FULL")
+        .await?;
+    let proxy = Proxy::start(t.primary_port).await;
+    let d = Durable::new();
+
+    run_until_with(&proxy, t.primary_port, &d, 1, true).await;
+    sync_idle_with(&t, &proxy, &d, true).await;
+    t.primary.stop().await?;
+    promote(t.standby_port).await;
+    admin(t.standby_port, DB)
+        .await
+        .execute("UPDATE toasty SET small = 1 WHERE id = 1", &[])
+        .await?;
+    proxy.switch_to(t.standby_port);
+
+    let src_run = source_with(&proxy, &d, true).await;
+    let (tx, mut rx) =
+        test_common::acked_channel(&src_run, &d.ckpt, &src_run.id, 256);
+    let handle = src_run.run(tx, Arc::clone(&d.ckpt)).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let update = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match timeout(left, rx.recv()).await {
+            Ok(Some(SourceItem::Event(e)))
+                if e.source.table == "toasty"
+                    && e.op == deltaforge_core::Op::Update =>
+            {
+                break e;
+            }
+            Ok(Some(_)) => continue,
+            other => panic!(
+                "no update after the failover: {}",
+                matches!(other, Ok(None))
+            ),
+        }
+    };
+    for col in ["body", "doc"] {
+        let after = update.after.as_ref().unwrap().get(col).unwrap();
+        assert!(
+            !matches!(after, deltaforge_core::CanonicalValue::Unchanged),
+            "{col} left unavailable after the failover"
+        );
+        assert_eq!(
+            Some(after),
+            update.before.as_ref().unwrap().get(col),
+            "{col}"
+        );
+    }
+    handle.stop();
+    handle.join().await.ok();
     drop(t.standby);
     Ok(())
 }

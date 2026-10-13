@@ -55,6 +55,8 @@ pub struct S3Sink {
     required: bool,
     send_timeout: std::time::Duration,
     pool: Arc<Mutex<WriterPool>>,
+    /// The file format needs every column's value in every row.
+    complete_rows: bool,
     cancel: CancellationToken,
     /// Background task that periodically rolls aged/idle writers so time-based
     /// rolling works even when the source is idle (no `send_batch` calls).
@@ -91,6 +93,7 @@ impl S3Sink {
             cancel,
             idle_sweep_interval,
         } = args;
+        let complete_rows = format.requires_complete_rows();
         let pool = WriterPool::new(store, format, schema_resolver, pool_cfg);
         let pool = Arc::new(Mutex::new(pool));
         info!(
@@ -113,6 +116,7 @@ impl S3Sink {
             required,
             send_timeout,
             pool,
+            complete_rows,
             cancel,
             sweeper,
         }
@@ -249,6 +253,10 @@ fn roll_label(reason: RollReason) -> String {
 
 #[async_trait]
 impl Sink for S3Sink {
+    fn requires_complete_rows(&self) -> bool {
+        self.complete_rows
+    }
+
     /// Close and upload every open file (the weaker durability this mode
     /// declares otherwise acknowledges buffered rows); with nothing buffered,
     /// acknowledge without an object. A file that fails to close is
