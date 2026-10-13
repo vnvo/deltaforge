@@ -4155,6 +4155,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "perf-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures",
+ "gate-ownership",
+ "mysql_async 0.36.2",
+ "object_store",
+ "parquet",
+ "rdkafka",
+ "reqwest",
+ "s3-test-server",
+ "serde_json",
+ "serde_yaml",
+ "sources",
+ "testcontainers",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "pgwire-replication"
 version = "0.4.0"
 dependencies = [

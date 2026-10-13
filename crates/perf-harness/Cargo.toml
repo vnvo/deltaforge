@@ -1,0 +1,29 @@
+[package]
+name = "perf-harness"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+description = "A/B performance comparison of two DeltaForge release binaries on identical fixtures"
+publish = false
+
+[[bin]]
+name = "canonical-perf"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio = { workspace = true, features = ["full"] }
+futures.workspace = true
+reqwest.workspace = true
+rdkafka.workspace = true
+clap = { version = "4", features = ["derive"] }
+mysql_async = "0.36"
+tokio-postgres = "0.7"
+testcontainers = "0.25"
+object_store = { version = "0.13", features = ["aws"] }
+parquet = { version = "58", features = ["async", "object_store"] }
+gate-ownership = { path = "../gate-ownership" }
+s3-test-server = { path = "../s3-test-server" }
+sources = { path = "../sources" }
