@@ -123,23 +123,7 @@ impl CountingBackend {
         if !self.normalize.load(Ordering::SeqCst) {
             return b.len();
         }
-        let Ok(serde_json::Value::Object(m)) =
-            serde_json::from_slice::<serde_json::Value>(b)
-        else {
-            return b.len();
-        };
-        let mut n = b.len();
-        if let Some(serde_json::Value::String(ts)) = m.get("registered_at") {
-            n -= ts.len();
-        }
-        // A registration's checkpoint is stored as a JSON array of byte
-        // values; count its bytes, not their decimal rendering (whose width
-        // depends on the values, e.g. a random server UUID).
-        if let Some(serde_json::Value::Array(bytes)) = m.get("checkpoint") {
-            let rendered = serde_json::to_vec(bytes).map_or(0, |v| v.len());
-            n = n - rendered + bytes.len();
-        }
-        n
+        normalized_len(b)
     }
 
     pub fn ops(&self) -> OpVector {
@@ -450,5 +434,113 @@ impl StorageBackend for CountingBackend {
     ) -> Result<usize> {
         self.count("queue_drop_oldest", 0, 0);
         self.inner.queue_drop_oldest(ns, key, count).await
+    }
+}
+
+/// A returned record's length without the bytes whose width depends on when
+/// or where it was written rather than on how much was read: timestamps
+/// (`*_at`, rendered with variable sub-second precision), WAL positions
+/// (`lsn`, `*_lsn`, hex of varying width), and a checkpoint stored as a JSON
+/// array of byte values (its bytes counted, not their decimal rendering, and
+/// positions inside it normalized the same way). Any depth.
+pub fn normalized_len(b: &[u8]) -> usize {
+    match serde_json::from_slice::<serde_json::Value>(b) {
+        Ok(v @ serde_json::Value::Object(_)) => b.len() - variable_width(&v),
+        _ => b.len(),
+    }
+}
+
+/// Bytes of `v`'s rendering that [`normalized_len`] leaves out.
+fn variable_width(v: &serde_json::Value) -> usize {
+    use serde_json::Value;
+    match v {
+        Value::Object(m) => m
+            .iter()
+            .map(|(k, x)| match x {
+                Value::String(s)
+                    if k.ends_with("_at")
+                        || k == "lsn"
+                        || k.ends_with("_lsn") =>
+                {
+                    s.len()
+                }
+                Value::Array(bytes)
+                    if k == "checkpoint"
+                        && bytes
+                            .iter()
+                            .all(|b| b.as_u64().is_some_and(|b| b <= 255)) =>
+                {
+                    let raw: Vec<u8> = bytes
+                        .iter()
+                        .filter_map(|b| b.as_u64())
+                        .map(|b| b as u8)
+                        .collect();
+                    let rendered =
+                        serde_json::to_vec(bytes).map_or(0, |r| r.len());
+                    rendered - raw.len() + (raw.len() - normalized_len(&raw))
+                }
+                _ => variable_width(x),
+            })
+            .sum(),
+        Value::Array(xs) => xs.iter().map(variable_width).sum(),
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalized_len;
+    use serde_json::json;
+
+    fn len(v: serde_json::Value) -> usize {
+        normalized_len(&serde_json::to_vec(&v).unwrap())
+    }
+
+    /// The live_ttfce failure: a catalog annotation captured at a time whose
+    /// nanoseconds end in 000 renders 3 digits shorter (chrono's AutoSi), and
+    /// a WAL position can gain a hex digit. Neither is work.
+    #[test]
+    fn timestamp_precision_and_position_width_are_not_counted() {
+        let annotation = |at: &str, lsn: &str| json!({"captured_at": at, "captured_lsn": lsn, "relation": "public.app_events"});
+        assert_eq!(
+            len(annotation(
+                "2026-10-13T12:37:00.232998099+00:00",
+                "0/FFFFF8"
+            )),
+            len(annotation(
+                "2026-10-13T12:37:05.927926000+00:00",
+                "0/1000008"
+            )),
+        );
+        assert_eq!(
+            len(annotation(
+                "2026-10-13T12:37:00.232998099+00:00",
+                "0/2722568"
+            )),
+            len(annotation("2026-10-13T12:37:05.927926+00:00", "0/2722998")),
+        );
+    }
+
+    #[test]
+    fn positions_inside_a_checkpoint_are_not_counted() {
+        let registration = |lsn: &str| {
+            let cp = serde_json::to_vec(&json!({"lsn": lsn, "tx_id": null}))
+                .unwrap();
+            json!({"version": 1, "checkpoint": cp, "registered_at": "2026-10-13T12:37:00Z"})
+        };
+        assert_eq!(
+            len(registration("0/FFFFF8")),
+            len(registration("0/10000008"))
+        );
+    }
+
+    #[test]
+    fn more_content_still_counts() {
+        assert!(
+            len(json!({"columns": ["a", "b", "c"], "captured_at": "x"}))
+                > len(json!({"columns": ["a"], "captured_at": "x"}))
+        );
+        // Not JSON: counted as is.
+        assert_eq!(normalized_len(b"raw bytes"), 9);
     }
 }

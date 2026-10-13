@@ -2680,20 +2680,30 @@ mod tests {
                 .await
                 .unwrap();
             let before = fresh.retained().await;
-            let cut = tokio::time::timeout(
-                Duration::from_micros(1),
-                fresh.interval(
-                    &segments,
-                    &id,
-                    LINEAGE,
-                    first,
-                    last,
-                    Some(first),
-                    &TAG,
-                ),
-            )
+            // Cancelled mid-extension, deterministically: polled once, it
+            // holds the record and waits on the server; then it is dropped.
+            // (A timeout could lose the race to fast local I/O.)
+            let mut req = Box::pin(fresh.interval(
+                &segments,
+                &id,
+                LINEAGE,
+                first,
+                last,
+                Some(first),
+                &TAG,
+            ));
+            let first_poll = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(
+                    req.as_mut(),
+                    cx,
+                ))
+            })
             .await;
-            assert!(cut.is_err(), "the request was cancelled");
+            assert!(
+                first_poll.is_pending(),
+                "the request is in flight on the server"
+            );
+            drop(req);
             assert_eq!(fresh.retained().await, before);
             assert_eq!(fresh.pinned(), 0);
             let r = fresh
