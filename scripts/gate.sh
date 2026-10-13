@@ -13,7 +13,8 @@
 #                                       left to the workspace step
 #
 # Steps: manifest check; fmt; clippy -D warnings (also with the `vault`
-# feature); workspace tests; with --release, the release images (both
+# feature); workspace tests; each vendored crate of scripts/vendor-crates.txt
+# built and tested on its own; with --release, the release images (both
 # Dockerfiles built from the committed tree and smoke-tested); every test
 # binary built once; then the
 # `serial-pg` and `serial` suites one at a time in one lane while the
@@ -53,6 +54,7 @@ set -u
 ROOT=$(git rev-parse --show-toplevel)
 cd "$ROOT"
 MANIFEST=${GATE_MANIFEST:-$ROOT/scripts/gate-suites.txt}
+VENDOR_MANIFEST=${GATE_VENDOR_MANIFEST:-$ROOT/scripts/vendor-crates.txt}
 
 die() {
   echo "gate: $*" >&2
@@ -92,6 +94,37 @@ check_manifest() {
       ok=1
     fi
   done < <(grep -E '^workspace[[:space:]]' "$MANIFEST" | awk '{print $2}')
+  check_vendor_manifest || ok=1
+  return $ok
+}
+
+# Every vendored crate the workspace patches in is listed in the vendor
+# manifest; every listed crate has a manifest and a known level; every extra
+# command belongs to a listed crate.
+check_vendor_manifest() {
+  local ok=0 dir kind level listed
+  listed=$(awk '$1 == "crate" {print $2}' "$VENDOR_MANIFEST" | sort)
+  for dir in $(sed -n '/^\[patch\./,/^\[/p' Cargo.toml |
+    grep -o 'path *= *"vendor/[^"]*"' | sed 's/.*"\(.*\)"/\1/'); do
+    grep -qx "$dir" <<<"$listed" ||
+      { echo "vendor: patched crate $dir is not listed in $VENDOR_MANIFEST"; ok=1; }
+  done
+  while read -r kind dir level; do
+    case $kind in
+      crate)
+        [ -f "$dir/Cargo.toml" ] || { echo "vendor: $dir has no Cargo.toml"; ok=1; }
+        case $level in
+          strict | warn) ;;
+          *) echo "vendor: $dir has unknown level '$level'"; ok=1 ;;
+        esac
+        ;;
+      extra)
+        grep -qx "$dir" <<<"$listed" ||
+          { echo "vendor: extra command for unlisted crate $dir"; ok=1; }
+        ;;
+      *) echo "vendor: unknown entry '$kind'"; ok=1 ;;
+    esac
+  done < <(grep -Ev '^\s*(#|$)' "$VENDOR_MANIFEST")
   return $ok
 }
 
@@ -180,7 +213,10 @@ reap_stale() {
     reap_run "$run"
   done
 }
-cleanup() { reap_run "$RUN_ID"; }
+cleanup() {
+  reap_run "$RUN_ID"
+  [ -z "${VENDOR_TMP:-}" ] || rm -rf -- "$VENDOR_TMP"
+}
 # Stop every descendant (TERM, then KILL after GATE_STOP_SECS, default 30)
 # and wait for it, so no suite creates a container after the cleanup.
 descendants() { # (excluding the subshell listing them)
@@ -253,6 +289,44 @@ export -f run summ suite
 
 lane() { grep -E "^$1[[:space:]]" "$MANIFEST" | awk '{$1=""; print substr($0, 2)}'; }
 
+# Each crate of the vendor manifest, from a copy in a gate-owned temporary
+# directory outside the workspace (so it builds against its own manifest),
+# with the workspace Cargo.lock; every command under a hard timeout
+# (GATE_VENDOR_TIMEOUT seconds, default 1800). The directory is removed
+# afterwards, and by `cleanup` on any exit.
+VENDOR_TMP=""
+vendor_step() { # name step target dir cmd...
+  local name=$1 step=$2 target=$3 dir=$4
+  shift 4
+  run "vendor/$name/$step" "$OUT/vendor_${name}_$step.log" \
+    timeout "${GATE_VENDOR_TIMEOUT:-1800}" env -C "$dir" CARGO_TARGET_DIR="$target" "$@"
+}
+vendor_crates() {
+  local kind dir level name copy target xdir xname xcmd
+  VENDOR_TMP=$(mktemp -d "${TMPDIR:-/tmp}/deltaforge-vendor-gate.XXXXXX")
+  while read -r kind dir level; do
+    [ "$kind" = crate ] || continue
+    name=$(basename "$dir")
+    copy="$VENDOR_TMP/$name"
+    target="$ROOT/target/vendor-gate/$name"
+    cp -a -- "$dir" "$copy" && cp -- Cargo.lock "$copy/Cargo.lock"
+    if [ "$level" = strict ]; then
+      vendor_step "$name" fmt "$target" "$copy" cargo fmt -- --check
+      vendor_step "$name" clippy "$target" "$copy" cargo clippy --all-targets -- -D warnings
+    else
+      vendor_step "$name" check "$target" "$copy" cargo check --all-targets
+      vendor_step "$name" clippy "$target" "$copy" cargo clippy --all-targets
+    fi
+    vendor_step "$name" test "$target" "$copy" cargo test
+    while read -r xname xcmd; do
+      vendor_step "$name" "$xname" "$target-$xname" "$copy" bash -c "$xcmd"
+    done < <(awk -v d="$dir" '$1 == "extra" && $2 == d {$1 = ""; $2 = ""; print substr($0, 3)}' \
+      "$VENDOR_MANIFEST")
+  done < <(grep -Ev '^\s*(#|$)' "$VENDOR_MANIFEST")
+  rm -rf -- "$VENDOR_TMP"
+  VENDOR_TMP=""
+}
+
 # Self-test only: a step that blocks until interrupted (its pid in the file).
 if [ -n "${GATE_SELFTEST_BLOCK:-}" ]; then
   run selftest-block "$OUT/selftest-block.log" \
@@ -266,6 +340,7 @@ if [ "${GATE_ONLY_SUITES:-}" != 1 ]; then
   run clippy-vault "$OUT/clippy-vault.log" \
     cargo clippy -p sources -p runner -p secrets --features vault --all-targets -- -D warnings
   run workspace "$OUT/workspace.log" cargo test --workspace --no-fail-fast
+  vendor_crates
   if [ "$TIER" = release ]; then
     run release-images "$OUT/release-images.log" "$ROOT/scripts/release-images.sh"
   fi

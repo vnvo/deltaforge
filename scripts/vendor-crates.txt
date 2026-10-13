@@ -1,0 +1,20 @@
+# Vendored Rust crates the gate builds and tests on their own (scripts/gate.sh,
+# steps `vendor/<name>/<step>`): each from a copy outside the workspace, with
+# the workspace Cargo.lock, under a hard timeout. Every `[patch.*]` path under
+# vendor/ in the workspace Cargo.toml must be listed (scripts/gate.sh --check).
+# Only crates listed here are tested: vendor/ may hold fixtures or trees that
+# are not independently buildable.
+#
+# crate <dir> <level>
+#   strict: cargo fmt --check, clippy --all-targets -D warnings, cargo test
+#   warn:   cargo check --all-targets, clippy --all-targets (warnings kept in
+#           the log, not failing: upstream code kept close to upstream),
+#           cargo test
+# extra <dir> <name> <command...>
+#   another command run in the copy (its own target directory), for example
+#   a loom model.
+
+crate vendor/pgwire-replication strict
+crate vendor/mysql-binlog-connector-rust warn
+
+extra vendor/pgwire-replication loom env RUSTFLAGS=--cfg=pgwire_loom cargo test --release --lib loom_model

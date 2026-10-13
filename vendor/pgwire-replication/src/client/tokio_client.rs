@@ -16,8 +16,7 @@ use crate::config::SslMode;
 
 use super::metrics::ReplicationMetrics;
 use super::worker::{
-    GateCommand, QueryRow, ReplicationEvent, ReplicationEventReceiver, SharedProgress,
-    WorkerState,
+    GateCommand, QueryRow, ReplicationEvent, ReplicationEventReceiver, SharedProgress, WorkerState,
 };
 
 /// The IDENTIFY_SYSTEM answer of a replication session. DeltaForge patch.
@@ -226,9 +225,8 @@ impl ReplicationClient {
         let timeline = text(1)?.parse::<u32>().map_err(|e| {
             PgWireError::Protocol(format!("IDENTIFY_SYSTEM: invalid timeline: {e}"))
         })?;
-        let xlogpos = Lsn::parse(&text(2)?).map_err(|e| {
-            PgWireError::Protocol(format!("IDENTIFY_SYSTEM: invalid xlogpos: {e}"))
-        })?;
+        let xlogpos = Lsn::parse(&text(2)?)
+            .map_err(|e| PgWireError::Protocol(format!("IDENTIFY_SYSTEM: invalid xlogpos: {e}")))?;
         Ok(IdentifySystem {
             system_id: text(0)?,
             timeline,
