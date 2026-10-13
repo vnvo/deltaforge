@@ -437,6 +437,13 @@ pub struct ReplicationConfig {
     ///
     /// (DeltaForge patch.)
     pub application_name: Option<String>,
+
+    /// Called after each successful standby status update that advanced the
+    /// position reported to the server, with how long that position waited
+    /// ([`FeedbackSent`](crate::FeedbackSent)). Without one, no timing is kept.
+    ///
+    /// Default: `None`
+    pub feedback_observer: Option<crate::FeedbackObserver>,
 }
 
 impl Default for ReplicationConfig {
@@ -458,6 +465,7 @@ impl Default for ReplicationConfig {
             buffer_events: 8192,
             binary: false,
             application_name: None,
+            feedback_observer: None,
         }
     }
 }
@@ -627,6 +635,13 @@ impl ReplicationConfig {
 
     pub fn with_binary(mut self, binary: bool) -> Self {
         self.binary = binary;
+        self
+    }
+
+    /// Observe successful standby status updates that advanced the reported
+    /// position (see [`feedback_observer`](Self::feedback_observer)).
+    pub fn with_feedback_observer(mut self, observer: crate::FeedbackObserver) -> Self {
+        self.feedback_observer = Some(observer);
         self
     }
 

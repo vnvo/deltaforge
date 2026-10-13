@@ -37,6 +37,12 @@ pub fn init(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
             0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
             10.0, 30.0,
         ];
+        // WAL-feedback delay buckets: 1 ms → 120 s (a held position waits up to
+        // the 30 s fallback, or a store outage up to its 60 s stop).
+        let feedback_delay_buckets: &[f64] = &[
+            0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0,
+            30.0, 60.0, 120.0,
+        ];
         // Batch-size buckets: 1 event up to max configured batch.
         let batch_buckets: &[f64] =
             &[1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0];
@@ -56,7 +62,14 @@ pub fn init(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
                 Matcher::Full("deltaforge_batch_events".to_string()),
                 batch_buckets,
             )
-            .expect("invalid batch buckets");
+            .expect("invalid batch buckets")
+            .set_buckets_for_metric(
+                Matcher::Full(
+                    "deltaforge_wal_feedback_delay_seconds".to_string(),
+                ),
+                feedback_delay_buckets,
+            )
+            .expect("invalid feedback delay buckets");
         let handle = builder
             .install_recorder()
             .expect("failed to install recorder");

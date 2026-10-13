@@ -31,6 +31,7 @@ use crate::snapshot_generation::PersistedLineage;
 use postgres_snapshot::IdentitySpec;
 
 mod event_counters;
+mod feedback_delay;
 mod postgres_errors;
 use postgres_errors::LoopControl;
 pub use postgres_errors::{PostgresSourceError, PostgresSourceResult};
@@ -2058,7 +2059,10 @@ impl PostgresSource {
                     .await
                     {
                         Ok(new_client) => {
-                            *ctx.repl_client.lock().await = new_client;
+                            feedback_delay::FeedbackDelayMetrics::replace_client(
+                                &mut *ctx.repl_client.lock().await,
+                                new_client,
+                            );
                             ctx.repl_epoch
                                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             ctx.refresh_stamp();
@@ -2093,6 +2097,21 @@ impl PostgresSource {
         // so no watcher/preflight task outlives the source.
         if let Some(rt) = rotation.take() {
             rt.shutdown().await;
+        }
+
+        // Feedback-delay measurements still pending when the source stops
+        // will never be observed.
+        if wal_feedback.refresh_since.is_some() {
+            wal_feedback.delay.dropped(feedback_delay::REFRESH);
+        }
+        if ctx
+            .repl_client
+            .lock()
+            .await
+            .feedback_pending_since()
+            .is_some()
+        {
+            wal_feedback.delay.dropped(feedback_delay::SEND);
         }
 
         // Re-propagate a fatal loop outcome (e.g. a gate-6 rotation failure) before
@@ -2164,6 +2183,13 @@ struct WalFeedback {
     repl_epoch: u64,
     pipeline: String,
     source_id: String,
+    /// Persistence time of the oldest observed checkpoint change not yet
+    /// reflected in a raised frontier (the `refresh` stage).
+    refresh_since: Option<tokio::time::Instant>,
+    /// The last poll raised the frontier: the caller applies it and reports
+    /// the `refresh` stage.
+    refreshed: bool,
+    delay: feedback_delay::FeedbackDelayMetrics,
 }
 
 impl WalFeedback {
@@ -2183,7 +2209,29 @@ impl WalFeedback {
             repl_epoch: 0,
             pipeline: pipeline.to_string(),
             source_id: source_id.to_string(),
+            refresh_since: None,
+            refreshed: false,
+            delay: feedback_delay::FeedbackDelayMetrics::new(
+                pipeline, source_id,
+            ),
         }
+    }
+
+    /// A published checkpoint change was observed: start the `refresh` stage
+    /// at its persistence time, unless an older one is still unreflected.
+    fn note_change(&mut self) {
+        if self.refresh_since.is_none() {
+            self.refresh_since = self.changes.changed_at();
+        }
+    }
+
+    /// After the caller raised the client's applied position from the last
+    /// poll: how long the `refresh` stage took, if one was measured.
+    fn take_refresh(&mut self) -> Option<std::time::Duration> {
+        if !std::mem::take(&mut self.refreshed) {
+            return None;
+        }
+        self.refresh_since.take().map(|since| since.elapsed())
     }
 
     /// Read on the next poll whatever was published (a resume after a pause).
@@ -2215,7 +2263,7 @@ impl WalFeedback {
         }
         let deadline = tokio::time::Instant::from_std(self.next_read);
         tokio::select! {
-            _ = self.changes.changed() => {}
+            _ = self.changes.changed() => self.note_change(),
             _ = tokio::time::sleep_until(deadline) => {}
         }
         self.stale = true;
@@ -2237,6 +2285,9 @@ impl WalFeedback {
         if !self.due(now) {
             return Ok(None);
         }
+        if self.changes.has_changed() {
+            self.note_change();
+        }
         self.changes.mark_seen();
         self.stale = false;
         self.next_read = now + self.changes.fallback();
@@ -2251,9 +2302,15 @@ impl WalFeedback {
         {
             FeedbackOutcome::Frontier(lsn) => {
                 self.frontier = Some(lsn);
+                self.refreshed = true;
                 self.store_available();
             }
-            FeedbackOutcome::Hold => self.store_available(),
+            // The observed change did not raise the frontier (another sink
+            // still holds it back): nothing to report for it.
+            FeedbackOutcome::Hold => {
+                self.refresh_since = None;
+                self.store_available();
+            }
             FeedbackOutcome::Transient(detail) => {
                 let since = *self.unavailable_since.get_or_insert(now);
                 if !self.warned_unavailable {
@@ -2391,6 +2448,9 @@ async fn advance_wal_feedback(
     );
     if let Some(lsn) = state.poll(chkpt, Instant::now()).await? {
         ctx.repl_client.lock().await.update_applied_lsn(lsn);
+        if let Some(refresh) = state.take_refresh() {
+            state.delay.observe(feedback_delay::REFRESH, refresh);
+        }
     }
     Ok(())
 }
@@ -3795,7 +3855,8 @@ mod wal_feedback_cache_tests {
     impl CheckpointStore for Durable {
         fn checkpoint_changes(
             &self,
-        ) -> Option<tokio::sync::watch::Receiver<u64>> {
+        ) -> Option<tokio::sync::watch::Receiver<checkpoints::CheckpointChange>>
+        {
             Some(self.generation.subscribe())
         }
         async fn get_raw(
@@ -4032,6 +4093,72 @@ mod wal_feedback_cache_tests {
             }
         }
         assert!(reported > 0);
+    }
+
+    // ── The `refresh` stage of deltaforge_wal_feedback_delay_seconds ──
+
+    #[tokio::test(start_paused = true)]
+    async fn a_raised_frontier_reports_the_refresh_stage() {
+        let store = Durable::new();
+        let (mut fb, chk) = feedback(&store);
+        fb.poll(&chk, Instant::now()).await.unwrap();
+        store.commit(0x100).await; // persisted now
+        tokio::time::advance(Duration::from_millis(300)).await;
+        assert_eq!(
+            fb.poll(&chk, Instant::now()).await.unwrap(),
+            Some(lsn(0x100))
+        );
+        assert_eq!(fb.take_refresh(), Some(Duration::from_millis(300)));
+        assert_eq!(fb.take_refresh(), None, "reported once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_change_that_does_not_raise_the_frontier_reports_nothing() {
+        let store = Durable::new();
+        store.commit(0x100).await;
+        let (mut fb, chk) = feedback(&store);
+        fb.poll(&chk, Instant::now()).await.unwrap();
+        fb.take_refresh();
+        // Another sink's commit: published, the minimum unchanged.
+        store.generation.bump();
+        assert_eq!(
+            fb.poll(&chk, Instant::now()).await.unwrap(),
+            Some(lsn(0x100))
+        );
+        assert_eq!(fb.take_refresh(), None);
+        assert!(fb.refresh_since.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_read_keeps_the_refresh_start() {
+        let store = Durable::new();
+        let (mut fb, chk) = feedback(&store);
+        fb.poll(&chk, Instant::now()).await.unwrap();
+        store.failing.store(true, Ordering::SeqCst);
+        store.commit(0x200).await;
+        tokio::time::advance(Duration::from_millis(400)).await;
+        assert_eq!(fb.poll(&chk, Instant::now()).await.unwrap(), None);
+        assert_eq!(fb.take_refresh(), None);
+        store.failing.store(false, Ordering::SeqCst);
+        // A newer change meanwhile; the older start is kept.
+        store.commit(0x300).await;
+        tokio::time::advance(Duration::from_millis(1100)).await;
+        let later = Instant::now() + Duration::from_secs(2);
+        assert_eq!(fb.poll(&chk, later).await.unwrap(), Some(lsn(0x300)));
+        assert_eq!(fb.take_refresh(), Some(Duration::from_millis(1500)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unpublished_raise_is_not_measured() {
+        let store = Durable::new();
+        store.commit_unpublished(0x100).await;
+        let (mut fb, chk) = feedback(&store);
+        // The first read at start: no published change, nothing measured.
+        assert_eq!(
+            fb.poll(&chk, Instant::now()).await.unwrap(),
+            Some(lsn(0x100))
+        );
+        assert_eq!(fb.take_refresh(), None);
     }
 }
 

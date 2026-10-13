@@ -22,27 +22,61 @@ pub use snapshot_state::assert_snapshot_state_contract;
 #[cfg(feature = "cp-sqlite")]
 pub use sqlite_store::SqliteCheckpointStore;
 
-/// A monotonic counter of durable checkpoint changes. The delivery layer bumps
+/// A monotonic record of durable checkpoint changes. The delivery layer bumps
 /// it after each successful checkpoint persistence; readers subscribe and mark
 /// the current generation seen *before* reading the store, so a change that
 /// lands during the read is still observed afterwards. Changes coalesce, and
-/// the newest generation is always the one a reader sees next.
+/// the newest generation is always the one a reader sees next. Its value is
+/// when the newest change was persisted ([`CheckpointChanges::changed_at`]).
 #[derive(Clone, Debug)]
 pub struct CheckpointGeneration(
-    std::sync::Arc<tokio::sync::watch::Sender<u64>>,
+    std::sync::Arc<tokio::sync::watch::Sender<CheckpointChange>>,
 );
+
+/// The newest durable checkpoint change: how many there were, and when the
+/// newest was persisted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CheckpointChange {
+    pub generation: u64,
+    /// Change clock reading (see `change_clock`); 0 before the first change.
+    persisted_at: u64,
+}
+
+/// Clock for change times: nanoseconds after a process-wide origin, plus one
+/// (0: no change yet). tokio's clock: the system clock, paused under test;
+/// the origin is set an hour back so a reading on another (paused) runtime
+/// never falls before it.
+fn change_origin() -> tokio::time::Instant {
+    static ORIGIN: std::sync::OnceLock<tokio::time::Instant> =
+        std::sync::OnceLock::new();
+    *ORIGIN.get_or_init(|| {
+        let now = tokio::time::Instant::now();
+        now.checked_sub(std::time::Duration::from_secs(3600))
+            .unwrap_or(now)
+    })
+}
+
+fn change_clock() -> u64 {
+    change_origin().elapsed().as_nanos() as u64 + 1
+}
 
 impl CheckpointGeneration {
     pub fn new() -> Self {
-        Self(std::sync::Arc::new(tokio::sync::watch::Sender::new(0)))
+        Self(std::sync::Arc::new(tokio::sync::watch::Sender::new(
+            CheckpointChange::default(),
+        )))
     }
 
-    /// Record that durable checkpoint state changed.
+    /// Record that durable checkpoint state changed (now).
     pub fn bump(&self) {
-        self.0.send_modify(|g| *g = g.wrapping_add(1));
+        let at = change_clock();
+        self.0.send_modify(|c| {
+            c.generation = c.generation.wrapping_add(1);
+            c.persisted_at = at;
+        });
     }
 
-    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<CheckpointChange> {
         self.0.subscribe()
     }
 }
@@ -66,7 +100,7 @@ pub const CHANGE_FALLBACK_UNPUBLISHED: std::time::Duration =
 /// lands after it is then reported by [`Self::has_changed`] and
 /// [`Self::changed`], never lost between the read and the wait.
 pub struct CheckpointChanges {
-    rx: Option<tokio::sync::watch::Receiver<u64>>,
+    rx: Option<tokio::sync::watch::Receiver<CheckpointChange>>,
     fallback: std::time::Duration,
 }
 
@@ -91,6 +125,13 @@ impl CheckpointChanges {
         if let Some(rx) = &mut self.rx {
             rx.mark_unchanged();
         }
+    }
+
+    /// When the newest published change was persisted, if any was.
+    pub fn changed_at(&self) -> Option<tokio::time::Instant> {
+        let at = self.rx.as_ref()?.borrow().persisted_at;
+        (at != 0)
+            .then(|| change_origin() + std::time::Duration::from_nanos(at - 1))
     }
 
     /// Whether a generation newer than the last seen one was published.
@@ -141,7 +182,9 @@ pub trait CheckpointStore: Send + Sync {
     /// (the per-sink proxy, fed by the coordinator after each persisted
     /// commit). `None`: the store publishes no changes and a reader must
     /// re-read on its own schedule.
-    fn checkpoint_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+    fn checkpoint_changes(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<CheckpointChange>> {
         None
     }
 
@@ -340,7 +383,7 @@ mod change_tests {
     impl CheckpointStore for Published {
         fn checkpoint_changes(
             &self,
-        ) -> Option<tokio::sync::watch::Receiver<u64>> {
+        ) -> Option<tokio::sync::watch::Receiver<CheckpointChange>> {
             Some(self.0.subscribe())
         }
         async fn get_raw(&self, _: &str) -> CheckpointResult<Option<Vec<u8>>> {

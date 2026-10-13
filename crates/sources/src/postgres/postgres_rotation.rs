@@ -329,7 +329,10 @@ impl RotationRuntime {
                     &cancel,
                 )
                 .await?;
-                *repl_client.lock().await = client;
+                super::feedback_delay::FeedbackDelayMetrics::replace_client(
+                    &mut *repl_client.lock().await,
+                    client,
+                );
                 epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok::<(), ()>(())
             }
@@ -353,7 +356,10 @@ impl RotationRuntime {
                     &cancel,
                 )
                 .await?;
-                *repl_client.lock().await = client;
+                super::feedback_delay::FeedbackDelayMetrics::replace_client(
+                    &mut *repl_client.lock().await,
+                    client,
+                );
                 epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok::<(), ()>(())
             }

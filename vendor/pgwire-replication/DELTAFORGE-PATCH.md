@@ -39,8 +39,13 @@ Files: `src/client/worker.rs`, `src/client/tokio_client.rs`,
 `src/client/mod.rs`.
 
 Change: standby status updates on applied-LSN changes (upstream-first; mirrors
-vnvo/pgwire-replication commits 4b9f39d and 8d93267, PR #13, not yet
-released). 8d93267 fixes a lost wake found by its loom model: the fast-path
+vnvo/pgwire-replication commits 4b9f39d and 8d93267, PR #13, and the feedback
+observer 808a8d7, PR #14 stacked on it; not yet released). The observer
+(`ReplicationConfig::with_feedback_observer`, `FeedbackSent::pending_for`,
+`ReplicationClient::feedback_pending_since` / `carry_feedback_pending`,
+`src/client/feedback.rs`) feeds DeltaForge's
+`deltaforge_wal_feedback_delay_seconds{stage="send"}`. In the vendored
+`connect`, timing is enabled with the DeltaForge `ack_lsn` start. 8d93267 fixes a lost wake found by its loom model: the fast-path
 load of the signalled flag was Relaxed; it is SeqCst, in `ProgressCell`
 (`src/client/progress.rs`). The loom model runs in DeltaForge's vendor gate
 step (`scripts/vendor-crates.txt`). Before, an
@@ -53,8 +58,8 @@ except for the first raise after the worker last looked. Source and unit tests
 are identical to upstream; the upstream changelog entry and live integration
 test stay upstream. Replace this patch with the released dependency once a
 release includes it. Files: `src/client/worker.rs`,
-`src/client/progress.rs`, `src/client/mod.rs`, `src/client/tokio_client.rs`,
-`src/config.rs`, `Cargo.toml` (tokio `test-util` and, under
+`src/client/progress.rs`, `src/client/feedback.rs`, `src/client/mod.rs`,
+`src/client/tokio_client.rs`, `src/config.rs`, `src/lib.rs`, `Cargo.toml` (tokio `test-util` and, under
 `cfg(pgwire_loom)`, loom dev-dependencies; the `pgwire_loom` check-cfg).
 
 Also included: upstream commit 21d84aa (released in 0.4.1), a test-only
