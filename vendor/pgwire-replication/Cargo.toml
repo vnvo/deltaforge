@@ -175,3 +175,9 @@ version = "0.7"
 [dev-dependencies.tokio]
 version = "1"
 features = ["test-util"]
+
+[target.'cfg(pgwire_loom)'.dev-dependencies.loom]
+version = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(pgwire_loom)'] }

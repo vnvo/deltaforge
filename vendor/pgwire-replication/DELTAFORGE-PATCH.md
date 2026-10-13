@@ -39,7 +39,11 @@ Files: `src/client/worker.rs`, `src/client/tokio_client.rs`,
 `src/client/mod.rs`.
 
 Change: standby status updates on applied-LSN changes (upstream-first; mirrors
-vnvo/pgwire-replication commit 4b9f39d, PR #13, not yet released). Before, an
+vnvo/pgwire-replication commits 4b9f39d and 8d93267, PR #13, not yet
+released). 8d93267 fixes a lost wake found by its loom model: the fast-path
+load of the signalled flag was Relaxed; it is SeqCst, in `ProgressCell`
+(`src/client/progress.rs`). The loom model runs in DeltaForge's vendor gate
+step (`scripts/vendor-crates.txt`). Before, an
 idle stream reported a raised applied LSN only at the next
 `idle_wakeup_interval` wakeup, server message or keepalive reply request.
 `update_applied_lsn` now wakes the worker, which sends the newest position
@@ -49,5 +53,12 @@ except for the first raise after the worker last looked. Source and unit tests
 are identical to upstream; the upstream changelog entry and live integration
 test stay upstream. Replace this patch with the released dependency once a
 release includes it. Files: `src/client/worker.rs`,
-`src/client/tokio_client.rs`, `src/config.rs`, `Cargo.toml` (tokio
-`test-util` dev-dependency).
+`src/client/progress.rs`, `src/client/mod.rs`, `src/client/tokio_client.rs`,
+`src/config.rs`, `Cargo.toml` (tokio `test-util` and, under
+`cfg(pgwire_loom)`, loom dev-dependencies; the `pgwire_loom` check-cfg).
+
+Also included: upstream commit 21d84aa (released in 0.4.1), a test-only
+clippy fix in `src/protocol/messages.rs`. The DeltaForge patch code is
+formatted with the crate's `rustfmt.toml`. DeltaForge's gate builds, lints
+(fmt, clippy -D warnings) and tests this crate on its own, including the loom
+model (`scripts/vendor-crates.txt`).

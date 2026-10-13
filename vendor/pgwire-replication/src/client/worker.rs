@@ -1,11 +1,11 @@
 use bytes::Bytes;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use super::metrics::ReplicationMetrics;
+use super::progress::ProgressCell;
 use crate::config::ReplicationConfig;
 use crate::error::{PgWireError, Result};
 use crate::lsn::Lsn;
@@ -20,56 +20,35 @@ use crate::protocol::replication::{
 
 /// Shared replication progress updated by the consumer and read by the worker.
 ///
-/// The applied LSN is an AtomicU64 so progress updates are cheap and monotonic
-/// without async backpressure. A raise also wakes an idle worker, which sends
-/// it promptly instead of at its next wakeup. Only the first raise after the
-/// worker last looked bumps the watch generation; later ones coalesce into it
-/// and cost one more atomic load.
+/// The applied LSN lives in a lock-free [`ProgressCell`] so progress updates
+/// are cheap and monotonic without async backpressure. A raise also wakes an
+/// idle worker, which sends it promptly instead of at its next wakeup. Only the
+/// first raise after the worker last looked bumps the watch generation; later
+/// ones coalesce into it and cost one more atomic load.
 pub struct SharedProgress {
-    applied: AtomicU64,
-    /// Set by the first raise the worker has not looked at yet.
-    signalled: AtomicBool,
+    cell: ProgressCell,
     changed: watch::Sender<u64>,
 }
 
 impl SharedProgress {
     pub fn new(start: Lsn) -> Self {
         Self {
-            applied: AtomicU64::new(start.as_u64()),
-            signalled: AtomicBool::new(false),
+            cell: ProgressCell::new(start.as_u64()),
             changed: watch::Sender::new(0),
         }
     }
 
     #[inline]
     pub fn load_applied(&self) -> Lsn {
-        Lsn::from_u64(self.applied.load(Ordering::Acquire))
+        Lsn::from_u64(self.cell.load())
     }
 
     /// Monotonic update: if `lsn` is lower than the currently stored applied LSN,
     /// this is a no-op.
     #[inline]
     pub fn update_applied(&self, lsn: Lsn) {
-        let new = lsn.as_u64();
-        let mut cur = self.applied.load(Ordering::Relaxed);
-
-        while new > cur {
-            // SeqCst pairs with `take_signal`: either the worker reads this
-            // raise, or this raise sees the signal cleared and wakes it.
-            match self
-                .applied
-                .compare_exchange_weak(cur, new, Ordering::SeqCst, Ordering::Relaxed)
-            {
-                Ok(_) => {
-                    if !self.signalled.load(Ordering::Relaxed)
-                        && !self.signalled.swap(true, Ordering::SeqCst)
-                    {
-                        self.changed.send_modify(|g| *g = g.wrapping_add(1));
-                    }
-                    break;
-                }
-                Err(observed) => cur = observed,
-            }
+        if self.cell.raise(lsn.as_u64()) {
+            self.changed.send_modify(|g| *g = g.wrapping_add(1));
         }
     }
 
@@ -81,8 +60,7 @@ impl SharedProgress {
     /// The worker is about to read the applied LSN: the next raise wakes it
     /// again. Returns the applied LSN read after clearing the signal.
     fn take_signal(&self) -> Lsn {
-        self.signalled.store(false, Ordering::SeqCst);
-        Lsn::from_u64(self.applied.load(Ordering::SeqCst))
+        Lsn::from_u64(self.cell.take_signal())
     }
 }
 
@@ -1182,16 +1160,22 @@ mod tests {
 
         let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
         let (gate_tx, mut gate_rx) = mpsc::channel(1);
-        let serve = tokio::spawn(async move {
-            WorkerState::serve_gate(&mut gate_rx, &mut worker_end).await
-        });
+        let serve =
+            tokio::spawn(
+                async move { WorkerState::serve_gate(&mut gate_rx, &mut worker_end).await },
+            );
 
         let reply = gated_query(&gate_tx, "IDENTIFY_SYSTEM").await;
         let (tag, payload) = read_frontend(&mut server).await;
         assert_eq!(tag, b'Q');
         assert_eq!(payload, b"IDENTIFY_SYSTEM\0");
         let mut answer = frame(b'T', &[0, 0]);
-        answer.extend(data_row(&[Some(b"7"), Some(b"2"), Some(b"0/16B3748"), None]));
+        answer.extend(data_row(&[
+            Some(b"7"),
+            Some(b"2"),
+            Some(b"0/16B3748"),
+            None,
+        ]));
         answer.extend(frame(b'C', b"IDENTIFY_SYSTEM\0"));
         answer.extend(frame(b'Z', b"I"));
         server.write_all(&answer).await.unwrap();
@@ -1201,7 +1185,10 @@ mod tests {
         assert_eq!(rows[0][3], None, "NULL stays NULL");
 
         gate_tx.send(GateCommand::Start).await.unwrap();
-        assert!(matches!(serve.await.unwrap(), Ok(true)), "Start ends the gate");
+        assert!(
+            matches!(serve.await.unwrap(), Ok(true)),
+            "Start ends the gate"
+        );
     }
 
     #[tokio::test]
@@ -1210,9 +1197,10 @@ mod tests {
 
         let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
         let (gate_tx, mut gate_rx) = mpsc::channel(1);
-        let serve = tokio::spawn(async move {
-            WorkerState::serve_gate(&mut gate_rx, &mut worker_end).await
-        });
+        let serve =
+            tokio::spawn(
+                async move { WorkerState::serve_gate(&mut gate_rx, &mut worker_end).await },
+            );
 
         let reply = gated_query(&gate_tx, "TIMELINE_HISTORY 1").await;
         read_frontend(&mut server).await;
@@ -1248,9 +1236,10 @@ mod tests {
     async fn a_broken_session_ends_the_gate_with_its_error() {
         let (mut worker_end, server) = tokio::io::duplex(64 * 1024);
         let (gate_tx, mut gate_rx) = mpsc::channel(1);
-        let serve = tokio::spawn(async move {
-            WorkerState::serve_gate(&mut gate_rx, &mut worker_end).await
-        });
+        let serve =
+            tokio::spawn(
+                async move { WorkerState::serve_gate(&mut gate_rx, &mut worker_end).await },
+            );
         let reply = gated_query(&gate_tx, "IDENTIFY_SYSTEM").await;
         drop(server);
         assert!(reply.await.unwrap().is_err());
