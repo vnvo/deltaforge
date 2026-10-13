@@ -170,7 +170,10 @@ impl PerSinkCheckpointProxy {
 
 #[async_trait]
 impl CheckpointStore for PerSinkCheckpointProxy {
-    fn checkpoint_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+    fn checkpoint_changes(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<checkpoints::CheckpointChange>>
+    {
         Some(self.generation.subscribe())
     }
 

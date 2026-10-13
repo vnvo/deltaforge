@@ -334,6 +334,14 @@ impl StreamProof {
         // replication.
         // A fresh nonce per session: the catalog proof matches the exact
         // walsender of the stream it serves, never an earlier one.
+        // The `send` stage of deltaforge_wal_feedback_delay_seconds.
+        let cfg = cfg.with_feedback_observer(
+            super::feedback_delay::FeedbackDelayMetrics::new(
+                &self.pipeline,
+                &self.source_id,
+            )
+            .observer(),
+        );
         let cfg = cfg.with_application_name(format!(
             "deltaforge:{}",
             uuid::Uuid::new_v4().simple()

@@ -70,11 +70,13 @@
 //! }
 //! ```
 
+mod feedback;
 mod metrics;
 mod progress;
 mod tokio_client;
 mod worker;
 
+pub use feedback::{FeedbackObserver, FeedbackSent};
 pub use metrics::ReplicationMetrics;
 pub use tokio_client::{IdentifySystem, ReplicationClient, TimelineHistory};
 pub use worker::{QueryRow, ReplicationEvent, ReplicationEventReceiver};

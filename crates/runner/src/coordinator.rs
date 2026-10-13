@@ -6199,7 +6199,7 @@ mod tests {
         let _ = coord
             .run(rx, tokio_util::sync::CancellationToken::new(), pause_rx)
             .await;
-        let published = *seen.borrow();
+        let published = seen.borrow().generation;
         (published, store)
     }
 
