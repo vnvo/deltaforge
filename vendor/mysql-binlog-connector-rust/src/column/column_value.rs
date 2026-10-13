@@ -210,7 +210,10 @@ impl ColumnValue {
         })
     }
 
-    fn parse_time2(cursor: &mut Cursor<&Vec<u8>>, column_meta: u16) -> Result<MysqlTime, BinlogError> {
+    fn parse_time2(
+        cursor: &mut Cursor<&Vec<u8>>,
+        column_meta: u16,
+    ) -> Result<MysqlTime, BinlogError> {
         // (in big endian)
 
         // 1 bit sign (1= non-negative, 0= negative)
@@ -225,7 +228,7 @@ impl ColumnValue {
 
         // refer to: https://github.com/debezium/debezium/blob/main/debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/event/RowDeserializers.java#L341
 
-        let fraction_bytes = ((column_meta + 1) / 2) as usize;
+        let fraction_bytes = column_meta.div_ceil(2) as usize;
         let payload_bytes = 3 + fraction_bytes;
         let payload_bits = payload_bytes * 8;
 
@@ -257,7 +260,7 @@ impl ColumnValue {
 
     fn parse_fraction(cursor: &mut Cursor<&Vec<u8>>, column_meta: u16) -> Result<u32, BinlogError> {
         let mut fraction = 0;
-        let length = ((column_meta + 1) / 2) as u32;
+        let length = column_meta.div_ceil(2) as u32;
         if length > 0 {
             fraction = cursor.read_uint::<BigEndian>(length as usize)?;
             fraction *= u64::pow(100, 3 - length);

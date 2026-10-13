@@ -92,15 +92,21 @@ impl TableMetadata {
                 }
                 MetadataType::DefaultCharset => {
                     let charset = parse_default_charset(&mut buffer)?;
-                    apply_default_charset(&mut columns, &charset, |i| {
-                        is_character_column(column_types[i], column_metas[i])
-                    }, false);
+                    apply_default_charset(
+                        &mut columns,
+                        &charset,
+                        |i| is_character_column(column_types[i], column_metas[i]),
+                        false,
+                    );
                     default_charset = Some(charset);
                 }
                 MetadataType::ColumnCharset => {
-                    parse_column_charsets(&mut columns, &mut buffer, |i| {
-                        is_character_column(column_types[i], column_metas[i])
-                    }, false)?;
+                    parse_column_charsets(
+                        &mut columns,
+                        &mut buffer,
+                        |i| is_character_column(column_types[i], column_metas[i]),
+                        false,
+                    )?;
                 }
                 MetadataType::ColumnName => {
                     parse_column_names(&mut columns, &mut buffer)?;
@@ -127,17 +133,27 @@ impl TableMetadata {
                 }
                 MetadataType::EnumAndSetDefaultCharset => {
                     let charset = parse_default_charset(&mut buffer)?;
-                    apply_default_charset(&mut columns, &charset, |i| {
-                        is_enum_column(column_types[i], column_metas[i])
-                            || is_set_column(column_types[i], column_metas[i])
-                    }, true);
+                    apply_default_charset(
+                        &mut columns,
+                        &charset,
+                        |i| {
+                            is_enum_column(column_types[i], column_metas[i])
+                                || is_set_column(column_types[i], column_metas[i])
+                        },
+                        true,
+                    );
                     enum_and_set_default_charset = Some(charset);
                 }
                 MetadataType::EnumAndSetColumnCharset => {
-                    parse_column_charsets(&mut columns, &mut buffer, |i| {
-                        is_enum_column(column_types[i], column_metas[i])
-                            || is_set_column(column_types[i], column_metas[i])
-                    }, true)?;
+                    parse_column_charsets(
+                        &mut columns,
+                        &mut buffer,
+                        |i| {
+                            is_enum_column(column_types[i], column_metas[i])
+                                || is_set_column(column_types[i], column_metas[i])
+                        },
+                        true,
+                    )?;
                 }
                 MetadataType::ColumnVisibility => {
                     let visibility = read_bitmap_reverted(&mut buffer, column_types.len())?;
@@ -174,7 +190,7 @@ pub(crate) fn read_bitmap_reverted(
     bits_number: usize,
 ) -> Result<Vec<bool>, BinlogError> {
     let mut result = vec![false; bits_number];
-    let bytes_number = (bits_number + 7) / 8;
+    let bytes_number = bits_number.div_ceil(8);
     for i in 0..bytes_number {
         let value = cursor.read_u8()?;
         for y in 0..8 {
@@ -354,8 +370,7 @@ fn parse_geometry_types(
     cursor: &mut Cursor<&Vec<u8>>,
     column_types: &[u8],
 ) -> Result<(), BinlogError> {
-    let mut targets = (0..columns.len())
-        .filter(|&i| column_types[i] == ColumnType::Geometry as u8);
+    let mut targets = (0..columns.len()).filter(|&i| column_types[i] == ColumnType::Geometry as u8);
     while cursor.available() > 0 {
         let geometry_type = cursor.read_packed_number()? as u32;
         let Some(i) = targets.next() else {
@@ -693,11 +708,11 @@ mod tests {
         let result = read_bitmap_reverted(&mut cursor, 5).unwrap();
 
         assert_eq!(result.len(), 5);
-        assert_eq!(result[0], true); // bit 7
-        assert_eq!(result[1], true); // bit 6
-        assert_eq!(result[2], false); // bit 5
-        assert_eq!(result[3], true); // bit 4
-        assert_eq!(result[4], false); // bit 3
+        assert!(result[0]); // bit 7
+        assert!(result[1]); // bit 6
+        assert!(!result[2]); // bit 5
+        assert!(result[3]); // bit 4
+        assert!(!result[4]); // bit 3
     }
 
     #[test]
@@ -746,7 +761,10 @@ mod tests {
         // Character columns: VARCHAR(2), BLOB(4), CHAR(6); not ENUM, GEOMETRY.
         let m = parse(vec![3, 3, 45, 63, 8]);
         let got: Vec<Option<u32>> = m.columns.iter().map(|c| c.charset_collation).collect();
-        assert_eq!(got, vec![None, None, Some(45), None, Some(63), None, Some(8), None]);
+        assert_eq!(
+            got,
+            vec![None, None, Some(45), None, Some(63), None, Some(8), None]
+        );
     }
 
     #[test]
@@ -755,7 +773,10 @@ mod tests {
         // (BLOB) is 63.
         let m = parse(vec![2, 5, 0xfc, 0xff, 0x00, 1, 63]);
         let got: Vec<Option<u32>> = m.columns.iter().map(|c| c.charset_collation).collect();
-        assert_eq!(got, vec![None, None, Some(255), None, Some(63), None, Some(255), None]);
+        assert_eq!(
+            got,
+            vec![None, None, Some(255), None, Some(63), None, Some(255), None]
+        );
         // ENUM/SET default.
         let m = parse(vec![10, 1, 8]);
         assert_eq!(m.columns[3].enum_and_set_charset_collation, Some(8));
