@@ -12,6 +12,17 @@ pub(crate) fn route_view(event: &Event) -> Value {
     event.view_value()
 }
 
+/// The smallest and largest capacity a payload buffer starts with.
+const MIN_PAYLOAD: usize = 256;
+const MAX_PAYLOAD_HINT: usize = 64 * 1024;
+
+thread_local! {
+    /// The size of this thread's last payload: the next one's starting
+    /// capacity.
+    static PAYLOAD_HINT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(MIN_PAYLOAD) };
+}
+
 /// The event's envelope, natively rendered for its mapping version and
 /// encoded as JSON. A value the rendering cannot hold under `opts` is a
 /// sink conversion failure (an incident, DLQ-eligible).
@@ -24,9 +35,13 @@ pub(crate) fn native_json(
     let data = envelope
         .wrap(event, opts)
         .map_err(|e| EncodingError::from(e).into_sink_error_for(sink_id))?;
-    // Straight into the message buffer (no intermediate `Bytes` copy).
-    serde_json::to_vec(&data)
-        .map_err(|e| EncodingError::from(e).into_sink_error_for(sink_id))
+    // Straight into the message buffer (no intermediate `Bytes` copy),
+    // sized like this thread's previous payload so it rarely grows.
+    let mut buf = Vec::with_capacity(PAYLOAD_HINT.get());
+    serde_json::to_writer(&mut buf, &data)
+        .map_err(|e| EncodingError::from(e).into_sink_error_for(sink_id))?;
+    PAYLOAD_HINT.set(buf.len().clamp(MIN_PAYLOAD, MAX_PAYLOAD_HINT));
+    Ok(buf)
 }
 
 /// Outbox raw mode: the after row's native rendering (JSON `null` when the
