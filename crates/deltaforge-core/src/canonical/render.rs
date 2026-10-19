@@ -306,22 +306,21 @@ fn serialize_db<S: Serializer>(
         DbValue::Enum(e) => s.serialize_str(&e.label),
         DbValue::Set(set) => s.collect_str(&Members(set.members())),
         DbValue::Json(j) => s.serialize_str(j.as_str()),
-        DbValue::Date(d) => s.serialize_str(&date_text(d)),
-        DbValue::Time(t) => s.serialize_str(&if v1 {
-            time_text_fixed(t.micros(), Precision::Fixed(6))
-        } else {
-            time_text(t)
-        }),
-        DbValue::DateTime(dt) => s.serialize_str(&if v1 {
-            datetime_text_v1(dt)
-        } else {
-            datetime_text(dt)
-        }),
+        DbValue::Date(d) => serialize_temporal(date_value(d), s),
+        DbValue::Time(t) => {
+            let p = if v1 {
+                Precision::Fixed(6)
+            } else {
+                t.precision()
+            };
+            s.serialize_str(time_value(t.micros(), p).as_str())
+        }
+        DbValue::DateTime(dt) => serialize_temporal(datetime_value(dt, v1), s),
         DbValue::Timestamp(ts) => match (v1, ts) {
             (true, TimestampValue::Instant { micros, .. }) => {
                 s.serialize_i64(*micros)
             }
-            _ => s.serialize_str(&timestamp_text(ts)),
+            _ => serialize_temporal(timestamp_value(ts), s),
         },
         DbValue::Year(y) => s.serialize_u16(*y),
         DbValue::Uuid(u) => {
@@ -408,144 +407,221 @@ pub fn uuid_text(u: &[u8; 16]) -> String {
     uuid::Uuid::from_bytes(*u).hyphenated().to_string()
 }
 
-/// A year in ISO 8601 form: four digits for 0..=9999, otherwise a sign and
-/// at least five digits.
-fn year_text(y: i32) -> String {
-    if (0..=9999).contains(&y) {
-        format!("{y:04}")
-    } else if y < 0 {
-        format!("-{:05}", -(y as i64))
-    } else {
-        format!("+{y:05}")
-    }
+/// Temporal text written into a stack buffer: no heap allocation and no
+/// formatting machinery. The longest text (an `i32` year, a 20-digit hour
+/// count, a fraction) fits the buffer.
+pub(crate) struct TemporalText {
+    buf: [u8; 64],
+    len: usize,
 }
 
-/// `YYYY-MM-DD` (zero parts as written).
-pub fn civil_date_text(d: &CivilDate) -> String {
-    format!("{}-{:02}-{:02}", year_text(d.year()), d.month(), d.day())
-}
-
-pub fn date_text(d: &DateValue) -> String {
-    match d {
-        DateValue::Civil(c) => civil_date_text(c),
-        DateValue::PosInfinity => "infinity".to_string(),
-        DateValue::NegInfinity => "-infinity".to_string(),
-    }
-}
-
-/// The fractional part of `micros` (0..1_000_000) at `precision`, with its
-/// leading dot, or empty.
-fn fraction_text(frac_micros: i64, precision: Precision) -> String {
-    match precision {
-        Precision::Fixed(0) => String::new(),
-        Precision::Fixed(d) => {
-            let digits = format!("{frac_micros:06}");
-            format!(".{}", &digits[..d as usize])
+impl TemporalText {
+    fn new() -> Self {
+        TemporalText {
+            buf: [0; 64],
+            len: 0,
         }
-        Precision::Variable => {
-            if frac_micros == 0 {
-                String::new()
-            } else {
-                let digits = format!("{frac_micros:06}");
-                format!(".{}", digits.trim_end_matches('0'))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.buf[..self.len]).expect("ASCII")
+    }
+
+    fn byte(&mut self, b: u8) {
+        self.buf[self.len] = b;
+        self.len += 1;
+    }
+
+    fn text(&mut self, s: &str) {
+        self.buf[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
+        self.len += s.len();
+    }
+
+    /// `v` in decimal, zero-padded to at least `width` digits.
+    fn digits(&mut self, mut v: u64, width: usize) {
+        let mut tmp = [0u8; 20];
+        let mut n = 0;
+        while v > 0 || n < width {
+            tmp[n] = b'0' + (v % 10) as u8;
+            v /= 10;
+            n += 1;
+        }
+        for i in (0..n).rev() {
+            self.byte(tmp[i]);
+        }
+    }
+
+    /// A year in ISO 8601 form: four digits for 0..=9999, otherwise a sign
+    /// and at least five digits.
+    fn year(&mut self, y: i32) {
+        if (0..=9999).contains(&y) {
+            self.digits(y as u64, 4);
+        } else {
+            self.byte(if y < 0 { b'-' } else { b'+' });
+            self.digits((y as i64).unsigned_abs(), 5);
+        }
+    }
+
+    /// `YYYY-MM-DD` (zero parts as written).
+    fn date(&mut self, y: i32, m: u8, d: u8) {
+        self.year(y);
+        self.byte(b'-');
+        self.digits(m as u64, 2);
+        self.byte(b'-');
+        self.digits(d as u64, 2);
+    }
+
+    /// `HH:MM:SS[.f]` of a non-negative microsecond count: hours as at
+    /// least two digits, the fraction at `precision`.
+    fn clock(&mut self, micros: u64, precision: Precision) {
+        let secs = micros / 1_000_000;
+        self.digits(secs / 3600, 2);
+        self.byte(b':');
+        self.digits(secs / 60 % 60, 2);
+        self.byte(b':');
+        self.digits(secs % 60, 2);
+        let frac = micros % 1_000_000;
+        let shown = match precision {
+            Precision::Fixed(d) => d.min(6) as usize,
+            Precision::Variable if frac == 0 => 0,
+            Precision::Variable => {
+                let mut d = 6;
+                let mut f = frac;
+                while f.is_multiple_of(10) {
+                    f /= 10;
+                    d -= 1;
+                }
+                d
             }
+        };
+        if shown > 0 {
+            self.byte(b'.');
+            self.digits(frac / 10u64.pow(6 - shown as u32), shown);
         }
+    }
+
+    /// `[-]H+:MM:SS[.f]`.
+    fn signed_clock(&mut self, micros: i64, precision: Precision) {
+        if micros < 0 {
+            self.byte(b'-');
+        }
+        self.clock(micros.unsigned_abs(), precision);
     }
 }
 
-/// `HH:MM:SS[.f]` of a time of day in microseconds (0..=24h).
-fn clock_text(micros: i64, precision: Precision) -> String {
-    let secs = micros / 1_000_000;
-    format!(
-        "{:02}:{:02}:{:02}{}",
-        secs / 3600,
-        secs / 60 % 60,
-        secs % 60,
-        fraction_text(micros % 1_000_000, precision)
-    )
+fn civil_date(d: &CivilDate) -> TemporalText {
+    let mut t = TemporalText::new();
+    t.date(d.year(), d.month(), d.day());
+    t
 }
 
-/// `[-]H+:MM:SS[.f]`: hours as at least two digits.
-pub fn time_text(t: &TimeValue) -> String {
-    time_text_fixed(t.micros(), t.precision())
+fn date_value(d: &DateValue) -> Result<TemporalText, &'static str> {
+    match d {
+        DateValue::Civil(c) => Ok(civil_date(c)),
+        DateValue::PosInfinity => Err("infinity"),
+        DateValue::NegInfinity => Err("-infinity"),
+    }
 }
 
-fn time_text_fixed(micros: i64, precision: Precision) -> String {
-    let sign = if micros < 0 { "-" } else { "" };
-    format!("{sign}{}", clock_text(micros.abs(), precision))
+fn time_value(micros: i64, precision: Precision) -> TemporalText {
+    let mut t = TemporalText::new();
+    t.signed_clock(micros, precision);
+    t
 }
 
-/// `YYYY-MM-DDTHH:MM:SS[.f]`; MySQL's zero date-time as
-/// `0000-00-00 00:00:00`; `infinity`/`-infinity`.
-pub fn datetime_text(dt: &DateTimeValue) -> String {
+/// A date-time; `v1` writes the legacy `YYYY-MM-DD HH:MM:SS.ffffff`.
+fn datetime_value(
+    dt: &DateTimeValue,
+    v1: bool,
+) -> Result<TemporalText, &'static str> {
     match dt {
         DateTimeValue::Civil {
             date,
             micros_of_day,
             precision,
         } => {
-            if date.has_zero_part() {
-                mysql_zero_datetime(date, *micros_of_day, *precision)
+            let mut t = TemporalText::new();
+            t.date(date.year(), date.month(), date.day());
+            // MySQL's zero date-time keeps its literal form.
+            t.byte(if v1 || date.has_zero_part() {
+                b' '
             } else {
-                format!(
-                    "{}T{}",
-                    civil_date_text(date),
-                    clock_text(*micros_of_day, *precision)
-                )
-            }
+                b'T'
+            });
+            let p = if v1 { Precision::Fixed(6) } else { *precision };
+            t.clock((*micros_of_day).max(0) as u64, p);
+            Ok(t)
         }
-        DateTimeValue::PosInfinity => "infinity".to_string(),
-        DateTimeValue::NegInfinity => "-infinity".to_string(),
+        DateTimeValue::PosInfinity => Err("infinity"),
+        DateTimeValue::NegInfinity => Err("-infinity"),
     }
 }
 
-/// The MySQL literal for a date-time with a zero part.
-fn mysql_zero_datetime(
-    date: &CivilDate,
-    micros_of_day: i64,
-    precision: Precision,
-) -> String {
-    format!(
-        "{} {}",
-        civil_date_text(date),
-        clock_text(micros_of_day, precision)
-    )
-}
-
-/// v1 DATETIME: the legacy `YYYY-MM-DD HH:MM:SS.ffffff`.
-fn datetime_text_v1(dt: &DateTimeValue) -> String {
-    match dt {
-        DateTimeValue::Civil {
-            date,
-            micros_of_day,
-            ..
-        } => format!(
-            "{} {}",
-            civil_date_text(date),
-            clock_text(*micros_of_day, Precision::Fixed(6))
-        ),
-        other => datetime_text(other),
-    }
-}
-
-/// RFC 3339 UTC with `Z` at the value's precision; MySQL's zero TIMESTAMP
-/// as `0000-00-00 00:00:00`; `infinity`/`-infinity`.
-pub fn timestamp_text(ts: &TimestampValue) -> String {
+fn timestamp_value(ts: &TimestampValue) -> Result<TemporalText, &'static str> {
     match ts {
         TimestampValue::Instant { micros, precision } => {
             let days = micros.div_euclid(MICROS_PER_DAY);
             let of_day = micros.rem_euclid(MICROS_PER_DAY);
             let (y, m, d) = super::civil_from_days(days);
-            format!(
-                "{}-{m:02}-{d:02}T{}Z",
-                year_text(y as i32),
-                clock_text(of_day, *precision)
-            )
+            let mut t = TemporalText::new();
+            t.date(y as i32, m as u8, d as u8);
+            t.byte(b'T');
+            t.clock(of_day as u64, *precision);
+            t.byte(b'Z');
+            Ok(t)
         }
         TimestampValue::Zero { precision } => {
-            format!("0000-00-00 {}", clock_text(0, *precision))
+            let mut t = TemporalText::new();
+            t.text("0000-00-00 ");
+            t.clock(0, *precision);
+            Ok(t)
         }
-        TimestampValue::PosInfinity => "infinity".to_string(),
-        TimestampValue::NegInfinity => "-infinity".to_string(),
+        TimestampValue::PosInfinity => Err("infinity"),
+        TimestampValue::NegInfinity => Err("-infinity"),
     }
+}
+
+/// A temporal text, or its fixed literal.
+fn text_of(t: Result<TemporalText, &'static str>) -> String {
+    match t {
+        Ok(t) => t.as_str().to_string(),
+        Err(lit) => lit.to_string(),
+    }
+}
+
+/// Serialize a temporal text, or its fixed literal, as a JSON string.
+fn serialize_temporal<S: Serializer>(
+    t: Result<TemporalText, &'static str>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match t {
+        Ok(t) => s.serialize_str(t.as_str()),
+        Err(lit) => s.serialize_str(lit),
+    }
+}
+
+/// `YYYY-MM-DD` (zero parts as written).
+pub fn civil_date_text(d: &CivilDate) -> String {
+    civil_date(d).as_str().to_string()
+}
+
+pub fn date_text(d: &DateValue) -> String {
+    text_of(date_value(d))
+}
+
+/// `[-]H+:MM:SS[.f]`: hours as at least two digits.
+pub fn time_text(t: &TimeValue) -> String {
+    time_value(t.micros(), t.precision()).as_str().to_string()
+}
+
+/// `YYYY-MM-DDTHH:MM:SS[.f]`; MySQL's zero date-time as
+/// `0000-00-00 00:00:00`; `infinity`/`-infinity`.
+pub fn datetime_text(dt: &DateTimeValue) -> String {
+    text_of(datetime_value(dt, false))
+}
+
+/// RFC 3339 UTC with `Z` at the value's precision; MySQL's zero TIMESTAMP
+/// as `0000-00-00 00:00:00`; `infinity`/`-infinity`.
+pub fn timestamp_text(ts: &TimestampValue) -> String {
+    text_of(timestamp_value(ts))
 }
