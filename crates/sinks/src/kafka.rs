@@ -49,11 +49,31 @@ use metrics::{counter, gauge};
 use rdkafka::config::ClientConfig;
 use rdkafka::error::KafkaError;
 use rdkafka::message::{Header, OwnedHeaders};
-use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
+use rdkafka::producer::{
+    DeliveryFuture, FutureProducer, FutureRecord, Producer,
+};
+use rdkafka::types::RDKafkaErrorCode;
 use rdkafka::util::Timeout;
 use rdkafka::{ClientContext, Statistics};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
+
+/// A record ready to enqueue: payload, topic, key and headers.
+type Prepared<'a> = (
+    Vec<u8>,
+    std::borrow::Cow<'a, str>,
+    String,
+    Option<OwnedHeaders>,
+);
+
+/// Why a record could not be enqueued.
+enum Enqueue {
+    /// The batch's transaction could not begin: the batch's error.
+    Begin(SinkError),
+    /// librdkafka refused the record: it fails the batch as a failed
+    /// delivery would.
+    Kafka(KafkaError),
+}
 
 /// Default timeout for individual send operations.
 const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -449,6 +469,77 @@ impl KafkaSink {
     /// Build rdkafka OwnedHeaders from routing.headers.
     /// Kafka headers: the event's routing headers, and `df-type-mapping`,
     /// the mapping version its values are rendered with.
+    /// Enqueue one prepared record, beginning the batch's transaction (in
+    /// transactional mode) before its first record. A full queue is retried
+    /// every 100 ms until `send_timeout`, as `FutureProducer::send` does.
+    async fn enqueue(
+        &self,
+        (payload, topic, key, headers): Prepared<'_>,
+        began: &mut bool,
+        deliveries: &mut Vec<DeliveryFuture>,
+        total_bytes: &mut u64,
+    ) -> Result<(), Enqueue> {
+        if self.transactional && !*began {
+            if let Err(e) = self.producer.begin_transaction() {
+                let is_fatal =
+                    matches!(&e, KafkaError::Transaction(re) if re.is_fatal());
+                // ProducerFenced or other fatal error — cannot recover: the
+                // pipeline must stop; retrying is pointless.
+                return Err(Enqueue::Begin(if is_fatal {
+                    SinkError::Fatal {
+                        details: format!("begin_transaction fatal: {e}").into(),
+                    }
+                } else {
+                    SinkError::Connect {
+                        details: format!("begin_transaction failed: {e}")
+                            .into(),
+                    }
+                }));
+            }
+            *began = true;
+        }
+        *total_bytes += payload.len() as u64;
+        let start = std::time::Instant::now();
+        // The record takes its headers: librdkafka owns them once enqueued.
+        let mut record = FutureRecord::to(&topic).payload(&payload).key(&key);
+        if let Some(h) = headers {
+            record = record.headers(h);
+        }
+        loop {
+            match self.producer.send_result(record) {
+                Ok(delivery) => {
+                    deliveries.push(delivery);
+                    return Ok(());
+                }
+                Err((
+                    KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull),
+                    r,
+                )) if start.elapsed() < self.send_timeout => {
+                    record = r;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err((e, _)) => return Err(Enqueue::Kafka(e)),
+            }
+        }
+    }
+
+    /// Abort the batch's transaction after a failure that stops the batch
+    /// before its delivery reports.
+    fn abort_after_failure(&self) {
+        counter!(
+            "deltaforge_sink_txn_aborts_total",
+            "pipeline" => self.pipeline.clone(),
+            "sink" => self.id.clone(),
+        )
+        .increment(1);
+        if let Err(e) = self
+            .producer
+            .abort_transaction(std::time::Duration::from_secs(10))
+        {
+            warn!(error = %e, "abort_transaction failed after a preparation failure");
+        }
+    }
+
     fn build_headers(&self, event: &Event) -> Option<OwnedHeaders> {
         let routing = event.routing.as_ref().and_then(|r| r.headers.as_ref());
         let mut headers =
@@ -656,16 +747,22 @@ impl Sink for KafkaSink {
             return Ok(BatchResult::ok());
         }
 
-        // Pre-serialize with resolved topic/key/headers.
-        // Per-event DLQ-eligible errors (serialization, routing) are collected
-        // instead of failing the batch. Non-DLQ errors fail the batch as before.
-        let mut serialized: Vec<(
-            Vec<u8>,
-            std::borrow::Cow<'_, str>,
-            String,
-            Option<OwnedHeaders>,
-        )> = Vec::with_capacity(events.len());
+        // Prepare each event (topic, payload, key, headers). Per-event
+        // DLQ-eligible errors (serialization, routing) are collected instead
+        // of failing the batch; a non-DLQ error fails the batch.
+        //
+        // A native JSON record is enqueued as soon as it is prepared, so
+        // librdkafka sends early records while later ones are encoded: its
+        // preparation fails only per event. An Avro batch is prepared in full
+        // first, because a schema registry failure fails the whole batch, and
+        // then nothing of it may have been enqueued.
+        let interleave = self.avro_encoder.is_none();
+        let mut prepared_all: Vec<Prepared<'_>> = Vec::new();
+        let mut deliveries = Vec::with_capacity(events.len());
         let mut dlq_failures: Vec<(usize, SinkError)> = Vec::new();
+        let mut began = false;
+        let mut total_bytes = 0u64;
+        let mut enqueue_error: Option<KafkaError> = None;
 
         for (i, e) in events.iter().enumerate() {
             let prepared = async {
@@ -677,7 +774,26 @@ impl Sink for KafkaSink {
             }
             .await;
             match prepared {
-                Ok(prepared) => serialized.push(prepared),
+                Ok(prepared) if interleave => {
+                    if let Err(e) = self
+                        .enqueue(
+                            prepared,
+                            &mut began,
+                            &mut deliveries,
+                            &mut total_bytes,
+                        )
+                        .await
+                    {
+                        match e {
+                            Enqueue::Begin(err) => return Err(err),
+                            Enqueue::Kafka(err) => {
+                                enqueue_error = Some(err);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Ok(prepared) => prepared_all.push(prepared),
                 Err(e) if e.is_dlq_eligible() => {
                     counter!(
                         "deltaforge_sink_routing_errors_total",
@@ -696,56 +812,55 @@ impl Sink for KafkaSink {
                         "kind" => e.kind(),
                     )
                     .increment(1);
+                    // Unreachable for interleaved (JSON) batches; should it
+                    // happen, records already enqueued outside a transaction
+                    // are delivered at least once more on the retry.
+                    if began {
+                        self.abort_after_failure();
+                    }
                     return Err(e);
                 }
             }
         }
+        for prepared in prepared_all {
+            if let Err(e) = self
+                .enqueue(
+                    prepared,
+                    &mut began,
+                    &mut deliveries,
+                    &mut total_bytes,
+                )
+                .await
+            {
+                match e {
+                    Enqueue::Begin(err) => return Err(err),
+                    Enqueue::Kafka(err) => {
+                        enqueue_error = Some(err);
+                        break;
+                    }
+                }
+            }
+        }
 
-        if serialized.is_empty() {
+        if deliveries.is_empty() && enqueue_error.is_none() {
             // All events failed preparation — nothing to send.
             return Ok(BatchResult { dlq_failures });
         }
 
-        // Begin transaction if exactly-once is enabled.
-        if self.transactional {
-            if let Err(e) = self.producer.begin_transaction() {
-                let is_fatal =
-                    matches!(&e, KafkaError::Transaction(re) if re.is_fatal());
-                if is_fatal {
-                    // ProducerFenced or other fatal error — cannot recover.
-                    // The pipeline must stop; retrying is pointless.
-                    return Err(SinkError::Fatal {
-                        details: format!("begin_transaction fatal: {e}").into(),
-                    });
+        // Await every delivery report (an enqueue that failed fails the
+        // batch as its delivery would have).
+        let result = match enqueue_error {
+            Some(e) => Err(KafkaRetryError::from(e)),
+            None => try_join_all(deliveries.into_iter().map(|d| async move {
+                match d.await {
+                    Ok(Ok(_)) => Ok(()),
+                    Ok(Err((e, _))) => Err(KafkaRetryError::from(e)),
+                    Err(_) => panic!("producer unexpectedly dropped"),
                 }
-                return Err(SinkError::Connect {
-                    details: format!("begin_transaction failed: {e}").into(),
-                });
-            }
-        }
-
-        // Enqueue all messages. Each record takes its headers (librdkafka
-        // owns them once enqueued): never a copy.
-        let futures: Vec<_> = serialized
-            .iter_mut()
-            .map(|(payload, topic, key, headers)| {
-                let mut record =
-                    FutureRecord::to(topic).payload(payload).key(key);
-
-                if let Some(h) = headers.take() {
-                    record = record.headers(h);
-                }
-
-                self.producer
-                    .send(record, Timeout::After(self.send_timeout))
-            })
-            .collect();
-
-        // await all deliveries
-        let result = try_join_all(futures.into_iter().map(|f| async move {
-            f.await.map_err(|(e, _)| KafkaRetryError::from(e))
-        }))
-        .await;
+            }))
+            .await
+            .map(|_| ()),
+        };
 
         match result {
             Ok(_) => {
@@ -781,8 +896,6 @@ impl Sink for KafkaSink {
                     .increment(1);
                 }
 
-                let total_bytes: u64 =
-                    serialized.iter().map(|(p, ..)| p.len() as u64).sum();
                 counter!(
                     "deltaforge_sink_bytes_total",
                     "pipeline" => self.pipeline.clone(),
