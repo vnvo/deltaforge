@@ -259,6 +259,7 @@ fn pg_rotation_cfg(
     slot: &str,
 ) -> PostgresSrcCfg {
     PostgresSrcCfg {
+        max_message_bytes: None,
         id: "pg-rot".to_string(),
         dsn: Some(format!("host=127.0.0.1 port={port} dbname={db}")),
         dsn_secret: None,
@@ -407,6 +408,7 @@ async fn start_rotation_harness(
     assert!(rotation.is_some(), "rotation spec should build");
 
     let src = PostgresSource {
+        max_message_size: None,
         id: cfg.id.clone(),
         dsn: initial_dsn,
         slot: slot.clone(),
@@ -815,6 +817,7 @@ fn cfg_with_file_creds(
     pass_loc: &str,
 ) -> PostgresSrcCfg {
     PostgresSrcCfg {
+        max_message_bytes: None,
         id: "pg".to_string(),
         dsn: Some("host=127.0.0.1 dbname=d".to_string()),
         dsn_secret: None,

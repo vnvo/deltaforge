@@ -90,6 +90,46 @@ pub(crate) fn source_decode_failed(
     )
 }
 
+/// A replication message over the source's configured limit. The stream is
+/// abandoned without a reconnect: a reconnect with the same limit would meet
+/// the same message again. Evidence is the sizes and the source only, never
+/// the payload. `read_position` (the stream's read position before the
+/// message) distinguishes the occurrence and is not exposed.
+pub(crate) fn message_too_large(
+    source_id: &str,
+    read_position: &str,
+    payload_bytes: usize,
+    limit_bytes: usize,
+) -> SourceError {
+    let draft = IncidentDraft::new(
+        ReasonCode::PgMessageTooLarge,
+        Component::Source {
+            id: source_id.to_string(),
+        },
+        Retryability::OperatorAction,
+        SafetyState::HaltedSafe,
+        CauseCode::SourceIncompatible,
+    )
+    .discriminate("read_position", read_position)
+    .discriminate("limit", limit_bytes.to_string())
+    .with_evidence(|e| {
+        e.text(K::SourceId, source_id)
+            .count(K::MessageBytes, payload_bytes as u64)
+            .count(K::MessageLimit, limit_bytes as u64);
+    })
+    .with_actions(&[ActionCode::RaiseMessageLimit]);
+    SourceError::incident(
+        draft,
+        SourceError::Incompatible {
+            details: format!(
+                "replication message of {payload_bytes} bytes exceeds \
+                 max_message_bytes {limit_bytes}"
+            )
+            .into(),
+        },
+    )
+}
+
 /// Record `draft`, a condition the source is retrying automatically, so the
 /// pipeline reports it while the source retries. It is bound to the current
 /// recovery epoch: the identity the supervisor gives the draft the source

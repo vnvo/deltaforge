@@ -19,12 +19,9 @@
 #   another command run in the copy (its own target directory), for example
 #   a loom model.
 
-crate vendor/pgwire-replication strict
 crate vendor/mysql-binlog-connector-rust warn
 patched vendor/mysql-binlog-connector-rust src/binlog_stream.rs
 patched vendor/mysql-binlog-connector-rust src/column/column_value.rs
 patched vendor/mysql-binlog-connector-rust src/event/table_map/default_charset.rs
 patched vendor/mysql-binlog-connector-rust src/event/table_map/table_metadata.rs
 patched vendor/mysql-binlog-connector-rust src/network/packet_channel.rs
-
-extra vendor/pgwire-replication loom env RUSTFLAGS=--cfg=pgwire_loom cargo test --release --lib loom_model

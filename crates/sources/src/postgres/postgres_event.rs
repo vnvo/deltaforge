@@ -152,7 +152,11 @@ pub(super) async fn read_next_event(
                 return Err(LoopControl::Stop);
             }
 
-            let control = LoopControl::from_replication_outcome(outcome);
+            let control = LoopControl::from_replication_read(
+                outcome,
+                &ctx.source_id,
+                &ctx.last_lsn.to_string(),
+            );
             if control.is_retryable() {
                 counter!(
                     "deltaforge_source_reconnects_total",
@@ -170,6 +174,61 @@ pub(super) async fn read_next_event(
                 .increment(1);
             }
             Err(control)
+        }
+    }
+}
+
+/// How long [`root_cause_of_ended_stream`] waits for an ended session's
+/// client to report why it ended.
+const ENDED_STREAM_OUTCOME_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+/// A failure showing that the stream's own session no longer holds its slot
+/// (a catalog proof's `slot_not_held_by_stream`) can be a consequence of why
+/// that session ended: a Relation buffered before a message over the limit is
+/// processed after the session closed. Read what the ended session left in
+/// its client and, when it ended on a message over the limit, report that
+/// instead. Buffered events are discarded (nothing is acknowledged). Only a
+/// session that no longer holds the slot is consulted, from the client's
+/// in-process buffer, never the network, for at most
+/// [`ENDED_STREAM_OUTCOME_WAIT`].
+pub(super) async fn root_cause_of_ended_stream(
+    ctx: &RunCtx,
+    err: SourceError,
+) -> SourceError {
+    use deltaforge_core::incident::{EvidenceKey, ReasonCode};
+    let ended = err.draft().is_some_and(|d| {
+        d.reason_code == ReasonCode::PgCatalogVisibilityUnproven
+            && d.evidence.text_of(EvidenceKey::ReasonClass)
+                == Some("slot_not_held_by_stream")
+    });
+    if !ended {
+        return err;
+    }
+    let mut client = ctx.repl_client.lock().await;
+    let deadline = tokio::time::Instant::now() + ENDED_STREAM_OUTCOME_WAIT;
+    loop {
+        match tokio::time::timeout_at(deadline, client.recv()).await {
+            Ok(Ok(Some(_))) => continue,
+            Ok(Err(pgwire_replication::PgWireError::MessageTooLarge {
+                payload_bytes,
+                limit_bytes,
+            })) => {
+                error!(
+                    source_id = %ctx.source_id,
+                    payload_bytes,
+                    limit_bytes,
+                    "the stream ended on a replication message over \
+                     max_message_bytes"
+                );
+                return crate::incident_drafts::message_too_large(
+                    &ctx.source_id,
+                    &ctx.last_lsn.to_string(),
+                    payload_bytes,
+                    limit_bytes,
+                );
+            }
+            _ => return err,
         }
     }
 }

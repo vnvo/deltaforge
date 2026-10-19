@@ -95,11 +95,14 @@ pub enum ReasonCode {
     /// replaced since it was bound, or holds rows without a binding: nothing
     /// of the batch was delivered.
     SinkDestinationConflict,
+    /// A PostgreSQL replication message is larger than the source's
+    /// configured message limit: the stream stopped before it.
+    PgMessageTooLarge,
 }
 
 impl ReasonCode {
     /// Every reason (bounded metric label values).
-    pub const ALL: [ReasonCode; 23] = [
+    pub const ALL: [ReasonCode; 24] = [
         Self::PgDifferentCluster,
         Self::PgContinuityUnproven,
         Self::PgFailoverSlotUnavailable,
@@ -123,6 +126,7 @@ impl ReasonCode {
         Self::PgPublicationEnforcement,
         Self::SourceDecodeFailed,
         Self::SinkDestinationConflict,
+        Self::PgMessageTooLarge,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -154,6 +158,7 @@ impl ReasonCode {
             Self::PgPublicationEnforcement => "pg_publication_enforcement",
             Self::SourceDecodeFailed => "source_decode_failed",
             Self::SinkDestinationConflict => "sink_destination_conflict",
+            Self::PgMessageTooLarge => "pg_message_too_large",
         }
     }
 }
@@ -265,6 +270,9 @@ pub enum ActionCode {
     /// Run the database-wide publication maintenance procedure (recovery
     /// operation `pg-publication-maintenance`).
     PublicationMaintenance,
+    /// Raise the source's message limit (`max_message_bytes`) above the
+    /// refused message, then restart.
+    RaiseMessageLimit,
 }
 
 /// The pipeline part that raised it.
@@ -434,6 +442,10 @@ pub enum EvidenceKey {
     Relation,
     /// The relation a destination is bound to.
     BoundRelation,
+    /// A message's payload size, in bytes.
+    MessageBytes,
+    /// A configured message size limit, in bytes.
+    MessageLimit,
 }
 
 impl EvidenceKey {
@@ -481,6 +493,8 @@ impl EvidenceKey {
             Self::Destination => "destination",
             Self::Relation => "relation",
             Self::BoundRelation => "bound_relation",
+            Self::MessageBytes => "message_bytes",
+            Self::MessageLimit => "message_limit",
         }
     }
 }
@@ -852,6 +866,15 @@ pub fn explain(
             ev.show(K::SourceType),
             ev.show(K::Table),
             ev.show(K::ReasonClass),
+        ),
+        ReasonCode::PgMessageTooLarge => format!(
+            "{component} received a replication message of {} bytes, over its \
+             limit of {} bytes (max_message_bytes). It stopped before the \
+             message without reconnecting; the checkpoint stays before its \
+             transaction. Raise max_message_bytes above the message size, then \
+             restart the pipeline.",
+            ev.show(K::MessageBytes),
+            ev.show(K::MessageLimit),
         ),
         ReasonCode::SinkDestinationConflict => format!(
             "{component} refused to write source table {} to destination {} \

@@ -200,6 +200,7 @@ async fn run_pipeline(
     run_for: Duration,
 ) -> Result<()> {
     let src = PostgresSource {
+        max_message_size: None,
         id: SID.into(),
         dsn: src_dsn.into(),
         slot: "slot_outage".into(),

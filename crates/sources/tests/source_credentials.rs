@@ -106,6 +106,7 @@ fn pg_cfg(
         on_schema_drift: Default::default(),
         rotation: None,
         type_mapping: Default::default(),
+        max_message_bytes: None,
     }
 }
 

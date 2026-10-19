@@ -948,6 +948,7 @@ fn postgres_cfg_with_inline_dsn(
         on_schema_drift: Default::default(),
         rotation: None,
         type_mapping: Default::default(),
+        max_message_bytes: None,
     }
 }
 
@@ -1233,5 +1234,34 @@ fn assert_leaf_diffs_are_redactions(
             *redactions += 1;
         }
         (n, s) => panic!("unexpected non-redaction change: {n:?} -> {s:?}"),
+    }
+}
+
+#[test]
+fn postgres_max_message_bytes_is_bounded() {
+    let parse = |extra: &str| {
+        serde_json::from_str::<deltaforge_config::PostgresSrcCfg>(&format!(
+            r#"{{"id":"pg","dsn":"postgres://h/db","publication":"p","slot":"s","tables":[]{extra}}}"#
+        ))
+    };
+    assert_eq!(parse("").unwrap().max_message_bytes, None);
+    assert_eq!(
+        parse(r#","max_message_bytes":1"#)
+            .unwrap()
+            .max_message_bytes,
+        Some(1)
+    );
+    let max = deltaforge_config::POSTGRES_MAX_MESSAGE_BYTES;
+    assert_eq!(
+        parse(&format!(r#","max_message_bytes":{max}"#))
+            .unwrap()
+            .max_message_bytes,
+        Some(max)
+    );
+    for bad in [0, max + 1] {
+        let err = parse(&format!(r#","max_message_bytes":{bad}"#))
+            .err()
+            .unwrap_or_else(|| panic!("{bad} must be refused"));
+        assert!(err.to_string().contains("max_message_bytes"), "{err}");
     }
 }

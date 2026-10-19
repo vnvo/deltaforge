@@ -62,6 +62,7 @@ async fn pg_source(
     )
     .await?;
     Ok(PostgresSource {
+        max_message_size: None,
         id: id.into(),
         dsn: pg_admin_dsn(db).await.into(),
         slot: format!("slot_{id}"),
@@ -731,6 +732,7 @@ async fn snapshot_with_setup(
     .await?;
     let slot = format!("slot_shape{n}");
     let src = PostgresSource {
+        max_message_size: None,
         id: format!("shape{n}"),
         dsn: pg_admin_dsn(&db).await.into(),
         slot: slot.clone(),
@@ -896,6 +898,7 @@ async fn wildcard_legacy_progress_ambiguity_is_detected() -> Result<()> {
         )
         .await?;
     let src = PostgresSource {
+        max_message_size: None,
         id: "ambig".into(),
         dsn: pg_admin_dsn(&db).await.into(),
         slot: "slot_ambig".into(),

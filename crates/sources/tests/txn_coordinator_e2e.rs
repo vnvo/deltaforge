@@ -386,6 +386,7 @@ async fn pg_source(
     publication: &str,
 ) -> sources::postgres::PostgresSource {
     sources::postgres::PostgresSource {
+        max_message_size: None,
         id: id.into(),
         dsn: test_common::pg_cdc_dsn(db).await.into(),
         slot: slot.into(),
@@ -439,6 +440,7 @@ async fn postgres_tx_intact_and_resume_from_commit() -> Result<()> {
     let batches = {
         let mut pipe = RunningPipeline::start(
             sources::postgres::PostgresSource {
+                max_message_size: None,
                 backend: backend.clone(),
                 ..pg_source("txc", &db, "slot_txc", "pub_txc").await
             },
@@ -477,6 +479,7 @@ async fn postgres_tx_intact_and_resume_from_commit() -> Result<()> {
     // ── Phase 2: restart resumes from the committed checkpoint. ──
     let mut pipe = RunningPipeline::start(
         sources::postgres::PostgresSource {
+            max_message_size: None,
             backend: backend.clone(),
             ..pg_source("txc", &db, "slot_txc", "pub_txc").await
         },

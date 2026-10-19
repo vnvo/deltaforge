@@ -211,6 +211,7 @@ async fn postgres_generation_operations_are_structurally_linear() -> Result<()>
         let inner = test_common::make_storage_backend().await;
         let counting = Arc::new(CountingBackend::new(inner.clone()));
         let src = sources::postgres::PostgresSource {
+            max_message_size: None,
             id: id.clone(),
             dsn: pg_admin_dsn(&db).await.into(),
             slot: format!("slot_{id}"),

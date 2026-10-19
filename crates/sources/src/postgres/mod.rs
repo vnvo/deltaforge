@@ -326,6 +326,9 @@ pub struct PostgresSource {
     /// The commit policy and sink cohort a snapshot generation freezes, set
     /// by the runner before the source runs.
     pub snapshot_cohort: crate::SnapshotCohortSlot,
+    /// The largest replication message accepted, in bytes (`None`: the
+    /// protocol's 1 GiB). A larger one stops the source fail-closed.
+    pub max_message_size: Option<usize>,
 }
 
 // ============================================================================
@@ -1716,6 +1719,7 @@ impl PostgresSource {
             recovery_window: REACHABILITY_RETRY_WINDOW,
             recovery_retry: Default::default(),
             token: Default::default(),
+            max_message_size: self.max_message_size,
         };
 
         let client = connect_replication_with_retries(
@@ -2084,6 +2088,8 @@ impl PostgresSource {
                     break;
                 }
                 Err(LoopControl::Fail(e)) => {
+                    let e = postgres_event::root_cause_of_ended_stream(&ctx, e)
+                        .await;
                     error!(source_id = %self.id, error = %e, "unrecoverable error");
                     return Err(e);
                 }

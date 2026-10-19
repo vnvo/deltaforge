@@ -308,6 +308,7 @@ async fn start_pipe(
     registry: Arc<DurableSchemaRegistry>,
 ) -> Result<Pipe> {
     let src = PostgresSource {
+        max_message_size: None,
         id: SID.into(),
         dsn: dsn.into(),
         slot: SLOT.into(),

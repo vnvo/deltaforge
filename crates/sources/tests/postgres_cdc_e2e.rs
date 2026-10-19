@@ -238,6 +238,7 @@ async fn make_source(
     outbox_prefixes: AllowList,
 ) -> PostgresSource {
     PostgresSource {
+        max_message_size: None,
         id: id.into(),
         dsn: pg_cdc_dsn(db).await.into(),
         slot: slot.into(),
@@ -1685,6 +1686,7 @@ async fn postgres_cdc_checkpoint_resume() -> Result<()> {
         )
         .await;
         let src = PostgresSource {
+            max_message_size: None,
             backend: backend.clone(),
             ..src
         };
@@ -1724,6 +1726,7 @@ async fn postgres_cdc_checkpoint_resume() -> Result<()> {
         )
         .await;
         let src = PostgresSource {
+            max_message_size: None,
             backend: backend.clone(),
             ..src
         };
@@ -3712,6 +3715,7 @@ async fn make_snap_source(
     >,
 ) -> PostgresSource {
     PostgresSource {
+        max_message_size: None,
         id: id.into(),
         dsn: pg_cdc_dsn(db).await.into(),
         slot: slot.into(),
@@ -5230,6 +5234,318 @@ async fn pg_startup_fails_closed_without_sink_checkpoints() -> Result<()> {
     test_common::assert_fails_closed_without_sink_checkpoints(handle, &mut rx)
         .await;
     cleanup_repl(&client, "pub_init", "slot_init").await;
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+/// The slot's holder: `Some(pid)` while a session holds it.
+async fn slot_holder(
+    client: &tokio_postgres::Client,
+    slot: &str,
+) -> Result<Option<i32>> {
+    Ok(client
+        .query_one(
+            "SELECT active_pid FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .await?
+        .get(0))
+}
+
+/// The message limit of the oversized-message test, and its oversized value.
+const MSG_LIMIT: usize = 64 * 1024;
+const MSG_BIG: usize = 200_000;
+
+/// How a source stopped by a message over its limit must look: stopped by
+/// itself with `pg_message_too_large` (the sizes and the source only), the
+/// checkpoint unchanged, the refused row never delivered, the session that
+/// received it gone (when it was seen holding the slot), and no session
+/// reconnecting.
+async fn assert_refused_without_reconnect(
+    client: &tokio_postgres::Client,
+    h: SourceHandle,
+    rx: &mut mpsc::Receiver<SourceItem>,
+    ckpt: &Arc<dyn CheckpointStore>,
+    cp0: &[u8],
+    session: Option<i32>,
+) -> Result<()> {
+    use deltaforge_core::incident::{
+        EvidenceKey as K, EvidenceValue as V, ReasonCode,
+    };
+    // The catalog proof of a Relation buffered before the message may run
+    // its retry window first.
+    let err = timeout(Duration::from_secs(60), h.join())
+        .await
+        .expect("the source stops on the oversized message")
+        .expect_err("fail-closed");
+    let draft = err
+        .downcast_ref::<deltaforge_core::SourceError>()
+        .and_then(|e| e.draft())
+        .unwrap_or_else(|| panic!("an incident: {err:#}"));
+    assert_eq!(draft.reason_code, ReasonCode::PgMessageTooLarge);
+    let bytes = match draft.evidence.get(K::MessageBytes) {
+        Some(&V::Count { value }) => value,
+        other => panic!("message_bytes: {other:?}"),
+    };
+    assert!(
+        bytes > MSG_BIG as u64,
+        "the refused message's size: {bytes}"
+    );
+    assert_eq!(
+        draft.evidence.get(K::MessageLimit),
+        Some(&V::Count {
+            value: MSG_LIMIT as u64
+        })
+    );
+    assert_eq!(draft.evidence.text_of(K::SourceId), Some("msglimit"));
+    let evidence = serde_json::to_string(&draft.evidence)?;
+    assert!(
+        !evidence.contains("xxxx") && evidence.len() < 512,
+        "no payload in the evidence: {evidence}"
+    );
+
+    // No checkpoint advancement.
+    assert_eq!(
+        ckpt.get_raw("msglimit").await?.as_deref(),
+        Some(cp0),
+        "the checkpoint stays before the refused transaction"
+    );
+    let items = drain_items(rx, Duration::from_millis(500)).await;
+    assert!(
+        !items
+            .iter()
+            .any(|i| matches!(i, SourceItem::Event(e) if has_id(e, 3))),
+        "the refused row is never delivered"
+    );
+
+    // The session that received it ended (its connection is never read
+    // again), and no session reconnects: the slot stays free.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while let Some(session) = session {
+        let alive: i64 = client
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE pid = $1",
+                &[&session],
+            )
+            .await?
+            .get(0);
+        if alive == 0 {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the poisoned session {session} is still connected"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+    for _ in 0..30 {
+        assert_eq!(
+            slot_holder(client, "slot_msglimit").await?,
+            None,
+            "no reconnect after the oversized message"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+    Ok(())
+}
+
+/// `deltaforge_source_reconnects_total` of source `msglimit`, as recorded by
+/// the test's thread-local recorder.
+fn msglimit_reconnects(
+    snapshotter: &metrics_util::debugging::Snapshotter,
+) -> u64 {
+    use metrics_util::debugging::DebugValue;
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(key, ..)| {
+            key.key().name() == "deltaforge_source_reconnects_total"
+                && key
+                    .key()
+                    .labels()
+                    .any(|l| l.key() == "source" && l.value() == "msglimit")
+        })
+        .map(|(.., value)| match value {
+            DebugValue::Counter(n) => n,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// The session holding `slot`, waited for.
+async fn wait_slot_holder(
+    client: &tokio_postgres::Client,
+    slot: &str,
+) -> Result<i32> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(pid) = slot_holder(client, slot).await? {
+            return Ok(pid);
+        }
+        anyhow::ensure!(Instant::now() < deadline, "no session holds {slot}");
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A replication message over `max_message_bytes` stops the source
+/// fail-closed, with the checkpoint held, the session abandoned and no
+/// reconnect, both when the oversized message is read directly and when a
+/// Relation buffered before it is processed after the session closed. A
+/// restart with the same limit stops the same way; a restart with a raised
+/// limit resumes from the held checkpoint and delivers the whole transaction.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_message_over_the_limit_fails_closed_and_resumes_with_a_raised_limit()
+-> Result<()> {
+    use deltaforge_config::OnSchemaDrift;
+
+    const LIMIT: usize = MSG_LIMIT;
+    const BIG: usize = MSG_BIG;
+    // The source's tasks run on this test's thread (current-thread runtime),
+    // so a thread-local recorder sees every reconnect it schedules.
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let (db, client) = pg_setup("msglimit").await?;
+    client
+        .execute("CREATE TABLE orders (id INT PRIMARY KEY, sku TEXT)", &[])
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
+        .await?;
+    create_pub_slot(&client, "pub_msglimit", "slot_msglimit", &[]).await?;
+
+    let (registry, backend) = shared_registry().await;
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let source = |limit: usize| {
+        let (registry, backend) = (registry.clone(), backend.clone());
+        let db = db.clone();
+        async move {
+            let mut src = configured_source(
+                "msglimit",
+                &db,
+                "slot_msglimit",
+                "pub_msglimit",
+                OnSchemaDrift::Adapt,
+                registry,
+                backend,
+            )
+            .await;
+            src.max_message_size = Some(limit);
+            src
+        }
+    };
+
+    // Run 1: row 1, then a graceful stop records the checkpoint.
+    {
+        let src = source(LIMIT).await;
+        let (tx, mut rx) =
+            test_common::acked_channel(&src, &ckpt, &src.id, 128);
+        let h = src.run(tx, ckpt.clone()).await;
+        wait_ready(&h, Duration::from_secs(3)).await?;
+        client
+            .execute("INSERT INTO orders VALUES (1, 'small')", &[])
+            .await?;
+        let ev = collect_until(&mut rx, Duration::from_secs(10), |e| {
+            e.iter().any(|x| has_id(x, 1))
+        })
+        .await;
+        assert!(ev.iter().any(|e| has_id(e, 1)), "row 1 delivered");
+        h.stop();
+        h.join().await.ok();
+    }
+    let cp0 = ckpt.get_raw("msglimit").await?.expect("run 1 checkpoint");
+
+    // Run 2: the table's Relation is processed on a live stream (row 10),
+    // then the oversized message is read directly.
+    {
+        let src = source(LIMIT).await;
+        let (tx, mut rx) =
+            test_common::acked_channel(&src, &ckpt, &src.id, 128);
+        let h = src.run(tx, ckpt.clone()).await;
+        let session = Some(wait_slot_holder(&client, "slot_msglimit").await?);
+        client
+            .execute("INSERT INTO orders VALUES (10, 'warm')", &[])
+            .await?;
+        let ev = collect_until(&mut rx, Duration::from_secs(10), |e| {
+            e.iter().any(|x| has_id(x, 10))
+        })
+        .await;
+        assert!(ev.iter().any(|e| has_id(e, 10)), "row 10 delivered");
+        client
+            .batch_execute(&format!(
+                "BEGIN; \
+                 INSERT INTO orders VALUES (2, 'before'); \
+                 INSERT INTO orders VALUES (3, repeat('x', {BIG})); \
+                 INSERT INTO orders VALUES (4, 'after'); \
+                 COMMIT;"
+            ))
+            .await?;
+        assert_refused_without_reconnect(
+            &client, h, &mut rx, &ckpt, &cp0, session,
+        )
+        .await?;
+        assert_eq!(
+            msglimit_reconnects(&snapshotter),
+            0,
+            "no reconnect is attempted for the oversized message"
+        );
+    }
+
+    // Run 3, the same limit: the new session's Relation precedes the
+    // retained oversized message and is processed after the session closed.
+    // It stops the same way, without a loop.
+    {
+        let src = source(LIMIT).await;
+        let (tx, mut rx) =
+            test_common::acked_channel(&src, &ckpt, &src.id, 128);
+        let h = src.run(tx, ckpt.clone()).await;
+        // The session closes on the retained message at once: there is no
+        // holder to observe, only that none returns.
+        assert_refused_without_reconnect(
+            &client, h, &mut rx, &ckpt, &cp0, None,
+        )
+        .await?;
+        assert_eq!(
+            msglimit_reconnects(&snapshotter),
+            0,
+            "no reconnect is attempted for the oversized message"
+        );
+    }
+
+    // Run 4: an operator restart with a raised limit resumes from the held
+    // checkpoint and delivers the whole transaction.
+    let src = source(1024 * 1024).await;
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
+    let h = src.run(tx, ckpt.clone()).await;
+    let events = collect_until(&mut rx, Duration::from_secs(20), |e| {
+        [2, 3, 4].iter().all(|id| e.iter().any(|x| has_id(x, *id)))
+    })
+    .await;
+    for id in [2, 3, 4] {
+        assert!(
+            events.iter().any(|e| has_id(e, id)),
+            "row {id} delivered after the restart"
+        );
+    }
+    let row3 = events.iter().find(|e| has_id(e, 3)).unwrap();
+    assert_eq!(
+        test_common::row_view(row3.after.as_ref().unwrap())["sku"]
+            .as_str()
+            .map(str::len),
+        Some(BIG),
+        "the large value is delivered whole"
+    );
+    h.stop();
+    h.join().await.ok();
+    assert_ne!(
+        ckpt.get_raw("msglimit").await?.as_deref(),
+        Some(cp0.as_slice()),
+        "the checkpoint advances past the delivered transaction"
+    );
+
+    cleanup_repl(&client, "pub_msglimit", "slot_msglimit").await;
     pg_drop_db(&db).await;
     Ok(())
 }

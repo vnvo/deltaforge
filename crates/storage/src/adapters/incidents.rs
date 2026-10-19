@@ -348,9 +348,10 @@ pub fn verified_start_check(
         ) => Some(PIPELINE_RECOVERED),
         // A value the source could not decode (an operator fixes the data
         // or the schema, then restarts): the same rule.
-        (ReasonCode::SourceDecodeFailed, Component::Source { .. }) => {
-            Some(PIPELINE_RECOVERED)
-        }
+        (
+            ReasonCode::SourceDecodeFailed | ReasonCode::PgMessageTooLarge,
+            Component::Source { .. },
+        ) => Some(PIPELINE_RECOVERED),
         _ => None,
     }
 }

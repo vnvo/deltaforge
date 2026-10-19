@@ -170,6 +170,9 @@ pub(crate) struct StreamProof {
     /// activated); replaced on every activation, so a catalog proof never
     /// accepts a previous stream's nonce.
     pub(super) token: Arc<std::sync::RwLock<Option<StreamToken>>>,
+    /// The largest replication message every stream accepts (`None`: the
+    /// protocol's 1 GiB).
+    pub(super) max_message_size: Option<usize>,
 }
 
 /// What a catalog session must find to prove it reaches the node and live
@@ -328,6 +331,10 @@ impl StreamProof {
         let start = cfg.start_lsn;
         let cfg = match f {
             Some(f) => cfg.with_ack_lsn(f),
+            None => cfg,
+        };
+        let cfg = match self.max_message_size {
+            Some(limit) => cfg.with_max_message_size(limit),
             None => cfg,
         };
         // Dropping the client before `start` ends the session without
@@ -1028,6 +1035,14 @@ fn pgwire_error_to_source_error(e: PgWireError) -> SourceError {
         Internal(msg) => {
             SourceError::Other(anyhow::anyhow!("pgwire internal: {}", msg))
         }
+        // Non-transient: retrying with the same limit would meet the same
+        // message again.
+        err @ MessageTooLarge { .. } => SourceError::Incompatible {
+            details: err.to_string().into(),
+        },
+        // PgWireError is non-exhaustive: an error this code does not know
+        // fails closed.
+        err => SourceError::Other(anyhow::anyhow!("pgwire: {err}")),
     }
 }
 
@@ -1504,6 +1519,7 @@ mod tests {
                 recovery_window: window,
                 recovery_retry: Default::default(),
                 token: Default::default(),
+                max_message_size: None,
             }
         }
 
@@ -1637,5 +1653,13 @@ mod tests {
             pgwire_error_to_source_error(PgWireError::Tls("x".into())),
             SourceError::Incompatible { .. }
         ));
+        // Not retried: the same limit would meet the same message again.
+        let too_large =
+            pgwire_error_to_source_error(PgWireError::MessageTooLarge {
+                payload_bytes: 2048,
+                limit_bytes: 1024,
+            });
+        assert!(matches!(too_large, SourceError::Incompatible { .. }));
+        assert!(!is_retryable_source_error(&too_large));
     }
 }

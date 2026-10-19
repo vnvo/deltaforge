@@ -457,6 +457,34 @@ pub struct PostgresSrcCfg {
     /// support only `v2`: there is no lossless legacy rendering to keep.
     #[serde(default, deserialize_with = "postgres_type_mapping")]
     pub type_mapping: deltaforge_core::TypeMapping,
+    /// The largest replication message accepted, in bytes (1 to 1 GiB;
+    /// default 1 GiB). Each row change arrives as one message, so a single
+    /// wide row must fit. A larger message stops the source fail-closed
+    /// (`pg_message_too_large`) before it, with the checkpoint held; raise
+    /// the limit and restart to resume.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "postgres_max_message_bytes"
+    )]
+    pub max_message_bytes: Option<usize>,
+}
+
+/// The largest `max_message_bytes` (the replication protocol's own limit).
+pub const POSTGRES_MAX_MESSAGE_BYTES: usize = 1024 * 1024 * 1024;
+
+/// A PostgreSQL source's `max_message_bytes`: 1 to 1 GiB.
+fn postgres_max_message_bytes<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<usize>, D::Error> {
+    let bytes = usize::deserialize(d)?;
+    if bytes == 0 || bytes > POSTGRES_MAX_MESSAGE_BYTES {
+        return Err(serde::de::Error::custom(format!(
+            "max_message_bytes must be between 1 and {POSTGRES_MAX_MESSAGE_BYTES} \
+             (1 GiB), got {bytes}"
+        )));
+    }
+    Ok(Some(bytes))
 }
 
 /// A PostgreSQL source's `type_mapping`: `v2` only.

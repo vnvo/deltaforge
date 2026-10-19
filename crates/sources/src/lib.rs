@@ -373,6 +373,7 @@ pub async fn build_source(
                 table_options: c.table_options.clone(),
                 rotation,
                 snapshot_cohort: Default::default(),
+                max_message_size: c.max_message_bytes,
             }))
         }
 

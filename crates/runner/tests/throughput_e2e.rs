@@ -316,6 +316,7 @@ async fn pg_to_kafka_backlog_drain_throughput() -> Result<()> {
     let registry = DurableSchemaRegistry::new(backend.clone()).await?;
 
     let src = PostgresSource {
+        max_message_size: None,
         id: SID.into(),
         dsn: pg_dsn(port).into(),
         slot: SLOT.into(),
