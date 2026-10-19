@@ -467,6 +467,7 @@ impl Durable {
 
 async fn source(proxy: &Proxy, d: &Durable) -> PostgresSource {
     PostgresSource {
+        max_message_size: None,
         id: SOURCE.into(),
         dsn: dsn(proxy.port, DB).into(),
         slot: SLOT.into(),

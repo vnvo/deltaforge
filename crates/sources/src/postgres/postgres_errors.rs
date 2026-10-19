@@ -131,6 +131,41 @@ impl LoopControl {
         }
     }
 
+    /// Classify a failed replication read. A message over the configured
+    /// limit fails closed with `pg_message_too_large` and never reconnects:
+    /// the same limit would meet the same message again. `read_position` is
+    /// the stream's read position before it. Everything else is classified
+    /// as before.
+    pub fn from_replication_read(
+        outcome: RetryOutcome<pgwire_replication::PgWireError>,
+        source_id: &str,
+        read_position: &str,
+    ) -> Self {
+        match outcome {
+            RetryOutcome::Failed(
+                pgwire_replication::PgWireError::MessageTooLarge {
+                    payload_bytes,
+                    limit_bytes,
+                },
+            ) => {
+                error!(
+                    source_id,
+                    payload_bytes,
+                    limit_bytes,
+                    "replication message over max_message_bytes; stopping \
+                     without reconnecting"
+                );
+                Self::Fail(crate::incident_drafts::message_too_large(
+                    source_id,
+                    read_position,
+                    payload_bytes,
+                    limit_bytes,
+                ))
+            }
+            other => Self::from_replication_outcome(other),
+        }
+    }
+
     /// Classify PgWireError (main event loop errors).
     #[allow(dead_code)]
     pub fn from_pgwire_error(err: pgwire_replication::PgWireError) -> Self {
@@ -191,6 +226,14 @@ impl LoopControl {
                 warn!(error = %msg, "protocol error, will reconnect");
                 Self::Reconnect
             }
+            // Non-transient: a reconnect with the same limit would meet the
+            // same message again.
+            err @ MessageTooLarge { .. } => {
+                error!(error = %err, "replication message over the limit");
+                Self::Fail(SourceError::Incompatible {
+                    details: err.to_string().into(),
+                })
+            }
 
             Task(msg) => {
                 warn!(error = %msg, "task error, will reconnect");
@@ -203,6 +246,12 @@ impl LoopControl {
                     "pgwire: {}",
                     msg
                 )))
+            }
+            // PgWireError is non-exhaustive: an error this code does not
+            // know fails closed.
+            err => {
+                error!(error = %err, "unclassified replication error");
+                Self::Fail(SourceError::Other(anyhow::anyhow!("pgwire: {err}")))
             }
         }
     }
@@ -558,5 +607,76 @@ mod tests {
             })
             .is_retryable()
         );
+    }
+
+    fn too_large() -> RetryOutcome<pgwire_replication::PgWireError> {
+        RetryOutcome::Failed(pgwire_replication::PgWireError::MessageTooLarge {
+            payload_bytes: 2048,
+            limit_bytes: 1024,
+        })
+    }
+
+    #[test]
+    fn an_oversized_message_fails_closed_without_reconnecting() {
+        let control =
+            LoopControl::from_replication_read(too_large(), "pg1", "0/16B3748");
+        assert!(!control.is_retryable(), "no reconnect");
+        let LoopControl::Fail(err) = control else {
+            panic!("expected Fail");
+        };
+        let draft = err.draft().expect("an incident");
+        assert_eq!(
+            draft.reason_code,
+            deltaforge_core::incident::ReasonCode::PgMessageTooLarge
+        );
+        assert_eq!(
+            draft.retryability,
+            deltaforge_core::incident::Retryability::OperatorAction
+        );
+        // Evidence is the sizes and the source only: no payload, no position.
+        let ev = serde_json::to_value(&draft.evidence).unwrap();
+        let mut keys: Vec<&str> = ev
+            .as_object()
+            .expect("evidence object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["message_bytes", "message_limit", "source_id"]);
+        use deltaforge_core::incident::{EvidenceKey as K, EvidenceValue as V};
+        assert_eq!(
+            draft.evidence.get(K::MessageBytes),
+            Some(&V::Count { value: 2048 })
+        );
+        assert_eq!(
+            draft.evidence.get(K::MessageLimit),
+            Some(&V::Count { value: 1024 })
+        );
+        assert_eq!(draft.evidence.text_of(K::SourceId), Some("pg1"));
+    }
+
+    #[test]
+    fn other_read_failures_keep_their_classification() {
+        let reset = RetryOutcome::Failed(pgwire_replication::PgWireError::Io(
+            std::sync::Arc::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            )),
+        ));
+        assert!(matches!(
+            LoopControl::from_replication_read(reset, "pg1", "0/1"),
+            LoopControl::Reconnect
+        ));
+    }
+
+    #[test]
+    fn the_pgwire_mapping_fails_closed_on_an_oversized_message() {
+        let RetryOutcome::Failed(err) = too_large() else {
+            unreachable!()
+        };
+        assert!(matches!(
+            LoopControl::from_pgwire_error(err),
+            LoopControl::Fail(_)
+        ));
     }
 }

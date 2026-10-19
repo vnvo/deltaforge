@@ -225,6 +225,7 @@ async fn postgres_snapshot_scale() -> Result<()> {
         .await?;
         let slot = format!("slot_scale{n}");
         let src = sources::postgres::PostgresSource {
+            max_message_size: None,
             id: format!("scale{n}"),
             dsn: pg_admin_dsn(&db).await.into(),
             slot: slot.clone(),

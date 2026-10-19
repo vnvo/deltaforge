@@ -159,6 +159,17 @@ Set `spec.source.type` to `postgres` and provide a config object:
 | `publication` | string | Yes | — | Publication name |
 | `tables` | array | Yes | — | Table patterns to capture |
 | `start_position` | string/object | No | — | ⚠️ Parsed but not yet implemented — a new slot always starts at the current WAL LSN |
+| `max_message_bytes` | integer | No | 1 GiB | Largest replication message accepted, 1 to 1073741824 bytes (see [Message size limit](#message-size-limit)) |
+
+### Message size limit
+
+PostgreSQL sends each row change as one replication message, so a single wide row (or a large `pg_logical_emit_message()` payload) must fit under `max_message_bytes`. A larger message is refused before any of it is buffered, and the source stops fail-closed with the incident `pg_message_too_large`:
+
+- the session that received it is abandoned and the source does not reconnect: a reconnect with the same limit would meet the same message again;
+- the checkpoint stays before the message's transaction, so nothing of it is acknowledged or delivered partially;
+- the evidence is the message's size (`message_bytes`), the limit (`message_limit`) and the source, never the payload.
+
+Raise `max_message_bytes` above the reported size and restart the pipeline: it resumes from the held checkpoint and delivers the whole transaction. The limit bounds one message, not a transaction or total memory.
 
 ### DSN Formats
 

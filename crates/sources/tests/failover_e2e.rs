@@ -263,6 +263,7 @@ async fn make_pg_source(
     backend: ArcStorageBackend,
 ) -> PostgresSource {
     PostgresSource {
+        max_message_size: None,
         id: id.into(),
         dsn: dsn.into(),
         slot: slot.into(),

@@ -43,6 +43,7 @@ async fn source(
     )
     .await?;
     Ok(sources::postgres::PostgresSource {
+        max_message_size: None,
         id: id.into(),
         dsn: pg_admin_dsn(db).await.into(),
         slot: format!("slot_{id}"),

@@ -522,6 +522,7 @@ fn source(
     };
     match db.engine {
         Engine::Postgres => Arc::new(sources::postgres::PostgresSource {
+            max_message_size: None,
             id: SOURCE.into(),
             dsn: pg_dsn(db.port).into(),
             slot: "scale_slot".into(),
