@@ -31,6 +31,7 @@ use anyhow::{Result, anyhow, bail};
 use deltaforge_core::canonical::DbValue;
 use deltaforge_core::canonical::Document;
 use deltaforge_core::canonical::parse::parse_like;
+use deltaforge_core::canonical::render::RowImage;
 use deltaforge_core::canonical::schema::{ColumnType, ColumnTypes};
 use deltaforge_core::{
     CanonicalRow, CanonicalValue, Event, NativeOpts, TypeMapping,
@@ -65,16 +66,17 @@ pub(crate) fn to_js(
     let native = event
         .native(NativeOpts::default())
         .map_err(|e| anyhow!("render event for JS: {e}"))?;
-    let before = native
-        .before
-        .zip(event.before.clone())
-        .map(|(m, r)| (r.clone(), js_safe(&r, m.to_map())));
-    let after = native
-        .after
-        .zip(event.after.clone())
-        .map(|(m, r)| (r.clone(), js_safe(&r, m.to_map())));
-    let mut value =
-        serde_json::to_value(&native).expect("a native payload serializes");
+    let image = |rendered: Option<RowImage<'_>>, row: &Option<CanonicalRow>| {
+        rendered
+            .zip(row.as_ref())
+            .map(|(m, r)| (r.clone(), js_safe(r, m.to_map())))
+    };
+    let before = image(native.before, &event.before);
+    let after = image(native.after, &event.after);
+    // The row images are rendered once, above; the payload carries them in
+    // their places.
+    let mut value = serde_json::to_value(native.row_placeholders())
+        .expect("a native payload serializes");
     if let Value::Object(o) = &mut value {
         if let Some((_, m)) = &before {
             o.insert("before".into(), Value::Object(m.clone()));

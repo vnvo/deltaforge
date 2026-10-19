@@ -158,8 +158,9 @@ impl Event {
 }
 
 impl<'a> NativePayload<'a> {
-    /// This payload with each present row image written as `{}`.
-    pub(crate) fn row_placeholders(&self) -> NativePayload<'a> {
+    /// This payload with each present row image written as `{}`: for a
+    /// caller that puts the rows in their places itself.
+    pub fn row_placeholders(&self) -> NativePayload<'a> {
         NativePayload {
             event: self.event,
             before: self.before.map(RowImage::placeholder),
