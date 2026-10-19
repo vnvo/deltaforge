@@ -200,6 +200,8 @@ async fn start_clickhouse()
         })
         .with_mapped_port(0, CH_HTTP.tcp())
         .with_env_var("CLICKHOUSE_PASSWORD", CH_PASSWORD)
+        // SQL-driven users and settings profiles (the async-insert test).
+        .with_env_var("CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT", "1")
         .gate_owned()
         .start()
         .await
@@ -220,9 +222,7 @@ async fn upsert_mode_auto_creates_and_reflects_current_state() {
         CancellationToken::new(),
         "p",
         Some(resolver()),
-        std::sync::Arc::new(
-            deltaforge_core::destination::MemoryDestinationBindings::default(),
-        ),
+        &sinks::SinkOwnership::ephemeral(),
         &sinks::ResolvedSinkCreds::default(),
     )
     .unwrap();
@@ -304,9 +304,7 @@ async fn changelog_mode_retains_all_changes() {
         CancellationToken::new(),
         "p",
         Some(resolver()),
-        std::sync::Arc::new(
-            deltaforge_core::destination::MemoryDestinationBindings::default(),
-        ),
+        &sinks::SinkOwnership::ephemeral(),
         &sinks::ResolvedSinkCreds::default(),
     )
     .unwrap();
@@ -360,30 +358,33 @@ async fn changelog_mode_retains_all_changes() {
 async fn dedup_token_prevents_double_insert() {
     let (_c, base) = start_clickhouse().await;
     let table = "orders_dedup";
-    // Pre-create a MergeTree with non-replicated dedup enabled; auto_create off.
-    ch(
-        &base,
-        &format!(
-            "CREATE TABLE default.{table} (`id` Int64, `amount` Nullable(Decimal(12,2)), \
-             `_op` LowCardinality(String), `_version` UInt64, `_deleted` UInt8, \
-             `_source_ts` DateTime64(3), `_extensions` Nullable(String)) \
-             ENGINE = MergeTree ORDER BY (`id`, `_version`) \
-             SETTINGS non_replicated_deduplication_window = 1000"
-        ),
-    )
-    .await;
-
+    // The sink creates the table (an unrelated first row), then
+    // non-replicated deduplication is enabled on it.
     let sink = build_clickhouse_sink(
-        &cfg(&base, table, ChMode::Changelog, false),
+        &cfg(&base, table, ChMode::Changelog, true),
         CancellationToken::new(),
         "p",
         Some(resolver()),
-        std::sync::Arc::new(
-            deltaforge_core::destination::MemoryDestinationBindings::default(),
-        ),
+        &sinks::SinkOwnership::ephemeral(),
         &sinks::ResolvedSinkCreds::default(),
     )
     .unwrap();
+    sink.send_batch(&[mk_event(
+        Op::Create,
+        json!({"id": 0, "amount": "0.00"}),
+        json!(null),
+        table,
+        0,
+    )])
+    .await
+    .unwrap();
+    ch(
+        &base,
+        &format!(
+            "ALTER TABLE default.{table} MODIFY SETTING non_replicated_deduplication_window = 1000"
+        ),
+    )
+    .await;
 
     let batch = vec![
         mk_event(
@@ -412,71 +413,432 @@ async fn dedup_token_prevents_double_insert() {
     .await;
     assert_eq!(
         n.trim(),
-        "2",
+        "3",
         "dedup token prevented the replayed batch from doubling rows"
     );
 }
 
-/// The target table's binding against a live server: a restarted sink
-/// whose first event is another relation is refused before inserting; a
-/// table dropped and recreated (another UUID) is refused as replaced; the
-/// refusal names both relations and no row data.
+/// Run a statement; its status and body, whatever the status.
+async fn ch_raw(base: &str, user: &str, key: &str, sql: &str) -> (u16, String) {
+    let r = reqwest::Client::new()
+        .post(base)
+        .header("X-ClickHouse-User", user)
+        .header("X-ClickHouse-Key", key)
+        .body(sql.to_string())
+        .send()
+        .await
+        .expect("clickhouse http request");
+    (r.status().as_u16(), r.text().await.unwrap_or_default())
+}
+
+fn class(e: &deltaforge_core::SinkError) -> Option<String> {
+    e.draft()
+        .and_then(|d| d.discriminator.get("class").cloned())
+}
+
+fn ch_sink(
+    base: &str,
+    database: &str,
+    table: &str,
+    o: &sinks::SinkOwnership,
+) -> sinks::clickhouse::sink::ClickHouseSink {
+    let mut c = cfg(base, table, ChMode::Changelog, true);
+    c.database = database.into();
+    build_clickhouse_sink(
+        &c,
+        CancellationToken::new(),
+        "p",
+        Some(resolver()),
+        o,
+        &sinks::ResolvedSinkCreds::default(),
+    )
+    .unwrap()
+}
+
+fn row(source_table: &str, id: i64) -> Event {
+    mk_event(
+        Op::Create,
+        json!({"id": id, "amount": "1.50"}),
+        json!(null),
+        source_table,
+        id,
+    )
+}
+
+/// Ownership against a live server: a restart of the owner writes; another
+/// relation, another deployment and a table the sink did not create are
+/// refused before inserting; a dropped table is never recreated, and one
+/// recreated by another deployment does not transfer ownership.
 #[tokio::test]
 #[ignore]
-async fn the_target_table_binding_holds_across_restart_and_recreation() {
+async fn ownership_holds_across_restarts_and_refuses_others() {
     let (_c, base) = start_clickhouse().await;
-    let table = "orders_bound";
-    let store: std::sync::Arc<
-        dyn deltaforge_core::destination::DestinationBindingStore,
-    > = std::sync::Arc::new(
-        deltaforge_core::destination::MemoryDestinationBindings::default(),
+    let table = "orders_owned";
+    let ownership = sinks::SinkOwnership::ephemeral();
+    let sink = |o: &sinks::SinkOwnership, table: &str| {
+        ch_sink(&base, "default", table, o)
+    };
+    sink(&ownership, table)
+        .send_batch(&[row("orders", 1)])
+        .await
+        .unwrap();
+    sink(&ownership, table)
+        .send_batch(&[row("orders", 2)])
+        .await
+        .unwrap();
+    let count = |t: &str| {
+        let (base, sql) =
+            (base.clone(), format!("SELECT count() FROM default.{t}"));
+        async move { ch(&base, &sql).await }
+    };
+    assert_eq!(count(table).await.trim(), "2");
+
+    let e = sink(&ownership, table)
+        .send_batch(&[row("orders_v2", 3)])
+        .await
+        .unwrap_err();
+    assert_eq!(class(&e).as_deref(), Some("bound_to_another_relation"));
+    assert!(!format!("{e:?}").contains("1.50"), "no row data");
+    let e = sink(&sinks::SinkOwnership::ephemeral(), table)
+        .send_batch(&[row("orders", 3)])
+        .await
+        .unwrap_err();
+    assert_eq!(class(&e).as_deref(), Some("owned_by_other"));
+    assert_eq!(count(table).await.trim(), "2", "nothing inserted");
+
+    ch(&base, "CREATE TABLE default.user_table (id Int64) ENGINE = MergeTree ORDER BY id").await;
+    let e = sink(&ownership, "user_table")
+        .send_batch(&[row("orders", 1)])
+        .await
+        .unwrap_err();
+    assert_eq!(class(&e).as_deref(), Some("marker_missing"));
+
+    ch(&base, &format!("DROP TABLE default.{table} SYNC")).await;
+    let e = sink(&ownership, table)
+        .send_batch(&[row("orders", 4)])
+        .await
+        .unwrap_err();
+    assert_eq!(class(&e).as_deref(), Some("destination_missing"));
+    let (_, exists) = ch_raw(
+        &base,
+        "default",
+        CH_PASSWORD,
+        &format!("EXISTS TABLE default.{table}"),
+    )
+    .await;
+    assert_eq!(exists.trim(), "0", "never recreated");
+    sink(&sinks::SinkOwnership::ephemeral(), table)
+        .send_batch(&[row("orders", 5)])
+        .await
+        .unwrap();
+    let e = sink(&ownership, table)
+        .send_batch(&[row("orders", 6)])
+        .await
+        .unwrap_err();
+    assert_eq!(class(&e).as_deref(), Some("owned_by_other"));
+}
+
+/// A copy of the state store claiming the table fences the original: its
+/// very next insert fails at the server (the fence constraint), and so does
+/// its next claim. Rows of the fenced writer after the rotation never land.
+#[tokio::test]
+#[ignore]
+async fn a_copied_store_fences_the_original_at_its_next_insert() {
+    let (_c, base) = start_clickhouse().await;
+    let table = "orders_clone";
+    let store = std::sync::Arc::new(
+        deltaforge_core::ownership::MemoryOwnershipStore::default(),
     );
-    let sink = || {
-        build_clickhouse_sink(
-            &cfg(&base, table, ChMode::Changelog, true),
+    let original = sinks::SinkOwnership {
+        deployment: deltaforge_core::ownership::random_token(),
+        store: store.clone(),
+    };
+    let a = ch_sink(&base, "default", table, &original);
+    a.send_batch(&[row("orders", 1)]).await.unwrap();
+    let copy = sinks::SinkOwnership {
+        deployment: original.deployment.clone(),
+        store: std::sync::Arc::new(store.copy()),
+    };
+    let b = ch_sink(&base, "default", table, &copy);
+    b.send_batch(&[row("orders", 2)]).await.unwrap();
+    let e = a.send_batch(&[row("orders", 3)]).await.unwrap_err();
+    assert_eq!(class(&e).as_deref(), Some("fenced"), "{e:?}");
+    let e = ch_sink(&base, "default", table, &original)
+        .send_batch(&[row("orders", 4)])
+        .await
+        .unwrap_err();
+    assert_eq!(class(&e).as_deref(), Some("fenced"));
+    b.send_batch(&[row("orders", 5)]).await.unwrap();
+    let ids = ch(
+        &base,
+        &format!("SELECT id FROM default.{table} ORDER BY id FORMAT TSV"),
+    )
+    .await;
+    assert_eq!(ids.split_whitespace().collect::<Vec<_>>(), ["1", "2", "5"]);
+}
+
+/// The allowed overlap: an insert the server already accepted may complete
+/// while the fence rotates; an insert submitted after the rotation
+/// committed is rejected.
+#[tokio::test]
+#[ignore]
+async fn an_insert_in_flight_during_rotation_may_complete_and_the_next_fails() {
+    let (_c, base) = start_clickhouse().await;
+    let table = "orders_inflight";
+    let store = std::sync::Arc::new(
+        deltaforge_core::ownership::MemoryOwnershipStore::default(),
+    );
+    let original = sinks::SinkOwnership {
+        deployment: deltaforge_core::ownership::random_token(),
+        store: store.clone(),
+    };
+    let a = std::sync::Arc::new(ch_sink(&base, "default", table, &original));
+    a.send_batch(&[row("orders", 0)]).await.unwrap();
+    let big: Vec<Event> = (1..=200_000).map(|i| row("orders", i)).collect();
+    let a2 = a.clone();
+    let inflight = tokio::spawn(async move { a2.send_batch(&big).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let copy = sinks::SinkOwnership {
+        deployment: original.deployment.clone(),
+        store: std::sync::Arc::new(store.copy()),
+    };
+    ch_sink(&base, "default", table, &copy)
+        .send_batch(&[row("orders", 999_999)])
+        .await
+        .unwrap();
+    match inflight.await.unwrap() {
+        Ok(_) => eprintln!(
+            "in-flight insert completed before or across the rotation"
+        ),
+        Err(e) => assert_eq!(class(&e).as_deref(), Some("fenced"), "{e:?}"),
+    }
+    let e = a.send_batch(&[row("orders", 1_000_000)]).await.unwrap_err();
+    assert_eq!(class(&e).as_deref(), Some("fenced"));
+}
+
+/// Unsupported topologies are refused: a `Distributed` table, and a server
+/// on which synchronous inserts cannot be forced. A profile that merely
+/// enables `async_insert` is overridden by the sink's `async_insert=0`.
+#[tokio::test]
+#[ignore]
+async fn unsupported_topologies_and_forced_async_inserts_are_refused() {
+    let (_c, base) = start_clickhouse().await;
+    let ownership = sinks::SinkOwnership::ephemeral();
+    ch(&base, "CREATE TABLE default.local_t (id Int64) ENGINE = MergeTree ORDER BY id").await;
+    let mut unsupported = vec![
+        (
+            "mem_t",
+            "CREATE TABLE default.mem_t (id Int64) ENGINE = Memory".to_string(),
+        ),
+        (
+            "log_t",
+            "CREATE TABLE default.log_t (id Int64) ENGINE = Log".to_string(),
+        ),
+    ];
+    // A Distributed table over a cluster the server defines.
+    let cluster = ch(
+        &base,
+        "SELECT cluster FROM system.clusters LIMIT 1 FORMAT TSV",
+    )
+    .await;
+    if !cluster.trim().is_empty() {
+        unsupported.push((
+            "dist_t",
+            format!(
+                "CREATE TABLE default.dist_t (id Int64) ENGINE = Distributed('{}', default, local_t)",
+                cluster.trim()
+            ),
+        ));
+    }
+    for (table, ddl) in unsupported {
+        ch(&base, &ddl).await;
+        let e = ch_sink(&base, "default", table, &ownership)
+            .send_batch(&[row("orders", 1)])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            class(&e).as_deref(),
+            Some("unsupported_topology"),
+            "{table}"
+        );
+    }
+
+    for (profile, constant, refused) in
+        [("async_on", "", false), ("async_const", " CONST", true)]
+    {
+        ch(
+            &base,
+            &format!("CREATE SETTINGS PROFILE {profile} SETTINGS async_insert = 1{constant}"),
+        )
+        .await;
+        let user = format!("u_{profile}");
+        ch(&base, &format!("CREATE USER {user} IDENTIFIED BY 'pw' SETTINGS PROFILE {profile}")).await;
+        ch(
+            &base,
+            &format!("GRANT SELECT, INSERT, CREATE TABLE, ALTER TABLE ON default.* TO {user}"),
+        )
+        .await;
+        let mut c =
+            cfg(&base, &format!("t_{profile}"), ChMode::Changelog, true);
+        c.user = Some(user.clone());
+        c.password = Some("pw".into());
+        let sink = build_clickhouse_sink(
+            &c,
             CancellationToken::new(),
             "p",
             Some(resolver()),
-            std::sync::Arc::clone(&store),
+            &ownership,
             &sinks::ResolvedSinkCreds::default(),
         )
-        .unwrap()
-    };
-    let row = |source_table: &str| {
-        mk_event(
-            Op::Create,
-            json!({"id": 7, "amount": "1.50"}),
-            json!(null),
-            source_table,
-            1,
+        .unwrap();
+        let r = sink.send_batch(&[row("orders", 1)]).await;
+        if refused {
+            assert_eq!(
+                class(&r.unwrap_err()).as_deref(),
+                Some("fencing_unenforced")
+            );
+        } else {
+            r.unwrap();
+            // Written synchronously: visible at once.
+            let n =
+                ch(&base, &format!("SELECT count() FROM default.t_{profile}"))
+                    .await;
+            assert_eq!(n.trim(), "1");
+        }
+    }
+}
+
+/// Database and table names that need quoting work end to end.
+#[tokio::test]
+#[ignore]
+async fn names_that_need_quoting_are_created_and_written() {
+    let (_c, base) = start_clickhouse().await;
+    let db = "we`ird db";
+    let table = "or.ders 'x' ü";
+    let q =
+        |s: &str| format!("`{}`", s.replace('\\', "\\\\").replace('`', "\\`"));
+    ch(&base, &format!("CREATE DATABASE {}", q(db))).await;
+    let ownership = sinks::SinkOwnership::ephemeral();
+    ch_sink(&base, db, table, &ownership)
+        .send_batch(&[row("orders", 1)])
+        .await
+        .unwrap();
+    ch_sink(&base, db, table, &ownership)
+        .send_batch(&[row("orders", 2)])
+        .await
+        .unwrap();
+    let n = ch(
+        &base,
+        &format!("SELECT count() FROM {}.{}", q(db), q(table)),
+    )
+    .await;
+    assert_eq!(n.trim(), "2");
+}
+
+/// A damaged enforcement shape is refused at the next claim.
+#[tokio::test]
+#[ignore]
+async fn a_malformed_fence_constraint_or_column_is_refused() {
+    let (_c, base) = start_clickhouse().await;
+    for (table, damage) in [
+        (
+            "orders_nocons",
+            "ALTER TABLE default.orders_nocons DROP CONSTRAINT {c}",
+        ),
+        (
+            "orders_extra",
+            "ALTER TABLE default.orders_extra ADD COLUMN _df_x String",
+        ),
+    ] {
+        let ownership = sinks::SinkOwnership::ephemeral();
+        ch_sink(&base, "default", table, &ownership)
+            .send_batch(&[row("orders", 1)])
+            .await
+            .unwrap();
+        let create = ch(
+            &base,
+            &format!("SELECT create_table_query FROM system.tables WHERE name = '{table}' FORMAT TSVRaw"),
         )
-    };
-    sink().send_batch(&[row("orders")]).await.unwrap();
-    let count_sql = format!("SELECT count() FROM default.{table}");
-    let count = || ch(&base, &count_sql);
-    assert_eq!(count().await.trim(), "1");
+        .await;
+        let c = &create[create.find("df_fence_").unwrap()..][..41];
+        ch(&base, &damage.replace("{c}", c)).await;
+        let e = ch_sink(&base, "default", table, &ownership)
+            .send_batch(&[row("orders", 2)])
+            .await
+            .unwrap_err();
+        assert_eq!(class(&e).as_deref(), Some("fence_malformed"), "{table}");
+    }
+}
 
-    // A restart: the other relation comes first.
-    let e = sink().send_batch(&[row("orders_v2")]).await.unwrap_err();
-    assert_eq!(
-        e.draft().map(|d| d.reason_code),
-        Some(deltaforge_core::incident::ReasonCode::SinkDestinationConflict)
-    );
-    let text = format!("{e:?}");
-    assert!(
-        text.contains("/orders") && text.contains("/orders_v2"),
-        "{text}"
-    );
-    assert!(!text.contains("1.50"), "no row data: {text}");
-    assert_eq!(count().await.trim(), "1", "nothing inserted");
-
-    // Recreated by hand: another table UUID.
-    ch(&base, &format!("DROP TABLE default.{table} SYNC")).await;
-    let e = sink().send_batch(&[row("orders")]).await.unwrap_err();
-    assert_eq!(
-        e.draft()
-            .and_then(|d| d.discriminator.get("class").cloned())
-            .as_deref(),
-        Some("target_replaced")
+/// Claim and steady-state costs against a live server (printed).
+#[tokio::test]
+#[ignore]
+async fn measure_claim_and_steady_state_costs() {
+    let (_c, base) = start_clickhouse().await;
+    let table = "orders_measure";
+    let ownership = sinks::SinkOwnership::ephemeral();
+    let t = Instant::now();
+    let s = ch_sink(&base, "default", table, &ownership);
+    s.send_batch(&[row("orders", 1)]).await.unwrap();
+    let first = t.elapsed();
+    let t = Instant::now();
+    ch_sink(&base, "default", table, &ownership)
+        .send_batch(&[row("orders", 2)])
+        .await
+        .unwrap();
+    let restart = t.elapsed();
+    let s = ch_sink(&base, "default", table, &ownership);
+    s.send_batch(&[row("orders", 3)]).await.unwrap();
+    let batches = 50;
+    let per = 5000;
+    let t = Instant::now();
+    for b in 0..batches {
+        let batch: Vec<Event> = (0..per)
+            .map(|i| row("orders", 10_000 + b * per + i))
+            .collect();
+        s.send_batch(&batch).await.unwrap();
+    }
+    let rate = (batches * per) as f64 / t.elapsed().as_secs_f64();
+    // Wide parts report per-column sizes (compact parts store one file).
+    ch(
+        &base,
+        &format!(
+            "ALTER TABLE default.{table} MODIFY SETTING min_bytes_for_wide_part = 0, \
+             min_rows_for_wide_part = 0"
+        ),
+    )
+    .await;
+    ch(&base, &format!("OPTIMIZE TABLE default.{table} FINAL")).await;
+    let sizes = ch(
+        &base,
+        &format!(
+            "SELECT column, sum(column_data_compressed_bytes), \
+             sum(column_data_uncompressed_bytes) FROM system.parts_columns \
+             WHERE table = '{table}' AND active GROUP BY column ORDER BY column FORMAT TSV"
+        ),
+    )
+    .await;
+    // Constraint compare-and-swap alone.
+    let create = ch(
+        &base,
+        &format!("SELECT create_table_query FROM system.tables WHERE name = '{table}' FORMAT TSVRaw"),
+    )
+    .await;
+    let old = &create[create.find("df_fence_").unwrap() + 9..][..32];
+    let new = "c".repeat(32);
+    let t = Instant::now();
+    ch(
+        &base,
+        &format!(
+            "ALTER TABLE default.{table} DROP CONSTRAINT df_fence_{old}, \
+             ADD CONSTRAINT df_fence_{new} CHECK _df_fence = '{new}'"
+        ),
+    )
+    .await;
+    let cas = t.elapsed();
+    println!(
+        "CH claim costs: first_creation={first:?} restart_claim={restart:?} \
+         constraint_cas={cas:?} steady_rows_per_s={rate:.0} fence_bytes_per_row_on_wire=33\n\
+         column sizes (name, compressed, uncompressed):\n{sizes}"
     );
 }

@@ -50,7 +50,7 @@ pub use canonical::{CanonicalRow, CanonicalValue, TypeMapping};
 pub mod canonical_json;
 
 /// Durable bindings between sink destinations and source relations.
-pub mod destination;
+pub mod ownership;
 
 /// The identity of a source relation (a table).
 pub mod relation;

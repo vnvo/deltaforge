@@ -34,7 +34,47 @@
 
 use std::sync::Arc;
 
-mod destination;
+mod ownership_guard;
+
+/// The prefix of every ownership record key of `pipeline`'s sinks.
+pub fn ownership_prefix(pipeline: &str) -> String {
+    format!("{}/", ownership_guard::escape(pipeline))
+}
+
+/// Who owns the destinations this process's sinks create: the deployment
+/// identity (one per state store) and the store of ownership records.
+#[derive(Clone)]
+pub struct SinkOwnership {
+    pub deployment: String,
+    pub store: Arc<dyn deltaforge_core::ownership::OwnershipStore>,
+}
+
+impl SinkOwnership {
+    /// A deployment that lives only in this process (library use, tests).
+    pub fn ephemeral() -> Self {
+        SinkOwnership {
+            deployment: deltaforge_core::ownership::random_token(),
+            store: Arc::new(
+                deltaforge_core::ownership::MemoryOwnershipStore::default(),
+            ),
+        }
+    }
+
+    pub(crate) fn guard(
+        &self,
+        pipeline: &str,
+        sink: &str,
+    ) -> ownership_guard::OwnershipGuard {
+        ownership_guard::OwnershipGuard::new(
+            deltaforge_core::ownership::OwnerIdentity {
+                deployment: self.deployment.clone(),
+                pipeline: pipeline.to_string(),
+                sink: sink.to_string(),
+            },
+            Arc::clone(&self.store),
+        )
+    }
+}
 mod payload;
 
 use deltaforge_config::{PipelineSpec, SinkCfg, SinkFilter};
@@ -134,9 +174,7 @@ pub fn build_sinks_with_schemas(
     arrow_schema_resolver: Option<s3::SchemaResolver>,
     clickhouse_resolver: Option<clickhouse::ClickHouseSchemaResolver>,
     es_resolver: Option<elasticsearch::EsSchemaResolver>,
-    destination_bindings: Option<
-        Arc<dyn deltaforge_core::destination::DestinationBindingStore>,
-    >,
+    ownership: Option<SinkOwnership>,
     secrets: &ResolvedSinkSecrets,
 ) -> anyhow::Result<Vec<ArcDynSink>> {
     // Public API: NEVER silently omit a configured sink. A durable_v2 S3 sink
@@ -150,7 +188,7 @@ pub fn build_sinks_with_schemas(
         arrow_schema_resolver,
         clickhouse_resolver,
         es_resolver,
-        destination_bindings.clone(),
+        ownership.clone(),
         secrets,
         /* defer_durable_s3 */ false,
     )
@@ -169,9 +207,7 @@ pub fn build_sinks_deferring_durable_s3(
     arrow_schema_resolver: Option<s3::SchemaResolver>,
     clickhouse_resolver: Option<clickhouse::ClickHouseSchemaResolver>,
     es_resolver: Option<elasticsearch::EsSchemaResolver>,
-    destination_bindings: Option<
-        Arc<dyn deltaforge_core::destination::DestinationBindingStore>,
-    >,
+    ownership: Option<SinkOwnership>,
     secrets: &ResolvedSinkSecrets,
 ) -> anyhow::Result<Vec<ArcDynSink>> {
     build_sinks_impl(
@@ -182,7 +218,7 @@ pub fn build_sinks_deferring_durable_s3(
         arrow_schema_resolver,
         clickhouse_resolver,
         es_resolver,
-        destination_bindings.clone(),
+        ownership.clone(),
         secrets,
         /* defer_durable_s3 */ true,
     )
@@ -197,19 +233,14 @@ fn build_sinks_impl(
     arrow_schema_resolver: Option<s3::SchemaResolver>,
     clickhouse_resolver: Option<clickhouse::ClickHouseSchemaResolver>,
     es_resolver: Option<elasticsearch::EsSchemaResolver>,
-    destination_bindings: Option<
-        Arc<dyn deltaforge_core::destination::DestinationBindingStore>,
-    >,
+    ownership: Option<SinkOwnership>,
     secrets: &ResolvedSinkSecrets,
     defer_durable_s3: bool,
 ) -> anyhow::Result<Vec<ArcDynSink>> {
-    // Destination bindings outlive the process only through the runner's
-    // durable store; without one (library use, tests) they are in memory.
-    let destination_bindings = destination_bindings.unwrap_or_else(|| {
-        Arc::new(
-            deltaforge_core::destination::MemoryDestinationBindings::default(),
-        )
-    });
+    // Ownership records outlive the process only through the runner's
+    // durable store and deployment identity; without them (library use,
+    // tests) an ephemeral deployment owns destinations in memory.
+    let ownership = ownership.unwrap_or_else(SinkOwnership::ephemeral);
     ps.spec
         .sinks
         .iter()
@@ -288,7 +319,7 @@ fn build_sinks_impl(
                             cancel.clone(),
                             pipeline,
                             clickhouse_resolver.clone(),
-                            Arc::clone(&destination_bindings),
+                            &ownership,
                             secrets.for_sink(&cfg.id),
                         )?) as ArcDynSink,
                         // v1: ClickHouse sink does not support sink-level filters.
@@ -300,7 +331,7 @@ fn build_sinks_impl(
                             cancel.clone(),
                             pipeline,
                             es_resolver.clone(),
-                            Arc::clone(&destination_bindings),
+                            &ownership,
                             secrets.for_sink(&cfg.id),
                         )?) as ArcDynSink,
                         // v1: Elasticsearch sink does not support sink-level filters.
@@ -375,9 +406,7 @@ pub fn build_sink(
                 cancel,
                 pipeline,
                 None,
-                Arc::new(
-                    deltaforge_core::destination::MemoryDestinationBindings::default(),
-                ),
+                &SinkOwnership::ephemeral(),
                 &ResolvedSinkCreds::default(),
             )?) as ArcDynSink
         }
@@ -386,9 +415,7 @@ pub fn build_sink(
             cancel,
             pipeline,
             None,
-            Arc::new(
-                deltaforge_core::destination::MemoryDestinationBindings::default(),
-            ),
+            &SinkOwnership::ephemeral(),
             &ResolvedSinkCreds::default(),
         )?) as ArcDynSink,
     };
@@ -430,7 +457,7 @@ mod tests {
             id: "es1".into(),
             url: "http://es:9200".into(),
             index: "t".into(),
-            auto_create_index: false,
+            auto_create_index: true,
             id_fields: vec!["id".into()],
             id_separator: "_".into(),
             version_source: EsVersionSource::SourcePosition,

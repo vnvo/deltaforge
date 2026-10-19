@@ -1,17 +1,25 @@
 //! `ElasticsearchSink` — the `Sink` implementation.
 //!
-//! `send_batch`: for each event resolve the source PK (+ types), ensure the
-//! target index exists once (with a generated mapping), derive `_id` + external
-//! `version`, assemble one `_bulk` request, then map the per-item response —
-//! `409 version_conflict` is success, other per-doc errors go to the DLQ.
+//! `send_batch`: for each event resolve the source PK (+ types) and the index
+//! it renders to. Each index is claimed once per session before it is
+//! written (see [`super::ownership`]): created by the sink with its marker
+//! and fenced write alias, or proven to be the sink's and its fence rotated.
+//! Every bulk action then targets the fenced write alias. Per item, `409
+//! version_conflict` is success, a removed alias fails the whole batch
+//! (`sink_destination_conflict`, class `fenced`, never dead-lettered), and
+//! other per-document errors go to the DLQ.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use deltaforge_config::{ElasticsearchSinkCfg, EsVersionSource};
-use deltaforge_core::SourceRelationIdentity;
+use deltaforge_core::ownership::{
+    DestinationMarker, EncodingMarker, Expected, OwnershipClass,
+    RelationMarker, ownership_refusal,
+};
 use deltaforge_core::{BatchResult, Event, Op, Sink, SinkError, SinkResult};
+use deltaforge_core::{SourceInfo, SourceRelationIdentity};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -25,29 +33,49 @@ use super::id::derive_id;
 use super::index::render_index;
 use super::mapping::build_mapping;
 use super::normalize::normalize_doc;
+use super::ownership::{EsDestination, write_alias};
 use super::version::derive_es_version;
-use crate::clickhouse::types::ColDesc;
+use crate::ownership_guard::OwnershipGuard;
+
+/// The marker's encoding layout.
+const LAYOUT: &str = "elasticsearch.document.v1";
 
 pub struct ElasticsearchSink {
     id: String,
     pipeline: String,
     required: bool,
     index_template: String,
-    auto_create_index: bool,
     id_fields: Vec<String>,
     id_separator: String,
     version_source: EsVersionSource,
     transport: Arc<dyn EsTransport>,
     resolver: Option<EsSchemaResolver>,
     resolved: RwLock<HashMap<SourceRelationIdentity, Arc<TableColumns>>>,
-    /// Each index holds one source relation (`_id`s are per relation),
-    /// durably bound.
-    guard: crate::destination::DestinationGuard,
-    /// The cluster's UUID (read once per session): part of each index's
-    /// destination name, so the same index name on two clusters is two
-    /// destinations.
-    cluster: tokio::sync::OnceCell<String>,
-    ensured: RwLock<HashSet<String>>,
+    /// The indices this session verified it owns, and their fences.
+    guard: OwnershipGuard,
+    /// The cluster's UUID (read once per session, forgotten on a
+    /// reconnect): part of each index's identity.
+    cluster: Mutex<Option<String>>,
+}
+
+/// An index claimed within one batch: the alias its actions target and the
+/// expectation it was claimed for.
+struct Target {
+    alias: String,
+    expected: Expected,
+}
+
+impl Target {
+    /// Whether `source` is the relation this index was claimed for.
+    fn holds(&self, source: &SourceInfo, ev: &Event) -> bool {
+        let r = &self.expected.relation;
+        r.connector == source.connector
+            && r.source == source.name
+            && r.database == source.db
+            && r.namespace == source.namespace()
+            && r.table == source.table
+            && self.expected.encoding.type_mapping == ev.type_mapping.as_str()
+    }
 }
 
 impl ElasticsearchSink {
@@ -55,12 +83,6 @@ impl ElasticsearchSink {
     /// within the pipeline's database.
     fn source_key(ev: &Event) -> String {
         ev.source.full_table_name()
-    }
-
-    /// True when the sink must know the source schema: for the PK (when no
-    /// `id_fields`) or for the generated mapping (when auto-creating indices).
-    fn needs_schema(&self) -> bool {
-        self.id_fields.is_empty() || self.auto_create_index
     }
 
     /// Resolve (and cache) the source columns + PK for an event's table.
@@ -87,49 +109,76 @@ impl ElasticsearchSink {
         Ok(tc)
     }
 
-    /// The index's durable binding admits the event's relation (verified
-    /// once per session per index, before anything is written to it).
-    async fn verify_destination(
-        &self,
-        index: &str,
-        ev: &Event,
-    ) -> Result<(), SinkError> {
-        let cluster = self
-            .cluster
-            .get_or_try_init(|| async {
-                let v = self.transport.get_json("").await?;
-                v["cluster_uuid"].as_str().map(str::to_string).ok_or_else(|| {
-                    SinkError::Io(std::io::Error::other(
-                        "elasticsearch: the cluster reports no cluster_uuid",
-                    ))
-                })
-            })
-            .await?;
-        let destination = format!("elasticsearch/{cluster}/{index}");
-        let transport = Arc::clone(&self.transport);
-        let index = index.to_string();
-        self.guard
-            .verify(
-                &destination,
-                &SourceRelationIdentity::of(&ev.source),
-                || async move { index_state(transport.as_ref(), &index).await },
-            )
-            .await
+    /// The cluster's UUID, read once per session.
+    async fn cluster(&self) -> Result<String, SinkError> {
+        if let Some(c) = self.cluster.lock().unwrap().clone() {
+            return Ok(c);
+        }
+        let v = self.transport.get_json("").await?;
+        let c = v["cluster_uuid"].as_str().map(str::to_string).ok_or_else(
+            || {
+                SinkError::Io(std::io::Error::other(
+                    "elasticsearch: the cluster reports no cluster_uuid",
+                ))
+            },
+        )?;
+        *self.cluster.lock().unwrap() = Some(c.clone());
+        Ok(c)
     }
 
-    /// Ensure the index exists (once), creating it with a generated mapping.
-    async fn ensure_index(
-        &self,
-        index: &str,
-        cols: &[ColDesc],
-    ) -> Result<(), SinkError> {
-        if self.ensured.read().unwrap().contains(index) {
-            return Ok(());
+    /// What the sink expects `index` to be for `ev`.
+    fn expected(&self, cluster: &str, index: &str, ev: &Event) -> Expected {
+        Expected {
+            owner: self.guard.owner().clone(),
+            relation: RelationMarker::from(&SourceRelationIdentity::of(
+                &ev.source,
+            )),
+            destination: DestinationMarker::elasticsearch(cluster, index),
+            encoding: EncodingMarker {
+                layout: LAYOUT.into(),
+                type_mapping: ev.type_mapping.as_str().into(),
+                mode: None,
+                extensions_column: None,
+            },
         }
-        let mapping = build_mapping(cols);
-        self.transport.ensure_index(index, &mapping).await?;
-        self.ensured.write().unwrap().insert(index.to_string());
-        Ok(())
+    }
+
+    /// The write alias for `ev` into `index`, claiming the index when this
+    /// session has not verified it for exactly this expectation.
+    async fn target(
+        &self,
+        cluster: &str,
+        index: &str,
+        ev: &Event,
+        cols: &TableColumns,
+    ) -> Result<Target, SinkError> {
+        let expected = self.expected(cluster, index, ev);
+        let claimed = self
+            .guard
+            .fence(&expected, || EsDestination {
+                transport: self.transport.as_ref(),
+                index,
+                mapping: build_mapping(&cols.columns),
+            })
+            .await?;
+        Ok(Target {
+            alias: write_alias(&claimed.instance, &claimed.fence),
+            expected,
+        })
+    }
+
+    /// A transport failure may be a reconnect: every verification is
+    /// claimed again before the next write.
+    fn forget_on_transport_error(&self, e: &SinkError) {
+        if matches!(
+            e,
+            SinkError::Connect { .. }
+                | SinkError::Io(_)
+                | SinkError::Backpressure { .. }
+        ) {
+            self.guard.invalidate_all();
+            *self.cluster.lock().unwrap() = None;
+        }
     }
 }
 
@@ -169,10 +218,21 @@ impl Sink for ElasticsearchSink {
         if events.is_empty() {
             return Ok(BatchResult::default());
         }
-        let needs_schema = self.needs_schema();
         let mut actions: Vec<BulkAction> = Vec::with_capacity(events.len());
         let mut action_event_idx: Vec<usize> = Vec::with_capacity(events.len());
         let mut dlq: Vec<(usize, SinkError)> = Vec::new();
+
+        let cluster = match self.cluster().await {
+            Ok(c) => c,
+            Err(e) => {
+                self.forget_on_transport_error(&e);
+                return Err(e);
+            }
+        };
+        // Indices claimed for this batch, by name: the claim itself (and
+        // its cache) is consulted once per index, not per event.
+        let mut targets: HashMap<String, Target> = HashMap::new();
+        let mut action_target: Vec<String> = Vec::with_capacity(events.len());
 
         for (i, ev) in events.iter().enumerate() {
             // Truncate carries no row — not representable as a per-doc op in v1.
@@ -180,21 +240,25 @@ impl Sink for ElasticsearchSink {
                 continue;
             }
 
-            let tc = if needs_schema {
-                // A missing/late schema is transient → replay the whole batch.
-                self.schema_for(ev)?
-            } else {
-                Arc::new(TableColumns {
-                    columns: vec![],
-                    primary_key: vec![],
-                })
-            };
+            // A missing/late schema is transient → replay the whole batch.
+            let tc = self.schema_for(ev)?;
 
             let index = render_index(&self.index_template, ev);
-            if self.auto_create_index {
-                self.ensure_index(&index, &tc.columns).await?;
-            }
-            self.verify_destination(&index, ev).await?;
+            let alias = match targets.get(&index) {
+                Some(t) if t.holds(&ev.source, ev) => t.alias.clone(),
+                _ => {
+                    let t = match self.target(&cluster, &index, ev, &tc).await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            self.forget_on_transport_error(&e);
+                            return Err(e);
+                        }
+                    };
+                    let alias = t.alias.clone();
+                    targets.insert(index.clone(), t);
+                    alias
+                }
+            };
 
             let id = match derive_id(
                 ev,
@@ -237,12 +301,13 @@ impl Sink for ElasticsearchSink {
 
             let version = derive_es_version(ev, self.version_source.clone());
             actions.push(BulkAction {
-                index,
+                index: alias,
                 id,
                 version,
                 doc,
             });
             action_event_idx.push(i);
+            action_target.push(index);
         }
 
         if actions.is_empty() {
@@ -251,13 +316,51 @@ impl Sink for ElasticsearchSink {
 
         let body = build_bulk_body(&actions);
         let start = std::time::Instant::now();
-        let resp = self.transport.bulk(body).await?; // retryable → replay
+        let resp = match self.transport.bulk(body).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.forget_on_transport_error(&e);
+                return Err(e); // retryable → replay
+            }
+        };
         let outcomes = parse_bulk_response(&resp)?;
+
+        // A removed write alias: this session no longer holds the fence.
+        // The whole batch fails (never dead-lettered) and the checkpoint
+        // stays; the next claim decides.
+        if let Some(pos) =
+            outcomes.iter().position(|o| *o == ItemOutcome::Fenced)
+        {
+            let mut refusal = None;
+            for (o, index) in outcomes.iter().zip(&action_target) {
+                if *o == ItemOutcome::Fenced
+                    && let Some(t) = targets.get(index)
+                {
+                    self.guard.invalidate(&t.expected);
+                    refusal.get_or_insert_with(|| {
+                        ownership_refusal(
+                            &self.id,
+                            &t.expected.destination,
+                            &t.expected.relation.identity(),
+                            OwnershipClass::Fenced,
+                            None,
+                            None,
+                        )
+                    });
+                }
+            }
+            return Err(refusal.unwrap_or_else(|| SinkError::Fatal {
+                details: format!("elasticsearch: bulk item {pos} was fenced")
+                    .into(),
+            }));
+        }
 
         let mut applied: u64 = 0;
         for (pos, outcome) in outcomes.into_iter().enumerate() {
             match outcome {
                 ItemOutcome::Ok | ItemOutcome::Superseded => applied += 1,
+                // Refused above, before anything is dead-lettered.
+                ItemOutcome::Fenced => {}
                 ItemOutcome::Failed(msg) => {
                     let orig =
                         action_event_idx.get(pos).copied().unwrap_or(pos);
@@ -288,36 +391,6 @@ impl Sink for ElasticsearchSink {
     }
 }
 
-/// An index's own identity (its UUID) and whether it holds documents.
-async fn index_state(
-    transport: &dyn EsTransport,
-    index: &str,
-) -> Result<crate::destination::TargetState, SinkError> {
-    let settings = transport
-        .get_json(&format!("{index}/_settings/index.uuid"))
-        .await?;
-    // Keyed by the concrete index name (an alias resolves to one index).
-    let uid = settings
-        .as_object()
-        .and_then(|o| {
-            let mut uids = o
-                .values()
-                .filter_map(|v| v["settings"]["index"]["uuid"].as_str());
-            let first = uids.next()?;
-            uids.next().is_none().then(|| first.to_string())
-        })
-        .ok_or_else(|| {
-            SinkError::Io(std::io::Error::other(format!(
-                "elasticsearch: {index} is not exactly one index with a uuid"
-            )))
-        })?;
-    let count = transport.get_json(&format!("{index}/_count")).await?;
-    Ok(crate::destination::TargetState {
-        uid,
-        has_rows: count["count"].as_u64().unwrap_or(1) > 0,
-    })
-}
-
 /// Build an `ElasticsearchSink` from config. `resolver` supplies source-table
 /// columns + PK (built by the runner).
 pub fn build_elasticsearch_sink(
@@ -325,21 +398,20 @@ pub fn build_elasticsearch_sink(
     _cancel: CancellationToken,
     pipeline: &str,
     resolver: Option<EsSchemaResolver>,
-    bindings: Arc<dyn deltaforge_core::destination::DestinationBindingStore>,
+    ownership: &crate::SinkOwnership,
     creds: &crate::ResolvedSinkCreds,
 ) -> anyhow::Result<ElasticsearchSink> {
+    validate_elasticsearch_cfg(cfg)?;
     // Expand ${ENV} in the URL. Auth is resolved (references win over inline).
     let mut expanded = cfg.clone();
     expanded.url = shellexpand::env(&cfg.url)?.into_owned();
     let auth = super::client::resolve_es_auth(&cfg.auth, creds)?;
 
-    let needs_schema = cfg.id_fields.is_empty() || cfg.auto_create_index;
-    if resolver.is_none() && needs_schema {
+    if resolver.is_none() {
         warn!(
             sink = %cfg.id,
-            "elasticsearch sink built without a schema resolver — projection \
-             will fail until one is provided (set id_fields and auto_create_index: \
-             false to run without a resolver)"
+            "elasticsearch sink built without a schema resolver — index \
+             creation and projection will fail until one is provided"
         );
     }
 
@@ -349,79 +421,256 @@ pub fn build_elasticsearch_sink(
         pipeline: pipeline.to_string(),
         required: cfg.required.unwrap_or(true),
         index_template: cfg.index.clone(),
-        auto_create_index: cfg.auto_create_index,
         id_fields: cfg.id_fields.clone(),
         id_separator: cfg.id_separator.clone(),
         version_source: cfg.version_source.clone(),
         transport: Arc::new(client),
         resolver,
         resolved: RwLock::new(HashMap::new()),
-        guard: crate::destination::DestinationGuard::new(&cfg.id, bindings),
-        cluster: Default::default(),
-        ensured: RwLock::new(HashSet::new()),
+        guard: ownership.guard(pipeline, &cfg.id),
+        cluster: Mutex::new(None),
     })
+}
+
+/// The sink writes only to indices it created and owns: an index it did
+/// not create can never be accepted, so `auto_create_index: false` is
+/// refused.
+pub fn validate_elasticsearch_cfg(
+    cfg: &ElasticsearchSinkCfg,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        cfg.auto_create_index,
+        "elasticsearch sink {}: auto_create_index: false is not supported: the \
+         sink writes only to indices it creates (with its ownership marker \
+         and fenced write alias); remove the setting",
+        cfg.id
+    );
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::clickhouse::types::ColDesc;
+    use crate::elasticsearch::ownership::{ALIAS_PREFIX, AUTO_CREATE_SETTINGS};
     use crate::elasticsearch::test_support::mk_event;
     use serde_json::{Value, json};
-    use std::sync::Mutex;
+    use std::collections::BTreeSet;
 
-    /// Capturing fake transport.
-    struct FakeTransport {
-        ensure_calls: Mutex<Vec<(String, Value)>>,
-        bulk_bodies: Mutex<Vec<Vec<u8>>>,
-        response: Value,
-        bulk_err: bool,
+    /// One index of [`MiniEs`].
+    #[derive(Clone, Default)]
+    struct Index {
+        meta: Value,
+        aliases: BTreeSet<String>,
     }
 
-    impl FakeTransport {
-        fn new(response: Value) -> Self {
-            Self {
-                ensure_calls: Mutex::new(vec![]),
+    /// An in-memory Elasticsearch enforcing what fencing relies on: atomic
+    /// creation, alias compare-and-swap (`must_exist`), `require_alias` for
+    /// index actions and the auto-create rule for deletes.
+    struct MiniEs {
+        auto_create: Mutex<String>,
+        settings_status: Mutex<u16>,
+        indices: Mutex<HashMap<String, Index>>,
+        /// Every remote call, as `METHOD path`.
+        calls: Mutex<Vec<String>>,
+        bulk_bodies: Mutex<Vec<Vec<u8>>>,
+        /// Replaces the per-item answers of the next bulk request.
+        items: Mutex<Option<Value>>,
+        bulk_err: Mutex<bool>,
+    }
+
+    impl MiniEs {
+        fn new() -> Arc<Self> {
+            Arc::new(MiniEs {
+                auto_create: Mutex::new("-df-w-*,+*".into()),
+                settings_status: Mutex::new(200),
+                indices: Mutex::new(HashMap::new()),
+                calls: Mutex::new(vec![]),
                 bulk_bodies: Mutex::new(vec![]),
-                response,
-                bulk_err: false,
+                items: Mutex::new(None),
+                bulk_err: Mutex::new(false),
+            })
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn concrete(&self, name: &str) -> Option<String> {
+            let ix = self.indices.lock().unwrap();
+            if ix.contains_key(name) {
+                return Some(name.into());
             }
+            ix.iter()
+                .find(|(_, i)| i.aliases.contains(name))
+                .map(|(n, _)| n.clone())
+        }
+
+        /// Rotate the internal alias of `index` to another fence (another
+        /// claimer, for example a clone of the state store).
+        fn steal(&self, index: &str) {
+            let mut ix = self.indices.lock().unwrap();
+            let i = ix.get_mut(index).unwrap();
+            let old: Vec<_> = i
+                .aliases
+                .iter()
+                .filter(|a| a.starts_with(ALIAS_PREFIX))
+                .cloned()
+                .collect();
+            let instance = i.meta["deltaforge"]["instance"].as_str().unwrap();
+            for a in old {
+                i.aliases.remove(&a);
+            }
+            i.aliases.insert(write_alias(
+                instance,
+                &deltaforge_core::ownership::random_token(),
+            ));
         }
     }
 
     #[async_trait]
-    impl EsTransport for FakeTransport {
+    impl EsTransport for MiniEs {
         async fn bulk(&self, body: Vec<u8>) -> Result<Vec<u8>, SinkError> {
-            self.bulk_bodies.lock().unwrap().push(body);
-            if self.bulk_err {
-                return Err(SinkError::Backpressure {
+            self.calls.lock().unwrap().push("POST _bulk".into());
+            self.bulk_bodies.lock().unwrap().push(body.clone());
+            if *self.bulk_err.lock().unwrap() {
+                return Err(SinkError::Connect {
                     details: "down".into(),
                 });
             }
-            Ok(self.response.to_string().into_bytes())
+            if let Some(items) = self.items.lock().unwrap().take() {
+                return Ok(json!({"errors": true, "items": items})
+                    .to_string()
+                    .into_bytes());
+            }
+            let text = String::from_utf8(body).unwrap();
+            let mut lines = text.lines();
+            let mut items = vec![];
+            while let Some(line) = lines.next() {
+                let meta: Value = serde_json::from_str(line).unwrap();
+                let (op, a) = meta.as_object().unwrap().iter().next().unwrap();
+                if op == "index" {
+                    lines.next();
+                }
+                let target = a["_index"].as_str().unwrap();
+                let item = match self.concrete(target) {
+                    // require_alias: the target must be an alias.
+                    Some(c) if c != target => {
+                        json!({op: {"_index": c, "status": 200}})
+                    }
+                    _ => {
+                        let forbidden = crate::elasticsearch::ownership::rules_forbid_prefix(
+                            &self.auto_create.lock().unwrap(),
+                            ALIAS_PREFIX,
+                        )
+                        .is_ok();
+                        if op == "delete" && !forbidden {
+                            // Auto-created, as a real cluster would.
+                            self.indices
+                                .lock()
+                                .unwrap()
+                                .insert(target.into(), Index::default());
+                            json!({op: {"_index": target, "status": 404, "result": "not_found"}})
+                        } else {
+                            json!({op: {"_index": target, "status": 404,
+                                "error": {"type": "index_not_found_exception"}}})
+                        }
+                    }
+                };
+                items.push(item);
+            }
+            Ok(json!({"errors": false, "items": items})
+                .to_string()
+                .into_bytes())
         }
-        async fn ensure_index(
+
+        async fn send_json(
             &self,
-            index: &str,
-            mapping: &Value,
-        ) -> Result<(), SinkError> {
-            self.ensure_calls
-                .lock()
-                .unwrap()
-                .push((index.to_string(), mapping.clone()));
-            Ok(())
-        }
-        /// One cluster; every index has a UUID; documents after any bulk.
-        async fn get_json(&self, path: &str) -> Result<Value, SinkError> {
-            if path.is_empty() {
-                return Ok(json!({"cluster_uuid": "c1"}));
+            method: reqwest::Method,
+            path: &str,
+            body: Option<&Value>,
+        ) -> Result<(u16, Value), SinkError> {
+            // Lets concurrent claims interleave between their requests.
+            tokio::task::yield_now().await;
+            self.calls.lock().unwrap().push(format!("{method} {path}"));
+            if path == AUTO_CREATE_SETTINGS {
+                let status = *self.settings_status.lock().unwrap();
+                return Ok((
+                    status,
+                    json!({"persistent": {"action": {"auto_create_index": *self.auto_create.lock().unwrap()}}}),
+                ));
             }
-            if let Some(index) = path.strip_suffix("/_settings/index.uuid") {
-                return Ok(
-                    json!({ index: {"settings": {"index": {"uuid": format!("u-{index}")}}}}),
+            if method == reqwest::Method::POST && path == "_aliases" {
+                let actions = body.unwrap()["actions"].as_array().unwrap();
+                let mut ix = self.indices.lock().unwrap();
+                let remove = &actions[0]["remove"];
+                let add = &actions[1]["add"];
+                let index =
+                    ix.get_mut(remove["index"].as_str().unwrap()).unwrap();
+                let old = remove["alias"].as_str().unwrap();
+                // Like the cluster: a missing alias fails the request only
+                // with `must_exist`.
+                if !index.aliases.contains(old) && remove["must_exist"] == true
+                {
+                    return Ok((
+                        404,
+                        json!({"error": {"type": "aliases_not_found_exception"}}),
+                    ));
+                }
+                index.aliases.remove(old);
+                index.aliases.insert(add["alias"].as_str().unwrap().into());
+                return Ok((200, json!({"acknowledged": true})));
+            }
+            let name = path.split('?').next().unwrap();
+            if method == reqwest::Method::PUT {
+                let mut ix = self.indices.lock().unwrap();
+                if ix.contains_key(name) {
+                    return Ok((
+                        400,
+                        json!({"error": {"type": "resource_already_exists_exception"}}),
+                    ));
+                }
+                let b = body.unwrap();
+                ix.insert(
+                    name.into(),
+                    Index {
+                        meta: b["mappings"]["_meta"].clone(),
+                        aliases: b["aliases"]
+                            .as_object()
+                            .unwrap()
+                            .keys()
+                            .cloned()
+                            .collect(),
+                    },
                 );
+                return Ok((200, json!({"acknowledged": true})));
             }
-            Ok(json!({"count": self.bulk_bodies.lock().unwrap().len()}))
+            // GET <name>: keyed by the concrete index.
+            match self.concrete(name) {
+                None => Ok((
+                    404,
+                    json!({"error": {"type": "index_not_found_exception"}}),
+                )),
+                Some(c) => {
+                    let i = self.indices.lock().unwrap()[&c].clone();
+                    let aliases: serde_json::Map<String, Value> = i
+                        .aliases
+                        .iter()
+                        .map(|a| (a.clone(), json!({})))
+                        .collect();
+                    Ok((
+                        200,
+                        json!({ c: {"aliases": aliases, "mappings": {"_meta": i.meta},
+                            "settings": {"index": {"uuid": "u"}}}}),
+                    ))
+                }
+            }
+        }
+
+        async fn get_json(&self, path: &str) -> Result<Value, SinkError> {
+            self.calls.lock().unwrap().push(format!("GET {path}"));
+            assert!(path.is_empty(), "only the cluster root is read: {path}");
+            Ok(json!({"cluster_uuid": "c1"}))
         }
     }
 
@@ -455,62 +704,57 @@ mod tests {
         })
     }
 
-    fn sink_with(fake: Arc<FakeTransport>) -> ElasticsearchSink {
-        sink_over(
-            fake,
-            Arc::new(deltaforge_core::destination::MemoryDestinationBindings::default()),
-        )
-    }
-
     fn sink_over(
-        fake: Arc<FakeTransport>,
-        store: Arc<dyn deltaforge_core::destination::DestinationBindingStore>,
+        es: Arc<MiniEs>,
+        ownership: &crate::SinkOwnership,
     ) -> ElasticsearchSink {
         ElasticsearchSink {
             id: "es".into(),
             pipeline: "p".into(),
             required: true,
             index_template: "cdc-{db}.{table}".into(),
-            auto_create_index: true,
             id_fields: vec![],
             id_separator: "_".into(),
             version_source: EsVersionSource::TsMs,
-            transport: fake,
+            transport: es,
             resolver: Some(resolver()),
             resolved: RwLock::new(HashMap::new()),
-            guard: crate::destination::DestinationGuard::new("es", store),
-            cluster: Default::default(),
-            ensured: RwLock::new(HashSet::new()),
+            guard: ownership.guard("p", "es"),
+            cluster: Mutex::new(None),
         }
+    }
+
+    fn sink_with(es: Arc<MiniEs>) -> ElasticsearchSink {
+        sink_over(es, &crate::SinkOwnership::ephemeral())
     }
 
     fn ev(op: Op, after: Value, before: Value, ts: i64) -> Event {
         mk_event(op, after, before, "orders", None, "customers", ts, None)
     }
 
-    /// Count `_bulk` action metas by type in a recorded body.
-    fn count_actions(body: &[u8]) -> (usize, usize) {
-        let s = String::from_utf8(body.to_vec()).unwrap();
-        let mut idx = 0;
-        let mut del = 0;
-        for line in s.lines() {
-            let v: Value = serde_json::from_str(line).unwrap();
-            if v.get("index").and_then(|a| a.get("_id")).is_some() {
-                idx += 1;
-            } else if v.get("delete").and_then(|a| a.get("_id")).is_some() {
-                del += 1;
-            }
-        }
-        (idx, del)
+    fn class(e: &SinkError) -> Option<String> {
+        e.draft()
+            .and_then(|d| d.discriminator.get("class").cloned())
+    }
+
+    /// The `_index` of every action in a recorded bulk body.
+    fn targets(body: &[u8]) -> Vec<String> {
+        String::from_utf8(body.to_vec())
+            .unwrap()
+            .lines()
+            .filter_map(|l| {
+                let v: Value = serde_json::from_str(l).unwrap();
+                ["index", "delete"]
+                    .iter()
+                    .find_map(|op| v[op]["_index"].as_str().map(str::to_string))
+            })
+            .collect()
     }
 
     #[tokio::test]
-    async fn builds_actions_and_ensures_index_once() {
-        let fake = Arc::new(FakeTransport::new(json!({
-            "errors": false,
-            "items": [{"index": {"status": 200}}, {"index": {"status": 200}}, {"delete": {"status": 200}}]
-        })));
-        let sink = sink_with(fake.clone());
+    async fn creates_the_index_with_its_marker_and_writes_through_the_alias() {
+        let es = MiniEs::new();
+        let sink = sink_with(es.clone());
         let batch = vec![
             ev(
                 Op::Create,
@@ -529,31 +773,45 @@ mod tests {
         let res = sink.send_batch(&batch).await.unwrap();
         assert!(res.dlq_failures.is_empty(), "{:?}", res.dlq_failures);
 
-        // ensure_index called exactly once, with a typed mapping (scaled_float).
-        let calls = fake.ensure_calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "cdc-orders.customers");
-        assert_eq!(calls[0].1["properties"]["amount"]["type"], "scaled_float");
-        assert_eq!(calls[0].1["properties"]["id"]["type"], "long");
-
-        // one bulk request: 2 index actions + 1 delete action.
-        let bodies = fake.bulk_bodies.lock().unwrap();
-        assert_eq!(bodies.len(), 1);
-        assert_eq!(count_actions(&bodies[0]), (2, 1));
+        let ix = es.indices.lock().unwrap()["cdc-orders.customers"].clone();
+        let marker = &ix.meta["deltaforge"];
+        assert_eq!(marker["format"], "deltaforge.destination-owner");
+        assert_eq!(marker["version"], 1);
+        assert_eq!(marker["owner"]["sink"], "es");
+        assert_eq!(marker["relation"]["table"], "customers");
+        assert_eq!(marker["destination"]["cluster"], "c1");
+        assert!(marker.get("fence").is_none(), "no fence in the marker");
+        let alias = ix.aliases.iter().next().unwrap().clone();
+        assert!(alias.starts_with("df-w-"));
+        // Every action (deletes too) targets the fenced alias.
+        let bodies = es.bulk_bodies.lock().unwrap();
+        assert_eq!(targets(&bodies[0]), vec![alias.clone(); 3]);
     }
 
-    /// Two schemas' same-named tables rendered into one index: the second
-    /// relation is refused before any bulk request, also after a restart in
-    /// which it comes first, naming both relations.
+    #[tokio::test]
+    async fn the_steady_state_makes_no_ownership_request() {
+        let es = MiniEs::new();
+        let sink = sink_with(es.clone());
+        for ts in 1..=20 {
+            sink.send_batch(&[ev(
+                Op::Create,
+                json!({"id": ts}),
+                json!(null),
+                ts,
+            )])
+            .await
+            .unwrap();
+        }
+        let calls = es.calls();
+        let bulks = calls.iter().filter(|c| *c == "POST _bulk").count();
+        assert_eq!(bulks, 20);
+        assert_eq!(calls.len() - bulks, 4, "one claim only: {calls:?}");
+    }
+
     #[tokio::test]
     async fn an_index_holds_one_relation_across_restarts() {
-        let ok =
-            json!({"errors": false, "items": [{"index": {"status": 200}}]});
-        let store: Arc<
-            dyn deltaforge_core::destination::DestinationBindingStore,
-        > = Arc::new(
-            deltaforge_core::destination::MemoryDestinationBindings::default(),
-        );
+        let es = MiniEs::new();
+        let ownership = crate::SinkOwnership::ephemeral();
         let row = |schema: &str| {
             mk_event(
                 Op::Create,
@@ -566,30 +824,21 @@ mod tests {
                 None,
             )
         };
-        let mut sink = sink_over(
-            Arc::new(FakeTransport::new(ok.clone())),
-            Arc::clone(&store),
-        );
+        let mut sink = sink_over(es.clone(), &ownership);
         sink.index_template = "cdc-{table}".into();
         sink.send_batch(&[row("a")]).await.unwrap();
 
-        let fake = Arc::new(FakeTransport::new(ok.clone()));
-        let mut restarted = sink_over(fake.clone(), Arc::clone(&store));
+        let mut restarted = sink_over(es.clone(), &ownership);
         restarted.index_template = "cdc-{table}".into();
+        let before = es.bulk_bodies.lock().unwrap().len();
         let e = restarted.send_batch(&[row("b")]).await.unwrap_err();
-        let d = e.draft().expect("an incident");
-        assert_eq!(
-            d.reason_code,
-            deltaforge_core::incident::ReasonCode::SinkDestinationConflict
-        );
+        assert_eq!(class(&e).as_deref(), Some("bound_to_another_relation"));
         let text = format!("{e:?}");
-        assert!(
-            text.contains("shop/a/orders") && text.contains("shop/b/orders"),
-            "{text}"
-        );
+        assert!(text.contains("shop/b/orders"), "{text}");
         assert!(!text.contains("1.00"), "no row data: {text}");
-        assert!(
-            fake.bulk_bodies.lock().unwrap().is_empty(),
+        assert_eq!(
+            es.bulk_bodies.lock().unwrap().len(),
+            before,
             "nothing delivered"
         );
         // The bound relation still writes after the restart.
@@ -597,44 +846,283 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_fenced_batch_fails_whole_and_never_reaches_the_dlq() {
+        let es = MiniEs::new();
+        let ownership = crate::SinkOwnership::ephemeral();
+        let sink = sink_over(es.clone(), &ownership);
+        sink.send_batch(&[ev(Op::Create, json!({"id": 1}), json!(null), 1)])
+            .await
+            .unwrap();
+        // Another claimer (a clone of the store) rotated the fence.
+        es.steal("cdc-orders.customers");
+        let batch = vec![
+            ev(Op::Create, json!({"id": 2}), json!(null), 2),
+            ev(Op::Delete, json!(null), json!({"id": 1}), 3),
+        ];
+        let e = sink.send_batch(&batch).await.unwrap_err();
+        assert_eq!(class(&e).as_deref(), Some("fenced"), "{e:?}");
+        // The next attempt claims again and is refused: the store's fence is
+        // not the destination's.
+        let e = sink.send_batch(&batch).await.unwrap_err();
+        assert_eq!(class(&e).as_deref(), Some("fenced"));
+        assert!(
+            !es.indices
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|k| k.starts_with("df-w-")),
+            "no index was auto-created"
+        );
+    }
+
+    /// Two copies of one state store claiming at once: whichever loses
+    /// the alias compare-and-swap is refused, and at most one of them can
+    /// write afterwards.
+    #[tokio::test]
+    async fn concurrently_claiming_copies_never_both_write() {
+        for _ in 0..20 {
+            let es = MiniEs::new();
+            let store = Arc::new(
+                deltaforge_core::ownership::MemoryOwnershipStore::default(),
+            );
+            let original = crate::SinkOwnership {
+                deployment: deltaforge_core::ownership::random_token(),
+                store: store.clone(),
+            };
+            sink_over(es.clone(), &original)
+                .send_batch(&[ev(Op::Create, json!({"id": 1}), json!(null), 1)])
+                .await
+                .unwrap();
+            let copy = crate::SinkOwnership {
+                deployment: original.deployment.clone(),
+                store: Arc::new(store.copy()),
+            };
+            let (a, b) = (
+                sink_over(es.clone(), &original),
+                sink_over(es.clone(), &copy),
+            );
+            let batch = [ev(Op::Create, json!({"id": 2}), json!(null), 2)];
+            let _ = tokio::join!(a.send_batch(&batch), b.send_batch(&batch));
+            let (ra, rb) =
+                tokio::join!(a.send_batch(&batch), b.send_batch(&batch));
+            assert!(
+                !(ra.is_ok() && rb.is_ok()),
+                "both copies kept writing; aliases: {:?}",
+                es.indices.lock().unwrap()["cdc-orders.customers"].aliases
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unenforced_or_unreadable_delete_fencing_is_refused() {
+        for (rule, status) in [("+*", 200), ("true", 200), ("-df-w-*,+*", 403)]
+        {
+            let es = MiniEs::new();
+            *es.auto_create.lock().unwrap() = rule.into();
+            *es.settings_status.lock().unwrap() = status;
+            let e = sink_with(es.clone())
+                .send_batch(&[ev(Op::Create, json!({"id": 1}), json!(null), 1)])
+                .await
+                .unwrap_err();
+            assert_eq!(
+                class(&e).as_deref(),
+                Some("fencing_unenforced"),
+                "{rule} {status}"
+            );
+            assert!(es.indices.lock().unwrap().is_empty(), "nothing created");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_alias_in_place_of_an_index_is_refused() {
+        let es = MiniEs::new();
+        let mut ix = Index::default();
+        ix.aliases.insert("cdc-orders.customers".into());
+        es.indices.lock().unwrap().insert("real-index".into(), ix);
+        let e = sink_with(es)
+            .send_batch(&[ev(Op::Create, json!({"id": 1}), json!(null), 1)])
+            .await
+            .unwrap_err();
+        assert_eq!(class(&e).as_deref(), Some("alias_not_supported"));
+    }
+
+    #[tokio::test]
+    async fn an_unmarked_or_foreign_index_is_refused() {
+        let es = MiniEs::new();
+        es.indices
+            .lock()
+            .unwrap()
+            .insert("cdc-orders.customers".into(), Index::default());
+        let e = sink_with(es.clone())
+            .send_batch(&[ev(Op::Create, json!({"id": 1}), json!(null), 1)])
+            .await
+            .unwrap_err();
+        assert_eq!(class(&e).as_deref(), Some("marker_missing"));
+        // Created by another deployment.
+        es.indices.lock().unwrap().clear();
+        sink_with(es.clone())
+            .send_batch(&[ev(Op::Create, json!({"id": 1}), json!(null), 1)])
+            .await
+            .unwrap();
+        let e = sink_with(es.clone())
+            .send_batch(&[ev(Op::Create, json!({"id": 1}), json!(null), 1)])
+            .await
+            .unwrap_err();
+        assert_eq!(class(&e).as_deref(), Some("owned_by_other"));
+        assert!(!format!("{e:?}").contains(r#""deployment""#));
+    }
+
+    #[tokio::test]
+    async fn zero_or_several_internal_aliases_are_refused() {
+        let es = MiniEs::new();
+        let ownership = crate::SinkOwnership::ephemeral();
+        sink_over(es.clone(), &ownership)
+            .send_batch(&[ev(Op::Create, json!({"id": 1}), json!(null), 1)])
+            .await
+            .unwrap();
+        let name = "cdc-orders.customers";
+        let alias = es.indices.lock().unwrap()[name]
+            .aliases
+            .iter()
+            .next()
+            .unwrap()
+            .clone();
+        let extra = write_alias(
+            es.indices.lock().unwrap()[name].meta["deltaforge"]["instance"]
+                .as_str()
+                .unwrap(),
+            &deltaforge_core::ownership::random_token(),
+        );
+        es.indices
+            .lock()
+            .unwrap()
+            .get_mut(name)
+            .unwrap()
+            .aliases
+            .insert(extra);
+        let e = sink_over(es.clone(), &ownership)
+            .send_batch(&[ev(Op::Create, json!({"id": 1}), json!(null), 1)])
+            .await
+            .unwrap_err();
+        assert_eq!(class(&e).as_deref(), Some("fence_malformed"));
+        es.indices
+            .lock()
+            .unwrap()
+            .get_mut(name)
+            .unwrap()
+            .aliases
+            .clear();
+        let e = sink_over(es.clone(), &ownership)
+            .send_batch(&[ev(Op::Create, json!({"id": 1}), json!(null), 1)])
+            .await
+            .unwrap_err();
+        assert_eq!(class(&e).as_deref(), Some("fence_malformed"));
+        let _ = alias;
+    }
+
+    #[tokio::test]
+    async fn user_aliases_and_metadata_survive_claims() {
+        let es = MiniEs::new();
+        let ownership = crate::SinkOwnership::ephemeral();
+        sink_over(es.clone(), &ownership)
+            .send_batch(&[ev(Op::Create, json!({"id": 1}), json!(null), 1)])
+            .await
+            .unwrap();
+        let name = "cdc-orders.customers";
+        {
+            let mut ix = es.indices.lock().unwrap();
+            let i = ix.get_mut(name).unwrap();
+            i.aliases.insert("orders-read".into());
+            i.meta["user_tool"] = json!({"owner": "team-x"});
+        }
+        for _ in 0..3 {
+            sink_over(es.clone(), &ownership)
+                .send_batch(&[ev(Op::Create, json!({"id": 1}), json!(null), 1)])
+                .await
+                .unwrap();
+        }
+        let i = es.indices.lock().unwrap()[name].clone();
+        assert!(i.aliases.contains("orders-read"));
+        assert_eq!(i.meta["user_tool"]["owner"], "team-x");
+        assert_eq!(
+            i.aliases.iter().filter(|a| a.starts_with("df-w-")).count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_index_is_neither_recreated_nor_auto_created() {
+        let es = MiniEs::new();
+        let ownership = crate::SinkOwnership::ephemeral();
+        let sink = sink_over(es.clone(), &ownership);
+        sink.send_batch(&[ev(Op::Create, json!({"id": 1}), json!(null), 1)])
+            .await
+            .unwrap();
+        es.indices.lock().unwrap().clear();
+        // The verified session writes through its alias: refused, nothing
+        // auto-created.
+        let e = sink
+            .send_batch(&[ev(Op::Delete, json!(null), json!({"id": 1}), 2)])
+            .await
+            .unwrap_err();
+        assert_eq!(class(&e).as_deref(), Some("fenced"));
+        assert!(es.indices.lock().unwrap().is_empty());
+        // A restart claims: the destination it created is gone.
+        let e = sink_over(es.clone(), &ownership)
+            .send_batch(&[ev(Op::Create, json!({"id": 1}), json!(null), 3)])
+            .await
+            .unwrap_err();
+        assert_eq!(class(&e).as_deref(), Some("destination_missing"));
+        assert!(es.indices.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_transport_failure_reclaims_before_the_next_write() {
+        let es = MiniEs::new();
+        let sink = sink_with(es.clone());
+        sink.send_batch(&[ev(Op::Create, json!({"id": 1}), json!(null), 1)])
+            .await
+            .unwrap();
+        *es.bulk_err.lock().unwrap() = true;
+        let e = sink
+            .send_batch(&[ev(Op::Create, json!({"id": 2}), json!(null), 2)])
+            .await
+            .unwrap_err();
+        assert!(matches!(e, SinkError::Connect { .. }));
+        *es.bulk_err.lock().unwrap() = false;
+        let n = es.calls().len();
+        sink.send_batch(&[ev(Op::Create, json!({"id": 2}), json!(null), 3)])
+            .await
+            .unwrap();
+        let calls = es.calls()[n..].to_vec();
+        assert!(
+            calls.iter().any(|c| c == "POST _aliases"),
+            "rotated: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn version_conflict_is_success_and_mapper_error_dlqs() {
-        let fake = Arc::new(FakeTransport::new(json!({
-            "errors": true,
-            "items": [
-                {"index": {"status": 200}},
-                {"index": {"status": 409, "error": {"type": "version_conflict_engine_exception"}}},
-                {"index": {"status": 400, "error": {"type": "mapper_parsing_exception", "reason": "bad"}}}
-            ]
-        })));
-        let sink = sink_with(fake);
+        let es = MiniEs::new();
+        let sink = sink_with(es.clone());
         let batch = vec![
             ev(Op::Create, json!({"id": 1}), json!(null), 1),
             ev(Op::Update, json!({"id": 2}), json!(null), 2),
             ev(Op::Update, json!({"id": 3}), json!(null), 3),
         ];
+        *es.items.lock().unwrap() = Some(json!([
+            {"index": {"status": 200}},
+            {"index": {"status": 409, "error": {"type": "version_conflict_engine_exception"}}},
+            {"index": {"status": 400, "error": {"type": "mapper_parsing_exception", "reason": "bad"}}}
+        ]));
         let res = sink.send_batch(&batch).await.unwrap();
         assert_eq!(res.dlq_failures.len(), 1, "only the 400 item fails");
         assert_eq!(res.dlq_failures[0].0, 2, "third event (index 2) failed");
     }
 
     #[tokio::test]
-    async fn retryable_bulk_error_returns_err_for_replay() {
-        let mut ft = FakeTransport::new(json!({"items": []}));
-        ft.bulk_err = true;
-        let fake = Arc::new(ft);
-        let sink = sink_with(fake);
-        let batch = vec![ev(Op::Create, json!({"id": 1}), json!(null), 1)];
-        let err = sink.send_batch(&batch).await.unwrap_err();
-        assert!(matches!(err, SinkError::Backpressure { .. }));
-    }
-
-    #[tokio::test]
     async fn bad_id_row_goes_to_dlq_without_failing_batch() {
-        let fake = Arc::new(FakeTransport::new(json!({
-            "errors": false,
-            "items": [{"index": {"status": 200}}]
-        })));
-        let sink = sink_with(fake);
+        let sink = sink_with(MiniEs::new());
         // Second event's row is missing the `id` PK field → DLQ, first still sent.
         let batch = vec![
             ev(Op::Create, json!({"id": 1}), json!(null), 1),
@@ -643,5 +1131,20 @@ mod tests {
         let res = sink.send_batch(&batch).await.unwrap();
         assert_eq!(res.dlq_failures.len(), 1);
         assert_eq!(res.dlq_failures[0].0, 1);
+    }
+
+    #[test]
+    fn auto_create_index_false_is_rejected_at_configuration() {
+        let mut cfg: ElasticsearchSinkCfg = serde_json::from_value(json!({
+            "id": "es", "url": "http://es:9200", "index": "t"
+        }))
+        .unwrap();
+        assert!(validate_elasticsearch_cfg(&cfg).is_ok());
+        cfg.auto_create_index = false;
+        let e = validate_elasticsearch_cfg(&cfg).unwrap_err().to_string();
+        assert!(
+            e.contains("auto_create_index: false is not supported"),
+            "{e}"
+        );
     }
 }

@@ -442,6 +442,8 @@ pub enum EvidenceKey {
     Relation,
     /// The relation a destination is bound to.
     BoundRelation,
+    /// A digest of a destination's owner identity.
+    Owner,
     /// A message's payload size, in bytes.
     MessageBytes,
     /// A configured message size limit, in bytes.
@@ -493,6 +495,7 @@ impl EvidenceKey {
             Self::Destination => "destination",
             Self::Relation => "relation",
             Self::BoundRelation => "bound_relation",
+            Self::Owner => "owner",
             Self::MessageBytes => "message_bytes",
             Self::MessageLimit => "message_limit",
         }
@@ -893,14 +896,14 @@ pub fn explain(
         ),
         ReasonCode::SinkDestinationConflict => format!(
             "{component} refused to write source table {} to destination {} \
-             ({}; bound to {}). Nothing of the batch was delivered and the \
-             sink's checkpoint was not advanced. Give each source table its \
-             own destination, or bind a replaced destination again, then \
-             restart the pipeline.",
+             ({}). The batch was not acknowledged and the sink's checkpoint \
+             was not advanced. The destination is owned by the sink that \
+             created it (see the sink's destination ownership \
+             documentation); resolve the condition, then restart the \
+             pipeline.",
             ev.show(K::Relation),
             ev.show(K::Destination),
             ev.show(K::ReasonClass),
-            ev.show(K::BoundRelation),
         ),
         ReasonCode::SinkSchemaRejected => format!(
             "{component}'s schema registry rejected the schema for subject {} \

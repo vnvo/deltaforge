@@ -26,7 +26,7 @@ sinks:
 | `id` | yes | — | Unique sink identifier |
 | `url` | yes | — | Elasticsearch HTTP(S) endpoint (`${ENV}` supported) |
 | `index` | yes | — | Index name or template — `{db}`, `{schema}`, `{table}` |
-| `auto_create_index` | no | `true` | Create each index with a generated mapping on first use |
+| `auto_create_index` | no | `true` | Must be `true`: the sink writes only to indices it creates (see [Destination ownership](#destination-ownership-and-fencing)); `false` is rejected |
 | `id_fields` | no | `[]` | Fields forming `_id`; empty → source primary key |
 | `id_separator` | no | `_` | Separator joining composite `_id` values |
 | `version_source` | no | `source_position` | External `version`: `source_position` (LSN/binlog) or `ts_ms` |
@@ -114,23 +114,72 @@ batch and the `required` policy is honored.
 End-to-end exactly-once is **not** claimed — Elasticsearch writes are not
 transactional with the DeltaForge checkpoint.
 
-## One source table per index
+## Destination ownership and fencing
 
-Documents are keyed by their source table's primary key, so an index holds one source table: rows of two tables in one index would overwrite each other's documents. Give each source table its own index (an `index` template with `{schema}` and `{table}`, or `{db}` when several databases share a cluster). Each index (identified by the cluster's `cluster_uuid` and the index name) is bound to the first source table written to it (its full identity: connector, pipeline, database, schema, table). The binding lives in DeltaForge's state store and is made atomically, so it survives restarts and concurrent pipelines sharing that store agree on one source table. Before a sink first writes to a destination after a start, it checks:
+Documents are keyed by their source table's primary key, so an index holds one source table. Give each source table its own index (an `index` template with `{schema}` and `{table}`, or `{db}` when several databases share a cluster).
 
-- the destination is bound to this source table (an unbound, empty destination is bound now);
-- it is the same index it was bound as (its UUID): one dropped and recreated is refused as replaced;
-- an unbound destination that already holds documents is refused (data from elsewhere, or a removed binding).
+**The sink writes only to indices it creates.** The index is created in one request, with:
 
-A refusal is the `sink_destination_conflict` incident: nothing of the batch is written, the checkpoint stays, and the incident names the destination and both source tables (never row data). Bindings are per state store: deployments with separate state stores writing to one destination are not coordinated.
+- an immutable ownership marker in `mappings._meta.deltaforge`, naming:
+  - the owner (the deployment, which is the state store's identity, plus the pipeline and the sink);
+  - the source table (connector, source, database, schema, table);
+  - the index (the cluster's `cluster_uuid` and the index name);
+  - the encoding;
+  - a random instance;
+- the internal write alias `df-w-<instance>-<fence>`.
+
+Every bulk action (index and delete) targets that alias, with `require_alias=true`. An index the sink did not create is refused, with no adoption, as is a name that is an alias or a data stream.
+
+**Claims.** Before a session first writes to an index, and again after a reconnect or a client recreation, the sink *claims* it:
+
+1. It proves the marker and the record in the state store agree.
+2. It rotates the fence by one atomic `_aliases` request, which removes the old alias (`must_exist`) and adds the new one.
+
+The state store keeps the index's instance and its current and pending fence for crash recovery; the index enforces. Claims never write `_meta`, and other `_meta` keys and user aliases are left alone. Between claims, writes make no ownership request.
+
+**The fencing guarantee.** After a claim has rotated an index's fence, every newly evaluated write through the old alias is rejected by the cluster: index actions by `require_alias`, deletes by the auto-create rule below. A bulk request the cluster had already accepted may still complete, so writes around an ownership change are at least once, as everywhere else.
+
+A rejected batch fails whole as `sink_destination_conflict` (class `fenced`):
+
+- it is never dead-lettered;
+- the checkpoint does not advance;
+- the pipeline stops.
+
+**Deployment requirement.** `require_alias` does not apply to delete actions. Deletes are fenced only when the cluster refuses to auto-create indices named `df-w-*`, for example:
+
+```json
+PUT _cluster/settings
+{ "persistent": { "action.auto_create_index": "-df-w-*,+*" } }
+```
+
+Rules are evaluated in order, and the first match decides. Every claim reads the effective setting (transient, then persistent, then the default) and refuses with `fencing_unenforced` when it cannot read it or cannot prove that `df-w-*` is forbidden. The sink's user needs:
+
+- the `monitor` cluster privilege, to read the setting;
+- on its indices: `create_index`, `manage_aliases`, `write` and `view_index_metadata`.
+
+**Clone and restore.**
+
+- **Two separately created state stores** are two deployments: neither can write to the other's indices (`owned_by_other`).
+- **A copied state store** has the same identity. The first copy to claim an index fences the other, whose next write fails at the cluster.
+- **A state store restored from an older backup** is refused (`fenced`). Restored from its latest state, it continues.
+- **A deleted index** is never recreated or auto-created (`destination_missing`). Its ownership record is removed only by deleting the pipeline, which resets the sink's checkpoints in the same operation.
+
+**Refusals.** Every refusal is the `sink_destination_conflict` incident: nothing of the batch is acknowledged and the checkpoint stays. The incident names the index, the source table and the class, and only a digest of another owner; it never contains row data or credentials. The classes:
+
+- `marker_missing`, `marker_malformed`, `marker_unsupported_version`;
+- `owned_by_other`, `bound_to_another_relation`;
+- `destination_identity_mismatch`, `encoding_mismatch`;
+- `fenced`, `fence_malformed` (none, or several, internal aliases);
+- `alias_not_supported`, `destination_missing`, `unrecorded_destination`;
+- `fencing_unenforced`.
 
 ## Requirements
 
 The sink needs the **source column types + primary key**. It loads these **on
 demand** the first time it sees a table (querying the source catalog — MySQL
 `INFORMATION_SCHEMA`, Postgres `pg_catalog`) and caches them, so it works under
-**any snapshot mode**, including `snapshot: never`. If you set `id_fields`
-explicitly *and* `auto_create_index: false`, no schema lookup is needed at all.
+**any snapshot mode**, including `snapshot: never`. The cluster must forbid
+auto-creating `df-w-*` indices (see [Destination ownership](#destination-ownership-and-fencing)).
 
 ## Examples
 

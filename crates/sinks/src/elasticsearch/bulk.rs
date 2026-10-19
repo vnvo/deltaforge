@@ -25,6 +25,9 @@ pub enum ItemOutcome {
     Superseded,
     /// Non-retryable per-document error (e.g. mapping conflict).
     Failed(String),
+    /// The write alias the action targeted does not exist: the fence moved
+    /// (or the index is gone). Fatal for the batch, never dead-lettered.
+    Fenced,
 }
 
 /// Build the NDJSON `_bulk` body: an action line per item, plus a document line
@@ -73,8 +76,18 @@ pub fn parse_bulk_response(body: &[u8]) -> Result<Vec<ItemOutcome>, SinkError> {
                 details: "elasticsearch bulk item malformed".into(),
             })?;
         let status = action.get("status").and_then(|s| s.as_u64()).unwrap_or(0);
+        let error_type = action
+            .get("error")
+            .and_then(|e| e.get("type"))
+            .and_then(|t| t.as_str());
         outcomes.push(match status {
             200..=299 => ItemOutcome::Ok,
+            // Every action targets the sink's write alias: an unknown index
+            // means the alias is gone (`require_alias`, or the auto-create
+            // rule for a delete).
+            404 if error_type == Some("index_not_found_exception") => {
+                ItemOutcome::Fenced
+            }
             // Delete of a missing doc is fine (already absent).
             404 => ItemOutcome::Ok,
             409 => ItemOutcome::Superseded,
@@ -99,6 +112,24 @@ pub fn parse_bulk_response(body: &[u8]) -> Result<Vec<ItemOutcome>, SinkError> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_removed_write_alias_is_fenced_not_a_missing_document() {
+        let body = json!({"errors": true, "items": [
+            {"delete": {"_index": "i", "_id": "1", "status": 404, "result": "not_found"}},
+            {"index": {"_index": "df-w-a-b", "_id": "2", "status": 404,
+                "error": {"type": "index_not_found_exception",
+                          "reason": "no such index [df-w-a-b] and [require_alias] request flag is [true]"}}},
+            {"delete": {"_index": "df-w-a-b", "_id": "3", "status": 404,
+                "error": {"type": "index_not_found_exception",
+                          "reason": "[action.auto_create_index] contains [-df-w-*]"}}}
+        ]});
+        let out = parse_bulk_response(body.to_string().as_bytes()).unwrap();
+        assert_eq!(
+            out,
+            [ItemOutcome::Ok, ItemOutcome::Fenced, ItemOutcome::Fenced]
+        );
+    }
 
     #[test]
     fn builds_index_and_delete_lines() {

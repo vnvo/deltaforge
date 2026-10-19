@@ -111,10 +111,10 @@ identity; Avro record names carry its escaped parts; legacy S3 partitions
 are `database=<db>/namespace=<schema or db>/table=<table>`. Same-named
 tables of two schemas or databases never share any of them; a name too
 long for an object-key segment is stored as its digest, never truncated. A
-ClickHouse table or Elasticsearch index holds one source table, durably
-bound: rows of a second one are refused (`sink_destination_conflict`; give
-each its own index, for example with `{schema}` and `{table}` in the index
-template).
+ClickHouse table or Elasticsearch index holds one source table, named in
+the ownership marker it is created with: rows of a second one are refused
+(`sink_destination_conflict`; give each its own index, for example with
+`{schema}` and `{table}` in the index template).
 
 ## Decoding failures
 
