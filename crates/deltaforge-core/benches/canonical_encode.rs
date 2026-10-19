@@ -438,6 +438,20 @@ fn main() {
             });
         }
     }
+    if wanted("envelope") {
+        // The narrow shape's metadata alone: an event with an empty row.
+        let events: Vec<Event> = (0..10_000)
+            .map(|i| {
+                let mut e = shapes[0].event(i);
+                e.after = Some(CanonicalRow::new(vec![]).unwrap());
+                e
+            })
+            .collect();
+        measure("json-envelope", &events, |e| {
+            let data = Native.wrap(e, NativeOpts::default()).unwrap();
+            Json.encode(&data).unwrap().len()
+        });
+    }
     if wanted("key") {
         let events: Vec<Event> =
             (0..10_000).map(|i| shapes[0].event(i)).collect();
