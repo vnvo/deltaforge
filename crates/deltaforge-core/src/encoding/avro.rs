@@ -426,15 +426,42 @@ fn registry_error(
 // Avro Encoder
 // =============================================================================
 
-/// What a DDL-derived (Path A) schema is resolved for: the subject, the
-/// source table, the exact source schema version the event was produced
-/// under, and the type mapping.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ResolvedKey {
-    subject: String,
-    relation: crate::SourceRelationIdentity,
-    identity: SchemaIdentity,
-    mapping: String,
+/// What a DDL-derived (Path A) schema is resolved for: the topic (its
+/// subject), the source relation, the exact source schema version the
+/// event was produced under, and the type mapping, written into `out` as
+/// one string with every part length-prefixed (injective), so a cached
+/// event builds no identity.
+fn resolved_key(
+    out: &mut String,
+    topic: &str,
+    event: &crate::Event,
+    fingerprint: &str,
+    mapping_id: &str,
+) {
+    use std::fmt::Write;
+    let source = &event.source;
+    let mut part = |p: &str| {
+        let _ = write!(out, "{}:", p.len());
+        out.push_str(p);
+    };
+    for p in [
+        topic,
+        &source.connector,
+        &source.name,
+        &source.db,
+        source.namespace(),
+        &source.table,
+        fingerprint,
+        mapping_id,
+        event.type_mapping.as_str(),
+    ] {
+        part(p);
+    }
+    // The registry sequence: `s<digits>;`, or `n;` without one.
+    let _ = match event.schema_sequence {
+        Some(n) => write!(out, "s{n};"),
+        None => write!(out, "n;"),
+    };
 }
 
 /// A schema registered for a subject, prepared for encoding.
@@ -531,7 +558,7 @@ pub struct AvroEncoder {
     /// Cache: topic → resolved subject name (avoids format! per event)
     subject_cache: RwLock<HashMap<String, String>>,
     /// Path A: the registered schema of each resolved version.
-    resolved: RwLock<HashMap<ResolvedKey, Registered>>,
+    resolved: RwLock<HashMap<String, Registered>>,
     /// Path C: (subject, record name) → widened inferred schema.
     inferred: RwLock<HashMap<(String, String), InferredState>>,
     /// DDL schemas by connector: (schema JSON, canonical hash).
@@ -618,6 +645,11 @@ impl AvroEncoder {
     }
 
     /// Resolve subject name with caching (avoids format! allocation per event).
+    /// The subject of `topic`'s records of mapping version `mapping`.
+    fn subject(&self, topic: &str, mapping: crate::TypeMapping) -> String {
+        format!("{}-{}", self.resolve_subject(topic), mapping.as_str())
+    }
+
     fn resolve_subject(&self, topic: &str) -> String {
         {
             let cache = self.subject_cache.read();
@@ -681,8 +713,6 @@ impl AvroEncoder {
         envelope: &EnvelopeData<'_>,
     ) -> Result<Bytes, EncodingError> {
         let mapping = event.type_mapping;
-        let subject =
-            format!("{}-{}", self.resolve_subject(topic), mapping.as_str());
         // The row images are converted from their canonical values (Path A)
         // or rebuilt from them (Path C): the envelope holds `{}` in their
         // places, never a rendering to discard.
@@ -693,15 +723,6 @@ impl AvroEncoder {
             event.source.db.as_str(),
             event.source.namespace(),
             event.source.table.as_str(),
-        );
-        // The relation's full identity: caches key on it, and Avro names
-        // carry its escaped parts, so same-named tables of other databases
-        // or schemas never share a name.
-        let relation = crate::SourceRelationIdentity::of(&event.source);
-        let (avro_ns, avro_table) = relation.avro_path();
-        let identity = SchemaIdentity::of(
-            event.schema_version.as_deref(),
-            event.schema_sequence,
         );
         let rows = row_paths(event);
         // The row images' extensions fill their stable sibling slots (null
@@ -736,29 +757,32 @@ impl AvroEncoder {
             }
         }
 
-        if let (Some(provider), Some(identity)) =
-            (self.source_schemas.as_ref(), identity.as_ref())
-        {
-            let key = ResolvedKey {
-                subject: subject.clone(),
-                relation: relation.clone(),
-                identity: identity.clone(),
-                mapping: format!(
-                    "{}:{}",
-                    provider.mapping_id(),
-                    mapping.as_str()
-                ),
-            };
-            let cached = self.resolved.read().get(&key).cloned();
+        if let (Some(provider), Some(fingerprint)) = (
+            self.source_schemas.as_ref(),
+            event.schema_version.as_deref(),
+        ) {
+            let mut key = String::with_capacity(160);
+            resolved_key(
+                &mut key,
+                topic,
+                event,
+                fingerprint,
+                provider.mapping_id(),
+            );
+            let cached = self.resolved.read().get(key.as_str()).cloned();
             if let Some(prepared) = cached {
                 return encode_with(&prepared, &json_value, &rows);
             }
+            let identity = SchemaIdentity {
+                fingerprint: fingerprint.to_string(),
+                sequence: event.schema_sequence,
+            };
             match provider.get_envelope_schema(
-                connector, database, namespace, table, identity,
+                connector, database, namespace, table, &identity,
             ) {
                 EnvelopeSchemaLookup::Found(schema_json, _) => {
                     debug!(
-                        relation = %relation.canonical(),
+                        relation = %crate::SourceRelationIdentity::of(&event.source).canonical(),
                         fingerprint = %identity.fingerprint,
                         "using DDL-derived Avro schema (Path A)"
                     );
@@ -766,8 +790,13 @@ impl AvroEncoder {
                         .increment(1);
                     let (schema_json, _) =
                         with_mapping_attr(&schema_json, mapping)?;
-                    let prepared =
-                        self.register(&key.subject, &schema_json, None).await?;
+                    let prepared = self
+                        .register(
+                            &self.subject(topic, mapping),
+                            &schema_json,
+                            None,
+                        )
+                        .await?;
                     self.resolved.write().insert(key, prepared.clone());
                     return encode_with(&prepared, &json_value, &rows);
                 }
@@ -785,6 +814,11 @@ impl AvroEncoder {
             }
         }
 
+        // The relation's full identity: Avro names carry its escaped parts,
+        // so same-named tables of other databases or schemas never share a
+        // name.
+        let relation = crate::SourceRelationIdentity::of(&event.source);
+        let (avro_ns, avro_table) = relation.avro_path();
         debug!(
             relation = %relation.canonical(),
             "no DDL schema version for the event: JSON inference (Path C)"
@@ -799,8 +833,12 @@ impl AvroEncoder {
             o.remove("after_extensions");
         }
         let json_value = inference_json(json_value, event)?;
-        self.encode_inferred(&subject, &record_name, &json_value)
-            .await
+        self.encode_inferred(
+            &self.subject(topic, mapping),
+            &record_name,
+            &json_value,
+        )
+        .await
     }
 
     /// Encode a DDL event as the explicit DDL record (see
@@ -2002,6 +2040,59 @@ mod tests {
             "schema with null fields should be valid: {:?}",
             schema.err()
         );
+    }
+
+    #[test]
+    fn resolved_keys_differ_whenever_a_part_differs() {
+        let event = |db: &str, table: &str, seq: Option<u64>| {
+            let mut e = crate::Event::new_row(
+                crate::EventId::mysql_row_server(1, "f", 1, 0),
+                crate::SourceInfo {
+                    version: "v".into(),
+                    connector: "mysql".into(),
+                    name: "src".into(),
+                    ts_ms: 0,
+                    db: db.into(),
+                    schema: None,
+                    table: table.into(),
+                    snapshot: None,
+                    position: Default::default(),
+                },
+                crate::Op::Create,
+                None,
+                Some(crate::canonical::fixture::row(json!({"id": 1}))),
+                crate::TypeMapping::V2,
+                0,
+                1,
+            );
+            e.schema_sequence = seq;
+            e
+        };
+        let key = |topic: &str, e: &crate::Event, fp: &str, m: &str| {
+            let mut k = String::new();
+            resolved_key(&mut k, topic, e, fp, m);
+            k
+        };
+        let base = event("a", "b", Some(1));
+        let k = key("t", &base, "fp", "m");
+        assert_eq!(k, key("t", &event("a", "b", Some(1)), "fp", "m"));
+        // A separator moved between parts, or any one part changed.
+        for other in [
+            key("t", &event("a1", "b", Some(1)), "fp", "m"),
+            key("t", &event("a", "1b", Some(1)), "fp", "m"),
+            key("t", &event("a:", "b", Some(1)), "fp", "m"),
+            key("t", &event("a", "b", Some(11)), "fp", "m"),
+            key("t", &event("a", "b", None), "fp", "m"),
+            key("t2", &base, "fp", "m"),
+            key("t", &base, "fp2", "m"),
+            key("t", &base, "fp", "m2"),
+            key("t", &event("a", "b", Some(1)), "f", "pm"),
+        ] {
+            assert_ne!(k, other);
+        }
+        let mut v1 = event("a", "b", Some(1));
+        v1.type_mapping = crate::TypeMapping::V1;
+        assert_ne!(k, key("t", &v1, "fp", "m"));
     }
 
     #[test]

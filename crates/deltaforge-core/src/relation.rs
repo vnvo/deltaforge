@@ -43,27 +43,16 @@ impl SourceRelationIdentity {
     /// is equal.
     pub fn canonical(&self) -> String {
         let mut out = String::new();
-        for (i, part) in [
-            &self.connector,
-            &self.source,
-            &self.database,
-            &self.namespace,
-            &self.table,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            if i > 0 {
-                out.push('/');
-            }
-            for c in part.chars() {
-                match c {
-                    '%' => out.push_str("%25"),
-                    '/' => out.push_str("%2F"),
-                    c => out.push(c),
-                }
-            }
-        }
+        write_canonical(
+            &mut out,
+            [
+                &self.connector,
+                &self.source,
+                &self.database,
+                &self.namespace,
+                &self.table,
+            ],
+        );
         out
     }
 
@@ -125,6 +114,44 @@ impl SourceRelationIdentity {
     }
 }
 
+/// Write the canonical encoding of the relation `source` names
+/// ([`SourceRelationIdentity::canonical`] of
+/// [`SourceRelationIdentity::of`]) into `out`, without building the
+/// identity.
+pub fn write_source_canonical(out: &mut String, source: &SourceInfo) {
+    write_canonical(
+        out,
+        [
+            &source.connector,
+            &source.name,
+            &source.db,
+            source.namespace(),
+            &source.table,
+        ],
+    );
+}
+
+/// The canonical encoding of relation parts (connector, source, database,
+/// namespace, table) written into `out`.
+fn write_canonical(out: &mut String, parts: [&str; 5]) {
+    for (i, part) in parts.into_iter().enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        if !part.bytes().any(|b| b == b'%' || b == b'/') {
+            out.push_str(part);
+            continue;
+        }
+        for c in part.chars() {
+            match c {
+                '%' => out.push_str("%25"),
+                '/' => out.push_str("%2F"),
+                c => out.push(c),
+            }
+        }
+    }
+}
+
 /// `(namespace path, record-name part)` for a relation: the escaped
 /// database, then the escaped namespace when it differs from the database
 /// (PostgreSQL), and the escaped table.
@@ -168,6 +195,36 @@ pub fn avro_name(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_source_block_writes_exactly_its_relation_canonical_encoding() {
+        for (name, db, schema, table) in [
+            ("src", "shop", None, "orders"),
+            ("a/b%", "d%2F", Some("s/x"), "t%25/"),
+            ("ünï", "db", Some("public"), "τ"),
+        ] {
+            let source = SourceInfo {
+                version: "v".into(),
+                connector: "postgresql".into(),
+                name: name.into(),
+                ts_ms: 0,
+                db: db.into(),
+                schema: schema.map(String::from),
+                table: table.into(),
+                snapshot: None,
+                position: Default::default(),
+            };
+            let mut out = String::from("prefix|");
+            write_source_canonical(&mut out, &source);
+            assert_eq!(
+                out,
+                format!(
+                    "prefix|{}",
+                    SourceRelationIdentity::of(&source).canonical()
+                )
+            );
+        }
+    }
 
     fn rel(db: &str, ns: &str, table: &str) -> SourceRelationIdentity {
         SourceRelationIdentity {

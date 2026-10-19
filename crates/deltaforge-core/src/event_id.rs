@@ -502,6 +502,20 @@ impl EventId {
     }
 }
 
+impl EventId {
+    /// Write the textual form (`dfid:v1:<class>:<32 hex>`) into `out`.
+    pub fn write_text(&self, out: &mut String) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        out.push_str("dfid:v1:");
+        out.push_str(self.class.wire());
+        out.push(':');
+        for b in self.hash {
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+    }
+}
+
 impl fmt::Display for EventId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -570,6 +584,22 @@ impl<'de> Deserialize<'de> for EventId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_written_text_is_the_display_form() {
+        let row = EventId::mysql_row_server(1, "binlog.000001", 4, 0);
+        for id in [
+            row,
+            EventId::mysql_row_server(u32::MAX, "", u64::MAX, u32::MAX),
+            EventId::mysql_row_gtid(&[0xab; 16], 9, 4, 1),
+            EventId::pg_row(7, u64::MAX, 16_384, 2),
+            EventId::synthetic(&row, "digest", 3),
+        ] {
+            let mut out = String::from("x");
+            id.write_text(&mut out);
+            assert_eq!(out, format!("x{id}"));
+        }
+    }
 
     fn sid() -> [u8; 16] {
         // 3e11fa47-71ca-11e1-9e33-c80aa9429562

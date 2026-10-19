@@ -615,24 +615,18 @@ impl Event {
 
     /// Generate idempotency key for deduplication.
     pub fn idempotency_key(&self) -> String {
-        use std::fmt::Write;
-        // Pre-size: tenant(~8) + db(~8) + table(~16) + tx_id(~8) + uuid(36) + separators(4)
-        let mut key = String::with_capacity(80);
-        let _ = write!(
-            key,
-            "{}|{}|{}|",
-            self.tenant_id.as_deref().unwrap_or("_"),
-            SourceRelationIdentity::of(&self.source).canonical(),
-            self.transaction
-                .as_ref()
-                .map(|t| t.id.as_str())
-                .unwrap_or(""),
-        );
+        let mut key = String::with_capacity(160);
+        key.push_str(self.tenant_id.as_deref().unwrap_or("_"));
+        key.push('|');
+        relation::write_source_canonical(&mut key, &self.source);
+        key.push('|');
+        if let Some(t) = &self.transaction {
+            key.push_str(&t.id);
+        }
+        key.push('|');
         match &self.event_id {
             // The stable EventId's textual form is already globally unique.
-            Some(id) => {
-                let _ = write!(key, "{id}");
-            }
+            Some(id) => id.write_text(&mut key),
             None => key.push('_'),
         }
         key
@@ -1389,6 +1383,50 @@ impl PipelineHandle {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The default Kafka key is `tenant|relation|transaction|event id`
+    /// (each absent part as before), written without building the
+    /// relation identity.
+    #[test]
+    fn the_idempotency_key_is_tenant_relation_transaction_and_event_id() {
+        let mut source = test_source();
+        source.name = "a/b%".into();
+        source.table = "t/1".into();
+        let id = EventId::mysql_row_server(1, "f", 9, 0);
+        for (tenant, tx, event_id) in [
+            (None, None, None),
+            (Some("acme"), Some("gtid:5"), Some(id)),
+            (Some(""), Some(""), Some(id)),
+        ] {
+            let mut e = Event::new_row(
+                id,
+                source.clone(),
+                Op::Create,
+                None,
+                None,
+                TypeMapping::V2,
+                0,
+                0,
+            );
+            e.event_id = event_id;
+            e.tenant_id = tenant.map(String::from);
+            e.transaction = tx.map(|t| Transaction {
+                id: t.into(),
+                total_order: None,
+                data_collection_order: None,
+            });
+            assert_eq!(
+                e.idempotency_key(),
+                format!(
+                    "{}|{}|{}|{}",
+                    tenant.unwrap_or("_"),
+                    SourceRelationIdentity::of(&source).canonical(),
+                    tx.unwrap_or(""),
+                    event_id.map_or("_".to_string(), |i| i.to_string())
+                )
+            );
+        }
+    }
 
     fn test_source() -> SourceInfo {
         SourceInfo {
