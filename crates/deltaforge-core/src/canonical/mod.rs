@@ -833,11 +833,22 @@ impl CanonicalRow {
     pub fn new(
         columns: Vec<(String, CanonicalValue)>,
     ) -> Result<CanonicalRow, CanonicalError> {
-        let mut seen = std::collections::HashSet::new();
-        for (name, _) in &columns {
-            if !seen.insert(name.as_str()) {
-                return invalid(format!("duplicate column {name}"));
-            }
+        // Rows are built per event: a narrow row is checked by comparison
+        // (no allocation), a wide one with a set sized up front.
+        let duplicate = if columns.len() <= 32 {
+            columns.iter().enumerate().find_map(|(i, (name, _))| {
+                columns[..i].iter().any(|(n, _)| n == name).then_some(name)
+            })
+        } else {
+            let mut seen =
+                std::collections::HashSet::with_capacity(columns.len());
+            columns
+                .iter()
+                .map(|(n, _)| n)
+                .find(|n| !seen.insert(n.as_str()))
+        };
+        if let Some(name) = duplicate {
+            return invalid(format!("duplicate column {name}"));
         }
         Ok(CanonicalRow {
             columns,

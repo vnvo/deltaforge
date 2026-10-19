@@ -806,3 +806,16 @@ fn a_hinted_lookup_is_a_lookup_by_name() {
         assert_eq!(row.get_hinted(hint, "c"), None);
     }
 }
+
+#[test]
+fn duplicate_columns_are_refused_in_narrow_and_wide_rows() {
+    for width in [2, 32, 33, 200] {
+        let mut cols: Vec<(String, CanonicalValue)> = (0..width)
+            .map(|i| (format!("c{i}"), CanonicalValue::Null))
+            .collect();
+        assert!(CanonicalRow::new(cols.clone()).is_ok());
+        cols.push(("c1".into(), CanonicalValue::Null));
+        let err = CanonicalRow::new(cols).unwrap_err();
+        assert!(err.0.contains("duplicate column c1"), "{err:?}");
+    }
+}
