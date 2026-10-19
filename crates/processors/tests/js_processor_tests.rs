@@ -1295,6 +1295,25 @@ async fn js_a_new_field_with_missing_schema_context_fails() {
     );
 }
 
+/// In one batch, each event gets its own version's schema context: an
+/// event after one with a resolved version still fails when its own
+/// version is missing.
+#[tokio::test(flavor = "current_thread")]
+async fn js_each_event_gets_its_own_schema_context() {
+    let mut unknown = new_event();
+    unknown.schema_version = Some("orders-unknown".into());
+    let err = run(
+        "function processBatch(e){ e[1].after.q = 1; return e; }",
+        vec![new_event(), unknown],
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("schema context is missing"),
+        "{err}"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn js_a_null_column_takes_a_value_of_its_declared_type() {
     let ev = event_with_after(vec![("n", CanonicalValue::Null)]);
@@ -1493,6 +1512,16 @@ async fn resolution_reuses_a_version_only_for_the_same_reference() {
         ResolvedSchemas::resolve(&schemas, &[new_event(), unknown])
             .await
             .is_err()
+    );
+    // A row whose columns are not in the schema's order is checked by name.
+    let reordered = event_with_after(vec![
+        ("note", db(DbValue::Text("x".into()))),
+        ("id", db(DbValue::int(1, IntWidth::W32).unwrap())),
+    ]);
+    assert!(
+        ResolvedSchemas::resolve(&schemas, &[reordered])
+            .await
+            .is_ok()
     );
     let mut other_sequence = new_event();
     other_sequence.schema_sequence = Some(2);
