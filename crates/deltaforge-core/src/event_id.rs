@@ -502,28 +502,47 @@ impl EventId {
     }
 }
 
+/// An id's textual form (`dfid:v1:<class>:<32 hex>`), on the stack.
+struct EventIdText {
+    buf: [u8; 48],
+    len: usize,
+}
+
+impl EventIdText {
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.buf[..self.len]).expect("ASCII")
+    }
+}
+
 impl EventId {
+    fn text(&self) -> EventIdText {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut t = EventIdText {
+            buf: [0; 48],
+            len: 0,
+        };
+        let mut push = |bytes: &[u8]| {
+            t.buf[t.len..t.len + bytes.len()].copy_from_slice(bytes);
+            t.len += bytes.len();
+        };
+        push(b"dfid:v1:");
+        push(self.class.wire().as_bytes());
+        push(b":");
+        for b in self.hash {
+            push(&[HEX[(b >> 4) as usize], HEX[(b & 0x0f) as usize]]);
+        }
+        t
+    }
+
     /// Write the textual form (`dfid:v1:<class>:<32 hex>`) into `out`.
     pub fn write_text(&self, out: &mut String) {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        out.push_str("dfid:v1:");
-        out.push_str(self.class.wire());
-        out.push(':');
-        for b in self.hash {
-            out.push(HEX[(b >> 4) as usize] as char);
-            out.push(HEX[(b & 0x0f) as usize] as char);
-        }
+        out.push_str(self.text().as_str());
     }
 }
 
 impl fmt::Display for EventId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "dfid:v1:{}:{}",
-            self.class.wire(),
-            hex::encode(self.hash)
-        )
+        f.write_str(self.text().as_str())
     }
 }
 
@@ -570,7 +589,7 @@ impl FromStr for EventId {
 
 impl Serialize for EventId {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&self.to_string())
+        s.serialize_str(self.text().as_str())
     }
 }
 
@@ -586,7 +605,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_written_text_is_the_display_form() {
+    fn the_text_form_is_the_class_and_the_hex_digest() {
         let row = EventId::mysql_row_server(1, "binlog.000001", 4, 0);
         for id in [
             row,
@@ -595,9 +614,20 @@ mod tests {
             EventId::pg_row(7, u64::MAX, 16_384, 2),
             EventId::synthetic(&row, "digest", 3),
         ] {
+            let expected = format!(
+                "dfid:v1:{}:{}",
+                id.class().wire(),
+                hex::encode(id.digest())
+            );
             let mut out = String::from("x");
             id.write_text(&mut out);
-            assert_eq!(out, format!("x{id}"));
+            assert_eq!(out, format!("x{expected}"));
+            assert_eq!(id.to_string(), expected);
+            assert_eq!(
+                serde_json::to_value(id).unwrap(),
+                serde_json::Value::String(expected.clone())
+            );
+            assert_eq!(expected.parse::<EventId>().unwrap(), id);
         }
     }
 
