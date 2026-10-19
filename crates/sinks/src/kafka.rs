@@ -387,17 +387,20 @@ impl KafkaSink {
     }
 
     /// Resolve topic, strict. Returns Err if template produces empty/invalid topic.
-    fn resolve_topic(&self, event: &Event) -> SinkResult<String> {
+    fn resolve_topic<'a>(
+        &'a self,
+        event: &'a Event,
+    ) -> SinkResult<std::borrow::Cow<'a, str>> {
         // 1. Check explicit routing override (empty string = no override)
         if let Some(t) =
             event.routing.as_ref().and_then(|r| r.effective_topic())
         {
-            return Ok(t.to_string());
+            return Ok(t.into());
         }
 
-        // 2. Resolve template (or return static)
+        // 2. Resolve template (or return static, borrowed)
         if self.topic_template.is_static() {
-            return Ok(self.topic.clone());
+            return Ok(self.topic.as_str().into());
         }
 
         let event_json = crate::payload::route_view(event);
@@ -418,7 +421,7 @@ impl KafkaSink {
                 .into(),
             });
         }
-        Ok(resolved)
+        Ok(resolved.into())
     }
 
     /// Resolve key, lenient. Unresolvable = falls back to idempotency_key.
@@ -447,13 +450,14 @@ impl KafkaSink {
     /// Kafka headers: the event's routing headers, and `df-type-mapping`,
     /// the mapping version its values are rendered with.
     fn build_headers(&self, event: &Event) -> Option<OwnedHeaders> {
-        let mut headers = OwnedHeaders::new().insert(Header {
-            key: "df-type-mapping",
-            value: Some(event.type_mapping.as_str().as_bytes()),
-        });
-        if let Some(map) =
-            event.routing.as_ref().and_then(|r| r.headers.as_ref())
-        {
+        let routing = event.routing.as_ref().and_then(|r| r.headers.as_ref());
+        let mut headers =
+            OwnedHeaders::new_with_capacity(1 + routing.map_or(0, |m| m.len()))
+                .insert(Header {
+                    key: "df-type-mapping",
+                    value: Some(event.type_mapping.as_str().as_bytes()),
+                });
+        if let Some(map) = routing {
             for (k, v) in map {
                 headers = headers.insert(Header {
                     key: k,
@@ -657,7 +661,7 @@ impl Sink for KafkaSink {
         // instead of failing the batch. Non-DLQ errors fail the batch as before.
         let mut serialized: Vec<(
             Vec<u8>,
-            String,
+            std::borrow::Cow<'_, str>,
             String,
             Option<OwnedHeaders>,
         )> = Vec::with_capacity(events.len());
