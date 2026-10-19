@@ -1116,6 +1116,12 @@ pub trait Source: Send + Sync {
     /// generations).
     fn set_snapshot_cohort(&self, _cohort: SnapshotCohort) {}
 
+    /// Whether a sink of the pipeline needs complete rows
+    /// ([`Sink::requires_complete_rows`]), set by the runner before
+    /// [`Source::run`]: the strictest sink decides. Default: ignored (a
+    /// source that always sends complete rows).
+    fn set_complete_rows_required(&self, _required: bool) {}
+
     /// The generation start barrier's local check on one sink's stored
     /// checkpoint (`prev`, `None` when empty). Default: refuse, so a source
     /// that does not implement snapshot generations never moves a checkpoint.
@@ -1191,6 +1197,15 @@ pub enum BoundaryOutcome {
 #[async_trait]
 pub trait Sink: Send + Sync {
     fn id(&self) -> &str;
+
+    /// Whether every delivered row must carry every column's value: an
+    /// output that cannot represent a value the source did not send (an
+    /// unchanged PostgreSQL TOAST value). A pipeline with such a sink needs
+    /// complete rows from its source (REPLICA IDENTITY FULL on PostgreSQL
+    /// tables whose columns can be TOASTed).
+    fn requires_complete_rows(&self) -> bool {
+        false
+    }
 
     fn required(&self) -> bool {
         true

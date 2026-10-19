@@ -58,6 +58,7 @@ parallel   sources/mysql_replica_binlog_e2e -p sources --test mysql_replica_binl
 parallel   sources/mysql_snapthot_e2e       -p sources --test mysql_snapthot_e2e
 parallel   sources/mysql_unsigned_values_e2e -p sources --test mysql_unsigned_values_e2e -- --include-ignored --test-threads=1
 parallel   sources/postgres_cdc_e2e         -p sources --test postgres_cdc_e2e
+parallel   sources/postgres_toast_old_image_e2e -p sources --test postgres_toast_old_image_e2e
 parallel   sources/postgres_snapshot_e2e    -p sources --test postgres_snapshot_e2e
 parallel   sources/snapshot_connection_cap_e2e -p sources --test snapshot_connection_cap_e2e
 parallel   sources/snapshot_structure_e2e   -p sources --test snapshot_structure_e2e

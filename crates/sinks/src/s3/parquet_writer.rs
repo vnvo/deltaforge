@@ -93,6 +93,11 @@ impl FileFormat for ParquetFormat {
         "parquet"
     }
 
+    /// A Parquet column has a value in every row.
+    fn requires_complete_rows(&self) -> bool {
+        true
+    }
+
     async fn open_writer(
         &self,
         store: Arc<dyn ObjectStore>,

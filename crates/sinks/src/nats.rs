@@ -586,6 +586,11 @@ async fn connect_nats(
 
 #[async_trait]
 impl Sink for NatsSink {
+    /// Avro carries no value for a column the source did not send.
+    fn requires_complete_rows(&self) -> bool {
+        self.encoding == EncodingType::Avro
+    }
+
     /// Nothing is buffered after an acknowledged batch: every message of an acknowledged batch had its JetStream PubAck before `send_batch` returned, and a
     /// barrier is delivered only after every earlier batch was acknowledged.
     /// This sink keeps no watermark of its own.

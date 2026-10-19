@@ -31,10 +31,12 @@ pub mod snapshot_position;
 pub mod snapshot_probe;
 pub mod snapshot_publish;
 
-/// A source's snapshot state shared with the runner: the commit policy and
-/// sink cohort the runner set before the source runs
-/// (`Source::set_snapshot_cohort`), which a generation freezes, and the
-/// sinks the resume fold leaves out (`Source::resume_exclusions`).
+/// A source's state shared with the runner: the commit policy and sink
+/// cohort the runner set before the source runs
+/// (`Source::set_snapshot_cohort`), which a generation freezes; the sinks the
+/// resume fold leaves out (`Source::resume_exclusions`); and whether the
+/// pipeline's sinks need complete rows
+/// (`Source::set_complete_rows_required`).
 #[derive(Debug, Clone, Default)]
 pub struct SnapshotShared {
     pub cohort: Option<deltaforge_core::SnapshotCohort>,
@@ -43,6 +45,9 @@ pub struct SnapshotShared {
     /// Bumped on every change of `resume_exclusions`, so a reader holding a
     /// fold computed under the previous set knows to recompute it.
     pub exclusions_version: u64,
+    /// A sink of the pipeline cannot deliver a row missing a value the
+    /// source did not send (`Sink::requires_complete_rows`).
+    pub complete_rows_required: bool,
 }
 
 impl SnapshotShared {

@@ -49,6 +49,12 @@ pub trait FileFormat: Send + Sync {
     /// Format identifier for metrics labels.
     fn label(&self) -> &'static str;
 
+    /// Whether every row must carry every column's value (see
+    /// `Sink::requires_complete_rows`).
+    fn requires_complete_rows(&self) -> bool {
+        false
+    }
+
     /// Open a new writer targeting `path`. The schema is used by Parquet and
     /// ignored by JSON Lines. The returned writer accepts incremental
     /// `append` calls and must be `close`d to finalize the upload.
@@ -84,4 +90,19 @@ pub trait FileWriter: Send {
     /// Close the writer, flush the footer (Parquet) or final blob (JSONL),
     /// complete the multipart upload, and return the final result.
     async fn close(self: Box<Self>) -> Result<WriteResult>;
+}
+
+#[cfg(test)]
+mod complete_rows_tests {
+    use super::FileFormat;
+    use crate::s3::jsonl_writer::JsonLinesFormat;
+    use crate::s3::parquet_writer::ParquetFormat;
+
+    /// Parquet needs a value for every column; JSON Lines carries the
+    /// native envelope, which lists unsent columns instead.
+    #[test]
+    fn parquet_needs_complete_rows_json_lines_does_not() {
+        assert!(ParquetFormat::default().requires_complete_rows());
+        assert!(!JsonLinesFormat::default().requires_complete_rows());
+    }
 }

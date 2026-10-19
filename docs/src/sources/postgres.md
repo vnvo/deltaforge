@@ -147,6 +147,58 @@ Without this setting:
 
 DeltaForge warns at startup if tables don't have `REPLICA IDENTITY FULL`.
 
+### Unchanged TOAST values
+
+PostgreSQL stores large values out of line (TOAST). When an UPDATE leaves
+such a value unchanged, PostgreSQL does not send it in the new row.
+
+- **Under `REPLICA IDENTITY FULL`** PostgreSQL sends the complete old row,
+  including those values (verified on PostgreSQL 14 through 18). DeltaForge
+  fills each unchanged value from the old row, exactly. The event's `after`
+  is complete.
+- **Otherwise** the value is not available. Sinks that accept partial rows
+  (native JSON: Kafka, Redis, NATS, HTTP, S3 JSON Lines) leave it out of
+  `after` and list it in `unchanged_columns`.
+
+**Sinks that need complete rows** (Avro encoding on any sink, S3 Parquet,
+ClickHouse, Elasticsearch) cannot represent a missing value. A pipeline with
+at least one of them requires `REPLICA IDENTITY FULL` on every captured table
+that has a TOAST-capable column (any variable-length type stored with a
+strategy other than `PLAIN`, domains and arrays included, read from the
+catalog).
+
+- **At start:** a bulk check over the publication's tables, before anything is
+  snapshotted or streamed, refuses the pipeline with `pg_table_unsupported`
+  (class `toast_without_full_identity`). The source log names every such
+  table with its TOAST-capable columns and the statement that fixes it, for
+  example `ALTER TABLE "public"."docs" REPLICA IDENTITY FULL;`. The refusal
+  contains table and column names only, never row values, and the checkpoint
+  does not move.
+- **While running:** the check is repeated whenever PostgreSQL announces a
+  table's definition (stream start, after DDL, after reconnect or failover),
+  so changing a table's identity away from `FULL` stops the source before
+  that table's next row.
+
+A pipeline whose sinks all accept partial rows does not require `FULL`; one
+sink that needs complete rows is enough to require it.
+`deltaforge_pg_unchanged_toast_total{pipeline,source,outcome}` counts values
+filled from the old row (`reconstructed`) and values left unavailable
+(`unavailable`).
+
+**WAL cost of `FULL`.** Under `FULL`, every UPDATE and DELETE writes the
+complete old row to the WAL, and the old row includes its out-of-line values
+even when the UPDATE leaves them unchanged. The cost grows with row width:
+
+| Workload (PostgreSQL 17, one 1,000-10,000 row UPDATE, steady state) | WAL with `DEFAULT` | WAL with `FULL` |
+|---|---|---|
+| Narrow rows (`int`, `int`, short `text`), one column changed | 227 B/row | 251 B/row (+10%) |
+| Rows with 16 KiB of out-of-line `text`/`jsonb`, a small column changed | 253 B/row | 16.3 KiB/row (about 66x) |
+
+More WAL also means more WAL decoded and sent to the source, and more
+retained for the slot while the source is behind. For wide, frequently
+updated tables, weigh this against delivering those tables only to sinks
+that accept partial rows.
+
 ## Configuration
 
 Set `spec.source.type` to `postgres` and provide a config object:
@@ -412,7 +464,7 @@ DeltaForge preserves PostgreSQL's native type semantics:
 | `uuid` | JSON string |
 | `timestamp`, `date`, `time` | ISO 8601 string |
 | Arrays (`int[]`, `text[]`, etc.) | JSON array |
-| TOAST unchanged | `{"_unchanged": true}` |
+| TOAST unchanged | filled from the old row under `REPLICA IDENTITY FULL`; otherwise left out of `after` and listed in `unchanged_columns` (see [Unchanged TOAST values](#unchanged-toast-values)) |
 
 ## Event Format
 

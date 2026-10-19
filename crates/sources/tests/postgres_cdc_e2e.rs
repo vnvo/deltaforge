@@ -7,7 +7,7 @@ use checkpoints::{CheckpointStore, MemCheckpointStore};
 use common::AllowList;
 use ctor::dtor;
 use deltaforge_core::{
-    BatchContext, Event, Op, Source, SourceHandle, SourceItem,
+    BatchContext, CanonicalValue, Event, Op, Source, SourceHandle, SourceItem,
 };
 
 use sources::postgres::{PostgresSource, pg_row_event_id};
@@ -2662,6 +2662,553 @@ async fn pg_idle_acknowledgement_reaches_the_slot_promptly() -> Result<()> {
         .ok();
     sources::postgres::postgres_publication::fixtures::release_all(&client)
         .await?;
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+// ── Unchanged TOAST ───────────────────────────────────────────────────────
+
+/// A table whose large columns are stored out of line (EXTERNAL), a domain
+/// among them, and one row of large values. `identity`: REPLICA IDENTITY.
+async fn toast_table(
+    client: &tokio_postgres::Client,
+    identity: &str,
+) -> Result<()> {
+    client
+        .batch_execute(&format!(
+            "CREATE DOMAIN note_text AS text;
+             CREATE TABLE toasty (
+                 id int PRIMARY KEY, small int, body text, doc jsonb, blob bytea,
+                 nums int[], note note_text, gone text);
+             ALTER TABLE toasty ALTER body SET STORAGE EXTERNAL,
+                 ALTER doc SET STORAGE EXTERNAL, ALTER blob SET STORAGE EXTERNAL,
+                 ALTER nums SET STORAGE EXTERNAL, ALTER note SET STORAGE EXTERNAL;
+             ALTER TABLE toasty REPLICA IDENTITY {identity};
+             GRANT SELECT ON toasty TO {PG_CDC_USER};
+             INSERT INTO toasty SELECT 1, 0,
+                 (SELECT string_agg(md5(g::text), '') FROM generate_series(1, 4000) g),
+                 jsonb_build_object('k', (SELECT string_agg(md5(g::text), '') FROM generate_series(1, 4000) g)),
+                 (SELECT decode(string_agg(md5(g::text), ''), 'hex') FROM generate_series(1, 4000) g),
+                 (SELECT array_agg(g) FROM generate_series(1, 20000) g),
+                 (SELECT string_agg(md5((g + 7)::text), '') FROM generate_series(1, 4000) g),
+                 NULL;"
+        ))
+        .await?;
+    sources::postgres::postgres_publication::fixtures::recreate_registered(
+        client,
+        "toast_pub",
+        &["toasty"],
+    )
+    .await?;
+    Ok(())
+}
+
+const TOASTED: [&str; 5] = ["body", "doc", "blob", "nums", "note"];
+
+/// A TOAST source; `complete`: a sink of the pipeline needs complete rows.
+async fn toast_source(db: &str, slot: &str, complete: bool) -> PostgresSource {
+    let src = make_source(
+        slot,
+        db,
+        slot,
+        "toast_pub",
+        vec!["public.toasty".into()],
+        AllowList::default(),
+    )
+    .await;
+    // Initial snapshot (SnapshotCfg::default() is `never`): the existing
+    // row arrives from the snapshot, then the stream continues.
+    let mut src = src;
+    src.snapshot_cfg = deltaforge_config::SnapshotCfg {
+        mode: SnapshotMode::Initial,
+        ..Default::default()
+    };
+    src.set_complete_rows_required(complete);
+    src
+}
+
+/// The next row event of `toasty` with `op`, skipping everything else
+/// (barriers and boundaries of a snapshot generation included).
+async fn next_toasty(
+    rx: &mut mpsc::Receiver<SourceItem>,
+    op: Op,
+) -> Option<Event> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(SourceItem::Event(ev)))
+                if ev.source.table == "toasty" && ev.op == op =>
+            {
+                return Some(ev);
+            }
+            Ok(Some(_)) => continue,
+            _ => return None,
+        }
+    }
+}
+
+fn value<'a>(
+    row: &'a Option<deltaforge_core::CanonicalRow>,
+    col: &str,
+) -> &'a CanonicalValue {
+    row.as_ref()
+        .unwrap()
+        .get(col)
+        .unwrap_or_else(|| panic!("no column {col}"))
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_full_identity_reconstructs_unchanged_toast_values() -> Result<()> {
+    let (db, client) = pg_setup("toast_full").await?;
+    toast_table(&client, "FULL").await?;
+    // One state store across the restart, as a deployment keeps it.
+    let backend = make_storage_backend().await;
+    let registry =
+        storage::DurableSchemaRegistry::new(Arc::clone(&backend)).await?;
+    let mut src = toast_source(&db, "slot_toast_full", true).await;
+    src.backend = Arc::clone(&backend);
+    src.registry = Arc::clone(&registry);
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
+    let handle = src.run(tx, Arc::clone(&ckpt)).await;
+
+    // Snapshot to CDC: the row arrives whole from the snapshot ...
+    let snap = next_toasty(&mut rx, Op::Read).await.expect("snapshot row");
+    let body: String = client
+        .query_one("SELECT body FROM toasty", &[])
+        .await?
+        .get(0);
+    let snap_view = test_common::row_view(snap.after.as_ref().unwrap());
+    assert_eq!(snap_view["body"], serde_json::Value::String(body.clone()));
+
+    // ... and an update leaving every large value unchanged is delivered whole:
+    // each value the old row's, SQL NULL still NULL, the changed column new.
+    client
+        .execute("UPDATE toasty SET small = 1 WHERE id = 1", &[])
+        .await?;
+    let u = next_toasty(&mut rx, Op::Update).await.expect("update");
+    for col in TOASTED {
+        assert!(
+            !matches!(value(&u.after, col), CanonicalValue::Unchanged),
+            "{col} left unavailable"
+        );
+        assert_eq!(value(&u.after, col), value(&u.before, col), "{col}");
+    }
+    let view = test_common::row_view(u.after.as_ref().unwrap());
+    assert_eq!(view["body"], serde_json::Value::String(body.clone()));
+    assert_eq!(view["small"], serde_json::json!(1));
+    assert_eq!(view["gone"], serde_json::Value::Null);
+
+    // A changed large value is the new one, the others still the old row's.
+    client
+        .execute("UPDATE toasty SET body = body || 'x' WHERE id = 1", &[])
+        .await?;
+    let c = next_toasty(&mut rx, Op::Update)
+        .await
+        .expect("changed update");
+    let view = test_common::row_view(c.after.as_ref().unwrap());
+    assert_eq!(view["body"], serde_json::Value::String(format!("{body}x")));
+    assert_eq!(value(&c.after, "doc"), value(&c.before, "doc"));
+
+    // Restart: a new session (Relation messages again) still reconstructs.
+    // The restarted source may re-snapshot; an update it streams after that
+    // is the one checked, written until one arrives (bounded).
+    handle.stop();
+    let _ = timeout(Duration::from_secs(10), handle.join()).await;
+    let mut src = toast_source(&db, "slot_toast_full", true).await;
+    src.backend = Arc::clone(&backend);
+    src.registry = Arc::clone(&registry);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
+    let handle = src.run(tx, Arc::clone(&ckpt)).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut restarted = None;
+    for small in 10.. {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no update streamed after the restart"
+        );
+        client
+            .execute("UPDATE toasty SET small = $1 WHERE id = 1", &[&small])
+            .await?;
+        let got = timeout(Duration::from_secs(3), async {
+            loop {
+                let ev = next_toasty(&mut rx, Op::Update).await?;
+                if test_common::row_view(ev.after.as_ref().unwrap())["small"]
+                    == serde_json::json!(small)
+                {
+                    return Some(ev);
+                }
+            }
+        })
+        .await;
+        match got {
+            Ok(Some(ev)) => {
+                restarted = Some(ev);
+                break;
+            }
+            // The source ended: stop writing at once and report why.
+            Ok(None) => {
+                let ended =
+                    timeout(Duration::from_secs(5), handle.join()).await;
+                panic!("the restarted source ended: {ended:?}");
+            }
+            Err(_) => {}
+        }
+    }
+    let r = restarted.expect("an update after the restart");
+    for col in TOASTED {
+        assert_eq!(
+            value(&r.after, col),
+            value(&r.before, col),
+            "{col} after restart"
+        );
+    }
+
+    handle.stop();
+    let _ = timeout(Duration::from_secs(10), handle.join()).await;
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_partial_row_pipeline_keeps_unchanged_toast_unavailable()
+-> Result<()> {
+    let (db, client) = pg_setup("toast_partial").await?;
+    toast_table(&client, "DEFAULT").await?;
+    // Sinks that accept partial rows: no FULL needed, the value stays unsent.
+    let src = toast_source(&db, "slot_toast_partial", false).await;
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
+    let handle = src.run(tx, ckpt).await;
+    next_toasty(&mut rx, Op::Read).await.expect("snapshot row");
+    client
+        .execute("UPDATE toasty SET small = 1 WHERE id = 1", &[])
+        .await?;
+    let u = next_toasty(&mut rx, Op::Update).await.expect("update");
+    for col in TOASTED {
+        assert!(
+            matches!(value(&u.after, col), CanonicalValue::Unchanged),
+            "{col}"
+        );
+    }
+    handle.stop();
+    let _ = timeout(Duration::from_secs(10), handle.join()).await;
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+/// A pipeline that needs complete rows refuses, before streaming, every
+/// captured table with a TOAST-capable column and no FULL identity: the
+/// error names each one with its exact statement, no row value appears, the
+/// checkpoint stays, and a pipeline whose sinks accept partial rows runs.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_complete_rows_refuse_a_table_without_full_identity_at_start()
+-> Result<()> {
+    use deltaforge_core::incident::{
+        EvidenceKey as K, EvidenceValue as V, ReasonCode,
+    };
+    let (db, client) = pg_setup("toast_refuse").await?;
+    toast_table(&client, "FULL").await?;
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"Mixed Docs\" (id int PRIMARY KEY, body text);
+             ALTER TABLE \"Mixed Docs\" REPLICA IDENTITY FULL;
+             INSERT INTO \"Mixed Docs\" VALUES (1, 'secret-mixed-docs-value');
+             CREATE TABLE plain (id int PRIMARY KEY, n int);
+             INSERT INTO plain VALUES (1, 424242);
+             GRANT SELECT ON \"Mixed Docs\", plain TO {PG_CDC_USER};"
+        ))
+        .await?;
+    sources::postgres::postgres_publication::fixtures::recreate_registered(
+        &client,
+        "toast_pub",
+        &["toasty", "\"Mixed Docs\"", "plain"],
+    )
+    .await?;
+    // One state store across the runs (the continuity record of run 1).
+    let (registry, backend) = shared_registry().await;
+    let source = |complete: bool| {
+        let db = db.clone();
+        let (registry, backend) = (registry.clone(), backend.clone());
+        async move {
+            let mut src = make_source(
+                "slot_toast_refuse",
+                &db,
+                "slot_toast_refuse",
+                "toast_pub",
+                vec![
+                    "public.toasty".into(),
+                    "public.Mixed Docs".into(),
+                    "public.plain".into(),
+                ],
+                AllowList::default(),
+            )
+            .await;
+            src.registry = registry;
+            src.backend = backend;
+            src.set_complete_rows_required(complete);
+            src
+        }
+    };
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+
+    // Run 1, every table FULL: streams; a graceful stop records the
+    // checkpoint.
+    {
+        let src = source(true).await;
+        let (tx, mut rx) =
+            test_common::acked_channel(&src, &ckpt, &src.id, 128);
+        let handle = src.run(tx, ckpt.clone()).await;
+        wait_ready(&handle, Duration::from_secs(3)).await?;
+        client
+            .execute("UPDATE plain SET n = n + 1 WHERE id = 1", &[])
+            .await?;
+        let ev = collect_until(&mut rx, Duration::from_secs(15), |e| {
+            e.iter().any(|x| x.source.table == "plain")
+        })
+        .await;
+        assert!(
+            ev.iter().any(|x| x.source.table == "plain"),
+            "run 1 streams"
+        );
+        handle.stop();
+        handle.join().await.ok();
+    }
+    let cp0 = ckpt
+        .get_raw("slot_toast_refuse")
+        .await?
+        .expect("run 1 checkpoint");
+
+    client
+        .batch_execute(
+            "ALTER TABLE toasty REPLICA IDENTITY DEFAULT;
+             ALTER TABLE \"Mixed Docs\" REPLICA IDENTITY NOTHING;",
+        )
+        .await?;
+
+    // Run 2, a sink needs complete rows: refused at start.
+    let src = source(true).await;
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
+    let handle = src.run(tx, ckpt.clone()).await;
+    let ended = timeout(Duration::from_secs(30), handle.join())
+        .await
+        .expect("the source stops at start")
+        .expect_err("refused");
+    let err = ended
+        .downcast_ref::<deltaforge_core::SourceError>()
+        .unwrap_or_else(|| panic!("a source error: {ended:#}"));
+    let text = err.root().to_string();
+    for statement in [
+        r#"ALTER TABLE "public"."Mixed Docs" REPLICA IDENTITY FULL;"#,
+        r#"ALTER TABLE "public"."toasty" REPLICA IDENTITY FULL;"#,
+    ] {
+        assert!(text.contains(statement), "{statement} missing: {text}");
+    }
+    assert!(text.contains("2 table(s)"), "{text}");
+    assert!(!text.contains("plain"), "no TOAST-capable column: {text}");
+    // Names only: no row value of any table.
+    let everything = format!("{ended:?} {text} {err}");
+    for value in ["c4ca4238", "secret-mixed-docs-value", "424242", "424243"] {
+        assert!(!everything.contains(value), "row value {value} exposed");
+    }
+    let draft = err.draft().expect("an incident");
+    assert_eq!(draft.reason_code, ReasonCode::PgTableUnsupported);
+    assert_eq!(
+        draft.evidence.get(K::BlockingCount),
+        Some(&V::Count { value: 2 })
+    );
+    // A name outside identifier characters is evidence as its digest.
+    assert!(draft.evidence.holds(K::Table, "public.Mixed Docs"));
+    assert!(
+        next_event(&mut rx, Duration::from_millis(200))
+            .await
+            .is_none(),
+        "nothing delivered"
+    );
+    assert_eq!(
+        ckpt.get_raw("slot_toast_refuse").await?.as_deref(),
+        Some(cp0.as_slice()),
+        "the checkpoint stays"
+    );
+
+    // Run 3, every sink accepts partial rows: no refusal.
+    let src = source(false).await;
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
+    let handle = src.run(tx, ckpt.clone()).await;
+    wait_ready(&handle, Duration::from_secs(3)).await?;
+    client
+        .execute("UPDATE plain SET n = n + 1 WHERE id = 1", &[])
+        .await?;
+    let ev = collect_until(&mut rx, Duration::from_secs(15), |e| {
+        e.iter().any(|x| x.source.table == "plain")
+    })
+    .await;
+    assert!(
+        ev.iter().any(|x| x.source.table == "plain"),
+        "a partial-row pipeline streams"
+    );
+    assert!(!handle.join.is_finished(), "a partial-row pipeline runs");
+    handle.stop();
+    handle.join().await.ok();
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_identity_change_stops_before_the_next_incomplete_row() -> Result<()>
+{
+    let (db, client) = pg_setup("toast_change").await?;
+    toast_table(&client, "FULL").await?;
+    let src = toast_source(&db, "slot_toast_change", true).await;
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
+    let handle = src.run(tx, ckpt).await;
+    next_toasty(&mut rx, Op::Read).await.expect("snapshot row");
+    client
+        .execute("UPDATE toasty SET small = 1 WHERE id = 1", &[])
+        .await?;
+    next_toasty(&mut rx, Op::Update)
+        .await
+        .expect("update under FULL");
+
+    // The identity drops to DEFAULT: the next update's Relation message is
+    // revalidated and the source stops before its row.
+    client
+        .batch_execute(
+            "ALTER TABLE toasty REPLICA IDENTITY DEFAULT;
+             UPDATE toasty SET small = 2 WHERE id = 1",
+        )
+        .await?;
+    let ended = timeout(Duration::from_secs(30), handle.join())
+        .await
+        .expect("the source stops");
+    let err = format!("{:?}", ended.expect_err("refused"));
+    assert!(err.contains("REPLICA IDENTITY FULL"), "{err}");
+    while let Some(ev) = next_event(&mut rx, Duration::from_millis(500)).await {
+        assert!(
+            !(ev.source.table == "toasty"
+                && test_common::row_view(ev.after.as_ref().unwrap())["small"]
+                    == serde_json::json!(2)),
+            "the incomplete row was delivered"
+        );
+    }
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_reconnect_revalidates_complete_rows() -> Result<()> {
+    let (db, client) = pg_setup("toast_reconnect").await?;
+    toast_table(&client, "FULL").await?;
+    let src = toast_source(&db, "slot_toast_reconnect", true).await;
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
+    let handle = src.run(tx, ckpt).await;
+    next_toasty(&mut rx, Op::Read).await.expect("snapshot row");
+    client
+        .execute("UPDATE toasty SET small = 1 WHERE id = 1", &[])
+        .await?;
+    next_toasty(&mut rx, Op::Update)
+        .await
+        .expect("update under FULL");
+
+    // The stream drops; while it is down the identity drops to DEFAULT and
+    // a row is updated. The reconnected session's Relation message is
+    // revalidated: the source stops before that row.
+    let (admin, admin_conn) = tokio_postgres::connect(
+        &pg_admin_dsn("postgres").await,
+        tokio_postgres::NoTls,
+    )
+    .await?;
+    tokio::spawn(async move {
+        admin_conn.await.ok();
+    });
+    admin
+        .batch_execute(
+            "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \
+             WHERE slot_name = 'slot_toast_reconnect' AND active_pid IS NOT NULL",
+        )
+        .await?;
+    client
+        .batch_execute(
+            "ALTER TABLE toasty REPLICA IDENTITY DEFAULT;
+             UPDATE toasty SET small = 2 WHERE id = 1",
+        )
+        .await?;
+    let ended = timeout(Duration::from_secs(60), handle.join())
+        .await
+        .expect("the source stops after reconnecting");
+    let err = format!("{:?}", ended.expect_err("refused"));
+    assert!(err.contains("REPLICA IDENTITY FULL"), "{err}");
+    while let Some(ev) = next_event(&mut rx, Duration::from_millis(500)).await {
+        assert!(
+            !(ev.source.table == "toasty"
+                && test_common::row_view(ev.after.as_ref().unwrap())["small"]
+                    == serde_json::json!(2)),
+            "the incomplete row was delivered"
+        );
+    }
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+/// After the stream drops and reconnects, a table kept at FULL is still
+/// reconstructed: an update made while the stream was down arrives with
+/// every unchanged TOAST value whole.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_full_identity_reconstructs_after_a_reconnect() -> Result<()> {
+    let (db, client) = pg_setup("toast_reconn_full").await?;
+    toast_table(&client, "FULL").await?;
+    let src = toast_source(&db, "slot_toast_reconn_full", true).await;
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 128);
+    let handle = src.run(tx, ckpt).await;
+    next_toasty(&mut rx, Op::Read).await.expect("snapshot row");
+    let body: String = client
+        .query_one("SELECT body FROM toasty", &[])
+        .await?
+        .get(0);
+
+    let (admin, admin_conn) = tokio_postgres::connect(
+        &pg_admin_dsn("postgres").await,
+        tokio_postgres::NoTls,
+    )
+    .await?;
+    tokio::spawn(async move {
+        admin_conn.await.ok();
+    });
+    admin
+        .batch_execute(
+            "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \
+             WHERE slot_name = 'slot_toast_reconn_full' AND active_pid IS NOT NULL",
+        )
+        .await?;
+    client
+        .execute("UPDATE toasty SET small = 7 WHERE id = 1", &[])
+        .await?;
+
+    let u = next_toasty(&mut rx, Op::Update)
+        .await
+        .expect("the update arrives after the reconnect");
+    for col in TOASTED {
+        assert!(
+            !matches!(value(&u.after, col), CanonicalValue::Unchanged),
+            "{col} left unavailable after the reconnect"
+        );
+        assert_eq!(value(&u.after, col), value(&u.before, col), "{col}");
+    }
+    let view = test_common::row_view(u.after.as_ref().unwrap());
+    assert_eq!(view["body"], serde_json::Value::String(body));
+    assert_eq!(view["small"], serde_json::json!(7));
+    assert!(!handle.join.is_finished(), "the source keeps running");
+    handle.stop();
+    let _ = timeout(Duration::from_secs(10), handle.join()).await;
     pg_drop_db(&db).await;
     Ok(())
 }

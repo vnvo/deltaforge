@@ -531,6 +531,15 @@ pub enum TupleValue<'a> {
     Binary,
 }
 
+/// What [`PgRowDecoder::reconstruct_unchanged`] did to one row.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Reconstruction {
+    /// Unchanged values filled from the full old row.
+    pub reconstructed: u64,
+    /// Unchanged values left unavailable (no full old row, or no value in it).
+    pub unavailable: u64,
+}
+
 /// Which row image a tuple is: only an update's new image may hold
 /// unchanged TOAST values, and a key-only old image (`K`) holds only the
 /// key columns (PostgreSQL sends no value for the others, so they are not
@@ -604,6 +613,36 @@ impl PgRowDecoder {
             type_name: String::new(),
             reason: e.0,
         })
+    }
+
+    /// Fill an update's unchanged TOAST values from its old row. PostgreSQL
+    /// leaves an unchanged out-of-line value out of the new row; under
+    /// REPLICA IDENTITY FULL it sends the complete old row, whose value of
+    /// that column is the unchanged value, exactly (proven per major by
+    /// `postgres_toast_old_image_e2e`). `full_before`: the old row, only when
+    /// it is that full image. Both rows were decoded by this decoder, so a
+    /// column's declared type is the same in both. A value whose old copy is
+    /// missing or itself unavailable stays unchanged (unavailable).
+    pub fn reconstruct_unchanged(
+        after: &mut CanonicalRow,
+        full_before: Option<&CanonicalRow>,
+    ) -> Reconstruction {
+        let mut outcome = Reconstruction::default();
+        let unchanged: Vec<String> = after
+            .iter()
+            .filter(|(_, v)| matches!(v, CanonicalValue::Unchanged))
+            .map(|(name, _)| name.to_string())
+            .collect();
+        for name in unchanged {
+            match full_before.and_then(|before| before.get(&name)) {
+                Some(old) if !matches!(old, CanonicalValue::Unchanged) => {
+                    after.set(name, old.clone());
+                    outcome.reconstructed += 1;
+                }
+                _ => outcome.unavailable += 1,
+            }
+        }
+        outcome
     }
 
     /// Decode a snapshot row read with the simple-query protocol (each

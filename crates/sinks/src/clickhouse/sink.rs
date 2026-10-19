@@ -211,6 +211,11 @@ async fn table_state(
 
 #[async_trait]
 impl Sink for ClickHouseSink {
+    /// A ClickHouse row has a value for every column.
+    fn requires_complete_rows(&self) -> bool {
+        true
+    }
+
     /// Nothing is buffered after an acknowledged batch: every INSERT of an
     /// acknowledged batch returned 2xx with `wait_for_async_insert=1` (so the
     /// rows are in the table even under `async_insert`) before `send_batch`

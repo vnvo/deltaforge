@@ -50,6 +50,12 @@ fn incomparable_checkpoint_error(
     ))
 }
 
+/// Whether the source must send complete rows: the strictest sink decides,
+/// so one sink that needs them is enough.
+fn complete_rows_required(sinks: &[deltaforge_core::ArcDynSink]) -> bool {
+    sinks.iter().any(|s| s.requires_complete_rows())
+}
+
 /// A pipeline's commit policy and sink cohort for its source (an unset policy
 /// is `Required`, as the delivery task applies it).
 pub fn snapshot_cohort(
@@ -1147,6 +1153,7 @@ impl PipelineManager {
             snapshot_cohort(spec.spec.commit_policy.as_ref(), &sinks)
         );
         source.set_snapshot_cohort(snapshot_cohort_of(&spec));
+        source.set_complete_rows_required(complete_rows_required(&sinks));
         let src_handle = source.run(event_tx, source_ckpt).await;
 
         // Supervise the source task: the moment it exits without an explicit
@@ -2973,6 +2980,35 @@ mod tests {
         BatchConfig, CommitPolicy, Metadata, MysqlSrcCfg, RedisSinkCfg,
         SinkCfg, SnapshotCfg, SourceCfg, Spec,
     };
+
+    struct RowsSink(bool);
+
+    #[async_trait::async_trait]
+    impl deltaforge_core::Sink for RowsSink {
+        fn id(&self) -> &str {
+            "rows"
+        }
+        async fn send(
+            &self,
+            _: &deltaforge_core::Event,
+        ) -> deltaforge_core::SinkResult<()> {
+            Ok(())
+        }
+        fn requires_complete_rows(&self) -> bool {
+            self.0
+        }
+    }
+
+    #[test]
+    fn one_sink_needing_complete_rows_requires_them() {
+        let sinks = |needs: &[bool]| -> Vec<deltaforge_core::ArcDynSink> {
+            needs.iter().map(|n| Arc::new(RowsSink(*n)) as _).collect()
+        };
+        assert!(!complete_rows_required(&sinks(&[])));
+        assert!(!complete_rows_required(&sinks(&[false, false])));
+        assert!(complete_rows_required(&sinks(&[false, true])));
+        assert!(complete_rows_required(&sinks(&[true])));
+    }
 
     #[test]
     fn coordinator_exit_failed_classifies_every_exit() {

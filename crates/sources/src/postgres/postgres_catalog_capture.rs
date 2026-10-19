@@ -248,6 +248,25 @@ impl CatalogSession {
         self.client = None;
     }
 
+    /// The TOAST-capable columns of a relation (see `postgres_toast`).
+    pub(crate) async fn toastable_columns(
+        &mut self,
+        relation_id: u32,
+    ) -> SourceResult<Vec<String>> {
+        let result = self
+            .client()
+            .await?
+            .query_one(super::postgres_toast::RELATION_SQL, &[&relation_id])
+            .await;
+        match result {
+            Ok(row) => Ok(row.get(0)),
+            Err(e) => {
+                self.reset();
+                Err(query_error("toast columns", e))
+            }
+        }
+    }
+
     /// Use `dsn` from the next connection on (credential rotation); the
     /// current connection is dropped.
     pub(crate) fn set_dsn(&mut self, dsn: crate::credentials::ProtectedDsn) {

@@ -33,6 +33,7 @@ use postgres_snapshot::IdentitySpec;
 mod event_counters;
 mod feedback_delay;
 mod postgres_errors;
+mod postgres_toast;
 use postgres_errors::LoopControl;
 pub use postgres_errors::{PostgresSourceError, PostgresSourceResult};
 
@@ -353,6 +354,8 @@ pub(crate) struct RunCtx {
     pub pause_notify: Arc<Notify>,
     pub schema: PostgresSchemaLoader,
     pub allow: AllowList,
+    /// A sink of the pipeline needs complete rows (see `postgres_toast`).
+    pub complete_rows: bool,
     /// The publication and the registration this run accepted (verified
     /// again before every stream's first message).
     pub publication: String,
@@ -1584,6 +1587,24 @@ impl PostgresSource {
             }
         };
 
+        // Complete rows, before anything is snapshotted or streamed: a sink of
+        // the pipeline needs every value, so every captured table with
+        // TOAST-capable columns must send its full old row.
+        if self
+            .snapshot_cohort
+            .lock()
+            .expect("not poisoned")
+            .complete_rows_required
+        {
+            postgres_toast::preflight(
+                self.dsn.expose(),
+                &self.id,
+                std::slice::from_ref(&self.publication),
+                &AllowList::new(&self.tables),
+            )
+            .await?;
+        }
+
         // The immutable-publication contract, before anything is snapshotted,
         // decoded, emitted or checkpointed: registered, enforced, unchanged
         // since the registration this source accepted (or re-registered under
@@ -1750,6 +1771,11 @@ impl PostgresSource {
             pause_notify,
             schema: schema_loader,
             allow: AllowList::new(&self.tables),
+            complete_rows: self
+                .snapshot_cohort
+                .lock()
+                .expect("not poisoned")
+                .complete_rows_required,
             publication: self.publication.clone(),
             publication_registration: admitted.registration.clone(),
             retry: RetryPolicy::default(),
@@ -2701,6 +2727,13 @@ impl Source for PostgresSource {
 
     fn checkpoint_is_snapshot(&self, raw: &[u8]) -> bool {
         pg_checkpoint_is_snapshot(raw)
+    }
+
+    fn set_complete_rows_required(&self, required: bool) {
+        self.snapshot_cohort
+            .lock()
+            .expect("not poisoned")
+            .complete_rows_required = required;
     }
 
     fn set_snapshot_cohort(&self, cohort: deltaforge_core::SnapshotCohort) {
