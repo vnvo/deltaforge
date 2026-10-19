@@ -152,7 +152,7 @@ Parquet output is unchanged (677 bytes per row). Output size adds broker and net
 
 ## 4. Optimizations
 
-The four costs of section 3, and the further costs found by profiling the optimized build, are removed by separate commits. None changes any output. Native JSON is checked byte for byte against a golden written by the previous renderer: every value kind, every temporal precision, both mapping versions and both wide-integer modes. Avro is checked against a golden written by the previous encoder: every MySQL column type, both schema paths, three envelopes, inserts, updates, deletes and extensions. The key writers are checked against the formulas they replace, and the script's input object against the one built through a JSON tree. Twenty-one targeted mutants were run against these tests; twenty are caught. The survivor writes an Avro row placeholder as `null` instead of `{}`, which is equivalent for every table with at least one column.
+The four costs of section 3, and the further costs found by profiling the optimized build, are removed by separate commits. None changes any output. Native JSON is checked byte for byte against a golden written by the previous renderer: every value kind, every temporal precision, both mapping versions and both wide-integer modes. Avro is checked against a golden written by the previous encoder: every MySQL column type, both schema paths, three envelopes, inserts, updates, deletes and extensions. The key writers are checked against the formulas they replace, and the script's input object against the one built through a JSON tree. Twenty-five targeted mutants were run against these tests and the coordinator's and Kafka sink's suites; twenty-four are caught. One behavior has no test that reaches it: an Avro batch is still prepared in full before its first record is enqueued, and only a schema registry failure part-way through a batch would show the difference. The survivor writes an Avro row placeholder as `null` instead of `{}`, which is equivalent for every table with at least one column.
 
 | Commit | Change |
 |---|---|
@@ -166,6 +166,8 @@ The four costs of section 3, and the further costs found by profiling the optimi
 | Event id text | The id's text (in every payload, key and script input) was built by hex-encoding into a `String` and formatting it. It is now written from a stack buffer. |
 | JS inputs | Each script input was rendered to a JSON tree (its payload, then clones of its JavaScript-safe rows) and that tree converted to V8. It is now serialized into V8 from the event and the renderings kept for re-typing, with the same keys in the same order. |
 | Schema references | Batch schema resolution and the JS processor built an owned reference (five strings) and hashed it for every event. Consecutive events of one version are now compared with it in place, and column types are looked up at their schema position first. |
+| Kafka enqueue as prepared | A batch was encoded in full before its first record reached librdkafka, so encoding time and the wait for delivery reports added up (about 7 ms and 15-25 ms per 2,000-event batch). Native JSON records are now enqueued as soon as each is prepared, so librdkafka sends early records while later ones are encoded. A JSON record fails only per event, to the DLQ. Avro batches are still prepared in full first: a schema registry failure fails the whole batch, and then nothing of it may be enqueued. A transactional batch begins its transaction before its first record. |
+| Processing overlapped with delivery | The coordinator's delivery task ran a batch's processors, then delivered and committed it, so processing and delivery times added up. Once a batch is processed, the next queued item's processors now run while it is delivered. Processing stays sequential and in order; delivery and commits stay one at a time and in order; a processing failure surfaces only after the batches before it are delivered and committed. At most one more batch is held (processed, awaiting delivery). |
 
 ### 4.1 Per hotspot, in process
 
@@ -221,31 +223,41 @@ A typed reader saved too little, because exact semantics still require enumerati
 
 ### 4.2 Interleaved matrix
 
-The cells of section 2.1 and the two latency cells: release builds, 3 repetitions alternating version order (`target/perf/final2-accept`). Base is `d44d0be`; optimized is `9dc8e865`, whose runtime code is that of the final commit. The host was less loaded than for section 2.1, so absolute rates are higher for both versions. CPU and system time are seconds per 100k rows.
+The cells of section 2.1 and the two latency cells, release builds, 5 repetitions alternating version order (`target/perf/final3`). Base is `d44d0be`; optimized is `bf0ebe77`, whose runtime code is that of the final commit. CPU and system time are seconds per 100k rows. The paired ratios are repetition *i* of the optimized build over repetition *i* of the base, run next to each other, so each pair shares the host's state.
 
-| Cell | Base rows/s | Optimized | Ratio | CPU base | Optimized | System base | Optimized | Bytes/row base | Optimized |
-|---|---|---|---|---|---|---|---|---|---|
-| MySQL CDC JSON narrow | 113,000 | 108,568 | 0.96 | 1.03 | 1.09 | 0.12 | 0.18 | 844 | 944 |
-| MySQL CDC JSON wide | 36,610 | 36,867 | 1.01 | 3.38 | 3.28 | 0.70 | 0.66 | 2,108 | 2,208 |
-| MySQL CDC JSON binary | 59,139 | 61,012 | 1.03 | 2.10 | 1.98 | 0.60 | 0.60 | 2,220 | 2,306 |
-| MySQL CDC JSON temporal | 80,000 | 74,741 | 0.93 | 1.74 | 1.67 | 0.31 | 0.31 | 1,262 | 1,421 |
-| MySQL CDC JSON null-heavy | 57,653 | 59,387 | 1.03 | 2.08 | 2.02 | 0.54 | 0.50 | 1,492 | 1,588 |
-| MySQL CDC Avro narrow | 50,497 | 68,144 | 1.35 | 1.99 | 1.54 | 0.09 | 0.11 | 456 | 523 |
-| MySQL CDC Avro wide | 16,987 | 28,128 | 1.66 | 6.50 | 4.04 | 0.58 | 0.48 | 1,146 | 1,209 |
-| MySQL CDC Parquet wide | 19,920 | 22,367 | 1.12 | 3.76 | 3.02 | 0.60 | 0.46 | 677 | 677 |
-| MySQL snapshot JSON narrow | 127,612 | 167,769 | 1.31 | 1.01 | 1.04 | 0.17 | 0.32 | 670 | 756 |
-| MySQL snapshot JSON temporal | 81,457 | 90,280 | 1.11 | 1.92 | 1.81 | 0.36 | 0.53 | 1,137 | 1,233 |
-| MySQL CDC JSON ints10 | 89,593 | 83,000 | 0.93 | 1.20 | 1.40 | 0.24 | 0.32 | 919 | 1,005 |
-| MySQL CDC JSON ints200 | 18,824 | 17,605 | 0.94 | 6.68 | 7.06 | 1.62 | 1.48 | 4,135 | 4,223 |
-| MySQL CDC JSON narrow + JS | 34,261 | 33,414 | 0.98 | 3.14 | 3.24 | 0.36 | 0.44 | 869 | 973 |
-| PostgreSQL snapshot JSON narrow | 112,954 | 149,921 | 1.33 | 0.99 | 1.12 | 0.15 | 0.34 | 718 | 763 |
-| MySQL latency JSON narrow (p50/p99 ms) | 57/107 | 54/106 | | | | | | 841 | 941 |
-| MySQL latency Avro narrow (p50/p99 ms) | 55/108 | 57/106 | | | | | | 456 | 523 |
+| Cell | Base rows/s | Optimized | Median ratio | Paired min-max | Pairs at or above 1.00 | CPU base | Optimized | System base | Optimized | Bytes/row base | Optimized |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| MySQL CDC JSON narrow | 113,483 | 135,352 | 1.19 | 1.16-1.21 | 5/5 | 1.01 | 0.95 | 0.12 | 0.12 | 844 | 945 |
+| MySQL CDC JSON wide | 36,736 | 46,005 | 1.25 | 1.21-1.27 | 5/5 | 3.38 | 3.12 | 0.66 | 0.52 | 2,108 | 2,208 |
+| MySQL CDC JSON binary | 58,908 | 73,379 | 1.25 | 1.18-1.27 | 5/5 | 2.04 | 1.94 | 0.60 | 0.52 | 2,220 | 2,307 |
+| MySQL CDC JSON temporal | 78,869 | 91,576 | 1.16 | 1.10-1.22 | 5/5 | 1.77 | 1.61 | 0.31 | 0.26 | 1,263 | 1,421 |
+| MySQL CDC JSON null-heavy | 58,289 | 71,898 | 1.23 | 1.17-1.27 | 5/5 | 2.14 | 1.80 | 0.48 | 0.36 | 1,494 | 1,588 |
+| MySQL CDC Avro narrow | 50,597 | 70,653 | 1.40 | 1.34-1.45 | 5/5 | 1.97 | 1.50 | 0.09 | 0.11 | 456 | 523 |
+| MySQL CDC Avro wide | 16,670 | 28,009 | 1.68 | 1.56-1.70 | 5/5 | 6.68 | 4.06 | 0.58 | 0.48 | 1,146 | 1,209 |
+| MySQL CDC Parquet wide | 19,910 | 22,102 | 1.11 | 0.99-1.12 | 4/5 | 3.72 | 3.10 | 0.60 | 0.46 | 677 | 677 |
+| MySQL snapshot JSON narrow | 122,581 | 225,824 | 1.84 | 1.68-1.85 | 5/5 | 1.07 | 0.90 | 0.15 | 0.22 | 670 | 756 |
+| MySQL snapshot JSON temporal | 83,296 | 119,892 | 1.44 | 1.38-1.46 | 5/5 | 1.91 | 1.66 | 0.36 | 0.37 | 1,137 | 1,233 |
+| MySQL CDC JSON ints10 | 87,199 | 104,749 | 1.20 | 1.14-1.29 | 5/5 | 1.28 | 1.18 | 0.24 | 0.22 | 919 | 1,006 |
+| MySQL CDC JSON ints200 | 18,948 | 21,299 | 1.12 | 1.08-1.15 | 5/5 | 6.60 | 6.62 | 1.48 | 1.28 | 4,135 | 4,224 |
+| MySQL CDC JSON narrow + JS | 34,335 | 38,948 | 1.13 | 1.07-1.17 | 5/5 | 3.14 | 3.26 | 0.38 | 0.36 | 869 | 973 |
+| PostgreSQL snapshot JSON narrow | 113,440 | 176,473 | 1.56 | 1.41-1.66 | 5/5 | 1.01 | 0.93 | 0.16 | 0.22 | 718 | 763 |
 
-Every representative cell is at 0.93 or above, and latency is unchanged. The run-to-run spread is a few percent:
-- CDC JSON narrow measured 0.91, 0.93, 0.95, 0.96 and 0.97 over five separate interleaved runs of this code;
-- narrow + JS measured 0.97 and 0.98 in two runs;
-- temporal and ints10 were measured once each, at 0.93.
+**Variability.** Every cell's median is at least 1.11. In thirteen of the fourteen cells every one of the five pairs is above 1.00, and the lowest of them is 1.07 (JavaScript). Parquet wide has one pair at 0.99 against a median of 1.11; its other four pairs are 1.10 to 1.12. The spread of the paired ratios within a cell is 0.03 to 0.15, so no cell's median is within its own noise of 1.00.
+
+**Latency** (the latency cells run 2,000 single-row transactions at a fixed 200 per second, so their rate is not a measure):
+
+| Cell | p50/p99 ms base | Optimized |
+|---|---|---|
+| MySQL latency JSON narrow | 56/107 | 56/107 |
+| MySQL latency Avro narrow | 58/107 | 57/107 |
+
+Latency is unchanged.
+
+**Where the improvement comes from.** In-process costs are at or below the base version's (section 4.1). The two scheduling changes remove waits the base version also had:
+- Kafka records are enqueued as they are encoded.
+- A pipeline's processors run while the previous batch is delivered.
+
+They do not change what is delivered, in what order, or when a checkpoint commits. The optimized build sends 100-160 more bytes per row (the relation identity in the key, `source.type_mapping`, temporal text; section 3.2) and still delivers more rows per second.
 
 Against the current main (`6b568a1`; `target/perf/opt-vs-main`, measured on the first optimized commit), the optimized build is as fast or faster in every cell, up to 2.12 times:
 - MySQL CDC JSON: 1.00 (ints10) to 1.38;
@@ -255,23 +267,30 @@ Against the current main (`6b568a1`; `target/perf/opt-vs-main`, measured on the 
 - JavaScript: 1.05 to 1.15;
 - PostgreSQL CDC, no longer capped (see section 2.2): 1.16 for JSON, 1.51 for Avro and 1.53 for Parquet.
 
-**Allocation requests per row** (stats builds, one repetition; `target/perf/final2-allocs`, and `final-allocs2-main` for main):
+The scheduling changes came after that run, so the current figures are higher.
+
+**Allocation requests per row** (stats builds, one repetition; `target/perf/final3-allocs`, and `final-allocs2-main` for main):
 
 | Cell | Base | main | Optimized |
 |---|---|---|---|
 | MySQL CDC JSON narrow | 57 | 88 | 46 |
 | MySQL CDC JSON wide | 252 | 408 | 185 |
+| MySQL CDC JSON binary | 97 | 117 | 68 |
 | MySQL CDC JSON temporal | 118 | 236 | 55 |
+| MySQL CDC JSON null-heavy | 120 | 208 | 103 |
 | MySQL CDC Avro narrow | 570 | 651 | 183 |
 | MySQL CDC Avro wide | 2,186 | 2,450 | 462 |
 | MySQL CDC Parquet wide | 382 | 513 | 321 |
+| MySQL snapshot JSON narrow | 62 | 78 | 37 |
 | MySQL snapshot JSON temporal | 114 | 230 | 49 |
+| MySQL CDC JSON ints10 | 55 | 82 | 43 |
 | MySQL CDC JSON ints200 | 266 | 487 | 254 |
 | MySQL CDC JSON narrow + JS | 209 | 325 | 171 |
+| PostgreSQL snapshot JSON narrow | 48 | 78 | 37 |
 
 Every cell allocates less than the base version. Temporal and wide rows carry no allocation penalty, and nothing grows faster than linearly with row width.
 
-### 4.3 The remaining system time, and the C allocator
+### 4.3 System time and the C allocator
 
 In the narrow Kafka cells the optimized build's user time per row is that of the base version (0.90 against 0.89 seconds per 100k rows). Its extra CPU is system time: 0.18-0.20 against 0.12. The harness's kernel counters show the same read and write system calls per row, but almost twice the minor page faults: 0.82 per row against 0.45.
 
@@ -281,7 +300,7 @@ Two experiments identify the source:
 
 The faults therefore come from glibc's heap, which only the C libraries use (librdkafka here). librdkafka allocates the per-message `df-type-mapping` header (the mapping version, part of the canonical contract) as three small blocks on the producing thread and frees them on its poll thread. That churn makes glibc consolidate and trim its heaps, and the trimmed pages fault back in.
 
-The code fixes in this section halved that churn (the header clone is gone) and bring every cell above 0.90 without changing any allocator. Tuning glibc for C libraries (trim and mmap thresholds, by `mallopt` at startup or by environment) would remove the rest. Linking jemalloc unprefixed would do the same. Either changes how every bundled C library allocates and how much memory it keeps, so it is left for a separate, qualified decision. That decision should cover memory use, latency, durability and long-running workloads.
+The code fixes in this section halved that churn (the header clone is gone). With records enqueued as they are encoded, the narrow cell's system time is the base version's (0.12 against 0.12 seconds per 100k rows), and every cell is faster than the base version without changing any allocator. Tuning glibc for C libraries (trim and mmap thresholds, by `mallopt` at startup or by environment) would remove the rest. Linking jemalloc unprefixed would do the same. Either changes how every bundled C library allocates and how much memory it keeps, so it is left for a separate, qualified decision. That decision should cover memory use, latency, durability and long-running workloads.
 ## 5. Kafka key audit
 
 The default Kafka key is `tenant|relation|transaction|event id` (`Event::idempotency_key`), where the relation is the canonical `connector/source/database/namespace/table` (the base version used `database.table`). The key is longer by the connector, the source name and the namespace: about 40-90 bytes with typical names.
