@@ -886,10 +886,52 @@ impl Process {
 
     /// utime + stime, seconds.
     fn cpu_secs(&self) -> f64 {
+        let (user, sys) = self.cpu_split();
+        user + sys
+    }
+
+    /// Kernel counters: read and write system calls (`/proc/<pid>/io`
+    /// `syscr`, `syscw`), the main thread's voluntary and involuntary
+    /// context switches, and the process's minor page faults.
+    fn kernel_counts(&self) -> [u64; 5] {
+        let read = |file: &str| {
+            std::fs::read_to_string(format!("/proc/{}/{file}", self.pid))
+                .unwrap_or_default()
+        };
+        let field = |text: &str, name: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(name))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0)
+        };
+        let (io, status, stat) = (read("io"), read("status"), read("stat"));
+        // minflt = field 10 (1-based); after the command name, field 3 is
+        // the first.
+        let minflt = stat
+            .rsplit_once(')')
+            .and_then(|(_, r)| r.split_whitespace().nth(7))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        [
+            field(&io, "syscr:"),
+            field(&io, "syscw:"),
+            field(&status, "voluntary_ctxt_switches:"),
+            field(&status, "nonvoluntary_ctxt_switches:"),
+            minflt,
+        ]
+    }
+
+    /// stime (system time), seconds.
+    fn sys_secs(&self) -> f64 {
+        self.cpu_split().1
+    }
+
+    /// (utime, stime), seconds.
+    fn cpu_split(&self) -> (f64, f64) {
         let Ok(stat) =
             std::fs::read_to_string(format!("/proc/{}/stat", self.pid))
         else {
-            return 0.0;
+            return (0.0, 0.0);
         };
         // Fields after the parenthesized command name.
         let rest = stat.rsplit_once(')').map(|(_, r)| r).unwrap_or("");
@@ -898,7 +940,7 @@ impl Process {
             f.get(i).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0)
         };
         // utime = field 14, stime = 15 (1-based); `rest` starts at field 3.
-        (ticks(11) + ticks(12)) / 100.0
+        (ticks(11) / 100.0, ticks(12) / 100.0)
     }
 
     fn rss_kib(&self) -> u64 {
@@ -1175,6 +1217,11 @@ struct Measured {
     secs: f64,
     rows_per_sec: f64,
     cpu_secs: f64,
+    /// The system (kernel) part of `cpu_secs`.
+    sys_secs: f64,
+    /// Read and write system calls, the main thread's voluntary and
+    /// involuntary context switches, and minor page faults in the window.
+    kernel: [u64; 5],
     rss_peak_mib: f64,
     db_cpu_secs: Option<f64>,
     out_bytes: u64,
@@ -1194,6 +1241,9 @@ impl Measured {
         json!({
             "ok": self.ok, "error": self.error, "rows": self.rows, "secs": self.secs,
             "rows_per_sec": self.rows_per_sec, "cpu_secs": self.cpu_secs,
+            "sys_secs": self.sys_secs, "syscr": self.kernel[0],
+            "syscw": self.kernel[1], "vcsw": self.kernel[2],
+            "ivcsw": self.kernel[3], "minflt": self.kernel[4],
             "rss_peak_mib": self.rss_peak_mib, "db_cpu_secs": self.db_cpu_secs,
             "out_bytes": self.out_bytes, "allocs": self.allocs,
             "lat_p50_ms": self.lat_p50_ms, "lat_p99_ms": self.lat_p99_ms,
@@ -1386,7 +1436,11 @@ async fn run_inner(
         let mut last_tx_lsn: Option<u64> = None;
         let window_start = || async {
             (
-                process.cpu_secs(),
+                (
+                    process.cpu_secs(),
+                    process.sys_secs(),
+                    process.kernel_counts(),
+                ),
                 infra.db_cpu_usec(engine),
                 infra.state_reads(&state_db).await,
                 feedback_reads().await,
@@ -1516,7 +1570,11 @@ async fn run_inner(
                 .unwrap_or_else(Instant::now)
         };
         let secs = t_end.duration_since(t0).as_secs_f64();
-        let cpu = process.cpu_secs() - cpu0;
+        let cpu = process.cpu_secs() - cpu0.0;
+        let sys = process.sys_secs() - cpu0.1;
+        let k1 = process.kernel_counts();
+        let kernel: [u64; 5] =
+            std::array::from_fn(|i| k1[i].saturating_sub(cpu0.2[i]));
         let kv_reads = match (reads0, infra.state_reads(&state_db).await) {
             (Some(a), Some(b)) => Some(b.saturating_sub(a)),
             _ => None,
@@ -1582,6 +1640,8 @@ async fn run_inner(
             secs,
             rows_per_sec: rows as f64 / secs,
             cpu_secs: cpu,
+            sys_secs: sys,
+            kernel,
             rss_peak_mib: rss_peak as f64 / 1024.0,
             db_cpu_secs: db,
             out_bytes: bytes,
@@ -1850,8 +1910,8 @@ async fn measure(
     // Summary: medians per cell and version, and B/A ratios.
     let (a, b) = (&binaries[0].0, &binaries[1].0);
     let mut md = format!(
-        "| cell | {a} rows/s | {b} rows/s | {b}/{a} | cpu s/100k {a} | {b} | rss MiB {a} | {b} | allocs/row {a} | {b} | bytes/row {a} | {b} | db cpu s {a} | {b} | p50/p99 ms {a} | {b} | failures |\n|{}\n",
-        "---|".repeat(18)
+        "| cell | {a} rows/s | {b} rows/s | {b}/{a} | cpu s/100k {a} | {b} | rss MiB {a} | {b} | allocs/row {a} | {b} | bytes/row {a} | {b} | db cpu s {a} | {b} | p50/p99 ms {a} | {b} | failures | sys s/100k {a} | {b} |\n|{}\n",
+        "---|".repeat(20)
     );
     for cell in &cells {
         let get = |l: &str| {
@@ -1871,6 +1931,9 @@ async fn measure(
         let thr = |v: &Vec<Measured>| med(v, &|m| Some(m.rows_per_sec));
         let cpu = |v: &Vec<Measured>| {
             med(v, &|m| Some(m.cpu_secs / m.rows as f64 * 1e5))
+        };
+        let sys = |v: &Vec<Measured>| {
+            med(v, &|m| Some(m.sys_secs / m.rows as f64 * 1e5))
         };
         let rss = |v: &Vec<Measured>| med(v, &|m| Some(m.rss_peak_mib));
         let alloc = |v: &Vec<Measured>| {
@@ -1896,7 +1959,7 @@ async fn measure(
         };
         let failures = ra.len() - oa.len() + rb.len() - ob.len();
         md.push_str(&format!(
-            "| {} | {} | {} | {ratio} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {failures} |\n",
+            "| {} | {} | {} | {ratio} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {failures} | {} | {} |\n",
             cell.id(),
             f(thr(&oa), 0), f(thr(&ob), 0),
             f(cpu(&oa), 2), f(cpu(&ob), 2),
@@ -1905,6 +1968,7 @@ async fn measure(
             f(bytes(&oa), 0), f(bytes(&ob), 0),
             f(db(&oa), 1), f(db(&ob), 1),
             lat(&oa), lat(&ob),
+            f(sys(&oa), 2), f(sys(&ob), 2),
         ));
     }
     std::fs::write(args.out.join("summary.md"), md)?;
