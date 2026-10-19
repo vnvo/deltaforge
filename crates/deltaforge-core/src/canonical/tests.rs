@@ -631,6 +631,14 @@ fn an_extension_never_overwrites_an_unchanged_column_in_rendering() {
     )
     .unwrap();
     assert!(render_row(&row, v2()).is_ok());
+    // A column set after an extension of its name, present or unchanged.
+    for value in [CanonicalValue::Null, CanonicalValue::Unchanged] {
+        let mut collided = row.clone();
+        collided.set("x", value);
+        let err = render_row(&collided, v2()).unwrap_err();
+        assert_eq!(err.column, "x");
+        assert_eq!(err.failure, RenderFailure::ExtensionCollision);
+    }
 }
 
 // ----- rendering golden ---------------------------------------------------

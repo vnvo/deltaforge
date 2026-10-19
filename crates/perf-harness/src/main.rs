@@ -12,7 +12,8 @@
 //! - latency (Kafka): commit-to-arrival of single-row transactions at a
 //!   steady rate;
 //! - process CPU (`/proc/<pid>/stat`), peak resident memory (sampled
-//!   `VmRSS`), allocations (jemalloc's exit statistics, minus an idle run's),
+//!   `VmRSS`), allocation requests (jemalloc's exit statistics of a build
+//!   with `tikv-jemallocator/stats`, minus an idle run's),
 //!   output bytes (Kafka payloads and keys, S3 data objects) and database CPU
 //!   (its container's cgroup) over the delivery window.
 //!
@@ -927,17 +928,24 @@ impl Process {
             self.child.kill().await.ok();
             return None;
         }
-        nmalloc(&std::fs::read_to_string(&self.stderr).ok()?)
+        alloc_requests(&std::fs::read_to_string(&self.stderr).ok()?)
     }
 }
 
-/// The merged arenas' total `nmalloc` from jemalloc's `stats_print`.
-fn nmalloc(stats: &str) -> Option<u64> {
-    let merged = stats.find("Merged arenas stats")?;
-    stats[merged..]
+/// The merged arenas' total allocation requests (`nrequests`) from
+/// jemalloc's `stats_print`. `nmalloc` counts only the allocations that
+/// reached an arena (thread-cache fills), not every request.
+fn alloc_requests(stats: &str) -> Option<u64> {
+    let merged = &stats[stats.find("Merged arenas stats")?..];
+    let header = merged.lines().find(|l| l.contains("nrequests"))?;
+    // The header's columns, in the order of the `total:` line's values.
+    let column = header
+        .split_whitespace()
+        .position(|c| c == "nrequests")?;
+    merged
         .lines()
         .find(|l| l.trim_start().starts_with("total:"))
-        .and_then(|l| l.split_whitespace().nth(2))
+        .and_then(|l| l.split_whitespace().nth(column + 1))
         .and_then(|v| v.parse().ok())
 }
 
@@ -1955,4 +1963,18 @@ async fn measure(
     std::fs::write(args.out.join("feedback.md"), fb)?;
     eprintln!("summary: {}", args.out.join("summary.md").display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn allocations_are_the_merged_request_count() {
+        let stats = "Merged arenas stats:\n\
+            assigned threads: 2\n\
+            \x20                allocated  nmalloc (#/sec) ndalloc (#/sec) nrequests (#/sec)\n\
+            small:              1191776  5110527  730075  5107728  729675  9767705  1395386\n\
+            total:              1757024  5112312  730330  5109503  729929  9772547  1396078\n";
+        assert_eq!(super::alloc_requests(stats), Some(9_772_547));
+        assert_eq!(super::alloc_requests("no stats"), None);
+    }
 }
