@@ -50,7 +50,7 @@ Rows are written 500 per statement, so each source transaction holds 500 rows. P
 - throughput: rows / window;
 - process CPU (`utime + stime`), reported per 100k rows;
 - peak RSS (sampled `VmRSS`);
-- allocations: not available. The release jemalloc is built without statistics (`config.stats` false), so allocation pressure is read from CPU profiles instead (section 3);
+- allocations: not available in the release build (its jemalloc has no statistics), so section 3 reads allocation pressure from CPU profiles. Section 4 counts allocation requests with builds that add `--features tikv-jemallocator/stats` (jemalloc's `nrequests` at exit, minus an idle run's);
 - output bytes per row: Kafka payloads and keys, or S3 Parquet data objects;
 - database CPU: the database container's cgroup `usage_usec`;
 - for snapshots, the window is the snapshot duration;
@@ -150,14 +150,92 @@ JSON and Avro output grows by a roughly constant 100-130 bytes per row, whatever
 
 Parquet output is unchanged (677 bytes per row). Output size adds broker and network cost but did not drive the CPU differences above; Kafka plus LZ4 kept the same CPU share.
 
-## 4. Candidate optimizations (deferred)
+## 4. Optimizations
 
-Absolute throughput is low in both versions, and optimization is deferred by decision. These candidates keep the reviewer's constraints: exact values, the mapping version kept, no unsafe wide integers, encoding plans cached by schema reference and mapping version, no per-row schema or name ownership, and output size reported separately from CPU.
+The four costs of section 3, and three more found by profiling the optimized build, are removed by separate commits. None changes any output: native JSON is checked byte for byte against a golden written by the previous renderer (every value kind, every temporal precision, both mapping versions and both wide-integer modes), Avro against a golden written by the previous encoder (every MySQL column type, both schema paths, three envelopes, inserts, updates, deletes and extensions), and the key writers against the formulas they replace. Thirteen targeted mutants were run against these tests; twelve are caught, and the survivor (writing an Avro row placeholder as `null` instead of `{}`) is equivalent for every table with at least one column.
 
-1. Serialize canonical rows directly into a reusable, pre-sized output buffer, with column names written from the cached schema, not owned per row (no `Map`, no `Value`). This addresses cost 1, most of the allocator growth, and part of cost 3.
-2. Render temporal values from their typed components with a fixed-width writer (no `format!`), parsing once at decode (cost 2).
-3. Encode Avro from canonical values with a plan cached per schema reference and mapping version, without the JSON envelope (cost 3).
-4. Cache each relation's identity string, key prefix and segment digest per relation and mapping version (cost 4).
-5. Pre-size per-batch buffers from the previous batch's size.
+| Commit | Change |
+|---|---|
+| 1. Streaming JSON | A row image is checked once, then written to the serializer column by column: no `Map`, no owned names, no per-column hashing. |
+| 2. Temporal text | Dates, times, date-times and timestamps are written digit by digit into a stack buffer: no `format!`, no intermediate strings. |
+| 3. Direct Avro | The envelope JSON holds `{}` where the rows go (Path A converts them from canonical values, Path C rebuilds them), so no row is rendered to be discarded. Each registered schema is prepared once (named types resolved, a writer that validates and encodes with them) instead of resolving the schema three times per event. Field paths and source types are written out only for a failure. |
+| 4. Identity and key material | The default Kafka key writes the relation's canonical encoding and the event id into one buffer. The Avro Path A cache is keyed by one length-prefixed string, so a cached event builds no relation, subject or schema identity. |
+| 5. Constant-time column lookup | Parquet, Avro and ClickHouse fetched each schema column from the row by a linear scan, so a row cost grew with the square of its width; the Parquet column check also formatted a name and scanned the schema per column. Lookups now try the column's schema position first. |
+| 6. JS boundary | Each row image was rendered three times and cloned twice per event; now once and once. |
+| 7. Row construction | A decoded row's duplicate-name check no longer allocates a hash set (up to 32 columns). |
 
-Each needs the interleaved rerun of section 2.1 afterwards, with output size reported separately from CPU.
+### 4.1 Per hotspot, in process
+
+`cargo bench -p deltaforge-core --bench canonical_encode`: one event at a time through the production path (`Native.wrap` then `Json.encode`; `AvroEncoder::encode_event` with DDL-derived schemas and a local registry; `Event::idempotency_key`), median of 9 runs, exact allocations per event from a counting allocator.
+
+| Case | main (ns, allocs) | after 1 | after 2 | after 3 | after 4 | final |
+|---|---|---|---|---|---|---|
+| JSON narrow | 1,231, 25 | 1,117, 18 | 848, 9 | | | 888, 9 |
+| JSON wide (60 columns) | 12,301, 219 | 6,120, 123 | 3,169, 11 | | | 3,368, 11 |
+| JSON temporal (20 columns) | 7,865, 178 | 6,383, 154 | 2,019, 9 | | | 2,033, 9 |
+| JSON null-heavy | 6,512, 93 | 2,344, 21 | 1,928, 10 | | | 1,870, 10 |
+| JSON 200 integers | 26,699, 242 | 4,644, 11 | 4,733, 11 | | | 4,751, 11 |
+| Avro narrow | 18,077, 544 | 16,812, 537 | 16,836, 528 | 8,019, 141 | 7,605, 123 | 7,478, 123 |
+| Avro wide | 84,798, 2,234 | 74,081, 2,138 | 65,741, 1,946 | 33,009, 281 | 31,636, 263 | 26,149, 263 |
+| Avro temporal | 37,552, 1,153 | 35,491, 1,129 | 29,293, 934 | 12,890, 178 | 12,554, 160 | 12,373, 160 |
+| Kafka key | 464, 12 | | | | 85, 1 | 73, 1 |
+
+Within commit 3, the row placeholders took Avro wide to 56,398 ns (1,834 allocations), prepared schemas to 35,211 (487) and deferred paths to 33,009 (281). JSON cost no longer grows with column count beyond the values themselves: 9 to 11 allocations per event at any width.
+
+### 4.2 Interleaved matrix
+
+The cells of section 2.1, release builds, 3 repetitions alternating version order (`target/perf/final-accept`; base `d44d0be`, optimized `ab85d33f`). The host was less loaded than for section 2.1, so absolute rates are higher for both versions.
+
+| Cell | Base rows/s | Optimized | Ratio | CPU s/100k base | Optimized | Bytes/row base | Optimized |
+|---|---|---|---|---|---|---|---|
+| MySQL CDC JSON narrow | 116,469 | 101,576 | 0.87 | 0.99 | 1.18 | 841 | 940 |
+| MySQL CDC JSON wide | 36,820 | 37,245 | 1.01 | 3.38 | 3.22 | 2,105 | 2,205 |
+| MySQL CDC JSON binary | 53,678 | 60,472 | 1.13 | 2.22 | 1.92 | 2,217 | 2,303 |
+| MySQL CDC JSON temporal | 78,242 | 71,749 | 0.92 | 1.76 | 1.76 | 1,259 | 1,418 |
+| MySQL CDC JSON null-heavy | 58,056 | 60,484 | 1.04 | 2.10 | 2.00 | 1,491 | 1,586 |
+| MySQL CDC Avro narrow | 50,596 | 66,699 | 1.32 | 1.98 | 1.56 | 454 | 521 |
+| MySQL CDC Avro wide | 17,127 | 27,646 | 1.61 | 6.52 | 4.14 | 1,144 | 1,207 |
+| MySQL CDC Parquet wide | 19,925 | 22,366 | 1.12 | 3.80 | 3.06 | 677 | 677 |
+| MySQL snapshot JSON narrow | 125,858 | 166,441 | 1.32 | 1.04 | 1.04 | 670 | 756 |
+| MySQL snapshot JSON temporal | 85,149 | 87,949 | 1.03 | 1.89 | 1.82 | 1,137 | 1,233 |
+| MySQL CDC JSON ints10 | 88,873 | 82,471 | 0.93 | 1.22 | 1.38 | 916 | 1,003 |
+| MySQL CDC JSON ints200 | 19,106 | 18,118 | 0.95 | 6.66 | 6.90 | 4,132 | 4,221 |
+| MySQL CDC JSON narrow + JS | 34,112 | 29,521 | 0.87 | 3.12 | 3.64 | 866 | 970 |
+| PostgreSQL snapshot JSON narrow | 107,964 | 142,692 | 1.32 | 1.07 | 1.19 | 718 | 763 |
+
+Against the current main (`6b568a1`, the canonical model with every later change; `target/perf/opt-vs-main`, measured before commit 7), the optimized build is as fast or faster in every cell, up to 2.12 times: MySQL CDC JSON 1.00 (ints10) to 1.38, Avro 1.43 to 2.06, Parquet 1.47 to 1.53, snapshots 1.18 to 2.12, JavaScript 1.05 to 1.15, and PostgreSQL CDC (no longer capped, see section 2.2) 1.16 (JSON), 1.51 (Avro) and 1.53 (Parquet).
+
+**Allocation requests per row** (stats builds, one repetition; `target/perf/final-allocs2-base`, `final-allocs2-main`):
+
+| Cell | Base | main | Optimized |
+|---|---|---|---|
+| MySQL CDC JSON narrow | 57 | 88 | 56 |
+| MySQL CDC JSON wide | 252 | 408 | 196 |
+| MySQL CDC JSON temporal | 118 | 236 | 66 |
+| MySQL CDC Avro narrow | 570 | 651 | 188 |
+| MySQL CDC Avro wide | 2,186 | 2,450 | 468 |
+| MySQL CDC Parquet wide | 382 | 513 | 324 |
+| MySQL snapshot JSON temporal | 114 | 230 | 60 |
+| MySQL CDC JSON ints200 | 266 | 487 | 265 |
+| MySQL CDC JSON narrow + JS | 209 | 325 | 254 |
+
+Every cell allocates no more than the base version except JavaScript. The temporal and wide cells have no allocation penalty left, and nothing grows faster than linearly with row width.
+
+### 4.3 What remains below 0.90
+
+**MySQL CDC JSON narrow (0.87 to 0.89 over three runs) and narrow + JS (0.86 to 0.87).** Their CPU per row is 15-17% above the base version. Profiles of the two versions (same cell, 2 repetitions each) put the difference in librdkafka, not in DeltaForge's code: the optimized build spends about 375 samples in glibc's allocator (`_int_free`, `malloc_consolidate`, `malloc`) against about 40 for the base version, out of a total difference of 279, on the producer's poll thread freeing messages. The canonical model added the `df-type-mapping` header to every Kafka message (the mapping version a consumer needs to read the values); librdkafka allocates each message's headers with glibc and frees them on another thread. Output is also about 100 bytes per row larger (the relation identity in the key, `source.type_mapping`; section 3.2), which LZ4 and the broker carry.
+
+Linking jemalloc unprefixed (`tikv-jemallocator/unprefixed_malloc_on_supported_platforms`, so C libraries allocate through jemalloc too) recovers it, measured with 3 repetitions: CDC JSON narrow 0.95, temporal 0.96, ints10 0.91, Avro wide 1.64, with narrow CPU at parity (1.04 against 1.03). It is not part of these commits, because it changes operations: every bundled C library (librdkafka, SQLite, zlib) would allocate through jemalloc, and jemalloc's environment variable becomes `MALLOC_CONF` instead of `_RJEM_MALLOC_CONF`, so existing tuning (the chaos compose file sets it) would silently stop applying. It needs a reviewed decision.
+
+**JavaScript.** With unprefixed jemalloc the JS cell stays at 0.85. Its remaining cost is spread over V8, `serde_v8` and the typed boundary, which re-types every script output against the input it came from (section 3.1 of the canonical model). The boundary allocates 254 times per row against 209 for the base version, which passed untyped JSON. No single cost dominates; the typed re-typing is part of the correctness contract.
+
+## 5. Kafka key audit
+
+The default Kafka key is `tenant|relation|transaction|event id` (`Event::idempotency_key`), where the relation is the canonical `connector/source/database/namespace/table` (the base version used `database.table`). The key is longer by the connector, the source name and the namespace: about 40-90 bytes with typical names.
+
+- **The event id** (`dfid:v1:<class>:<32 hex>`) is a hash of the event's source coordinates. For MySQL without GTIDs these are the server id, binlog file, position and row ordinal, which do not name the source: two sources reading servers with the same `server_id` (often the default 1) can produce the same id.
+- **The source name** is what separates such sources. It must stay. The connector separates nothing the event id's class does not, and the database, namespace and table are implied by the position. They are redundant for uniqueness, but they make the key readable and match every other relation-keyed store.
+- **The transaction id** is redundant given the event id.
+- **The tenant** keeps the keys of different tenants apart.
+
+A fixed digest of these parts (32 hex characters of SHA-256) would save 60-90 bytes per message with these names. It would weaken nothing in uniqueness. But it changes every key: a consumer that deduplicates by key would see a redelivered event under a new key after an upgrade, and it makes keys unreadable. Partitioning is unaffected either way, since the default key is unique per event and spreads events across partitions; that is unchanged from the base version. Recommendation: keep the format. A shorter key is a separate, versioned key-format decision, which this work does not make.
