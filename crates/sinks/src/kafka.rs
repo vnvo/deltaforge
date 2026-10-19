@@ -720,15 +720,16 @@ impl Sink for KafkaSink {
             }
         }
 
-        // Enqueue all messages
+        // Enqueue all messages. Each record takes its headers (librdkafka
+        // owns them once enqueued): never a copy.
         let futures: Vec<_> = serialized
-            .iter()
+            .iter_mut()
             .map(|(payload, topic, key, headers)| {
                 let mut record =
                     FutureRecord::to(topic).payload(payload).key(key);
 
-                if let Some(h) = headers {
-                    record = record.headers(h.clone());
+                if let Some(h) = headers.take() {
+                    record = record.headers(h);
                 }
 
                 self.producer

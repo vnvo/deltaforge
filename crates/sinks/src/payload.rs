@@ -1,7 +1,7 @@
 //! How the message sinks (Kafka, Redis, NATS, HTTP) turn an event into
 //! bytes and routing input, from its canonical values.
 
-use deltaforge_core::encoding::{EncodingError, Json};
+use deltaforge_core::encoding::EncodingError;
 use deltaforge_core::envelope::Envelope;
 use deltaforge_core::{Event, NativeOpts, SinkError, SinkResult};
 use serde_json::Value;
@@ -24,9 +24,9 @@ pub(crate) fn native_json(
     let data = envelope
         .wrap(event, opts)
         .map_err(|e| EncodingError::from(e).into_sink_error_for(sink_id))?;
-    Json.encode(&data)
-        .map(|b| b.to_vec())
-        .map_err(|e| e.into_sink_error_for(sink_id))
+    // Straight into the message buffer (no intermediate `Bytes` copy).
+    serde_json::to_vec(&data)
+        .map_err(|e| EncodingError::from(e).into_sink_error_for(sink_id))
 }
 
 /// Outbox raw mode: the after row's native rendering (JSON `null` when the
