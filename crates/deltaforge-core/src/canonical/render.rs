@@ -105,6 +105,9 @@ pub fn render_row(
 pub struct RowImage<'a> {
     row: &'a CanonicalRow,
     opts: RenderOpts,
+    /// Written as `{}`: the image's place in an envelope whose rows an
+    /// encoder converts from their canonical values.
+    placeholder: bool,
 }
 
 /// Check that every value of `row` renders under `opts`: the row's image,
@@ -132,10 +135,25 @@ pub fn row_image(
             failure: RenderFailure::ExtensionCollision,
         });
     }
-    Ok((RowImage { row, opts }, unchanged))
+    Ok((
+        RowImage {
+            row,
+            opts,
+            placeholder: false,
+        },
+        unchanged,
+    ))
 }
 
 impl RowImage<'_> {
+    /// This image written as an empty object.
+    pub(crate) fn placeholder(self) -> Self {
+        RowImage {
+            placeholder: true,
+            ..self
+        }
+    }
+
     /// The image as a JSON map.
     pub fn to_map(&self) -> Map<String, Value> {
         match serde_json::to_value(self) {
@@ -147,6 +165,9 @@ impl RowImage<'_> {
 
 impl Serialize for RowImage<'_> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if self.placeholder {
+            return s.serialize_map(Some(0))?.end();
+        }
         let mut m = s.serialize_map(None)?;
         for (name, v) in self.row.iter() {
             if !matches!(v, CanonicalValue::Unchanged) {

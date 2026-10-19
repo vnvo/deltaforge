@@ -26,10 +26,10 @@ impl Cx<'_> {
         reason: &'static str,
     ) -> EncodingError {
         EncodingError::Conversion(super::super::ConversionFailure {
-            column: self.path.clone(),
+            column: self.path(),
             source_type: self
                 .source
-                .clone()
+                .map(str::to_string)
                 .unwrap_or_else(|| value_kind(v).to_string()),
             target_type: format!("Avro {target}"),
             reason,
@@ -69,8 +69,7 @@ pub(super) fn convert_row(
         let source = field
             .custom_attributes
             .get(SOURCE_TYPE_ATTR)
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+            .and_then(|v| v.as_str());
         let fcx = cx.field(&field.name, source);
         let value = row.get(&field.name).unwrap_or(&CanonicalValue::Null);
         fields.push((

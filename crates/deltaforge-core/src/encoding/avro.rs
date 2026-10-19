@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use apache_avro::Schema as AvroSchema;
 use apache_avro::types::Value as AvroValue;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use metrics::counter;
 use parking_lot::RwLock;
 use serde::Serialize;
@@ -437,8 +437,58 @@ struct ResolvedKey {
     mapping: String,
 }
 
-/// A schema registered for a subject: its ID and parsed schema.
-type Registered = (u32, Arc<AvroSchema>);
+/// A schema registered for a subject, prepared for encoding.
+type Registered = Arc<Prepared>;
+
+/// A registered schema prepared once for encoding: its ID, its named types
+/// (resolved once, not per event) and a writer that validates and encodes
+/// values with them.
+struct Prepared {
+    id: u32,
+    schema: Arc<AvroSchema>,
+    names: Names,
+    writer: parking_lot::Mutex<apache_avro::GenericSingleObjectWriter>,
+}
+
+/// A schema's named types by name.
+type Names = HashMap<apache_avro::schema::Name, AvroSchema>;
+
+/// The length of the single-object header the writer puts before each
+/// datum (`C3 01` and the schema's 8-byte fingerprint).
+const SINGLE_OBJECT_HEADER: usize = 10;
+
+impl Prepared {
+    fn new(
+        id: u32,
+        schema: Arc<AvroSchema>,
+    ) -> Result<Registered, EncodingError> {
+        let names = resolve_names(&schema)?;
+        let writer = apache_avro::GenericSingleObjectWriter::new_with_capacity(
+            &schema, 1024,
+        )
+        .map_err(|e| {
+            EncodingError::Avro(format!("unresolvable schema: {e}"))
+        })?;
+        Ok(Arc::new(Prepared {
+            id,
+            schema,
+            names,
+            writer: parking_lot::Mutex::new(writer),
+        }))
+    }
+}
+
+fn resolve_names(schema: &AvroSchema) -> Result<Names, EncodingError> {
+    let resolved = apache_avro::schema::ResolvedSchema::try_from(schema)
+        .map_err(|e| {
+            EncodingError::Avro(format!("unresolvable schema: {e}"))
+        })?;
+    Ok(resolved
+        .get_names()
+        .iter()
+        .map(|(n, s)| (n.clone(), (*s).clone()))
+        .collect())
+}
 
 /// The Schema Registry subject of a topic's DDL events: stable, separate from
 /// every row subject, so neither's compatibility checks affect the other.
@@ -488,6 +538,8 @@ pub struct AvroEncoder {
     ddl_schemas: RwLock<HashMap<String, (String, String)>>,
     /// DDL: the registered schema of each (subject, hash, mapping version).
     ddl: RwLock<HashMap<DdlKey, Registered>>,
+    /// Every registered schema, prepared, by (subject, canonical hash).
+    prepared: RwLock<HashMap<(String, String), Registered>>,
 }
 
 impl AvroEncoder {
@@ -537,6 +589,7 @@ impl AvroEncoder {
             inferred: RwLock::new(HashMap::new()),
             ddl_schemas: RwLock::new(HashMap::new()),
             ddl: RwLock::new(HashMap::new()),
+            prepared: RwLock::new(HashMap::new()),
         })
     }
 
@@ -557,6 +610,7 @@ impl AvroEncoder {
         self.resolved.write().clear();
         self.inferred.write().clear();
         self.ddl.write().clear();
+        self.prepared.write().clear();
     }
 
     fn auth(&self) -> Option<(&str, &str)> {
@@ -629,7 +683,10 @@ impl AvroEncoder {
         let mapping = event.type_mapping;
         let subject =
             format!("{}-{}", self.resolve_subject(topic), mapping.as_str());
-        let json_value = serde_json::to_value(envelope)
+        // The row images are converted from their canonical values (Path A)
+        // or rebuilt from them (Path C): the envelope holds `{}` in their
+        // places, never a rendering to discard.
+        let json_value = serde_json::to_value(envelope.row_placeholders())
             .map_err(|e| EncodingError::Avro(e.to_string()))?;
         let (connector, database, namespace, table) = (
             event.source.connector.as_str(),
@@ -693,8 +750,8 @@ impl AvroEncoder {
                 ),
             };
             let cached = self.resolved.read().get(&key).cloned();
-            if let Some((schema_id, schema)) = cached {
-                return encode_with(schema_id, &schema, &json_value, &rows);
+            if let Some(prepared) = cached {
+                return encode_with(&prepared, &json_value, &rows);
             }
             match provider.get_envelope_schema(
                 connector, database, namespace, table, identity,
@@ -709,12 +766,10 @@ impl AvroEncoder {
                         .increment(1);
                     let (schema_json, _) =
                         with_mapping_attr(&schema_json, mapping)?;
-                    let (schema_id, schema) =
+                    let prepared =
                         self.register(&key.subject, &schema_json, None).await?;
-                    self.resolved
-                        .write()
-                        .insert(key, (schema_id, schema.clone()));
-                    return encode_with(schema_id, &schema, &json_value, &rows);
+                    self.resolved.write().insert(key, prepared.clone());
+                    return encode_with(&prepared, &json_value, &rows);
                 }
                 EnvelopeSchemaLookup::Unavailable(reason) => {
                     return Err(EncodingError::SchemaUnavailable(format!(
@@ -795,7 +850,7 @@ impl AvroEncoder {
         // mixed-version regression that fails without it.
         let key = (subject, hash, DDL_MAPPING_VERSION);
         let cached = self.ddl.read().get(&key).cloned();
-        let (schema_id, schema) = match cached {
+        let prepared = match cached {
             Some(r) => r,
             None => {
                 let r =
@@ -806,7 +861,7 @@ impl AvroEncoder {
         };
         counter!("deltaforge_avro_encode_total", "path" => "ddl_event")
             .increment(1);
-        encode_with(schema_id, &schema, &record, &[])
+        encode_with(&prepared, &record, &[])
     }
 
     /// Path C: widen the inferred schema of `(subject, record_name)` to
@@ -859,9 +914,9 @@ impl AvroEncoder {
             }
             (state.schema_json.clone(), state.hash.clone())
         };
-        let (schema_id, schema) =
+        let prepared =
             self.register(subject, &schema_json, Some(&hash)).await?;
-        encode_with(schema_id, &schema, json_value, &[])
+        encode_with(&prepared, json_value, &[])
     }
 
     /// Register a schema (cached per subject and canonical hash).
@@ -875,28 +930,35 @@ impl AvroEncoder {
             Some(h) => h.to_string(),
             None => canonical_schema_hash(schema_json)?,
         };
-        if let Some(cached) = self.registry.get_cached(subject, &hash) {
-            return Ok(cached);
+        let key = (subject.to_string(), hash);
+        if let Some(prepared) = self.prepared.read().get(&key) {
+            return Ok(prepared.clone());
         }
-        match self
-            .registry
-            .register_hashed(subject, schema_json, &hash, self.auth())
-            .await
-        {
-            Ok(result) => {
-                counter!("deltaforge_avro_schema_registrations_total")
+        let (id, schema) = match self.registry.get_cached(subject, &key.1) {
+            Some(cached) => cached,
+            None => match self
+                .registry
+                .register_hashed(subject, schema_json, &key.1, self.auth())
+                .await
+            {
+                Ok(result) => {
+                    counter!("deltaforge_avro_schema_registrations_total")
+                        .increment(1);
+                    result
+                }
+                Err(e) => {
+                    counter!(
+                        "deltaforge_avro_encode_failure_total",
+                        "reason" => "sr_unavailable"
+                    )
                     .increment(1);
-                Ok(result)
-            }
-            Err(e) => {
-                counter!(
-                    "deltaforge_avro_encode_failure_total",
-                    "reason" => "sr_unavailable"
-                )
-                .increment(1);
-                Err(e)
-            }
-        }
+                    return Err(e);
+                }
+            },
+        };
+        let prepared = Prepared::new(id, schema)?;
+        self.prepared.write().insert(key, prepared.clone());
+        Ok(prepared)
     }
 }
 
@@ -910,31 +972,42 @@ fn inferred_state(shape: Inferred) -> Result<InferredState, EncodingError> {
     })
 }
 
-/// Convert `json_value` exactly to `schema` and frame it in the Confluent
-/// wire format: `[0x00][schema_id:4][avro_payload]`.
+/// Convert `json_value` exactly to the prepared schema and frame it in the
+/// Confluent wire format: `[0x00][schema_id:4][avro_payload]`.
 fn encode_with(
-    schema_id: u32,
-    schema: &AvroSchema,
+    prepared: &Prepared,
     json_value: &serde_json::Value,
     rows: &[(&str, &CanonicalRow)],
 ) -> Result<Bytes, EncodingError> {
     let avro_value =
-        json_to_avro_rows(json_value, schema, rows).inspect_err(|_| {
-            counter!(
-                "deltaforge_avro_encode_failure_total",
-                "reason" => "schema_mismatch"
-            )
-            .increment(1);
-        })?;
-    let avro_bytes =
-        apache_avro::to_avro_datum(schema, avro_value).map_err(|e| {
+        convert_named(json_value, &prepared.schema, &prepared.names, rows)
+            .inspect_err(|_| {
+                counter!(
+                    "deltaforge_avro_encode_failure_total",
+                    "reason" => "schema_mismatch"
+                )
+                .increment(1);
+            })?;
+    let mut out = Vec::with_capacity(256);
+    prepared
+        .writer
+        .lock()
+        .write_value_ref(&avro_value, &mut out)
+        .map_err(|e| {
+            // A failed validation names the reason only: never the value.
+            let e = match e {
+                apache_avro::Error::ValidationWithReason { .. } => {
+                    apache_avro::Error::Validation
+                }
+                e => e,
+            };
             EncodingError::Avro(format!("Avro encoding failed: {e}"))
         })?;
-    let mut buf = BytesMut::with_capacity(5 + avro_bytes.len());
-    buf.put_u8(0x00);
-    buf.put_u32(schema_id);
-    buf.extend_from_slice(&avro_bytes);
-    Ok(buf.freeze())
+    // The writer's single-object header becomes the wire-format prefix.
+    out.drain(..SINGLE_OBJECT_HEADER - 5);
+    out[0] = 0x00;
+    out[1..5].copy_from_slice(&prepared.id.to_be_bytes());
+    Ok(Bytes::from(out))
 }
 
 // =============================================================================
@@ -961,22 +1034,23 @@ fn json_to_avro(
 /// [`json_to_avro`], with the event's row images (by envelope path)
 /// converted from their canonical values wherever the schema has a row
 /// image record.
+#[cfg(test)]
 fn json_to_avro_rows(
     json: &serde_json::Value,
     schema: &AvroSchema,
     rows: &[(&str, &CanonicalRow)],
 ) -> Result<AvroValue, EncodingError> {
-    let resolved = apache_avro::schema::ResolvedSchema::try_from(schema)
-        .map_err(|e| {
-            EncodingError::Avro(format!("unresolvable schema: {e}"))
-        })?;
-    let cx = Cx {
-        names: resolved.get_names(),
-        path: String::new(),
-        source: None,
-        rows,
-    };
-    convert(json, schema, &cx)
+    convert_named(json, schema, &resolve_names(schema)?, rows)
+}
+
+/// [`json_to_avro_rows`] with the schema's named types resolved.
+fn convert_named(
+    json: &serde_json::Value,
+    schema: &AvroSchema,
+    names: &Names,
+    rows: &[(&str, &CanonicalRow)],
+) -> Result<AvroValue, EncodingError> {
+    convert(json, schema, &Cx::root(names, rows))
 }
 
 /// The envelope paths of an event's row images, for every envelope.
@@ -1081,33 +1155,93 @@ fn with_mapping_attr(
 }
 
 /// Where a conversion is: the named types, the field path and the field's
-/// declared source type.
+/// declared source type. The path is a chain of borrowed steps, written
+/// out only for a failure (or to find a row image).
 struct Cx<'a> {
-    names: &'a apache_avro::schema::NamesRef<'a>,
-    path: String,
-    source: Option<String>,
+    names: &'a Names,
+    /// The enclosing context; `None` at the root.
+    parent: Option<&'a Cx<'a>>,
+    step: Step<'a>,
+    source: Option<&'a str>,
     /// The event's canonical row images by envelope path (`after`,
     /// `payload.after`, ...): converted from their values, never from JSON.
     rows: &'a [(&'a str, &'a CanonicalRow)],
 }
 
-impl Cx<'_> {
+/// One step of a field path.
+#[derive(Clone, Copy)]
+enum Step<'a> {
+    Root,
+    Field(&'a str),
+    Item,
+}
+
+impl<'a> Cx<'a> {
+    fn root(names: &'a Names, rows: &'a [(&'a str, &'a CanonicalRow)]) -> Self {
+        Cx {
+            names,
+            parent: None,
+            step: Step::Root,
+            source: None,
+            rows,
+        }
+    }
+
+    /// The field path (`after.id`, `tags[]`).
+    fn path(&self) -> String {
+        let mut out = String::new();
+        self.write_path(&mut out);
+        out
+    }
+
+    fn write_path(&self, out: &mut String) {
+        if let Some(p) = self.parent {
+            p.write_path(out);
+        }
+        match self.step {
+            Step::Root => {}
+            Step::Field(name) => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(name);
+            }
+            Step::Item => out.push_str("[]"),
+        }
+    }
+
+    /// Whether the field path is exactly `path` (written out by
+    /// [`Self::path`]), without writing it.
+    fn path_is(&self, path: &str) -> bool {
+        match (self.step, self.parent) {
+            (Step::Root, _) | (_, None) => path.is_empty(),
+            (Step::Item, Some(p)) => {
+                path.strip_suffix("[]").is_some_and(|rest| p.path_is(rest))
+            }
+            (Step::Field(name), Some(p)) => match path.strip_suffix(name) {
+                None => false,
+                Some("") => p.path_is(""),
+                Some(rest) => rest.strip_suffix('.').is_some_and(|r| {
+                    // An empty parent path writes no separator.
+                    !r.is_empty() && p.path_is(r)
+                }),
+            },
+        }
+    }
+
     fn row(&self) -> Option<&CanonicalRow> {
         self.rows
             .iter()
-            .find(|(p, _)| *p == self.path)
+            .find(|(p, _)| self.path_is(p))
             .map(|(_, r)| *r)
     }
 
-    fn field(&self, name: &str, source: Option<String>) -> Cx<'_> {
+    fn field<'b>(&'b self, name: &'b str, source: Option<&'b str>) -> Cx<'b> {
         Cx {
             rows: self.rows,
             names: self.names,
-            path: if self.path.is_empty() {
-                name.to_string()
-            } else {
-                format!("{}.{name}", self.path)
-            },
+            parent: Some(self),
+            step: Step::Field(name),
             source,
         }
     }
@@ -1116,8 +1250,9 @@ impl Cx<'_> {
         Cx {
             rows: self.rows,
             names: self.names,
-            path: format!("{}[]", self.path),
-            source: self.source.clone(),
+            parent: Some(self),
+            step: Step::Item,
+            source: self.source,
         }
     }
 
@@ -1128,21 +1263,25 @@ impl Cx<'_> {
         reason: &'static str,
     ) -> EncodingError {
         EncodingError::Conversion(super::ConversionFailure {
-            column: self.path.clone(),
+            column: self.path(),
             source_type: self
                 .source
-                .clone()
+                .map(str::to_string)
                 .unwrap_or_else(|| format!("JSON {}", json_kind(json))),
             target_type: format!("Avro {target}"),
             reason,
         })
     }
 
-    /// Whether the field's source type starts with `prefix` (lowercase).
+    /// Whether the field's source type starts with `prefix` (ASCII case
+    /// insensitive).
     fn source_is(&self, prefixes: &[&str]) -> bool {
-        self.source.as_deref().is_some_and(|s| {
-            let s = s.to_ascii_lowercase();
-            prefixes.iter().any(|p| s.starts_with(p))
+        self.source.is_some_and(|s| {
+            prefixes.iter().any(|p| {
+                s.len() >= p.len()
+                    && s.as_bytes()[..p.len()]
+                        .eq_ignore_ascii_case(p.as_bytes())
+            })
         })
     }
 }
@@ -1403,8 +1542,7 @@ fn convert(
                 let source = field
                     .custom_attributes
                     .get(SOURCE_TYPE_ATTR)
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
+                    .and_then(|v| v.as_str());
                 let value = map.get(&field.name).unwrap_or(&J::Null);
                 let v = convert(
                     value,
@@ -1867,20 +2005,69 @@ mod tests {
     }
 
     #[test]
-    fn test_confluent_wire_format_prefix() {
-        // Verify the wire format structure: [0x00][4-byte ID][payload]
-        let mut buf = BytesMut::with_capacity(9);
-        buf.put_u8(0x00);
-        buf.put_u32(42);
-        buf.extend_from_slice(&[1, 2, 3, 4]);
-        let bytes = buf.freeze();
+    fn field_paths_match_exactly_without_being_written() {
+        let names = Names::new();
+        let root = Cx::root(&names, &[]);
+        let payload = root.field("payload", None);
+        let after = payload.field("after", None);
+        assert_eq!(after.path(), "payload.after");
+        assert!(after.path_is("payload.after"));
+        for other in [
+            "after",
+            "xpayload.after",
+            "payload.xafter",
+            "payload..after",
+            ".after",
+            "",
+        ] {
+            assert!(!after.path_is(other), "{other}");
+        }
+        let top = root.field("after", None);
+        assert!(top.path_is("after"));
+        assert!(!top.path_is("payload.after"));
+        let tags = after.field("tags", Some("set('a')"));
+        let item = tags.item();
+        assert_eq!(item.path(), "payload.after.tags[]");
+        assert!(item.path_is("payload.after.tags[]"));
+        assert!(!item.path_is("payload.after.tags"));
+        assert!(item.source_is(&["SET"]));
+        assert!(root.path_is(""));
+    }
 
-        assert_eq!(bytes[0], 0x00); // magic byte
-        assert_eq!(
-            u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]),
-            42
-        ); // schema ID
-        assert_eq!(&bytes[5..], &[1, 2, 3, 4]); // payload
+    #[test]
+    fn the_wire_format_is_the_magic_byte_the_schema_id_then_the_datum() {
+        let schema = Arc::new(
+            AvroSchema::parse_str(
+                r#"{"type": "record", "name": "R", "fields": [
+                    {"name": "a", "type": "long"},
+                    {"name": "s", "type": ["null", "string"]}
+                ]}"#,
+            )
+            .unwrap(),
+        );
+        let prepared = Prepared::new(42, schema.clone()).unwrap();
+        // Twice: the writer's buffer is reused.
+        for _ in 0..2 {
+            let bytes = encode_with(&prepared, &json!({"a": 7, "s": "x"}), &[])
+                .unwrap();
+            assert_eq!(bytes[0], 0x00);
+            assert_eq!(bytes[1..5], 42u32.to_be_bytes());
+            let datum = apache_avro::to_avro_datum(
+                &schema,
+                AvroValue::Record(vec![
+                    ("a".into(), AvroValue::Long(7)),
+                    (
+                        "s".into(),
+                        AvroValue::Union(
+                            1,
+                            Box::new(AvroValue::String("x".into())),
+                        ),
+                    ),
+                ]),
+            )
+            .unwrap();
+            assert_eq!(bytes[5..], datum[..]);
+        }
     }
 
     // ── json_to_avro tests ──────────────────────────────────────────────

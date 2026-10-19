@@ -157,6 +157,18 @@ impl Event {
     }
 }
 
+impl<'a> NativePayload<'a> {
+    /// This payload with each present row image written as `{}`.
+    pub(crate) fn row_placeholders(&self) -> NativePayload<'a> {
+        NativePayload {
+            event: self.event,
+            before: self.before.map(RowImage::placeholder),
+            after: self.after.map(RowImage::placeholder),
+            unchanged_columns: self.unchanged_columns.clone(),
+        }
+    }
+}
+
 /// The `source` block of the native rendering: the source metadata and the
 /// event's mapping version.
 #[derive(Serialize)]

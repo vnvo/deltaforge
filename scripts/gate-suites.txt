@@ -83,6 +83,7 @@ parallel   secrets/vault_e2e                -p secrets --features vault --test v
 
 # No ignored tests: run by the workspace step
 workspace  deltaforge-config/config_tests
+workspace  deltaforge-core/avro_golden
 workspace  deltaforge-core/source_handle
 workspace  processors/filter_processor_tests
 workspace  processors/flatten_processor_tests

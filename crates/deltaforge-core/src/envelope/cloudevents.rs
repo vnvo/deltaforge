@@ -40,7 +40,7 @@ impl CloudEvents {
 }
 
 /// CloudEvents wire format.
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct CloudEventsWrapper<'a> {
     specversion: &'static str,
     id: String,
@@ -56,7 +56,7 @@ pub struct CloudEventsWrapper<'a> {
     _event: std::marker::PhantomData<&'a Event>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub(crate) struct CloudEventsData<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     before: Option<RowImage<'a>>,
@@ -68,6 +68,15 @@ pub(crate) struct CloudEventsData<'a> {
     /// After-image columns PostgreSQL did not send (unchanged TOAST).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     unchanged_columns: Vec<String>,
+}
+
+impl<'a> CloudEventsWrapper<'a> {
+    pub(crate) fn row_placeholders(&self) -> CloudEventsWrapper<'a> {
+        let mut w = self.clone();
+        w.data.before = w.data.before.map(RowImage::placeholder);
+        w.data.after = w.data.after.map(RowImage::placeholder);
+        w
+    }
 }
 
 impl Envelope for CloudEvents {
