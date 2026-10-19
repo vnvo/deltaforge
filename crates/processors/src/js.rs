@@ -21,7 +21,7 @@ use deltaforge_core::{
 };
 use serde::Deserialize;
 
-use crate::js_boundary::{Authority, SchemaCtx, from_js_row, to_js};
+use crate::js_boundary::{Authority, JsInput, SchemaCtx, from_js_row, to_js};
 use deno_core::{JsRuntime, RuntimeOptions, extension};
 use deno_core::{serde_v8, v8};
 use serde_json::Value;
@@ -64,7 +64,7 @@ function __df_setup(events, existingRouting) {
 
 /// Reserved JS field carrying an input event's stable id (injected by the
 /// bridge, stripped before the output becomes a Rust `Event`).
-const DF_ID: &str = "__df_id";
+pub(crate) const DF_ID: &str = "__df_id";
 /// Reserved JS field set by `derive(parent, output)` naming the parent's id.
 const DF_PARENT: &str = "__df_parent";
 
@@ -250,30 +250,37 @@ fn process_batch_in_runtime(
     let input_ids: std::collections::HashSet<EventId> =
         events.iter().filter_map(|e| e.event_id).collect();
 
-    // Each input's rendering for the script, and its typed rows (by id) to
-    // re-type the outputs with.
-    let mut rendered = Vec::with_capacity(events.len());
-    let mut authorities: std::collections::HashMap<EventId, Authority> =
-        std::collections::HashMap::new();
-    for (ev, schema) in events.iter().zip(schemas) {
-        let (mut v, authority) = to_js(ev, schema)?;
-        // Inject each input's stable id as `__df_id` so scripts can pass it
-        // to derive() and so retained ids are visible.
-        if let (Value::Object(o), Some(pid)) = (&mut v, ev.event_id) {
-            o.insert(DF_ID.into(), Value::String(pid.to_string()));
-            authorities.insert(pid, authority);
-        }
-        rendered.push(v);
-    }
-    let json_events = Value::Array(rendered);
+    // Each input's typed rows and their renderings for the script, kept (by
+    // id) to re-type the outputs with.
+    let typed: Vec<Authority> = events
+        .iter()
+        .zip(schemas)
+        .map(|(ev, schema)| to_js(ev, schema))
+        .collect::<Result<_>>()?;
 
     let scope = &mut rt.handle_scope();
     let ctx = scope.get_current_context();
     let global = ctx.global(scope);
 
     // --- Call __df_setup(events, existingRouting) ---
-    let arg = serde_v8::to_v8(scope, json_events)
+    // Each input as the script sees it, written straight into V8; with its
+    // stable id as `__df_id`, so scripts can pass it to derive() and so
+    // retained ids are visible.
+    let inputs: Vec<JsInput<'_>> = events
+        .iter()
+        .zip(&typed)
+        .map(|(event, authority)| JsInput { event, authority })
+        .collect();
+    let arg = serde_v8::to_v8(scope, &inputs)
         .context("failed to convert events to v8")?;
+    drop(inputs);
+    let mut authorities: std::collections::HashMap<EventId, Authority> =
+        std::collections::HashMap::with_capacity(typed.len());
+    for (ev, authority) in events.iter().zip(typed) {
+        if let Some(pid) = ev.event_id {
+            authorities.insert(pid, authority);
+        }
+    }
 
     let routing_arg = serde_v8::to_v8(scope, Value::Array(existing_routing))
         .context("failed to convert routing to v8")?;

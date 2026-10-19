@@ -34,8 +34,10 @@ use deltaforge_core::canonical::parse::parse_like;
 use deltaforge_core::canonical::render::RowImage;
 use deltaforge_core::canonical::schema::{ColumnType, ColumnTypes};
 use deltaforge_core::{
-    CanonicalRow, CanonicalValue, Event, NativeOpts, TypeMapping,
+    CanonicalRow, CanonicalValue, Event, NativeOpts, NativePayload, TypeMapping,
 };
+use serde::ser::SerializeMap;
+use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
 
 /// An input event's schema context.
@@ -56,13 +58,13 @@ pub(crate) struct Authority {
     pub schema: SchemaCtx,
     pub before: Option<(CanonicalRow, Map<String, Value>)>,
     pub after: Option<(CanonicalRow, Map<String, Value>)>,
+    /// After-image columns PostgreSQL did not send.
+    pub unchanged: Vec<String>,
 }
 
-/// The script's view of `event`, and the authority to re-type its outputs.
-pub(crate) fn to_js(
-    event: &Event,
-    schema: SchemaCtx,
-) -> Result<(Value, Authority)> {
+/// The typed rows of `event` and their renderings for the script: the
+/// authority to re-type its outputs.
+pub(crate) fn to_js(event: &Event, schema: SchemaCtx) -> Result<Authority> {
     let native = event
         .native(NativeOpts::default())
         .map_err(|e| anyhow!("render event for JS: {e}"))?;
@@ -71,29 +73,39 @@ pub(crate) fn to_js(
             .zip(row.as_ref())
             .map(|(m, r)| (r.clone(), js_safe(r, m.to_map())))
     };
-    let before = image(native.before, &event.before);
-    let after = image(native.after, &event.after);
-    // The row images are rendered once, above; the payload carries them in
-    // their places.
-    let mut value = serde_json::to_value(native.row_placeholders())
-        .expect("a native payload serializes");
-    if let Value::Object(o) = &mut value {
-        if let Some((_, m)) = &before {
-            o.insert("before".into(), Value::Object(m.clone()));
+    Ok(Authority {
+        mapping: event.type_mapping,
+        schema,
+        before: image(native.before, &event.before),
+        after: image(native.after, &event.after),
+        unchanged: native.unchanged_columns,
+    })
+}
+
+/// An input event as the script sees it: its native rendering with the
+/// authority's renderings as its row images, and `__df_id` when it has a
+/// stable id. Serialized straight into V8 (no intermediate JSON tree).
+pub(crate) struct JsInput<'a> {
+    pub event: &'a Event,
+    pub authority: &'a Authority,
+}
+
+impl Serialize for JsInput<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let a = self.authority;
+        let payload = NativePayload {
+            event: self.event,
+            before: a.before.as_ref().map(|(_, m)| m),
+            after: a.after.as_ref().map(|(_, m)| m),
+            unchanged_columns: a.unchanged.clone(),
+        };
+        let mut m = s.serialize_map(None)?;
+        payload.serialize_entries(&mut m)?;
+        if let Some(id) = self.event.event_id {
+            m.serialize_entry(crate::js::DF_ID, &id.to_string())?;
         }
-        if let Some((_, m)) = &after {
-            o.insert("after".into(), Value::Object(m.clone()));
-        }
+        m.end()
     }
-    Ok((
-        value,
-        Authority {
-            mapping: event.type_mapping,
-            schema,
-            before,
-            after,
-        },
-    ))
 }
 
 /// Replace every number JavaScript cannot hold exactly (a 64-bit integer, a
@@ -299,5 +311,72 @@ fn retype(
                  is unknown"
             ),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deltaforge_core::canonical::{IntWidth, fixture};
+    use deltaforge_core::{EventId, Op, SourceInfo, SourcePosition};
+    use serde_json::json;
+
+    /// The object a script receives is the event's native rendering with
+    /// the JavaScript-safe rows in place, then `__df_id`: the same keys, in
+    /// the same order, with the same values, as the payload built through a
+    /// JSON tree.
+    #[test]
+    fn the_script_sees_the_native_rendering_with_safe_rows_and_its_id() {
+        let mut before = fixture::row(json!({"id": 1, "name": "a"}));
+        before.set(
+            "big",
+            CanonicalValue::Db(DbValue::int(i64::MAX, IntWidth::W64).unwrap()),
+        );
+        let mut after = before.clone();
+        after.set("doc", CanonicalValue::Unchanged);
+        let mut event = Event::new_row(
+            EventId::mysql_row_server(1, "f", 9, 0),
+            SourceInfo {
+                version: "v".into(),
+                connector: "postgresql".into(),
+                name: "src".into(),
+                ts_ms: 5,
+                db: "db".into(),
+                schema: Some("public".into()),
+                table: "t".into(),
+                snapshot: None,
+                position: SourcePosition::default(),
+            },
+            Op::Update,
+            Some(before),
+            Some(after),
+            TypeMapping::V2,
+            7,
+            64,
+        );
+        event.tenant_id = Some("acme".into());
+        let authority = to_js(&event, SchemaCtx::NoReference).unwrap();
+        let seen = serde_json::to_value(JsInput {
+            event: &event,
+            authority: &authority,
+        })
+        .unwrap();
+
+        let mut expected = event.native_value(NativeOpts::default()).unwrap();
+        let o = expected.as_object_mut().unwrap();
+        o["before"] =
+            Value::Object(authority.before.as_ref().unwrap().1.clone());
+        o["after"] = Value::Object(authority.after.as_ref().unwrap().1.clone());
+        o.insert(
+            crate::js::DF_ID.into(),
+            Value::String(event.event_id.unwrap().to_string()),
+        );
+        assert_eq!(seen, expected);
+        let keys = |v: &Value| {
+            v.as_object().unwrap().keys().cloned().collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&seen), keys(&expected), "same key order");
+        assert_eq!(seen["after"]["big"], json!(i64::MAX.to_string()));
+        assert_eq!(seen["unchanged_columns"], json!(["doc"]));
     }
 }

@@ -181,8 +181,20 @@ struct NativeSource<'a> {
 
 impl<I: Serialize> Serialize for NativePayload<'_, I> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let e = self.event;
         let mut m = s.serialize_map(None)?;
+        self.serialize_entries(&mut m)?;
+        m.end()
+    }
+}
+
+impl<I: Serialize> NativePayload<'_, I> {
+    /// Write the payload's entries into an open map, for a caller that adds
+    /// entries of its own after them.
+    pub fn serialize_entries<M: SerializeMap>(
+        &self,
+        m: &mut M,
+    ) -> Result<(), M::Error> {
+        let e = self.event;
         m.serialize_entry("before", &self.before)?;
         m.serialize_entry("after", &self.after)?;
         m.serialize_entry(
@@ -227,7 +239,7 @@ impl<I: Serialize> Serialize for NativePayload<'_, I> {
         if !self.unchanged_columns.is_empty() {
             m.serialize_entry("unchanged_columns", &self.unchanged_columns)?;
         }
-        m.end()
+        Ok(())
     }
 }
 

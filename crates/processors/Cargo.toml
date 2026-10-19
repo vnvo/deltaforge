@@ -37,6 +37,10 @@ name = "js_processor_bench"
 harness = false
 
 [[bench]]
+name = "js_boundary_bench"
+harness = false
+
+[[bench]]
 name = "outbox_processor_bench"
 harness = false
 
