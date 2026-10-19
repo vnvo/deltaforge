@@ -1078,6 +1078,20 @@ impl PipelineManager {
             sinks::resolve_sink_secrets(&spec, resolver.as_ref())
                 .await
                 .context("resolve sink credentials")?;
+        // The destinations a sink creates are owned by this deployment (one
+        // identity per state store) and the sink.
+        let ownership = sinks::SinkOwnership {
+            deployment: crate::destination_ownership::deployment_identity(
+                &self.backend,
+            )
+            .await
+            .context("deployment identity")?,
+            store: Arc::new(
+                crate::destination_ownership::StorageOwnershipStore::new(
+                    self.backend.clone(),
+                ),
+            ),
+        };
         let mut sinks = sinks::build_sinks_deferring_durable_s3(
             &spec,
             cancel.clone(),
@@ -1086,11 +1100,7 @@ impl PipelineManager {
             arrow_schema_resolver.clone(),
             clickhouse_resolver,
             es_resolver,
-            Some(Arc::new(
-                crate::destination_bindings::StorageDestinationBindings::new(
-                    self.backend.clone(),
-                ),
-            )),
+            Some(ownership),
             &sink_secrets,
         )
         .context("build sinks")?;
@@ -2716,6 +2726,19 @@ impl PipelineController for PipelineManager {
             pipeline = %name,
             "cleaned up per-sink checkpoints on delete"
         );
+        // The sinks' destination ownership records go with their
+        // checkpoints, in this one operation (never on their own).
+        crate::destination_ownership::StorageOwnershipStore::new(
+            self.backend.clone(),
+        )
+        .remove_pipeline(name)
+        .await
+        .map_err(|e| {
+            PipelineAPIError::Failed(anyhow::anyhow!(
+                "failed to remove destination ownership records ({e}); delete \
+                 aborted and source id '{source_id}' stays locked"
+            ))
+        })?;
 
         // Release the source-id claim only after confirmed shutdown AND successful
         // checkpoint cleanup. A release failure keeps the id locked (safe) and the

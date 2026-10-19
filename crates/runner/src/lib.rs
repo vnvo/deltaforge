@@ -1,5 +1,5 @@
 pub mod coordinator;
-pub mod destination_bindings;
+pub mod destination_ownership;
 pub mod dlq;
 pub mod drift_detector;
 pub mod incidents;

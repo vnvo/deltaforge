@@ -75,12 +75,16 @@ pub trait EsTransport: Send + Sync {
     /// POST an NDJSON `_bulk` body; return the response body bytes on success.
     async fn bulk(&self, body: Vec<u8>) -> Result<Vec<u8>, SinkError>;
 
-    /// Create `index` with the given mapping if it does not already exist.
-    async fn ensure_index(
+    /// Send `method path` with an optional JSON body; return the status
+    /// and the JSON answer (`{}` when it has none), whatever the status.
+    /// `Err` only when no answer arrived (connect, timeout, I/O): the
+    /// outcome of a mutation is then unknown.
+    async fn send_json(
         &self,
-        index: &str,
-        mapping: &Value,
-    ) -> Result<(), SinkError>;
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<(u16, Value), SinkError>;
 
     /// GET `path` (relative to the cluster URL, e.g. `orders/_count`) as
     /// JSON.
@@ -121,8 +125,11 @@ impl ElasticsearchClient {
         })
     }
 
+    /// Every action must target an alias (the sink's fenced write alias):
+    /// an index, create or update action through a removed alias fails
+    /// instead of auto-creating an index.
     pub fn bulk_url(&self) -> String {
-        format!("{}/_bulk", self.base)
+        format!("{}/_bulk?require_alias=true", self.base)
     }
 
     pub fn index_url(&self, index: &str) -> String {
@@ -222,28 +229,25 @@ impl EsTransport for ElasticsearchClient {
         Err(Self::status_err(code, text))
     }
 
-    async fn ensure_index(
+    async fn send_json(
         &self,
-        index: &str,
-        mapping: &Value,
-    ) -> Result<(), SinkError> {
-        let body = json!({ "mappings": mapping });
-        let req = self.http.put(self.index_url(index)).json(&body);
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<(u16, Value), SinkError> {
+        let mut req =
+            self.http.request(method, format!("{}/{path}", self.base));
+        if let Some(b) = body {
+            req = req.json(b);
+        }
         let resp = self
             .with_auth(req)
             .send()
             .await
             .map_err(|e| self.send_err(e))?;
-        let code = resp.status();
-        if code.is_success() {
-            return Ok(());
-        }
-        let text = resp.text().await.unwrap_or_default();
-        // A concurrent/prior create is fine — the index exists either way.
-        if text.contains("resource_already_exists_exception") {
-            return Ok(());
-        }
-        Err(Self::status_err(code, text))
+        let code = resp.status().as_u16();
+        let bytes = resp.bytes().await.map_err(|e| self.send_err(e))?;
+        Ok((code, serde_json::from_slice(&bytes).unwrap_or(json!({}))))
     }
 }
 
@@ -276,7 +280,7 @@ mod tests {
     #[test]
     fn builds_client_and_urls() {
         let c = ElasticsearchClient::new(&cfg(), EsAuthResolved::None).unwrap();
-        assert_eq!(c.bulk_url(), "http://es:9200/_bulk");
+        assert_eq!(c.bulk_url(), "http://es:9200/_bulk?require_alias=true");
         assert_eq!(c.index_url("orders"), "http://es:9200/orders");
     }
 
@@ -285,6 +289,6 @@ mod tests {
         let mut cf = cfg();
         cf.url = "http://es:9200/".into();
         let c = ElasticsearchClient::new(&cf, EsAuthResolved::None).unwrap();
-        assert_eq!(c.bulk_url(), "http://es:9200/_bulk");
+        assert_eq!(c.bulk_url(), "http://es:9200/_bulk?require_alias=true");
     }
 }

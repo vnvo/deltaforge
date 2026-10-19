@@ -4,6 +4,7 @@
 
 pub mod client;
 pub mod ddl;
+pub(crate) mod ownership;
 pub mod project;
 pub mod rowbinary;
 pub mod sink;

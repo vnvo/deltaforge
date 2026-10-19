@@ -22,9 +22,14 @@ pub struct TableProjection {
     pub extensions_column: String,
 }
 
-/// The ClickHouse meta columns every row carries.
-pub const META_COLUMNS: [&str; 4] =
-    ["_op", "_version", "_deleted", "_source_ts"];
+/// The ClickHouse meta columns every row carries (the fence column last).
+pub const META_COLUMNS: [&str; 5] = [
+    "_op",
+    "_version",
+    "_deleted",
+    "_source_ts",
+    super::ddl::FENCE_COLUMN,
+];
 
 /// The one-character `_op` value for an event.
 fn op_str(op: Op) -> &'static str {
@@ -42,6 +47,7 @@ fn op_str(op: Op) -> &'static str {
 pub fn project_row(
     p: &TableProjection,
     event: &Event,
+    fence: &str,
 ) -> Result<Vec<u8>, EncodeError> {
     let image = match event.op {
         Op::Delete => event.before.as_ref(),
@@ -102,6 +108,11 @@ pub fn project_row(
             buf.extend_from_slice(&bytes);
         }
     }
+
+    // _df_fence (LowCardinality(String)): the writer's fence, checked by the
+    // table's fence constraint.
+    write_varuint(&mut buf, fence.len() as u64);
+    buf.extend_from_slice(fence.as_bytes());
 
     Ok(buf)
 }
@@ -176,11 +187,14 @@ mod tests {
         }
     }
 
+    const F: &str = "0123456789abcdef0123456789abcdef";
+
     #[test]
     fn projects_insert_uses_after_and_appends_meta() {
         let bytes = project_row(
             &proj(),
             &ev(Op::Create, json!({"id": 7}), json!(null)),
+            F,
         )
         .unwrap();
         let mut want = Vec::new();
@@ -191,6 +205,8 @@ mod tests {
         want.push(0); // _deleted
         want.extend_from_slice(&5i64.to_le_bytes()); // _source_ts
         want.push(1); // _extensions: NULL
+        want.push(32); // _df_fence: varuint length
+        want.extend_from_slice(F.as_bytes());
         assert_eq!(bytes, want);
     }
 
@@ -207,8 +223,9 @@ mod tests {
                 ),
             )
             .unwrap();
-        let bytes = project_row(&proj(), &e).unwrap();
+        let bytes = project_row(&proj(), &e, F).unwrap();
         let tail = br#"{"z":{"a":2,"b":1}}"#;
+        let bytes = &bytes[..bytes.len() - 33]; // the fence column
         assert!(bytes.ends_with(tail));
         assert_eq!(bytes[bytes.len() - tail.len() - 2], 0, "not NULL");
         assert_eq!(bytes[bytes.len() - tail.len() - 1] as usize, tail.len());
@@ -219,6 +236,7 @@ mod tests {
         let bytes = project_row(
             &proj(),
             &ev(Op::Delete, json!(null), json!({"id": 9})),
+            F,
         )
         .unwrap();
         assert_eq!(&bytes[..8], &9i64.to_le_bytes()); // key from before-image
@@ -234,7 +252,8 @@ mod tests {
         assert!(
             project_row(
                 &proj(),
-                &ev(Op::Create, json!({"id": "abc"}), json!(null))
+                &ev(Op::Create, json!({"id": "abc"}), json!(null)),
+                F
             )
             .is_err()
         );
@@ -246,7 +265,8 @@ mod tests {
                     Op::Create,
                     json!({"id": 1, "extra": {"a": 1}}),
                     json!(null)
-                )
+                ),
+                F
             )
             .is_err()
         );

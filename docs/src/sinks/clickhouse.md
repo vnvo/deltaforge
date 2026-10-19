@@ -32,7 +32,7 @@ sinks:
 | `tls.enabled` | no | `true` | TLS for `https://` endpoints |
 | `tls.insecure_skip_verify` | no | `false` | Skip certificate verification |
 | `version_source` | no | `source_position` | `_version` source: `source_position` (LSN/binlog) or `ts_ms` |
-| `auto_create` | no | `true` | Auto-create the target table on first event |
+| `auto_create` | no | `true` | Must be `true`: the sink writes only to a table it creates (see [Destination ownership](#destination-ownership-and-fencing)); `false` is rejected |
 | `send_timeout_secs` | no | `30` | Per-batch insert timeout (timeouts → backpressure) |
 | `required` | no | `true` | Required (blocks) vs best-effort (log + continue) |
 
@@ -95,15 +95,63 @@ are not transactional with the DeltaForge checkpoint.
 makes `ReplacingMergeTree` replacement correct. Only fall back to `ts_ms` when the
 source lacks a usable position (millisecond ties per key are undefined).
 
-## One source table per target table
+## Destination ownership and fencing
 
-A ClickHouse sink writes one target table, which holds one source table: rows of a second source table would mix two tables' rows. The target table (identified by the server's `serverUUID()`, database and table) is bound to the first source table written to it (its full identity: connector, pipeline, database, schema, table). The binding lives in DeltaForge's state store and is made atomically, so it survives restarts and concurrent pipelines sharing that store agree on one source table. Before a sink first writes to a destination after a start, it checks:
+A ClickHouse sink writes one target table, which holds one source table.
 
-- the destination is bound to this source table (an unbound, empty destination is bound now);
-- it is the same table it was bound as (its UUID): one dropped and recreated is refused as replaced;
-- an unbound destination that already holds rows is refused (data from elsewhere, or a removed binding).
+**Supported topology.** The sink's guarantees cover one ClickHouse server holding a local `MergeTree` (`changelog`) or `ReplacingMergeTree` (`upsert`) table that the sink created itself, written with synchronous inserts. Refused:
 
-A refusal is the `sink_destination_conflict` incident: nothing of the batch is written, the checkpoint stays, and the incident names the destination and both source tables (never row data). Bindings are per state store: deployments with separate state stores writing to one destination are not coordinated.
+- `Replicated*` engines, `Distributed` tables and every other engine (`unsupported_topology`);
+- an endpoint whose `serverUUID()` differs from the one recorded when the table was created (`server_changed`). A load balancer over several servers is unsupported.
+
+Every insert runs with `async_insert=0`, and every claim proves that this takes effect: a settings profile that pins `async_insert` on is refused (`fencing_unenforced`). An asynchronous insert would be acknowledged before the fence below is checked.
+
+**The sink writes only to a table it creates.** It runs `CREATE TABLE` without `IF NOT EXISTS`. The table has:
+
+- an immutable ownership marker as its comment, naming:
+  - the owner (the deployment, which is the state store's identity, plus the pipeline and the sink);
+  - the source table;
+  - the target database and table;
+  - the encoding (layout, type mapping, mode, extensions column);
+  - a random instance;
+- the reserved last column `_df_fence LowCardinality(String)`;
+- the constraint `df_fence_<fence> CHECK _df_fence = '<fence>'`.
+
+Every row carries its writer's fence. A table the sink did not create is refused, with no adoption, as is a source column named `_df_fence`.
+
+**Claims.** Before a session first writes, and again after a reconnect or a client recreation, the sink *claims* the table:
+
+1. It checks the marker, the record in the state store, the engine, the reserved column (exactly one, last, of the exact type), and that exactly one well-formed fence constraint exists.
+2. It rotates the fence with one `ALTER TABLE … DROP CONSTRAINT df_fence_<old>, ADD CONSTRAINT df_fence_<new> …`. That statement fails as a whole if the old constraint is gone: a compare-and-swap.
+
+Between claims, inserts make no ownership request.
+
+**The fencing guarantee.** After a claim has rotated the fence, every newly evaluated insert carrying the old fence is rejected by the server (`VIOLATED_CONSTRAINT`). An insert the server had already accepted may still complete, so writes around an ownership change are at least once.
+
+A rejected batch fails whole as `sink_destination_conflict` (class `fenced`):
+
+- it is never dead-lettered;
+- the checkpoint does not advance;
+- the pipeline stops.
+
+**Cost.** The fence adds 33 bytes per row to each insert. Stored, it compresses to under 0.01 bytes per row.
+
+**Clone and restore.**
+
+- **Two separately created state stores** are two deployments (`owned_by_other`).
+- **A copied state store** has the same identity. The first copy to claim fences the other, whose next insert fails at the server.
+- **A state store restored from an older backup** is refused (`fenced`).
+- **A dropped table** is never recreated (`destination_missing`). Its ownership record is removed only by deleting the pipeline, which resets the sink's checkpoints in the same operation.
+- **Not distinguishable:** a copy of the table, with its comment and constraint, on a server cloned from the same data directory (the same `serverUUID()`). This is outside the guarantee.
+
+**Refusals** are the `sink_destination_conflict` incident: nothing of the batch is acknowledged and the checkpoint stays. The incident names the table, the source table and the class; it never contains row data or credentials. The classes:
+
+- `marker_missing`, `marker_malformed`, `marker_unsupported_version`;
+- `owned_by_other`, `bound_to_another_relation`;
+- `destination_identity_mismatch`, `encoding_mismatch`;
+- `fenced`, `fence_malformed`;
+- `destination_missing`, `unrecorded_destination`;
+- `server_changed`, `unsupported_topology`, `fencing_unenforced`.
 
 ## Requirements
 
@@ -119,9 +167,12 @@ source table per ClickHouse sink (not a wildcard).
 
 ## Auto table creation
 
-By default the sink creates the target table on the first event, deriving column
-types from the source DDL and the engine/`ORDER BY` from the mode + primary key.
-Set `auto_create: false` to require a pre-created table (locked-down setups).
+The sink creates the target table on the first event, deriving column types from
+the source DDL and the engine/`ORDER BY` from the mode + primary key, with its
+ownership marker, fence column and fence constraint (see
+[Destination ownership](#destination-ownership-and-fencing)). A pre-created table
+is refused. The sink's user needs `CREATE TABLE`, `ALTER TABLE` (constraints),
+`INSERT` and `SELECT` on the target database.
 
 ## Type mapping
 

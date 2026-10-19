@@ -107,11 +107,11 @@ pipeline and so one database); it is never a key across sources. Object-key segm
 too long for a backend (the 200-byte segment, 900-byte key bounds) use the
 relation's domain-separated digest; the manifest keeps the readable
 identity. A sink destination written by key (a ClickHouse table, an
-Elasticsearch index) is durably bound to one relation: the binding is a
-create-only state-store record (relation, target UUID), verified before a
-session first writes, and a second relation, a replaced target or an
-unbound target holding rows is refused (`sink_destination_conflict`) with
-the checkpoint held. PostgreSQL registers two schema shapes for a table (the
+Elasticsearch index) holds one relation, named in the immutable ownership
+marker the sink creates it with; writes carry a fence the destination
+enforces (see the sinks' destination ownership documentation), and a second
+relation, another owner or an unmarked target is refused
+(`sink_destination_conflict`) with the checkpoint held. PostgreSQL registers two schema shapes for a table (the
 Relation-proven event schema of change events, the catalog schema of the
 snapshot); both describe the same DDL to encoders identically (by type OID
 and modifier, every column nullable), so a snapshot row and a change row of

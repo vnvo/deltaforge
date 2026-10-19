@@ -22,6 +22,22 @@ pub trait ChTransport: Send + Sync {
 
     /// Run a query; its response text (`FORMAT TabSeparated` output).
     async fn query_text(&self, sql: &str) -> Result<String, SinkError>;
+
+    /// Run a statement; its HTTP status and answer text, whatever the
+    /// status. `Err` only when no answer arrived (connect, timeout, I/O):
+    /// the outcome of a statement is then unknown.
+    async fn query_status(&self, sql: &str)
+    -> Result<(u16, String), SinkError>;
+}
+
+/// The error a fenced insert fails with: the table's fence constraint
+/// rejected rows carrying this writer's fence (it was rotated away).
+pub const FENCE_REJECTED: &str =
+    "clickhouse: the fence constraint rejected the insert";
+
+/// Whether `e` is a fenced insert's error.
+pub fn is_fence_rejection(e: &SinkError) -> bool {
+    matches!(e, SinkError::Fatal { details } if details.starts_with(FENCE_REJECTED))
 }
 
 pub struct ClickHouseClient {
@@ -60,14 +76,14 @@ impl ClickHouseClient {
         })
     }
 
-    /// POST a body with a `?query=…` (+ extra params); the response body,
-    /// or a `SinkError` on failure.
-    async fn post(
+    /// POST a body with a `?query=…` (+ extra params); the status and the
+    /// answer text, or a `SinkError` when no answer arrived.
+    async fn post_raw(
         &self,
         query: String,
         extra: &[(&str, String)],
         body: Vec<u8>,
-    ) -> Result<String, SinkError> {
+    ) -> Result<(u16, String), SinkError> {
         let mut params: Vec<(String, String)> = Vec::new();
         // Only add ?query= when non-empty. DDL is sent as the request *body*
         // (see `execute_ddl`) — a query-in-URL with an empty body triggers
@@ -116,13 +132,39 @@ impl ClickHouseClient {
             }
         })?;
 
-        if resp.status().is_success() {
-            return resp.text().await.map_err(|e| {
-                SinkError::Io(std::io::Error::other(e.to_string()))
+        let code = resp.status().as_u16();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| SinkError::Io(std::io::Error::other(e.to_string())))?;
+        Ok((code, text))
+    }
+
+    /// POST a body with a `?query=…` (+ extra params); the response body,
+    /// or a `SinkError` on failure.
+    async fn post(
+        &self,
+        query: String,
+        extra: &[(&str, String)],
+        body: Vec<u8>,
+    ) -> Result<String, SinkError> {
+        let (code, text) = self.post_raw(query, extra, body).await?;
+        if (200..300).contains(&code) {
+            return Ok(text);
+        }
+        let code = reqwest::StatusCode::from_u16(code)
+            .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        if super::ownership::error_code(&text) == Some(469)
+            && text.contains("df_fence_")
+        {
+            return Err(SinkError::Fatal {
+                details: format!(
+                    "{FENCE_REJECTED}: {}",
+                    &text[..text.len().min(300)]
+                )
+                .into(),
             });
         }
-        let code = resp.status();
-        let text = resp.text().await.unwrap_or_default();
         if code == reqwest::StatusCode::UNAUTHORIZED
             || code == reqwest::StatusCode::FORBIDDEN
         {
@@ -137,21 +179,26 @@ impl ClickHouseClient {
 
     /// The `INSERT` query string for a table (public for unit testing).
     pub fn insert_query(&self, table: &str) -> String {
-        format!("INSERT INTO {}.{} FORMAT RowBinary", self.database, table)
+        format!(
+            "INSERT INTO {}.{} FORMAT RowBinary",
+            super::ddl::quote_ident(&self.database),
+            super::ddl::quote_ident(table)
+        )
     }
 }
 
-/// The settings every insert carries. `wait_for_async_insert=1` makes a 2xx
-/// mean the rows are written to the table even when the server or user
-/// profile enables `async_insert` (otherwise a 2xx only means "queued in the
-/// server's buffer", which an acknowledged batch and a checkpoint barrier
-/// must never mean). A server whose constraints forbid the setting rejects
-/// the insert: it fails, never acknowledging less.
+/// The settings every insert carries. `async_insert=0` makes every insert
+/// synchronous, whatever the server or user profile enables: a 2xx means
+/// the rows are written to the table, after the fence constraint accepted
+/// them (an asynchronous insert would acknowledge before either). A server
+/// whose constraints forbid the setting rejects the insert: it fails, never
+/// acknowledging less. `wait_for_async_insert=1` is kept as a second line.
 pub(crate) fn insert_settings(
     dedup_token: &str,
-) -> [(&'static str, String); 2] {
+) -> [(&'static str, String); 3] {
     [
         ("insert_deduplication_token", dedup_token.to_string()),
+        ("async_insert", "0".to_string()),
         ("wait_for_async_insert", "1".to_string()),
     ]
 }
@@ -184,6 +231,14 @@ impl ChTransport for ClickHouseClient {
     async fn query_text(&self, sql: &str) -> Result<String, SinkError> {
         self.post(String::new(), &[], sql.as_bytes().to_vec()).await
     }
+
+    async fn query_status(
+        &self,
+        sql: &str,
+    ) -> Result<(u16, String), SinkError> {
+        self.post_raw(String::new(), &[], sql.as_bytes().to_vec())
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -212,8 +267,10 @@ mod tests {
     }
 
     #[test]
-    fn every_insert_waits_for_an_async_insert() {
+    fn every_insert_is_synchronous() {
         let settings = insert_settings("tok");
+        // The fence constraint is evaluated before the insert answers.
+        assert!(settings.contains(&("async_insert", "0".to_string())));
         assert!(settings.contains(&("wait_for_async_insert", "1".to_string())));
         assert!(
             settings
@@ -226,7 +283,7 @@ mod tests {
         let c = ClickHouseClient::new(&cfg(), None, None).unwrap();
         assert_eq!(
             c.insert_query("orders"),
-            "INSERT INTO analytics.orders FORMAT RowBinary"
+            "INSERT INTO `analytics`.`orders` FORMAT RowBinary"
         );
     }
 }

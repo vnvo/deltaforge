@@ -7025,6 +7025,56 @@ mod tests {
         );
     }
 
+    /// A server-enforced fencing rejection (another writer holds the
+    /// destination's fence) halts the pipeline with its
+    /// `sink_destination_conflict` incident: even with a DLQ nothing is
+    /// dead-lettered, nothing is retried in process, and the checkpoint
+    /// never advances past the batch.
+    #[tokio::test]
+    async fn a_fencing_rejection_holds_the_checkpoint_and_never_dead_letters() {
+        let dlq = accepting_dlq("test-fenced-dlq");
+        let sink = DlqMockSink::new_encode_error("es", vec![1], |id| {
+            deltaforge_core::ownership::ownership_refusal(
+                id,
+                &deltaforge_core::ownership::DestinationMarker::elasticsearch(
+                    "c1", "orders",
+                ),
+                &deltaforge_core::SourceRelationIdentity {
+                    connector: "postgresql".into(),
+                    source: "pg".into(),
+                    database: "db".into(),
+                    namespace: "public".into(),
+                    table: "orders".into(),
+                },
+                deltaforge_core::ownership::OwnershipClass::Fenced,
+                None,
+                None,
+            )
+        });
+        let (result, cp, sink) =
+            run_failing_sink(sink, Some(dlq.clone())).await;
+        let err = result.expect_err("a fenced batch fails closed");
+        assert!(cp.is_none(), "the checkpoint did not advance");
+        assert!(
+            dlq.peek(10).await.unwrap().is_empty(),
+            "nothing dead-lettered"
+        );
+        assert_eq!(
+            sink.delivery_count(),
+            0,
+            "nothing acknowledged as delivered"
+        );
+        let draft = crate::incidents::classify_coordinator_exit(&err, 0);
+        assert_eq!(
+            draft.reason_code,
+            deltaforge_core::incident::ReasonCode::SinkDestinationConflict
+        );
+        assert_eq!(
+            draft.discriminator.get("class").map(String::as_str),
+            Some("fenced")
+        );
+    }
+
     /// A DLQ that cannot durably capture the event (full, rejecting) never
     /// lets the checkpoint pass it.
     #[tokio::test]
