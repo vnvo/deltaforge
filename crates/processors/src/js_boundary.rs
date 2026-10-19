@@ -67,14 +67,12 @@ pub(crate) fn to_js(
         .map_err(|e| anyhow!("render event for JS: {e}"))?;
     let before = native
         .before
-        .clone()
         .zip(event.before.clone())
-        .map(|(m, r)| (r.clone(), js_safe(&r, m)));
+        .map(|(m, r)| (r.clone(), js_safe(&r, m.to_map())));
     let after = native
         .after
-        .clone()
         .zip(event.after.clone())
-        .map(|(m, r)| (r.clone(), js_safe(&r, m)));
+        .map(|(m, r)| (r.clone(), js_safe(&r, m.to_map())));
     let mut value =
         serde_json::to_value(&native).expect("a native payload serializes");
     if let Value::Object(o) = &mut value {

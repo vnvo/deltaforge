@@ -32,3 +32,6 @@ test-fixtures = []
 
 [lints]
 workspace = true
+[[bench]]
+name = "canonical_encode"
+harness = false

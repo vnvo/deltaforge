@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
 
 use crate::canonical::render::{
-    RenderError, RenderOpts, RenderedRow, WideIntegers, render_row,
+    RenderError, RenderOpts, RowImage, WideIntegers, row_image,
 };
 use crate::canonical::{CanonicalRow, TypeMapping};
 use crate::{Event, EventId, Op, SourceInfo, Transaction};
@@ -29,12 +29,13 @@ impl NativeOpts {
 /// An event rendered natively: the Debezium payload structure, with the
 /// row images rendered for the event's mapping version, `type_mapping` in
 /// the `source` block, and (when PostgreSQL did not send some columns)
-/// `unchanged_columns`.
+/// `unchanged_columns`. The row images are checked [`RowImage`]s, written
+/// as they serialize; the path view uses JSON maps instead.
 #[derive(Debug, Clone)]
-pub struct NativePayload<'a> {
+pub struct NativePayload<'a, I = RowImage<'a>> {
     pub event: &'a Event,
-    pub before: Option<Map<String, Value>>,
-    pub after: Option<Map<String, Value>>,
+    pub before: Option<I>,
+    pub after: Option<I>,
     /// After-image columns PostgreSQL did not send (unchanged TOAST).
     pub unchanged_columns: Vec<String>,
 }
@@ -46,32 +47,34 @@ impl Event {
         opts: NativeOpts,
     ) -> Result<NativePayload<'_>, RenderError> {
         let opts = opts.render(self.type_mapping);
-        let image = |image: &str, row: &CanonicalRow| {
-            render_row(row, opts).map_err(|e| RenderError {
+        fn image<'r>(
+            image: &str,
+            row: &'r CanonicalRow,
+            opts: RenderOpts,
+        ) -> Result<(RowImage<'r>, Vec<String>), RenderError> {
+            row_image(row, opts).map_err(|e| RenderError {
                 column: format!("{image}.{}", e.column),
                 failure: e.failure,
             })
-        };
-        let before = self
-            .before
-            .as_ref()
-            .map(|r| image("before", r))
-            .transpose()?
-            .map(|r: RenderedRow| {
+        }
+        let before = match &self.before {
+            Some(r) => {
+                let (row, unchanged) = image("before", r, opts)?;
                 debug_assert!(
-                    r.unchanged.is_empty(),
+                    unchanged.is_empty(),
                     "before images are complete"
                 );
-                r.values
-            });
-        let (after, unchanged_columns) =
-            match self.after.as_ref().map(|r| image("after", r)) {
-                Some(r) => {
-                    let r = r?;
-                    (Some(r.values), r.unchanged)
-                }
-                None => (None, Vec::new()),
-            };
+                Some(row)
+            }
+            None => None,
+        };
+        let (after, unchanged_columns) = match &self.after {
+            Some(r) => {
+                let (row, unchanged) = image("after", r, opts)?;
+                (Some(row), unchanged)
+            }
+            None => (None, Vec::new()),
+        };
         Ok(NativePayload {
             event: self,
             before,
@@ -90,12 +93,13 @@ impl Event {
     /// sensing): its native structure with the row images as
     /// [`crate::canonical::view::row_view`]s.
     pub fn view_value(&self) -> Value {
-        let mut payload = NativePayload {
-            event: self,
-            before: None,
-            after: None,
-            unchanged_columns: Vec::new(),
-        };
+        let mut payload: NativePayload<'_, Map<String, Value>> =
+            NativePayload {
+                event: self,
+                before: None,
+                after: None,
+                unchanged_columns: Vec::new(),
+            };
         payload.before = self
             .before
             .as_ref()
@@ -162,7 +166,7 @@ struct NativeSource<'a> {
     type_mapping: TypeMapping,
 }
 
-impl Serialize for NativePayload<'_> {
+impl<I: Serialize> Serialize for NativePayload<'_, I> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let e = self.event;
         let mut m = s.serialize_map(None)?;

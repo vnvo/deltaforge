@@ -6,6 +6,7 @@
 use serde::Serialize;
 
 use super::{Envelope, EnvelopeData, EnvelopeError};
+use crate::canonical::render::RowImage;
 use crate::{Event, NativeOpts, Op, TypeMapping};
 
 /// CloudEvents envelope - restructures Event to CloudEvents 1.0.
@@ -50,17 +51,17 @@ pub struct CloudEventsWrapper<'a> {
     datacontenttype: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     subject: Option<String>,
-    data: CloudEventsData,
+    data: CloudEventsData<'a>,
     #[serde(skip)]
     _event: std::marker::PhantomData<&'a Event>,
 }
 
 #[derive(Serialize)]
-pub(crate) struct CloudEventsData {
+pub(crate) struct CloudEventsData<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
-    before: Option<serde_json::Map<String, serde_json::Value>>,
+    before: Option<RowImage<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    after: Option<serde_json::Map<String, serde_json::Value>>,
+    after: Option<RowImage<'a>>,
     op: &'static str,
     /// The mapping version the values are rendered with.
     type_mapping: TypeMapping,

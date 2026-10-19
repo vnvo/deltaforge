@@ -3,7 +3,10 @@
 //! Text forms used by more than one encoder (temporal text, decimal text,
 //! UUID text) live here too, so every sink renders a value the same way.
 
+use base64::display::Base64Display;
 use base64::prelude::*;
+use serde::ser::{Error as _, SerializeMap, SerializeSeq};
+use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
 
 use super::{
@@ -83,37 +86,102 @@ pub struct RenderedRow {
     pub unchanged: Vec<String>,
 }
 
-/// Render a row image.
+/// Render a row image as a JSON map.
 pub fn render_row(
     row: &CanonicalRow,
     opts: RenderOpts,
 ) -> Result<RenderedRow, RenderError> {
-    let mut values = Map::with_capacity(row.len());
+    let (image, unchanged) = row_image(row, opts)?;
+    Ok(RenderedRow {
+        values: image.to_map(),
+        unchanged,
+    })
+}
+
+/// A checked row image that renders as it serializes: its present columns
+/// in row order, then its extensions, written straight to the serializer
+/// (no map, no owned names, no intermediate values).
+#[derive(Debug, Clone, Copy)]
+pub struct RowImage<'a> {
+    row: &'a CanonicalRow,
+    opts: RenderOpts,
+}
+
+/// Check that every value of `row` renders under `opts`: the row's image,
+/// and the columns PostgreSQL did not send (unchanged TOAST values), which
+/// the image omits. A processor extension with a column's name is refused,
+/// never written over the column.
+pub fn row_image(
+    row: &CanonicalRow,
+    opts: RenderOpts,
+) -> Result<(RowImage<'_>, Vec<String>), RenderError> {
     let mut unchanged = Vec::new();
     for (name, v) in row.iter() {
         if matches!(v, CanonicalValue::Unchanged) {
             unchanged.push(name.to_string());
         } else {
-            let rendered =
-                render_value(v, opts).map_err(|failure| RenderError {
-                    column: name.to_string(),
-                    failure,
-                })?;
-            values.insert(name.to_string(), rendered);
+            check_value(v, opts).map_err(|failure| RenderError {
+                column: name.to_string(),
+                failure,
+            })?;
         }
     }
-    // Extensions merge into the rendered row; a name a column already
-    // renders under (or lists as unchanged) is refused, never overwritten.
-    for (name, doc) in row.extensions() {
-        if values.contains_key(name) || unchanged.iter().any(|u| u == name) {
-            return Err(RenderError {
-                column: name.clone(),
-                failure: RenderFailure::ExtensionCollision,
-            });
-        }
-        values.insert(name.clone(), doc.value().clone());
+    if let Some(name) = row.extensions().keys().find(|n| row.get(n).is_some()) {
+        return Err(RenderError {
+            column: name.clone(),
+            failure: RenderFailure::ExtensionCollision,
+        });
     }
-    Ok(RenderedRow { values, unchanged })
+    Ok((RowImage { row, opts }, unchanged))
+}
+
+impl RowImage<'_> {
+    /// The image as a JSON map.
+    pub fn to_map(&self) -> Map<String, Value> {
+        match serde_json::to_value(self) {
+            Ok(Value::Object(m)) => m,
+            other => unreachable!("a row image is a JSON object: {other:?}"),
+        }
+    }
+}
+
+impl Serialize for RowImage<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(None)?;
+        for (name, v) in self.row.iter() {
+            if !matches!(v, CanonicalValue::Unchanged) {
+                m.serialize_entry(name, &Rendered(v, self.opts))?;
+            }
+        }
+        for (name, doc) in self.row.extensions() {
+            m.serialize_entry(name, doc.value())?;
+        }
+        m.end()
+    }
+}
+
+/// Whether `v` renders under `opts` (the failures [`Rendered`] would
+/// meet).
+fn check_value(
+    v: &CanonicalValue,
+    opts: RenderOpts,
+) -> Result<(), RenderFailure> {
+    match v {
+        CanonicalValue::Unchanged => Err(RenderFailure::Unchanged),
+        CanonicalValue::Db(DbValue::UInt {
+            value,
+            width: IntWidth::W64,
+        }) if opts.mapping != TypeMapping::V1
+            && opts.wide_integers == WideIntegers::Number
+            && *value > i64::MAX as u64 =>
+        {
+            Err(RenderFailure::WideUnsignedNumber)
+        }
+        CanonicalValue::Db(DbValue::Array(a)) => {
+            a.items().iter().try_for_each(|i| check_value(i, opts))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Render one value.
@@ -121,14 +189,179 @@ pub fn render_value(
     v: &CanonicalValue,
     opts: RenderOpts,
 ) -> Result<Value, RenderFailure> {
-    Ok(match v {
-        CanonicalValue::Null => Value::Null,
-        CanonicalValue::Unchanged => return Err(RenderFailure::Unchanged),
-        CanonicalValue::Db(db) => render_db(db, opts)?,
-        CanonicalValue::Opaque(o) => Value::String(o.text.clone()),
-        CanonicalValue::Document(d) => d.value().clone(),
-        CanonicalValue::Bytes(b) => base64_wrapper(b),
-    })
+    check_value(v, opts)?;
+    Ok(serde_json::to_value(Rendered(v, opts))
+        .expect("a checked value renders"))
+}
+
+/// A value's native rendering, written as it serializes. Only checked
+/// values (see [`check_value`]) are serialized.
+struct Rendered<'a>(&'a CanonicalValue, RenderOpts);
+
+impl Serialize for Rendered<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            CanonicalValue::Null => s.serialize_unit(),
+            CanonicalValue::Unchanged => {
+                Err(S::Error::custom(RenderFailure::Unchanged.to_string()))
+            }
+            CanonicalValue::Db(db) => serialize_db(db, self.1, s),
+            CanonicalValue::Opaque(o) => s.serialize_str(&o.text),
+            CanonicalValue::Document(d) => d.value().serialize(s),
+            CanonicalValue::Bytes(b) => Base64Wrapper(b).serialize(s),
+        }
+    }
+}
+
+/// The binary wrapper `{"_base64": "<standard base64>"}`, encoded as it
+/// serializes.
+struct Base64Wrapper<'a>(&'a [u8]);
+
+impl Serialize for Base64Wrapper<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(Some(1))?;
+        m.serialize_entry(
+            "_base64",
+            &Collect(Base64Display::new(self.0, &BASE64_STANDARD)),
+        )?;
+        m.end()
+    }
+}
+
+/// A displayed value serialized as a JSON string.
+struct Collect<T>(T);
+
+impl<T: std::fmt::Display> Serialize for Collect<T> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(&self.0)
+    }
+}
+
+/// A SET's members joined by `,`.
+struct Members<'a>(&'a [String]);
+
+impl std::fmt::Display for Members<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, m) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(",")?;
+            }
+            f.write_str(m)?;
+        }
+        Ok(())
+    }
+}
+
+fn serialize_db<S: Serializer>(
+    v: &DbValue,
+    opts: RenderOpts,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    let v1 = opts.mapping == TypeMapping::V1;
+    match v {
+        DbValue::Int { value, width } => {
+            if *width == IntWidth::W64
+                && !v1
+                && opts.wide_integers == WideIntegers::String
+            {
+                s.collect_str(value)
+            } else {
+                s.serialize_i64(*value)
+            }
+        }
+        DbValue::UInt { value, width } => {
+            if *width != IntWidth::W64 || v1 {
+                s.serialize_u64(*value)
+            } else if opts.wide_integers == WideIntegers::String {
+                s.collect_str(value)
+            } else if *value > i64::MAX as u64 {
+                Err(S::Error::custom(
+                    RenderFailure::WideUnsignedNumber.to_string(),
+                ))
+            } else {
+                s.serialize_u64(*value)
+            }
+        }
+        DbValue::Decimal(d) => s.serialize_str(decimal_text(d)),
+        DbValue::Float32(f) => {
+            if v1 {
+                serialize_f64(*f as f64, s)
+            } else {
+                serialize_f32(*f, s)
+            }
+        }
+        DbValue::Float64(f) => serialize_f64(*f, s),
+        DbValue::Bool(b) => s.serialize_bool(*b),
+        DbValue::Text(t) => s.serialize_str(t),
+        DbValue::Binary(b) => Base64Wrapper(b).serialize(s),
+        DbValue::Bits(bits) => {
+            if v1 {
+                s.serialize_u64(bits.to_u64())
+            } else if bits.len() == 1 {
+                s.serialize_bool(bits.to_u64() == 1)
+            } else {
+                Base64Wrapper(bits.bytes()).serialize(s)
+            }
+        }
+        DbValue::Enum(e) => s.serialize_str(&e.label),
+        DbValue::Set(set) => s.collect_str(&Members(set.members())),
+        DbValue::Json(j) => s.serialize_str(j.as_str()),
+        DbValue::Date(d) => s.serialize_str(&date_text(d)),
+        DbValue::Time(t) => s.serialize_str(&if v1 {
+            time_text_fixed(t.micros(), Precision::Fixed(6))
+        } else {
+            time_text(t)
+        }),
+        DbValue::DateTime(dt) => s.serialize_str(&if v1 {
+            datetime_text_v1(dt)
+        } else {
+            datetime_text(dt)
+        }),
+        DbValue::Timestamp(ts) => match (v1, ts) {
+            (true, TimestampValue::Instant { micros, .. }) => {
+                s.serialize_i64(*micros)
+            }
+            _ => s.serialize_str(&timestamp_text(ts)),
+        },
+        DbValue::Year(y) => s.serialize_u16(*y),
+        DbValue::Uuid(u) => {
+            s.collect_str(&uuid::Uuid::from_bytes(*u).hyphenated())
+        }
+        DbValue::Array(a) => {
+            let mut seq = s.serialize_seq(Some(a.items().len()))?;
+            for i in a.items() {
+                seq.serialize_element(&Rendered(i, opts))?;
+            }
+            seq.end()
+        }
+    }
+}
+
+/// A finite f64 as the shortest round-trip number; non-finite values as
+/// `"NaN"`, `"Infinity"`, `"-Infinity"`.
+fn serialize_f64<S: Serializer>(f: f64, s: S) -> Result<S::Ok, S::Error> {
+    if f.is_finite() {
+        s.serialize_f64(f)
+    } else {
+        s.serialize_str(non_finite_text(f))
+    }
+}
+
+/// A finite f32 as the shortest f32 round-trip number (`1.1`, not the
+/// widened `1.100000023841858`).
+fn serialize_f32<S: Serializer>(f: f32, s: S) -> Result<S::Ok, S::Error> {
+    if !f.is_finite() {
+        return s.serialize_str(non_finite_text(f as f64));
+    }
+    // The shortest f32 text, read back as the f64 nearest to it: renders
+    // with the same digits.
+    let mut buf = [0u8; 64];
+    let mut w = &mut buf[..];
+    std::io::Write::write_fmt(&mut w, format_args!("{f}"))
+        .expect("an f32's text fits 64 bytes");
+    let len = 64 - w.len();
+    let text = std::str::from_utf8(&buf[..len]).expect("ASCII digits");
+    s.serialize_f64(text.parse().expect("an f32's text parses as f64"))
 }
 
 /// The binary wrapper: exactly `{"_base64": "<standard base64>"}`.
@@ -148,104 +381,6 @@ pub fn parse_base64_wrapper(v: &Value) -> Option<Vec<u8>> {
         return None;
     }
     BASE64_STANDARD.decode(m.get("_base64")?.as_str()?).ok()
-}
-
-fn render_db(v: &DbValue, opts: RenderOpts) -> Result<Value, RenderFailure> {
-    let v1 = opts.mapping == TypeMapping::V1;
-    Ok(match v {
-        DbValue::Int { value, width } => {
-            if *width == IntWidth::W64
-                && !v1
-                && opts.wide_integers == WideIntegers::String
-            {
-                Value::String(value.to_string())
-            } else {
-                Value::from(*value)
-            }
-        }
-        DbValue::UInt { value, width } => {
-            if *width != IntWidth::W64 || v1 {
-                Value::from(*value)
-            } else if opts.wide_integers == WideIntegers::String {
-                Value::String(value.to_string())
-            } else if *value > i64::MAX as u64 {
-                return Err(RenderFailure::WideUnsignedNumber);
-            } else {
-                Value::from(*value)
-            }
-        }
-        DbValue::Decimal(d) => Value::String(decimal_text(d).to_string()),
-        DbValue::Float32(f) => {
-            if v1 {
-                float_value(*f as f64)
-            } else {
-                float32_value(*f)
-            }
-        }
-        DbValue::Float64(f) => float_value(*f),
-        DbValue::Bool(b) => Value::Bool(*b),
-        DbValue::Text(s) => Value::String(s.clone()),
-        DbValue::Binary(b) => base64_wrapper(b),
-        DbValue::Bits(bits) => {
-            if v1 {
-                Value::from(bits.to_u64())
-            } else if bits.len() == 1 {
-                Value::Bool(bits.to_u64() == 1)
-            } else {
-                base64_wrapper(bits.bytes())
-            }
-        }
-        DbValue::Enum(e) => Value::String(e.label.clone()),
-        DbValue::Set(s) => Value::String(s.members().join(",")),
-        DbValue::Json(j) => Value::String(j.as_str().to_string()),
-        DbValue::Date(d) => Value::String(date_text(d)),
-        DbValue::Time(t) => Value::String(if v1 {
-            time_text_fixed(t.micros(), Precision::Fixed(6))
-        } else {
-            time_text(t)
-        }),
-        DbValue::DateTime(dt) => Value::String(if v1 {
-            datetime_text_v1(dt)
-        } else {
-            datetime_text(dt)
-        }),
-        DbValue::Timestamp(ts) => match (v1, ts) {
-            (true, TimestampValue::Instant { micros, .. }) => {
-                Value::from(*micros)
-            }
-            _ => Value::String(timestamp_text(ts)),
-        },
-        DbValue::Year(y) => Value::from(*y),
-        DbValue::Uuid(u) => Value::String(uuid_text(u)),
-        DbValue::Array(a) => Value::Array(
-            a.items()
-                .iter()
-                .map(|i| render_value(i, opts))
-                .collect::<Result<_, _>>()?,
-        ),
-    })
-}
-
-/// A finite f64 as the shortest round-trip number; non-finite values as
-/// `"NaN"`, `"Infinity"`, `"-Infinity"`.
-fn float_value(f: f64) -> Value {
-    match serde_json::Number::from_f64(f) {
-        Some(n) => Value::Number(n),
-        None => Value::String(non_finite_text(f).to_string()),
-    }
-}
-
-/// A finite f32 as the shortest f32 round-trip number (`1.1`, not the
-/// widened `1.100000023841858`).
-fn float32_value(f: f32) -> Value {
-    if !f.is_finite() {
-        return Value::String(non_finite_text(f as f64).to_string());
-    }
-    // The shortest f32 text, read back as the f64 nearest to it: renders
-    // with the same digits.
-    let shortest: f64 =
-        f.to_string().parse().expect("an f32's text parses as f64");
-    float_value(shortest)
 }
 
 pub(crate) fn non_finite_text(f: f64) -> &'static str {
