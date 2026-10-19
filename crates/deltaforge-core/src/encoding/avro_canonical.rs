@@ -65,13 +65,15 @@ pub(super) fn convert_row(
         ));
     }
     let mut fields = Vec::with_capacity(r.fields.len());
-    for field in &r.fields {
+    for (i, field) in r.fields.iter().enumerate() {
         let source = field
             .custom_attributes
             .get(SOURCE_TYPE_ATTR)
             .and_then(|v| v.as_str());
         let fcx = cx.field(&field.name, source);
-        let value = row.get(&field.name).unwrap_or(&CanonicalValue::Null);
+        let value = row
+            .get_hinted(i, &field.name)
+            .unwrap_or(&CanonicalValue::Null);
         fields.push((
             field.name.clone(),
             convert_value(value, &field.schema, &fcx)?,

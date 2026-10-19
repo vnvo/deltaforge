@@ -60,6 +60,9 @@ fn record_batch(schema: &Arc<Schema>, events: &[Event]) -> Result<RecordBatch> {
     check_rows_defined(schema, events)?;
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
 
+    // Each image's columns in schema order: the position a row usually
+    // holds a column at.
+    let (mut before_at, mut after_at) = (0, 0);
     for field in schema.fields() {
         let name = field.name();
         let dt = field.data_type();
@@ -69,9 +72,11 @@ fn record_batch(schema: &Arc<Schema>, events: &[Event]) -> Result<RecordBatch> {
         } else if name == "after_extensions" {
             build_extensions_column(events, true)
         } else if let Some(col) = name.strip_prefix("before_") {
-            build_user_column(events, field, col, /* after */ false)?
+            before_at += 1;
+            build_user_column(events, field, col, before_at - 1, false)?
         } else if let Some(col) = name.strip_prefix("after_") {
-            build_user_column(events, field, col, /* after */ true)?
+            after_at += 1;
+            build_user_column(events, field, col, after_at - 1, true)?
         } else {
             build_meta_column(events, name, dt)?
         };
@@ -243,6 +248,7 @@ fn build_user_column(
     events: &[Event],
     field: &Field,
     col_name: &str,
+    position: usize,
     after: bool,
 ) -> Result<ArrayRef> {
     let dt = field.data_type();
@@ -252,7 +258,7 @@ fn build_user_column(
         let row = if after { &e.after } else { &e.before };
         let v = row
             .as_ref()
-            .and_then(|r| r.get(col_name))
+            .and_then(|r| r.get_hinted(position, col_name))
             .unwrap_or(&CanonicalValue::Null);
         append(b.as_mut(), dt, v).map_err(|e| {
             match e.downcast::<Refused>() {
@@ -302,26 +308,39 @@ pub(crate) fn check_rows_defined(
     schema: &Schema,
     events: &[Event],
 ) -> Result<()> {
-    let defined = |image: &str, row: &CanonicalRow| -> Result<()> {
-        for name in row.names() {
-            if schema.field_with_name(&format!("{image}_{name}")).is_err() {
-                return Err(conversion(
-                    format!("{image}.{name}"),
-                    "a column".to_string(),
-                    "the Arrow schema of its version".to_string(),
-                    "a column the event's schema version does not define \
-                     (never dropped)",
-                ));
-            }
+    let columns = |image: &str| -> std::collections::HashSet<&str> {
+        schema
+            .fields()
+            .iter()
+            .filter_map(|f| {
+                f.name()
+                    .strip_prefix(image)
+                    .and_then(|n| n.strip_prefix('_'))
+            })
+            .collect()
+    };
+    let (before, after) = (columns("before"), columns("after"));
+    let defined = |image: &str,
+                   columns: &std::collections::HashSet<&str>,
+                   row: &CanonicalRow|
+     -> Result<()> {
+        match row.names().find(|n| !columns.contains(n)) {
+            None => Ok(()),
+            Some(name) => Err(conversion(
+                format!("{image}.{name}"),
+                "a column".to_string(),
+                "the Arrow schema of its version".to_string(),
+                "a column the event's schema version does not define \
+                 (never dropped)",
+            )),
         }
-        Ok(())
     };
     for e in events {
         if let Some(r) = &e.before {
-            defined("before", r)?;
+            defined("before", &before, r)?;
         }
         if let Some(r) = &e.after {
-            defined("after", r)?;
+            defined("after", &after, r)?;
         }
     }
     Ok(())
@@ -874,6 +893,39 @@ mod tests {
             i64::MAX,
             "64-bit integers are exact"
         );
+    }
+
+    #[test]
+    fn columns_are_found_by_name_whatever_the_row_order() {
+        let schema = mysql_schema(&[
+            col("age", "int", "int"),
+            col("id", "bigint", "bigint"),
+            col("name", "varchar", "varchar(8)"),
+        ]);
+        let int = |v: i64| db(DbValue::int(v, IntWidth::W64).unwrap());
+        // Reversed, and with a column missing (a NULL).
+        let reversed = CanonicalRow::new(vec![
+            ("id".into(), int(7)),
+            ("age".into(), db(DbValue::int(31, IntWidth::W32).unwrap())),
+        ])
+        .unwrap();
+        let events =
+            vec![make_event(Op::Create, "users", 0, None, Some(reversed))];
+        let batch = events_to_record_batch(&schema, &events).unwrap();
+        assert_eq!(column::<Int32Array>(&batch, "after_age").value(0), 31);
+        assert_eq!(column::<Int64Array>(&batch, "after_id").value(0), 7);
+        assert!(column::<StringArray>(&batch, "after_name").is_null(0));
+        // A column the schema does not define is still refused.
+        let extra = CanonicalRow::new(vec![
+            ("id".into(), int(7)),
+            ("ghost".into(), int(1)),
+        ])
+        .unwrap();
+        let msg = err_of(
+            &schema,
+            &[make_event(Op::Create, "users", 0, None, Some(extra))],
+        );
+        assert!(msg.contains("after.ghost"), "{msg}");
     }
 
     #[test]

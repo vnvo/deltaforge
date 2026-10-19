@@ -792,3 +792,17 @@ fn rendering_matches_the_golden_bytes() {
     }
     assert_eq!(actual.lines().count(), golden.lines().count());
 }
+
+#[test]
+fn a_hinted_lookup_is_a_lookup_by_name() {
+    let row = CanonicalRow::new(vec![
+        ("a".into(), CanonicalValue::Null),
+        ("b".into(), db(DbValue::Bool(true))),
+    ])
+    .unwrap();
+    for hint in 0..4 {
+        assert_eq!(row.get_hinted(hint, "b"), row.get("b"));
+        assert_eq!(row.get_hinted(hint, "a"), row.get("a"));
+        assert_eq!(row.get_hinted(hint, "c"), None);
+    }
+}

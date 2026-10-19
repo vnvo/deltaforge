@@ -862,6 +862,20 @@ impl CanonicalRow {
         self.columns.iter().find(|(n, _)| n == name).map(|(_, v)| v)
     }
 
+    /// [`Self::get`], looking at position `hint` first: a row usually holds
+    /// its columns in its schema's order, so a caller walking the schema
+    /// finds each column in constant time instead of scanning the row.
+    pub fn get_hinted(
+        &self,
+        hint: usize,
+        name: &str,
+    ) -> Option<&CanonicalValue> {
+        match self.columns.get(hint) {
+            Some((n, v)) if n == name => Some(v),
+            _ => self.get(name),
+        }
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&str, &CanonicalValue)> {
         self.columns.iter().map(|(n, v)| (n.as_str(), v))
     }
