@@ -1466,6 +1466,41 @@ async fn resolved_schemas_resolve_each_version_once_and_validate_values() {
     assert!(ResolvedSchemas::resolve(&schemas, &[ev]).await.is_ok());
 }
 
+/// Consecutive events of one version reuse its resolution, but every event
+/// is still checked, and an event of another relation or version is
+/// resolved on its own.
+#[tokio::test]
+async fn resolution_reuses_a_version_only_for_the_same_reference() {
+    let schemas = TestSchemas::default();
+    let mut other_table = new_event();
+    other_table.source.table = "orders_archive".into();
+    let events = vec![new_event(), new_event(), other_table, new_event()];
+    let r = ResolvedSchemas::resolve(&schemas, &events).await.unwrap();
+    assert_eq!(r.len(), 2, "a version per relation");
+    // The fourth event is the first's version again: found, not resolved.
+    assert_eq!(schemas.lookups.load(Ordering::Relaxed), 2);
+    // A later event of the same version is still checked.
+    let bad = event_with_after(vec![("id", db(DbValue::Text("x".into())))]);
+    assert!(
+        ResolvedSchemas::resolve(&schemas, &[new_event(), bad])
+            .await
+            .is_err()
+    );
+    // And one of another version is resolved (and refused) on its own.
+    let mut unknown = new_event();
+    unknown.schema_version = Some("orders-unknown".into());
+    assert!(
+        ResolvedSchemas::resolve(&schemas, &[new_event(), unknown])
+            .await
+            .is_err()
+    );
+    let mut other_sequence = new_event();
+    other_sequence.schema_sequence = Some(2);
+    let r = ResolvedSchemas::resolve(&schemas, &[new_event(), other_sequence])
+        .await;
+    assert!(r.is_err(), "sequence 2 conflicts with the registered 1");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn js_sql_null_and_json_null_stay_distinct() {
     let json_null = db(DbValue::Json(JsonText::new("null".into()).unwrap()));

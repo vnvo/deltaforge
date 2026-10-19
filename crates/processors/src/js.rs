@@ -22,6 +22,7 @@ use deltaforge_core::{
 use serde::Deserialize;
 
 use crate::js_boundary::{Authority, JsInput, SchemaCtx, from_js_row, to_js};
+use deltaforge_core::canonical::schema::SchemaRef;
 use deno_core::{JsRuntime, RuntimeOptions, extension};
 use deno_core::{serde_v8, v8};
 use serde_json::Value;
@@ -695,29 +696,35 @@ impl Processor for JsProcessor {
         // The batch's schema versions were resolved and validated before
         // any processor ran; each event's types are looked up once per
         // distinct version and shared.
-        let mut resolved: std::collections::HashMap<
-            deltaforge_core::canonical::schema::SchemaRef,
-            SchemaCtx,
-        > = std::collections::HashMap::new();
+        let mut resolved: std::collections::HashMap<SchemaRef, SchemaCtx> =
+            std::collections::HashMap::new();
         let mut batch = Vec::with_capacity(events.len());
+        // Consecutive events usually name one version: the last reference is
+        // compared in place instead of being built and looked up again.
+        let mut last: Option<(SchemaRef, SchemaCtx)> = None;
         for ev in events {
-            let schema = match deltaforge_core::canonical::schema::SchemaRef::of(
-                &ev,
-            ) {
-                None => SchemaCtx::NoReference,
-                Some(r) => match resolved.get(&r) {
-                    Some(s) => s.clone(),
-                    None => {
-                        let s = match ctx.schemas.as_ref().map(|s| s.get(&r)) {
-                            None => SchemaCtx::Missing(
-                                "the pipeline provides no schema context".into(),
-                            ),
-                            Some(None) => SchemaCtx::Missing(
-                                "the batch did not resolve the event's schema version".into(),
-                            ),
-                            Some(Some(types)) => SchemaCtx::Resolved(Arc::clone(types)),
+            let schema = match &last {
+                Some((r, s)) if r.is_of(&ev) => s.clone(),
+                _ => match SchemaRef::of(&ev) {
+                    None => SchemaCtx::NoReference,
+                    Some(r) => {
+                        let s = match resolved.get(&r) {
+                            Some(s) => s.clone(),
+                            None => {
+                                let s = match ctx.schemas.as_ref().map(|s| s.get(&r)) {
+                                    None => SchemaCtx::Missing(
+                                        "the pipeline provides no schema context".into(),
+                                    ),
+                                    Some(None) => SchemaCtx::Missing(
+                                        "the batch did not resolve the event's schema version".into(),
+                                    ),
+                                    Some(Some(types)) => SchemaCtx::Resolved(Arc::clone(types)),
+                                };
+                                resolved.insert(r.clone(), s.clone());
+                                s
+                            }
                         };
-                        resolved.insert(r, s.clone());
+                        last = Some((r, s.clone()));
                         s
                     }
                 },

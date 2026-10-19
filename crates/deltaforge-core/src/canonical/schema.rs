@@ -91,6 +91,15 @@ impl ColumnTypes {
         self.columns.iter().find(|(n, _)| n == name).map(|(_, t)| t)
     }
 
+    /// [`Self::get`], looking at position `hint` first (a row holds its
+    /// columns in its schema's order).
+    pub fn get_hinted(&self, hint: usize, name: &str) -> Option<&ColumnType> {
+        match self.columns.get(hint) {
+            Some((n, t)) if n == name => Some(t),
+            _ => self.get(name),
+        }
+    }
+
     pub fn columns(&self) -> &[(String, ColumnType)] {
         &self.columns
     }
@@ -110,6 +119,17 @@ pub struct SchemaRef {
 }
 
 impl SchemaRef {
+    /// Whether `event` carries exactly this reference (compared in place,
+    /// without building one).
+    pub fn is_of(&self, event: &crate::Event) -> bool {
+        event.schema_version.as_deref() == Some(self.fingerprint.as_str())
+            && event.schema_sequence == self.sequence
+            && event.source.table == self.table
+            && event.source.db == self.database
+            && event.source.namespace() == self.namespace
+            && event.source.connector == self.connector
+    }
+
     /// The reference an event carries, if it carries one.
     pub fn of(event: &crate::Event) -> Option<SchemaRef> {
         Some(SchemaRef {
@@ -174,56 +194,89 @@ impl ResolvedSchemas {
         events: &[crate::Event],
     ) -> Result<ResolvedSchemas, SchemaContextError> {
         let mut versions = std::collections::HashMap::new();
+        // Consecutive events usually share a version: the last one is
+        // reused without building its reference.
+        let mut last: Option<(SchemaRef, Arc<ColumnTypes>)> = None;
         for ev in events {
-            let Some(r) = SchemaRef::of(ev) else {
+            if ev.schema_version.is_none() {
                 continue;
-            };
-            let types = match versions.get(&r) {
-                Some(t) => Arc::clone(t),
-                None => {
-                    let t = context.resolve(&r).await?;
-                    if *t.fingerprint != *r.fingerprint
-                        || (r.sequence.is_some()
-                            && t.sequence.is_some()
-                            && t.sequence != r.sequence)
-                    {
-                        return Err(SchemaContextError::Conflict(format!(
-                            "{}.{} resolved {}@{:?} for the event's {}@{:?}",
-                            r.namespace,
-                            r.table,
-                            t.fingerprint,
-                            t.sequence,
-                            r.fingerprint,
-                            r.sequence
-                        )));
-                    }
-                    versions.insert(r.clone(), Arc::clone(&t));
-                    t
+            }
+            let (r, types) = match last.take() {
+                Some((r, t)) if r.is_of(ev) => (r, t),
+                _ => {
+                    let r =
+                        SchemaRef::of(ev).expect("the event names a version");
+                    let t = Self::version(context, &mut versions, &r).await?;
+                    (r, t)
                 }
             };
-            for row in [&ev.before, &ev.after].into_iter().flatten() {
-                for (name, v) in row.iter() {
-                    match types.get(name) {
-                        Some(ty) if ty.admits(v) => {}
-                        Some(_) => {
-                            return Err(SchemaContextError::Conflict(format!(
-                                "{}.{} column `{name}`: the event's value is not of \
+            Self::admits(&r, &types, ev)?;
+            last = Some((r, types));
+        }
+        Ok(ResolvedSchemas { versions })
+    }
+
+    /// The types of `r`, resolved once per batch and checked against the
+    /// reference.
+    async fn version(
+        context: &dyn SchemaContext,
+        versions: &mut std::collections::HashMap<SchemaRef, Arc<ColumnTypes>>,
+        r: &SchemaRef,
+    ) -> Result<Arc<ColumnTypes>, SchemaContextError> {
+        let types = match versions.get(r) {
+            Some(t) => Arc::clone(t),
+            None => {
+                let t = context.resolve(r).await?;
+                if *t.fingerprint != *r.fingerprint
+                    || (r.sequence.is_some()
+                        && t.sequence.is_some()
+                        && t.sequence != r.sequence)
+                {
+                    return Err(SchemaContextError::Conflict(format!(
+                        "{}.{} resolved {}@{:?} for the event's {}@{:?}",
+                        r.namespace,
+                        r.table,
+                        t.fingerprint,
+                        t.sequence,
+                        r.fingerprint,
+                        r.sequence
+                    )));
+                }
+                versions.insert(r.clone(), Arc::clone(&t));
+                t
+            }
+        };
+        Ok(types)
+    }
+
+    /// Every value of `ev` is of the type `types` declares for its column.
+    fn admits(
+        r: &SchemaRef,
+        types: &ColumnTypes,
+        ev: &crate::Event,
+    ) -> Result<(), SchemaContextError> {
+        for row in [&ev.before, &ev.after].into_iter().flatten() {
+            for (i, (name, v)) in row.iter().enumerate() {
+                match types.get_hinted(i, name) {
+                    Some(ty) if ty.admits(v) => {}
+                    Some(_) => {
+                        return Err(SchemaContextError::Conflict(format!(
+                            "{}.{} column `{name}`: the event's value is not of \
                                  the type schema version {} declares",
-                                r.namespace, r.table, r.fingerprint
-                            )));
-                        }
-                        // Undeclared data belongs in the row's extensions.
-                        None => {
-                            return Err(SchemaContextError::Conflict(format!(
-                                "{}.{} column `{name}` is not declared by schema version {}",
-                                r.namespace, r.table, r.fingerprint
-                            )));
-                        }
+                            r.namespace, r.table, r.fingerprint
+                        )));
+                    }
+                    // Undeclared data belongs in the row's extensions.
+                    None => {
+                        return Err(SchemaContextError::Conflict(format!(
+                            "{}.{} column `{name}` is not declared by schema version {}",
+                            r.namespace, r.table, r.fingerprint
+                        )));
                     }
                 }
             }
         }
-        Ok(ResolvedSchemas { versions })
+        Ok(())
     }
 
     /// A batch's versions given directly (tests, and contexts resolved
