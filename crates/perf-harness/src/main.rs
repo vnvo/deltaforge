@@ -939,9 +939,7 @@ fn alloc_requests(stats: &str) -> Option<u64> {
     let merged = &stats[stats.find("Merged arenas stats")?..];
     let header = merged.lines().find(|l| l.contains("nrequests"))?;
     // The header's columns, in the order of the `total:` line's values.
-    let column = header
-        .split_whitespace()
-        .position(|c| c == "nrequests")?;
+    let column = header.split_whitespace().position(|c| c == "nrequests")?;
     merged
         .lines()
         .find(|l| l.trim_start().starts_with("total:"))
