@@ -343,9 +343,15 @@ enum Expect {
     /// The source refuses every non-null row (`source_decode_failed`): no
     /// sink emits an event for one.
     DecodeRefused,
-    /// PostgreSQL: an update leaves a TOASTed value unchanged. Native JSON
-    /// omits it (`unchanged_columns`); Avro and Parquet refuse the update.
+    /// PostgreSQL, default replica identity: an update leaves a TOASTed
+    /// value unchanged. Native JSON (partial rows) omits it
+    /// (`unchanged_columns`); a pipeline with a sink needing complete rows
+    /// (Avro, Parquet) refuses the table at startup (`pg_table_unsupported`)
+    /// and emits nothing.
     Toast,
+    /// PostgreSQL, REPLICA IDENTITY FULL: the same update reaches every sink
+    /// with the unchanged value reconstructed from the full old row.
+    ToastFull,
 }
 
 /// One probed row: SQL literals per column, and whether the session must be
@@ -378,6 +384,7 @@ impl Table {
     fn refused_row(&self, k: usize) -> bool {
         self.expect != Expect::Parity
             && self.expect != Expect::Toast
+            && self.expect != Expect::ToastFull
             && self.rows[k].label != "null"
     }
 }
@@ -1059,6 +1066,18 @@ fn pg_tables() -> Vec<Table> {
             expect: Expect::Toast,
             ..Default::default()
         },
+        Table {
+            name: "t_toast_full",
+            columns: vec![("big", "text"), ("n", "integer")],
+            rows: vec![row("toasted", &[PG_TOASTED, "1"])],
+            setup: vec![
+                "ALTER TABLE {db}.t_toast_full ALTER COLUMN big SET STORAGE EXTERNAL"
+                    .into(),
+                "ALTER TABLE {db}.t_toast_full REPLICA IDENTITY FULL".into(),
+            ],
+            expect: Expect::ToastFull,
+            ..Default::default()
+        },
     ]
 }
 
@@ -1207,11 +1226,10 @@ impl Sink {
     /// The incident a sink raises for a table's values, if any.
     fn refusal(self, expect: Expect) -> Option<&'static str> {
         match (expect, self) {
-            (Expect::Parity, _)
+            (Expect::Parity | Expect::ToastFull, _)
             | (Expect::TypedRefused | Expect::Toast, Sink::Json) => None,
-            (Expect::TypedRefused | Expect::Toast, _) => {
-                Some("sink_conversion_failed")
-            }
+            (Expect::TypedRefused, _) => Some("sink_conversion_failed"),
+            (Expect::Toast, _) => Some("pg_table_unsupported"),
             (Expect::DecodeRefused, _) => Some("source_decode_failed"),
         }
     }
@@ -1913,7 +1931,8 @@ async fn change_rows(run: &Run, tables: &[Table], sql: &mut Sql) {
         }
         sql.mode(true).await;
         for k in 0..n {
-            let stmt = if t.expect == Expect::Toast {
+            let stmt = if matches!(t.expect, Expect::Toast | Expect::ToastFull)
+            {
                 format!(
                     "UPDATE {db}.{} SET n = n + 1 WHERE id = {}",
                     t.name,
@@ -2082,19 +2101,73 @@ fn check(
     let want = expected_keys(run, t);
     let n = t.rows.len() as i64;
 
+    if t.expect == Expect::ToastFull {
+        // One row: snapshot 1, insert/update/delete 101; the update changes
+        // only `n`, and every sink receives the unchanged value whole.
+        if keys != want {
+            failures.push(format!("{ctx}: events {keys:?}, expected {want:?}"));
+        }
+        let ins = image(&m, "c", 101, "after");
+        if run.initial() {
+            expect_eq(
+                failures,
+                &ctx,
+                "snapshot = insert",
+                image(&m, "r", 1, "after"),
+                ins,
+            );
+        }
+        // The insert's image with only `n`'s value changed (its type and
+        // any encoding detail, such as an Avro union branch, kept).
+        let mut changed = ins.cloned().unwrap_or_default();
+        if let Some(n) = changed.get_mut("n").and_then(Value::as_object_mut) {
+            n.insert("value".into(), json!(2));
+        }
+        expect_eq(
+            failures,
+            &ctx,
+            "update after carries the reconstructed TOAST value",
+            image(&m, "u", 101, "after"),
+            Some(&changed),
+        );
+        expect_eq(
+            failures,
+            &ctx,
+            "update before is the full old row (FULL identity)",
+            image(&m, "u", 101, "before"),
+            ins,
+        );
+        expect_eq(
+            failures,
+            &ctx,
+            "delete before = update after",
+            image(&m, "d", 101, "before"),
+            image(&m, "u", 101, "after"),
+        );
+        if sink == Sink::Json
+            && let Some(unchanged) = recs
+                .iter()
+                .find(|r| r["op"] == "u")
+                .map(|r| r["raw"]["unchanged_columns"].clone())
+                .filter(|v| !v.is_null() && v != &json!([]))
+        {
+            failures.push(format!(
+                "{ctx}: FULL identity, yet unchanged_columns {unchanged}"
+            ));
+        }
+        return m;
+    }
+
     if t.expect == Expect::Toast {
         // One row: snapshot 1, insert/update/delete 101.
         let typed = refusal.is_some();
         if typed {
-            // Never the refused update; the insert before it and the
-            // delete after it may share its batch.
-            let allowed: BTreeSet<(String, i64)> =
-                [("r".into(), 1), ("c".into(), 101), ("d".into(), 101)].into();
-            let snap = ("r".to_string(), 1);
-            if !keys.is_subset(&allowed)
-                || (run.initial() != keys.contains(&snap))
-            {
-                failures.push(format!("{ctx}: events {keys:?}"));
+            // Refused at startup, before the snapshot or the stream: no
+            // event at all.
+            if !keys.is_empty() {
+                failures.push(format!(
+                    "{ctx}: refused at startup, yet emitted {keys:?}"
+                ));
             }
         } else if keys != want {
             failures.push(format!("{ctx}: events {keys:?}, expected {want:?}"));
@@ -2653,6 +2726,10 @@ async fn postgres_same_named_tables_in_two_schemas_keep_separate_identities() {
             false,
         )
         .await;
+        // `v` is TOAST-capable; the Avro and Parquet sinks need complete
+        // rows.
+        sql.run(&format!("ALTER TABLE {s}.t REPLICA IDENTITY FULL"), false)
+            .await;
         sql.run(&format!("INSERT INTO {s}.t VALUES (1, '{s}')"), false)
             .await;
     }
@@ -2877,6 +2954,9 @@ async fn a_snapshot_larger_than_a_batch_reaches_durable_s3() {
         false,
     )
     .await;
+    // `v` is TOAST-capable; the Parquet sink needs complete rows.
+    sql.run("ALTER TABLE big_snap.t REPLICA IDENTITY FULL", false)
+        .await;
     sql.run(
         &format!(
             "INSERT INTO big_snap.t SELECT g, 'v' || g FROM generate_series(1, {rows}) g"

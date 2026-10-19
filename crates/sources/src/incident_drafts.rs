@@ -394,6 +394,44 @@ pub(crate) fn catalog_visibility_unproven(
     )
 }
 
+/// Tables a pipeline needing complete rows cannot capture without REPLICA
+/// IDENTITY FULL (`pg_table_unsupported`, class
+/// `toast_without_full_identity`). Evidence names the first table and counts
+/// them all; `details` (the error) names every one. No row value is part of
+/// either.
+pub(crate) fn toast_without_full_identity(
+    source_id: &str,
+    class: &str,
+    first_table: &str,
+    tables: usize,
+    details: String,
+) -> SourceError {
+    let draft = IncidentDraft::new(
+        ReasonCode::PgTableUnsupported,
+        Component::Source {
+            id: source_id.to_string(),
+        },
+        Retryability::OperatorAction,
+        SafetyState::HaltedSafe,
+        CauseCode::SourceIncompatible,
+    )
+    .discriminate("table", first_table)
+    .discriminate("class", class)
+    .with_evidence(|e| {
+        e.text(K::SourceId, source_id)
+            .text(K::Table, first_table)
+            .text(K::ReasonClass, class)
+            .count(K::BlockingCount, tables as u64);
+    })
+    .with_actions(&[ActionCode::ReviewSchemaChange]);
+    SourceError::incident(
+        draft,
+        SourceError::Incompatible {
+            details: details.into(),
+        },
+    )
+}
+
 /// A tracked table uses an unsupported feature (halted before its next row).
 pub(crate) fn table_unsupported(
     source_id: &str,

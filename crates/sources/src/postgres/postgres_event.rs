@@ -543,7 +543,8 @@ async fn handle_relation(
                 return Err(LoopControl::Fail(super::postgres_toast::refusal(
                     &ctx.source_id,
                     &[super::postgres_toast::Incomplete {
-                        qualified: format!("{schema}.{table}"),
+                        schema: schema.to_string(),
+                        table: table.to_string(),
                         identity: replica_identity.to_string(),
                         columns,
                     }],

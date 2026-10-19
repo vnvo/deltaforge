@@ -169,18 +169,35 @@ catalog).
 
 - **At start:** a bulk check over the publication's tables, before anything is
   snapshotted or streamed, refuses the pipeline with `pg_table_unsupported`
-  (class `toast_without_full_identity`), naming the tables and their columns.
+  (class `toast_without_full_identity`). The source log names every such
+  table with its TOAST-capable columns and the statement that fixes it, for
+  example `ALTER TABLE "public"."docs" REPLICA IDENTITY FULL;`. The refusal
+  contains table and column names only, never row values, and the checkpoint
+  does not move.
 - **While running:** the check is repeated whenever PostgreSQL announces a
   table's definition (stream start, after DDL, after reconnect or failover),
   so changing a table's identity away from `FULL` stops the source before
   that table's next row.
 
-A pipeline whose sinks all accept partial rows does not require `FULL`.
+A pipeline whose sinks all accept partial rows does not require `FULL`; one
+sink that needs complete rows is enough to require it.
 `deltaforge_pg_unchanged_toast_total{pipeline,source,outcome}` counts values
 filled from the old row (`reconstructed`) and values left unavailable
-(`unavailable`). `REPLICA IDENTITY FULL` makes PostgreSQL write the complete
-old row to WAL for every UPDATE and DELETE: measure the WAL volume before
-enabling it on update-heavy tables.
+(`unavailable`).
+
+**WAL cost of `FULL`.** Under `FULL`, every UPDATE and DELETE writes the
+complete old row to the WAL, and the old row includes its out-of-line values
+even when the UPDATE leaves them unchanged. The cost grows with row width:
+
+| Workload (PostgreSQL 17, one 1,000-10,000 row UPDATE, steady state) | WAL with `DEFAULT` | WAL with `FULL` |
+|---|---|---|
+| Narrow rows (`int`, `int`, short `text`), one column changed | 227 B/row | 251 B/row (+10%) |
+| Rows with 16 KiB of out-of-line `text`/`jsonb`, a small column changed | 253 B/row | 16.3 KiB/row (about 66x) |
+
+More WAL also means more WAL decoded and sent to the source, and more
+retained for the slot while the source is behind. For wide, frequently
+updated tables, weigh this against delivering those tables only to sinks
+that accept partial rows.
 
 ## Configuration
 

@@ -807,6 +807,21 @@ pub fn explain(
              the guarantee.",
             ev.show(K::ReasonClass),
         ),
+        ReasonCode::PgTableUnsupported
+            if ev.text_of(K::ReasonClass)
+                == Some("toast_without_full_identity") =>
+        {
+            format!(
+                "{component} stopped before streaming: {} captured table(s) \
+                 with TOAST-capable columns lack REPLICA IDENTITY FULL, which \
+                 a sink of this pipeline needs to receive complete rows \
+                 (first: {}). The source log names each table with its \
+                 ALTER TABLE ... REPLICA IDENTITY FULL statement; or deliver \
+                 these tables only to sinks that accept partial rows.",
+                ev.show(K::BlockingCount),
+                ev.show(K::Table),
+            )
+        }
         ReasonCode::PgTableUnsupported => format!(
             "{component} stopped before the next row of table {}: {}.",
             ev.show(K::Table),

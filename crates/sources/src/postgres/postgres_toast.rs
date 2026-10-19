@@ -47,9 +47,42 @@ WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped
 /// A captured table that has TOAST-capable columns and no FULL identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Incomplete {
-    pub qualified: String,
+    pub schema: String,
+    pub table: String,
+    /// `relreplident`: `d` default, `n` nothing, `i` index.
     pub identity: String,
     pub columns: Vec<String>,
+}
+
+impl Incomplete {
+    pub(crate) fn qualified(&self) -> String {
+        format!("{}.{}", self.schema, self.table)
+    }
+
+    /// The statement that makes the table send complete rows.
+    pub(crate) fn alter_statement(&self) -> String {
+        format!(
+            "ALTER TABLE {}.{} REPLICA IDENTITY FULL;",
+            quote_ident(&self.schema),
+            quote_ident(&self.table)
+        )
+    }
+}
+
+/// A PostgreSQL identifier, always quoted.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// `relreplident` as PostgreSQL names it.
+fn identity_name(code: &str) -> &str {
+    match code {
+        "d" => "default",
+        "n" => "nothing",
+        "i" => "index",
+        "f" => "full",
+        other => other,
+    }
 }
 
 /// From the preflight rows (schema, table, relreplident, TOAST-capable
@@ -66,41 +99,51 @@ pub(crate) fn incomplete(
                 && !columns.is_empty()
         })
         .map(|(schema, table, identity, columns)| Incomplete {
-            qualified: format!("{schema}.{table}"),
+            schema,
+            table,
             identity,
             columns,
         })
         .collect();
-    out.sort_by(|a, b| a.qualified.cmp(&b.qualified));
+    out.sort_by(|a, b| (&a.schema, &a.table).cmp(&(&b.schema, &b.table)));
     out
 }
 
-/// The refusal for tables that cannot send complete rows.
+/// The refusal for tables that cannot send complete rows: every table, its
+/// TOAST-capable columns and identity, and the statement that fixes it.
+/// Names only; never a row value.
 pub(crate) fn refusal(source_id: &str, tables: &[Incomplete]) -> SourceError {
-    let first = &tables[0];
-    let shown: Vec<String> = tables
+    let statements: Vec<String> = tables
         .iter()
-        .take(10)
-        .map(|t| format!("{} ({})", t.qualified, t.columns.join(", ")))
+        .map(|t| {
+            format!(
+                "{} -- {} (identity {}; TOAST-capable: {})",
+                t.alter_statement(),
+                t.qualified(),
+                identity_name(&t.identity),
+                t.columns.join(", ")
+            )
+        })
         .collect();
-    let more = tables.len().saturating_sub(10);
-    crate::incident_drafts::table_unsupported(
+    for statement in &statements {
+        tracing::error!(
+            source_id,
+            "needs REPLICA IDENTITY FULL for complete rows: {statement}"
+        );
+    }
+    crate::incident_drafts::toast_without_full_identity(
         source_id,
-        &first.qualified,
         CLASS,
+        &tables[0].qualified(),
+        tables.len(),
         format!(
             "a sink of this pipeline needs complete rows, but PostgreSQL does \
              not send an unchanged TOASTed value unless the table has REPLICA \
-             IDENTITY FULL; {} table(s) with TOAST-capable columns lack it: {}{}. \
-             Run ALTER TABLE <table> REPLICA IDENTITY FULL, or deliver these \
-             tables only to sinks that accept partial rows",
+             IDENTITY FULL; {} table(s) with TOAST-capable columns lack it. \
+             Run: {} Or deliver these tables only to sinks that accept \
+             partial rows (native JSON).",
             tables.len(),
-            shown.join("; "),
-            if more > 0 {
-                format!(" and {more} more")
-            } else {
-                String::new()
-            },
+            statements.join(" "),
         ),
     )
 }
@@ -172,9 +215,61 @@ mod tests {
             &allow,
         );
         assert_eq!(
-            got.iter().map(|t| t.qualified.as_str()).collect::<Vec<_>>(),
+            got.iter().map(Incomplete::qualified).collect::<Vec<_>>(),
             ["public.docs", "public.idx"]
         );
         assert_eq!(got[1].columns, ["body", "meta"]);
+    }
+
+    #[test]
+    fn the_refusal_names_every_table_and_its_statement() {
+        let tables: Vec<Incomplete> = (0..25)
+            .map(|i| Incomplete {
+                schema: "public".into(),
+                table: format!("t{i:02}"),
+                identity: "d".into(),
+                columns: vec!["body".into()],
+            })
+            .chain([Incomplete {
+                schema: "odd\"schema".into(),
+                table: "Mixed Case".into(),
+                identity: "n".into(),
+                columns: vec!["doc".into(), "blob".into()],
+            }])
+            .collect();
+        let err = refusal("pg1", &tables);
+        let text = err.root().to_string();
+        for t in &tables[..25] {
+            assert!(
+                text.contains(&format!(
+                    "ALTER TABLE \"public\".\"{}\" REPLICA IDENTITY FULL;",
+                    t.table
+                )),
+                "{} missing: {text}",
+                t.table
+            );
+        }
+        assert!(
+            text.contains(
+                "ALTER TABLE \"odd\"\"schema\".\"Mixed Case\" REPLICA IDENTITY FULL;"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("identity nothing; TOAST-capable: doc, blob"));
+        assert!(text.contains("26 table(s)"));
+        let draft = err.draft().expect("an incident");
+        use deltaforge_core::incident::{EvidenceKey as K, EvidenceValue as V};
+        assert_eq!(draft.evidence.text_of(K::Table), Some("public.t00"));
+        assert_eq!(
+            draft.evidence.get(K::BlockingCount),
+            Some(&V::Count { value: 26 })
+        );
+        assert_eq!(
+            draft.evidence.text_of(K::ReasonClass),
+            Some("toast_without_full_identity")
+        );
+        let explained = err.to_string();
+        assert!(explained.contains("26 captured table(s)"), "{explained}");
+        assert!(explained.contains("first: public.t00"), "{explained}");
     }
 }
