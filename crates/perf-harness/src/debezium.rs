@@ -151,7 +151,9 @@ impl Connect {
         path: &str,
         body: Option<&Value>,
     ) -> Result<Value> {
-        let c = reqwest::Client::new();
+        let c = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
         let mut req = c.request(method, format!("{}{path}", self.rest));
         if let Some(b) = body {
             req = req.json(b);

@@ -2067,6 +2067,9 @@ async fn run_inner(
         let want = rows as u64 + base;
         let mut rss_peak = 0u64;
         let deadline = Instant::now() + Duration::from_secs(1800);
+        // A run that stops delivering fails rather than waiting out the
+        // deadline (e.g. a worker out of memory).
+        let (mut last_got, mut last_progress) = (0u64, Instant::now());
         let (got, bytes) = loop {
             rss_peak = rss_peak.max(process.rss_kib());
             let (r, local) = delivered(&mut parquet_seen).await;
@@ -2074,6 +2077,11 @@ async fn run_inner(
             let (got, bytes) = r?;
             if got >= want {
                 break (got, bytes);
+            }
+            if got > last_got {
+                (last_got, last_progress) = (got, Instant::now());
+            } else if last_progress.elapsed() > Duration::from_secs(120) {
+                bail!("stalled: no row for 120 s ({got} of {want} arrived)");
             }
             match &process {
                 Sut::Df(_) => {
