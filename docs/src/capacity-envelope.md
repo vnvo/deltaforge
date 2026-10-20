@@ -41,6 +41,7 @@ DeltaForge has **no aggregate (pipeline-wide or process-wide) memory or byte bud
 | `max_events` | 2000 | events per batch |
 | `max_bytes` | 16 MiB | serialized bytes per batch |
 | `max_ms` | 50 ms | batch flush interval |
+| `min_flush_interval_ms` | 40 ms | minimum time between flushes of a drained input |
 | `respect_source_tx` | true | align batches to source transactions |
 | `max_inflight` | 1 | batch depth (see [Concurrency](#concurrency-and-in-flight)) |
 | `max_tx_events` | 1,000,000 | events in one source transaction |
@@ -92,7 +93,7 @@ Size `max_connections` on the source and on the PostgreSQL storage DB for the sn
   checkpoint writes/sec = committed batches/sec × checkpointed sinks
   ```
 
-  This is workload-dependent and has **no configured QPS ceiling**. `max_ms = 50` is a time-based *flush ceiling*, not a rate cap: batches also flush on `max_events`, `max_bytes`, and transaction boundaries, so committed-batches/sec can be much higher than `1000/max_ms` under load. Size the checkpoint/storage backend for the actual committed-batch rate × checkpointed sinks across all pipelines. Reads are change-driven (the source is notified on commit), not polled.
+  This is workload-dependent and has **no configured QPS ceiling**. `max_ms = 50` is a time-based *flush ceiling*, not a rate cap: batches also flush on `max_events`, `max_bytes`, and when the input drains (at most once per `min_flush_interval_ms` while nothing is in flight), so committed-batches/sec can be much higher than `1000/max_ms` under load. Size the checkpoint/storage backend for the actual committed-batch rate × checkpointed sinks across all pipelines. Reads are change-driven (the source is notified on commit), not polled.
 - **Checkpoint reads are scoped to the source** [code-derived, measured]: a source reads its per-sink checkpoints by key prefix, answered by the store as a bounded key range (PostgreSQL: a partial index on the checkpoint namespace). Cost does not grow with the number of other sources or pipelines sharing the store.
 - **Schema registry startup reads one record** [measured]: no namespace scan and no history replay; each table's latest schema is read on first use and cached within the budget above. See below.
 

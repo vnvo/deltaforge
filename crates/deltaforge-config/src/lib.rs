@@ -714,7 +714,7 @@ impl Default for BatchConfig {
             max_events: Some(2000),
             max_bytes: Some(16 * 1024 * 1024),
             max_ms: Some(50),
-            min_flush_interval_ms: Some(20),
+            min_flush_interval_ms: Some(40),
             respect_source_tx: Some(true),
             max_inflight: Some(1),
             max_tx_events: Some(1_000_000),

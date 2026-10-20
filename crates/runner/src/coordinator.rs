@@ -8506,7 +8506,7 @@ mod tests {
     }
 
     /// A transaction drained soon after the previous drained flush waits
-    /// for the flush interval (20 ms by default), not for the deadline.
+    /// for the flush interval (40 ms by default), not for the deadline.
     #[tokio::test]
     async fn a_drained_flush_waits_for_the_flush_interval() {
         let ms = std::time::Duration::from_millis;
