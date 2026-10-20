@@ -26,9 +26,17 @@ sha2.workspace = true
 hex.workspace = true
 arrow-schema = "58"
 
+[dev-dependencies]
+# The order production builds have (deno_core enables it): the goldens of
+# map-ordered output (inferred Avro schemas) are the same in every build.
+serde_json = { workspace = true, features = ["preserve_order"] }
+
 [features]
 # Canonical rows built from JSON literals, for test fixtures only.
 test-fixtures = []
 
 [lints]
 workspace = true
+[[bench]]
+name = "canonical_encode"
+harness = false

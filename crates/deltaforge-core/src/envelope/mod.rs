@@ -78,6 +78,25 @@ pub enum EnvelopeData<'a> {
     CloudEvents(CloudEventsWrapper<'a>),
 }
 
+impl<'a> EnvelopeData<'a> {
+    /// This envelope with each present row image written as `{}`: for an
+    /// encoder that converts (or rebuilds) the rows from their canonical
+    /// values, so they are never rendered only to be discarded.
+    pub(crate) fn row_placeholders(&self) -> EnvelopeData<'a> {
+        match self {
+            EnvelopeData::Native(p) => {
+                EnvelopeData::Native(p.row_placeholders())
+            }
+            EnvelopeData::Debezium(w) => {
+                EnvelopeData::Debezium(w.row_placeholders())
+            }
+            EnvelopeData::CloudEvents(w) => {
+                EnvelopeData::CloudEvents(w.row_placeholders())
+            }
+        }
+    }
+}
+
 impl Serialize for EnvelopeData<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where

@@ -32,6 +32,15 @@ pub struct DebeziumWrapper<'a> {
     payload: NativePayload<'a>,
 }
 
+impl<'a> DebeziumWrapper<'a> {
+    pub(crate) fn row_placeholders(&self) -> DebeziumWrapper<'a> {
+        DebeziumWrapper {
+            schema: self.schema.clone(),
+            payload: self.payload.row_placeholders(),
+        }
+    }
+}
+
 impl Envelope for Debezium {
     fn name(&self) -> &'static str {
         "debezium"

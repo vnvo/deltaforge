@@ -58,16 +58,20 @@ pub fn project_row(
 
     // A column the table does not have is refused, never dropped.
     if let Some(extra) = image.and_then(|r| {
-        r.names()
-            .find(|n| !p.columns.iter().any(|(c, _)| c.name == *n))
+        r.names().enumerate().find_map(|(i, n)| {
+            let at = p.columns.get(i).is_some_and(|(c, _)| c.name == n);
+            (!at && !p.columns.iter().any(|(c, _)| c.name == n)).then_some(n)
+        })
     }) {
         return Err(EncodeError::Type {
             expected: format!("a column of the table (`{extra}` is not one)"),
             got: "an undefined column".into(),
         });
     }
-    for (col, ty) in &p.columns {
-        let v = image.and_then(|m| m.get(&col.name)).unwrap_or(&null);
+    for (i, (col, ty)) in p.columns.iter().enumerate() {
+        let v = image
+            .and_then(|m| m.get_hinted(i, &col.name))
+            .unwrap_or(&null);
         encode_value(&mut buf, ty, col.nullable, v).map_err(|e| match e {
             EncodeError::Type { expected, got } => EncodeError::Type {
                 expected: format!("{expected} for column `{}`", col.name),

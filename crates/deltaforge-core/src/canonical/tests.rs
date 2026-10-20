@@ -631,4 +631,199 @@ fn an_extension_never_overwrites_an_unchanged_column_in_rendering() {
     )
     .unwrap();
     assert!(render_row(&row, v2()).is_ok());
+    // A column set after an extension of its name, present or unchanged.
+    for value in [CanonicalValue::Null, CanonicalValue::Unchanged] {
+        let mut collided = row.clone();
+        collided.set("x", value);
+        let err = render_row(&collided, v2()).unwrap_err();
+        assert_eq!(err.column, "x");
+        assert_eq!(err.failure, RenderFailure::ExtensionCollision);
+    }
+}
+
+// ----- rendering golden ---------------------------------------------------
+
+/// Temporal values at every precision form, the year edges and MySQL's
+/// zero parts.
+fn temporal_values() -> Vec<CanonicalValue> {
+    let mut out = Vec::new();
+    for (p, frac) in [
+        (Precision::Fixed(0), 0),
+        (Precision::Fixed(1), 500_000),
+        (Precision::Fixed(3), 123_000),
+        (Precision::Fixed(5), 987_650),
+        (Precision::Fixed(6), 123_456),
+        (Precision::Fixed(6), 0),
+        (Precision::Variable, 120_000),
+        (Precision::Variable, 0),
+        (Precision::Variable, 7),
+    ] {
+        let max_time = (838 * 3600 + 59 * 60 + 59) * 1_000_000;
+        out.extend([
+            db(DbValue::Time(TimeValue::mysql(frac, p).unwrap())),
+            db(DbValue::Time(
+                TimeValue::mysql(-(max_time + frac), p).unwrap(),
+            )),
+            db(DbValue::Time(
+                TimeValue::mysql(25 * 3_600_000_000 + frac, p).unwrap(),
+            )),
+            db(DbValue::Time(
+                TimeValue::time_of_day(3_723_000_000 + frac, p).unwrap(),
+            )),
+            db(DbValue::DateTime(
+                DateTimeValue::civil(
+                    date(9999, 12, 31),
+                    86_399_000_000 + frac,
+                    p,
+                )
+                .unwrap(),
+            )),
+            db(DbValue::DateTime(
+                DateTimeValue::civil(
+                    CivilDate::mysql(0, 0, 0).unwrap(),
+                    frac,
+                    p,
+                )
+                .unwrap(),
+            )),
+            db(DbValue::DateTime(
+                DateTimeValue::civil(
+                    CivilDate::mysql(2024, 2, 0).unwrap(),
+                    45_296_000_000 + frac,
+                    p,
+                )
+                .unwrap(),
+            )),
+            db(DbValue::Timestamp(
+                TimestampValue::instant(1_760_000_000_000_000 + frac, p)
+                    .unwrap(),
+            )),
+            db(DbValue::Timestamp(
+                TimestampValue::instant(-100_000_000_000_000_000 + frac, p)
+                    .unwrap(),
+            )),
+            db(DbValue::Timestamp(
+                TimestampValue::instant(300_000_000_000_000_000 + frac, p)
+                    .unwrap(),
+            )),
+            db(DbValue::Timestamp(TimestampValue::Zero { precision: p })),
+        ]);
+    }
+    for days in [0, -1, -719_528, -1_000_000, 2_932_896, 3_000_000] {
+        out.push(db(DbValue::Date(DateValue::Civil(
+            CivilDate::from_days_since_epoch(days).unwrap(),
+        ))));
+    }
+    out.push(db(DbValue::Date(DateValue::NegInfinity)));
+    out
+}
+
+/// Checks a row's streamed image against its rendered map.
+type StreamCheck =
+    fn(&CanonicalRow, RenderOpts, &serde_json::Map<String, Value>);
+
+/// A rendered map's JSON with its keys in the row's order (then the
+/// extensions'), whatever order the map keeps.
+fn in_row_order(
+    row: &CanonicalRow,
+    map: &serde_json::Map<String, Value>,
+) -> String {
+    let names = row
+        .names()
+        .chain(row.extensions().keys().map(String::as_str))
+        .filter(|n| map.contains_key(*n));
+    let entries: Vec<String> = names
+        .map(|n| format!("{}:{}", Value::from(n), map[n]))
+        .collect();
+    assert_eq!(entries.len(), map.len());
+    format!("{{{}}}", entries.join(","))
+}
+
+/// Every option set's rendering of a row holding every value (each value
+/// a column; values the options refuse are left out), one line each.
+fn rendering_golden(streamed: Option<StreamCheck>) -> String {
+    let mut values = every_value();
+    values.extend(temporal_values());
+    let mut out = String::new();
+    for mapping in [TypeMapping::V1, TypeMapping::V2] {
+        for wide_integers in [WideIntegers::String, WideIntegers::Number] {
+            let opts = RenderOpts {
+                mapping,
+                wide_integers,
+            };
+            let cols = values
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| {
+                    matches!(v, CanonicalValue::Unchanged)
+                        || render_value(v, opts).is_ok()
+                })
+                .map(|(i, v)| (format!("c{i}"), v.clone()))
+                .collect();
+            let row = CanonicalRow::new(cols).unwrap();
+            let rendered = render_row(&row, opts).unwrap();
+            if let Some(check) = streamed {
+                check(&row, opts, &rendered.values);
+            }
+            out.push_str(&format!(
+                "{mapping:?} {wide_integers:?} {} {:?}\n",
+                in_row_order(&row, &rendered.values),
+                rendered.unchanged
+            ));
+        }
+    }
+    out
+}
+
+/// The native rendering is exactly the reviewed one (generated before
+/// rendering was made to stream, `DF_WRITE_RENDER_GOLDEN=1` rewrites it).
+#[test]
+fn rendering_matches_the_golden_bytes() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/canonical/render_golden.txt"
+    );
+    // The streamed image writes exactly the bytes of the rendered map.
+    let actual = rendering_golden(Some(|row, opts, map| {
+        let (image, _) = super::render::row_image(row, opts).unwrap();
+        assert_eq!(
+            serde_json::to_string(&image).unwrap(),
+            in_row_order(row, map)
+        );
+    }));
+    if std::env::var_os("DF_WRITE_RENDER_GOLDEN").is_some() {
+        std::fs::write(path, &actual).unwrap();
+    }
+    let golden = std::fs::read_to_string(path).unwrap();
+    for (a, g) in actual.lines().zip(golden.lines()) {
+        assert_eq!(a, g);
+    }
+    assert_eq!(actual.lines().count(), golden.lines().count());
+}
+
+#[test]
+fn a_hinted_lookup_is_a_lookup_by_name() {
+    let row = CanonicalRow::new(vec![
+        ("a".into(), CanonicalValue::Null),
+        ("b".into(), db(DbValue::Bool(true))),
+    ])
+    .unwrap();
+    for hint in 0..4 {
+        assert_eq!(row.get_hinted(hint, "b"), row.get("b"));
+        assert_eq!(row.get_hinted(hint, "a"), row.get("a"));
+        assert_eq!(row.get_hinted(hint, "c"), None);
+    }
+}
+
+#[test]
+fn duplicate_columns_are_refused_in_narrow_and_wide_rows() {
+    for width in [2, 32, 33, 200] {
+        let mut cols: Vec<(String, CanonicalValue)> = (0..width)
+            .map(|i| (format!("c{i}"), CanonicalValue::Null))
+            .collect();
+        assert!(CanonicalRow::new(cols.clone()).is_ok());
+        cols.push(("c1".into(), CanonicalValue::Null));
+        let err = CanonicalRow::new(cols).unwrap_err();
+        assert!(err.0.contains("duplicate column c1"), "{err:?}");
+    }
 }

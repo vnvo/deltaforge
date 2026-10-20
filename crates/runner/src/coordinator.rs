@@ -350,6 +350,23 @@ fn finalize_batch(
 }
 
 /// Item sent from the accumulation loop to the delivery task.
+/// A batch whose processors have run, ready for delivery.
+struct Processed<Tok> {
+    processed: ProcessedBatch<Tok>,
+    /// Non-aligned batching: a commit-only batch's commit boundary.
+    commit_only_cp: Option<CheckpointMeta>,
+    /// The batch's source boundary (its delivery context).
+    boundary: Option<deltaforge_core::SourceBoundary>,
+    reason: &'static str,
+}
+
+/// A delivery item with its processors run: a barrier, or a processed
+/// batch (or why processing failed).
+enum Staged<Tok> {
+    Barrier(deltaforge_core::Barrier),
+    Batch(Result<Processed<Tok>>),
+}
+
 struct DeliveryItem {
     batch: BuildingBatch,
     reason: &'static str,
@@ -1489,17 +1506,50 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
         let d_inflight = Arc::clone(&inflight);
         let d_drained = Arc::clone(&drained);
         let delivery_handle = tokio::spawn(async move {
-            while let Some(item) = deliver_rx.recv().await {
-                let outcome = match item.barrier {
-                    Some(barrier) => d_coord.process_barrier(barrier).await,
-                    None => {
-                        d_coord
-                            .process_deliver_and_maybe_commit(
-                                item.batch,
-                                item.reason,
-                            )
-                            .await
+            // Items are delivered (and committed) one at a time, in order.
+            // While one is delivered, the processors of the next queued item
+            // run: processing stays in order (the current item's processors
+            // have finished), and a processing failure surfaces only once
+            // the items before it are delivered.
+            let stage = |item: DeliveryItem| {
+                let coord = &d_coord;
+                async move {
+                    match item.barrier {
+                        Some(barrier) => Staged::Barrier(barrier),
+                        None => Staged::Batch(
+                            coord.process_stage(item.batch, item.reason).await,
+                        ),
                     }
+                }
+            };
+            let mut next: Option<Staged<Tok>> = None;
+            loop {
+                let current = match next.take() {
+                    Some(staged) => staged,
+                    None => match deliver_rx.recv().await {
+                        Some(item) => stage(item).await,
+                        None => break,
+                    },
+                };
+                let deliver = async {
+                    match current {
+                        Staged::Barrier(barrier) => {
+                            d_coord.process_barrier(barrier).await
+                        }
+                        Staged::Batch(Ok(processed)) => {
+                            d_coord.deliver_and_maybe_commit(processed).await
+                        }
+                        Staged::Batch(Err(e)) => Err(e),
+                    }
+                };
+                let outcome = match deliver_rx.try_recv() {
+                    Ok(item) => {
+                        let (outcome, staged) =
+                            futures::join!(deliver, stage(item));
+                        next = Some(staged);
+                        outcome
+                    }
+                    Err(_) => deliver.await,
                 };
                 // Decrement + notify AFTER processing (success or failure) so the quiesce
                 // barrier only observes drain once the batch is truly done.
@@ -1955,11 +2005,12 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
         accum_result
     }
 
-    async fn process_deliver_and_maybe_commit(
+    /// Run the processors over a batch: the first stage of its delivery.
+    async fn process_stage(
         &self,
         mut b: BuildingBatch,
-        reason: &str,
-    ) -> Result<()> {
+        reason: &'static str,
+    ) -> Result<Processed<Tok>> {
         let legacy = !self.batch_cfg_eff.respect_source_tx.unwrap_or(true);
         // Non-aligned batching: a commit-only batch's checkpoint is its
         // commit boundary (each sink acknowledges it with no events).
@@ -1995,7 +2046,23 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
             processed_count=%processed.events.len(),
             "received events from processors"
         );
+        Ok(Processed {
+            processed,
+            commit_only_cp,
+            boundary: b.boundary.take(),
+            reason,
+        })
+    }
 
+    /// Deliver a processed batch to the sinks and commit its checkpoint per
+    /// the commit policy: the second stage.
+    async fn deliver_and_maybe_commit(&self, p: Processed<Tok>) -> Result<()> {
+        let Processed {
+            processed,
+            commit_only_cp,
+            boundary,
+            reason,
+        } = p;
         let last_cp = processed
             .last_checkpoint
             .or_else(|| commit_only_cp.map(Tok::from));
@@ -2188,13 +2255,11 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
         // filtering). Checkpoint and watermark are the SAME source state - the
         // single watermark authority; nothing re-derives a watermark here.
         let ctx = Arc::new(deltaforge_core::SinkBatchContext {
-            checkpoint: b
-                .boundary
+            checkpoint: boundary
                 .as_ref()
                 .map(|bd| bd.checkpoint.clone())
                 .unwrap_or_else(|| CheckpointMeta::from_vec(Vec::new())),
-            durable_watermark: b
-                .boundary
+            durable_watermark: boundary
                 .as_ref()
                 .and_then(|bd| bd.durable_watermark.as_ref())
                 .map(|w| w.to_vec()),
@@ -8173,6 +8238,186 @@ mod tests {
                 SourceItem::Event(ev)
             })
             .collect()
+    }
+
+    /// A sink that records when each delivery starts and ends (by its
+    /// checkpoint) and takes `delay` to deliver.
+    struct PacedSink {
+        id: String,
+        delay: std::time::Duration,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl deltaforge_core::Sink for PacedSink {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        async fn send(&self, _e: &Event) -> SinkResult<()> {
+            Ok(())
+        }
+        async fn send_batch_with_context(
+            &self,
+            _events: &[Event],
+            ctx: &deltaforge_core::SinkBatchContext,
+        ) -> SinkResult<deltaforge_core::BatchResult> {
+            let cp =
+                String::from_utf8_lossy(ctx.checkpoint.as_bytes()).to_string();
+            self.log.lock().unwrap().push(format!("deliver-start {cp}"));
+            tokio::time::sleep(self.delay).await;
+            self.log.lock().unwrap().push(format!("deliver-end {cp}"));
+            Ok(deltaforge_core::BatchResult::ok())
+        }
+        async fn barrier(
+            &self,
+            _kind: &deltaforge_core::BarrierKind,
+            _ctx: &deltaforge_core::SinkBatchContext,
+        ) -> SinkResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A coordinator whose processing takes `process` per batch (logging its
+    /// start and end by the batch's first row id) and fails for the batch
+    /// starting at `fail_at`, delivering to a sink taking `deliver`.
+    fn paced_coord(
+        process: std::time::Duration,
+        deliver: std::time::Duration,
+        fail_at: Option<i64>,
+    ) -> (
+        Coordinator<CheckpointMeta>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<checkpoints::MemCheckpointStore>,
+    ) {
+        use futures::FutureExt;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+        let sink = Arc::new(PacedSink {
+            id: "paced".into(),
+            delay: deliver,
+            log: Arc::clone(&log),
+        });
+        let plog = Arc::clone(&log);
+        let process_fn: ProcessBatchFn<CheckpointMeta> =
+            Arc::new(move |events: Vec<Event>| {
+                let log = Arc::clone(&plog);
+                async move {
+                    // The batch's first row id.
+                    let first = events
+                        .first()
+                        .and_then(|e| e.after.as_ref())
+                        .and_then(|r| match r.get("id") {
+                            Some(deltaforge_core::CanonicalValue::Db(
+                                deltaforge_core::canonical::DbValue::Int {
+                                    value,
+                                    ..
+                                },
+                            )) => Some(*value),
+                            _ => None,
+                        })
+                        .unwrap_or(-1);
+                    log.lock().unwrap().push(format!("process-start {first}"));
+                    tokio::time::sleep(process).await;
+                    log.lock().unwrap().push(format!("process-end {first}"));
+                    if fail_at == Some(first) {
+                        anyhow::bail!("processor failed on purpose");
+                    }
+                    let last_checkpoint = events
+                        .iter()
+                        .rev()
+                        .find_map(|e| e.checkpoint())
+                        .cloned();
+                    Ok(ProcessedBatch {
+                        events,
+                        last_checkpoint,
+                    })
+                }
+                .boxed()
+            });
+        let coord = Coordinator::builder("test-paced")
+            .sinks(vec![sink as ArcDynSink])
+            .batch_config(Some(BatchConfig {
+                max_events: Some(3),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_fn(
+                "paced",
+                build_commit_fn(store.clone(), "src::sink::paced".to_string()),
+            )
+            .process_fn(process_fn)
+            .build();
+        (coord, log, store)
+    }
+
+    fn three_chunks() -> Vec<SourceItem> {
+        snapshot_chunk(1, 3, b"cp-1", b"WM-1")
+            .into_iter()
+            .chain(snapshot_chunk(4, 3, b"cp-2", b"WM-2"))
+            .chain(snapshot_chunk(7, 3, b"cp-3", b"WM-3"))
+            .collect()
+    }
+
+    /// The next batch's processors run while the current batch is
+    /// delivered; processing, delivery and commits stay in order.
+    #[tokio::test]
+    async fn the_next_batch_is_processed_while_the_current_one_is_delivered() {
+        let ms = std::time::Duration::from_millis;
+        let (coord, log, store) = paced_coord(ms(30), ms(80), None);
+        feed_and_run(coord, three_chunks()).await.unwrap();
+        let log = log.lock().unwrap().clone();
+        let at = |entry: &str| {
+            log.iter()
+                .position(|e| e.starts_with(entry))
+                .unwrap_or_else(|| panic!("{entry} missing from {log:?}"))
+        };
+        let order = |kind: &str| -> Vec<String> {
+            log.iter()
+                .filter(|e| e.starts_with(kind))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            order("deliver-start"),
+            [
+                "deliver-start cp-1",
+                "deliver-start cp-2",
+                "deliver-start cp-3"
+            ]
+        );
+        // Processing is sequential and in order.
+        let starts = order("process-start");
+        assert_eq!(starts.len(), 3);
+        assert!(at("process-end 1") < at("process-start 4"));
+        assert!(at("process-end 4") < at("process-start 7"));
+        // The second batch was processed during the first's delivery.
+        assert!(at("process-start 4") < at("deliver-end cp-1"));
+        assert_eq!(
+            store.get_raw("src::sink::paced").await.unwrap().as_deref(),
+            Some(&b"cp-3"[..])
+        );
+    }
+
+    /// A batch whose processors fail is never delivered, but the batch
+    /// before it, being delivered meanwhile, is delivered and committed.
+    #[tokio::test]
+    async fn a_processing_failure_stops_after_the_batches_before_it() {
+        let ms = std::time::Duration::from_millis;
+        let (coord, log, store) = paced_coord(ms(10), ms(60), Some(4));
+        let err = feed_and_run(coord, three_chunks()).await.unwrap_err();
+        assert!(format!("{err:#}").contains("process batch"), "{err:#}");
+        let log = log.lock().unwrap().clone();
+        let delivered: Vec<&String> = log
+            .iter()
+            .filter(|e| e.starts_with("deliver-end"))
+            .collect();
+        assert_eq!(delivered, ["deliver-end cp-1"]);
+        assert_eq!(
+            store.get_raw("src::sink::paced").await.unwrap().as_deref(),
+            Some(&b"cp-1"[..])
+        );
     }
 
     /// A snapshot chunk is one unit: a batch limit below the chunk size never
