@@ -610,6 +610,17 @@ impl TxTracker {
 
 /// Send a completed batch to the delivery task. Returns Err if the delivery
 /// task has stopped (e.g. due to a sink error).
+/// Whether a building batch may be delivered now: in tx-aligned mode it
+/// holds whole transactions only (none open, no open snapshot chunk);
+/// otherwise anything, or a commit-only batch.
+fn flushable(b: &BuildingBatch, respect_source_tx: bool) -> bool {
+    if respect_source_tx {
+        b.committed_len > 0 && !b.mid_tx()
+    } else {
+        !b.raw.is_empty() || is_commit_only(b)
+    }
+}
+
 async fn send_to_delivery(
     tx: &tokio::sync::mpsc::Sender<DeliveryItem>,
     inflight: &std::sync::atomic::AtomicUsize,
@@ -1665,6 +1676,28 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                     quiesced_acked = false;
                 }
 
+                // Flush a batch of whole units as soon as the input is
+                // drained and nothing is being delivered: low latency when the
+                // source is quiet, while under load (a batch in flight, or
+                // input queued) it keeps accumulating, up to its limits and
+                // deadline. The wake-up for the end of a delivery is
+                // registered before the check, so a delivery finishing in
+                // between still wakes the loop.
+                let delivery_done = drained.notified();
+                tokio::pin!(delivery_done);
+                delivery_done.as_mut().enable();
+                let waiting = building
+                    .as_ref()
+                    .is_some_and(|b| flushable(b, respect_source_tx));
+                if waiting
+                    && event_rx.is_empty()
+                    && inflight.load(std::sync::atomic::Ordering::SeqCst) == 0
+                {
+                    let b = building.take().expect("checked");
+                    send_to_delivery(&deliver_tx, &inflight, b, "drained").await?;
+                    continue;
+                }
+
                 tokio::select! {
                     _ = cancel.cancelled() => {
                         if let Some(b) = building.take() {
@@ -1677,18 +1710,17 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                         break;
                     }
 
+                    // A delivery finished while a flushable batch waits: the
+                    // check above runs again.
+                    _ = delivery_done.as_mut(), if waiting => continue,
+
                     _ = ticker.tick() => {
                         if let Some(b) = building.take() {
                             let elapsed = b.started_at.elapsed()
                                 >= Duration::from_millis(tick_ms);
                             // In tx-aligned mode only whole transactions may
                             // flush - never mid-transaction.
-                            let flushable = if respect_source_tx {
-                                b.committed_len > 0 && !b.mid_tx()
-                            } else {
-                                !b.raw.is_empty() || is_commit_only(&b)
-                            };
-                            if flushable && elapsed {
+                            if flushable(&b, respect_source_tx) && elapsed {
                                 send_to_delivery(&deliver_tx, &inflight, b, "timer").await?;
                             } else {
                                 building = Some(b);
@@ -1719,16 +1751,17 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                         }
                         let mut b = building.take().unwrap();
 
-                        // Gather the first item plus an immediately-available
-                        // burst. The timeout bounds the wait so an idle source
-                        // at the WAL tail lets the ticker branch flush.
+                        // Gather the first item plus the burst already queued
+                        // (never waiting for more: what arrives later is
+                        // the next turn's).
                         drain_buf.clear();
                         drain_buf.push(first);
-                        let _ = tokio::time::timeout(
-                            Duration::from_millis(tick_ms),
-                            event_rx.recv_many(&mut drain_buf, 512),
-                        )
-                        .await;
+                        while drain_buf.len() < 512 {
+                            match event_rx.try_recv() {
+                                Ok(item) => drain_buf.push(item),
+                                Err(_) => break,
+                            }
+                        }
 
                         for item in drain_buf.drain(..) {
                             if respect_source_tx {
@@ -8238,6 +8271,237 @@ mod tests {
                 SourceItem::Event(ev)
             })
             .collect()
+    }
+
+    /// A sink that records each delivery's time and size, taking `delay`.
+    struct TimedSink {
+        id: String,
+        delay: std::time::Duration,
+        seen: std::sync::Mutex<Vec<(std::time::Instant, usize)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl deltaforge_core::Sink for TimedSink {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        async fn send(&self, _e: &Event) -> SinkResult<()> {
+            Ok(())
+        }
+        async fn send_batch_with_context(
+            &self,
+            events: &[Event],
+            _ctx: &deltaforge_core::SinkBatchContext,
+        ) -> SinkResult<deltaforge_core::BatchResult> {
+            tokio::time::sleep(self.delay).await;
+            self.seen
+                .lock()
+                .unwrap()
+                .push((std::time::Instant::now(), events.len()));
+            Ok(deltaforge_core::BatchResult::ok())
+        }
+        async fn barrier(
+            &self,
+            _kind: &deltaforge_core::BarrierKind,
+            _ctx: &deltaforge_core::SinkBatchContext,
+        ) -> SinkResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A tx-aligned coordinator with a 10 s batch deadline (never reached by
+    /// these tests) delivering to a `TimedSink` taking `delay`.
+    fn timed_coord(
+        delay: std::time::Duration,
+    ) -> (
+        Coordinator<CheckpointMeta>,
+        Arc<TimedSink>,
+        Arc<checkpoints::MemCheckpointStore>,
+    ) {
+        let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+        let sink = Arc::new(TimedSink {
+            id: "timed".into(),
+            delay,
+            seen: Default::default(),
+        });
+        let coord = Coordinator::builder("test-timed")
+            .sinks(vec![Arc::clone(&sink) as ArcDynSink])
+            .batch_config(Some(BatchConfig {
+                max_events: Some(1000),
+                max_ms: Some(10_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_fn(
+                "timed",
+                build_commit_fn(store.clone(), "src::sink::timed".to_string()),
+            )
+            .process_fn(build_batch_processor(
+                Arc::from(vec![]),
+                "test".to_string(),
+            ))
+            .build();
+        (coord, sink, store)
+    }
+
+    /// One transaction's items: begin, `rows` rows, commit at `cp`.
+    fn one_tx(n: i64, rows: i64) -> Vec<SourceItem> {
+        let txn = format!("gtid:{n}");
+        let mut items = vec![SourceItem::TxBegin { tx_id: txn.clone() }];
+        for i in 0..rows {
+            items.push(SourceItem::Event(tx_event(n * 100 + i, &txn, b"row")));
+        }
+        items.push(SourceItem::TxCommit {
+            tx_id: txn,
+            boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                CheckpointMeta::from_vec(format!("cp-{n}").into_bytes()),
+            ),
+        });
+        items
+    }
+
+    /// Run `coord` on a channel the test feeds; returns the sender and the
+    /// run's handle.
+    fn start_fed(
+        coord: Coordinator<CheckpointMeta>,
+    ) -> (
+        tokio::sync::mpsc::Sender<SourceItem>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4096);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
+        let handle = tokio::spawn(async move {
+            let _keep = pause_tx;
+            coord.run(rx, cancel, pause_rx).await
+        });
+        (tx, handle)
+    }
+
+    /// A transaction committed while the input is otherwise quiet is
+    /// delivered at once, not at the batch deadline.
+    #[tokio::test]
+    async fn a_committed_transaction_on_a_quiet_input_is_delivered_at_once() {
+        let ms = std::time::Duration::from_millis;
+        let (coord, sink, store) = timed_coord(ms(0));
+        let (tx, handle) = start_fed(coord);
+        let t0 = std::time::Instant::now();
+        for item in one_tx(1, 1) {
+            tx.send(item).await.unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while sink.seen.lock().unwrap().is_empty() {
+                tokio::time::sleep(ms(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let at = sink.seen.lock().unwrap()[0].0;
+        assert!(at - t0 < ms(1000), "delivered after {:?}", at - t0);
+        drop(tx);
+        handle.await.unwrap().unwrap();
+        assert_eq!(
+            store.get_raw("src::sink::timed").await.unwrap().as_deref(),
+            Some(&b"cp-1"[..])
+        );
+    }
+
+    /// An open transaction is never delivered, however quiet the input.
+    #[tokio::test]
+    async fn an_open_transaction_is_never_delivered_early() {
+        let ms = std::time::Duration::from_millis;
+        let (coord, sink, _store) = timed_coord(ms(0));
+        let (tx, handle) = start_fed(coord);
+        let mut items = one_tx(1, 3);
+        let commit = items.pop().unwrap();
+        for item in items {
+            tx.send(item).await.unwrap();
+        }
+        tokio::time::sleep(ms(300)).await;
+        assert!(
+            sink.seen.lock().unwrap().is_empty(),
+            "nothing of an open transaction"
+        );
+        tx.send(commit).await.unwrap();
+        drop(tx);
+        handle.await.unwrap().unwrap();
+        assert_eq!(
+            sink.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, n)| *n)
+                .collect::<Vec<_>>(),
+            [3]
+        );
+    }
+
+    /// A transaction committed while a batch is being delivered waits for
+    /// it, then goes at once (not at the deadline).
+    #[tokio::test]
+    async fn a_transaction_waiting_on_a_delivery_goes_when_it_ends() {
+        let ms = std::time::Duration::from_millis;
+        let (coord, sink, store) = timed_coord(ms(200));
+        let (tx, handle) = start_fed(coord);
+        let t0 = std::time::Instant::now();
+        for item in one_tx(1, 1) {
+            tx.send(item).await.unwrap();
+        }
+        tokio::time::sleep(ms(50)).await;
+        for item in one_tx(2, 1) {
+            tx.send(item).await.unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while sink.seen.lock().unwrap().len() < 2 {
+                tokio::time::sleep(ms(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let seen = sink.seen.lock().unwrap().clone();
+        // The second went right after the first's delivery, well before the
+        // 10 s deadline.
+        assert!(
+            seen[1].0 - t0 < ms(1500),
+            "second delivered after {:?}",
+            seen[1].0 - t0
+        );
+        assert_eq!(seen.iter().map(|(_, n)| *n).collect::<Vec<_>>(), [1, 1]);
+        drop(tx);
+        handle.await.unwrap().unwrap();
+        assert_eq!(
+            store.get_raw("src::sink::timed").await.unwrap().as_deref(),
+            Some(&b"cp-2"[..])
+        );
+    }
+
+    /// Under load, transactions keep batching: those committed while a
+    /// batch is in flight go together in the next.
+    #[tokio::test]
+    async fn transactions_arriving_during_a_delivery_are_batched_together() {
+        let ms = std::time::Duration::from_millis;
+        let (coord, sink, store) = timed_coord(ms(50));
+        let (tx, handle) = start_fed(coord);
+        // 100 single-row transactions, one every 2 ms, against 50 ms
+        // deliveries.
+        for n in 1..=100 {
+            for item in one_tx(n, 1) {
+                tx.send(item).await.unwrap();
+            }
+            tokio::time::sleep(ms(2)).await;
+        }
+        drop(tx);
+        handle.await.unwrap().unwrap();
+        let sizes: Vec<usize> =
+            sink.seen.lock().unwrap().iter().map(|(_, n)| *n).collect();
+        assert_eq!(sizes.iter().sum::<usize>(), 100);
+        assert!(sizes.len() <= 20, "{} batches: {sizes:?}", sizes.len());
+        assert_eq!(
+            store.get_raw("src::sink::timed").await.unwrap().as_deref(),
+            Some(&b"cp-100"[..])
+        );
     }
 
     /// A sink that records when each delivery starts and ends (by its
