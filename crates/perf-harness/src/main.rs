@@ -42,6 +42,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 mod debezium;
+mod extras;
 
 const NETWORK: &str = "df-perf-net";
 /// MySQL's name on the harness network (Kafka Connect reaches it there).
@@ -68,8 +69,11 @@ const KAFKA_IMAGE: (&str, &str) = (
     "confluentinc/cp-kafka",
     "7.5.0@sha256:fbbb6fa11b258a88b83f54d4f0bddfcffbf2279f99d66a843486e3da7bdfbf41",
 );
-const SCHEMA_REGISTRY_IMAGE: (&str, &str) =
-    ("confluentinc/cp-schema-registry", "7.5.0");
+const SCHEMA_REGISTRY_IMAGE: (&str, &str) = (
+    "confluentinc/cp-schema-registry",
+    "7.5.0@sha256:e51684b472a2481f065f44616d3d8ad2182029a7011f949a612d35b54566a1f6",
+);
+const SCHEMA_REGISTRY_NAME: &str = "df-perf-sr";
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -116,6 +120,10 @@ struct Args {
     /// confirmed_flush_lsn to measure WAL-feedback staleness.
     #[arg(long)]
     feedback_probe: bool,
+    /// Where the Debezium worker's added plugins (the Avro converter,
+    /// GraalJS) are downloaded and verified.
+    #[arg(long, default_value = "target/perf-cache")]
+    cache: PathBuf,
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +334,25 @@ fn matrix() -> Vec<Cell> {
                 js: false,
                 rows: 2_000,
                 load: Load::DEFAULT,
+            });
+        }
+        // Latency at 50 transactions/s (Avro), and with JavaScript (JSON).
+        for (sink, js, rate, rows) in [
+            (Sink::Avro, false, 50, 1_000),
+            (Sink::Json, true, 200, 2_000),
+        ] {
+            cells.push(Cell {
+                engine,
+                mode: Mode::Latency,
+                sink,
+                shape: Shape::Narrow,
+                batch: None,
+                js,
+                rows,
+                load: Load {
+                    rate,
+                    ..Load::DEFAULT
+                },
             });
         }
         // Latency across rates, transaction sizes and bursts (JSON).
@@ -612,6 +639,10 @@ impl Infra {
             .start()
             .await
             .context("start kafka")?;
+        std::process::Command::new("docker")
+            .args(["rm", "-f", SCHEMA_REGISTRY_NAME])
+            .output()
+            .ok();
         let sr =
             GenericImage::new(SCHEMA_REGISTRY_IMAGE.0, SCHEMA_REGISTRY_IMAGE.1)
                 .with_exposed_port(8081.tcp())
@@ -628,6 +659,7 @@ impl Infra {
                     "SCHEMA_REGISTRY_LISTENERS",
                     "http://0.0.0.0:8081",
                 )
+                .with_container_name(SCHEMA_REGISTRY_NAME)
                 .gate_owned()
                 .start()
                 .await
@@ -959,7 +991,7 @@ enum System {
 /// The running system of one run: a DeltaForge process of its own, or
 /// the invocation's shared (warmed-up) Kafka Connect worker.
 enum Sut<'a> {
-    Df(Process),
+    Df(Box<Process>),
     Dbz(&'a debezium::Connect),
 }
 
@@ -1007,8 +1039,97 @@ impl Sut<'_> {
 
 struct Process {
     child: tokio::process::Child,
+    /// The runner's own process: the one listening on the API address (the
+    /// started command itself, or a process it runs, e.g. under a wrapper).
     pid: u32,
+    /// The executable that process runs.
+    exe: PathBuf,
     stderr: PathBuf,
+}
+
+/// Refuse to start a runner while anything answers on the API address or
+/// holds the API or metrics port: a leftover runner would serve the run.
+async fn ports_free() -> Result<()> {
+    if reqwest::get(format!("http://{API}/health")).await.is_ok() {
+        bail!("something answers on {API} before the run (a leftover runner?)");
+    }
+    for addr in [API, METRICS] {
+        std::net::TcpListener::bind(addr).with_context(|| {
+            format!("{addr} is in use before the run (a leftover runner?)")
+        })?;
+    }
+    Ok(())
+}
+
+/// The process listening on TCP `port` (IPv4 or IPv6), from `/proc`.
+fn listener_pid(port: u16) -> Option<u32> {
+    let inodes: Vec<String> = ["/proc/net/tcp", "/proc/net/tcp6"]
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .flat_map(|t| {
+            t.lines()
+                .skip(1)
+                .filter_map(|l| {
+                    let f: Vec<&str> = l.split_whitespace().collect();
+                    let local_port = f.get(1)?.rsplit_once(':')?.1;
+                    let inode = f.get(9)?;
+                    (u16::from_str_radix(local_port, 16).ok()? == port
+                        && *f.get(3)? == "0A")
+                        .then(|| format!("socket:[{inode}]"))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    std::fs::read_dir("/proc").ok()?.flatten().find_map(|e| {
+        let pid: u32 = e.file_name().to_str()?.parse().ok()?;
+        std::fs::read_dir(e.path().join("fd"))
+            .ok()?
+            .flatten()
+            .find_map(|fd| {
+                let target = std::fs::read_link(fd.path()).ok()?;
+                inodes
+                    .iter()
+                    .any(|i| target.as_os_str() == i.as_str())
+                    .then_some(pid)
+            })
+    })
+}
+
+/// Whether `pid` is `ancestor` or runs under it.
+fn descends_from(mut pid: u32, ancestor: u32) -> bool {
+    while pid > 1 {
+        if pid == ancestor {
+            return true;
+        }
+        let Some(ppid) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| {
+                s.rsplit_once(')')?
+                    .1
+                    .split_whitespace()
+                    .nth(1)?
+                    .parse()
+                    .ok()
+            })
+        else {
+            return false;
+        };
+        pid = ppid;
+    }
+    false
+}
+
+/// The SHA-256 of a file, as `sha256sum` prints it.
+fn sha256(path: &Path) -> Option<String> {
+    let out = std::process::Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .ok()?;
+    String::from_utf8(out.stdout)
+        .ok()?
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
 }
 
 impl Process {
@@ -1018,6 +1139,7 @@ impl Process {
         state_dsn: Option<&str>,
     ) -> Result<Process> {
         std::fs::create_dir_all(dir)?;
+        ports_free().await?;
         let stderr = dir.join("stderr.log");
         let mut cmd = tokio::process::Command::new(binary);
         cmd.args(["--api-addr", API, "--metrics-addr", METRICS]);
@@ -1030,7 +1152,7 @@ impl Process {
             ]),
             None => cmd.arg("--storage-path").arg(dir.join("state.db")),
         };
-        let child = cmd
+        let mut child = cmd
             .env("RUST_LOG", "warn")
             .env("_RJEM_MALLOC_CONF", "stats_print:true")
             .stdout(std::fs::File::create(dir.join("stdout.log"))?)
@@ -1038,9 +1160,15 @@ impl Process {
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("start {}", binary.display()))?;
-        let pid = child.id().ok_or_else(|| anyhow!("no pid"))?;
+        let child_pid = child.id().ok_or_else(|| anyhow!("no pid"))?;
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
+            if let Some(status) = child.try_wait()? {
+                bail!(
+                    "{} exited before becoming healthy: {status}",
+                    binary.display()
+                );
+            }
             if reqwest::get(format!("http://{API}/health"))
                 .await
                 .is_ok_and(|r| r.status().is_success())
@@ -1052,7 +1180,26 @@ impl Process {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        Ok(Process { child, pid, stderr })
+        // The API must be served by the process just started (or one it
+        // runs), never by another.
+        let api_port: u16 = API
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse().ok())
+            .unwrap_or(0);
+        let pid = listener_pid(api_port)
+            .ok_or_else(|| anyhow!("no process found listening on {API}"))?;
+        if !descends_from(pid, child_pid) {
+            bail!(
+                "{API} is served by pid {pid}, not by the started runner ({child_pid})"
+            );
+        }
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe"))?;
+        Ok(Process {
+            child,
+            pid,
+            exe,
+            stderr,
+        })
     }
 
     /// utime + stime, seconds.
@@ -1138,6 +1285,11 @@ impl Process {
             .await
             .is_err()
         {
+            // The runner itself too, when it runs under a wrapper.
+            std::process::Command::new("kill")
+                .args(["-KILL", &self.pid.to_string()])
+                .output()
+                .ok();
             self.child.kill().await.ok();
             return None;
         }
@@ -1483,6 +1635,11 @@ struct Measured {
     /// `deltaforge_wal_feedback_reads_total` in the window (when exported).
     feedback_reads: Option<u64>,
     feedback_staleness_s: Option<f64>,
+    /// The process that ran the pipeline (DeltaForge), and the executable
+    /// it ran with its SHA-256 (DeltaForge), or the worker image (Debezium).
+    pid: Option<u32>,
+    binary: Option<String>,
+    binary_sha256: Option<String>,
 }
 
 impl Measured {
@@ -1504,6 +1661,14 @@ impl Measured {
             "lat_p99_ms": self.lat_p99_ms, "lat_max_ms": self.lat_max_ms,
             "kv_reads": self.kv_reads, "feedback_reads": self.feedback_reads,
             "feedback_staleness_s": self.feedback_staleness_s,
+            "pid": self.pid, "binary": self.binary,
+            "binary_sha256": self.binary_sha256,
+            // Rates over the window (the delivery counters' window adds
+            // only an idle tail).
+            "cpu_cores": (self.secs > 0.0).then(|| self.cpu_secs / self.secs),
+            "batches_per_sec": self.delivery.map(|d| d[0] / self.secs),
+            "checkpoints_per_sec": self.delivery.map(|d| d[2] / self.secs),
+            "kafka_requests_per_sec": self.delivery.map(|d| d[3] / self.secs),
         })
     }
 }
@@ -1597,8 +1762,8 @@ async fn run_inner(
         System::Debezium(p) => *p,
         System::DeltaForge(_) => debezium::Profile::Defaults,
     };
-    if dbz && (engine != Engine::Mysql || cell.sink != Sink::Json || cell.js) {
-        bail!("not measured for Debezium: only MySQL to Kafka JSON cells");
+    if dbz && (engine != Engine::Mysql || cell.sink == Sink::Parquet) {
+        bail!("not measured for Debezium: only MySQL to Kafka cells");
     }
     let topic = if dbz {
         debezium::topic(&format!("perf-{tag}"), &ns)
@@ -1676,9 +1841,9 @@ async fn run_inner(
     };
     let slot = name.replace('-', "_");
     let process = match system {
-        System::DeltaForge(binary) => {
-            Sut::Df(Process::start(binary, dir, state_dsn.as_deref()).await?)
-        }
+        System::DeltaForge(binary) => Sut::Df(Box::new(
+            Process::start(binary, dir, state_dsn.as_deref()).await?,
+        )),
         System::Debezium(_) => {
             Sut::Dbz(connect.ok_or_else(|| anyhow!("no Kafka Connect worker"))?)
         }
@@ -1697,7 +1862,13 @@ async fn run_inner(
             &ns,
             &format!("perf-{tag}"),
             cell.mode == Mode::Snapshot,
-            debezium::Format::Json,
+            match cell.sink {
+                Sink::Avro => debezium::Format::Avro(format!(
+                    "http://{SCHEMA_REGISTRY_NAME}:8081"
+                )),
+                _ => debezium::Format::Json,
+            },
+            cell.js,
             profile,
         )
     });
@@ -1770,6 +1941,14 @@ async fn run_inner(
         // feedback covers that transaction once confirmed_flush passes it.
         let mut last_tx_lsn: Option<u64> = None;
         let window_start = || async {
+            // Debezium's counters first: their reader runs in the worker's
+            // cgroup, before its CPU is read.
+            let dbz = match (&process, args_delivery) {
+                (Sut::Dbz(c), true) => c
+                    .counters()
+                    .map(|[req, commits]| [f64::NAN, f64::NAN, commits, req]),
+                _ => None,
+            };
             (
                 (
                     process.cpu_secs(),
@@ -1781,7 +1960,7 @@ async fn run_inner(
                 feedback_reads().await,
                 match (&process, args_delivery) {
                     (Sut::Df(_), true) => delivery_counters().await,
-                    _ => None,
+                    _ => dbz,
                 },
             )
         };
@@ -1974,15 +2153,19 @@ async fn run_inner(
             }
             _ => None,
         };
-        // librdkafka refreshes its statistics every 5 s.
-        let delivery = match dc0 {
-            Some(a) => {
+        // librdkafka refreshes its statistics every 5 s. Debezium's are
+        // read after its CPU (above). Debezium has no batch counters (NaN).
+        let delivery = match (dc0, &process) {
+            (Some(a), Sut::Df(_)) => {
                 tokio::time::sleep(Duration::from_millis(5_500)).await;
                 delivery_counters()
                     .await
                     .map(|b| std::array::from_fn(|i| b[i] - a[i]))
             }
-            None => None,
+            (Some(a), Sut::Dbz(c)) => c.counters().map(|[req, commits]| {
+                [f64::NAN, f64::NAN, commits - a[2], req - a[3]]
+            }),
+            _ => None,
         };
         let db = match (db0, infra.db_cpu_usec(engine)) {
             (Some(a), Some(b)) => Some((b - a) as f64 / 1e6),
@@ -2032,9 +2215,28 @@ async fn run_inner(
             kv_reads,
             feedback_reads: fb_reads,
             feedback_staleness_s: staleness,
+            pid: None,
+            binary: None,
+            binary_sha256: None,
         })
     }
     .await;
+    let identity = match &process {
+        Sut::Df(p) => (
+            Some(p.pid),
+            Some(p.exe.display().to_string()),
+            sha256(&p.exe),
+        ),
+        Sut::Dbz(_) => (
+            None,
+            Some(format!(
+                "{}:{}",
+                debezium::CONNECT_IMAGE.0,
+                debezium::CONNECT_IMAGE.1
+            )),
+            None,
+        ),
+    };
 
     match &process {
         Sut::Df(_) => {
@@ -2072,6 +2274,7 @@ async fn run_inner(
             .ok();
     }
     let mut m = result?;
+    (m.pid, m.binary, m.binary_sha256) = identity;
     m.allocs = match (allocs, idle_allocs) {
         (Some(a), Some(i)) => Some(a.saturating_sub(i)),
         (a, _) => a,
@@ -2179,6 +2382,14 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+    // One invocation at a time on this machine: two would share the named
+    // containers and the runner's ports. Held until exit.
+    let lock = std::fs::File::create(
+        std::env::temp_dir().join("canonical-perf.lock"),
+    )?;
+    if lock.try_lock().is_err() {
+        bail!("another canonical-perf invocation is running on this machine");
+    }
     let profile = debezium::Profile::parse(&args.debezium_profile)?;
     if let Some(b) = &args.df_batch {
         let v: Value = serde_json::from_str(b).context("--df-batch")?;
@@ -2263,6 +2474,7 @@ async fn measure(
                 &bootstrap_internal(),
                 "shared",
                 profile,
+                &extras::prepare(&args.cache)?,
             )
             .await?,
         ),

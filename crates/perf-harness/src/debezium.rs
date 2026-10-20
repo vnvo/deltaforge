@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use gate_ownership::GateOwned;
 use serde_json::{Value, json};
-use testcontainers::core::IntoContainerPort;
+use testcontainers::core::{AccessMode, IntoContainerPort, Mount};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
@@ -48,6 +48,9 @@ impl Profile {
     }
 }
 
+/// The worker's JMX port (inside its container).
+const JMX_PORT: u16 = 9012;
+
 /// A running Kafka Connect worker.
 pub struct Connect {
     container: ContainerAsync<GenericImage>,
@@ -62,10 +65,38 @@ impl Connect {
         bootstrap: &str,
         tag: &str,
         profile: Profile,
+        extras: &crate::extras::Extras,
     ) -> Result<Connect> {
         let mut image = GenericImage::new(CONNECT_IMAGE.0, CONNECT_IMAGE.1)
             .with_exposed_port(8083.tcp())
             .with_network(network)
+            // Debezium's scripting transformations, with GraalJS added to
+            // the MySQL connector's plugin, and Confluent's Avro converter
+            // as a plugin of its own.
+            .with_env_var("ENABLE_DEBEZIUM_SCRIPTING", "true")
+            // GraalJS compiles scripts only with JVMCI enabled (otherwise it
+            // interprets them); the image's JDK ships the Graal compiler.
+            .with_env_var(
+                "KAFKA_OPTS",
+                "-XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI",
+            )
+            .with_mount(
+                Mount::bind_mount(
+                    extras.graaljs.display().to_string(),
+                    "/kafka/connect/debezium-connector-mysql/graaljs",
+                )
+                .with_access_mode(AccessMode::ReadOnly),
+            )
+            .with_mount(
+                Mount::bind_mount(
+                    extras.avro_converter.display().to_string(),
+                    "/kafka/connect/confluent-avro-converter",
+                )
+                .with_access_mode(AccessMode::ReadWrite),
+            )
+            // JMX inside the container only, read by `counters`.
+            .with_env_var("JMXPORT", JMX_PORT.to_string())
+            .with_env_var("JMXHOST", "localhost")
             .with_env_var("BOOTSTRAP_SERVERS", bootstrap)
             .with_env_var("GROUP_ID", format!("connect-{tag}"))
             .with_env_var(
@@ -102,7 +133,15 @@ impl Connect {
                 break;
             }
             if Instant::now() > deadline {
-                bail!("Kafka Connect never answered");
+                let logs = std::process::Command::new("docker")
+                    .args(["logs", "--tail", "40", container.id()])
+                    .output()
+                    .map(|o| {
+                        String::from_utf8_lossy(&o.stdout).into_owned()
+                            + &String::from_utf8_lossy(&o.stderr)
+                    })
+                    .unwrap_or_default();
+                bail!("Kafka Connect never answered; its log ends:\n{logs}");
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -254,6 +293,57 @@ impl Connect {
         Self::stat(&self.cgroup("memory.stat"), "anon ") / 1024
     }
 
+    /// Read MBean attributes with Kafka's JmxTool inside the worker's
+    /// container: the sum of every matching MBean's attributes. The tool's
+    /// JVM runs in the worker's cgroup, so callers read outside a measured
+    /// window.
+    fn jmx_sum(&self, object: &str, attribute: &str) -> Option<f64> {
+        let out = std::process::Command::new("docker")
+            .args(["exec", self.container.id()])
+            .args([
+                "/kafka/bin/kafka-run-class.sh",
+                "org.apache.kafka.tools.JmxTool",
+                "--one-time",
+                "true",
+                "--report-format",
+                "csv",
+                "--jmx-url",
+            ])
+            .arg(format!(
+                "service:jmx:rmi:///jndi/rmi://localhost:{JMX_PORT}/jmxrmi"
+            ))
+            .args(["--object-name", object, "--attributes", attribute])
+            .output()
+            .ok()?;
+        let text = String::from_utf8(out.stdout).ok()?;
+        // One `name:attribute,"value"` line per MBean, after a `time` line.
+        let values: Vec<f64> = text
+            .lines()
+            .filter(|l| l.contains(&format!(":{attribute},")))
+            .filter_map(|l| {
+                l.rsplit_once(',')?.1.trim_matches('"').parse().ok()
+            })
+            .collect();
+        (!values.is_empty()).then(|| values.iter().sum())
+    }
+
+    /// The worker's Kafka requests (every producer: the connector's records
+    /// and the worker's offset, status and config writes) and its offset
+    /// records written (its checkpoint writes: the offset store's producer
+    /// sends one record per committed source partition), so far.
+    pub fn counters(&self) -> Option<[f64; 2]> {
+        Some([
+            self.jmx_sum(
+                "kafka.producer:type=producer-metrics,client-id=*",
+                "request-total",
+            )?,
+            self.jmx_sum(
+                "kafka.producer:type=producer-metrics,client-id=*-offsets",
+                "record-send-total",
+            )?,
+        ])
+    }
+
     /// Stop the worker (at the end of an invocation).
     pub async fn stop(self) {
         self.container.stop().await.ok();
@@ -261,12 +351,15 @@ impl Connect {
     }
 }
 
-/// The value format a connector writes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The format a connector writes.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Format {
     /// JSON without embedded schemas (`schemas.enable=false`): the
     /// Debezium payload alone, as DeltaForge's native envelope writes it.
     Json,
+    /// Avro through Confluent's converter and the schema registry at this
+    /// URL (keys and values), as DeltaForge's Avro encoding writes it.
+    Avro(String),
 }
 
 /// The Debezium MySQL connector of one run: table `{ns}.t`, its change
@@ -285,9 +378,9 @@ pub fn mysql_connector(
     prefix: &str,
     snapshot: bool,
     format: Format,
+    js: bool,
     profile: Profile,
 ) -> Value {
-    let Format::Json = format;
     let mut connector = json!({
         "name": name,
         "config": {
@@ -305,12 +398,38 @@ pub fn mysql_connector(
             "schema.history.internal.kafka.bootstrap.servers": bootstrap,
             "schema.history.internal.kafka.topic": format!("dbz-history-{tag}"),
             "snapshot.mode": if snapshot { "initial" } else { "no_data" },
-            "key.converter": "org.apache.kafka.connect.json.JsonConverter",
-            "key.converter.schemas.enable": "false",
-            "value.converter": "org.apache.kafka.connect.json.JsonConverter",
-            "value.converter.schemas.enable": "false",
         }
     });
+    let config = &mut connector["config"];
+    match format {
+        Format::Json => {
+            for side in ["key", "value"] {
+                config[format!("{side}.converter")] =
+                    json!("org.apache.kafka.connect.json.JsonConverter");
+                config[format!("{side}.converter.schemas.enable")] =
+                    json!("false");
+            }
+        }
+        Format::Avro(registry) => {
+            for side in ["key", "value"] {
+                config[format!("{side}.converter")] =
+                    json!("io.confluent.connect.avro.AvroConverter");
+                config[format!("{side}.converter.schema.registry.url")] =
+                    json!(registry);
+            }
+        }
+    }
+    // The JavaScript counterpart of DeltaForge's JavaScript processor: a
+    // JavaScript expression evaluated per record that reads the row image
+    // (Debezium's scripting transformations filter or route records; none
+    // adds a field, so this one keeps every record).
+    if js {
+        config["transforms"] = json!("js");
+        config["transforms.js.type"] = json!("io.debezium.transforms.Filter");
+        config["transforms.js.language"] = json!("jsr223.graal.js");
+        config["transforms.js.condition"] =
+            json!("value.after == null || value.after.id != null");
+    }
     if profile == Profile::Tuned {
         connector["config"]["poll.interval.ms"] = json!("50");
         connector["config"]["max.batch.size"] = json!("2048");
