@@ -95,6 +95,11 @@ struct Args {
     /// separate container, with its reads counted by pg_stat_statements).
     #[arg(long, default_value = "sqlite")]
     state_store: String,
+    /// Read DeltaForge's batch, checkpoint and Kafka request counters over
+    /// each run's window (adds 5.5 s per run: librdkafka's statistics
+    /// interval).
+    #[arg(long)]
+    delivery_stats: bool,
     /// Run every cell once for every system before the measured
     /// repetitions, unrecorded (a JIT-compiled system is measured warm).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -156,6 +161,26 @@ struct Cell {
     batch: Option<usize>,
     js: bool,
     rows: usize,
+    /// Latency cells: how the transactions are written.
+    load: Load,
+}
+
+/// A latency cell's write pattern: `rate` transactions per second of
+/// `tx_rows` rows each, on one connection; with `burst`, groups of
+/// `burst.0` transactions separated by `burst.1` ms of idle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Load {
+    rate: u32,
+    tx_rows: usize,
+    burst: Option<(usize, u64)>,
+}
+
+impl Load {
+    const DEFAULT: Load = Load {
+        rate: 200,
+        tx_rows: 1,
+        burst: None,
+    };
 }
 
 impl Cell {
@@ -190,6 +215,18 @@ impl Cell {
         }
         if self.js {
             id.push_str("-js");
+        }
+        if self.load != Load::DEFAULT {
+            let l = self.load;
+            if l.rate != Load::DEFAULT.rate {
+                id.push_str(&format!("-r{}", l.rate));
+            }
+            if l.tx_rows != 1 {
+                id.push_str(&format!("-tx{}", l.tx_rows));
+            }
+            if let Some((n, idle)) = l.burst {
+                id.push_str(&format!("-burst{n}x{idle}ms"));
+            }
         }
         id
     }
@@ -226,6 +263,7 @@ fn matrix() -> Vec<Cell> {
                         batch: None,
                         js: false,
                         rows: rows_for(shape),
+                        load: Load::DEFAULT,
                     });
                 }
             }
@@ -241,6 +279,7 @@ fn matrix() -> Vec<Cell> {
                     batch: Some(batch),
                     js: false,
                     rows: rows_for(shape),
+                    load: Load::DEFAULT,
                 });
             }
         }
@@ -255,6 +294,7 @@ fn matrix() -> Vec<Cell> {
                     batch: None,
                     js: false,
                     rows: rows_for(Shape::Ints(n)),
+                    load: Load::DEFAULT,
                 });
             }
         }
@@ -268,6 +308,7 @@ fn matrix() -> Vec<Cell> {
                 batch: None,
                 js: true,
                 rows: 50_000,
+                load: Load::DEFAULT,
             });
         }
         // Latency (Kafka sinks).
@@ -280,6 +321,57 @@ fn matrix() -> Vec<Cell> {
                 batch: None,
                 js: false,
                 rows: 2_000,
+                load: Load::DEFAULT,
+            });
+        }
+        // Latency across rates, transaction sizes and bursts (JSON).
+        for (rows, load) in [
+            (
+                30,
+                Load {
+                    rate: 1,
+                    ..Load::DEFAULT
+                },
+            ),
+            (
+                1_000,
+                Load {
+                    rate: 50,
+                    ..Load::DEFAULT
+                },
+            ),
+            (
+                5_000,
+                Load {
+                    rate: 1_000,
+                    ..Load::DEFAULT
+                },
+            ),
+            (
+                20_000,
+                Load {
+                    tx_rows: 10,
+                    ..Load::DEFAULT
+                },
+            ),
+            (
+                1_000,
+                Load {
+                    rate: 1_000,
+                    burst: Some((200, 2_000)),
+                    ..Load::DEFAULT
+                },
+            ),
+        ] {
+            cells.push(Cell {
+                engine,
+                mode: Mode::Latency,
+                sink: Sink::Json,
+                shape: Shape::Narrow,
+                batch: None,
+                js: false,
+                rows,
+                load,
             });
         }
     }
@@ -1083,6 +1175,34 @@ async fn api(
     Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
 }
 
+/// DeltaForge's delivery counters: batches delivered, the events in them,
+/// checkpoints committed and Kafka requests sent (librdkafka's broker
+/// statistics, refreshed every 5 s).
+async fn delivery_counters() -> Option<[f64; 4]> {
+    let text = reqwest::get(format!("http://{METRICS}/metrics"))
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    let sum = |name: &str| -> f64 {
+        text.lines()
+            .filter(|l| {
+                l.strip_prefix(name).is_some_and(|rest| {
+                    rest.starts_with('{') || rest.starts_with(' ')
+                })
+            })
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+            .sum()
+    };
+    Some([
+        sum("deltaforge_batch_events_count"),
+        sum("deltaforge_batch_events_sum"),
+        sum("deltaforge_checkpoints_total"),
+        sum("deltaforge_kafka_requests_total"),
+    ])
+}
+
 async fn wait_status(name: &str, want: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
@@ -1325,6 +1445,9 @@ struct Measured {
     cpu_secs: f64,
     /// The system (kernel) part of `cpu_secs`.
     sys_secs: f64,
+    /// DeltaForge's batches, events in them, checkpoint commits and Kafka
+    /// requests in the window (`--delivery-stats`).
+    delivery: Option<[f64; 4]>,
     /// Distinct row ids that arrived (JSON sinks), and duplicated messages.
     distinct_rows: Option<u64>,
     duplicates: Option<u64>,
@@ -1336,7 +1459,9 @@ struct Measured {
     out_bytes: u64,
     allocs: Option<u64>,
     lat_p50_ms: Option<f64>,
+    lat_p95_ms: Option<f64>,
     lat_p99_ms: Option<f64>,
+    lat_max_ms: Option<f64>,
     /// State-store key-value reads in the measured window (PostgreSQL state
     /// store only).
     kv_reads: Option<u64>,
@@ -1351,12 +1476,17 @@ impl Measured {
             "ok": self.ok, "error": self.error, "rows": self.rows, "secs": self.secs,
             "rows_per_sec": self.rows_per_sec, "cpu_secs": self.cpu_secs,
             "sys_secs": self.sys_secs,
-            "distinct_rows": self.distinct_rows, "duplicates": self.duplicates, "syscr": self.kernel[0],
+            "distinct_rows": self.distinct_rows, "duplicates": self.duplicates,
+            "batches": self.delivery.map(|d| d[0]),
+            "batch_events": self.delivery.map(|d| d[1]),
+            "checkpoints": self.delivery.map(|d| d[2]),
+            "kafka_requests": self.delivery.map(|d| d[3]), "syscr": self.kernel[0],
             "syscw": self.kernel[1], "vcsw": self.kernel[2],
             "ivcsw": self.kernel[3], "minflt": self.kernel[4],
             "rss_peak_mib": self.rss_peak_mib, "db_cpu_secs": self.db_cpu_secs,
             "out_bytes": self.out_bytes, "allocs": self.allocs,
-            "lat_p50_ms": self.lat_p50_ms, "lat_p99_ms": self.lat_p99_ms,
+            "lat_p50_ms": self.lat_p50_ms, "lat_p95_ms": self.lat_p95_ms,
+            "lat_p99_ms": self.lat_p99_ms, "lat_max_ms": self.lat_max_ms,
             "kv_reads": self.kv_reads, "feedback_reads": self.feedback_reads,
             "feedback_staleness_s": self.feedback_staleness_s,
         })
@@ -1404,6 +1534,7 @@ async fn run_once(
     tag: &str,
     dir: &Path,
     args_probe: bool,
+    args_delivery: bool,
 ) -> Measured {
     match run_inner(
         infra,
@@ -1416,6 +1547,7 @@ async fn run_once(
         tag,
         dir,
         args_probe,
+        args_delivery,
     )
     .await
     {
@@ -1440,6 +1572,7 @@ async fn run_inner(
     tag: &str,
     dir: &Path,
     args_probe: bool,
+    args_delivery: bool,
 ) -> Result<Measured> {
     let engine = cell.engine;
     let ns = format!("p_{}", tag.replace('-', "_"));
@@ -1631,11 +1764,15 @@ async fn run_inner(
                 infra.db_cpu_usec(engine),
                 infra.state_reads(&state_db).await,
                 feedback_reads().await,
+                match (&process, args_delivery) {
+                    (Sut::Df(_), true) => delivery_counters().await,
+                    _ => None,
+                },
             )
         };
-        let (cpu0, db0, reads0, fb0);
+        let (cpu0, db0, reads0, fb0, dc0);
         if cell.mode == Mode::Snapshot {
-            (cpu0, db0, reads0, fb0) = window_start().await;
+            (cpu0, db0, reads0, fb0, dc0) = window_start().await;
             t0 = Instant::now();
             create().await?;
         } else {
@@ -1692,24 +1829,44 @@ async fn run_inner(
                     last_tx_lsn = infra.wal_insert_lsn().await;
                 }
                 infra.exec(engine, &[last]).await?;
-                (cpu0, db0, reads0, fb0) = window_start().await;
+                (cpu0, db0, reads0, fb0, dc0) = window_start().await;
                 t0 = Instant::now();
                 control("resume").await?;
             } else {
-                // Latency: single-row transactions every 5 ms, on one
-                // connection.
+                // Latency: transactions of `tx_rows` rows at `rate` per
+                // second, on one connection (in bursts with idle between
+                // them, for a bursty load).
+                let load = cell.load;
                 let mut sql = Sql::open(infra, engine).await?;
-                (cpu0, db0, reads0, fb0) = window_start().await;
+                (cpu0, db0, reads0, fb0, dc0) = window_start().await;
                 t0 = Instant::now();
-                let mut tick = tokio::time::interval(Duration::from_millis(5));
-                for row in 0..rows {
+                let mut tick = tokio::time::interval(Duration::from_micros(
+                    1_000_000 / u64::from(load.rate.max(1)),
+                ));
+                tick.set_missed_tick_behavior(
+                    tokio::time::MissedTickBehavior::Delay,
+                );
+                let mut row = 0;
+                let mut txs = 0;
+                while row < rows {
+                    if let Some((n, idle)) = load.burst
+                        && txs > 0
+                        && txs % n == 0
+                    {
+                        tokio::time::sleep(Duration::from_millis(idle)).await;
+                        tick.reset();
+                    }
                     tick.tick().await;
-                    if row + 1 == rows && engine == Engine::Postgres {
+                    let end = (row + load.tx_rows).min(rows);
+                    if end == rows && engine == Engine::Postgres {
                         last_tx_lsn = infra.wal_insert_lsn().await;
                     }
-                    let one = inserts(engine, &ns, cell.shape, row, row + 1);
+                    let one = inserts(engine, &ns, cell.shape, row, end);
                     sql.exec(&one[0]).await?;
-                    commits.push(Instant::now());
+                    let at = Instant::now();
+                    commits.extend(std::iter::repeat_n(at, end - row));
+                    row = end;
+                    txs += 1;
                 }
             }
         }
@@ -1802,11 +1959,21 @@ async fn run_inner(
             }
             _ => None,
         };
+        // librdkafka refreshes its statistics every 5 s.
+        let delivery = match dc0 {
+            Some(a) => {
+                tokio::time::sleep(Duration::from_millis(5_500)).await;
+                delivery_counters()
+                    .await
+                    .map(|b| std::array::from_fn(|i| b[i] - a[i]))
+            }
+            None => None,
+        };
         let db = match (db0, infra.db_cpu_usec(engine)) {
             (Some(a), Some(b)) => Some((b - a) as f64 / 1e6),
             _ => None,
         };
-        let (p50, p99) = if cell.mode == Mode::Latency {
+        let (p50, p95, p99, pmax) = if cell.mode == Mode::Latency {
             let times = arrivals.times.lock().unwrap();
             let mut lat: Vec<f64> = commits
                 .iter()
@@ -1821,9 +1988,9 @@ async fn run_inner(
             let q = |p: f64| {
                 lat.get(((lat.len() as f64 - 1.0) * p) as usize).copied()
             };
-            (q(0.5), q(0.99))
+            (q(0.5), q(0.95), q(0.99), lat.last().copied())
         } else {
-            (None, None)
+            (None, None, None, None)
         };
         Ok::<_, anyhow::Error>(Measured {
             ok: true,
@@ -1833,6 +2000,7 @@ async fn run_inner(
             rows_per_sec: rows as f64 / secs,
             cpu_secs: cpu,
             sys_secs: sys,
+            delivery,
             distinct_rows: (cell.sink == Sink::Json)
                 .then(|| arrivals.ids.lock().unwrap().len() as u64),
             duplicates: (cell.sink == Sink::Json)
@@ -1843,7 +2011,9 @@ async fn run_inner(
             out_bytes: bytes,
             allocs: None,
             lat_p50_ms: p50,
+            lat_p95_ms: p95,
             lat_p99_ms: p99,
+            lat_max_ms: pmax,
             kv_reads,
             feedback_reads: fb_reads,
             feedback_staleness_s: staleness,
@@ -2094,6 +2264,7 @@ async fn measure(
                     &tag,
                     &args.out.join("warmup").join(&tag),
                     false,
+                    false,
                 )
                 .await;
                 eprintln!(
@@ -2139,6 +2310,7 @@ async fn measure(
                     &tag,
                     &dir,
                     args.feedback_probe,
+                    args.delivery_stats,
                 )
                 .await;
                 let line = json!({"cell": cell.id(), "version": label, "rep": rep, "rows_target": rows, "result": m.json()});
