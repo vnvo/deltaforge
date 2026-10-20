@@ -41,7 +41,11 @@ use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
+mod debezium;
+
 const NETWORK: &str = "df-perf-net";
+/// MySQL's name on the harness network (Kafka Connect reaches it there).
+const MYSQL_NAME: &str = "df-perf-mysql";
 const KAFKA_NAME: &str = "df-perf-kafka";
 const KAFKA_INTERNAL_PORT: u16 = 29092;
 const KAFKA_HOST_PORT: u16 = 9397;
@@ -91,6 +95,14 @@ struct Args {
     /// separate container, with its reads counted by pg_stat_statements).
     #[arg(long, default_value = "sqlite")]
     state_store: String,
+    /// Run every cell once for every system before the measured
+    /// repetitions, unrecorded (a JIT-compiled system is measured warm).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    warmup: bool,
+    /// The Debezium profile (`defaults` or `tuned`) of a `debezium` system
+    /// (`--binary label=debezium`).
+    #[arg(long, default_value = "defaults")]
+    debezium_profile: String,
     /// After the last row arrives, watch the PostgreSQL slot's
     /// confirmed_flush_lsn to measure WAL-feedback staleness.
     #[arg(long)]
@@ -524,11 +536,17 @@ impl Infra {
                 .start()
                 .await
                 .context("start schema registry")?;
+        std::process::Command::new("docker")
+            .args(["rm", "-f", MYSQL_NAME])
+            .output()
+            .ok();
         let mysql = GenericImage::new(MYSQL_IMAGE.0, MYSQL_IMAGE.1)
             .with_wait_for(WaitFor::message_on_stderr(
                 "ready for connections. Version: '8.4",
             ))
             .with_env_var("MYSQL_ROOT_PASSWORD", PW)
+            .with_container_name(MYSQL_NAME)
+            .with_network(NETWORK)
             .with_cmd(vec![
                 "--server-id=60",
                 "--log-bin=mysql-bin",
@@ -834,6 +852,63 @@ fn truncate(s: &str) -> String {
 // The process under test
 // ---------------------------------------------------------------------------
 
+/// A system under test: a DeltaForge release binary, or Debezium on Kafka
+/// Connect (`--binary label=debezium`).
+#[derive(Clone, Debug)]
+enum System {
+    DeltaForge(PathBuf),
+    Debezium(debezium::Profile),
+}
+
+/// The running system of one run: a DeltaForge process of its own, or
+/// the invocation's shared (warmed-up) Kafka Connect worker.
+enum Sut<'a> {
+    Df(Process),
+    Dbz(&'a debezium::Connect),
+}
+
+impl Sut<'_> {
+    fn cpu_secs(&self) -> f64 {
+        match self {
+            Sut::Df(p) => p.cpu_secs(),
+            Sut::Dbz(c) => {
+                let (user, sys) = c.cpu_split();
+                user + sys
+            }
+        }
+    }
+
+    fn sys_secs(&self) -> f64 {
+        match self {
+            Sut::Df(p) => p.sys_secs(),
+            Sut::Dbz(c) => c.cpu_split().1,
+        }
+    }
+
+    /// Process kernel counters (DeltaForge only; zeros for a container).
+    fn kernel_counts(&self) -> [u64; 5] {
+        match self {
+            Sut::Df(p) => p.kernel_counts(),
+            Sut::Dbz(_) => [0; 5],
+        }
+    }
+
+    fn rss_kib(&self) -> u64 {
+        match self {
+            Sut::Df(p) => p.rss_kib(),
+            Sut::Dbz(c) => c.rss_kib(),
+        }
+    }
+
+    async fn stop(self) -> Option<u64> {
+        match self {
+            Sut::Df(p) => p.stop().await,
+            // The shared worker outlives the run.
+            Sut::Dbz(_) => None,
+        }
+    }
+}
+
 struct Process {
     child: tokio::process::Child,
     pid: u32,
@@ -1037,6 +1112,32 @@ struct Arrivals {
     count: AtomicU64,
     bytes: AtomicU64,
     times: std::sync::Mutex<Vec<Instant>>,
+    /// The row ids seen (`after.id`, or `before.id` for a delete), and how
+    /// many messages repeated one: delivery is counted per message, so
+    /// distinct ids show a missing or duplicated row.
+    ids: std::sync::Mutex<std::collections::HashSet<i64>>,
+    duplicates: AtomicU64,
+}
+
+/// The row id of a JSON change event (a number, or a decimal string for a
+/// 64-bit integer rendered exactly).
+fn row_id(payload: &[u8]) -> Option<i64> {
+    let v: Value = serde_json::from_slice(payload).ok()?;
+    let image = if v["after"].is_object() {
+        &v["after"]
+    } else {
+        &v["before"]
+    };
+    match &image["id"] {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Kafka's bootstrap address on the harness network.
+fn bootstrap_internal() -> String {
+    format!("{KAFKA_NAME}:{KAFKA_INTERNAL_PORT}")
 }
 
 fn brokers() -> String {
@@ -1076,6 +1177,11 @@ fn consume(
                     let n = m.payload().map_or(0, <[u8]>::len)
                         + m.key().map_or(0, <[u8]>::len);
                     arrivals.bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    if let Some(id) = m.payload().and_then(row_id)
+                        && !arrivals.ids.lock().unwrap().insert(id)
+                    {
+                        arrivals.duplicates.fetch_add(1, Ordering::Relaxed);
+                    }
                     arrivals.times.lock().unwrap().push(now);
                     arrivals.count.fetch_add(1, Ordering::Release);
                 }
@@ -1219,6 +1325,9 @@ struct Measured {
     cpu_secs: f64,
     /// The system (kernel) part of `cpu_secs`.
     sys_secs: f64,
+    /// Distinct row ids that arrived (JSON sinks), and duplicated messages.
+    distinct_rows: Option<u64>,
+    duplicates: Option<u64>,
     /// Read and write system calls, the main thread's voluntary and
     /// involuntary context switches, and minor page faults in the window.
     kernel: [u64; 5],
@@ -1241,7 +1350,8 @@ impl Measured {
         json!({
             "ok": self.ok, "error": self.error, "rows": self.rows, "secs": self.secs,
             "rows_per_sec": self.rows_per_sec, "cpu_secs": self.cpu_secs,
-            "sys_secs": self.sys_secs, "syscr": self.kernel[0],
+            "sys_secs": self.sys_secs,
+            "distinct_rows": self.distinct_rows, "duplicates": self.duplicates, "syscr": self.kernel[0],
             "syscw": self.kernel[1], "vcsw": self.kernel[2],
             "ivcsw": self.kernel[3], "minflt": self.kernel[4],
             "rss_peak_mib": self.rss_peak_mib, "db_cpu_secs": self.db_cpu_secs,
@@ -1286,7 +1396,8 @@ async fn feedback_reads() -> Option<u64> {
 async fn run_once(
     infra: &Infra,
     store: &Arc<dyn object_store::ObjectStore>,
-    binary: &Path,
+    system: &System,
+    connect: Option<&debezium::Connect>,
     idle_allocs: Option<u64>,
     cell: &Cell,
     rows: usize,
@@ -1297,7 +1408,8 @@ async fn run_once(
     match run_inner(
         infra,
         store,
-        binary,
+        system,
+        connect,
         idle_allocs,
         cell,
         rows,
@@ -1320,7 +1432,8 @@ async fn run_once(
 async fn run_inner(
     infra: &Infra,
     store: &Arc<dyn object_store::ObjectStore>,
-    binary: &Path,
+    system: &System,
+    connect: Option<&debezium::Connect>,
     idle_allocs: Option<u64>,
     cell: &Cell,
     rows: usize,
@@ -1331,7 +1444,19 @@ async fn run_inner(
     let engine = cell.engine;
     let ns = format!("p_{}", tag.replace('-', "_"));
     let name = format!("p-{tag}");
-    let topic = format!("perf-{tag}");
+    let dbz = matches!(system, System::Debezium(_));
+    let profile = match system {
+        System::Debezium(p) => *p,
+        System::DeltaForge(_) => debezium::Profile::Defaults,
+    };
+    if dbz && (engine != Engine::Mysql || cell.sink != Sink::Json || cell.js) {
+        bail!("not measured for Debezium: only MySQL to Kafka JSON cells");
+    }
+    let topic = if dbz {
+        debezium::topic(&format!("perf-{tag}"), &ns)
+    } else {
+        format!("perf-{tag}")
+    };
     let prefix = format!("perf/{tag}");
 
     // Fixture.
@@ -1402,7 +1527,69 @@ async fn run_inner(
         None
     };
     let slot = name.replace('-', "_");
-    let process = Process::start(binary, dir, state_dsn.as_deref()).await?;
+    let process = match system {
+        System::DeltaForge(binary) => {
+            Sut::Df(Process::start(binary, dir, state_dsn.as_deref()).await?)
+        }
+        System::Debezium(_) => {
+            Sut::Dbz(connect.ok_or_else(|| anyhow!("no Kafka Connect worker"))?)
+        }
+    };
+    // A MySQL server id of its own per Debezium run (the fixture is 60).
+    static SERVER_IDS: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(10_000);
+    let connector = dbz.then(|| {
+        debezium::mysql_connector(
+            &name,
+            tag,
+            MYSQL_NAME,
+            PW,
+            &bootstrap_internal(),
+            SERVER_IDS.fetch_add(1, Ordering::Relaxed),
+            &ns,
+            &format!("perf-{tag}"),
+            cell.mode == Mode::Snapshot,
+            debezium::Format::Json,
+            profile,
+        )
+    });
+    if let Some(c) = &connector {
+        std::fs::create_dir_all(dir).ok();
+        std::fs::write(
+            dir.join("connector.json"),
+            serde_json::to_string_pretty(c).unwrap_or_default(),
+        )
+        .ok();
+    }
+    // Create, pause, resume, check and delete the pipeline (a DeltaForge
+    // pipeline, or the Debezium connector).
+    let create = || async {
+        match &process {
+            Sut::Df(_) => api(reqwest::Method::POST, "/pipelines", Some(&spec))
+                .await
+                .map(|_| ()),
+            Sut::Dbz(c) => {
+                c.create(connector.as_ref().expect("a Debezium run")).await
+            }
+        }
+    };
+    let control = |action: &'static str| {
+        let name = name.clone();
+        let process = &process;
+        async move {
+            match process {
+                Sut::Df(_) => api(
+                    reqwest::Method::POST,
+                    &format!("/pipelines/{name}/{action}"),
+                    None,
+                )
+                .await
+                .map(|_| ()),
+                Sut::Dbz(c) if action == "pause" => c.pause(&name).await,
+                Sut::Dbz(c) => c.resume(&name).await,
+            }
+        }
+    };
     let mut parquet_seen = BTreeMap::new();
     let delivered = |seen: &mut BTreeMap<String, (u64, u64)>| {
         let arrivals = Arc::clone(&arrivals);
@@ -1450,10 +1637,13 @@ async fn run_inner(
         if cell.mode == Mode::Snapshot {
             (cpu0, db0, reads0, fb0) = window_start().await;
             t0 = Instant::now();
-            api(reqwest::Method::POST, "/pipelines", Some(&spec)).await?;
+            create().await?;
         } else {
-            api(reqwest::Method::POST, "/pipelines", Some(&spec)).await?;
-            wait_status(&name, "running").await?;
+            create().await?;
+            match &process {
+                Sut::Df(_) => wait_status(&name, "running").await?,
+                Sut::Dbz(c) => c.wait(&name, "RUNNING").await?,
+            }
             let deadline = Instant::now() + Duration::from_secs(120);
             loop {
                 markers += 1;
@@ -1488,12 +1678,7 @@ async fn run_inner(
             // delivered: the baseline is what has arrived once the source is
             // quiet, not the number of markers written.
             if cell.mode == Mode::Cdc {
-                api(
-                    reqwest::Method::POST,
-                    &format!("/pipelines/{name}/pause"),
-                    None,
-                )
-                .await?;
+                control("pause").await?;
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
             let (r, local) = delivered(&mut parquet_seen).await;
@@ -1509,12 +1694,7 @@ async fn run_inner(
                 infra.exec(engine, &[last]).await?;
                 (cpu0, db0, reads0, fb0) = window_start().await;
                 t0 = Instant::now();
-                api(
-                    reqwest::Method::POST,
-                    &format!("/pipelines/{name}/resume"),
-                    None,
-                )
-                .await?;
+                control("resume").await?;
             } else {
                 // Latency: single-row transactions every 5 ms, on one
                 // connection.
@@ -1544,12 +1724,24 @@ async fn run_inner(
             if got >= want {
                 break (got, bytes);
             }
-            if let Ok(v) =
-                api(reqwest::Method::GET, &format!("/pipelines/{name}"), None)
+            match &process {
+                Sut::Df(_) => {
+                    if let Ok(v) = api(
+                        reqwest::Method::GET,
+                        &format!("/pipelines/{name}"),
+                        None,
+                    )
                     .await
-                && v["status"] == "failed"
-            {
-                bail!("pipeline failed: {}", v);
+                        && v["status"] == "failed"
+                    {
+                        bail!("pipeline failed: {}", v);
+                    }
+                }
+                Sut::Dbz(c) => {
+                    if let Some(why) = c.failure(&name).await {
+                        bail!("connector failed: {why}");
+                    }
+                }
             }
             if Instant::now() > deadline {
                 bail!("only {got} of {want} rows arrived");
@@ -1641,6 +1833,10 @@ async fn run_inner(
             rows_per_sec: rows as f64 / secs,
             cpu_secs: cpu,
             sys_secs: sys,
+            distinct_rows: (cell.sink == Sink::Json)
+                .then(|| arrivals.ids.lock().unwrap().len() as u64),
+            duplicates: (cell.sink == Sink::Json)
+                .then(|| arrivals.duplicates.load(Ordering::Relaxed)),
             kernel,
             rss_peak_mib: rss_peak as f64 / 1024.0,
             db_cpu_secs: db,
@@ -1655,9 +1851,14 @@ async fn run_inner(
     }
     .await;
 
-    api(reqwest::Method::DELETE, &format!("/pipelines/{name}"), None)
-        .await
-        .ok();
+    match &process {
+        Sut::Df(_) => {
+            api(reqwest::Method::DELETE, &format!("/pipelines/{name}"), None)
+                .await
+                .ok();
+        }
+        Sut::Dbz(c) => c.delete(&name).await,
+    }
     let allocs = process.stop().await;
     if let Some(c) = consumer {
         c.abort();
@@ -1793,14 +1994,20 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
-    let binaries: Vec<(String, PathBuf)> = args
+    let profile = debezium::Profile::parse(&args.debezium_profile)?;
+    let binaries: Vec<(String, System)> = args
         .binaries
         .iter()
         .map(|b| {
             let (l, p) = b
                 .split_once('=')
                 .ok_or_else(|| anyhow!("--binary label=path"))?;
-            Ok((l.to_string(), PathBuf::from(p)))
+            let system = if p == "debezium" {
+                System::Debezium(profile)
+            } else {
+                System::DeltaForge(PathBuf::from(p))
+            };
+            Ok((l.to_string(), system))
         })
         .collect::<Result<_>>()?;
     if binaries.len() != 2 {
@@ -1815,7 +2022,7 @@ async fn main() -> Result<()> {
 
 async fn measure(
     args: &Args,
-    binaries: &[(String, PathBuf)],
+    binaries: &[(String, System)],
     infra: &Infra,
 ) -> Result<()> {
     let cells: Vec<Cell> = matrix()
@@ -1841,11 +2048,65 @@ async fn measure(
 
     // Idle allocation baselines.
     let mut idle = BTreeMap::new();
-    for (label, bin) in binaries {
+    for (label, system) in binaries {
+        let System::DeltaForge(bin) = system else {
+            idle.insert(label.clone(), None);
+            continue;
+        };
         let dir = args.out.join(format!("idle-{label}"));
         let p = Process::start(bin, &dir, None).await?;
         tokio::time::sleep(Duration::from_secs(3)).await;
         idle.insert(label.clone(), p.stop().await);
+    }
+
+    // One Kafka Connect worker for the invocation, warmed up: each run
+    // registers a connector of its own on it.
+    let connect = match binaries.iter().find_map(|(_, s)| match s {
+        System::Debezium(p) => Some(*p),
+        _ => None,
+    }) {
+        Some(profile) => Some(
+            debezium::Connect::start(
+                NETWORK,
+                &bootstrap_internal(),
+                "shared",
+                profile,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    // Warm-up: one unrecorded run of every cell for every system, so a JIT
+    // compiled system is measured warm.
+    if args.warmup {
+        for cell in &cells {
+            for (label, system) in binaries {
+                let rows = ((cell.rows as f64 * args.scale) as usize).max(100);
+                let tag = format!("{}-{}-warmup", cell.id(), label);
+                let m = run_once(
+                    infra,
+                    &store,
+                    system,
+                    connect.as_ref(),
+                    idle[label],
+                    cell,
+                    rows,
+                    &tag,
+                    &args.out.join("warmup").join(&tag),
+                    false,
+                )
+                .await;
+                eprintln!(
+                    "{} {label} warm-up: {}",
+                    cell.id(),
+                    if m.ok {
+                        format!("{:.0} rows/s", m.rows_per_sec)
+                    } else {
+                        format!("FAILED {}", m.error.unwrap_or_default())
+                    }
+                );
+            }
+        }
     }
 
     let mut log = std::fs::OpenOptions::new()
@@ -1857,7 +2118,7 @@ async fn measure(
     let mut seq = 0usize;
     for rep in 0..args.reps {
         for cell in &cells {
-            let order: Vec<&(String, PathBuf)> = if rep % 2 == 0 {
+            let order: Vec<&(String, System)> = if rep % 2 == 0 {
                 binaries.iter().collect()
             } else {
                 binaries.iter().rev().collect()
@@ -1871,6 +2132,7 @@ async fn measure(
                     infra,
                     &store,
                     bin,
+                    connect.as_ref(),
                     idle[label],
                     cell,
                     rows,
@@ -1972,6 +2234,9 @@ async fn measure(
         ));
     }
     std::fs::write(args.out.join("summary.md"), md)?;
+    if let Some(c) = connect {
+        c.stop().await;
+    }
 
     // WAL feedback: state-store reads per million rows and staleness.
     let mut fb = format!(
@@ -2029,6 +2294,20 @@ async fn measure(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_row_id_is_read_from_either_image_as_a_number_or_exact_text() {
+        assert_eq!(super::row_id(br#"{"after":{"id":7}}"#), Some(7));
+        assert_eq!(
+            super::row_id(br#"{"after":{"id":"9007199254740993"}}"#),
+            Some(9007199254740993)
+        );
+        assert_eq!(
+            super::row_id(br#"{"before":{"id":3},"after":null}"#),
+            Some(3)
+        );
+        assert_eq!(super::row_id(b"not json"), None);
+    }
+
     #[test]
     fn allocations_are_the_merged_request_count() {
         let stats = "Merged arenas stats:\n\
