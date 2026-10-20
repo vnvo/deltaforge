@@ -95,6 +95,10 @@ struct Args {
     /// separate container, with its reads counted by pg_stat_statements).
     #[arg(long, default_value = "sqlite")]
     state_store: String,
+    /// Batch settings (a JSON object) added to every DeltaForge pipeline,
+    /// e.g. `{"min_flush_interval_ms": 10}`.
+    #[arg(long)]
+    df_batch: Option<String>,
     /// Read DeltaForge's batch, checkpoint and Kafka request counters over
     /// each run's window (adds 5.5 s per run: librdkafka's statistics
     /// interval).
@@ -1427,6 +1431,14 @@ fn pipeline_spec(
     if cell.mode == Mode::Snapshot && cell.sink == Sink::Parquet {
         spec["batch"] = json!({"max_ms": 1000});
     }
+    if let Some(Value::Object(extra)) = DF_BATCH.get() {
+        if !spec["batch"].is_object() {
+            spec["batch"] = json!({});
+        }
+        for (k, v) in extra {
+            spec["batch"][k] = v.clone();
+        }
+    }
     json!({
         "apiVersion": "deltaforge/v1",
         "kind": "Pipeline",
@@ -1434,6 +1446,9 @@ fn pipeline_spec(
         "spec": spec,
     })
 }
+
+/// Batch settings added to every DeltaForge pipeline (`--df-batch`).
+static DF_BATCH: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
 
 #[derive(Debug, Default, Clone)]
 struct Measured {
@@ -2165,6 +2180,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let profile = debezium::Profile::parse(&args.debezium_profile)?;
+    if let Some(b) = &args.df_batch {
+        let v: Value = serde_json::from_str(b).context("--df-batch")?;
+        if !v.is_object() {
+            bail!("--df-batch must be a JSON object");
+        }
+        DF_BATCH.set(v).ok();
+    }
     let binaries: Vec<(String, System)> = args
         .binaries
         .iter()
