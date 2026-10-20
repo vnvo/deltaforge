@@ -344,8 +344,16 @@ impl Connect {
         ])
     }
 
-    /// Stop the worker (at the end of an invocation).
-    pub async fn stop(self) {
+    /// Stop the worker (at the end of an invocation), keeping its log.
+    pub async fn stop(self, log: &std::path::Path) {
+        if let Ok(o) = std::process::Command::new("docker")
+            .args(["logs", self.container.id()])
+            .output()
+        {
+            let mut text = o.stdout;
+            text.extend_from_slice(&o.stderr);
+            std::fs::write(log, text).ok();
+        }
         self.container.stop().await.ok();
         self.container.rm().await.ok();
     }

@@ -2641,7 +2641,7 @@ async fn measure(
     }
     std::fs::write(args.out.join("summary.md"), md)?;
     if let Some(c) = connect {
-        c.stop().await;
+        c.stop(&args.out.join("connect.log")).await;
     }
 
     // WAL feedback: state-store reads per million rows and staleness.
