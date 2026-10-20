@@ -1389,6 +1389,9 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                 max_events: c.max_events.or(defaults.max_events),
                 max_bytes: c.max_bytes.or(defaults.max_bytes),
                 max_ms: c.max_ms.or(defaults.max_ms),
+                min_flush_interval_ms: c
+                    .min_flush_interval_ms
+                    .or(defaults.min_flush_interval_ms),
                 respect_source_tx: c
                     .respect_source_tx
                     .or(defaults.respect_source_tx),
@@ -1454,6 +1457,9 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
         mut pause_rx: watch::Receiver<PauseState>,
     ) -> Result<()> {
         let tick_ms = self.batch_cfg_eff.max_ms.unwrap_or(200);
+        let min_flush_interval = Duration::from_millis(
+            self.batch_cfg_eff.min_flush_interval_ms.unwrap_or(0),
+        );
         let max_events = self.batch_cfg_eff.max_events.unwrap_or(usize::MAX);
         let max_bytes = self.batch_cfg_eff.max_bytes.unwrap_or(usize::MAX);
         let max_inflight = self.batch_cfg_eff.max_inflight.unwrap_or(1);
@@ -1586,6 +1592,8 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
         let mut ticker = interval(Duration::from_millis(tick_ms));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut building: Option<BuildingBatch> = None;
+        // When the last drained flush handed its batch over.
+        let mut last_drained: Option<Instant> = None;
         let mut drain_buf: Vec<SourceItem> = Vec::with_capacity(256);
         let mut tx_tracker = TxTracker::default();
         // Replay capture accumulator: raw pre-processing events for the currently-open
@@ -1677,26 +1685,45 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                 }
 
                 // Flush a batch of whole units as soon as the input is
-                // drained and nothing is being delivered: low latency when the
-                // source is quiet, while under load (a batch in flight, or
-                // input queued) it keeps accumulating, up to its limits and
-                // deadline. The wake-up for the end of a delivery is
-                // registered before the check, so a delivery finishing in
-                // between still wakes the loop.
+                // drained and nothing is being delivered, but no sooner than
+                // `min_flush_interval` after the previous drained flush: low
+                // latency when the source is quiet, a steady trickle batched
+                // over that window, and under load (a batch in flight, or
+                // input queued) accumulation up to the limits and deadline.
+                // The wake-up for the end of a delivery is registered before
+                // the check, so a delivery finishing in between still wakes
+                // the loop; a flush held back by the interval sleeps until
+                // the interval ends.
                 let delivery_done = drained.notified();
                 tokio::pin!(delivery_done);
                 delivery_done.as_mut().enable();
                 let waiting = building
                     .as_ref()
                     .is_some_and(|b| flushable(b, respect_source_tx));
+                let mut hold_until = None;
                 if waiting
                     && event_rx.is_empty()
                     && inflight.load(std::sync::atomic::Ordering::SeqCst) == 0
                 {
-                    let b = building.take().expect("checked");
-                    send_to_delivery(&deliver_tx, &inflight, b, "drained").await?;
-                    continue;
+                    let now = Instant::now();
+                    match last_drained.map(|t| t + min_flush_interval) {
+                        Some(at) if at > now => hold_until = Some(at),
+                        _ => {
+                            let b = building.take().expect("checked");
+                            send_to_delivery(&deliver_tx, &inflight, b, "drained")
+                                .await?;
+                            last_drained = Some(now);
+                            continue;
+                        }
+                    }
                 }
+                let hold = async {
+                    match hold_until {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::pin!(hold);
 
                 tokio::select! {
                     _ = cancel.cancelled() => {
@@ -1710,9 +1737,10 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                         break;
                     }
 
-                    // A delivery finished while a flushable batch waits: the
-                    // check above runs again.
+                    // A delivery finished while a flushable batch waits, or
+                    // the interval that held it back ended: check again.
                     _ = delivery_done.as_mut(), if waiting => continue,
+                    _ = hold.as_mut(), if hold_until.is_some() => continue,
 
                     _ = ticker.tick() => {
                         if let Some(b) = building.take() {
@@ -8474,6 +8502,61 @@ mod tests {
         assert_eq!(
             store.get_raw("src::sink::timed").await.unwrap().as_deref(),
             Some(&b"cp-2"[..])
+        );
+    }
+
+    /// A transaction drained soon after the previous drained flush waits
+    /// for the flush interval (20 ms by default), not for the deadline.
+    #[tokio::test]
+    async fn a_drained_flush_waits_for_the_flush_interval() {
+        let ms = std::time::Duration::from_millis;
+        let (coord, sink, _store) = timed_coord(ms(0));
+        let (tx, handle) = start_fed(coord);
+        for item in one_tx(1, 1) {
+            tx.send(item).await.unwrap();
+        }
+        tokio::time::sleep(ms(5)).await;
+        for item in one_tx(2, 1) {
+            tx.send(item).await.unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while sink.seen.lock().unwrap().len() < 2 {
+                tokio::time::sleep(ms(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let seen = sink.seen.lock().unwrap().clone();
+        let gap = seen[1].0 - seen[0].0;
+        assert!(gap >= ms(14), "held for the interval: {gap:?}");
+        assert!(gap < ms(1000), "not until the deadline: {gap:?}");
+        drop(tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    /// A steady trickle is batched over the flush interval, not delivered
+    /// a transaction at a time.
+    #[tokio::test]
+    async fn a_steady_trickle_is_batched_over_the_flush_interval() {
+        let ms = std::time::Duration::from_millis;
+        let (coord, sink, store) = timed_coord(ms(0));
+        let (tx, handle) = start_fed(coord);
+        // 100 single-row transactions, one every 2 ms (about 200 ms).
+        for n in 1..=100 {
+            for item in one_tx(n, 1) {
+                tx.send(item).await.unwrap();
+            }
+            tokio::time::sleep(ms(2)).await;
+        }
+        drop(tx);
+        handle.await.unwrap().unwrap();
+        let sizes: Vec<usize> =
+            sink.seen.lock().unwrap().iter().map(|(_, n)| *n).collect();
+        assert_eq!(sizes.iter().sum::<usize>(), 100);
+        assert!(sizes.len() <= 25, "{} batches: {sizes:?}", sizes.len());
+        assert_eq!(
+            store.get_raw("src::sink::timed").await.unwrap().as_deref(),
+            Some(&b"cp-100"[..])
         );
     }
 

@@ -688,6 +688,11 @@ pub struct BatchConfig {
     pub max_bytes: Option<usize>,
     /// Flush when this much time has elapsed since batch start (ms).
     pub max_ms: Option<u64>,
+    /// When the input drains and nothing is in flight, a batch of whole
+    /// transactions is delivered at once, but no sooner than this long
+    /// (ms) after the previous such delivery: a steady trickle is batched
+    /// over this window instead of delivered one transaction at a time.
+    pub min_flush_interval_ms: Option<u64>,
     /// If true, never split a single source transaction (e.g., MySQL XID) across batches.
     pub respect_source_tx: Option<bool>,
     /// How many batches may be in-flight concurrently (keep 1 until we add WAL).
@@ -709,6 +714,7 @@ impl Default for BatchConfig {
             max_events: Some(2000),
             max_bytes: Some(16 * 1024 * 1024),
             max_ms: Some(50),
+            min_flush_interval_ms: Some(20),
             respect_source_tx: Some(true),
             max_inflight: Some(1),
             max_tx_events: Some(1_000_000),
