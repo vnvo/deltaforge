@@ -1694,12 +1694,16 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                 // the check, so a delivery finishing in between still wakes
                 // the loop; a flush held back by the interval sleeps until
                 // the interval ends.
-                let delivery_done = drained.notified();
-                tokio::pin!(delivery_done);
-                delivery_done.as_mut().enable();
                 let waiting = building
                     .as_ref()
                     .is_some_and(|b| flushable(b, respect_source_tx));
+                let delivery_done = drained.notified();
+                tokio::pin!(delivery_done);
+                // Registered only while a batch waits (it is polled only
+                // then), before the check below.
+                if waiting {
+                    delivery_done.as_mut().enable();
+                }
                 let mut hold_until = None;
                 if waiting
                     && event_rx.is_empty()
@@ -1784,11 +1788,10 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                         // the next turn's).
                         drain_buf.clear();
                         drain_buf.push(first);
-                        while drain_buf.len() < 512 {
-                            match event_rx.try_recv() {
-                                Ok(item) => drain_buf.push(item),
-                                Err(_) => break,
-                            }
+                        // `recv_many` returns at once when items are queued
+                        // (this is the only receiver).
+                        if !event_rx.is_empty() {
+                            event_rx.recv_many(&mut drain_buf, 511).await;
                         }
 
                         for item in drain_buf.drain(..) {
