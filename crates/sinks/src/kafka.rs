@@ -93,10 +93,21 @@ struct KafkaMetricsContext {
 
 impl ClientContext for KafkaMetricsContext {
     fn stats(&self, statistics: Statistics) {
-        let (total_retries, total_connects) =
-            statistics.brokers.values().fold((0u64, 0u64), |acc, b| {
-                (acc.0 + b.txretries, acc.1 + b.connects.unwrap_or(0) as u64)
+        let (total_retries, total_connects, total_requests) =
+            statistics.brokers.values().fold((0u64, 0u64, 0u64), |acc, b| {
+                (
+                    acc.0 + b.txretries,
+                    acc.1 + b.connects.unwrap_or(0) as u64,
+                    acc.2 + b.tx,
+                )
             });
+
+        counter!(
+            "deltaforge_kafka_requests_total",
+            "pipeline" => self.pipeline.clone(),
+            "sink" => self.sink_id.clone(),
+        )
+        .absolute(total_requests);
 
         counter!(
             "deltaforge_kafka_produce_retries_total",
