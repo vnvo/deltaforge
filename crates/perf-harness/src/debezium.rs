@@ -74,12 +74,9 @@ impl Connect {
             // the MySQL connector's plugin, and Confluent's Avro converter
             // as a plugin of its own.
             .with_env_var("ENABLE_DEBEZIUM_SCRIPTING", "true")
-            // GraalJS compiles scripts only with JVMCI enabled (otherwise it
-            // interprets them); the image's JDK ships the Graal compiler.
-            .with_env_var(
-                "KAFKA_OPTS",
-                "-XX:+UnlockExperimentalVMOptions -XX:+EnableJVMCI",
-            )
+            // GraalJS runs on Truffle's fallback (interpreting) runtime: the
+            // image's OpenJDK has no optimizing Truffle runtime (that needs a
+            // GraalVM JDK), with or without JVMCI and module-path setups.
             .with_mount(
                 Mount::bind_mount(
                     extras.graaljs.display().to_string(),
