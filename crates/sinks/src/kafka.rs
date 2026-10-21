@@ -1763,8 +1763,7 @@ mod tests {
             for workers in [None, Some(4)] {
                 let (url, calls) = registry_counting(true).await;
                 let sink = sink(&url, workers).unwrap();
-                let err =
-                    sink.send_batch(&events).await.err().expect("refused");
+                let err = sink.send_batch(&events).await.expect_err("refused");
                 assert!(!err.is_dlq_eligible(), "{err}");
                 assert_eq!(
                     sink.producer.in_flight_count(),
