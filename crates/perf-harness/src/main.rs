@@ -104,6 +104,12 @@ struct Args {
     /// e.g. `{"min_flush_interval_ms": 10}`.
     #[arg(long)]
     df_batch: Option<String>,
+    /// Sink settings (a JSON object) added to the DeltaForge sink of the
+    /// system labelled LABEL, as `LABEL=JSON`, e.g.
+    /// `two='{"encode_workers": 2}'` (repeatable; the same binary may run
+    /// under two labels).
+    #[arg(long = "df-sink")]
+    df_sink: Vec<String>,
     /// Read DeltaForge's batch, checkpoint and Kafka request counters over
     /// each run's window (adds 5.5 s per run: librdkafka's statistics
     /// interval).
@@ -1517,6 +1523,7 @@ fn pipeline_spec(
     ns: &str,
     topic: &str,
     prefix: &str,
+    sink_extra: Option<&Value>,
 ) -> Value {
     // A snapshot chunk that a batch cuts mid-chunk reaches the durable S3
     // sink without a boundary, which it refuses (a defect of both
@@ -1573,6 +1580,12 @@ fn pipeline_spec(
     } else {
         json!([])
     };
+    let mut sink = sink;
+    if let Some(Value::Object(extra)) = sink_extra {
+        for (k, v) in extra {
+            sink["config"][k] = v.clone();
+        }
+    }
     let mut spec = json!({
         "source": source,
         "processors": processors,
@@ -1602,6 +1615,9 @@ fn pipeline_spec(
 
 /// Batch settings added to every DeltaForge pipeline (`--df-batch`).
 static DF_BATCH: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+/// `--df-sink` settings by system label.
+static DF_SINK: std::sync::OnceLock<BTreeMap<String, Value>> =
+    std::sync::OnceLock::new();
 
 #[derive(Debug, Default, Clone)]
 struct Measured {
@@ -1721,6 +1737,7 @@ async fn run_once(
     dir: &Path,
     args_probe: bool,
     args_delivery: bool,
+    sink_extra: Option<&Value>,
 ) -> Measured {
     match run_inner(
         infra,
@@ -1734,6 +1751,7 @@ async fn run_once(
         dir,
         args_probe,
         args_delivery,
+        sink_extra,
     )
     .await
     {
@@ -1759,6 +1777,7 @@ async fn run_inner(
     dir: &Path,
     args_probe: bool,
     args_delivery: bool,
+    sink_extra: Option<&Value>,
 ) -> Result<Measured> {
     let engine = cell.engine;
     let ns = format!("p_{}", tag.replace('-', "_"));
@@ -1834,6 +1853,7 @@ async fn run_inner(
         &ns,
         &topic,
         &prefix,
+        sink_extra,
     );
 
     let state_db = format!("st_{ns}");
@@ -2442,6 +2462,18 @@ async fn main() -> Result<()> {
         }
         DF_BATCH.set(v).ok();
     }
+    let mut df_sink = BTreeMap::new();
+    for item in &args.df_sink {
+        let (label, json) = item
+            .split_once('=')
+            .ok_or_else(|| anyhow!("--df-sink must be LABEL=JSON"))?;
+        let v: Value = serde_json::from_str(json).context("--df-sink")?;
+        if !v.is_object() {
+            bail!("--df-sink must be LABEL=<a JSON object>");
+        }
+        df_sink.insert(label.to_string(), v);
+    }
+    DF_SINK.set(df_sink).ok();
     let binaries: Vec<(String, System)> = args
         .binaries
         .iter()
@@ -2543,6 +2575,7 @@ async fn measure(
                     &args.out.join("warmup").join(&tag),
                     false,
                     false,
+                    DF_SINK.get().and_then(|m| m.get(label.as_str())),
                 )
                 .await;
                 eprintln!(
@@ -2589,6 +2622,7 @@ async fn measure(
                     &dir,
                     args.feedback_probe,
                     args.delivery_stats,
+                    DF_SINK.get().and_then(|m| m.get(label.as_str())),
                 )
                 .await;
                 if let (false, System::Debezium(_), Some(c)) =
