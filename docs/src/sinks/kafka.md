@@ -62,6 +62,7 @@ sinks:
 | `topic` | string | — | Destination topic |
 | `required` | bool | `true` | Gates checkpoints |
 | `exactly_once` | bool | `false` | Enable the transactional producer (atomic-batch delivery) |
+| `encode_workers` | int | `1` | Threads that encode an Avro batch (see [Avro encoding threads](#avro-encoding-threads)) |
 | `client_conf` | map | `{}` | librdkafka overrides |
 
 </td>
@@ -120,6 +121,23 @@ If the broker fences the producer (another instance started with the same `trans
 ### Performance impact
 
 Transactions add ~1-3ms overhead per batch for the two-phase commit. With properly sized batches (`max_events=16000, max_bytes=16MB`), throughput impact is **~7-11%**. See the [Performance guide](../performance.md#transactional-producer-overhead) for tuning details and benchmark results.
+
+## Avro encoding threads
+
+An Avro sink encodes each batch in full before it enqueues any record, so a
+batch whose schema cannot be resolved publishes nothing. With
+`encode_workers: N` (N > 1) the batch is split into N contiguous slices,
+encoded on N threads, and enqueued in its original order: the records, their
+order, the batch's failure behavior and its acknowledgement are the same as
+with one thread. A record whose schema is not registered yet (a table's
+first batch, a new schema version) is encoded on the delivery task, which
+registers the schema once. One thread (the default) keeps encoding on the
+delivery task and uses the least CPU; more threads raise saturated Avro
+throughput where cores are free. JSON sinks ignore the setting.
+
+An Avro sink's producer lingers 1 ms by default (JSON: 5 ms): its batches
+are enqueued whole, so a longer linger gathers no more records per request
+and only delays the batch's last request. `client_conf` overrides both.
 
 ## Recommended client_conf settings
 
