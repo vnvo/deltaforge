@@ -270,6 +270,19 @@ impl Connect {
         Ok(())
     }
 
+    /// Kill the worker container at once (`docker kill`: no shutdown, no
+    /// final offset commit).
+    pub fn crash(&self) -> Result<()> {
+        let ok = std::process::Command::new("docker")
+            .args(["kill", self.container.id()])
+            .status()?
+            .success();
+        if !ok {
+            bail!("docker kill failed");
+        }
+        Ok(())
+    }
+
     /// Start the worker again and wait until its REST API answers; its
     /// connectors start from their stored configuration and offsets.
     pub async fn up(&self) -> Result<()> {
@@ -292,6 +305,31 @@ impl Connect {
             }
             if Instant::now() > deadline {
                 bail!("Kafka Connect never answered after a restart");
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// Wait until the worker has committed an offset for the connector
+    /// (`offset.flush.interval.ms`, 60 s by default). Until then a crash
+    /// leaves no offset, and a `no_data` connector restarts at the binlog's
+    /// end, past every row it had not delivered.
+    pub async fn committed(&self, name: &str) -> Result<Duration> {
+        let start = Instant::now();
+        loop {
+            if let Ok(v) = self
+                .call(
+                    reqwest::Method::GET,
+                    &format!("/connectors/{name}/offsets"),
+                    None,
+                )
+                .await
+                && v["offsets"].as_array().is_some_and(|o| !o.is_empty())
+            {
+                return Ok(start.elapsed());
+            }
+            if start.elapsed() > Duration::from_secs(180) {
+                bail!("connector {name} committed no offset");
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }

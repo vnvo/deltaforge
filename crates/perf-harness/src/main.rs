@@ -169,6 +169,12 @@ enum Mode {
     /// state store; Kafka Connect's connectors from their stored
     /// configuration and offsets).
     Restart,
+    /// Recovery from a crash: while N rows are delivered, the DeltaForge
+    /// process is killed (SIGKILL) or the Kafka Connect worker container
+    /// killed (`docker kill`) once half have arrived, and started again at
+    /// once; measured until every row has arrived (JSON: by distinct id),
+    /// with the duplicates the replay delivered.
+    Crash,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,6 +258,7 @@ impl Cell {
                 Mode::Latency => "lat",
                 Mode::Catchup => "catchup",
                 Mode::Restart => "restart",
+                Mode::Crash => "crash",
             },
             match self.sink {
                 Sink::Json => "json",
@@ -406,7 +413,7 @@ fn matrix() -> Vec<Cell> {
         // Catch-up after the pipeline, and after the process, was down
         // (MySQL to Kafka JSON).
         if engine == Engine::Mysql {
-            for mode in [Mode::Catchup, Mode::Restart] {
+            for mode in [Mode::Catchup, Mode::Restart, Mode::Crash] {
                 cells.push(Cell {
                     engine,
                     mode,
@@ -1406,6 +1413,70 @@ impl Process {
         *guard = None;
     }
 
+    /// Kill the runner at once (SIGKILL: no shutdown, no final commit) and
+    /// wait for it.
+    async fn kill(&self) {
+        std::process::Command::new("kill")
+            .args(["-KILL", &self.pid().to_string()])
+            .output()
+            .ok();
+        let mut guard = self.child.lock().await;
+        if let Some(child) = guard.as_mut() {
+            child.kill().await.ok();
+        }
+        *guard = None;
+    }
+
+    /// The operator step after a crash: the server's store gate is held by
+    /// design until it is broken for an owner that is no longer running
+    /// (`store-gate status`, then `store-gate break --owner`). Refuses while
+    /// the recorded process is alive. Returns the owner it released.
+    fn break_gate(&self) -> Result<String> {
+        let gate = |args: &[&str]| -> Result<String> {
+            let mut cmd = std::process::Command::new(&self.binary);
+            cmd.arg("store-gate").args(args);
+            match &self.state_dsn {
+                Some(dsn) => cmd.args([
+                    "--storage-backend",
+                    "postgres",
+                    "--storage-dsn",
+                    dsn,
+                ]),
+                None => {
+                    cmd.arg("--storage-path").arg(self.dir.join("state.db"))
+                }
+            };
+            let out = cmd.output().context("store-gate")?;
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if !out.status.success() {
+                bail!("store-gate {}: {text}", args[0]);
+            }
+            Ok(text)
+        };
+        let status = gate(&["status"])?;
+        let field = |name: &str| {
+            status
+                .split(name)
+                .nth(1)
+                .and_then(|r| r.split([',', ')']).next())
+                .map(str::trim)
+                .map(str::to_string)
+        };
+        let owner = field("owner ")
+            .ok_or_else(|| anyhow!("no gate owner in: {status}"))?;
+        let pid =
+            field("pid ").ok_or_else(|| anyhow!("no gate pid in: {status}"))?;
+        if Path::new(&format!("/proc/{pid}")).exists() {
+            bail!("the gate's owner (pid {pid}) is still running");
+        }
+        gate(&["break", "--owner", &owner])?;
+        Ok(owner)
+    }
+
     /// Launch the runner again, as it was first launched (the same binary
     /// and state store), with the same checks.
     async fn up(&self) -> Result<()> {
@@ -1917,6 +1988,13 @@ struct Measured {
     /// rows committed within 2 s after one, and whether the last row
     /// (JSON) carries every column added.
     ddls: Option<usize>,
+    /// A crash: seconds from the kill until the restarted system serves
+    /// again, and until the first row it delivers.
+    restart_s: Option<f64>,
+    recovery_s: Option<f64>,
+    /// The operator step a crash needed before the restart: DeltaForge's
+    /// store gate broken for this owner (Debezium needs none).
+    gate_broken: Option<String>,
     after_ddl_max_ms: Option<f64>,
     ddl_columns_ok: Option<bool>,
     /// State-store key-value reads in the measured window (PostgreSQL state
@@ -1955,6 +2033,7 @@ impl Measured {
             "lat_p99_ms": self.lat_p99_ms, "lat_max_ms": self.lat_max_ms,
             "first_row_s": self.first_row_s,
             "ddls": self.ddls, "after_ddl_max_ms": self.after_ddl_max_ms,
+            "restart_s": self.restart_s, "recovery_s": self.recovery_s, "gate_broken": self.gate_broken,
             "ddl_columns_ok": self.ddl_columns_ok,
             "kv_reads": self.kv_reads, "feedback_reads": self.feedback_reads,
             "feedback_staleness_s": self.feedback_staleness_s,
@@ -2354,6 +2433,15 @@ async fn run_inner(
             // quiet, not the number of markers written.
             match cell.mode {
                 Mode::Cdc => control("pause").await?,
+                // A crash of a running system: each has a durable position
+                // first (DeltaForge checkpoints the marker; Debezium's worker
+                // commits offsets on its flush interval).
+                Mode::Crash => {
+                    if let Sut::Dbz(c) = &process {
+                        c.committed(&name).await?;
+                    }
+                    control("pause").await?
+                }
                 Mode::Catchup => {
                     control("stop").await?;
                     if !dbz {
@@ -2370,7 +2458,10 @@ async fn run_inner(
             let (r, local) = delivered(&mut parquet_seen).await;
             parquet_seen = local;
             base = r?.0;
-            if matches!(cell.mode, Mode::Cdc | Mode::Catchup | Mode::Restart) {
+            if matches!(
+                cell.mode,
+                Mode::Cdc | Mode::Catchup | Mode::Restart | Mode::Crash
+            ) {
                 let mut stmts =
                     inserts(engine, &main_table, cell.shape, 0, rows);
                 let last = stmts.pop().expect("at least one insert");
@@ -2448,6 +2539,19 @@ async fn run_inner(
             }
         }
         let want = rows as u64 + base;
+        // A crash: when, and the distinct rows already there before the
+        // backlog (the replay repeats rows; completion is by distinct id).
+        let mut crashed_at: Option<Instant> = None;
+        // When the restarted system serves again (DeltaForge healthy with the
+        // pipeline created; Kafka Connect answering).
+        let mut restarted_at: Option<Instant> = None;
+        // DeltaForge after a crash: the store gate's owner released by the
+        // operator step (counted in the recovery time).
+        let mut gate_broken: Option<String> = None;
+        // A crash replaces the process, whose counters start again: the
+        // killed one's CPU and kernel counts up to the kill are carried.
+        let mut carried: Option<(f64, f64, [u64; 5])> = None;
+        let base_ids = arrivals.ids.lock().unwrap().len() as u64;
         let mut rss_peak = 0u64;
         let deadline = Instant::now() + Duration::from_secs(1800);
         // A run that stops delivering fails rather than waiting out the
@@ -2458,7 +2562,34 @@ async fn run_inner(
             let (r, local) = delivered(&mut parquet_seen).await;
             parquet_seen = local;
             let (got, bytes) = r?;
-            if got >= want {
+            if cell.mode == Mode::Crash {
+                let distinct = arrivals.ids.lock().unwrap().len() as u64;
+                if crashed_at.is_some() && distinct >= base_ids + rows as u64 {
+                    break (got, bytes);
+                }
+                if crashed_at.is_none() && got >= base + rows as u64 / 2 {
+                    let k = process.kernel_counts();
+                    carried = Some((
+                        process.cpu_secs() - cpu0.0,
+                        process.sys_secs() - cpu0.1,
+                        std::array::from_fn(|i| k[i].saturating_sub(cpu0.2[i])),
+                    ));
+                    crashed_at = Some(Instant::now());
+                    match &process {
+                        Sut::Df(p) => {
+                            p.kill().await;
+                            gate_broken = Some(p.break_gate()?);
+                            p.up().await?;
+                            create().await?;
+                        }
+                        Sut::Dbz(c) => {
+                            c.crash()?;
+                            c.up().await?;
+                        }
+                    }
+                    restarted_at = Some(Instant::now());
+                }
+            } else if got >= want {
                 break (got, bytes);
             }
             if got > last_got {
@@ -2496,6 +2627,8 @@ async fn run_inner(
         // The window ends at the last row's arrival (Kafka) or its listing.
         let t_end = if cell.sink == Sink::Parquet {
             Instant::now()
+        } else if cell.mode == Mode::Crash {
+            arrivals.times.lock().unwrap().last().copied().unwrap_or_else(Instant::now)
         } else {
             let times = arrivals.times.lock().unwrap();
             times
@@ -2504,6 +2637,19 @@ async fn run_inner(
                 .unwrap_or_else(Instant::now)
         };
         let secs = t_end.duration_since(t0).as_secs_f64();
+        // From the kill to the first row delivered after the restarted
+        // system serves again (rows arriving earlier were produced before
+        // the kill).
+        let restart_s = crashed_at
+            .zip(restarted_at)
+            .map(|(at, up)| up.duration_since(at).as_secs_f64());
+        let recovery_s = crashed_at.zip(restarted_at).and_then(|(at, up)| {
+            let times = arrivals.times.lock().unwrap();
+            times
+                .iter()
+                .find(|t| **t > up)
+                .map(|t| t.saturating_duration_since(at).as_secs_f64())
+        });
         let first_row_s = (cell.sink != Sink::Parquet)
             .then(|| {
                 let times = arrivals.times.lock().unwrap();
@@ -2512,22 +2658,28 @@ async fn run_inner(
                     .map(|t| t.saturating_duration_since(t0).as_secs_f64())
             })
             .flatten();
-        let cpu = process.cpu_secs() - cpu0.0;
-        let sys = process.sys_secs() - cpu0.1;
+        let (cpu, sys) = match carried {
+            Some((c, s, _)) => (c + process.cpu_secs(), s + process.sys_secs()),
+            None => (process.cpu_secs() - cpu0.0, process.sys_secs() - cpu0.1),
+        };
         // The process tree now (a restart replaced it).
         let root_pid = match &process {
             Sut::Df(p) => Some(p.pid()),
             Sut::Dbz(c) => c.pid(),
         };
+        // Per-thread counters are not compared across a crash's restart.
         let threads = match (root_pid, &threads0) {
+            _ if carried.is_some() => None,
             (Some(pid), Some(t0)) => {
                 Some(threads::Snapshot::take(pid).since(t0))
             }
             _ => None,
         };
         let k1 = process.kernel_counts();
-        let kernel: [u64; 5] =
-            std::array::from_fn(|i| k1[i].saturating_sub(cpu0.2[i]));
+        let kernel: [u64; 5] = match carried {
+            Some((_, _, k0)) => std::array::from_fn(|i| k0[i] + k1[i]),
+            None => std::array::from_fn(|i| k1[i].saturating_sub(cpu0.2[i])),
+        };
         let kv_reads = match (reads0, infra.state_reads(&state_db).await) {
             (Some(a), Some(b)) => Some(b.saturating_sub(a)),
             _ => None,
@@ -2652,6 +2804,9 @@ async fn run_inner(
             lat_max_ms: pmax,
             first_row_s,
             ddls: (ddls > 0).then_some(ddls),
+            restart_s,
+            recovery_s,
+            gate_broken,
             after_ddl_max_ms,
             ddl_columns_ok,
             kv_reads,
