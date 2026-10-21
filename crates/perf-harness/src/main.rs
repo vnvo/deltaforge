@@ -188,6 +188,12 @@ struct Cell {
     rows: usize,
     /// Latency cells: how the transactions are written.
     load: Load,
+    /// Tables the rows are spread over (a snapshot copies them in
+    /// parallel); 1: one table `t`.
+    tables: usize,
+    /// DeltaForge's parallel chunk readers within one table (a snapshot's
+    /// `intra_table_parallel`, `max_parallel_chunks`).
+    intra: Option<usize>,
 }
 
 /// A latency cell's write pattern: `rate` transactions per second of
@@ -241,6 +247,12 @@ impl Cell {
         if self.js {
             id.push_str("-js");
         }
+        if self.tables > 1 {
+            id.push_str(&format!("-t{}", self.tables));
+        }
+        if let Some(n) = self.intra {
+            id.push_str(&format!("-intra{n}"));
+        }
         if self.load != Load::DEFAULT {
             let l = self.load;
             if l.rate != Load::DEFAULT.rate {
@@ -263,7 +275,14 @@ impl Cell {
 /// in bytes, which is reported), and `architectural` when the systems do
 /// the work in different ways, with the reason.
 fn comparison(cell: &Cell, debezium: bool) -> (&'static str, &'static str) {
-    if debezium && cell.js {
+    if debezium && cell.intra.is_some() {
+        (
+            "architectural",
+            "DeltaForge reads the one table with parallel chunk readers \
+             (intra_table_parallel); Debezium reads a table on one thread \
+             (its snapshot threads parallelize across tables only)",
+        )
+    } else if debezium && cell.js {
         (
             "architectural",
             "DeltaForge runs a JavaScript batch processor that adds a field to \
@@ -308,6 +327,8 @@ fn matrix() -> Vec<Cell> {
                         js: false,
                         rows: rows_for(shape),
                         load: Load::DEFAULT,
+                        tables: 1,
+                        intra: None,
                     });
                 }
             }
@@ -324,6 +345,8 @@ fn matrix() -> Vec<Cell> {
                     js: false,
                     rows: rows_for(shape),
                     load: Load::DEFAULT,
+                    tables: 1,
+                    intra: None,
                 });
             }
         }
@@ -339,6 +362,8 @@ fn matrix() -> Vec<Cell> {
                     js: false,
                     rows: rows_for(Shape::Ints(n)),
                     load: Load::DEFAULT,
+                    tables: 1,
+                    intra: None,
                 });
             }
         }
@@ -353,7 +378,27 @@ fn matrix() -> Vec<Cell> {
                 js: true,
                 rows: 50_000,
                 load: Load::DEFAULT,
+                tables: 1,
+                intra: None,
             });
+        }
+        // Parallel snapshots: 8 tables copied in parallel, and one table
+        // read by DeltaForge's parallel chunk readers (MySQL to Kafka JSON).
+        if engine == Engine::Mysql {
+            for (tables, intra) in [(8, None), (1, Some(4))] {
+                cells.push(Cell {
+                    engine,
+                    mode: Mode::Snapshot,
+                    sink: Sink::Json,
+                    shape: Shape::Narrow,
+                    batch: None,
+                    js: false,
+                    rows: 400_000,
+                    load: Load::DEFAULT,
+                    tables,
+                    intra,
+                });
+            }
         }
         // Latency (Kafka sinks).
         for sink in [Sink::Json, Sink::Avro] {
@@ -366,6 +411,8 @@ fn matrix() -> Vec<Cell> {
                 js: false,
                 rows: 2_000,
                 load: Load::DEFAULT,
+                tables: 1,
+                intra: None,
             });
         }
         // Latency at 50 transactions/s (Avro), and with JavaScript (JSON).
@@ -385,6 +432,8 @@ fn matrix() -> Vec<Cell> {
                     rate,
                     ..Load::DEFAULT
                 },
+                tables: 1,
+                intra: None,
             });
         }
         // Latency across rates, transaction sizes and bursts (JSON).
@@ -435,6 +484,8 @@ fn matrix() -> Vec<Cell> {
                 js: false,
                 rows,
                 load,
+                tables: 1,
+                intra: None,
             });
         }
     }
@@ -567,22 +618,32 @@ fn civil(z: i64) -> (i64, i64, i64) {
     (y, m, d)
 }
 
-fn create_table(engine: Engine, ns: &str, shape: Shape) -> String {
+/// The tables of a cell in `ns`: `t`, or `t0..t{n-1}`.
+fn table_names(ns: &str, tables: usize) -> Vec<String> {
+    if tables <= 1 {
+        vec![format!("{ns}.t")]
+    } else {
+        (0..tables).map(|k| format!("{ns}.t{k}")).collect()
+    }
+}
+
+fn create_table(engine: Engine, table: &str, shape: Shape) -> String {
     let cols: Vec<String> = columns(shape)
         .iter()
         .enumerate()
         .map(|(i, c)| format!("c{i} {}", sql_type(engine, *c)))
         .collect();
     format!(
-        "CREATE TABLE {ns}.t (id BIGINT PRIMARY KEY, {})",
+        "CREATE TABLE {table} (id BIGINT PRIMARY KEY, {})",
         cols.join(", ")
     )
 }
 
-/// INSERT statements of rows `from..to`, `ROWS_PER_STATEMENT` per statement.
+/// INSERT statements into `table` of rows `from..to` (ids `from + 1..`),
+/// `ROWS_PER_STATEMENT` per statement.
 fn inserts(
     engine: Engine,
-    ns: &str,
+    table: &str,
     shape: Shape,
     from: usize,
     to: usize,
@@ -604,7 +665,7 @@ fn inserts(
             })
             .collect();
         out.push(format!(
-            "INSERT INTO {ns}.t (id, {}) VALUES {}",
+            "INSERT INTO {table} (id, {}) VALUES {}",
             names.join(", "),
             rows.join(", ")
         ));
@@ -1466,9 +1527,10 @@ async fn create_topic(topic: &str) -> Result<()> {
 }
 
 fn consume(
-    topic: &str,
+    topics: &[String],
     arrivals: Arc<Arrivals>,
 ) -> Result<tokio::task::JoinHandle<()>> {
+    let topic = topics.join(",");
     let c: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", brokers())
         .set("group.id", format!("perf-{topic}"))
@@ -1476,7 +1538,7 @@ fn consume(
         .set("enable.auto.commit", "false")
         .set("fetch.wait.max.ms", "10")
         .create()?;
-    c.subscribe(&[topic])?;
+    c.subscribe(&topics.iter().map(String::as_str).collect::<Vec<_>>())?;
     Ok(tokio::spawn(async move {
         loop {
             match c.recv().await {
@@ -1560,16 +1622,19 @@ fn pipeline_spec(
         json!({"mode": "never"})
     } else if cell.sink == Sink::Parquet {
         json!({"mode": "initial", "chunk_size": 1000})
+    } else if let Some(n) = cell.intra {
+        json!({"mode": "initial", "intra_table_parallel": true, "max_parallel_chunks": n})
     } else {
         json!({"mode": "initial"})
     };
+    let tables = table_names(ns, cell.tables);
     let source = match cell.engine {
         Engine::Mysql => json!({
             "type": "mysql",
             "config": {
                 "id": name,
                 "dsn": format!("{infra_dsn}"),
-                "tables": [format!("{ns}.t")],
+                "tables": tables,
                 "snapshot": snapshot,
             }
         }),
@@ -1580,7 +1645,7 @@ fn pipeline_spec(
                 "dsn": infra_dsn,
                 "slot": name.replace('-', "_"),
                 "publication": format!("pub_{ns}"),
-                "tables": [format!("{ns}.t")],
+                "tables": tables,
                 "snapshot": snapshot,
             }
         }),
@@ -1815,11 +1880,16 @@ async fn run_inner(
     if dbz && (engine != Engine::Mysql || cell.sink == Sink::Parquet) {
         bail!("not measured for Debezium: only MySQL to Kafka cells");
     }
-    let topic = if dbz {
-        debezium::topic(&format!("perf-{tag}"), &ns)
+    // Debezium writes each table to a topic of its own; DeltaForge all to one.
+    let topics: Vec<String> = if dbz {
+        table_names(&ns, cell.tables)
+            .iter()
+            .map(|t| debezium::topic(&format!("perf-{tag}"), t))
+            .collect()
     } else {
-        format!("perf-{tag}")
+        vec![format!("perf-{tag}")]
     };
+    let topic = topics[0].clone();
     let prefix = format!("perf/{tag}");
 
     // Fixture.
@@ -1830,10 +1900,19 @@ async fn run_inner(
         ],
         Engine::Postgres => vec![format!("CREATE SCHEMA {ns}")],
     };
-    setup.push(create_table(engine, &ns, cell.shape));
+    let tables = table_names(&ns, cell.tables);
+    let main_table = tables[0].clone();
+    for t in &tables {
+        setup.push(create_table(engine, t, cell.shape));
+        if engine == Engine::Postgres {
+            setup.push(format!("ALTER TABLE {t} REPLICA IDENTITY FULL"));
+        }
+    }
     if engine == Engine::Postgres {
-        setup.push(format!("ALTER TABLE {ns}.t REPLICA IDENTITY FULL"));
-        setup.push(format!("CREATE PUBLICATION pub_{ns} FOR TABLE {ns}.t"));
+        setup.push(format!(
+            "CREATE PUBLICATION pub_{ns} FOR TABLE {}",
+            tables.join(", ")
+        ));
     }
     infra.exec(engine, &setup).await?;
     if engine == Engine::Postgres {
@@ -1851,9 +1930,14 @@ async fn run_inner(
         .context("register publication")?;
     }
     if cell.mode == Mode::Snapshot {
-        infra
-            .exec(engine, &inserts(engine, &ns, cell.shape, 0, rows))
-            .await?;
+        // Each table its own disjoint range of rows (and so of ids).
+        let per = rows.div_ceil(tables.len());
+        for (k, t) in tables.iter().enumerate() {
+            let (from, to) = (k * per, ((k + 1) * per).min(rows));
+            infra
+                .exec(engine, &inserts(engine, t, cell.shape, from, to))
+                .await?;
+        }
     }
 
     // Sink observation.
@@ -1861,8 +1945,10 @@ async fn run_inner(
     let consumer = if cell.sink == Sink::Parquet {
         None
     } else {
-        create_topic(&topic).await?;
-        Some(consume(&topic, Arc::clone(&arrivals))?)
+        for t in &topics {
+            create_topic(t).await?;
+        }
+        Some(consume(&topics, Arc::clone(&arrivals))?)
     };
 
     let dsn = match engine {
@@ -1917,6 +2003,7 @@ async fn run_inner(
             &bootstrap_internal(),
             SERVER_IDS.fetch_add(1, Ordering::Relaxed),
             &ns,
+            &table_names(&ns, cell.tables),
             &format!("perf-{tag}"),
             cell.mode == Mode::Snapshot,
             match cell.sink {
@@ -2045,7 +2132,7 @@ async fn run_inner(
                 let marker = rows as u64 + markers;
                 let one = inserts(
                     engine,
-                    &ns,
+                    &main_table,
                     cell.shape,
                     marker as usize - 1,
                     marker as usize,
@@ -2080,7 +2167,8 @@ async fn run_inner(
             parquet_seen = local;
             base = r?.0;
             if cell.mode == Mode::Cdc {
-                let mut stmts = inserts(engine, &ns, cell.shape, 0, rows);
+                let mut stmts =
+                    inserts(engine, &main_table, cell.shape, 0, rows);
                 let last = stmts.pop().expect("at least one insert");
                 infra.exec(engine, &stmts).await?;
                 if engine == Engine::Postgres {
@@ -2121,7 +2209,8 @@ async fn run_inner(
                     if end == rows && engine == Engine::Postgres {
                         last_tx_lsn = infra.wal_insert_lsn().await;
                     }
-                    let one = inserts(engine, &ns, cell.shape, row, end);
+                    let one =
+                        inserts(engine, &main_table, cell.shape, row, end);
                     sql.exec(&one[0]).await?;
                     let at = Instant::now();
                     commits.extend(std::iter::repeat_n(at, end - row));

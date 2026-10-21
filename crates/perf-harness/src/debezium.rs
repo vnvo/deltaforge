@@ -13,7 +13,9 @@
 //! - `tuned`: configured as DeltaForge runs: the producer with LZ4 (and
 //!   `acks=all`, idempotence, 5 ms linger stated), and the connector polling
 //!   its queue every 50 ms (DeltaForge's batch deadline) with batches of
-//!   2,048 events (DeltaForge: 2,000).
+//!   2,048 events (DeltaForge: 2,000), and snapshotting up to 8 tables in
+//!   parallel (`snapshot.max.threads`; DeltaForge's `max_parallel_tables`
+//!   default).
 
 use std::time::{Duration, Instant};
 
@@ -412,6 +414,7 @@ pub fn mysql_connector(
     bootstrap: &str,
     server_id: u32,
     ns: &str,
+    tables: &[String],
     prefix: &str,
     snapshot: bool,
     format: Format,
@@ -430,7 +433,7 @@ pub fn mysql_connector(
             "database.server.id": server_id.to_string(),
             "topic.prefix": prefix,
             "database.include.list": ns,
-            "table.include.list": format!("{ns}.t"),
+            "table.include.list": tables.join(","),
             "include.schema.changes": "false",
             "schema.history.internal.kafka.bootstrap.servers": bootstrap,
             "schema.history.internal.kafka.topic": format!("dbz-history-{tag}"),
@@ -470,11 +473,14 @@ pub fn mysql_connector(
     if profile == Profile::Tuned {
         connector["config"]["poll.interval.ms"] = json!("50");
         connector["config"]["max.batch.size"] = json!("2048");
+        // Tables snapshotted in parallel, as many as DeltaForge's default
+        // (`max_parallel_tables`, 8).
+        connector["config"]["snapshot.max.threads"] = json!("8");
     }
     connector
 }
 
-/// The topic a connector of `prefix` writes table `{ns}.t` to.
-pub fn topic(prefix: &str, ns: &str) -> String {
-    format!("{prefix}.{ns}.t")
+/// The topic a connector of `prefix` writes `table` (`db.table`) to.
+pub fn topic(prefix: &str, table: &str) -> String {
+    format!("{prefix}.{table}")
 }
