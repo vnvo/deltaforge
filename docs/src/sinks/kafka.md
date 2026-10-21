@@ -62,6 +62,7 @@ sinks:
 | `topic` | string | — | Destination topic |
 | `required` | bool | `true` | Gates checkpoints |
 | `exactly_once` | bool | `false` | Enable the transactional producer (atomic-batch delivery) |
+| `encode_workers` | int | `1` | Threads that encode an Avro batch, 1 to 64 (see [Avro encoding threads](#avro-encoding-threads)) |
 | `client_conf` | map | `{}` | librdkafka overrides |
 
 </td>
@@ -120,6 +121,45 @@ If the broker fences the producer (another instance started with the same `trans
 ### Performance impact
 
 Transactions add ~1-3ms overhead per batch for the two-phase commit. With properly sized batches (`max_events=16000, max_bytes=16MB`), throughput impact is **~7-11%**. See the [Performance guide](../performance.md#transactional-producer-overhead) for tuning details and benchmark results.
+
+## Avro encoding threads
+
+An Avro sink encodes each batch in full before it enqueues any record, so a
+batch whose schema cannot be resolved publishes nothing. With
+`encode_workers: N` (N > 1) the batch is split into N contiguous slices,
+encoded on N threads, and enqueued in its original order: the records, their
+order, the batch's failure behavior and its acknowledgement are the same as
+with one thread. A record whose schema is not registered yet (a table's
+first batch, a new schema version) is encoded on the delivery task, which
+registers the schema once. A record that cannot be encoded is handled as
+with one thread. Only one batch is encoded at a time, so memory holds one
+batch's encoded records whatever the thread count; the threads exist only
+while a batch is encoded. JSON sinks ignore the setting.
+
+One thread (the default) keeps encoding on the delivery task and uses the
+least CPU. More threads are a capacity option for saturated Avro streams on
+hosts with free cores. Measured on one host (a 15 W laptop CPU, MySQL to
+Kafka, saturated backlog, five interleaved repetitions):
+
+| `encode_workers` | Narrow rows (4 columns) | CPU | RSS | Wide rows (50 columns) | CPU | RSS |
+|---|---|---|---|---|---|---|
+| 1 (default) | 82-85k rows/s | 1.2 cores | 235-242 MiB | 29.0k rows/s | 1.2 cores | 473 MiB |
+| 2 | 97k rows/s | 1.8 cores | 240 MiB | 35.0k rows/s | 1.6 cores | 527 MiB |
+| 4 | 120k rows/s | 2.9 cores | 253 MiB | 38.0k rows/s | 2.2 cores | 525 MiB |
+
+The extra CPU per row with more threads (1.45 to 2.44 CPU seconds per 100k
+narrow rows at four) is mostly lower clock speed on a power-limited CPU
+running more cores: the instructions per row do not grow. Records per Kafka
+request stay the same (about 970-980 narrow, 660 wide).
+
+### Linger defaults by format
+
+| Encoding | Default `linger.ms` | Why |
+|---|---|---|
+| Avro | 1 | A batch is encoded in full before any record is enqueued, so linger gathers nothing more: records per request are unchanged at 1 ms (about 980 per request for narrow rows at 1, 2, 3 and 5 ms), and a longer linger only delays the batch's last request, which the batch's acknowledgement waits for. |
+| JSON | 5 | Records are enqueued as they are encoded; linger gathers them into full requests (about 975 records per request at 5 ms, 310 at 1 ms). |
+
+`client_conf` overrides both.
 
 ## Recommended client_conf settings
 

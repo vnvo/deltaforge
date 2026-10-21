@@ -240,11 +240,12 @@ async fn pipeline_named(
     mode: &str,
     dlq: bool,
 ) -> String {
-    pipeline_with(i, mgr, name, db, mode, dlq, false).await
+    pipeline_with(i, mgr, name, db, mode, dlq, false, 1).await
 }
 
 /// [`pipeline_named`], plus a JSON (native envelope) sink to topic
-/// `{db}_json` when `mirror`: the source's own events to compare with.
+/// `{db}_json` when `mirror`, the Avro sink encoding on `workers` threads.
+#[allow(clippy::too_many_arguments)]
 async fn pipeline_with(
     i: &Infra,
     mgr: &PipelineManager,
@@ -253,6 +254,7 @@ async fn pipeline_with(
     mode: &str,
     dlq: bool,
     mirror: bool,
+    workers: usize,
 ) -> String {
     let mirror = if mirror {
         format!(
@@ -286,6 +288,7 @@ spec:
         topic: {db}
         envelope: {{type: native}}
         required: true
+        encode_workers: {workers}
         encoding:
           type: avro
           schema_registry_url: "{sr}"
@@ -934,7 +937,7 @@ async fn ddl_events_reach_avro_as_lossless_ddl_records() {
     .await;
     let mgr = manager().await;
     let name =
-        pipeline_with(i, &mgr, "ua-ddlrec", db, "string", false, true).await;
+        pipeline_with(i, &mgr, "ua-ddlrec", db, "string", false, true, 1).await;
     until_streaming(i, db).await;
     sql(
         i,
@@ -1190,4 +1193,159 @@ async fn decoded_records_carry_every_column_of_their_schema_version() {
     ];
     assert_eq!(got, want, "status {status}");
     mgr.delete(&name).await.ok();
+}
+
+/// The ids of a topic's records past the marker range (`id >= 10000`), in
+/// topic order.
+async fn ids(i: &Infra, topic: &str, want: usize) -> Vec<i64> {
+    let mut out = Vec::new();
+    for bytes in consume_raw(
+        topic,
+        want,
+        Duration::from_secs(5),
+        Duration::from_secs(180),
+    )
+    .await
+    {
+        let rec = decode(i, &bytes).await;
+        let image = rec.after.or(rec.before).expect("a row image");
+        let id = match image.get("id") {
+            Some(Avro::Int(v)) => i64::from(*v),
+            Some(Avro::Long(v)) => *v,
+            other => panic!("id {other:?}"),
+        };
+        if id >= 10_000 {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// `count` rows from id `first` in transactions of `per_tx` rows.
+fn inserts(db: &str, first: i64, count: i64, per_tx: i64) -> Vec<String> {
+    (0..count)
+        .step_by(per_tx as usize)
+        .map(|start| {
+            let values: Vec<String> = (start..(start + per_tx).min(count))
+                .map(|k| format!("({}, {k}, {k})", first + k))
+                .collect();
+            format!("INSERT INTO {db}.t VALUES {}", values.join(", "))
+        })
+        .collect()
+}
+
+/// With four encoding threads every row arrives exactly once and in source
+/// order, and the checkpoint advances with what was delivered: after a
+/// stop and resume the pipeline continues from it (the rows written while
+/// stopped arrive; none delivered before is delivered again).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "docker: MySQL, Kafka and Schema Registry"]
+async fn four_encoding_threads_deliver_in_order_and_the_checkpoint_advances() {
+    let i = INFRA.get_or_init(start).await;
+    let db = "ua_workers";
+    sql(
+        i,
+        &[
+            format!("DROP DATABASE IF EXISTS {db}"),
+            format!("CREATE DATABASE {db}"),
+            format!("CREATE TABLE {db}.t ({TABLE})"),
+        ],
+    )
+    .await;
+    let mgr = manager().await;
+    let name =
+        pipeline_with(i, &mgr, "ua-workers", db, "string", false, false, 4)
+            .await;
+    until_streaming(i, db).await;
+
+    sql(i, &inserts(db, 10_000, 2_000, 200)).await;
+    let got = ids(i, db, 2_000).await;
+    assert_eq!(
+        got,
+        (10_000..12_000).collect::<Vec<_>>(),
+        "every row once, in order"
+    );
+
+    mgr.stop(&name).await.expect("stop");
+    until_status(&mgr, &name, "stopped").await;
+    sql(i, &inserts(db, 12_000, 500, 100)).await;
+    mgr.resume(&name).await.expect("resume");
+    until_status(&mgr, &name, "running").await;
+    let got = ids(i, db, 2_500).await;
+    assert_eq!(
+        got,
+        (10_000..12_500).collect::<Vec<_>>(),
+        "resumed from the checkpoint: the new rows once, nothing again"
+    );
+    mgr.delete(&name).await.ok();
+}
+
+/// The ids a pipeline encoding on `workers` threads publishes when one
+/// transaction's row cannot be encoded: 100 rows, then a 300-row
+/// transaction whose 151st row holds a value long mode cannot, then 50 more
+/// rows after the pipeline failed.
+async fn failing_row_scenario(i: &Infra, workers: usize) -> Vec<i64> {
+    let db = format!("ua_workers_fail{workers}");
+    sql(
+        i,
+        &[
+            format!("DROP DATABASE IF EXISTS {db}"),
+            format!("CREATE DATABASE {db}"),
+            format!("CREATE TABLE {db}.t ({TABLE})"),
+        ],
+    )
+    .await;
+    let mgr = manager().await;
+    let name = pipeline_with(
+        i,
+        &mgr,
+        &format!("ua-workers-fail{workers}"),
+        &db,
+        "long",
+        false,
+        false,
+        workers,
+    )
+    .await;
+    until_streaming(i, &db).await;
+    sql(i, &inserts(&db, 10_000, 100, 100)).await;
+    assert_eq!(ids(i, &db, 100).await, (10_000..10_100).collect::<Vec<_>>());
+
+    let values: Vec<String> = (0..300_i64)
+        .map(|k| {
+            let b = if k == 150 { I64_MAX + 1 } else { k as u64 };
+            format!("({}, {k}, {b})", 20_000 + k)
+        })
+        .collect();
+    sql(
+        i,
+        &[format!("INSERT INTO {db}.t VALUES {}", values.join(", "))],
+    )
+    .await;
+    until_status(&mgr, &name, "failed").await;
+    let incidents = mgr.incidents(&name).await.unwrap().to_string();
+    assert!(incidents.contains("sink_conversion_failed"), "{incidents}");
+    sql(i, &inserts(&db, 30_000, 50, 50)).await;
+    let got = ids(i, &db, 399).await;
+    mgr.delete(&name).await.ok();
+    got
+}
+
+/// With four encoding threads a row that cannot be encoded is handled
+/// exactly as with one: it is never published, the rows of its batch are
+/// (a conversion failure is a row's, which a DLQ would take; without one
+/// the pipeline fails after the batch, its checkpoint not advanced), and no
+/// later batch is published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "docker: MySQL, Kafka and Schema Registry"]
+async fn with_four_encoding_threads_a_failing_row_is_handled_as_with_one() {
+    capture_logs();
+    let i = INFRA.get_or_init(start).await;
+    let one = failing_row_scenario(i, 1).await;
+    let four = failing_row_scenario(i, 4).await;
+    let want: Vec<i64> = (10_000..10_100)
+        .chain((20_000..20_300).filter(|id| *id != 20_150))
+        .collect();
+    assert_eq!(one, want, "one thread");
+    assert_eq!(four, one, "four threads publish what one does");
 }

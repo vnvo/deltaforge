@@ -468,14 +468,17 @@ fn resolved_key(
 type Registered = Arc<Prepared>;
 
 /// A registered schema prepared once for encoding: its ID, its named types
-/// (resolved once, not per event) and a writer that validates and encodes
-/// values with them.
+/// (resolved once, not per event) and writers that validate and encode
+/// values with them (several, so concurrent encoders do not wait for one).
 struct Prepared {
     id: u32,
     schema: Arc<AvroSchema>,
     names: Names,
-    writer: parking_lot::Mutex<apache_avro::GenericSingleObjectWriter>,
+    writers: Vec<parking_lot::Mutex<apache_avro::GenericSingleObjectWriter>>,
 }
+
+/// Writers per prepared schema: concurrent encoders beyond this share them.
+const WRITERS: usize = 8;
 
 /// A schema's named types by name.
 type Names = HashMap<apache_avro::schema::Name, AvroSchema>;
@@ -490,17 +493,22 @@ impl Prepared {
         schema: Arc<AvroSchema>,
     ) -> Result<Registered, EncodingError> {
         let names = resolve_names(&schema)?;
-        let writer = apache_avro::GenericSingleObjectWriter::new_with_capacity(
-            &schema, 1024,
-        )
-        .map_err(|e| {
-            EncodingError::Avro(format!("unresolvable schema: {e}"))
-        })?;
+        let writers = (0..WRITERS)
+            .map(|_| {
+                apache_avro::GenericSingleObjectWriter::new_with_capacity(
+                    &schema, 1024,
+                )
+                .map(parking_lot::Mutex::new)
+                .map_err(|e| {
+                    EncodingError::Avro(format!("unresolvable schema: {e}"))
+                })
+            })
+            .collect::<Result<_, _>>()?;
         Ok(Arc::new(Prepared {
             id,
             schema,
             names,
-            writer: parking_lot::Mutex::new(writer),
+            writers,
         }))
     }
 }
@@ -690,45 +698,18 @@ impl AvroEncoder {
         self.encode_inferred(&subject, name, &json_value).await
     }
 
-    /// Encode a CDC event with the schema it requires, under the subject
-    /// of its mapping version (`<subject>-v1` / `<subject>-v2`: records of
-    /// different versions never share a subject or a cached schema).
-    ///
-    /// An event carrying its source schema version is encoded with the
-    /// DDL-derived schema of exactly that version (Path A), its row images
-    /// converted from their canonical values; an event without one, or from
-    /// a source the provider does not serve, with the subject's inferred
-    /// schema (Path C).
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` - Destination topic/stream/subject (used for SR subject naming)
-    /// * `event` - The event (its rows, mapping version and schema version)
-    /// * `envelope` - The event's envelope (its non-row fields are encoded
-    ///   from it)
-    pub async fn encode_event(
-        &self,
-        topic: &str,
+    /// The envelope as the JSON value the schema's converter reads: the
+    /// row images as placeholders (converted from their canonical values),
+    /// their extensions in their sibling slots.
+    fn envelope_value(
         event: &crate::Event,
         envelope: &EnvelopeData<'_>,
-    ) -> Result<Bytes, EncodingError> {
-        let mapping = event.type_mapping;
-        // The row images are converted from their canonical values (Path A)
-        // or rebuilt from them (Path C): the envelope holds `{}` in their
-        // places, never a rendering to discard.
-        let json_value = serde_json::to_value(envelope.row_placeholders())
+    ) -> Result<serde_json::Value, EncodingError> {
+        let mut json_value = serde_json::to_value(envelope.row_placeholders())
             .map_err(|e| EncodingError::Avro(e.to_string()))?;
-        let (connector, database, namespace, table) = (
-            event.source.connector.as_str(),
-            event.source.db.as_str(),
-            event.source.namespace(),
-            event.source.table.as_str(),
-        );
-        let rows = row_paths(event);
         // The row images' extensions fill their stable sibling slots (null
         // when a row has none); the rows' own records hold declared columns
         // only.
-        let mut json_value = json_value;
         if let serde_json::Value::Object(o) = &mut json_value {
             for (key, row) in [
                 ("before_extensions", &event.before),
@@ -757,6 +738,56 @@ impl AvroEncoder {
             }
         }
 
+        Ok(json_value)
+    }
+
+    /// An encoder of events whose DDL-derived schema (Path A) is already
+    /// registered, for one thread: it keeps the schema it last resolved
+    /// (most events of a batch share one) and writes with writer `slot`, so
+    /// encoders on several threads share neither the cache nor a writer.
+    pub fn cached(&self, slot: usize) -> CachedEncoder<'_> {
+        CachedEncoder {
+            encoder: self,
+            slot,
+            key: String::with_capacity(160),
+            last: None,
+        }
+    }
+
+    /// Encode a CDC event with the schema it requires, under the subject
+    /// of its mapping version (`<subject>-v1` / `<subject>-v2`: records of
+    /// different versions never share a subject or a cached schema).
+    ///
+    /// An event carrying its source schema version is encoded with the
+    /// DDL-derived schema of exactly that version (Path A), its row images
+    /// converted from their canonical values; an event without one, or from
+    /// a source the provider does not serve, with the subject's inferred
+    /// schema (Path C).
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - Destination topic/stream/subject (used for SR subject naming)
+    /// * `event` - The event (its rows, mapping version and schema version)
+    /// * `envelope` - The event's envelope (its non-row fields are encoded
+    ///   from it)
+    pub async fn encode_event(
+        &self,
+        topic: &str,
+        event: &crate::Event,
+        envelope: &EnvelopeData<'_>,
+    ) -> Result<Bytes, EncodingError> {
+        let mapping = event.type_mapping;
+        // The row images are converted from their canonical values (Path A)
+        // or rebuilt from them (Path C): the envelope holds `{}` in their
+        // places, never a rendering to discard.
+        let mut json_value = Self::envelope_value(event, envelope)?;
+        let (connector, database, namespace, table) = (
+            event.source.connector.as_str(),
+            event.source.db.as_str(),
+            event.source.namespace(),
+            event.source.table.as_str(),
+        );
+        let rows = row_paths(event);
         if let (Some(provider), Some(fingerprint)) = (
             self.source_schemas.as_ref(),
             event.schema_version.as_deref(),
@@ -1010,12 +1041,70 @@ fn inferred_state(shape: Inferred) -> Result<InferredState, EncodingError> {
     })
 }
 
+/// Encodes events whose schema is registered without waiting (see
+/// [`AvroEncoder::cached`]).
+pub struct CachedEncoder<'a> {
+    encoder: &'a AvroEncoder,
+    slot: usize,
+    key: String,
+    last: Option<(String, Registered)>,
+}
+
+impl CachedEncoder<'_> {
+    /// Encode `event`, or `None` when its DDL-derived schema is not
+    /// registered yet (the event is encoded by [`AvroEncoder::encode_event`],
+    /// which registers or infers it): the bytes and errors that path gives.
+    pub fn encode(
+        &mut self,
+        topic: &str,
+        event: &crate::Event,
+        envelope: &EnvelopeData<'_>,
+    ) -> Option<Result<Bytes, EncodingError>> {
+        let provider = self.encoder.source_schemas.as_ref()?;
+        let fingerprint = event.schema_version.as_deref()?;
+        self.key.clear();
+        resolved_key(
+            &mut self.key,
+            topic,
+            event,
+            fingerprint,
+            provider.mapping_id(),
+        );
+        let prepared = match &self.last {
+            Some((key, prepared)) if *key == self.key => Arc::clone(prepared),
+            _ => {
+                let prepared = self
+                    .encoder
+                    .resolved
+                    .read()
+                    .get(self.key.as_str())
+                    .cloned()?;
+                self.last = Some((self.key.clone(), Arc::clone(&prepared)));
+                prepared
+            }
+        };
+        Some(AvroEncoder::envelope_value(event, envelope).and_then(|v| {
+            encode_in(&prepared, &v, &row_paths(event), Some(self.slot))
+        }))
+    }
+}
+
 /// Convert `json_value` exactly to the prepared schema and frame it in the
 /// Confluent wire format: `[0x00][schema_id:4][avro_payload]`.
 fn encode_with(
     prepared: &Prepared,
     json_value: &serde_json::Value,
     rows: &[(&str, &CanonicalRow)],
+) -> Result<Bytes, EncodingError> {
+    encode_in(prepared, json_value, rows, None)
+}
+
+/// [`encode_with`] with writer `slot` (any free writer when `None`).
+fn encode_in(
+    prepared: &Prepared,
+    json_value: &serde_json::Value,
+    rows: &[(&str, &CanonicalRow)],
+    slot: Option<usize>,
 ) -> Result<Bytes, EncodingError> {
     let avro_value =
         convert_named(json_value, &prepared.schema, &prepared.names, rows)
@@ -1027,20 +1116,26 @@ fn encode_with(
                 .increment(1);
             })?;
     let mut out = Vec::with_capacity(256);
-    prepared
-        .writer
-        .lock()
-        .write_value_ref(&avro_value, &mut out)
-        .map_err(|e| {
-            // A failed validation names the reason only: never the value.
-            let e = match e {
-                apache_avro::Error::ValidationWithReason { .. } => {
-                    apache_avro::Error::Validation
-                }
-                e => e,
-            };
-            EncodingError::Avro(format!("Avro encoding failed: {e}"))
-        })?;
+    // The slot's writer, or a free one (the first when every one is busy).
+    match slot {
+        Some(i) => prepared.writers[i % WRITERS].lock(),
+        None => prepared
+            .writers
+            .iter()
+            .find_map(|w| w.try_lock())
+            .unwrap_or_else(|| prepared.writers[0].lock()),
+    }
+    .write_value_ref(&avro_value, &mut out)
+    .map_err(|e| {
+        // A failed validation names the reason only: never the value.
+        let e = match e {
+            apache_avro::Error::ValidationWithReason { .. } => {
+                apache_avro::Error::Validation
+            }
+            e => e,
+        };
+        EncodingError::Avro(format!("Avro encoding failed: {e}"))
+    })?;
     // The writer's single-object header becomes the wire-format prefix.
     out.drain(..SINGLE_OBJECT_HEADER - 5);
     out[0] = 0x00;

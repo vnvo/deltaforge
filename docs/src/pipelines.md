@@ -36,6 +36,7 @@ The coordinator builds batches using soft thresholds:
 - `max_events`: flush after this many events.
 - `max_bytes`: flush after the serialized size reaches this limit.
 - `max_ms`: flush after this much time has elapsed since the batch started.
+- `min_flush_interval_ms` (default 40): when the input drains and no batch is being delivered, a batch of whole transactions is delivered at once, but no sooner than this long after the previous such delivery. A quiet source's transaction goes immediately; a steady trickle is batched over this window; under load, batches fill to the limits above.
 - `respect_source_tx`: when true, never split a single source transaction across batches.
 - `max_inflight`: cap the number of batches being processed concurrently.
 

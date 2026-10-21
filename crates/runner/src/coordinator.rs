@@ -367,6 +367,32 @@ enum Staged<Tok> {
     Batch(Result<Processed<Tok>>),
 }
 
+/// What the accumulation loop carries across source items besides the
+/// building batch: transaction tracking, the replay capture of the open
+/// commit unit, and the batch limits.
+struct Accumulator {
+    tx_tracker: TxTracker,
+    replay_on: bool,
+    /// Replay capture accumulator: raw pre-processing events for the
+    /// currently-open commit unit. Separate from batching, so it spans
+    /// soft-limit flushes; closed at a boundary, discarded (dropped) on
+    /// cancel/shutdown/error before a boundary.
+    capture_accum: Vec<Event>,
+    /// Where the open transaction's events start in `capture_accum`.
+    capture_tx_start: usize,
+    /// Full boundary record of the last commit unit actually captured. Used
+    /// to distinguish a genuine data-less boundary (worth capturing) from a
+    /// redundant snapshot-completion marker that repeats the already-captured
+    /// boundary.
+    last_captured_boundary:
+        Option<deltaforge_core::replay::SourceBoundaryRecord>,
+    respect_source_tx: bool,
+    max_events: usize,
+    max_bytes: usize,
+    max_tx_events: usize,
+    max_tx_bytes: usize,
+}
+
 struct DeliveryItem {
     batch: BuildingBatch,
     reason: &'static str,
@@ -610,6 +636,83 @@ impl TxTracker {
 
 /// Send a completed batch to the delivery task. Returns Err if the delivery
 /// task has stopped (e.g. due to a sink error).
+/// Whether a building batch may be delivered now: in tx-aligned mode it
+/// holds whole transactions only (none open, no open snapshot chunk);
+/// otherwise anything, or a commit-only batch.
+fn flushable(b: &BuildingBatch, respect_source_tx: bool) -> bool {
+    if respect_source_tx {
+        b.committed_len > 0 && !b.mid_tx()
+    } else {
+        !b.raw.is_empty() || is_commit_only(b)
+    }
+}
+
+/// What one turn of the accumulation loop waited for. Held only for the
+/// turn: boxing the item would allocate on every turn under load.
+#[allow(clippy::large_enum_variant)]
+enum Step {
+    Cancelled,
+    Tick,
+    /// A pause change; `true` when the pause channel closed.
+    Paused(bool),
+    /// The next source item (`None`: the source ended).
+    Item(Option<SourceItem>),
+    /// A drained batch was flushed, a delivery finished or the flush
+    /// interval ended: check again.
+    Recheck,
+}
+
+/// The drained path, entered when a batch of whole units meets an empty
+/// input. With nothing being delivered and the flush interval since the
+/// previous drained flush elapsed, the batch goes to delivery at once.
+/// Otherwise the turn also waits for the end of the delivery in flight
+/// (registered before `inflight` is read, so one finishing in between still
+/// wakes it) or of the interval; an item arriving wakes it through `recv`.
+#[allow(clippy::too_many_arguments)]
+async fn drained_step(
+    building: &mut Option<BuildingBatch>,
+    last_drained: &mut Option<Instant>,
+    min_flush_interval: Duration,
+    deliver_tx: &tokio::sync::mpsc::Sender<DeliveryItem>,
+    inflight: &std::sync::atomic::AtomicUsize,
+    drained: &tokio::sync::Notify,
+    cancel: &CancellationToken,
+    ticker: &mut tokio::time::Interval,
+    pause_rx: &mut watch::Receiver<PauseState>,
+    event_rx: &mut tokio::sync::mpsc::Receiver<SourceItem>,
+) -> Result<Step> {
+    let delivery_done = drained.notified();
+    tokio::pin!(delivery_done);
+    delivery_done.as_mut().enable();
+    let mut hold_until = None;
+    if inflight.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        let now = Instant::now();
+        match last_drained.map(|t| t + min_flush_interval) {
+            Some(at) if at > now => hold_until = Some(at),
+            _ => {
+                let b = building.take().expect("a flushable batch");
+                send_to_delivery(deliver_tx, inflight, b, "drained").await?;
+                *last_drained = Some(now);
+                return Ok(Step::Recheck);
+            }
+        }
+    }
+    let hold = async {
+        match hold_until {
+            Some(at) => tokio::time::sleep_until(at).await,
+            None => std::future::pending().await,
+        }
+    };
+    Ok(tokio::select! {
+        _ = cancel.cancelled() => Step::Cancelled,
+        _ = delivery_done => Step::Recheck,
+        _ = hold => Step::Recheck,
+        _ = ticker.tick() => Step::Tick,
+        changed = pause_rx.changed() => Step::Paused(changed.is_err()),
+        maybe_ev = event_rx.recv() => Step::Item(maybe_ev),
+    })
+}
+
 async fn send_to_delivery(
     tx: &tokio::sync::mpsc::Sender<DeliveryItem>,
     inflight: &std::sync::atomic::AtomicUsize,
@@ -1378,6 +1481,9 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                 max_events: c.max_events.or(defaults.max_events),
                 max_bytes: c.max_bytes.or(defaults.max_bytes),
                 max_ms: c.max_ms.or(defaults.max_ms),
+                min_flush_interval_ms: c
+                    .min_flush_interval_ms
+                    .or(defaults.min_flush_interval_ms),
                 respect_source_tx: c
                     .respect_source_tx
                     .or(defaults.respect_source_tx),
@@ -1443,6 +1549,9 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
         mut pause_rx: watch::Receiver<PauseState>,
     ) -> Result<()> {
         let tick_ms = self.batch_cfg_eff.max_ms.unwrap_or(200);
+        let min_flush_interval = Duration::from_millis(
+            self.batch_cfg_eff.min_flush_interval_ms.unwrap_or(0),
+        );
         let max_events = self.batch_cfg_eff.max_events.unwrap_or(usize::MAX);
         let max_bytes = self.batch_cfg_eff.max_bytes.unwrap_or(usize::MAX);
         let max_inflight = self.batch_cfg_eff.max_inflight.unwrap_or(1);
@@ -1575,21 +1684,21 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
         let mut ticker = interval(Duration::from_millis(tick_ms));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut building: Option<BuildingBatch> = None;
+        // When the last drained flush handed its batch over.
+        let mut last_drained: Option<Instant> = None;
         let mut drain_buf: Vec<SourceItem> = Vec::with_capacity(256);
-        let mut tx_tracker = TxTracker::default();
-        // Replay capture accumulator: raw pre-processing events for the currently-open
-        // commit unit. Separate from batching, so it spans soft-limit flushes; closed at
-        // a boundary, discarded (dropped) on cancel/shutdown/error before a boundary.
-        let replay_on = coord.replay_capture.is_some();
-        let mut capture_accum: Vec<Event> = Vec::new();
-        // Where the open transaction's events start in `capture_accum`.
-        let mut capture_tx_start = 0usize;
-        // Full boundary record of the last commit unit actually captured. Used to
-        // distinguish a genuine data-less boundary (worth capturing) from a redundant
-        // snapshot-completion marker that repeats the already-captured boundary.
-        let mut last_captured_boundary: Option<
-            deltaforge_core::replay::SourceBoundaryRecord,
-        > = None;
+        let mut acc = Accumulator {
+            tx_tracker: TxTracker::default(),
+            replay_on: coord.replay_capture.is_some(),
+            capture_accum: Vec::new(),
+            capture_tx_start: 0,
+            last_captured_boundary: None,
+            respect_source_tx,
+            max_events,
+            max_bytes,
+            max_tx_events,
+            max_tx_bytes,
+        };
 
         // Mirrors the quiesce-ack this receiver last published, so we ack/clear only on
         // edges rather than every loop turn.
@@ -1605,7 +1714,7 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                     // could enter the journal AFTER the selected sink is restored, losing
                     // them for that sink.
                     let unit_open = building.as_ref().is_some_and(|b| b.mid_tx())
-                        || (replay_on && !capture_accum.is_empty());
+                        || (acc.replay_on && !acc.capture_accum.is_empty());
                     if ps.replay && !unit_open && !quiesced_acked {
                         // Flush any whole commit units that are ready, then wait for
                         // in-flight delivery to drain. Capture is already durable in-loop,
@@ -1665,8 +1774,42 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                     quiesced_acked = false;
                 }
 
-                tokio::select! {
-                    _ = cancel.cancelled() => {
+                // Under load the input is never drained: the turn waits on
+                // the input, the deadline, a pause and cancellation only.
+                // Once a batch of whole units meets an empty input, the
+                // drained path (its own future, allocated per drain) flushes
+                // it or waits for what lets it flush (see `drained_step`).
+                let drained_input = building
+                    .as_ref()
+                    .is_some_and(|b| flushable(b, respect_source_tx))
+                    && event_rx.is_empty();
+                let step = if drained_input {
+                    Box::pin(drained_step(
+                        &mut building,
+                        &mut last_drained,
+                        min_flush_interval,
+                        &deliver_tx,
+                        &inflight,
+                        &drained,
+                        &cancel,
+                        &mut ticker,
+                        &mut pause_rx,
+                        &mut event_rx,
+                    ))
+                    .await?
+                } else {
+                    tokio::select! {
+                        _ = cancel.cancelled() => Step::Cancelled,
+                        _ = ticker.tick() => Step::Tick,
+                        changed = pause_rx.changed() => Step::Paused(changed.is_err()),
+                        maybe_ev = event_rx.recv() => Step::Item(maybe_ev),
+                    }
+                };
+
+                match step {
+                    Step::Recheck => continue,
+
+                    Step::Cancelled => {
                         if let Some(b) = building.take() {
                             if let Some(b) = finalize_batch(
                                 b, respect_source_tx, &coord.pipeline_name,
@@ -1677,18 +1820,13 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                         break;
                     }
 
-                    _ = ticker.tick() => {
+                    Step::Tick => {
                         if let Some(b) = building.take() {
                             let elapsed = b.started_at.elapsed()
                                 >= Duration::from_millis(tick_ms);
                             // In tx-aligned mode only whole transactions may
                             // flush - never mid-transaction.
-                            let flushable = if respect_source_tx {
-                                b.committed_len > 0 && !b.mid_tx()
-                            } else {
-                                !b.raw.is_empty() || is_commit_only(&b)
-                            };
-                            if flushable && elapsed {
+                            if flushable(&b, respect_source_tx) && elapsed {
                                 send_to_delivery(&deliver_tx, &inflight, b, "timer").await?;
                             } else {
                                 building = Some(b);
@@ -1696,12 +1834,12 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                         }
                     }
 
-                    changed = pause_rx.changed() => {
-                        if changed.is_err() { break; }
+                    Step::Paused(closed) => {
+                        if closed { break; }
                         continue;
                     }
 
-                    maybe_ev = event_rx.recv() => {
+                    Step::Item(maybe_ev) => {
                         let Some(first) = maybe_ev else {
                             if let Some(b) = building.take() {
                                 if let Some(b) = finalize_batch(
@@ -1719,272 +1857,26 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                         }
                         let mut b = building.take().unwrap();
 
-                        // Gather the first item plus an immediately-available
-                        // burst. The timeout bounds the wait so an idle source
-                        // at the WAL tail lets the ticker branch flush.
+                        // Gather the first item plus the burst already queued
+                        // (never waiting for more: what arrives later is
+                        // the next turn's).
                         drain_buf.clear();
                         drain_buf.push(first);
-                        let _ = tokio::time::timeout(
-                            Duration::from_millis(tick_ms),
-                            event_rx.recv_many(&mut drain_buf, 512),
-                        )
-                        .await;
-
-                        for item in drain_buf.drain(..) {
-                            if respect_source_tx {
-                                match item {
-                                    SourceItem::TxBegin { tx_id } => {
-                                        // Open the transaction; a second open
-                                        // before a commit is a protocol error.
-                                        tx_tracker.begin(&tx_id)?;
-                                        capture_tx_start = capture_accum.len();
-                                    }
-                                    SourceItem::Event(ev) => {
-                                        // Every transactional event must belong
-                                        // to the open transaction.
-                                        tx_tracker.observe_event(&ev)?;
-                                        if ev.transaction.is_some() {
-                                            // Accumulate the raw event for replay before
-                                            // it is moved into the batch.
-                                            if replay_on {
-                                                capture_accum.push(ev.clone());
-                                            }
-                                            // In-transaction event: buffer without
-                                            // splitting; enforce the hard caps.
-                                            if let Err(o) = push_tx_event(
-                                                &mut b, ev, max_tx_events, max_tx_bytes,
-                                            ) {
-                                                counter!(
-                                                    "deltaforge_oversized_tx_total",
-                                                    "pipeline" => coord.pipeline_name.to_string(),
-                                                )
-                                                .increment(1);
-                                                return Err(OversizedTxError {
-                                                    tx_id: tx_tracker
-                                                        .active()
-                                                        .unwrap_or("<unknown>")
-                                                        .to_string(),
-                                                    observed_events: o.events,
-                                                    observed_bytes: o.bytes,
-                                                    max_tx_events,
-                                                    max_tx_bytes,
-                                                    exceeded: o.exceeded,
-                                                }
-                                                .into());
-                                            }
-                                            maybe_warn_approaching(
-                                                &mut b,
-                                                max_tx_events,
-                                                max_tx_bytes,
-                                                &coord.pipeline_name,
-                                            );
-                                        } else {
-                                            // Standalone/snapshot event: its own
-                                            // boundary; split by soft limits. Accumulate
-                                            // the raw event and note whether it carries a
-                                            // boundary (snapshot chunk-final rows do; the
-                                            // rest accumulate across soft-limit flushes).
-                                            let ev_boundary = if replay_on {
-                                                ev.boundary.clone()
-                                            } else {
-                                                None
-                                            };
-                                            if replay_on {
-                                                capture_accum.push(ev.clone());
-                                            }
-                                            // A snapshot chunk is one unit, like a
-                                            // transaction: only its final row carries
-                                            // the chunk's boundary, and the rows before
-                                            // it commit with that row. Neither a limit
-                                            // nor the timer cuts a chunk, so every
-                                            // delivered batch ends at a boundary (a
-                                            // durable sink refuses one without its
-                                            // watermark).
-                                            let open_chunk_row = ev.source.snapshot.is_some()
-                                                && ev.boundary.is_none();
-                                            b.bytes += event_size_hint(&ev);
-                                            b.raw.push(ev);
-                                            if !open_chunk_row {
-                                                commit_standalone(&mut b);
-                                            }
-                                            // Close the replay unit at the boundary event,
-                                            // before any flush that could commit its
-                                            // checkpoint (fail-closed).
-                                            if let Some(bd) = ev_boundary {
-                                                coord
-                                                    .close_capture_unit(
-                                                        &mut capture_accum,
-                                                        &bd,
-                                                        &mut last_captured_boundary,
-                                                    )
-                                                    .await?;
-                                            }
-                                            if soft_limit_reached(&b, max_events, max_bytes) {
-                                                let full = std::mem::replace(
-                                                    &mut b,
-                                                    BuildingBatch::with_capacity(max_events),
-                                                );
-                                                send_to_delivery(&deliver_tx, &inflight, full, "limits").await?;
-                                            }
-                                        }
-                                    }
-                                    SourceItem::TxCommit { tx_id, boundary } => {
-                                        // The marker must match the open tx and
-                                        // may close it exactly once - a stale or
-                                        // duplicate marker cannot advance twice.
-                                        tx_tracker.commit(&tx_id)?;
-                                        // Commit boundary: close the open tx with
-                                        // the boundary's checkpoint + watermark
-                                        // (atomic), flush only if soft limits are
-                                        // reached.
-                                        close_tx(&mut b, boundary.clone());
-                                        // Persist the replay envelope for the whole tx
-                                        // before any flush can commit its checkpoint
-                                        // (fail-closed).
-                                        coord
-                                            .close_capture_unit(
-                                                &mut capture_accum,
-                                                &boundary,
-                                                &mut last_captured_boundary,
-                                            )
-                                            .await?;
-                                        if soft_limit_reached(&b, max_events, max_bytes) {
-                                            let full = std::mem::replace(
-                                                &mut b,
-                                                BuildingBatch::with_capacity(max_events),
-                                            );
-                                            send_to_delivery(&deliver_tx, &inflight, full, "tx_commit").await?;
-                                        }
-                                    }
-                                    SourceItem::TxAbort { tx_id } => {
-                                        // The source abandoned the open
-                                        // transaction and sends it again from
-                                        // its beginning: drop what was buffered
-                                        // for it (never flushed: only whole
-                                        // transactions flush in this mode).
-                                        tx_tracker.abort(&tx_id)?;
-                                        let dropped = abandon_open_tx(&mut b);
-                                        capture_accum.truncate(capture_tx_start);
-                                        warn!(
-                                            pipeline = %coord.pipeline_name,
-                                            tx_id = %tx_id,
-                                            discarded_events = dropped,
-                                            duplicates = false,
-                                            "source abandoned an open transaction: its \
-                                             buffered prefix was discarded and the \
-                                             transaction is replayed atomically"
-                                        );
-                                        counter!(
-                                            "deltaforge_abandoned_tx_total",
-                                            "pipeline" => coord.pipeline_name.to_string(),
-                                            "outcome" => "discarded",
-                                        )
-                                        .increment(1);
-                                    }
-                                    SourceItem::Barrier { barrier } => {
-                                        // Barriers arrive between rows (snapshot
-                                        // starts and ends), never inside a
-                                        // source transaction.
-                                        if b.mid_tx() {
-                                            return Err(anyhow::anyhow!(
-                                                "a checkpoint barrier arrived inside a \
-                                                 source transaction"
-                                            ));
-                                        }
-                                        coord
-                                            .close_capture_unit(
-                                                &mut capture_accum,
-                                                &barrier.boundary,
-                                                &mut last_captured_boundary,
-                                            )
-                                            .await?;
-                                        let pending = std::mem::replace(
-                                            &mut b,
-                                            BuildingBatch::with_capacity(max_events),
-                                        );
-                                        send_barrier_to_delivery(
-                                            &deliver_tx, &inflight, pending, barrier,
-                                        )
-                                        .await?;
-                                    }
-                                    SourceItem::Boundary { boundary } => {
-                                        // A data-less boundary (snapshot table /
-                                        // full completion). Apply it to the pending
-                                        // batch and flush now so it is delivered -
-                                        // and durably acked - promptly, even when
-                                        // the batch is empty because prior data
-                                        // already flushed (the sink then publishes a
-                                        // zero-object entry + HEAD CAS for it).
-                                        // Close any accumulated commit unit at this
-                                        // data-less boundary before the flush commits its
-                                        // checkpoint (fail-closed). Usually empty (a
-                                        // chunk-final event already closed the unit).
-                                        coord
-                                            .close_capture_unit(
-                                                &mut capture_accum,
-                                                &boundary,
-                                                &mut last_captured_boundary,
-                                            )
-                                            .await?;
-                                        close_boundary(&mut b, boundary);
-                                        let full = std::mem::replace(
-                                            &mut b,
-                                            BuildingBatch::with_capacity(max_events),
-                                        );
-                                        send_to_delivery(&deliver_tx, &inflight, full, "boundary").await?;
-                                    }
-                                }
-                            } else {
-                                // Legacy path: soft-limit splitting; markers ignored.
-                                if let SourceItem::TxAbort { tx_id } = &item {
-                                    // Rows already flushed for it cannot be
-                                    // recalled: its replay may duplicate them.
-                                    warn!(
-                                        pipeline = %coord.pipeline_name,
-                                        tx_id = %tx_id,
-                                        duplicates = true,
-                                        "source abandoned an open transaction: rows \
-                                         already delivered for it may be delivered \
-                                         again by its replay (respect_source_tx=false)"
-                                    );
-                                    counter!(
-                                        "deltaforge_abandoned_tx_total",
-                                        "pipeline" => coord.pipeline_name.to_string(),
-                                        "outcome" => "may_duplicate",
-                                    )
-                                    .increment(1);
-                                }
-                                if let SourceItem::Barrier { barrier } = item {
-                                    let pending = std::mem::replace(
-                                        &mut b,
-                                        BuildingBatch::with_capacity(max_events),
-                                    );
-                                    send_barrier_to_delivery(
-                                        &deliver_tx, &inflight, pending, barrier,
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                                if let SourceItem::TxCommit { boundary, .. } = item {
-                                    legacy_commit(&mut b, boundary);
-                                    continue;
-                                }
-                                let SourceItem::Event(ev) = item else { continue; };
-                                // A commit-only batch goes ahead of later
-                                // rows, never merged with them.
-                                if is_commit_only(&b) {
-                                    let pending = std::mem::replace(
-                                        &mut b,
-                                        BuildingBatch::with_capacity(max_events),
-                                    );
-                                    send_to_delivery(&deliver_tx, &inflight, pending, "tx_commit").await?;
-                                }
-                                if let Some(full) = check_and_split(&mut b, ev, max_events, max_bytes) {
-                                    send_to_delivery(&deliver_tx, &inflight, full, "limits").await?;
-                                }
-                            }
+                        // `recv_many` returns at once when items are queued
+                        // (this is the only receiver).
+                        if !event_rx.is_empty() {
+                            event_rx.recv_many(&mut drain_buf, 511).await;
                         }
 
+                        coord
+                            .accumulate(
+                                &mut acc,
+                                &mut b,
+                                &mut drain_buf,
+                                &deliver_tx,
+                                &inflight,
+                            )
+                            .await?;
                         building = Some(b);
                     }
                 }
@@ -2003,6 +1895,314 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
         }
 
         accum_result
+    }
+
+    /// Fold one gathered burst of source items into the building batch `b`,
+    /// in order: transaction tracking, replay capture of the open commit
+    /// unit, and the deliveries the limits, commits, barriers and boundaries
+    /// call for. Kept out of the accumulation loop so the per-item code is
+    /// compiled on its own, whatever the loop around it does.
+    async fn accumulate(
+        &self,
+        acc: &mut Accumulator,
+        b: &mut BuildingBatch,
+        items: &mut Vec<SourceItem>,
+        deliver_tx: &tokio::sync::mpsc::Sender<DeliveryItem>,
+        inflight: &std::sync::atomic::AtomicUsize,
+    ) -> Result<()> {
+        let Accumulator {
+            tx_tracker,
+            replay_on,
+            capture_accum,
+            capture_tx_start,
+            last_captured_boundary,
+            respect_source_tx,
+            max_events,
+            max_bytes,
+            max_tx_events,
+            max_tx_bytes,
+        } = acc;
+        let (replay_on, respect_source_tx) = (*replay_on, *respect_source_tx);
+        let (max_events, max_bytes, max_tx_events, max_tx_bytes) =
+            (*max_events, *max_bytes, *max_tx_events, *max_tx_bytes);
+        for item in items.drain(..) {
+            if respect_source_tx {
+                match item {
+                    SourceItem::TxBegin { tx_id } => {
+                        // Open the transaction; a second open
+                        // before a commit is a protocol error.
+                        tx_tracker.begin(&tx_id)?;
+                        *capture_tx_start = capture_accum.len();
+                    }
+                    SourceItem::Event(ev) => {
+                        // Every transactional event must belong
+                        // to the open transaction.
+                        tx_tracker.observe_event(&ev)?;
+                        if ev.transaction.is_some() {
+                            // Accumulate the raw event for replay before
+                            // it is moved into the batch.
+                            if replay_on {
+                                capture_accum.push(ev.clone());
+                            }
+                            // In-transaction event: buffer without
+                            // splitting; enforce the hard caps.
+                            if let Err(o) = push_tx_event(
+                                b,
+                                ev,
+                                max_tx_events,
+                                max_tx_bytes,
+                            ) {
+                                counter!(
+                                    "deltaforge_oversized_tx_total",
+                                    "pipeline" => self.pipeline_name.to_string(),
+                                )
+                                .increment(1);
+                                return Err(OversizedTxError {
+                                    tx_id: tx_tracker
+                                        .active()
+                                        .unwrap_or("<unknown>")
+                                        .to_string(),
+                                    observed_events: o.events,
+                                    observed_bytes: o.bytes,
+                                    max_tx_events,
+                                    max_tx_bytes,
+                                    exceeded: o.exceeded,
+                                }
+                                .into());
+                            }
+                            maybe_warn_approaching(
+                                b,
+                                max_tx_events,
+                                max_tx_bytes,
+                                &self.pipeline_name,
+                            );
+                        } else {
+                            // Standalone/snapshot event: its own
+                            // boundary; split by soft limits. Accumulate
+                            // the raw event and note whether it carries a
+                            // boundary (snapshot chunk-final rows do; the
+                            // rest accumulate across soft-limit flushes).
+                            let ev_boundary = if replay_on {
+                                ev.boundary.clone()
+                            } else {
+                                None
+                            };
+                            if replay_on {
+                                capture_accum.push(ev.clone());
+                            }
+                            // A snapshot chunk is one unit, like a
+                            // transaction: only its final row carries
+                            // the chunk's boundary, and the rows before
+                            // it commit with that row. Neither a limit
+                            // nor the timer cuts a chunk, so every
+                            // delivered batch ends at a boundary (a
+                            // durable sink refuses one without its
+                            // watermark).
+                            let open_chunk_row = ev.source.snapshot.is_some()
+                                && ev.boundary.is_none();
+                            b.bytes += event_size_hint(&ev);
+                            b.raw.push(ev);
+                            if !open_chunk_row {
+                                commit_standalone(b);
+                            }
+                            // Close the replay unit at the boundary event,
+                            // before any flush that could commit its
+                            // checkpoint (fail-closed).
+                            if let Some(bd) = ev_boundary {
+                                self.close_capture_unit(
+                                    capture_accum,
+                                    &bd,
+                                    last_captured_boundary,
+                                )
+                                .await?;
+                            }
+                            if soft_limit_reached(b, max_events, max_bytes) {
+                                let full = std::mem::replace(
+                                    b,
+                                    BuildingBatch::with_capacity(max_events),
+                                );
+                                send_to_delivery(
+                                    deliver_tx, inflight, full, "limits",
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                    SourceItem::TxCommit { tx_id, boundary } => {
+                        // The marker must match the open tx and
+                        // may close it exactly once - a stale or
+                        // duplicate marker cannot advance twice.
+                        tx_tracker.commit(&tx_id)?;
+                        // Commit boundary: close the open tx with
+                        // the boundary's checkpoint + watermark
+                        // (atomic), flush only if soft limits are
+                        // reached.
+                        close_tx(b, boundary.clone());
+                        // Persist the replay envelope for the whole tx
+                        // before any flush can commit its checkpoint
+                        // (fail-closed).
+                        self.close_capture_unit(
+                            capture_accum,
+                            &boundary,
+                            last_captured_boundary,
+                        )
+                        .await?;
+                        if soft_limit_reached(b, max_events, max_bytes) {
+                            let full = std::mem::replace(
+                                b,
+                                BuildingBatch::with_capacity(max_events),
+                            );
+                            send_to_delivery(
+                                deliver_tx,
+                                inflight,
+                                full,
+                                "tx_commit",
+                            )
+                            .await?;
+                        }
+                    }
+                    SourceItem::TxAbort { tx_id } => {
+                        // The source abandoned the open
+                        // transaction and sends it again from
+                        // its beginning: drop what was buffered
+                        // for it (never flushed: only whole
+                        // transactions flush in this mode).
+                        tx_tracker.abort(&tx_id)?;
+                        let dropped = abandon_open_tx(b);
+                        capture_accum.truncate(*capture_tx_start);
+                        warn!(
+                            pipeline = %self.pipeline_name,
+                            tx_id = %tx_id,
+                            discarded_events = dropped,
+                            duplicates = false,
+                            "source abandoned an open transaction: its \
+                             buffered prefix was discarded and the \
+                             transaction is replayed atomically"
+                        );
+                        counter!(
+                            "deltaforge_abandoned_tx_total",
+                            "pipeline" => self.pipeline_name.to_string(),
+                            "outcome" => "discarded",
+                        )
+                        .increment(1);
+                    }
+                    SourceItem::Barrier { barrier } => {
+                        // Barriers arrive between rows (snapshot
+                        // starts and ends), never inside a
+                        // source transaction.
+                        if b.mid_tx() {
+                            return Err(anyhow::anyhow!(
+                                "a checkpoint barrier arrived inside a \
+                                 source transaction"
+                            ));
+                        }
+                        self.close_capture_unit(
+                            capture_accum,
+                            &barrier.boundary,
+                            last_captured_boundary,
+                        )
+                        .await?;
+                        let pending = std::mem::replace(
+                            b,
+                            BuildingBatch::with_capacity(max_events),
+                        );
+                        send_barrier_to_delivery(
+                            deliver_tx, inflight, pending, barrier,
+                        )
+                        .await?;
+                    }
+                    SourceItem::Boundary { boundary } => {
+                        // A data-less boundary (snapshot table /
+                        // full completion). Apply it to the pending
+                        // batch and flush now so it is delivered -
+                        // and durably acked - promptly, even when
+                        // the batch is empty because prior data
+                        // already flushed (the sink then publishes a
+                        // zero-object entry + HEAD CAS for it).
+                        // Close any accumulated commit unit at this
+                        // data-less boundary before the flush commits its
+                        // checkpoint (fail-closed). Usually empty (a
+                        // chunk-final event already closed the unit).
+                        self.close_capture_unit(
+                            capture_accum,
+                            &boundary,
+                            last_captured_boundary,
+                        )
+                        .await?;
+                        close_boundary(b, boundary);
+                        let full = std::mem::replace(
+                            b,
+                            BuildingBatch::with_capacity(max_events),
+                        );
+                        send_to_delivery(
+                            deliver_tx, inflight, full, "boundary",
+                        )
+                        .await?;
+                    }
+                }
+            } else {
+                // Legacy path: soft-limit splitting; markers ignored.
+                if let SourceItem::TxAbort { tx_id } = &item {
+                    // Rows already flushed for it cannot be
+                    // recalled: its replay may duplicate them.
+                    warn!(
+                        pipeline = %self.pipeline_name,
+                        tx_id = %tx_id,
+                        duplicates = true,
+                        "source abandoned an open transaction: rows \
+                         already delivered for it may be delivered \
+                         again by its replay (respect_source_tx=false)"
+                    );
+                    counter!(
+                        "deltaforge_abandoned_tx_total",
+                        "pipeline" => self.pipeline_name.to_string(),
+                        "outcome" => "may_duplicate",
+                    )
+                    .increment(1);
+                }
+                if let SourceItem::Barrier { barrier } = item {
+                    let pending = std::mem::replace(
+                        b,
+                        BuildingBatch::with_capacity(max_events),
+                    );
+                    send_barrier_to_delivery(
+                        deliver_tx, inflight, pending, barrier,
+                    )
+                    .await?;
+                    continue;
+                }
+                if let SourceItem::TxCommit { boundary, .. } = item {
+                    legacy_commit(b, boundary);
+                    continue;
+                }
+                let SourceItem::Event(ev) = item else {
+                    continue;
+                };
+                // A commit-only batch goes ahead of later
+                // rows, never merged with them.
+                if is_commit_only(b) {
+                    let pending = std::mem::replace(
+                        b,
+                        BuildingBatch::with_capacity(max_events),
+                    );
+                    send_to_delivery(
+                        deliver_tx,
+                        inflight,
+                        pending,
+                        "tx_commit",
+                    )
+                    .await?;
+                }
+                if let Some(full) =
+                    check_and_split(b, ev, max_events, max_bytes)
+                {
+                    send_to_delivery(deliver_tx, inflight, full, "limits")
+                        .await?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Run the processors over a batch: the first stage of its delivery.
@@ -8238,6 +8438,292 @@ mod tests {
                 SourceItem::Event(ev)
             })
             .collect()
+    }
+
+    /// A sink that records each delivery's time and size, taking `delay`.
+    struct TimedSink {
+        id: String,
+        delay: std::time::Duration,
+        seen: std::sync::Mutex<Vec<(std::time::Instant, usize)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl deltaforge_core::Sink for TimedSink {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        async fn send(&self, _e: &Event) -> SinkResult<()> {
+            Ok(())
+        }
+        async fn send_batch_with_context(
+            &self,
+            events: &[Event],
+            _ctx: &deltaforge_core::SinkBatchContext,
+        ) -> SinkResult<deltaforge_core::BatchResult> {
+            tokio::time::sleep(self.delay).await;
+            self.seen
+                .lock()
+                .unwrap()
+                .push((std::time::Instant::now(), events.len()));
+            Ok(deltaforge_core::BatchResult::ok())
+        }
+        async fn barrier(
+            &self,
+            _kind: &deltaforge_core::BarrierKind,
+            _ctx: &deltaforge_core::SinkBatchContext,
+        ) -> SinkResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A tx-aligned coordinator with a 10 s batch deadline (never reached by
+    /// these tests) delivering to a `TimedSink` taking `delay`.
+    fn timed_coord(
+        delay: std::time::Duration,
+    ) -> (
+        Coordinator<CheckpointMeta>,
+        Arc<TimedSink>,
+        Arc<checkpoints::MemCheckpointStore>,
+    ) {
+        let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+        let sink = Arc::new(TimedSink {
+            id: "timed".into(),
+            delay,
+            seen: Default::default(),
+        });
+        let coord = Coordinator::builder("test-timed")
+            .sinks(vec![Arc::clone(&sink) as ArcDynSink])
+            .batch_config(Some(BatchConfig {
+                max_events: Some(1000),
+                max_ms: Some(10_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_fn(
+                "timed",
+                build_commit_fn(store.clone(), "src::sink::timed".to_string()),
+            )
+            .process_fn(build_batch_processor(
+                Arc::from(vec![]),
+                "test".to_string(),
+            ))
+            .build();
+        (coord, sink, store)
+    }
+
+    /// One transaction's items: begin, `rows` rows, commit at `cp`.
+    fn one_tx(n: i64, rows: i64) -> Vec<SourceItem> {
+        let txn = format!("gtid:{n}");
+        let mut items = vec![SourceItem::TxBegin { tx_id: txn.clone() }];
+        for i in 0..rows {
+            items.push(SourceItem::Event(tx_event(n * 100 + i, &txn, b"row")));
+        }
+        items.push(SourceItem::TxCommit {
+            tx_id: txn,
+            boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                CheckpointMeta::from_vec(format!("cp-{n}").into_bytes()),
+            ),
+        });
+        items
+    }
+
+    /// Run `coord` on a channel the test feeds; returns the sender and the
+    /// run's handle.
+    fn start_fed(
+        coord: Coordinator<CheckpointMeta>,
+    ) -> (
+        tokio::sync::mpsc::Sender<SourceItem>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4096);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
+        let handle = tokio::spawn(async move {
+            let _keep = pause_tx;
+            coord.run(rx, cancel, pause_rx).await
+        });
+        (tx, handle)
+    }
+
+    /// A transaction committed while the input is otherwise quiet is
+    /// delivered at once, not at the batch deadline.
+    #[tokio::test]
+    async fn a_committed_transaction_on_a_quiet_input_is_delivered_at_once() {
+        let ms = std::time::Duration::from_millis;
+        let (coord, sink, store) = timed_coord(ms(0));
+        let (tx, handle) = start_fed(coord);
+        let t0 = std::time::Instant::now();
+        for item in one_tx(1, 1) {
+            tx.send(item).await.unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while sink.seen.lock().unwrap().is_empty() {
+                tokio::time::sleep(ms(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let at = sink.seen.lock().unwrap()[0].0;
+        assert!(at - t0 < ms(1000), "delivered after {:?}", at - t0);
+        drop(tx);
+        handle.await.unwrap().unwrap();
+        assert_eq!(
+            store.get_raw("src::sink::timed").await.unwrap().as_deref(),
+            Some(&b"cp-1"[..])
+        );
+    }
+
+    /// An open transaction is never delivered, however quiet the input.
+    #[tokio::test]
+    async fn an_open_transaction_is_never_delivered_early() {
+        let ms = std::time::Duration::from_millis;
+        let (coord, sink, _store) = timed_coord(ms(0));
+        let (tx, handle) = start_fed(coord);
+        let mut items = one_tx(1, 3);
+        let commit = items.pop().unwrap();
+        for item in items {
+            tx.send(item).await.unwrap();
+        }
+        tokio::time::sleep(ms(300)).await;
+        assert!(
+            sink.seen.lock().unwrap().is_empty(),
+            "nothing of an open transaction"
+        );
+        tx.send(commit).await.unwrap();
+        drop(tx);
+        handle.await.unwrap().unwrap();
+        assert_eq!(
+            sink.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, n)| *n)
+                .collect::<Vec<_>>(),
+            [3]
+        );
+    }
+
+    /// A transaction committed while a batch is being delivered waits for
+    /// it, then goes at once (not at the deadline).
+    #[tokio::test]
+    async fn a_transaction_waiting_on_a_delivery_goes_when_it_ends() {
+        let ms = std::time::Duration::from_millis;
+        let (coord, sink, store) = timed_coord(ms(200));
+        let (tx, handle) = start_fed(coord);
+        let t0 = std::time::Instant::now();
+        for item in one_tx(1, 1) {
+            tx.send(item).await.unwrap();
+        }
+        tokio::time::sleep(ms(50)).await;
+        for item in one_tx(2, 1) {
+            tx.send(item).await.unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while sink.seen.lock().unwrap().len() < 2 {
+                tokio::time::sleep(ms(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let seen = sink.seen.lock().unwrap().clone();
+        // The second went right after the first's delivery, well before the
+        // 10 s deadline.
+        assert!(
+            seen[1].0 - t0 < ms(1500),
+            "second delivered after {:?}",
+            seen[1].0 - t0
+        );
+        assert_eq!(seen.iter().map(|(_, n)| *n).collect::<Vec<_>>(), [1, 1]);
+        drop(tx);
+        handle.await.unwrap().unwrap();
+        assert_eq!(
+            store.get_raw("src::sink::timed").await.unwrap().as_deref(),
+            Some(&b"cp-2"[..])
+        );
+    }
+
+    /// A transaction drained soon after the previous drained flush waits
+    /// for the flush interval (40 ms by default), not for the deadline.
+    #[tokio::test]
+    async fn a_drained_flush_waits_for_the_flush_interval() {
+        let ms = std::time::Duration::from_millis;
+        let (coord, sink, _store) = timed_coord(ms(0));
+        let (tx, handle) = start_fed(coord);
+        for item in one_tx(1, 1) {
+            tx.send(item).await.unwrap();
+        }
+        tokio::time::sleep(ms(5)).await;
+        for item in one_tx(2, 1) {
+            tx.send(item).await.unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while sink.seen.lock().unwrap().len() < 2 {
+                tokio::time::sleep(ms(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let seen = sink.seen.lock().unwrap().clone();
+        let gap = seen[1].0 - seen[0].0;
+        assert!(gap >= ms(14), "held for the interval: {gap:?}");
+        assert!(gap < ms(1000), "not until the deadline: {gap:?}");
+        drop(tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    /// A steady trickle is batched over the flush interval, not delivered
+    /// a transaction at a time.
+    #[tokio::test]
+    async fn a_steady_trickle_is_batched_over_the_flush_interval() {
+        let ms = std::time::Duration::from_millis;
+        let (coord, sink, store) = timed_coord(ms(0));
+        let (tx, handle) = start_fed(coord);
+        // 100 single-row transactions, one every 2 ms (about 200 ms).
+        for n in 1..=100 {
+            for item in one_tx(n, 1) {
+                tx.send(item).await.unwrap();
+            }
+            tokio::time::sleep(ms(2)).await;
+        }
+        drop(tx);
+        handle.await.unwrap().unwrap();
+        let sizes: Vec<usize> =
+            sink.seen.lock().unwrap().iter().map(|(_, n)| *n).collect();
+        assert_eq!(sizes.iter().sum::<usize>(), 100);
+        assert!(sizes.len() <= 25, "{} batches: {sizes:?}", sizes.len());
+        assert_eq!(
+            store.get_raw("src::sink::timed").await.unwrap().as_deref(),
+            Some(&b"cp-100"[..])
+        );
+    }
+
+    /// Under load, transactions keep batching: those committed while a
+    /// batch is in flight go together in the next.
+    #[tokio::test]
+    async fn transactions_arriving_during_a_delivery_are_batched_together() {
+        let ms = std::time::Duration::from_millis;
+        let (coord, sink, store) = timed_coord(ms(50));
+        let (tx, handle) = start_fed(coord);
+        // 100 single-row transactions, one every 2 ms, against 50 ms
+        // deliveries.
+        for n in 1..=100 {
+            for item in one_tx(n, 1) {
+                tx.send(item).await.unwrap();
+            }
+            tokio::time::sleep(ms(2)).await;
+        }
+        drop(tx);
+        handle.await.unwrap().unwrap();
+        let sizes: Vec<usize> =
+            sink.seen.lock().unwrap().iter().map(|(_, n)| *n).collect();
+        assert_eq!(sizes.iter().sum::<usize>(), 100);
+        assert!(sizes.len() <= 20, "{} batches: {sizes:?}", sizes.len());
+        assert_eq!(
+            store.get_raw("src::sink::timed").await.unwrap().as_deref(),
+            Some(&b"cp-100"[..])
+        );
     }
 
     /// A sink that records when each delivery starts and ends (by its

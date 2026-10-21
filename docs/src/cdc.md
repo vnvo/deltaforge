@@ -307,6 +307,7 @@ When sinks can't keep up with the change rate, pipelines need to slow down grace
 |---------|-----------|------------|
 | `max_events` | Lower latency, more overhead | Higher throughput, more latency |
 | `max_ms` | Faster flush, smaller batches | Larger batches, delayed flush |
+| `min_flush_interval_ms` | Lower latency on a trickle, more batches and checkpoint commits | Fewer batches, latency up to this value |
 | `max_bytes` | Memory-safe, frequent commits | Efficient for large rows |
 
 Start with DeltaForge defaults and tune based on observed latency and throughput.
