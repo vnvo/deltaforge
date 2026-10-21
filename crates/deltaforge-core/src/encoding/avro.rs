@@ -757,30 +757,17 @@ impl AvroEncoder {
         Ok(json_value)
     }
 
-    /// Encode an event whose DDL-derived schema (Path A) is already
-    /// registered, without waiting: `None` when it is not (the event is
-    /// encoded by [`Self::encode_event`], which registers or infers it).
-    pub fn encode_cached(
-        &self,
-        topic: &str,
-        event: &crate::Event,
-        envelope: &EnvelopeData<'_>,
-    ) -> Option<Result<Bytes, EncodingError>> {
-        let provider = self.source_schemas.as_ref()?;
-        let fingerprint = event.schema_version.as_deref()?;
-        let mut key = String::with_capacity(160);
-        resolved_key(
-            &mut key,
-            topic,
-            event,
-            fingerprint,
-            provider.mapping_id(),
-        );
-        let prepared = self.resolved.read().get(key.as_str()).cloned()?;
-        Some(
-            Self::envelope_value(event, envelope)
-                .and_then(|v| encode_with(&prepared, &v, &row_paths(event))),
-        )
+    /// An encoder of events whose DDL-derived schema (Path A) is already
+    /// registered, for one thread: it keeps the schema it last resolved
+    /// (most events of a batch share one) and writes with writer `slot`, so
+    /// encoders on several threads share neither the cache nor a writer.
+    pub fn cached(&self, slot: usize) -> CachedEncoder<'_> {
+        CachedEncoder {
+            encoder: self,
+            slot,
+            key: String::with_capacity(160),
+            last: None,
+        }
     }
 
     pub async fn encode_event(
@@ -1054,12 +1041,70 @@ fn inferred_state(shape: Inferred) -> Result<InferredState, EncodingError> {
     })
 }
 
+/// Encodes events whose schema is registered without waiting (see
+/// [`AvroEncoder::cached`]).
+pub struct CachedEncoder<'a> {
+    encoder: &'a AvroEncoder,
+    slot: usize,
+    key: String,
+    last: Option<(String, Registered)>,
+}
+
+impl CachedEncoder<'_> {
+    /// Encode `event`, or `None` when its DDL-derived schema is not
+    /// registered yet (the event is encoded by [`AvroEncoder::encode_event`],
+    /// which registers or infers it): the bytes and errors that path gives.
+    pub fn encode(
+        &mut self,
+        topic: &str,
+        event: &crate::Event,
+        envelope: &EnvelopeData<'_>,
+    ) -> Option<Result<Bytes, EncodingError>> {
+        let provider = self.encoder.source_schemas.as_ref()?;
+        let fingerprint = event.schema_version.as_deref()?;
+        self.key.clear();
+        resolved_key(
+            &mut self.key,
+            topic,
+            event,
+            fingerprint,
+            provider.mapping_id(),
+        );
+        let prepared = match &self.last {
+            Some((key, prepared)) if *key == self.key => Arc::clone(prepared),
+            _ => {
+                let prepared = self
+                    .encoder
+                    .resolved
+                    .read()
+                    .get(self.key.as_str())
+                    .cloned()?;
+                self.last = Some((self.key.clone(), Arc::clone(&prepared)));
+                prepared
+            }
+        };
+        Some(AvroEncoder::envelope_value(event, envelope).and_then(|v| {
+            encode_in(&prepared, &v, &row_paths(event), Some(self.slot))
+        }))
+    }
+}
+
 /// Convert `json_value` exactly to the prepared schema and frame it in the
 /// Confluent wire format: `[0x00][schema_id:4][avro_payload]`.
 fn encode_with(
     prepared: &Prepared,
     json_value: &serde_json::Value,
     rows: &[(&str, &CanonicalRow)],
+) -> Result<Bytes, EncodingError> {
+    encode_in(prepared, json_value, rows, None)
+}
+
+/// [`encode_with`] with writer `slot` (any free writer when `None`).
+fn encode_in(
+    prepared: &Prepared,
+    json_value: &serde_json::Value,
+    rows: &[(&str, &CanonicalRow)],
+    slot: Option<usize>,
 ) -> Result<Bytes, EncodingError> {
     let avro_value =
         convert_named(json_value, &prepared.schema, &prepared.names, rows)
@@ -1071,23 +1116,26 @@ fn encode_with(
                 .increment(1);
             })?;
     let mut out = Vec::with_capacity(256);
-    // A free writer, or the first one when every writer is busy.
-    prepared
-        .writers
-        .iter()
-        .find_map(|w| w.try_lock())
-        .unwrap_or_else(|| prepared.writers[0].lock())
-        .write_value_ref(&avro_value, &mut out)
-        .map_err(|e| {
-            // A failed validation names the reason only: never the value.
-            let e = match e {
-                apache_avro::Error::ValidationWithReason { .. } => {
-                    apache_avro::Error::Validation
-                }
-                e => e,
-            };
-            EncodingError::Avro(format!("Avro encoding failed: {e}"))
-        })?;
+    // The slot's writer, or a free one (the first when every one is busy).
+    match slot {
+        Some(i) => prepared.writers[i % WRITERS].lock(),
+        None => prepared
+            .writers
+            .iter()
+            .find_map(|w| w.try_lock())
+            .unwrap_or_else(|| prepared.writers[0].lock()),
+    }
+    .write_value_ref(&avro_value, &mut out)
+    .map_err(|e| {
+        // A failed validation names the reason only: never the value.
+        let e = match e {
+            apache_avro::Error::ValidationWithReason { .. } => {
+                apache_avro::Error::Validation
+            }
+            e => e,
+        };
+        EncodingError::Avro(format!("Avro encoding failed: {e}"))
+    })?;
     // The writer's single-object header becomes the wire-format prefix.
     out.drain(..SINGLE_OBJECT_HEADER - 5);
     out[0] = 0x00;

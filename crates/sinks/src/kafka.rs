@@ -429,8 +429,8 @@ impl KafkaSink {
     fn prepare_cached<'a>(
         &'a self,
         e: &'a Event,
+        encoder: &mut deltaforge_core::encoding::avro::CachedEncoder<'_>,
     ) -> Option<SinkResult<Prepared<'a>>> {
-        let encoder = self.avro_encoder.as_ref()?;
         if e.ddl.is_some() || e.routing.as_ref().is_some_and(|r| r.raw_payload)
         {
             return None;
@@ -448,7 +448,7 @@ impl KafkaSink {
                 ));
             }
         };
-        let payload = match encoder.encode_cached(&topic, e, &envelope)? {
+        let payload = match encoder.encode(&topic, e, &envelope)? {
             Ok(b) => b.to_vec(),
             Err(err) => {
                 warn!(
@@ -477,27 +477,31 @@ impl KafkaSink {
             tokio::runtime::Handle::try_current().is_ok_and(|h| {
                 h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
             });
-        if self.avro_encoder.is_none() || workers < 2 || !multi_thread {
+        let Some(encoder) = self.avro_encoder.as_ref() else {
+            return Vec::new();
+        };
+        if workers < 2 || !multi_thread {
             return Vec::new();
         }
         let chunk = events.len().div_ceil(workers);
+        // Each thread encodes one slice with an encoder of its own.
+        let prepare = |slot: usize, part: &'a [Event]| {
+            let mut cached = encoder.cached(slot);
+            part.iter()
+                .map(|e| self.prepare_cached(e, &mut cached))
+                .collect::<Vec<_>>()
+        };
         tokio::task::block_in_place(|| {
             std::thread::scope(|scope| {
                 let rest: Vec<_> = events
                     .chunks(chunk)
+                    .enumerate()
                     .skip(1)
-                    .map(|part| {
-                        scope.spawn(move || {
-                            part.iter()
-                                .map(|e| self.prepare_cached(e))
-                                .collect::<Vec<_>>()
-                        })
+                    .map(|(slot, part)| {
+                        scope.spawn(move || prepare(slot, part))
                     })
                     .collect();
-                let mut out: Vec<_> = events[..chunk]
-                    .iter()
-                    .map(|e| self.prepare_cached(e))
-                    .collect();
+                let mut out = prepare(0, &events[..chunk]);
                 for part in rest {
                     out.extend(
                         part.join().expect("an encoding thread panicked"),
@@ -1469,13 +1473,15 @@ mod tests {
     mod parallel_avro {
         use super::*;
         use deltaforge_core::canonical::fixture;
+        use deltaforge_core::encoding::avro::{
+            EnvelopeSchemaLookup, SchemaIdentity,
+        };
         use deltaforge_core::encoding::avro_schema::{
             build_envelope_schema, build_value_schema,
         };
         use deltaforge_core::encoding::avro_types::{
             ColumnDesc, TypeConversionOpts, mysql_column_to_avro,
         };
-        use deltaforge_core::encoding::avro::{EnvelopeSchemaLookup, SchemaIdentity};
         use serde_json::json;
 
         /// A registry that gives every distinct schema the next id.
