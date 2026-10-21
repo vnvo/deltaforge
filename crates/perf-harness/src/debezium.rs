@@ -526,7 +526,8 @@ pub fn mysql_connector(
     prefix: &str,
     snapshot: bool,
     format: Format,
-    js: bool,
+    js: Js,
+    rows: usize,
     profile: Profile,
 ) -> Value {
     let mut connector = json!({
@@ -567,16 +568,37 @@ pub fn mysql_connector(
             }
         }
     }
-    // The JavaScript counterpart of DeltaForge's JavaScript processor: a
-    // JavaScript expression evaluated per record that reads the row image
-    // (Debezium's scripting transformations filter or route records; none
-    // adds a field, so this one keeps every record).
-    if js {
-        config["transforms"] = json!("js");
-        config["transforms.js.type"] = json!("io.debezium.transforms.Filter");
-        config["transforms.js.language"] = json!("jsr223.graal.js");
-        config["transforms.js.condition"] =
-            json!("value.after == null || value.after.id != null");
+    match js {
+        Js::Off => {}
+        // The JavaScript counterpart of DeltaForge's JavaScript processor: a
+        // JavaScript expression evaluated per record that reads the row image
+        // (Debezium's scripting transformations filter or route records; none
+        // adds a field, so this one keeps every record).
+        Js::Tag => {
+            config["transforms"] = json!("js");
+            config["transforms.js.type"] =
+                json!("io.debezium.transforms.Filter");
+            config["transforms.js.language"] = json!("jsr223.graal.js");
+            config["transforms.js.condition"] =
+                json!("value.after == null || value.after.id != null");
+        }
+        // The same filter and routing as DeltaForge's script (`Js::Route`):
+        // its Filter, then its ContentBasedRouter, both JavaScript.
+        Js::Route => {
+            let [a, b] = route_topics(prefix);
+            config["transforms"] = json!("filter,route");
+            config["transforms.filter.type"] =
+                json!("io.debezium.transforms.Filter");
+            config["transforms.filter.language"] = json!("jsr223.graal.js");
+            config["transforms.filter.condition"] = json!(format!(
+                "value.after != null && (value.after.id % 2 == 0 || value.after.id > {rows})"
+            ));
+            config["transforms.route.type"] =
+                json!("io.debezium.transforms.ContentBasedRouter");
+            config["transforms.route.language"] = json!("jsr223.graal.js");
+            config["transforms.route.topic.expression"] =
+                json!(format!("value.after.id % 4 == 0 ? '{a}' : '{b}'"));
+        }
     }
     if profile == Profile::Tuned {
         connector["config"]["poll.interval.ms"] = json!("50");
@@ -586,6 +608,25 @@ pub fn mysql_connector(
         connector["config"]["snapshot.max.threads"] = json!("8");
     }
     connector
+}
+
+/// The JavaScript a cell runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Js {
+    Off,
+    /// DeltaForge adds a field to every row; Debezium, whose scripting
+    /// transformations cannot, evaluates a condition per record that keeps
+    /// every one.
+    Tag,
+    /// Both keep the rows with an even id (and the markers, above the
+    /// fixture's ids) and route each to one of two topics by `id % 4`
+    /// (`route_topics`, the first for 0).
+    Route,
+}
+
+/// The two topics a `Js::Route` cell routes to.
+pub fn route_topics(base: &str) -> [String; 2] {
+    [format!("{base}.a"), format!("{base}.b")]
 }
 
 /// The topic a connector of `prefix` writes `table` (`db.table`) to.

@@ -74,8 +74,14 @@ from official distributions and verified against the SHA-256 digests in
 Against Debezium a cell is either:
 
 - **direct:** both systems run the same workload to equivalent output. The
-  JSON and Avro CDC, snapshot and latency cells are direct. Their envelopes
-  differ in bytes, which is reported.
+  JSON and Avro CDC, snapshot, latency, catch-up, restart, crash and DDL
+  cells are direct. Their envelopes differ in bytes, which is reported. So
+  are the JavaScript filtering and routing cells (`-jsroute`): both keep the
+  rows with an even id and route each to one of two topics by `id % 4`
+  (DeltaForge's JavaScript processor; Debezium's `Filter` and
+  `ContentBasedRouter`). The consumer checks every row's topic, and a row
+  that should have been filtered out or arrives on the wrong topic fails
+  the run.
 - **architectural:** the systems do the work in different ways, and
   `summary.md` states how. The JavaScript cells are architectural.
   DeltaForge runs a batch JavaScript processor that adds a field.
@@ -85,6 +91,27 @@ Against Debezium a cell is either:
   is no optimizing Truffle runtime.
 
 DeltaForge against DeltaForge is always direct.
+
+## Crash and recovery
+
+The crash cells kill the system mid-backlog: SIGKILL for DeltaForge,
+`docker kill` for the Kafka Connect worker. Completion is by distinct row
+id, and a replayed row counts as a duplicate. Each system first has a
+durable position. DeltaForge has checkpointed the marker row. Debezium is
+crashed only after its worker has committed an offset for the connector
+(`offset.flush.interval.ms`, 60 s by default). Without one, a `no_data`
+connector restarts at the binary log's end, past every row it had not
+delivered.
+
+After the kill, DeltaForge's store gate is still held. By design it does
+not expire. The harness performs the operator step: `store-gate status`,
+a check that the recorded process is gone, then `store-gate break
+--owner`. The run records it (`gate_broken`) and counts it in the
+recovery time. Recorded per run:
+
+- `restart_s`: kill to the restarted system serving again;
+- `recovery_s`: kill to the first row it delivers;
+- CPU, including the killed process's CPU up to the kill.
 
 ## Layout-randomized qualification
 

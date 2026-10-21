@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+use debezium::Js;
 use gate_ownership::GateOwned;
 use mysql_async::prelude::Queryable;
 use rdkafka::ClientConfig;
@@ -202,7 +203,7 @@ struct Cell {
     sink: Sink,
     shape: Shape,
     batch: Option<usize>,
-    js: bool,
+    js: Js,
     rows: usize,
     /// Latency cells: how the transactions are written.
     load: Load,
@@ -269,8 +270,10 @@ impl Cell {
         if let Some(b) = self.batch {
             id.push_str(&format!("-b{b}"));
         }
-        if self.js {
-            id.push_str("-js");
+        match self.js {
+            Js::Off => {}
+            Js::Tag => id.push_str("-js"),
+            Js::Route => id.push_str("-jsroute"),
         }
         if self.tables > 1 {
             id.push_str(&format!("-t{}", self.tables));
@@ -310,7 +313,7 @@ fn comparison(cell: &Cell, debezium: bool) -> (&'static str, &'static str) {
              (intra_table_parallel); Debezium reads a table on one thread \
              (its snapshot threads parallelize across tables only)",
         )
-    } else if debezium && cell.js {
+    } else if debezium && cell.js == Js::Tag {
         (
             "architectural",
             "DeltaForge runs a JavaScript batch processor that adds a field to \
@@ -352,7 +355,7 @@ fn matrix() -> Vec<Cell> {
                         sink,
                         shape,
                         batch: None,
-                        js: false,
+                        js: Js::Off,
                         rows: rows_for(shape),
                         load: Load::DEFAULT,
                         tables: 1,
@@ -370,7 +373,7 @@ fn matrix() -> Vec<Cell> {
                     sink: Sink::Json,
                     shape,
                     batch: Some(batch),
-                    js: false,
+                    js: Js::Off,
                     rows: rows_for(shape),
                     load: Load::DEFAULT,
                     tables: 1,
@@ -387,7 +390,7 @@ fn matrix() -> Vec<Cell> {
                     sink,
                     shape: Shape::Ints(n),
                     batch: None,
-                    js: false,
+                    js: Js::Off,
                     rows: rows_for(Shape::Ints(n)),
                     load: Load::DEFAULT,
                     tables: 1,
@@ -403,13 +406,27 @@ fn matrix() -> Vec<Cell> {
                 sink: Sink::Json,
                 shape,
                 batch: None,
-                js: true,
+                js: Js::Tag,
                 rows: 50_000,
                 load: Load::DEFAULT,
                 tables: 1,
                 intra: None,
             });
         }
+        // JavaScript filtering and routing (CDC, JSON): half the rows kept,
+        // routed to two topics.
+        cells.push(Cell {
+            engine,
+            mode: Mode::Cdc,
+            sink: Sink::Json,
+            shape: Shape::Narrow,
+            batch: None,
+            js: Js::Route,
+            rows: 50_000,
+            load: Load::DEFAULT,
+            tables: 1,
+            intra: None,
+        });
         // Catch-up after the pipeline, and after the process, was down
         // (MySQL to Kafka JSON).
         if engine == Engine::Mysql {
@@ -420,7 +437,7 @@ fn matrix() -> Vec<Cell> {
                     sink: Sink::Json,
                     shape: Shape::Narrow,
                     batch: None,
-                    js: false,
+                    js: Js::Off,
                     rows: rows_for(Shape::Narrow),
                     load: Load::DEFAULT,
                     tables: 1,
@@ -438,7 +455,7 @@ fn matrix() -> Vec<Cell> {
                     sink: Sink::Json,
                     shape: Shape::Narrow,
                     batch: None,
-                    js: false,
+                    js: Js::Off,
                     rows: 400_000,
                     load: Load::DEFAULT,
                     tables,
@@ -454,7 +471,7 @@ fn matrix() -> Vec<Cell> {
                 sink,
                 shape: Shape::Narrow,
                 batch: None,
-                js: false,
+                js: Js::Off,
                 rows: 2_000,
                 load: Load::DEFAULT,
                 tables: 1,
@@ -463,8 +480,9 @@ fn matrix() -> Vec<Cell> {
         }
         // Latency at 50 transactions/s (Avro), and with JavaScript (JSON).
         for (sink, js, rate, rows) in [
-            (Sink::Avro, false, 50, 1_000),
-            (Sink::Json, true, 200, 2_000),
+            (Sink::Avro, Js::Off, 50, 1_000),
+            (Sink::Json, Js::Tag, 200, 2_000),
+            (Sink::Json, Js::Route, 200, 2_000),
         ] {
             cells.push(Cell {
                 engine,
@@ -491,7 +509,7 @@ fn matrix() -> Vec<Cell> {
                 sink,
                 shape: Shape::Narrow,
                 batch: None,
-                js: false,
+                js: Js::Off,
                 rows: 3_000,
                 load: Load {
                     ddl_every: Some(1_000),
@@ -546,7 +564,7 @@ fn matrix() -> Vec<Cell> {
                 sink: Sink::Json,
                 shape: Shape::Narrow,
                 batch: None,
-                js: false,
+                js: Js::Off,
                 rows,
                 load,
                 tables: 1,
@@ -1686,6 +1704,12 @@ struct Arrivals {
     /// distinct ids show a missing or duplicated row.
     ids: std::sync::Mutex<std::collections::HashSet<i64>>,
     duplicates: AtomicU64,
+    /// Each id's first arrival (a routed cell's latency pairs by id: its
+    /// rows are filtered and spread over two topics).
+    at_id: std::sync::Mutex<std::collections::HashMap<i64, Instant>>,
+    /// A routed cell (`Js::Route`): rows that arrived although filtered out,
+    /// or on the wrong topic.
+    misrouted: AtomicU64,
     /// The last message's payload.
     last: std::sync::Mutex<Option<Vec<u8>>>,
 }
@@ -1762,10 +1786,26 @@ async fn is_row(
     }
 }
 
+/// A routed cell's rule (`Js::Route`): ids up to `rows` pass when even, and
+/// every passed id goes to `topics[0]` when `id % 4 == 0`, else `topics[1]`.
+#[derive(Clone)]
+struct Route {
+    topics: [String; 2],
+    rows: i64,
+}
+
+impl Route {
+    fn holds(&self, id: i64, topic: &str) -> bool {
+        (id % 2 == 0 || id > self.rows)
+            && topic == self.topics[usize::from(id % 4 != 0)]
+    }
+}
+
 fn consume(
     topics: &[String],
     arrivals: Arc<Arrivals>,
     sr: Option<String>,
+    route: Option<Route>,
 ) -> Result<tokio::task::JoinHandle<()>> {
     let topic = topics.join(",");
     let c: StreamConsumer = ClientConfig::new()
@@ -1790,10 +1830,16 @@ fn consume(
                     if !is_row(payload, sr.as_deref(), &mut kinds).await {
                         continue;
                     }
-                    if let Some(id) = m.payload().and_then(row_id)
-                        && !arrivals.ids.lock().unwrap().insert(id)
-                    {
-                        arrivals.duplicates.fetch_add(1, Ordering::Relaxed);
+                    if let Some(id) = m.payload().and_then(row_id) {
+                        if !arrivals.ids.lock().unwrap().insert(id) {
+                            arrivals.duplicates.fetch_add(1, Ordering::Relaxed);
+                        }
+                        arrivals.at_id.lock().unwrap().entry(id).or_insert(now);
+                        if let Some(r) = &route
+                            && !r.holds(id, m.topic())
+                        {
+                            arrivals.misrouted.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     arrivals.times.lock().unwrap().push(now);
                     *arrivals.last.lock().unwrap() =
@@ -1856,6 +1902,7 @@ fn pipeline_spec(
     topic: &str,
     prefix: &str,
     sink_extra: Option<&Value>,
+    rows: usize,
 ) -> Value {
     // A snapshot chunk that a batch cuts mid-chunk reaches the durable S3
     // sink without a boundary, which it refuses (a defect of both
@@ -1909,11 +1956,20 @@ fn pipeline_spec(
             "secret_access_key": s3_test_server::SECRET_KEY, "format": "parquet",
             "required": true}}),
     };
-    let processors = if cell.js {
-        json!([{"type": "javascript", "id": "js", "inline":
-            "function processBatch(events) { return events.map(e => { if (e.after) { e.after.tagged = true; } return e; }); }"}])
-    } else {
-        json!([])
+    let processors = match cell.js {
+        Js::Off => json!([]),
+        Js::Tag => json!([{"type": "javascript", "id": "js", "inline":
+            "function processBatch(events) { return events.map(e => { if (e.after) { e.after.tagged = true; } return e; }); }"}]),
+        // Debezium's Filter and ContentBasedRouter do the same per record.
+        Js::Route => {
+            let [a, b] = debezium::route_topics(topic);
+            json!([{"type": "javascript", "id": "js", "inline": format!(
+                "function processBatch(events) {{ const out = []; for (const e of events) {{ \
+                 if (!e.after) continue; const id = Number(e.after.id); \
+                 if (id % 2 !== 0 && id <= {rows}) continue; \
+                 e.route({{topic: id % 4 === 0 ? '{a}' : '{b}'}}); out.push(e); }} return out; }}"
+            )}])
+        }
     };
     let mut sink = sink;
     if let Some(Value::Object(extra)) = sink_extra {
@@ -2146,7 +2202,14 @@ async fn run_inner(
         bail!("not measured for Debezium: only MySQL to Kafka cells");
     }
     // Debezium writes each table to a topic of its own; DeltaForge all to one.
-    let topics: Vec<String> = if dbz {
+    // A routed cell's rows go to its two topics in both.
+    let route = (cell.js == Js::Route).then(|| Route {
+        topics: debezium::route_topics(&format!("perf-{tag}")),
+        rows: rows as i64,
+    });
+    let topics: Vec<String> = if let Some(r) = &route {
+        r.topics.to_vec()
+    } else if dbz {
         table_names(&ns, cell.tables)
             .iter()
             .map(|t| debezium::topic(&format!("perf-{tag}"), t))
@@ -2154,7 +2217,12 @@ async fn run_inner(
     } else {
         vec![format!("perf-{tag}")]
     };
-    let topic = topics[0].clone();
+    // DeltaForge's sink topic (a routed cell routes every row elsewhere).
+    let topic = if route.is_some() {
+        format!("perf-{tag}")
+    } else {
+        topics[0].clone()
+    };
     let prefix = format!("perf/{tag}");
 
     // Fixture.
@@ -2214,7 +2282,12 @@ async fn run_inner(
             create_topic(t).await?;
         }
         let sr = infra.sr_url().await;
-        Some(consume(&topics, Arc::clone(&arrivals), Some(sr))?)
+        Some(consume(
+            &topics,
+            Arc::clone(&arrivals),
+            Some(sr),
+            route.clone(),
+        )?)
     };
 
     let dsn = match engine {
@@ -2231,6 +2304,7 @@ async fn run_inner(
         &topic,
         &prefix,
         sink_extra,
+        rows,
     );
     // The run's exact configuration, beside its results.
     std::fs::create_dir_all(dir).ok();
@@ -2279,6 +2353,7 @@ async fn run_inner(
                 _ => debezium::Format::Json,
             },
             cell.js,
+            rows,
             profile,
         )
     });
@@ -2538,7 +2613,8 @@ async fn run_inner(
                 }
             }
         }
-        let want = rows as u64 + base;
+        // A routed cell delivers the even ids only.
+        let want = if route.is_some() { rows as u64 / 2 } else { rows as u64 } + base;
         // A crash: when, and the distinct rows already there before the
         // backlog (the replay repeats rows; completion is by distinct id).
         let mut crashed_at: Option<Instant> = None;
@@ -2624,6 +2700,10 @@ async fn run_inner(
             ))
             .await;
         };
+        let misrouted = arrivals.misrouted.load(Ordering::Relaxed);
+        if misrouted > 0 {
+            bail!("{misrouted} rows arrived although filtered out, or on the wrong topic");
+        }
         // The window ends at the last row's arrival (Kafka) or its listing.
         let t_end = if cell.sink == Sink::Parquet {
             Instant::now()
@@ -2736,13 +2816,18 @@ async fn run_inner(
         let mut after_ddl_max_ms = None;
         let (p50, p95, p99, pmax) = if cell.mode == Mode::Latency {
             let times = arrivals.times.lock().unwrap();
+            let at_id = arrivals.at_id.lock().unwrap();
+            // Commit `i` wrote the row of id `i + 1`.
             let mut lat: Vec<f64> = commits
                 .iter()
                 .enumerate()
                 .filter_map(|(i, c)| {
-                    times.get(base as usize + i).map(|a| {
-                        a.saturating_duration_since(*c).as_secs_f64() * 1e3
-                    })
+                    if route.is_some() {
+                        at_id.get(&(i as i64 + 1))
+                    } else {
+                        times.get(base as usize + i)
+                    }
+                    .map(|a| a.saturating_duration_since(*c).as_secs_f64() * 1e3)
                 })
                 .collect();
             // The worst latency of the rows committed within 2 s after a DDL.
@@ -2874,7 +2959,11 @@ async fn run_inner(
             .await
             .ok();
     }
-    teardown(infra, store, engine, &ns, &topic, &prefix).await;
+    let mut used = topics.clone();
+    if !used.contains(&topic) {
+        used.push(topic.clone());
+    }
+    teardown(infra, store, engine, &ns, &used, &prefix).await;
     if infra.state.is_some() {
         infra
             .state_exec(
@@ -2894,14 +2983,14 @@ async fn run_inner(
     Ok(m)
 }
 
-/// Free a run's data: its topic, its S3 objects, its database or schema
+/// Free a run's data: its topics, its S3 objects, its database or schema
 /// (and its publication), and MySQL's binary logs. Best effort.
 async fn teardown(
     infra: &Infra,
     store: &Arc<dyn object_store::ObjectStore>,
     engine: Engine,
     ns: &str,
-    topic: &str,
+    topics: &[String],
     prefix: &str,
 ) {
     use futures::TryStreamExt;
@@ -2909,8 +2998,9 @@ async fn teardown(
         .set("bootstrap.servers", brokers())
         .create::<AdminClient<DefaultClientContext>>()
     {
+        let topics: Vec<&str> = topics.iter().map(String::as_str).collect();
         admin
-            .delete_topics(&[topic], &AdminOptions::new())
+            .delete_topics(&topics, &AdminOptions::new())
             .await
             .ok();
     }
@@ -3442,6 +3532,18 @@ async fn measure(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_routed_row_must_be_kept_and_on_its_topic() {
+        let r = super::Route {
+            topics: ["t.a".into(), "t.b".into()],
+            rows: 100,
+        };
+        assert!(r.holds(4, "t.a") && r.holds(6, "t.b"));
+        assert!(!r.holds(4, "t.b") && !r.holds(6, "t.a"), "wrong topic");
+        assert!(!r.holds(7, "t.b"), "an odd id is filtered out");
+        assert!(r.holds(101, "t.b") && r.holds(104, "t.a"), "markers pass");
+    }
+
     #[test]
     fn a_row_id_is_read_from_either_image_as_a_number_or_exact_text() {
         assert_eq!(super::row_id(br#"{"after":{"id":7}}"#), Some(7));
