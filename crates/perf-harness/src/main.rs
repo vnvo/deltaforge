@@ -2594,8 +2594,11 @@ fn invocation(args: &Args, layouts: &[(String, layout::Manifest)]) -> Value {
     });
     json!({
         "args": format!("{args:?}"),
-        "harness_rev": cmd("git", &["rev-parse", "HEAD"]),
-        "harness_tree_clean": cmd("git", &["status", "--porcelain"]).map(|s| s.is_empty()),
+        // The harness that ran, by its executable; the revision and
+        // cleanliness of the directory it ran in (its fixtures' checkout).
+        "harness_executable_sha256": std::env::current_exe().ok().and_then(|e| sha256(&e)),
+        "working_dir_rev": cmd("git", &["rev-parse", "HEAD"]),
+        "working_dir_clean": cmd("git", &["status", "--porcelain"]).map(|s| s.is_empty()),
         "images": {
             "mysql": format!("{}:{}", MYSQL_IMAGE.0, MYSQL_IMAGE.1),
             "postgres": format!("{}:{}", POSTGRES_IMAGE.0, POSTGRES_IMAGE.1),

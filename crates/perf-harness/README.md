@@ -54,7 +54,8 @@ from official distributions and verified against the SHA-256 digests in
 - **`invocation.json`:**
   - its arguments;
   - every pinned image and artifact;
-  - the harness revision and whether its tree was clean;
+  - the harness executable's SHA-256, and the revision and cleanliness of
+    the directory it ran in;
   - the host (CPU model, kernel, CPU count);
   - for a layout comparison, every link.
 - **`runs.jsonl`:** one line per run, including:
