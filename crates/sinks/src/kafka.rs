@@ -93,8 +93,10 @@ struct KafkaMetricsContext {
 
 impl ClientContext for KafkaMetricsContext {
     fn stats(&self, statistics: Statistics) {
-        let (total_retries, total_connects, total_requests) =
-            statistics.brokers.values().fold((0u64, 0u64, 0u64), |acc, b| {
+        let (total_retries, total_connects, total_requests) = statistics
+            .brokers
+            .values()
+            .fold((0u64, 0u64, 0u64), |acc, b| {
                 (
                     acc.0 + b.txretries,
                     acc.1 + b.connects.unwrap_or(0) as u64,
@@ -206,6 +208,9 @@ impl KafkaSink {
         source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
         creds: &crate::ResolvedSinkCreds,
     ) -> anyhow::Result<Self> {
+        if cfg.encode_workers == Some(0) {
+            anyhow::bail!("encode_workers must be at least 1");
+        }
         let mut client_cfg = ClientConfig::new();
 
         // Core connection settings
@@ -414,6 +419,92 @@ impl KafkaSink {
             cancel,
             send_timeout,
             transactional,
+        })
+    }
+
+    /// A record of an Avro batch prepared without waiting: `None` for one
+    /// the asynchronous path prepares (a schema not registered yet, a DDL or
+    /// raw-payload event), otherwise its record or its error exactly as that
+    /// path would give them.
+    fn prepare_cached<'a>(
+        &'a self,
+        e: &'a Event,
+    ) -> Option<SinkResult<Prepared<'a>>> {
+        let encoder = self.avro_encoder.as_ref()?;
+        if e.ddl.is_some() || e.routing.as_ref().is_some_and(|r| r.raw_payload)
+        {
+            return None;
+        }
+        let topic = match self.resolve_topic(e) {
+            Ok(t) => t,
+            Err(err) => return Some(Err(err)),
+        };
+        let envelope = match self.envelope.wrap(e, self.json_opts) {
+            Ok(v) => v,
+            Err(err) => {
+                return Some(Err(
+                    deltaforge_core::encoding::EncodingError::from(err)
+                        .into_sink_error_for(&self.id),
+                ));
+            }
+        };
+        let payload = match encoder.encode_cached(&topic, e, &envelope)? {
+            Ok(b) => b.to_vec(),
+            Err(err) => {
+                warn!(
+                    table = %e.source.table,
+                    error = %err,
+                    "Avro encoding failed"
+                );
+                return Some(Err(err.into_sink_error_for(&self.id)));
+            }
+        };
+        let key = self.resolve_key(e);
+        let headers = self.build_headers(e);
+        Some(Ok((payload, topic, key, headers)))
+    }
+
+    /// The records of an Avro batch prepared on `encode_workers` threads
+    /// (contiguous slices of the batch, results in its order), when more
+    /// than one is configured and the runtime can lend its thread; empty
+    /// otherwise (the batch is prepared on the delivery task).
+    fn prepare_parallel<'a>(
+        &'a self,
+        events: &'a [Event],
+    ) -> Vec<Option<SinkResult<Prepared<'a>>>> {
+        let workers = self.cfg.encode_workers.unwrap_or(1).min(events.len());
+        let multi_thread =
+            tokio::runtime::Handle::try_current().is_ok_and(|h| {
+                h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+            });
+        if self.avro_encoder.is_none() || workers < 2 || !multi_thread {
+            return Vec::new();
+        }
+        let chunk = events.len().div_ceil(workers);
+        tokio::task::block_in_place(|| {
+            std::thread::scope(|scope| {
+                let rest: Vec<_> = events
+                    .chunks(chunk)
+                    .skip(1)
+                    .map(|part| {
+                        scope.spawn(move || {
+                            part.iter()
+                                .map(|e| self.prepare_cached(e))
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                let mut out: Vec<_> = events[..chunk]
+                    .iter()
+                    .map(|e| self.prepare_cached(e))
+                    .collect();
+                for part in rest {
+                    out.extend(
+                        part.join().expect("an encoding thread panicked"),
+                    );
+                }
+                out
+            })
         })
     }
 
@@ -775,15 +866,24 @@ impl Sink for KafkaSink {
         let mut total_bytes = 0u64;
         let mut enqueue_error: Option<KafkaError> = None;
 
+        // An Avro batch's records prepared ahead on several threads (when
+        // configured); a record they could not prepare without waiting is
+        // prepared here, in order.
+        let mut ahead = self.prepare_parallel(events);
         for (i, e) in events.iter().enumerate() {
-            let prepared = async {
-                let topic = self.resolve_topic(e)?;
-                let payload = self.encode_event(e, &topic).await?;
-                let key = self.resolve_key(e);
-                let headers = self.build_headers(e);
-                Ok::<_, SinkError>((payload, topic, key, headers))
-            }
-            .await;
+            let prepared = match ahead.get_mut(i).and_then(Option::take) {
+                Some(prepared) => prepared,
+                None => {
+                    async {
+                        let topic = self.resolve_topic(e)?;
+                        let payload = self.encode_event(e, &topic).await?;
+                        let key = self.resolve_key(e);
+                        let headers = self.build_headers(e);
+                        Ok::<_, SinkError>((payload, topic, key, headers))
+                    }
+                    .await
+                }
+            };
             match prepared {
                 Ok(prepared) if interleave => {
                     if let Err(e) = self
@@ -1362,6 +1462,245 @@ fn uncertain_commit(attempts: u32, reason: &str) -> SinkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An Avro sink's records prepared on several threads, against a mock
+    /// Schema Registry and the DDL schema of one table (no broker: nothing
+    /// is enqueued).
+    mod parallel_avro {
+        use super::*;
+        use deltaforge_core::canonical::fixture;
+        use deltaforge_core::encoding::avro_schema::{
+            build_envelope_schema, build_value_schema,
+        };
+        use deltaforge_core::encoding::avro_types::{
+            ColumnDesc, TypeConversionOpts, mysql_column_to_avro,
+        };
+        use deltaforge_core::encoding::avro::{EnvelopeSchemaLookup, SchemaIdentity};
+        use serde_json::json;
+
+        /// A registry that gives every distinct schema the next id.
+        async fn registry() -> String {
+            let ids = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let app = axum::Router::new()
+                .route(
+                    "/subjects/{subject}/versions",
+                    axum::routing::post(
+                        |axum::extract::State(ids): axum::extract::State<
+                            Arc<std::sync::Mutex<Vec<String>>>,
+                        >,
+                         axum::Json(body): axum::Json<serde_json::Value>| async move {
+                            let schema = body["schema"].as_str().unwrap_or("").to_string();
+                            let mut ids = ids.lock().unwrap();
+                            let id = match ids.iter().position(|s| *s == schema) {
+                                Some(i) => i,
+                                None => {
+                                    ids.push(schema);
+                                    ids.len() - 1
+                                }
+                            };
+                            axum::Json(json!({ "id": id + 1 }))
+                        },
+                    ),
+                )
+                .with_state(ids);
+            let listener =
+                tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(
+                async move { axum::serve(listener, app).await.unwrap() },
+            );
+            url
+        }
+
+        /// The envelope schema of `shop.orders` (`id int`, `name
+        /// varchar(20)`) for the fingerprint `h1`.
+        struct Orders(String);
+
+        impl Orders {
+            fn new() -> Self {
+                let col = |name: &str, data_type: &str, column_type: &str| {
+                    ColumnDesc {
+                        name: name.into(),
+                        data_type: data_type.into(),
+                        column_type: column_type.into(),
+                        nullable: true,
+                        precision: None,
+                        scale: None,
+                        unsigned: false,
+                        is_array: false,
+                        element_type: None,
+                    }
+                };
+                let opts = TypeConversionOpts::default();
+                let fields = [
+                    col("id", "int", "int"),
+                    col("name", "varchar", "varchar(20)"),
+                ]
+                .iter()
+                .map(|c| mysql_column_to_avro(c, &opts))
+                .collect();
+                let vs = build_value_schema("mysql", "shop", "orders", fields);
+                Orders(
+                    build_envelope_schema("mysql", "shop", "orders", vs)
+                        .unwrap()
+                        .0,
+                )
+            }
+        }
+
+        impl SourceSchemaProvider for Orders {
+            fn get_envelope_schema(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &str,
+                identity: &SchemaIdentity,
+            ) -> EnvelopeSchemaLookup {
+                assert_eq!(identity.fingerprint, "h1");
+                let schema = apache_avro::Schema::parse_str(&self.0).unwrap();
+                EnvelopeSchemaLookup::Found(self.0.clone(), Arc::new(schema))
+            }
+
+            fn mapping_id(&self) -> &str {
+                "test-mapping"
+            }
+        }
+
+        fn sink(
+            url: &str,
+            workers: Option<usize>,
+        ) -> anyhow::Result<KafkaSink> {
+            let cfg: KafkaSinkCfg = serde_json::from_value(json!({
+                "id": "k",
+                "brokers": "127.0.0.1:1",
+                "topic": "orders",
+                "encoding": {"type": "avro", "schema_registry_url": url},
+                "encode_workers": workers,
+            }))
+            .unwrap();
+            KafkaSink::new(
+                &cfg,
+                CancellationToken::new(),
+                "p",
+                Some(Arc::new(Orders::new())),
+                &crate::ResolvedSinkCreds::default(),
+            )
+        }
+
+        /// `n` inserts into `shop.orders`; the one at `bad` has an id no
+        /// Avro `int` holds, so its conversion fails.
+        fn batch(n: i64, bad: i64) -> Vec<Event> {
+            (0..n)
+                .map(|i| {
+                    let id = if i == bad {
+                        json!(1_i64 << 40)
+                    } else {
+                        json!(i)
+                    };
+                    let mut e = Event::new_row(
+                        deltaforge_core::EventId::mysql_row_server(
+                            1, "orders", i as u64, 0,
+                        ),
+                        deltaforge_core::SourceInfo {
+                            version: "t".into(),
+                            connector: "mysql".into(),
+                            name: "t".into(),
+                            ts_ms: 1_700_000_000_000,
+                            db: "shop".into(),
+                            schema: None,
+                            table: "orders".into(),
+                            snapshot: None,
+                            position: deltaforge_core::SourcePosition::default(
+                            ),
+                        },
+                        deltaforge_core::Op::Create,
+                        None,
+                        Some(fixture::row(
+                            json!({"id": id, "name": format!("n{i}")}),
+                        )),
+                        deltaforge_core::TypeMapping::V2,
+                        1_700_000_000_000,
+                        0,
+                    );
+                    e.schema_version = Some("h1".into());
+                    e
+                })
+                .collect()
+        }
+
+        /// With the schema registered, four threads prepare every record
+        /// exactly as the delivery task does, in order: the same topic, key
+        /// and payload bytes, and the failing record's error at its index.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn records_prepared_on_several_threads_are_the_sequential_ones() {
+            let url = registry().await;
+            let events = batch(301, 157);
+            let one = sink(&url, None).unwrap();
+            let four = sink(&url, Some(4)).unwrap();
+            // Registered by the sequential path (a cache miss waits).
+            four.encode_event(&events[0], "orders").await.unwrap();
+
+            let ahead = four.prepare_parallel(&events);
+            assert_eq!(ahead.len(), events.len());
+            for (i, (e, got)) in events.iter().zip(ahead).enumerate() {
+                let got = got.expect("a registered schema is prepared ahead");
+                let want = one.encode_event(e, "orders").await;
+                match (got, want) {
+                    (Ok((payload, topic, key, _)), Ok(bytes)) => {
+                        assert_eq!(payload, bytes, "record {i}");
+                        assert_eq!(topic, "orders");
+                        assert_eq!(key, one.resolve_key(e));
+                    }
+                    (Err(got), Err(want)) => {
+                        assert_eq!(i, 157);
+                        assert_eq!(got.to_string(), want.to_string());
+                    }
+                    (got, want) => panic!(
+                        "record {i}: {:?} vs {:?}",
+                        got.map(|_| ()),
+                        want.map(|_| ())
+                    ),
+                }
+            }
+        }
+
+        /// Before its schema is registered no record is prepared ahead: the
+        /// delivery task registers it (and nothing registers concurrently).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_unregistered_schema_leaves_every_record_to_the_delivery_task()
+         {
+            let url = registry().await;
+            let events = batch(40, -1);
+            let four = sink(&url, Some(4)).unwrap();
+            let ahead = four.prepare_parallel(&events);
+            assert_eq!(ahead.len(), events.len());
+            assert!(ahead.iter().all(Option::is_none));
+        }
+
+        /// One thread (the default) prepares nothing ahead, and zero is
+        /// refused.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn one_encode_worker_prepares_on_the_delivery_task_and_zero_is_refused()
+         {
+            let url = registry().await;
+            let events = batch(10, -1);
+            assert!(
+                sink(&url, None)
+                    .unwrap()
+                    .prepare_parallel(&events)
+                    .is_empty()
+            );
+            assert!(
+                sink(&url, Some(1))
+                    .unwrap()
+                    .prepare_parallel(&events)
+                    .is_empty()
+            );
+            let err = sink(&url, Some(0)).err().expect("zero refused");
+            assert!(err.to_string().contains("encode_workers"));
+        }
+    }
 
     #[test]
     fn auth_errors_are_not_retryable() {

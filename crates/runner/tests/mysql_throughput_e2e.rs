@@ -328,6 +328,7 @@ async fn spawn_pipeline(
     let cancel = CancellationToken::new();
     let kafka = Arc::new(KafkaSink::new(
         &KafkaSinkCfg {
+            encode_workers: None,
             id: "kafka".into(),
             brokers: brokers.into(),
             topic: TOPIC.into(),

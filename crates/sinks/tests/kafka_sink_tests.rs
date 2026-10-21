@@ -279,6 +279,7 @@ fn make_sink(
     envelope: EnvelopeCfg,
 ) -> Result<KafkaSink> {
     let cfg = KafkaSinkCfg {
+        encode_workers: None,
         json_wide_integers: Default::default(),
         id: id.into(),
         brokers: brokers.into(),
@@ -864,6 +865,7 @@ async fn kafka_sink_idempotent_mode() -> Result<()> {
 
     let sink = KafkaSink::new(
         &KafkaSinkCfg {
+            encode_workers: None,
             json_wide_integers: Default::default(),
             id: "test-idempotent".into(),
             brokers: brokers.clone(),
@@ -909,6 +911,7 @@ async fn kafka_sink_exactly_once_mode() -> Result<()> {
 
     let sink = KafkaSink::new(
         &KafkaSinkCfg {
+            encode_workers: None,
             json_wide_integers: Default::default(),
             id: "test-exactly-once".into(),
             brokers: brokers.clone(),
@@ -1063,6 +1066,7 @@ async fn kafka_sink_custom_config() -> Result<()> {
     client_conf.insert("compression.type".to_string(), "gzip".to_string());
 
     let cfg = KafkaSinkCfg {
+        encode_workers: None,
         json_wide_integers: Default::default(),
         id: "test-custom".into(),
         brokers: brokers.clone(),
@@ -1138,6 +1142,7 @@ async fn kafka_sink_optional() -> Result<()> {
     get_kafka_container().await;
 
     let cfg = KafkaSinkCfg {
+        encode_workers: None,
         json_wide_integers: Default::default(),
         id: "test-optional".into(),
         brokers: brokers(),
@@ -1215,6 +1220,7 @@ async fn kafka_sink_recovers_after_restart() -> Result<()> {
     let cancel = CancellationToken::new();
     let sink = Arc::new(KafkaSink::new(
         &KafkaSinkCfg {
+            encode_workers: None,
             json_wide_integers: Default::default(),
             id: "test-restart".into(),
             brokers: brokers.clone(),
@@ -1368,6 +1374,7 @@ async fn kafka_sink_respects_cancellation() -> Result<()> {
     let cancel = CancellationToken::new();
     let sink = Arc::new(KafkaSink::new(
         &KafkaSinkCfg {
+            encode_workers: None,
             json_wide_integers: Default::default(),
             id: "test-cancel".into(),
             brokers: "invalid-host:9999".into(),
@@ -1618,6 +1625,7 @@ async fn kafka_sink_routing_key_and_headers() -> Result<()> {
     let (brokers, topic) = setup("route-key-headers", 1).await?;
 
     let cfg = KafkaSinkCfg {
+        encode_workers: None,
         json_wide_integers: Default::default(),
         id: "test-kh".into(),
         brokers: brokers.clone(),
@@ -1792,6 +1800,7 @@ fn make_txn_sink(
     pipeline: &str,
 ) -> Result<KafkaSink> {
     let cfg = KafkaSinkCfg {
+        encode_workers: None,
         json_wide_integers: Default::default(),
         id: id.into(),
         brokers: brokers.into(),

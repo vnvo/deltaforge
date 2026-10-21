@@ -720,6 +720,12 @@ pub struct KafkaSinkCfg {
     /// are silently ignored by this sink.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<SinkFilter>,
+
+    /// Threads that encode an Avro batch's records (default 1: the batch is
+    /// encoded on the delivery task). Records keep their order; the batch is
+    /// encoded in full before any record is enqueued, as with one thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encode_workers: Option<usize>,
 }
 
 impl std::fmt::Debug for KafkaSinkCfg {
@@ -738,6 +744,7 @@ impl std::fmt::Debug for KafkaSinkCfg {
             .field("client_conf", &redact_map_values(&self.client_conf))
             .field("secret_refs", &self.secret_refs.keys().collect::<Vec<_>>())
             .field("filter", &self.filter)
+            .field("encode_workers", &self.encode_workers)
             .finish()
     }
 }
