@@ -698,22 +698,6 @@ impl AvroEncoder {
         self.encode_inferred(&subject, name, &json_value).await
     }
 
-    /// Encode a CDC event with the schema it requires, under the subject
-    /// of its mapping version (`<subject>-v1` / `<subject>-v2`: records of
-    /// different versions never share a subject or a cached schema).
-    ///
-    /// An event carrying its source schema version is encoded with the
-    /// DDL-derived schema of exactly that version (Path A), its row images
-    /// converted from their canonical values; an event without one, or from
-    /// a source the provider does not serve, with the subject's inferred
-    /// schema (Path C).
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` - Destination topic/stream/subject (used for SR subject naming)
-    /// * `event` - The event (its rows, mapping version and schema version)
-    /// * `envelope` - The event's envelope (its non-row fields are encoded
-    ///   from it)
     /// The envelope as the JSON value the schema's converter reads: the
     /// row images as placeholders (converted from their canonical values),
     /// their extensions in their sibling slots.
@@ -770,6 +754,22 @@ impl AvroEncoder {
         }
     }
 
+    /// Encode a CDC event with the schema it requires, under the subject
+    /// of its mapping version (`<subject>-v1` / `<subject>-v2`: records of
+    /// different versions never share a subject or a cached schema).
+    ///
+    /// An event carrying its source schema version is encoded with the
+    /// DDL-derived schema of exactly that version (Path A), its row images
+    /// converted from their canonical values; an event without one, or from
+    /// a source the provider does not serve, with the subject's inferred
+    /// schema (Path C).
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - Destination topic/stream/subject (used for SR subject naming)
+    /// * `event` - The event (its rows, mapping version and schema version)
+    /// * `envelope` - The event's envelope (its non-row fields are encoded
+    ///   from it)
     pub async fn encode_event(
         &self,
         topic: &str,
