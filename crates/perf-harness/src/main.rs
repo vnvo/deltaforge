@@ -41,7 +41,14 @@ use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
+mod debezium;
+mod extras;
+mod layout;
+mod threads;
+
 const NETWORK: &str = "df-perf-net";
+/// MySQL's name on the harness network (Kafka Connect reaches it there).
+const MYSQL_NAME: &str = "df-perf-mysql";
 const KAFKA_NAME: &str = "df-perf-kafka";
 const KAFKA_INTERNAL_PORT: u16 = 29092;
 const KAFKA_HOST_PORT: u16 = 9397;
@@ -64,14 +71,22 @@ const KAFKA_IMAGE: (&str, &str) = (
     "confluentinc/cp-kafka",
     "7.5.0@sha256:fbbb6fa11b258a88b83f54d4f0bddfcffbf2279f99d66a843486e3da7bdfbf41",
 );
-const SCHEMA_REGISTRY_IMAGE: (&str, &str) =
-    ("confluentinc/cp-schema-registry", "7.5.0");
+const SCHEMA_REGISTRY_IMAGE: (&str, &str) = (
+    "confluentinc/cp-schema-registry",
+    "7.5.0@sha256:e51684b472a2481f065f44616d3d8ad2182029a7011f949a612d35b54566a1f6",
+);
+const SCHEMA_REGISTRY_NAME: &str = "df-perf-sr";
 
 #[derive(Parser, Debug)]
 struct Args {
-    /// `label=path` of a DeltaForge release binary; exactly two.
-    #[arg(long = "binary", required = true)]
+    /// `label=path` of a DeltaForge release binary, or `label=debezium`;
+    /// exactly two (or two `--layout`).
+    #[arg(long = "binary")]
     binaries: Vec<String>,
+    /// `label=dir` of a version's seeded links (`layout-links.sh`); exactly
+    /// two, compared seed by seed and aggregated over every seed.
+    #[arg(long = "layout")]
+    layouts: Vec<String>,
     /// Output directory.
     #[arg(long)]
     out: PathBuf,
@@ -91,10 +106,37 @@ struct Args {
     /// separate container, with its reads counted by pg_stat_statements).
     #[arg(long, default_value = "sqlite")]
     state_store: String,
+    /// Batch settings (a JSON object) added to every DeltaForge pipeline,
+    /// e.g. `{"min_flush_interval_ms": 10}`.
+    #[arg(long)]
+    df_batch: Option<String>,
+    /// Sink settings (a JSON object) added to the DeltaForge sink of the
+    /// system labelled LABEL, as `LABEL=JSON`, e.g.
+    /// `two='{"encode_workers": 2}'` (repeatable; the same binary may run
+    /// under two labels).
+    #[arg(long = "df-sink")]
+    df_sink: Vec<String>,
+    /// Read DeltaForge's batch, checkpoint and Kafka request counters over
+    /// each run's window (adds 5.5 s per run: librdkafka's statistics
+    /// interval).
+    #[arg(long)]
+    delivery_stats: bool,
+    /// Run every cell once for every system before the measured
+    /// repetitions, unrecorded (a JIT-compiled system is measured warm).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    warmup: bool,
+    /// The Debezium profile (`defaults` or `tuned`) of a `debezium` system
+    /// (`--binary label=debezium`).
+    #[arg(long, default_value = "defaults")]
+    debezium_profile: String,
     /// After the last row arrives, watch the PostgreSQL slot's
     /// confirmed_flush_lsn to measure WAL-feedback staleness.
     #[arg(long)]
     feedback_probe: bool,
+    /// Where the Debezium worker's added plugins (the Avro converter,
+    /// GraalJS) are downloaded and verified.
+    #[arg(long, default_value = "target/perf-cache")]
+    cache: PathBuf,
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +186,26 @@ struct Cell {
     batch: Option<usize>,
     js: bool,
     rows: usize,
+    /// Latency cells: how the transactions are written.
+    load: Load,
+}
+
+/// A latency cell's write pattern: `rate` transactions per second of
+/// `tx_rows` rows each, on one connection; with `burst`, groups of
+/// `burst.0` transactions separated by `burst.1` ms of idle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Load {
+    rate: u32,
+    tx_rows: usize,
+    burst: Option<(usize, u64)>,
+}
+
+impl Load {
+    const DEFAULT: Load = Load {
+        rate: 200,
+        tx_rows: 1,
+        burst: None,
+    };
 }
 
 impl Cell {
@@ -179,7 +241,38 @@ impl Cell {
         if self.js {
             id.push_str("-js");
         }
+        if self.load != Load::DEFAULT {
+            let l = self.load;
+            if l.rate != Load::DEFAULT.rate {
+                id.push_str(&format!("-r{}", l.rate));
+            }
+            if l.tx_rows != 1 {
+                id.push_str(&format!("-tx{}", l.tx_rows));
+            }
+            if let Some((n, idle)) = l.burst {
+                id.push_str(&format!("-burst{n}x{idle}ms"));
+            }
+        }
         id
+    }
+}
+
+/// Whether a cell compares the same thing in both systems. DeltaForge
+/// against DeltaForge always does; against Debezium a cell is `direct` when
+/// both run the same workload to equivalent output (their envelopes differ
+/// in bytes, which is reported), and `architectural` when the systems do
+/// the work in different ways, with the reason.
+fn comparison(cell: &Cell, debezium: bool) -> (&'static str, &'static str) {
+    if debezium && cell.js {
+        (
+            "architectural",
+            "DeltaForge runs a JavaScript batch processor that adds a field to \
+             every row; Debezium evaluates a JavaScript condition per record \
+             (its scripting Filter transformation, GraalJS interpreted on its \
+             image's OpenJDK) and adds nothing",
+        )
+    } else {
+        ("direct", "")
     }
 }
 
@@ -214,6 +307,7 @@ fn matrix() -> Vec<Cell> {
                         batch: None,
                         js: false,
                         rows: rows_for(shape),
+                        load: Load::DEFAULT,
                     });
                 }
             }
@@ -229,6 +323,7 @@ fn matrix() -> Vec<Cell> {
                     batch: Some(batch),
                     js: false,
                     rows: rows_for(shape),
+                    load: Load::DEFAULT,
                 });
             }
         }
@@ -243,6 +338,7 @@ fn matrix() -> Vec<Cell> {
                     batch: None,
                     js: false,
                     rows: rows_for(Shape::Ints(n)),
+                    load: Load::DEFAULT,
                 });
             }
         }
@@ -256,6 +352,7 @@ fn matrix() -> Vec<Cell> {
                 batch: None,
                 js: true,
                 rows: 50_000,
+                load: Load::DEFAULT,
             });
         }
         // Latency (Kafka sinks).
@@ -268,6 +365,76 @@ fn matrix() -> Vec<Cell> {
                 batch: None,
                 js: false,
                 rows: 2_000,
+                load: Load::DEFAULT,
+            });
+        }
+        // Latency at 50 transactions/s (Avro), and with JavaScript (JSON).
+        for (sink, js, rate, rows) in [
+            (Sink::Avro, false, 50, 1_000),
+            (Sink::Json, true, 200, 2_000),
+        ] {
+            cells.push(Cell {
+                engine,
+                mode: Mode::Latency,
+                sink,
+                shape: Shape::Narrow,
+                batch: None,
+                js,
+                rows,
+                load: Load {
+                    rate,
+                    ..Load::DEFAULT
+                },
+            });
+        }
+        // Latency across rates, transaction sizes and bursts (JSON).
+        for (rows, load) in [
+            (
+                30,
+                Load {
+                    rate: 1,
+                    ..Load::DEFAULT
+                },
+            ),
+            (
+                1_000,
+                Load {
+                    rate: 50,
+                    ..Load::DEFAULT
+                },
+            ),
+            (
+                5_000,
+                Load {
+                    rate: 1_000,
+                    ..Load::DEFAULT
+                },
+            ),
+            (
+                20_000,
+                Load {
+                    tx_rows: 10,
+                    ..Load::DEFAULT
+                },
+            ),
+            (
+                1_000,
+                Load {
+                    rate: 1_000,
+                    burst: Some((200, 2_000)),
+                    ..Load::DEFAULT
+                },
+            ),
+        ] {
+            cells.push(Cell {
+                engine,
+                mode: Mode::Latency,
+                sink: Sink::Json,
+                shape: Shape::Narrow,
+                batch: None,
+                js: false,
+                rows,
+                load,
             });
         }
     }
@@ -504,6 +671,10 @@ impl Infra {
             .start()
             .await
             .context("start kafka")?;
+        std::process::Command::new("docker")
+            .args(["rm", "-f", SCHEMA_REGISTRY_NAME])
+            .output()
+            .ok();
         let sr =
             GenericImage::new(SCHEMA_REGISTRY_IMAGE.0, SCHEMA_REGISTRY_IMAGE.1)
                 .with_exposed_port(8081.tcp())
@@ -520,15 +691,22 @@ impl Infra {
                     "SCHEMA_REGISTRY_LISTENERS",
                     "http://0.0.0.0:8081",
                 )
+                .with_container_name(SCHEMA_REGISTRY_NAME)
                 .gate_owned()
                 .start()
                 .await
                 .context("start schema registry")?;
+        std::process::Command::new("docker")
+            .args(["rm", "-f", MYSQL_NAME])
+            .output()
+            .ok();
         let mysql = GenericImage::new(MYSQL_IMAGE.0, MYSQL_IMAGE.1)
             .with_wait_for(WaitFor::message_on_stderr(
                 "ready for connections. Version: '8.4",
             ))
             .with_env_var("MYSQL_ROOT_PASSWORD", PW)
+            .with_container_name(MYSQL_NAME)
+            .with_network(NETWORK)
             .with_cmd(vec![
                 "--server-id=60",
                 "--log-bin=mysql-bin",
@@ -834,10 +1012,156 @@ fn truncate(s: &str) -> String {
 // The process under test
 // ---------------------------------------------------------------------------
 
+/// A system under test: a DeltaForge release binary, or Debezium on Kafka
+/// Connect (`--binary label=debezium`).
+#[derive(Clone, Debug)]
+enum System {
+    DeltaForge(PathBuf),
+    Debezium(debezium::Profile),
+}
+
+/// The running system of one run: a DeltaForge process of its own, or
+/// the invocation's shared (warmed-up) Kafka Connect worker.
+enum Sut<'a> {
+    Df(Box<Process>),
+    Dbz(&'a debezium::Connect),
+}
+
+impl Sut<'_> {
+    fn cpu_secs(&self) -> f64 {
+        match self {
+            Sut::Df(p) => p.cpu_secs(),
+            Sut::Dbz(c) => {
+                let (user, sys) = c.cpu_split();
+                user + sys
+            }
+        }
+    }
+
+    fn sys_secs(&self) -> f64 {
+        match self {
+            Sut::Df(p) => p.sys_secs(),
+            Sut::Dbz(c) => c.cpu_split().1,
+        }
+    }
+
+    /// Process kernel counters (DeltaForge only; zeros for a container).
+    fn kernel_counts(&self) -> [u64; 5] {
+        match self {
+            Sut::Df(p) => p.kernel_counts(),
+            Sut::Dbz(_) => [0; 5],
+        }
+    }
+
+    fn rss_kib(&self) -> u64 {
+        match self {
+            Sut::Df(p) => p.rss_kib(),
+            Sut::Dbz(c) => c.rss_kib(),
+        }
+    }
+
+    async fn stop(self) -> Option<u64> {
+        match self {
+            Sut::Df(p) => p.stop().await,
+            // The shared worker outlives the run.
+            Sut::Dbz(_) => None,
+        }
+    }
+}
+
 struct Process {
     child: tokio::process::Child,
+    /// The runner's own process: the one listening on the API address (the
+    /// started command itself, or a process it runs, e.g. under a wrapper).
     pid: u32,
+    /// The executable that process runs.
+    exe: PathBuf,
     stderr: PathBuf,
+}
+
+/// Refuse to start a runner while anything answers on the API address or
+/// holds the API or metrics port: a leftover runner would serve the run.
+async fn ports_free() -> Result<()> {
+    if reqwest::get(format!("http://{API}/health")).await.is_ok() {
+        bail!("something answers on {API} before the run (a leftover runner?)");
+    }
+    for addr in [API, METRICS] {
+        std::net::TcpListener::bind(addr).with_context(|| {
+            format!("{addr} is in use before the run (a leftover runner?)")
+        })?;
+    }
+    Ok(())
+}
+
+/// The process listening on TCP `port` (IPv4 or IPv6), from `/proc`.
+fn listener_pid(port: u16) -> Option<u32> {
+    let inodes: Vec<String> = ["/proc/net/tcp", "/proc/net/tcp6"]
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .flat_map(|t| {
+            t.lines()
+                .skip(1)
+                .filter_map(|l| {
+                    let f: Vec<&str> = l.split_whitespace().collect();
+                    let local_port = f.get(1)?.rsplit_once(':')?.1;
+                    let inode = f.get(9)?;
+                    (u16::from_str_radix(local_port, 16).ok()? == port
+                        && *f.get(3)? == "0A")
+                        .then(|| format!("socket:[{inode}]"))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    std::fs::read_dir("/proc").ok()?.flatten().find_map(|e| {
+        let pid: u32 = e.file_name().to_str()?.parse().ok()?;
+        std::fs::read_dir(e.path().join("fd"))
+            .ok()?
+            .flatten()
+            .find_map(|fd| {
+                let target = std::fs::read_link(fd.path()).ok()?;
+                inodes
+                    .iter()
+                    .any(|i| target.as_os_str() == i.as_str())
+                    .then_some(pid)
+            })
+    })
+}
+
+/// Whether `pid` is `ancestor` or runs under it.
+fn descends_from(mut pid: u32, ancestor: u32) -> bool {
+    while pid > 1 {
+        if pid == ancestor {
+            return true;
+        }
+        let Some(ppid) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| {
+                s.rsplit_once(')')?
+                    .1
+                    .split_whitespace()
+                    .nth(1)?
+                    .parse()
+                    .ok()
+            })
+        else {
+            return false;
+        };
+        pid = ppid;
+    }
+    false
+}
+
+/// The SHA-256 of a file, as `sha256sum` prints it.
+fn sha256(path: &Path) -> Option<String> {
+    let out = std::process::Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .ok()?;
+    String::from_utf8(out.stdout)
+        .ok()?
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
 }
 
 impl Process {
@@ -847,6 +1171,7 @@ impl Process {
         state_dsn: Option<&str>,
     ) -> Result<Process> {
         std::fs::create_dir_all(dir)?;
+        ports_free().await?;
         let stderr = dir.join("stderr.log");
         let mut cmd = tokio::process::Command::new(binary);
         cmd.args(["--api-addr", API, "--metrics-addr", METRICS]);
@@ -859,7 +1184,7 @@ impl Process {
             ]),
             None => cmd.arg("--storage-path").arg(dir.join("state.db")),
         };
-        let child = cmd
+        let mut child = cmd
             .env("RUST_LOG", "warn")
             .env("_RJEM_MALLOC_CONF", "stats_print:true")
             .stdout(std::fs::File::create(dir.join("stdout.log"))?)
@@ -867,9 +1192,15 @@ impl Process {
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("start {}", binary.display()))?;
-        let pid = child.id().ok_or_else(|| anyhow!("no pid"))?;
+        let child_pid = child.id().ok_or_else(|| anyhow!("no pid"))?;
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
+            if let Some(status) = child.try_wait()? {
+                bail!(
+                    "{} exited before becoming healthy: {status}",
+                    binary.display()
+                );
+            }
             if reqwest::get(format!("http://{API}/health"))
                 .await
                 .is_ok_and(|r| r.status().is_success())
@@ -881,7 +1212,26 @@ impl Process {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        Ok(Process { child, pid, stderr })
+        // The API must be served by the process just started (or one it
+        // runs), never by another.
+        let api_port: u16 = API
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse().ok())
+            .unwrap_or(0);
+        let pid = listener_pid(api_port)
+            .ok_or_else(|| anyhow!("no process found listening on {API}"))?;
+        if !descends_from(pid, child_pid) {
+            bail!(
+                "{API} is served by pid {pid}, not by the started runner ({child_pid})"
+            );
+        }
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe"))?;
+        Ok(Process {
+            child,
+            pid,
+            exe,
+            stderr,
+        })
     }
 
     /// utime + stime, seconds.
@@ -967,6 +1317,11 @@ impl Process {
             .await
             .is_err()
         {
+            // The runner itself too, when it runs under a wrapper.
+            std::process::Command::new("kill")
+                .args(["-KILL", &self.pid.to_string()])
+                .output()
+                .ok();
             self.child.kill().await.ok();
             return None;
         }
@@ -1008,6 +1363,34 @@ async fn api(
     Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
 }
 
+/// DeltaForge's delivery counters: batches delivered, the events in them,
+/// checkpoints committed and Kafka requests sent (librdkafka's broker
+/// statistics, refreshed every 5 s).
+async fn delivery_counters() -> Option<[f64; 4]> {
+    let text = reqwest::get(format!("http://{METRICS}/metrics"))
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    let sum = |name: &str| -> f64 {
+        text.lines()
+            .filter(|l| {
+                l.strip_prefix(name).is_some_and(|rest| {
+                    rest.starts_with('{') || rest.starts_with(' ')
+                })
+            })
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+            .sum()
+    };
+    Some([
+        sum("deltaforge_batch_events_count"),
+        sum("deltaforge_batch_events_sum"),
+        sum("deltaforge_checkpoints_total"),
+        sum("deltaforge_kafka_requests_total"),
+    ])
+}
+
 async fn wait_status(name: &str, want: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
@@ -1037,6 +1420,32 @@ struct Arrivals {
     count: AtomicU64,
     bytes: AtomicU64,
     times: std::sync::Mutex<Vec<Instant>>,
+    /// The row ids seen (`after.id`, or `before.id` for a delete), and how
+    /// many messages repeated one: delivery is counted per message, so
+    /// distinct ids show a missing or duplicated row.
+    ids: std::sync::Mutex<std::collections::HashSet<i64>>,
+    duplicates: AtomicU64,
+}
+
+/// The row id of a JSON change event (a number, or a decimal string for a
+/// 64-bit integer rendered exactly).
+fn row_id(payload: &[u8]) -> Option<i64> {
+    let v: Value = serde_json::from_slice(payload).ok()?;
+    let image = if v["after"].is_object() {
+        &v["after"]
+    } else {
+        &v["before"]
+    };
+    match &image["id"] {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Kafka's bootstrap address on the harness network.
+fn bootstrap_internal() -> String {
+    format!("{KAFKA_NAME}:{KAFKA_INTERNAL_PORT}")
 }
 
 fn brokers() -> String {
@@ -1076,6 +1485,11 @@ fn consume(
                     let n = m.payload().map_or(0, <[u8]>::len)
                         + m.key().map_or(0, <[u8]>::len);
                     arrivals.bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    if let Some(id) = m.payload().and_then(row_id)
+                        && !arrivals.ids.lock().unwrap().insert(id)
+                    {
+                        arrivals.duplicates.fetch_add(1, Ordering::Relaxed);
+                    }
                     arrivals.times.lock().unwrap().push(now);
                     arrivals.count.fetch_add(1, Ordering::Release);
                 }
@@ -1134,6 +1548,7 @@ fn pipeline_spec(
     ns: &str,
     topic: &str,
     prefix: &str,
+    sink_extra: Option<&Value>,
 ) -> Value {
     // A snapshot chunk that a batch cuts mid-chunk reaches the durable S3
     // sink without a boundary, which it refuses (a defect of both
@@ -1190,6 +1605,12 @@ fn pipeline_spec(
     } else {
         json!([])
     };
+    let mut sink = sink;
+    if let Some(Value::Object(extra)) = sink_extra {
+        for (k, v) in extra {
+            sink["config"][k] = v.clone();
+        }
+    }
     let mut spec = json!({
         "source": source,
         "processors": processors,
@@ -1201,6 +1622,14 @@ fn pipeline_spec(
     if cell.mode == Mode::Snapshot && cell.sink == Sink::Parquet {
         spec["batch"] = json!({"max_ms": 1000});
     }
+    if let Some(Value::Object(extra)) = DF_BATCH.get() {
+        if !spec["batch"].is_object() {
+            spec["batch"] = json!({});
+        }
+        for (k, v) in extra {
+            spec["batch"][k] = v.clone();
+        }
+    }
     json!({
         "apiVersion": "deltaforge/v1",
         "kind": "Pipeline",
@@ -1208,6 +1637,12 @@ fn pipeline_spec(
         "spec": spec,
     })
 }
+
+/// Batch settings added to every DeltaForge pipeline (`--df-batch`).
+static DF_BATCH: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+/// `--df-sink` settings by system label.
+static DF_SINK: std::sync::OnceLock<BTreeMap<String, Value>> =
+    std::sync::OnceLock::new();
 
 #[derive(Debug, Default, Clone)]
 struct Measured {
@@ -1219,6 +1654,12 @@ struct Measured {
     cpu_secs: f64,
     /// The system (kernel) part of `cpu_secs`.
     sys_secs: f64,
+    /// DeltaForge's batches, events in them, checkpoint commits and Kafka
+    /// requests in the window (`--delivery-stats`).
+    delivery: Option<[f64; 4]>,
+    /// Distinct row ids that arrived (JSON sinks), and duplicated messages.
+    distinct_rows: Option<u64>,
+    duplicates: Option<u64>,
     /// Read and write system calls, the main thread's voluntary and
     /// involuntary context switches, and minor page faults in the window.
     kernel: [u64; 5],
@@ -1227,13 +1668,24 @@ struct Measured {
     out_bytes: u64,
     allocs: Option<u64>,
     lat_p50_ms: Option<f64>,
+    lat_p95_ms: Option<f64>,
     lat_p99_ms: Option<f64>,
+    lat_max_ms: Option<f64>,
     /// State-store key-value reads in the measured window (PostgreSQL state
     /// store only).
     kv_reads: Option<u64>,
     /// `deltaforge_wal_feedback_reads_total` in the window (when exported).
     feedback_reads: Option<u64>,
     feedback_staleness_s: Option<f64>,
+    /// The process that ran the pipeline (DeltaForge), and the executable
+    /// it ran with its SHA-256 (DeltaForge), or the worker image (Debezium).
+    pid: Option<u32>,
+    binary: Option<String>,
+    binary_sha256: Option<String>,
+    /// Per thread group over the window (see `threads`).
+    threads: Option<Value>,
+    /// An instrumented runner's own attribution (its `ATTR {json}` line).
+    attribution: Option<Value>,
 }
 
 impl Measured {
@@ -1241,14 +1693,29 @@ impl Measured {
         json!({
             "ok": self.ok, "error": self.error, "rows": self.rows, "secs": self.secs,
             "rows_per_sec": self.rows_per_sec, "cpu_secs": self.cpu_secs,
-            "sys_secs": self.sys_secs, "syscr": self.kernel[0],
+            "sys_secs": self.sys_secs,
+            "distinct_rows": self.distinct_rows, "duplicates": self.duplicates,
+            "batches": self.delivery.map(|d| d[0]),
+            "batch_events": self.delivery.map(|d| d[1]),
+            "checkpoints": self.delivery.map(|d| d[2]),
+            "kafka_requests": self.delivery.map(|d| d[3]), "syscr": self.kernel[0],
             "syscw": self.kernel[1], "vcsw": self.kernel[2],
             "ivcsw": self.kernel[3], "minflt": self.kernel[4],
             "rss_peak_mib": self.rss_peak_mib, "db_cpu_secs": self.db_cpu_secs,
             "out_bytes": self.out_bytes, "allocs": self.allocs,
-            "lat_p50_ms": self.lat_p50_ms, "lat_p99_ms": self.lat_p99_ms,
+            "lat_p50_ms": self.lat_p50_ms, "lat_p95_ms": self.lat_p95_ms,
+            "lat_p99_ms": self.lat_p99_ms, "lat_max_ms": self.lat_max_ms,
             "kv_reads": self.kv_reads, "feedback_reads": self.feedback_reads,
             "feedback_staleness_s": self.feedback_staleness_s,
+            "pid": self.pid, "binary": self.binary,
+            "binary_sha256": self.binary_sha256,
+            "threads": self.threads, "attribution": self.attribution,
+            // Rates over the window (the delivery counters' window adds
+            // only an idle tail).
+            "cpu_cores": (self.secs > 0.0).then(|| self.cpu_secs / self.secs),
+            "batches_per_sec": self.delivery.map(|d| d[0] / self.secs),
+            "checkpoints_per_sec": self.delivery.map(|d| d[2] / self.secs),
+            "kafka_requests_per_sec": self.delivery.map(|d| d[3] / self.secs),
         })
     }
 }
@@ -1286,24 +1753,30 @@ async fn feedback_reads() -> Option<u64> {
 async fn run_once(
     infra: &Infra,
     store: &Arc<dyn object_store::ObjectStore>,
-    binary: &Path,
+    system: &System,
+    connect: Option<&debezium::Connect>,
     idle_allocs: Option<u64>,
     cell: &Cell,
     rows: usize,
     tag: &str,
     dir: &Path,
     args_probe: bool,
+    args_delivery: bool,
+    sink_extra: Option<&Value>,
 ) -> Measured {
     match run_inner(
         infra,
         store,
-        binary,
+        system,
+        connect,
         idle_allocs,
         cell,
         rows,
         tag,
         dir,
         args_probe,
+        args_delivery,
+        sink_extra,
     )
     .await
     {
@@ -1320,18 +1793,33 @@ async fn run_once(
 async fn run_inner(
     infra: &Infra,
     store: &Arc<dyn object_store::ObjectStore>,
-    binary: &Path,
+    system: &System,
+    connect: Option<&debezium::Connect>,
     idle_allocs: Option<u64>,
     cell: &Cell,
     rows: usize,
     tag: &str,
     dir: &Path,
     args_probe: bool,
+    args_delivery: bool,
+    sink_extra: Option<&Value>,
 ) -> Result<Measured> {
     let engine = cell.engine;
     let ns = format!("p_{}", tag.replace('-', "_"));
     let name = format!("p-{tag}");
-    let topic = format!("perf-{tag}");
+    let dbz = matches!(system, System::Debezium(_));
+    let profile = match system {
+        System::Debezium(p) => *p,
+        System::DeltaForge(_) => debezium::Profile::Defaults,
+    };
+    if dbz && (engine != Engine::Mysql || cell.sink == Sink::Parquet) {
+        bail!("not measured for Debezium: only MySQL to Kafka cells");
+    }
+    let topic = if dbz {
+        debezium::topic(&format!("perf-{tag}"), &ns)
+    } else {
+        format!("perf-{tag}")
+    };
     let prefix = format!("perf/{tag}");
 
     // Fixture.
@@ -1390,7 +1878,14 @@ async fn run_inner(
         &ns,
         &topic,
         &prefix,
+        sink_extra,
     );
+    // The run's exact configuration, beside its results.
+    std::fs::create_dir_all(dir).ok();
+    std::fs::write(
+        dir.join("pipeline.json"),
+        serde_json::to_vec_pretty(&spec)?,
+    )?;
 
     let state_db = format!("st_{ns}");
     let state_dsn = if infra.state.is_some() {
@@ -1402,7 +1897,75 @@ async fn run_inner(
         None
     };
     let slot = name.replace('-', "_");
-    let process = Process::start(binary, dir, state_dsn.as_deref()).await?;
+    let process = match system {
+        System::DeltaForge(binary) => Sut::Df(Box::new(
+            Process::start(binary, dir, state_dsn.as_deref()).await?,
+        )),
+        System::Debezium(_) => {
+            Sut::Dbz(connect.ok_or_else(|| anyhow!("no Kafka Connect worker"))?)
+        }
+    };
+    // A MySQL server id of its own per Debezium run (the fixture is 60).
+    static SERVER_IDS: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(10_000);
+    let connector = dbz.then(|| {
+        debezium::mysql_connector(
+            &name,
+            tag,
+            MYSQL_NAME,
+            PW,
+            &bootstrap_internal(),
+            SERVER_IDS.fetch_add(1, Ordering::Relaxed),
+            &ns,
+            &format!("perf-{tag}"),
+            cell.mode == Mode::Snapshot,
+            match cell.sink {
+                Sink::Avro => debezium::Format::Avro(format!(
+                    "http://{SCHEMA_REGISTRY_NAME}:8081"
+                )),
+                _ => debezium::Format::Json,
+            },
+            cell.js,
+            profile,
+        )
+    });
+    if let Some(c) = &connector {
+        std::fs::create_dir_all(dir).ok();
+        std::fs::write(
+            dir.join("connector.json"),
+            serde_json::to_string_pretty(c).unwrap_or_default(),
+        )
+        .ok();
+    }
+    // Create, pause, resume, check and delete the pipeline (a DeltaForge
+    // pipeline, or the Debezium connector).
+    let create = || async {
+        match &process {
+            Sut::Df(_) => api(reqwest::Method::POST, "/pipelines", Some(&spec))
+                .await
+                .map(|_| ()),
+            Sut::Dbz(c) => {
+                c.create(connector.as_ref().expect("a Debezium run")).await
+            }
+        }
+    };
+    let control = |action: &'static str| {
+        let name = name.clone();
+        let process = &process;
+        async move {
+            match process {
+                Sut::Df(_) => api(
+                    reqwest::Method::POST,
+                    &format!("/pipelines/{name}/{action}"),
+                    None,
+                )
+                .await
+                .map(|_| ()),
+                Sut::Dbz(c) if action == "pause" => c.pause(&name).await,
+                Sut::Dbz(c) => c.resume(&name).await,
+            }
+        }
+    };
     let mut parquet_seen = BTreeMap::new();
     let delivered = |seen: &mut BTreeMap<String, (u64, u64)>| {
         let arrivals = Arc::clone(&arrivals);
@@ -1435,6 +1998,14 @@ async fn run_inner(
         // feedback covers that transaction once confirmed_flush passes it.
         let mut last_tx_lsn: Option<u64> = None;
         let window_start = || async {
+            // Debezium's counters first: their reader runs in the worker's
+            // cgroup, before its CPU is read.
+            let dbz = match (&process, args_delivery) {
+                (Sut::Dbz(c), true) => c
+                    .counters()
+                    .map(|[req, commits]| [f64::NAN, f64::NAN, commits, req]),
+                _ => None,
+            };
             (
                 (
                     process.cpu_secs(),
@@ -1444,16 +2015,30 @@ async fn run_inner(
                 infra.db_cpu_usec(engine),
                 infra.state_reads(&state_db).await,
                 feedback_reads().await,
+                match (&process, args_delivery) {
+                    (Sut::Df(_), true) => delivery_counters().await,
+                    _ => dbz,
+                },
             )
         };
-        let (cpu0, db0, reads0, fb0);
+        let (cpu0, db0, reads0, fb0, dc0);
+        // The process tree whose threads are attributed.
+        let root_pid = match &process {
+            Sut::Df(p) => Some(p.pid),
+            Sut::Dbz(c) => c.pid(),
+        };
+        let threads0;
         if cell.mode == Mode::Snapshot {
-            (cpu0, db0, reads0, fb0) = window_start().await;
+            (cpu0, db0, reads0, fb0, dc0) = window_start().await;
+            threads0 = root_pid.map(threads::Snapshot::take);
             t0 = Instant::now();
-            api(reqwest::Method::POST, "/pipelines", Some(&spec)).await?;
+            create().await?;
         } else {
-            api(reqwest::Method::POST, "/pipelines", Some(&spec)).await?;
-            wait_status(&name, "running").await?;
+            create().await?;
+            match &process {
+                Sut::Df(_) => wait_status(&name, "running").await?,
+                Sut::Dbz(c) => c.wait(&name, "RUNNING").await?,
+            }
             let deadline = Instant::now() + Duration::from_secs(120);
             loop {
                 markers += 1;
@@ -1488,12 +2073,7 @@ async fn run_inner(
             // delivered: the baseline is what has arrived once the source is
             // quiet, not the number of markers written.
             if cell.mode == Mode::Cdc {
-                api(
-                    reqwest::Method::POST,
-                    &format!("/pipelines/{name}/pause"),
-                    None,
-                )
-                .await?;
+                control("pause").await?;
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
             let (r, local) = delivered(&mut parquet_seen).await;
@@ -1507,35 +2087,55 @@ async fn run_inner(
                     last_tx_lsn = infra.wal_insert_lsn().await;
                 }
                 infra.exec(engine, &[last]).await?;
-                (cpu0, db0, reads0, fb0) = window_start().await;
+                (cpu0, db0, reads0, fb0, dc0) = window_start().await;
+                threads0 = root_pid.map(threads::Snapshot::take);
                 t0 = Instant::now();
-                api(
-                    reqwest::Method::POST,
-                    &format!("/pipelines/{name}/resume"),
-                    None,
-                )
-                .await?;
+                control("resume").await?;
             } else {
-                // Latency: single-row transactions every 5 ms, on one
-                // connection.
+                // Latency: transactions of `tx_rows` rows at `rate` per
+                // second, on one connection (in bursts with idle between
+                // them, for a bursty load).
+                let load = cell.load;
                 let mut sql = Sql::open(infra, engine).await?;
-                (cpu0, db0, reads0, fb0) = window_start().await;
+                (cpu0, db0, reads0, fb0, dc0) = window_start().await;
+                threads0 = root_pid.map(threads::Snapshot::take);
                 t0 = Instant::now();
-                let mut tick = tokio::time::interval(Duration::from_millis(5));
-                for row in 0..rows {
+                let mut tick = tokio::time::interval(Duration::from_micros(
+                    1_000_000 / u64::from(load.rate.max(1)),
+                ));
+                tick.set_missed_tick_behavior(
+                    tokio::time::MissedTickBehavior::Delay,
+                );
+                let mut row = 0;
+                let mut txs = 0;
+                while row < rows {
+                    if let Some((n, idle)) = load.burst
+                        && txs > 0
+                        && txs % n == 0
+                    {
+                        tokio::time::sleep(Duration::from_millis(idle)).await;
+                        tick.reset();
+                    }
                     tick.tick().await;
-                    if row + 1 == rows && engine == Engine::Postgres {
+                    let end = (row + load.tx_rows).min(rows);
+                    if end == rows && engine == Engine::Postgres {
                         last_tx_lsn = infra.wal_insert_lsn().await;
                     }
-                    let one = inserts(engine, &ns, cell.shape, row, row + 1);
+                    let one = inserts(engine, &ns, cell.shape, row, end);
                     sql.exec(&one[0]).await?;
-                    commits.push(Instant::now());
+                    let at = Instant::now();
+                    commits.extend(std::iter::repeat_n(at, end - row));
+                    row = end;
+                    txs += 1;
                 }
             }
         }
         let want = rows as u64 + base;
         let mut rss_peak = 0u64;
         let deadline = Instant::now() + Duration::from_secs(1800);
+        // A run that stops delivering fails rather than waiting out the
+        // deadline (e.g. a worker out of memory).
+        let (mut last_got, mut last_progress) = (0u64, Instant::now());
         let (got, bytes) = loop {
             rss_peak = rss_peak.max(process.rss_kib());
             let (r, local) = delivered(&mut parquet_seen).await;
@@ -1544,12 +2144,29 @@ async fn run_inner(
             if got >= want {
                 break (got, bytes);
             }
-            if let Ok(v) =
-                api(reqwest::Method::GET, &format!("/pipelines/{name}"), None)
+            if got > last_got {
+                (last_got, last_progress) = (got, Instant::now());
+            } else if last_progress.elapsed() > Duration::from_secs(120) {
+                bail!("stalled: no row for 120 s ({got} of {want} arrived)");
+            }
+            match &process {
+                Sut::Df(_) => {
+                    if let Ok(v) = api(
+                        reqwest::Method::GET,
+                        &format!("/pipelines/{name}"),
+                        None,
+                    )
                     .await
-                && v["status"] == "failed"
-            {
-                bail!("pipeline failed: {}", v);
+                        && v["status"] == "failed"
+                    {
+                        bail!("pipeline failed: {}", v);
+                    }
+                }
+                Sut::Dbz(c) => {
+                    if let Some(why) = c.failure(&name).await {
+                        bail!("connector failed: {why}");
+                    }
+                }
             }
             if Instant::now() > deadline {
                 bail!("only {got} of {want} rows arrived");
@@ -1572,6 +2189,12 @@ async fn run_inner(
         let secs = t_end.duration_since(t0).as_secs_f64();
         let cpu = process.cpu_secs() - cpu0.0;
         let sys = process.sys_secs() - cpu0.1;
+        let threads = match (root_pid, &threads0) {
+            (Some(pid), Some(t0)) => {
+                Some(threads::Snapshot::take(pid).since(t0))
+            }
+            _ => None,
+        };
         let k1 = process.kernel_counts();
         let kernel: [u64; 5] =
             std::array::from_fn(|i| k1[i].saturating_sub(cpu0.2[i]));
@@ -1610,11 +2233,25 @@ async fn run_inner(
             }
             _ => None,
         };
+        // librdkafka refreshes its statistics every 5 s. Debezium's are
+        // read after its CPU (above). Debezium has no batch counters (NaN).
+        let delivery = match (dc0, &process) {
+            (Some(a), Sut::Df(_)) => {
+                tokio::time::sleep(Duration::from_millis(5_500)).await;
+                delivery_counters()
+                    .await
+                    .map(|b| std::array::from_fn(|i| b[i] - a[i]))
+            }
+            (Some(a), Sut::Dbz(c)) => c.counters().map(|[req, commits]| {
+                [f64::NAN, f64::NAN, commits - a[2], req - a[3]]
+            }),
+            _ => None,
+        };
         let db = match (db0, infra.db_cpu_usec(engine)) {
             (Some(a), Some(b)) => Some((b - a) as f64 / 1e6),
             _ => None,
         };
-        let (p50, p99) = if cell.mode == Mode::Latency {
+        let (p50, p95, p99, pmax) = if cell.mode == Mode::Latency {
             let times = arrivals.times.lock().unwrap();
             let mut lat: Vec<f64> = commits
                 .iter()
@@ -1629,9 +2266,9 @@ async fn run_inner(
             let q = |p: f64| {
                 lat.get(((lat.len() as f64 - 1.0) * p) as usize).copied()
             };
-            (q(0.5), q(0.99))
+            (q(0.5), q(0.95), q(0.99), lat.last().copied())
         } else {
-            (None, None)
+            (None, None, None, None)
         };
         Ok::<_, anyhow::Error>(Measured {
             ok: true,
@@ -1641,24 +2278,69 @@ async fn run_inner(
             rows_per_sec: rows as f64 / secs,
             cpu_secs: cpu,
             sys_secs: sys,
+            delivery,
+            distinct_rows: (cell.sink == Sink::Json)
+                .then(|| arrivals.ids.lock().unwrap().len() as u64),
+            duplicates: (cell.sink == Sink::Json)
+                .then(|| arrivals.duplicates.load(Ordering::Relaxed)),
             kernel,
             rss_peak_mib: rss_peak as f64 / 1024.0,
             db_cpu_secs: db,
             out_bytes: bytes,
             allocs: None,
             lat_p50_ms: p50,
+            lat_p95_ms: p95,
             lat_p99_ms: p99,
+            lat_max_ms: pmax,
             kv_reads,
             feedback_reads: fb_reads,
             feedback_staleness_s: staleness,
+            pid: None,
+            binary: None,
+            binary_sha256: None,
+            threads,
+            attribution: None,
         })
     }
     .await;
+    let identity = match &process {
+        Sut::Df(p) => (
+            Some(p.pid),
+            Some(p.exe.display().to_string()),
+            sha256(&p.exe),
+        ),
+        Sut::Dbz(_) => (
+            None,
+            Some(format!(
+                "{}:{}",
+                debezium::CONNECT_IMAGE.0,
+                debezium::CONNECT_IMAGE.1
+            )),
+            None,
+        ),
+    };
 
-    api(reqwest::Method::DELETE, &format!("/pipelines/{name}"), None)
-        .await
-        .ok();
+    match &process {
+        Sut::Df(_) => {
+            api(reqwest::Method::DELETE, &format!("/pipelines/{name}"), None)
+                .await
+                .ok();
+        }
+        Sut::Dbz(c) => c.delete(&name).await,
+    }
+    let attr_log = match &process {
+        Sut::Df(p) => Some(p.stderr.clone()),
+        Sut::Dbz(_) => None,
+    };
     let allocs = process.stop().await;
+    let attribution = attr_log
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .and_then(|t| {
+            t.lines()
+                .rev()
+                .find_map(|l| l.strip_prefix("ATTR "))
+                .and_then(|j| serde_json::from_str::<Value>(j).ok())
+        });
     if let Some(c) = consumer {
         c.abort();
     }
@@ -1686,6 +2368,8 @@ async fn run_inner(
             .ok();
     }
     let mut m = result?;
+    (m.pid, m.binary, m.binary_sha256) = identity;
+    m.attribution = attribution;
     m.allocs = match (allocs, idle_allocs) {
         (Some(a), Some(i)) => Some(a.saturating_sub(i)),
         (a, _) => a,
@@ -1793,31 +2477,151 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
-    let binaries: Vec<(String, PathBuf)> = args
+    // One invocation at a time on this machine: two would share the named
+    // containers and the runner's ports. Held until exit.
+    let lock = std::fs::File::create(
+        std::env::temp_dir().join("canonical-perf.lock"),
+    )?;
+    if lock.try_lock().is_err() {
+        bail!("another canonical-perf invocation is running on this machine");
+    }
+    let profile = debezium::Profile::parse(&args.debezium_profile)?;
+    if let Some(b) = &args.df_batch {
+        let v: Value = serde_json::from_str(b).context("--df-batch")?;
+        if !v.is_object() {
+            bail!("--df-batch must be a JSON object");
+        }
+        DF_BATCH.set(v).ok();
+    }
+    let mut df_sink = BTreeMap::new();
+    for item in &args.df_sink {
+        let (label, json) = item
+            .split_once('=')
+            .ok_or_else(|| anyhow!("--df-sink must be LABEL=JSON"))?;
+        let v: Value = serde_json::from_str(json).context("--df-sink")?;
+        if !v.is_object() {
+            bail!("--df-sink must be LABEL=<a JSON object>");
+        }
+        df_sink.insert(label.to_string(), v);
+    }
+    DF_SINK.set(df_sink).ok();
+    let binaries: Vec<(String, System)> = args
         .binaries
         .iter()
         .map(|b| {
             let (l, p) = b
                 .split_once('=')
                 .ok_or_else(|| anyhow!("--binary label=path"))?;
-            Ok((l.to_string(), PathBuf::from(p)))
+            let system = if p == "debezium" {
+                System::Debezium(profile)
+            } else {
+                System::DeltaForge(PathBuf::from(p))
+            };
+            Ok((l.to_string(), system))
         })
         .collect::<Result<_>>()?;
-    if binaries.len() != 2 {
-        bail!("exactly two binaries");
+    let layouts: Vec<(String, layout::Manifest)> = args
+        .layouts
+        .iter()
+        .map(|l| {
+            let (label, dir) = l
+                .split_once('=')
+                .ok_or_else(|| anyhow!("--layout label=dir"))?;
+            Ok((label.to_string(), layout::load(Path::new(dir))?))
+        })
+        .collect::<Result<_>>()?;
+    match (binaries.len(), layouts.len()) {
+        (2, 0) | (0, 2) => {}
+        _ => bail!("exactly two --binary, or exactly two --layout"),
     }
     std::fs::create_dir_all(&args.out)?;
+    std::fs::write(
+        args.out.join("invocation.json"),
+        serde_json::to_vec_pretty(&invocation(&args, &layouts))?,
+    )?;
     let infra = Infra::start(args.state_store == "postgres").await?;
-    let outcome = measure(&args, &binaries, &infra).await;
+    let outcome = if layouts.is_empty() {
+        measure(&args, &binaries, &infra, &args.out).await
+    } else {
+        // Seed by seed, the same workload order for each; then over all.
+        let ((la, ma), (lb, mb)) = (&layouts[0], &layouts[1]);
+        let seeds = layout::seeds(ma, mb)?;
+        let mut outcome = Ok(());
+        for (i, seed) in seeds.iter().enumerate() {
+            let pair = [
+                (la.clone(), System::DeltaForge(ma.links[i].1.clone())),
+                (lb.clone(), System::DeltaForge(mb.links[i].1.clone())),
+            ];
+            eprintln!("layout seed {seed} ({}/{})", i + 1, seeds.len());
+            outcome = measure(
+                &args,
+                &pair,
+                &infra,
+                &args.out.join(format!("seed-{seed}")),
+            )
+            .await;
+            if outcome.is_err() {
+                break;
+            }
+        }
+        outcome.and_then(|_| {
+            layout::aggregate(&args.out, (la, &ma.rev), (lb, &mb.rev), &seeds)?;
+            eprintln!(
+                "layout summary: {}",
+                args.out.join("layout-summary.md").display()
+            );
+            Ok(())
+        })
+    };
     infra.cleanup();
     outcome
 }
 
+/// What an invocation ran: its arguments, the pinned images and artifacts,
+/// the harness's own revision, the host, and each layout's links.
+fn invocation(args: &Args, layouts: &[(String, layout::Manifest)]) -> Value {
+    let cmd = |c: &str, a: &[&str]| {
+        std::process::Command::new(c)
+            .args(a)
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let cpu = std::fs::read_to_string("/proc/cpuinfo").ok().and_then(|t| {
+        t.lines()
+            .find_map(|l| l.strip_prefix("model name"))
+            .map(|v| v.trim_start_matches([' ', '\t', ':']).to_string())
+    });
+    json!({
+        "args": format!("{args:?}"),
+        // The harness that ran, by its executable; the revision and
+        // cleanliness of the directory it ran in (its fixtures' checkout).
+        "harness_executable_sha256": std::env::current_exe().ok().and_then(|e| sha256(&e)),
+        "working_dir_rev": cmd("git", &["rev-parse", "HEAD"]),
+        "working_dir_clean": cmd("git", &["status", "--porcelain"]).map(|s| s.is_empty()),
+        "images": {
+            "mysql": format!("{}:{}", MYSQL_IMAGE.0, MYSQL_IMAGE.1),
+            "postgres": format!("{}:{}", POSTGRES_IMAGE.0, POSTGRES_IMAGE.1),
+            "kafka": format!("{}:{}", KAFKA_IMAGE.0, KAFKA_IMAGE.1),
+            "schema_registry": format!("{}:{}", SCHEMA_REGISTRY_IMAGE.0, SCHEMA_REGISTRY_IMAGE.1),
+            "kafka_connect_debezium": format!("{}:{}", debezium::CONNECT_IMAGE.0, debezium::CONNECT_IMAGE.1),
+        },
+        "debezium_artifacts": extras::pins(),
+        "host": {"cpu": cpu, "kernel": cmd("uname", &["-r"]), "cpus": cmd("nproc", &[])},
+        "layouts": layouts.iter().map(|(label, m)| json!({
+            "label": label, "rev": m.rev,
+            "links": m.links.iter().map(|(s, p, h)| json!({"seed": s, "path": p, "sha256": h})).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
 async fn measure(
     args: &Args,
-    binaries: &[(String, PathBuf)],
+    binaries: &[(String, System)],
     infra: &Infra,
+    out: &Path,
 ) -> Result<()> {
+    std::fs::create_dir_all(out)?;
     let cells: Vec<Cell> = matrix()
         .into_iter()
         .filter(|c| {
@@ -1841,23 +2645,80 @@ async fn measure(
 
     // Idle allocation baselines.
     let mut idle = BTreeMap::new();
-    for (label, bin) in binaries {
-        let dir = args.out.join(format!("idle-{label}"));
+    for (label, system) in binaries {
+        let System::DeltaForge(bin) = system else {
+            idle.insert(label.clone(), None);
+            continue;
+        };
+        let dir = out.join(format!("idle-{label}"));
         let p = Process::start(bin, &dir, None).await?;
         tokio::time::sleep(Duration::from_secs(3)).await;
         idle.insert(label.clone(), p.stop().await);
     }
 
+    // One Kafka Connect worker for the invocation, warmed up: each run
+    // registers a connector of its own on it.
+    let connect = match binaries.iter().find_map(|(_, s)| match s {
+        System::Debezium(p) => Some(*p),
+        _ => None,
+    }) {
+        Some(profile) => Some(
+            debezium::Connect::start(
+                NETWORK,
+                &bootstrap_internal(),
+                "shared",
+                profile,
+                &extras::prepare(&args.cache)?,
+            )
+            .await?,
+        ),
+        None => None,
+    };
+    // Warm-up: one unrecorded run of every cell for every system, so a JIT
+    // compiled system is measured warm.
+    if args.warmup {
+        for cell in &cells {
+            for (label, system) in binaries {
+                let rows = ((cell.rows as f64 * args.scale) as usize).max(100);
+                let tag = format!("{}-{}-warmup", cell.id(), label);
+                let m = run_once(
+                    infra,
+                    &store,
+                    system,
+                    connect.as_ref(),
+                    idle[label],
+                    cell,
+                    rows,
+                    &tag,
+                    &out.join("warmup").join(&tag),
+                    false,
+                    false,
+                    DF_SINK.get().and_then(|m| m.get(label.as_str())),
+                )
+                .await;
+                eprintln!(
+                    "{} {label} warm-up: {}",
+                    cell.id(),
+                    if m.ok {
+                        format!("{:.0} rows/s", m.rows_per_sec)
+                    } else {
+                        format!("FAILED {}", m.error.unwrap_or_default())
+                    }
+                );
+            }
+        }
+    }
+
     let mut log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(args.out.join("runs.jsonl"))?;
+        .open(out.join("runs.jsonl"))?;
     let mut results: BTreeMap<(String, String), Vec<Measured>> =
         BTreeMap::new();
     let mut seq = 0usize;
     for rep in 0..args.reps {
         for cell in &cells {
-            let order: Vec<&(String, PathBuf)> = if rep % 2 == 0 {
+            let order: Vec<&(String, System)> = if rep % 2 == 0 {
                 binaries.iter().collect()
             } else {
                 binaries.iter().rev().collect()
@@ -1866,19 +2727,31 @@ async fn measure(
                 seq += 1;
                 let rows = ((cell.rows as f64 * args.scale) as usize).max(100);
                 let tag = format!("{}-{}-r{rep}-{seq}", cell.id(), label);
-                let dir = args.out.join("runs").join(&tag);
+                let dir = out.join("runs").join(&tag);
                 let m = run_once(
                     infra,
                     &store,
                     bin,
+                    connect.as_ref(),
                     idle[label],
                     cell,
                     rows,
                     &tag,
                     &dir,
                     args.feedback_probe,
+                    args.delivery_stats,
+                    DF_SINK.get().and_then(|m| m.get(label.as_str())),
                 )
                 .await;
+                if let (false, System::Debezium(_), Some(c)) =
+                    (m.ok, bin, &connect)
+                    && !c.alive().await
+                {
+                    eprintln!(
+                        "the Kafka Connect worker no longer answers: killed"
+                    );
+                    c.kill();
+                }
                 let line = json!({"cell": cell.id(), "version": label, "rep": rep, "rows_target": rows, "result": m.json()});
                 use std::io::Write;
                 writeln!(log, "{line}")?;
@@ -1909,9 +2782,12 @@ async fn measure(
 
     // Summary: medians per cell and version, and B/A ratios.
     let (a, b) = (&binaries[0].0, &binaries[1].0);
+    let debezium = binaries
+        .iter()
+        .any(|(_, s)| matches!(s, System::Debezium(_)));
     let mut md = format!(
-        "| cell | {a} rows/s | {b} rows/s | {b}/{a} | cpu s/100k {a} | {b} | rss MiB {a} | {b} | allocs/row {a} | {b} | bytes/row {a} | {b} | db cpu s {a} | {b} | p50/p99 ms {a} | {b} | failures | sys s/100k {a} | {b} |\n|{}\n",
-        "---|".repeat(20)
+        "| cell | comparison | {a} rows/s | {b} rows/s | {b}/{a} | cpu s/100k {a} | {b} | rss MiB {a} | {b} | allocs/row {a} | {b} | bytes/row {a} | {b} | db cpu s {a} | {b} | p50/p99 ms {a} | {b} | failures | sys s/100k {a} | {b} |\n|{}\n",
+        "---|".repeat(21)
     );
     for cell in &cells {
         let get = |l: &str| {
@@ -1959,8 +2835,9 @@ async fn measure(
         };
         let failures = ra.len() - oa.len() + rb.len() - ob.len();
         md.push_str(&format!(
-            "| {} | {} | {} | {ratio} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {failures} | {} | {} |\n",
+            "| {} | {} | {} | {} | {ratio} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {failures} | {} | {} |\n",
             cell.id(),
+            comparison(cell, debezium).0,
             f(thr(&oa), 0), f(thr(&ob), 0),
             f(cpu(&oa), 2), f(cpu(&ob), 2),
             f(rss(&oa), 0), f(rss(&ob), 0),
@@ -1971,7 +2848,26 @@ async fn measure(
             f(sys(&oa), 2), f(sys(&ob), 2),
         ));
     }
-    std::fs::write(args.out.join("summary.md"), md)?;
+    // Why each architectural comparison is one.
+    let notes: Vec<String> = cells
+        .iter()
+        .filter(|c| comparison(c, debezium).0 == "architectural")
+        .map(|c| format!("- `{}`: {}\n", c.id(), comparison(c, debezium).1))
+        .collect();
+    if !notes.is_empty() {
+        md.push_str("\nArchitectural comparisons (not like for like):\n\n");
+        md.push_str(&notes.concat());
+    }
+    md.push_str(
+        "\nRaw results: `runs.jsonl` (one line per run), each run's output \
+         under `runs/<cell>-<label>-r<rep>-<seq>/` (its pipeline spec or \
+         connector configuration, logs); the invocation in \
+         `invocation.json`.\n",
+    );
+    std::fs::write(out.join("summary.md"), md)?;
+    if let Some(c) = connect {
+        c.stop(&out.join("connect.log")).await;
+    }
 
     // WAL feedback: state-store reads per million rows and staleness.
     let mut fb = format!(
@@ -2022,13 +2918,27 @@ async fn measure(
             ));
         }
     }
-    std::fs::write(args.out.join("feedback.md"), fb)?;
-    eprintln!("summary: {}", args.out.join("summary.md").display());
+    std::fs::write(out.join("feedback.md"), fb)?;
+    eprintln!("summary: {}", out.join("summary.md").display());
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_row_id_is_read_from_either_image_as_a_number_or_exact_text() {
+        assert_eq!(super::row_id(br#"{"after":{"id":7}}"#), Some(7));
+        assert_eq!(
+            super::row_id(br#"{"after":{"id":"9007199254740993"}}"#),
+            Some(9007199254740993)
+        );
+        assert_eq!(
+            super::row_id(br#"{"before":{"id":3},"after":null}"#),
+            Some(3)
+        );
+        assert_eq!(super::row_id(b"not json"), None);
+    }
+
     #[test]
     fn allocations_are_the_merged_request_count() {
         let stats = "Merged arenas stats:\n\
