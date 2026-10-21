@@ -4,7 +4,9 @@
 //! - Confluent's Avro converter (Confluent Hub), so a connector writes Avro
 //!   through the same Confluent-compatible schema registry DeltaForge uses;
 //! - GraalJS (Maven Central), the JavaScript engine of Debezium's scripting
-//!   transformations (the image ships the transformations, not an engine).
+//!   transformations (the image ships the transformations, not an engine);
+//! - Confluent's S3 sink connector (Confluent Hub), which writes a topic to
+//!   S3 as Parquet: Debezium's path to Parquet goes through Kafka.
 //!
 //! Files are cached under `<cache>/`; a cached file is re-verified on use.
 
@@ -16,6 +18,14 @@ use anyhow::{Context, Result, bail};
 const AVRO_CONVERTER: (&str, &str) = (
     "https://hub-downloads.confluent.io/api/plugins/confluentinc/kafka-connect-avro-converter/versions/8.3.2/confluentinc-kafka-connect-avro-converter-8.3.2.zip",
     "f849f49ae500d1c02f94a50d1dd4b3e63d26433843007ac114a7f8e9fb3d6be8",
+);
+
+/// Confluent's S3 sink connector (Confluent Hub zip, all dependencies). The
+/// hub publishes no digest for it: this is the digest of the archive as
+/// first downloaded.
+const S3_SINK: (&str, &str) = (
+    "https://hub-downloads.confluent.io/api/plugins/confluentinc/kafka-connect-s3/versions/12.1.13/confluentinc-kafka-connect-s3-12.1.13.zip",
+    "315c0ab43524d75a078cb33780adbad90cc6c8aa648fd38712e848d14efea485",
 );
 
 const GRAALJS_VERSION: &str = "25.4.4.1.1";
@@ -83,6 +93,7 @@ const GRAALJS: [(&str, &str); 13] = [
 pub fn pins() -> serde_json::Value {
     serde_json::json!({
         "avro_converter": {"url": AVRO_CONVERTER.0, "sha256": AVRO_CONVERTER.1},
+        "s3_sink": {"url": S3_SINK.0, "sha256": S3_SINK.1},
         "graaljs": {
             "version": GRAALJS_VERSION,
             "jars": GRAALJS.iter().map(|(c, h)| serde_json::json!({"artifact": c, "sha256": h})).collect::<Vec<_>>(),
@@ -97,6 +108,8 @@ pub struct Extras {
     pub avro_converter: PathBuf,
     /// The GraalJS jars (added to the MySQL connector's plugin directory).
     pub graaljs: PathBuf,
+    /// The S3 sink connector's jars (a Kafka Connect plugin directory).
+    pub s3_sink: PathBuf,
 }
 
 fn sha256(path: &Path) -> Result<String> {
@@ -140,49 +153,8 @@ pub fn prepare(cache: &Path) -> Result<Extras> {
     std::fs::create_dir_all(cache)?;
     // Docker bind mounts need absolute paths.
     let cache = &std::fs::canonicalize(cache)?;
-    let zip = cache.join("confluentinc-kafka-connect-avro-converter-8.3.2.zip");
-    fetch(AVRO_CONVERTER.0, &zip, AVRO_CONVERTER.1)?;
-    let unpacked = cache.join("avro-converter");
-    if !unpacked.exists() {
-        let partial = cache.join("avro-converter.part");
-        std::fs::remove_dir_all(&partial).ok();
-        let ok = std::process::Command::new("unzip")
-            .args(["-q", "-o"])
-            .arg(&zip)
-            .arg("-d")
-            .arg(&partial)
-            .status()
-            .context("unzip")?
-            .success();
-        if !ok {
-            bail!("unzip {}", zip.display());
-        }
-        std::fs::rename(&partial, &unpacked)?;
-    }
-    // A writable copy per invocation: the worker's entrypoint links the
-    // scripting jar into every plugin directory.
-    let avro_converter = cache.join("avro-converter-plugin");
-    std::fs::remove_dir_all(&avro_converter).ok();
-    let ok = std::process::Command::new("cp")
-        .arg("-r")
-        .arg(
-            unpacked
-                .join("confluentinc-kafka-connect-avro-converter-8.3.2")
-                .join("lib"),
-        )
-        .arg(&avro_converter)
-        .status()
-        .context("cp")?
-        .success();
-    if !ok {
-        bail!("copy the Avro converter plugin");
-    }
-    // The worker runs as its own user.
-    std::process::Command::new("chmod")
-        .args(["-R", "a+rwX"])
-        .arg(&avro_converter)
-        .status()
-        .context("chmod")?;
+    let avro_converter = hub_plugin(cache, AVRO_CONVERTER, "avro-converter")?;
+    let s3_sink = hub_plugin(cache, S3_SINK, "s3-sink")?;
     let graaljs = cache.join(format!("graaljs-{GRAALJS_VERSION}"));
     std::fs::create_dir_all(&graaljs)?;
     for (coord, digest) in GRAALJS {
@@ -198,5 +170,55 @@ pub fn prepare(cache: &Path) -> Result<Extras> {
     Ok(Extras {
         avro_converter,
         graaljs,
+        s3_sink,
     })
+}
+
+/// A Confluent Hub plugin: `(url, sha256)` fetched (or reused) under
+/// `cache`, verified, unpacked, and its `lib` copied to a writable plugin
+/// directory `<name>-plugin` (the worker's entrypoint links the scripting jar
+/// into every plugin directory, and runs as its own user).
+fn hub_plugin(
+    cache: &Path,
+    (url, digest): (&str, &str),
+    name: &str,
+) -> Result<PathBuf> {
+    let file = url.rsplit('/').next().context("plugin file name")?;
+    let zip = cache.join(file);
+    fetch(url, &zip, digest)?;
+    let unpacked = cache.join(name);
+    if !unpacked.exists() {
+        let partial = cache.join(format!("{name}.part"));
+        std::fs::remove_dir_all(&partial).ok();
+        let ok = std::process::Command::new("unzip")
+            .args(["-q", "-o"])
+            .arg(&zip)
+            .arg("-d")
+            .arg(&partial)
+            .status()
+            .context("unzip")?
+            .success();
+        if !ok {
+            bail!("unzip {}", zip.display());
+        }
+        std::fs::rename(&partial, &unpacked)?;
+    }
+    let plugin = cache.join(format!("{name}-plugin"));
+    std::fs::remove_dir_all(&plugin).ok();
+    let ok = std::process::Command::new("cp")
+        .arg("-r")
+        .arg(unpacked.join(file.trim_end_matches(".zip")).join("lib"))
+        .arg(&plugin)
+        .status()
+        .context("cp")?
+        .success();
+    if !ok {
+        bail!("copy the {name} plugin");
+    }
+    std::process::Command::new("chmod")
+        .args(["-R", "a+rwX"])
+        .arg(&plugin)
+        .status()
+        .context("chmod")?;
+    Ok(plugin)
 }

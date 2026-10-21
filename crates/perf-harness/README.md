@@ -35,6 +35,8 @@ from official distributions and verified against the SHA-256 digests in
 `src/extras.rs`:
 
 - Confluent's Avro converter 8.3.2 (Confluent Hub);
+- Confluent's S3 sink connector 12.1.13 (Confluent Hub), Debezium's path to
+  Parquet;
 - GraalJS 25.4.4.1.1 and its runtime jars (Maven Central), the engine of
   Debezium's scripting transformations.
 
@@ -91,6 +93,27 @@ Against Debezium a cell is either:
   is no optimizing Truffle runtime.
 
 DeltaForge against DeltaForge is always direct.
+
+## Parquet end to end
+
+DeltaForge writes Parquet to S3 directly: its durable S3 sink writes one
+object per 2,000-row batch. Debezium has no S3 path of its own. It writes
+Avro to Kafka, and Confluent's S3 sink connector 12.1.13 (Confluent Hub,
+pinned in `src/extras.rs`) writes the topic to the same RustFS server as
+Parquet. That connector is configured to match: 2,000 rows per object
+(`flush.size`), and a partial object every second
+(`rotate.schedule.interval.ms`). The cell is architectural: the paths
+differ, and so do the columns (DeltaForge's flat envelope, Debezium's
+nested one).
+
+The connector checks its rotation only when records arrive, or at the
+worker's offset commit (60 s). The last partial object of a backlog lands
+on that commit. Two times are recorded:
+
+- `secs`: until every row is visible;
+- `bulk_s`: until all but the last object's 2,000 rows are visible.
+
+Each run also records `objects`, the number of Parquet objects written.
 
 ## Crash and recovery
 

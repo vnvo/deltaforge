@@ -57,6 +57,8 @@ const KAFKA_INTERNAL_PORT: u16 = 29092;
 const KAFKA_HOST_PORT: u16 = 9397;
 const PW: &str = "pw";
 const BUCKET: &str = "perf";
+/// The S3 server's name on the harness network (port 9000).
+const S3_NAME: &str = "df-perf-s3";
 const API: &str = "127.0.0.1:18080";
 const METRICS: &str = "127.0.0.1:19000";
 /// Rows per INSERT statement (and so per source transaction).
@@ -312,6 +314,15 @@ fn comparison(cell: &Cell, debezium: bool) -> (&'static str, &'static str) {
             "DeltaForge reads the one table with parallel chunk readers \
              (intra_table_parallel); Debezium reads a table on one thread \
              (its snapshot threads parallelize across tables only)",
+        )
+    } else if debezium && cell.sink == Sink::Parquet {
+        (
+            "architectural",
+            "DeltaForge writes Parquet to S3 directly (its durable S3 sink, an \
+             object per 2,000-row batch); Debezium writes Avro to Kafka, and \
+             Confluent's S3 sink connector writes that topic to S3 as Parquet \
+             (2,000 rows per object, a partial one every second). Columns \
+             differ: DeltaForge's flat envelope, Debezium's nested one",
         )
     } else if debezium && cell.js == Js::Tag {
         (
@@ -907,6 +918,20 @@ impl Infra {
         };
         let s3 = s3_test_server::shared().await;
         s3.create_bucket(BUCKET).await.context("bucket")?;
+        // On the harness network too, for Kafka Connect's S3 sink.
+        let joined = std::process::Command::new("docker")
+            .args(["network", "connect", "--alias", S3_NAME, NETWORK, s3.id()])
+            .output()
+            .context("docker network connect")?;
+        if !joined.status.success()
+            && !String::from_utf8_lossy(&joined.stderr)
+                .contains("already exists")
+        {
+            bail!(
+                "attach the S3 server to {NETWORK}: {}",
+                String::from_utf8_lossy(&joined.stderr)
+            );
+        }
         let infra = Infra {
             _kafka: kafka,
             sr,
@@ -2051,6 +2076,10 @@ struct Measured {
     /// The operator step a crash needed before the restart: DeltaForge's
     /// store gate broken for this owner (Debezium needs none).
     gate_broken: Option<String>,
+    /// Parquet: the data objects the measured rows were written in, and
+    /// seconds until all but the last object's 2,000 rows were visible.
+    objects: Option<u64>,
+    bulk_s: Option<f64>,
     after_ddl_max_ms: Option<f64>,
     ddl_columns_ok: Option<bool>,
     /// State-store key-value reads in the measured window (PostgreSQL state
@@ -2089,7 +2118,7 @@ impl Measured {
             "lat_p99_ms": self.lat_p99_ms, "lat_max_ms": self.lat_max_ms,
             "first_row_s": self.first_row_s,
             "ddls": self.ddls, "after_ddl_max_ms": self.after_ddl_max_ms,
-            "restart_s": self.restart_s, "recovery_s": self.recovery_s, "gate_broken": self.gate_broken,
+            "restart_s": self.restart_s, "recovery_s": self.recovery_s, "gate_broken": self.gate_broken, "objects": self.objects, "bulk_s": self.bulk_s,
             "ddl_columns_ok": self.ddl_columns_ok,
             "kv_reads": self.kv_reads, "feedback_reads": self.feedback_reads,
             "feedback_staleness_s": self.feedback_staleness_s,
@@ -2198,8 +2227,8 @@ async fn run_inner(
         System::Debezium(p) => *p,
         System::DeltaForge(_) => debezium::Profile::Defaults,
     };
-    if dbz && (engine != Engine::Mysql || cell.sink == Sink::Parquet) {
-        bail!("not measured for Debezium: only MySQL to Kafka cells");
+    if dbz && engine != Engine::Mysql {
+        bail!("not measured for Debezium: only MySQL cells");
     }
     // Debezium writes each table to a topic of its own; DeltaForge all to one.
     // A routed cell's rows go to its two topics in both.
@@ -2275,6 +2304,12 @@ async fn run_inner(
 
     // Sink observation.
     let arrivals = Arc::new(Arrivals::default());
+    // Debezium's Parquet path writes the connector's topic first.
+    if dbz && cell.sink == Sink::Parquet {
+        for t in &topics {
+            create_topic(t).await?;
+        }
+    }
     let consumer = if cell.sink == Sink::Parquet {
         None
     } else {
@@ -2346,21 +2381,45 @@ async fn run_inner(
             &table_names(&ns, cell.tables),
             &format!("perf-{tag}"),
             cell.mode == Mode::Snapshot,
+            // Parquet goes through Kafka as Avro (`s3_sink`).
             match cell.sink {
-                Sink::Avro => debezium::Format::Avro(format!(
+                Sink::Avro | Sink::Parquet => debezium::Format::Avro(format!(
                     "http://{SCHEMA_REGISTRY_NAME}:8081"
                 )),
-                _ => debezium::Format::Json,
+                Sink::Json => debezium::Format::Json,
             },
             cell.js,
             rows,
             profile,
         )
     });
+    // Debezium to Parquet: its topic, written to S3 by the S3 sink connector
+    // as DeltaForge's durable S3 sink writes it (one object per 2,000-row
+    // batch).
+    let s3_sink = (dbz && cell.sink == Sink::Parquet).then(|| {
+        debezium::s3_sink(
+            &format!("{name}-s3"),
+            &topics,
+            &format!("http://{S3_NAME}:9000"),
+            BUCKET,
+            &prefix,
+            s3_test_server::ACCESS_KEY,
+            s3_test_server::SECRET_KEY,
+            &format!("http://{SCHEMA_REGISTRY_NAME}:8081"),
+            2_000,
+        )
+    });
     if let Some(c) = &connector {
         std::fs::create_dir_all(dir).ok();
         std::fs::write(
             dir.join("connector.json"),
+            serde_json::to_string_pretty(c).unwrap_or_default(),
+        )
+        .ok();
+    }
+    if let Some(c) = &s3_sink {
+        std::fs::write(
+            dir.join("s3-sink-connector.json"),
             serde_json::to_string_pretty(c).unwrap_or_default(),
         )
         .ok();
@@ -2373,6 +2432,9 @@ async fn run_inner(
                 .await
                 .map(|_| ()),
             Sut::Dbz(c) => {
+                if let Some(sink) = &s3_sink {
+                    c.create(sink).await?;
+                }
                 c.create(connector.as_ref().expect("a Debezium run")).await
             }
         }
@@ -2398,6 +2460,8 @@ async fn run_inner(
         }
     };
     let mut parquet_seen = BTreeMap::new();
+    // Parquet objects already there before the measured rows.
+    let mut objects0 = 0usize;
     let delivered = |seen: &mut BTreeMap<String, (u64, u64)>| {
         let arrivals = Arc::clone(&arrivals);
         let prefix = prefix.clone();
@@ -2533,6 +2597,7 @@ async fn run_inner(
             let (r, local) = delivered(&mut parquet_seen).await;
             parquet_seen = local;
             base = r?.0;
+            objects0 = parquet_seen.len();
             if matches!(
                 cell.mode,
                 Mode::Cdc | Mode::Catchup | Mode::Restart | Mode::Crash
@@ -2621,6 +2686,10 @@ async fn run_inner(
         // When the restarted system serves again (DeltaForge healthy with the
         // pipeline created; Kafka Connect answering).
         let mut restarted_at: Option<Instant> = None;
+        // Parquet: when every row but the last object's (2,000) was visible.
+        // A sink that lands its last partial object only on a later commit
+        // shows it as the gap to the full window.
+        let mut bulk_at: Option<Instant> = None;
         // DeltaForge after a crash: the store gate's owner released by the
         // operator step (counted in the recovery time).
         let mut gate_broken: Option<String> = None;
@@ -2638,6 +2707,12 @@ async fn run_inner(
             let (r, local) = delivered(&mut parquet_seen).await;
             parquet_seen = local;
             let (got, bytes) = r?;
+            if cell.sink == Sink::Parquet
+                && bulk_at.is_none()
+                && got >= want.saturating_sub(2_000)
+            {
+                bulk_at = Some(Instant::now());
+            }
             if cell.mode == Mode::Crash {
                 let distinct = arrivals.ids.lock().unwrap().len() as u64;
                 if crashed_at.is_some() && distinct >= base_ids + rows as u64 {
@@ -2689,6 +2764,11 @@ async fn run_inner(
                 Sut::Dbz(c) => {
                     if let Some(why) = c.failure(&name).await {
                         bail!("connector failed: {why}");
+                    }
+                    if s3_sink.is_some()
+                        && let Some(why) = c.failure(&format!("{name}-s3")).await
+                    {
+                        bail!("S3 sink connector failed: {why}");
                     }
                 }
             }
@@ -2892,6 +2972,9 @@ async fn run_inner(
             restart_s,
             recovery_s,
             gate_broken,
+            bulk_s: bulk_at.map(|at| at.duration_since(t0).as_secs_f64()),
+            objects: (cell.sink == Sink::Parquet)
+                .then(|| parquet_seen.len().saturating_sub(objects0) as u64),
             after_ddl_max_ms,
             ddl_columns_ok,
             kv_reads,
@@ -2928,7 +3011,12 @@ async fn run_inner(
                 .await
                 .ok();
         }
-        Sut::Dbz(c) => c.delete(&name).await,
+        Sut::Dbz(c) => {
+            c.delete(&name).await;
+            if s3_sink.is_some() {
+                c.delete(&format!("{name}-s3")).await;
+            }
+        }
     }
     let attr_log = match &process {
         Sut::Df(p) => Some(p.stderr()),

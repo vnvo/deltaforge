@@ -95,6 +95,13 @@ impl Connect {
                 )
                 .with_access_mode(AccessMode::ReadWrite),
             )
+            .with_mount(
+                Mount::bind_mount(
+                    extras.s3_sink.display().to_string(),
+                    "/kafka/connect/confluent-s3-sink",
+                )
+                .with_access_mode(AccessMode::ReadWrite),
+            )
             // JMX inside the container only, read by `counters`.
             .with_env_var("JMXPORT", JMX_PORT.to_string())
             .with_env_var("JMXHOST", "localhost")
@@ -593,6 +600,52 @@ pub fn mysql_connector(
         connector["config"]["snapshot.max.threads"] = json!("8");
     }
     connector
+}
+
+/// The Parquet path of a Debezium run: Confluent's S3 sink connector
+/// writing the connector's topic (Avro through `registry`) to `bucket` under
+/// `prefix`, `rows_per_object` rows per Parquet object as DeltaForge's
+/// durable S3 sink writes one object per batch (2,000 rows by default), and a
+/// partial object at least every second (DeltaForge's batch timer delivers a
+/// partial batch too).
+#[allow(clippy::too_many_arguments)]
+pub fn s3_sink(
+    name: &str,
+    topics: &[String],
+    endpoint: &str,
+    bucket: &str,
+    prefix: &str,
+    access_key: &str,
+    secret_key: &str,
+    registry: &str,
+    rows_per_object: usize,
+) -> Value {
+    json!({
+        "name": name,
+        "config": {
+            "connector.class": "io.confluent.connect.s3.S3SinkConnector",
+            "tasks.max": "1",
+            "topics": topics.join(","),
+            "store.url": endpoint,
+            "s3.bucket.name": bucket,
+            "s3.region": "us-east-1",
+            "s3.path.style.access.enabled": "true",
+            "aws.access.key.id": access_key,
+            "aws.secret.access.key": secret_key,
+            "storage.class": "io.confluent.connect.s3.storage.S3Storage",
+            "format.class": "io.confluent.connect.s3.format.parquet.ParquetFormat",
+            "parquet.codec": "snappy",
+            "topics.dir": prefix,
+            "flush.size": rows_per_object.to_string(),
+            "rotate.schedule.interval.ms": "1000",
+            "timezone": "UTC",
+            "schema.compatibility": "NONE",
+            "key.converter": "io.confluent.connect.avro.AvroConverter",
+            "key.converter.schema.registry.url": registry,
+            "value.converter": "io.confluent.connect.avro.AvroConverter",
+            "value.converter.schema.registry.url": registry,
+        }
+    })
 }
 
 /// The JavaScript a cell runs.
