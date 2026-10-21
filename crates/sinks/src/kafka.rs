@@ -146,6 +146,9 @@ impl ClientContext for KafkaMetricsContext {
 /// messages) in one burst, so rdkafka batches naturally without needing a long
 /// linger wait. Higher values (20ms+) bottleneck throughput on small batches.
 const DEFAULT_LINGER_MS: &str = "5";
+/// The most threads an Avro batch is encoded on.
+const MAX_ENCODE_WORKERS: usize = 64;
+
 /// Default linger time of an Avro sink (ms). Its batch is encoded in full
 /// before any record is enqueued, so linger has nothing left to gather:
 /// every batch's requests are already full (as many records per request at
@@ -223,8 +226,12 @@ impl KafkaSink {
         source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
         creds: &crate::ResolvedSinkCreds,
     ) -> anyhow::Result<Self> {
-        if cfg.encode_workers == Some(0) {
-            anyhow::bail!("encode_workers must be at least 1");
+        if let Some(n) = cfg.encode_workers
+            && !(1..=MAX_ENCODE_WORKERS).contains(&n)
+        {
+            anyhow::bail!(
+                "encode_workers must be from 1 to {MAX_ENCODE_WORKERS} (got {n})"
+            );
         }
         let mut client_cfg = ClientConfig::new();
 
@@ -1501,27 +1508,46 @@ mod tests {
 
         /// A registry that gives every distinct schema the next id.
         async fn registry() -> String {
-            let ids = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            registry_counting(false).await.0
+        }
+
+        /// [`registry`], refusing every registration (HTTP 500) when
+        /// `refuse`, with the number of registration requests it received.
+        async fn registry_counting(
+            refuse: bool,
+        ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            type Ids = Arc<std::sync::Mutex<Vec<String>>>;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&calls);
+            let ids: Ids = Arc::default();
+            let register = move |axum::extract::State(ids): axum::extract::State<Ids>,
+                                 axum::Json(body): axum::Json<serde_json::Value>| {
+                let counted = Arc::clone(&counted);
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    if refuse {
+                        return (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            axum::Json(json!({"error_code": 50001, "message": "refused"})),
+                        );
+                    }
+                    let schema = body["schema"].as_str().unwrap_or("").to_string();
+                    let mut ids = ids.lock().unwrap();
+                    let id = match ids.iter().position(|s| *s == schema) {
+                        Some(i) => i,
+                        None => {
+                            ids.push(schema);
+                            ids.len() - 1
+                        }
+                    };
+                    (axum::http::StatusCode::OK, axum::Json(json!({ "id": id + 1 })))
+                }
+            };
             let app = axum::Router::new()
                 .route(
                     "/subjects/{subject}/versions",
-                    axum::routing::post(
-                        |axum::extract::State(ids): axum::extract::State<
-                            Arc<std::sync::Mutex<Vec<String>>>,
-                        >,
-                         axum::Json(body): axum::Json<serde_json::Value>| async move {
-                            let schema = body["schema"].as_str().unwrap_or("").to_string();
-                            let mut ids = ids.lock().unwrap();
-                            let id = match ids.iter().position(|s| *s == schema) {
-                                Some(i) => i,
-                                None => {
-                                    ids.push(schema);
-                                    ids.len() - 1
-                                }
-                            };
-                            axum::Json(json!({ "id": id + 1 }))
-                        },
-                    ),
+                    axum::routing::post(register),
                 )
                 .with_state(ids);
             let listener =
@@ -1530,7 +1556,7 @@ mod tests {
             tokio::spawn(
                 async move { axum::serve(listener, app).await.unwrap() },
             );
-            url
+            (url, calls)
         }
 
         /// The envelope schema of `shop.orders` (`id int`, `name
@@ -1702,7 +1728,7 @@ mod tests {
         /// One thread (the default) prepares nothing ahead, and zero is
         /// refused.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn one_encode_worker_prepares_on_the_delivery_task_and_zero_is_refused()
+        async fn one_encode_worker_prepares_on_the_delivery_task_and_out_of_range_counts_are_refused()
          {
             let url = registry().await;
             let events = batch(10, -1);
@@ -1718,8 +1744,79 @@ mod tests {
                     .prepare_parallel(&events)
                     .is_empty()
             );
-            let err = sink(&url, Some(0)).err().expect("zero refused");
-            assert!(err.to_string().contains("encode_workers"));
+            for refused in [0, MAX_ENCODE_WORKERS + 1] {
+                let err = sink(&url, Some(refused)).err().expect("refused");
+                assert!(err.to_string().contains("encode_workers"), "{err}");
+            }
+            assert!(sink(&url, Some(MAX_ENCODE_WORKERS)).is_ok());
+        }
+
+        /// A schema the registry refuses fails the batch with several
+        /// threads as with one: registered from the delivery task only (as
+        /// many requests as with one thread, none concurrent), and nothing of
+        /// the batch enqueued.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refused_registration_fails_the_batch_from_one_thread_and_enqueues_nothing()
+         {
+            let events = batch(400, -1);
+            let mut seen = Vec::new();
+            for workers in [None, Some(4)] {
+                let (url, calls) = registry_counting(true).await;
+                let sink = sink(&url, workers).unwrap();
+                let err =
+                    sink.send_batch(&events).await.err().expect("refused");
+                assert!(!err.is_dlq_eligible(), "{err}");
+                assert_eq!(
+                    sink.producer.in_flight_count(),
+                    0,
+                    "nothing enqueued"
+                );
+                seen.push((
+                    calls.load(std::sync::atomic::Ordering::SeqCst),
+                    err.to_string().replace(&url, "<registry>"),
+                ));
+            }
+            assert!(seen[0].0 >= 1);
+            assert_eq!(
+                seen[0], seen[1],
+                "the same requests and error with four threads"
+            );
+        }
+
+        /// A delivery cancelled while its batch is being encoded on several
+        /// threads stops cleanly (no panic; every encoding thread is joined
+        /// before the delivery task can be dropped) and the sink prepares
+        /// later batches exactly as before.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_delivery_cancelled_while_encoding_leaves_the_sink_usable() {
+            let url = registry().await;
+            let events = batch(20_000, -1);
+            let four = Arc::new(sink(&url, Some(4)).unwrap());
+            four.encode_event(&events[0], "orders").await.unwrap();
+            for delay in [0_u64, 1, 5] {
+                let (sink, batch) = (Arc::clone(&four), events.clone());
+                let task =
+                    tokio::spawn(async move { sink.send_batch(&batch).await });
+                tokio::time::sleep(std::time::Duration::from_millis(delay))
+                    .await;
+                task.abort();
+                match task.await {
+                    Err(e) => assert!(e.is_cancelled(), "{e}"),
+                    Ok(r) => panic!(
+                        "an unreachable broker cannot acknowledge: {:?}",
+                        r.map(|_| ())
+                    ),
+                }
+            }
+            let one = sink(&url, None).unwrap();
+            let small = batch(64, -1);
+            for (e, got) in small.iter().zip(four.prepare_parallel(&small)) {
+                let (payload, ..) = got.expect("prepared").unwrap();
+                assert_eq!(
+                    payload,
+                    one.encode_event(e, "orders").await.unwrap()
+                );
+            }
         }
     }
 
