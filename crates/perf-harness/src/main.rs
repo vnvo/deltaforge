@@ -43,6 +43,7 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 mod debezium;
 mod extras;
+mod threads;
 
 const NETWORK: &str = "df-perf-net";
 /// MySQL's name on the harness network (Kafka Connect reaches it there).
@@ -1640,6 +1641,10 @@ struct Measured {
     pid: Option<u32>,
     binary: Option<String>,
     binary_sha256: Option<String>,
+    /// Per thread group over the window (see `threads`).
+    threads: Option<Value>,
+    /// An instrumented runner's own attribution (its `ATTR {json}` line).
+    attribution: Option<Value>,
 }
 
 impl Measured {
@@ -1663,6 +1668,7 @@ impl Measured {
             "feedback_staleness_s": self.feedback_staleness_s,
             "pid": self.pid, "binary": self.binary,
             "binary_sha256": self.binary_sha256,
+            "threads": self.threads, "attribution": self.attribution,
             // Rates over the window (the delivery counters' window adds
             // only an idle tail).
             "cpu_cores": (self.secs > 0.0).then(|| self.cpu_secs / self.secs),
@@ -1965,8 +1971,15 @@ async fn run_inner(
             )
         };
         let (cpu0, db0, reads0, fb0, dc0);
+        // The process tree whose threads are attributed.
+        let root_pid = match &process {
+            Sut::Df(p) => Some(p.pid),
+            Sut::Dbz(c) => c.pid(),
+        };
+        let threads0;
         if cell.mode == Mode::Snapshot {
             (cpu0, db0, reads0, fb0, dc0) = window_start().await;
+            threads0 = root_pid.map(threads::Snapshot::take);
             t0 = Instant::now();
             create().await?;
         } else {
@@ -2024,6 +2037,7 @@ async fn run_inner(
                 }
                 infra.exec(engine, &[last]).await?;
                 (cpu0, db0, reads0, fb0, dc0) = window_start().await;
+                threads0 = root_pid.map(threads::Snapshot::take);
                 t0 = Instant::now();
                 control("resume").await?;
             } else {
@@ -2033,6 +2047,7 @@ async fn run_inner(
                 let load = cell.load;
                 let mut sql = Sql::open(infra, engine).await?;
                 (cpu0, db0, reads0, fb0, dc0) = window_start().await;
+                threads0 = root_pid.map(threads::Snapshot::take);
                 t0 = Instant::now();
                 let mut tick = tokio::time::interval(Duration::from_micros(
                     1_000_000 / u64::from(load.rate.max(1)),
@@ -2123,6 +2138,12 @@ async fn run_inner(
         let secs = t_end.duration_since(t0).as_secs_f64();
         let cpu = process.cpu_secs() - cpu0.0;
         let sys = process.sys_secs() - cpu0.1;
+        let threads = match (root_pid, &threads0) {
+            (Some(pid), Some(t0)) => {
+                Some(threads::Snapshot::take(pid).since(t0))
+            }
+            _ => None,
+        };
         let k1 = process.kernel_counts();
         let kernel: [u64; 5] =
             std::array::from_fn(|i| k1[i].saturating_sub(cpu0.2[i]));
@@ -2226,6 +2247,8 @@ async fn run_inner(
             pid: None,
             binary: None,
             binary_sha256: None,
+            threads,
+            attribution: None,
         })
     }
     .await;
@@ -2254,7 +2277,19 @@ async fn run_inner(
         }
         Sut::Dbz(c) => c.delete(&name).await,
     }
+    let attr_log = match &process {
+        Sut::Df(p) => Some(p.stderr.clone()),
+        Sut::Dbz(_) => None,
+    };
     let allocs = process.stop().await;
+    let attribution = attr_log
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .and_then(|t| {
+            t.lines()
+                .rev()
+                .find_map(|l| l.strip_prefix("ATTR "))
+                .and_then(|j| serde_json::from_str::<Value>(j).ok())
+        });
     if let Some(c) = consumer {
         c.abort();
     }
@@ -2283,6 +2318,7 @@ async fn run_inner(
     }
     let mut m = result?;
     (m.pid, m.binary, m.binary_sha256) = identity;
+    m.attribution = attribution;
     m.allocs = match (allocs, idle_allocs) {
         (Some(a), Some(i)) => Some(a.saturating_sub(i)),
         (a, _) => a,

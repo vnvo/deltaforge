@@ -288,6 +288,20 @@ impl Connect {
 
     /// The worker's anonymous (heap and stack) memory, KiB: its resident
     /// memory without the page cache.
+    /// The worker container's main process (host pid).
+    pub fn pid(&self) -> Option<u32> {
+        let out = std::process::Command::new("docker")
+            .args([
+                "inspect",
+                "--format",
+                "{{.State.Pid}}",
+                self.container.id(),
+            ])
+            .output()
+            .ok()?;
+        String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+    }
+
     pub fn rss_kib(&self) -> u64 {
         Self::stat(&self.cgroup("memory.stat"), "anon ") / 1024
     }
