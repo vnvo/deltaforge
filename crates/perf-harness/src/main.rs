@@ -43,6 +43,7 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 mod debezium;
 mod extras;
+mod layout;
 mod threads;
 
 const NETWORK: &str = "df-perf-net";
@@ -78,9 +79,14 @@ const SCHEMA_REGISTRY_NAME: &str = "df-perf-sr";
 
 #[derive(Parser, Debug)]
 struct Args {
-    /// `label=path` of a DeltaForge release binary; exactly two.
-    #[arg(long = "binary", required = true)]
+    /// `label=path` of a DeltaForge release binary, or `label=debezium`;
+    /// exactly two (or two `--layout`).
+    #[arg(long = "binary")]
     binaries: Vec<String>,
+    /// `label=dir` of a version's seeded links (`layout-links.sh`); exactly
+    /// two, compared seed by seed and aggregated over every seed.
+    #[arg(long = "layout")]
+    layouts: Vec<String>,
     /// Output directory.
     #[arg(long)]
     out: PathBuf,
@@ -248,6 +254,25 @@ impl Cell {
             }
         }
         id
+    }
+}
+
+/// Whether a cell compares the same thing in both systems. DeltaForge
+/// against DeltaForge always does; against Debezium a cell is `direct` when
+/// both run the same workload to equivalent output (their envelopes differ
+/// in bytes, which is reported), and `architectural` when the systems do
+/// the work in different ways, with the reason.
+fn comparison(cell: &Cell, debezium: bool) -> (&'static str, &'static str) {
+    if debezium && cell.js {
+        (
+            "architectural",
+            "DeltaForge runs a JavaScript batch processor that adds a field to \
+             every row; Debezium evaluates a JavaScript condition per record \
+             (its scripting Filter transformation, GraalJS interpreted on its \
+             image's OpenJDK) and adds nothing",
+        )
+    } else {
+        ("direct", "")
     }
 }
 
@@ -1855,6 +1880,12 @@ async fn run_inner(
         &prefix,
         sink_extra,
     );
+    // The run's exact configuration, beside its results.
+    std::fs::create_dir_all(dir).ok();
+    std::fs::write(
+        dir.join("pipeline.json"),
+        serde_json::to_vec_pretty(&spec)?,
+    )?;
 
     let state_db = format!("st_{ns}");
     let state_dsn = if infra.state.is_some() {
@@ -2489,21 +2520,105 @@ async fn main() -> Result<()> {
             Ok((l.to_string(), system))
         })
         .collect::<Result<_>>()?;
-    if binaries.len() != 2 {
-        bail!("exactly two binaries");
+    let layouts: Vec<(String, layout::Manifest)> = args
+        .layouts
+        .iter()
+        .map(|l| {
+            let (label, dir) = l
+                .split_once('=')
+                .ok_or_else(|| anyhow!("--layout label=dir"))?;
+            Ok((label.to_string(), layout::load(Path::new(dir))?))
+        })
+        .collect::<Result<_>>()?;
+    match (binaries.len(), layouts.len()) {
+        (2, 0) | (0, 2) => {}
+        _ => bail!("exactly two --binary, or exactly two --layout"),
     }
     std::fs::create_dir_all(&args.out)?;
+    std::fs::write(
+        args.out.join("invocation.json"),
+        serde_json::to_vec_pretty(&invocation(&args, &layouts))?,
+    )?;
     let infra = Infra::start(args.state_store == "postgres").await?;
-    let outcome = measure(&args, &binaries, &infra).await;
+    let outcome = if layouts.is_empty() {
+        measure(&args, &binaries, &infra, &args.out).await
+    } else {
+        // Seed by seed, the same workload order for each; then over all.
+        let ((la, ma), (lb, mb)) = (&layouts[0], &layouts[1]);
+        let seeds = layout::seeds(ma, mb)?;
+        let mut outcome = Ok(());
+        for (i, seed) in seeds.iter().enumerate() {
+            let pair = [
+                (la.clone(), System::DeltaForge(ma.links[i].1.clone())),
+                (lb.clone(), System::DeltaForge(mb.links[i].1.clone())),
+            ];
+            eprintln!("layout seed {seed} ({}/{})", i + 1, seeds.len());
+            outcome = measure(
+                &args,
+                &pair,
+                &infra,
+                &args.out.join(format!("seed-{seed}")),
+            )
+            .await;
+            if outcome.is_err() {
+                break;
+            }
+        }
+        outcome.and_then(|_| {
+            layout::aggregate(&args.out, (la, &ma.rev), (lb, &mb.rev), &seeds)?;
+            eprintln!(
+                "layout summary: {}",
+                args.out.join("layout-summary.md").display()
+            );
+            Ok(())
+        })
+    };
     infra.cleanup();
     outcome
+}
+
+/// What an invocation ran: its arguments, the pinned images and artifacts,
+/// the harness's own revision, the host, and each layout's links.
+fn invocation(args: &Args, layouts: &[(String, layout::Manifest)]) -> Value {
+    let cmd = |c: &str, a: &[&str]| {
+        std::process::Command::new(c)
+            .args(a)
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let cpu = std::fs::read_to_string("/proc/cpuinfo").ok().and_then(|t| {
+        t.lines()
+            .find_map(|l| l.strip_prefix("model name"))
+            .map(|v| v.trim_start_matches([' ', '\t', ':']).to_string())
+    });
+    json!({
+        "args": format!("{args:?}"),
+        "harness_rev": cmd("git", &["rev-parse", "HEAD"]),
+        "harness_tree_clean": cmd("git", &["status", "--porcelain"]).map(|s| s.is_empty()),
+        "images": {
+            "mysql": format!("{}:{}", MYSQL_IMAGE.0, MYSQL_IMAGE.1),
+            "postgres": format!("{}:{}", POSTGRES_IMAGE.0, POSTGRES_IMAGE.1),
+            "kafka": format!("{}:{}", KAFKA_IMAGE.0, KAFKA_IMAGE.1),
+            "schema_registry": format!("{}:{}", SCHEMA_REGISTRY_IMAGE.0, SCHEMA_REGISTRY_IMAGE.1),
+            "kafka_connect_debezium": format!("{}:{}", debezium::CONNECT_IMAGE.0, debezium::CONNECT_IMAGE.1),
+        },
+        "debezium_artifacts": extras::pins(),
+        "host": {"cpu": cpu, "kernel": cmd("uname", &["-r"]), "cpus": cmd("nproc", &[])},
+        "layouts": layouts.iter().map(|(label, m)| json!({
+            "label": label, "rev": m.rev,
+            "links": m.links.iter().map(|(s, p, h)| json!({"seed": s, "path": p, "sha256": h})).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })
 }
 
 async fn measure(
     args: &Args,
     binaries: &[(String, System)],
     infra: &Infra,
+    out: &Path,
 ) -> Result<()> {
+    std::fs::create_dir_all(out)?;
     let cells: Vec<Cell> = matrix()
         .into_iter()
         .filter(|c| {
@@ -2532,7 +2647,7 @@ async fn measure(
             idle.insert(label.clone(), None);
             continue;
         };
-        let dir = args.out.join(format!("idle-{label}"));
+        let dir = out.join(format!("idle-{label}"));
         let p = Process::start(bin, &dir, None).await?;
         tokio::time::sleep(Duration::from_secs(3)).await;
         idle.insert(label.clone(), p.stop().await);
@@ -2572,7 +2687,7 @@ async fn measure(
                     cell,
                     rows,
                     &tag,
-                    &args.out.join("warmup").join(&tag),
+                    &out.join("warmup").join(&tag),
                     false,
                     false,
                     DF_SINK.get().and_then(|m| m.get(label.as_str())),
@@ -2594,7 +2709,7 @@ async fn measure(
     let mut log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(args.out.join("runs.jsonl"))?;
+        .open(out.join("runs.jsonl"))?;
     let mut results: BTreeMap<(String, String), Vec<Measured>> =
         BTreeMap::new();
     let mut seq = 0usize;
@@ -2609,7 +2724,7 @@ async fn measure(
                 seq += 1;
                 let rows = ((cell.rows as f64 * args.scale) as usize).max(100);
                 let tag = format!("{}-{}-r{rep}-{seq}", cell.id(), label);
-                let dir = args.out.join("runs").join(&tag);
+                let dir = out.join("runs").join(&tag);
                 let m = run_once(
                     infra,
                     &store,
@@ -2664,9 +2779,12 @@ async fn measure(
 
     // Summary: medians per cell and version, and B/A ratios.
     let (a, b) = (&binaries[0].0, &binaries[1].0);
+    let debezium = binaries
+        .iter()
+        .any(|(_, s)| matches!(s, System::Debezium(_)));
     let mut md = format!(
-        "| cell | {a} rows/s | {b} rows/s | {b}/{a} | cpu s/100k {a} | {b} | rss MiB {a} | {b} | allocs/row {a} | {b} | bytes/row {a} | {b} | db cpu s {a} | {b} | p50/p99 ms {a} | {b} | failures | sys s/100k {a} | {b} |\n|{}\n",
-        "---|".repeat(20)
+        "| cell | comparison | {a} rows/s | {b} rows/s | {b}/{a} | cpu s/100k {a} | {b} | rss MiB {a} | {b} | allocs/row {a} | {b} | bytes/row {a} | {b} | db cpu s {a} | {b} | p50/p99 ms {a} | {b} | failures | sys s/100k {a} | {b} |\n|{}\n",
+        "---|".repeat(21)
     );
     for cell in &cells {
         let get = |l: &str| {
@@ -2714,8 +2832,9 @@ async fn measure(
         };
         let failures = ra.len() - oa.len() + rb.len() - ob.len();
         md.push_str(&format!(
-            "| {} | {} | {} | {ratio} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {failures} | {} | {} |\n",
+            "| {} | {} | {} | {} | {ratio} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {failures} | {} | {} |\n",
             cell.id(),
+            comparison(cell, debezium).0,
             f(thr(&oa), 0), f(thr(&ob), 0),
             f(cpu(&oa), 2), f(cpu(&ob), 2),
             f(rss(&oa), 0), f(rss(&ob), 0),
@@ -2726,9 +2845,25 @@ async fn measure(
             f(sys(&oa), 2), f(sys(&ob), 2),
         ));
     }
-    std::fs::write(args.out.join("summary.md"), md)?;
+    // Why each architectural comparison is one.
+    let notes: Vec<String> = cells
+        .iter()
+        .filter(|c| comparison(c, debezium).0 == "architectural")
+        .map(|c| format!("- `{}`: {}\n", c.id(), comparison(c, debezium).1))
+        .collect();
+    if !notes.is_empty() {
+        md.push_str("\nArchitectural comparisons (not like for like):\n\n");
+        md.push_str(&notes.concat());
+    }
+    md.push_str(
+        "\nRaw results: `runs.jsonl` (one line per run), each run's output \
+         under `runs/<cell>-<label>-r<rep>-<seq>/` (its pipeline spec or \
+         connector configuration, logs); the invocation in \
+         `invocation.json`.\n",
+    );
+    std::fs::write(out.join("summary.md"), md)?;
     if let Some(c) = connect {
-        c.stop(&args.out.join("connect.log")).await;
+        c.stop(&out.join("connect.log")).await;
     }
 
     // WAL feedback: state-store reads per million rows and staleness.
@@ -2780,8 +2915,8 @@ async fn measure(
             ));
         }
     }
-    std::fs::write(args.out.join("feedback.md"), fb)?;
-    eprintln!("summary: {}", args.out.join("summary.md").display());
+    std::fs::write(out.join("feedback.md"), fb)?;
+    eprintln!("summary: {}", out.join("summary.md").display());
     Ok(())
 }
 

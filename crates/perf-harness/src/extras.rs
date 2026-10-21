@@ -79,6 +79,17 @@ const GRAALJS: [(&str, &str); 13] = [
     ),
 ];
 
+/// The pinned artifacts, for an invocation's record.
+pub fn pins() -> serde_json::Value {
+    serde_json::json!({
+        "avro_converter": {"url": AVRO_CONVERTER.0, "sha256": AVRO_CONVERTER.1},
+        "graaljs": {
+            "version": GRAALJS_VERSION,
+            "jars": GRAALJS.iter().map(|(c, h)| serde_json::json!({"artifact": c, "sha256": h})).collect::<Vec<_>>(),
+        },
+    })
+}
+
 /// Host directories to mount into the worker.
 pub struct Extras {
     /// The Avro converter's jars (a Kafka Connect plugin directory).
