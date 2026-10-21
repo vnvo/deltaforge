@@ -56,7 +56,9 @@ const JMX_PORT: u16 = 9012;
 /// A running Kafka Connect worker.
 pub struct Connect {
     container: ContainerAsync<GenericImage>,
-    rest: String,
+    /// Its REST address (resolved again after a restart: the container's
+    /// host port can change).
+    rest: std::sync::Mutex<String>,
 }
 
 impl Connect {
@@ -144,7 +146,10 @@ impl Connect {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        Ok(Connect { container, rest })
+        Ok(Connect {
+            container,
+            rest: std::sync::Mutex::new(rest),
+        })
     }
 
     async fn call(
@@ -156,7 +161,8 @@ impl Connect {
         let c = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()?;
-        let mut req = c.request(method, format!("{}{path}", self.rest));
+        let rest = self.rest.lock().unwrap().clone();
+        let mut req = c.request(method, format!("{rest}{path}"));
         if let Some(b) = body {
             req = req.json(b);
         }
@@ -224,6 +230,70 @@ impl Connect {
                 bail!("connector {name} never reached {state}");
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Stop a connector (Kafka Connect's `stop`: its tasks shut down and
+    /// commit their offsets; `resume` starts it again from them).
+    pub async fn stop_connector(&self, name: &str) -> Result<()> {
+        self.call(
+            reqwest::Method::PUT,
+            &format!("/connectors/{name}/stop"),
+            None,
+        )
+        .await?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if let Ok((c, tasks, _)) = self.status(name).await
+                && c == "STOPPED"
+                && tasks.is_empty()
+            {
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                bail!("connector {name} never stopped");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Stop the worker container (a graceful shutdown: its tasks commit
+    /// their offsets).
+    pub async fn down(&self) -> Result<()> {
+        let ok = std::process::Command::new("docker")
+            .args(["stop", "--time", "60", self.container.id()])
+            .status()?
+            .success();
+        if !ok {
+            bail!("docker stop failed");
+        }
+        Ok(())
+    }
+
+    /// Start the worker again and wait until its REST API answers; its
+    /// connectors start from their stored configuration and offsets.
+    pub async fn up(&self) -> Result<()> {
+        let ok = std::process::Command::new("docker")
+            .args(["start", self.container.id()])
+            .status()?
+            .success();
+        if !ok {
+            bail!("docker start failed");
+        }
+        let port = self.container.get_host_port_ipv4(8083).await?;
+        let rest = format!("http://127.0.0.1:{port}");
+        *self.rest.lock().unwrap() = rest.clone();
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            if let Ok(r) = reqwest::get(format!("{rest}/connectors")).await
+                && r.status().is_success()
+            {
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                bail!("Kafka Connect never answered after a restart");
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 

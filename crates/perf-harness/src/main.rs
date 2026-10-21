@@ -24,7 +24,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -157,6 +157,16 @@ enum Mode {
     Snapshot,
     /// Single-row transactions at a steady rate (Kafka sinks).
     Latency,
+    /// Catch-up after the pipeline was down: stopped (DeltaForge's pipeline
+    /// `stop`, Kafka Connect's connector `stop`) while N rows are written,
+    /// then resumed from its checkpoint.
+    Catchup,
+    /// Catch-up after the process was down: the DeltaForge process or the
+    /// Kafka Connect worker container stopped while N rows are written,
+    /// then started again (DeltaForge's pipeline created again on the same
+    /// state store; Kafka Connect's connectors from their stored
+    /// configuration and offsets).
+    Restart,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,6 +244,8 @@ impl Cell {
                 Mode::Cdc => "cdc",
                 Mode::Snapshot => "snap",
                 Mode::Latency => "lat",
+                Mode::Catchup => "catchup",
+                Mode::Restart => "restart",
             },
             match self.sink {
                 Sink::Json => "json",
@@ -381,6 +393,24 @@ fn matrix() -> Vec<Cell> {
                 tables: 1,
                 intra: None,
             });
+        }
+        // Catch-up after the pipeline, and after the process, was down
+        // (MySQL to Kafka JSON).
+        if engine == Engine::Mysql {
+            for mode in [Mode::Catchup, Mode::Restart] {
+                cells.push(Cell {
+                    engine,
+                    mode,
+                    sink: Sink::Json,
+                    shape: Shape::Narrow,
+                    batch: None,
+                    js: false,
+                    rows: rows_for(Shape::Narrow),
+                    load: Load::DEFAULT,
+                    tables: 1,
+                    intra: None,
+                });
+            }
         }
         // Parallel snapshots: 8 tables copied in parallel, and one table
         // read by DeltaForge's parallel chunk readers (MySQL to Kafka JSON).
@@ -1131,13 +1161,20 @@ impl Sut<'_> {
 }
 
 struct Process {
-    child: tokio::process::Child,
+    /// What it was launched with (a restart launches the same).
+    binary: PathBuf,
+    dir: PathBuf,
+    state_dsn: Option<String>,
+    /// The running launch (none while down).
+    child: tokio::sync::Mutex<Option<tokio::process::Child>>,
     /// The runner's own process: the one listening on the API address (the
     /// started command itself, or a process it runs, e.g. under a wrapper).
-    pid: u32,
+    pid: AtomicU32,
     /// The executable that process runs.
-    exe: PathBuf,
-    stderr: PathBuf,
+    exe: std::sync::Mutex<PathBuf>,
+    /// The latest launch's standard error.
+    stderr: std::sync::Mutex<PathBuf>,
+    launches: AtomicU32,
 }
 
 /// Refuse to start a runner while anything answers on the API address or
@@ -1225,74 +1262,135 @@ fn sha256(path: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Launch a runner on `dir`'s state store (or `state_dsn`) and wait until
+/// it serves its API; the API must be served by the process just started
+/// (or one it runs). Its standard error goes to `stderr`.
+async fn launch(
+    binary: &Path,
+    dir: &Path,
+    state_dsn: Option<&str>,
+    stderr: &Path,
+) -> Result<(tokio::process::Child, u32, PathBuf)> {
+    std::fs::create_dir_all(dir)?;
+    ports_free().await?;
+    let mut cmd = tokio::process::Command::new(binary);
+    cmd.args(["--api-addr", API, "--metrics-addr", METRICS]);
+    match state_dsn {
+        Some(dsn) => {
+            cmd.args(["--storage-backend", "postgres", "--storage-dsn", dsn])
+        }
+        None => cmd.arg("--storage-path").arg(dir.join("state.db")),
+    };
+    let mut child = cmd
+        .env("RUST_LOG", "warn")
+        .env("_RJEM_MALLOC_CONF", "stats_print:true")
+        .stdout(std::fs::File::create(stderr.with_extension("out"))?)
+        .stderr(std::fs::File::create(stderr)?)
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("start {}", binary.display()))?;
+    let child_pid = child.id().ok_or_else(|| anyhow!("no pid"))?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            bail!(
+                "{} exited before becoming healthy: {status}",
+                binary.display()
+            );
+        }
+        if reqwest::get(format!("http://{API}/health"))
+            .await
+            .is_ok_and(|r| r.status().is_success())
+        {
+            break;
+        }
+        if Instant::now() > deadline {
+            bail!("{} never became healthy", binary.display());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let api_port: u16 = API
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse().ok())
+        .unwrap_or(0);
+    let pid = listener_pid(api_port)
+        .ok_or_else(|| anyhow!("no process found listening on {API}"))?;
+    if !descends_from(pid, child_pid) {
+        bail!(
+            "{API} is served by pid {pid}, not by the started runner ({child_pid})"
+        );
+    }
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe"))?;
+    Ok((child, pid, exe))
+}
+
 impl Process {
     async fn start(
         binary: &Path,
         dir: &Path,
         state_dsn: Option<&str>,
     ) -> Result<Process> {
-        std::fs::create_dir_all(dir)?;
-        ports_free().await?;
         let stderr = dir.join("stderr.log");
-        let mut cmd = tokio::process::Command::new(binary);
-        cmd.args(["--api-addr", API, "--metrics-addr", METRICS]);
-        match state_dsn {
-            Some(dsn) => cmd.args([
-                "--storage-backend",
-                "postgres",
-                "--storage-dsn",
-                dsn,
-            ]),
-            None => cmd.arg("--storage-path").arg(dir.join("state.db")),
-        };
-        let mut child = cmd
-            .env("RUST_LOG", "warn")
-            .env("_RJEM_MALLOC_CONF", "stats_print:true")
-            .stdout(std::fs::File::create(dir.join("stdout.log"))?)
-            .stderr(std::fs::File::create(&stderr)?)
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("start {}", binary.display()))?;
-        let child_pid = child.id().ok_or_else(|| anyhow!("no pid"))?;
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            if let Some(status) = child.try_wait()? {
-                bail!(
-                    "{} exited before becoming healthy: {status}",
-                    binary.display()
-                );
-            }
-            if reqwest::get(format!("http://{API}/health"))
-                .await
-                .is_ok_and(|r| r.status().is_success())
-            {
-                break;
-            }
-            if Instant::now() > deadline {
-                bail!("{} never became healthy", binary.display());
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        // The API must be served by the process just started (or one it
-        // runs), never by another.
-        let api_port: u16 = API
-            .rsplit_once(':')
-            .and_then(|(_, p)| p.parse().ok())
-            .unwrap_or(0);
-        let pid = listener_pid(api_port)
-            .ok_or_else(|| anyhow!("no process found listening on {API}"))?;
-        if !descends_from(pid, child_pid) {
-            bail!(
-                "{API} is served by pid {pid}, not by the started runner ({child_pid})"
-            );
-        }
-        let exe = std::fs::read_link(format!("/proc/{pid}/exe"))?;
+        let (child, pid, exe) = launch(binary, dir, state_dsn, &stderr).await?;
         Ok(Process {
-            child,
-            pid,
-            exe,
-            stderr,
+            binary: binary.to_path_buf(),
+            dir: dir.to_path_buf(),
+            state_dsn: state_dsn.map(str::to_string),
+            child: tokio::sync::Mutex::new(Some(child)),
+            pid: AtomicU32::new(pid),
+            exe: std::sync::Mutex::new(exe),
+            stderr: std::sync::Mutex::new(stderr),
+            launches: AtomicU32::new(1),
         })
+    }
+
+    fn pid(&self) -> u32 {
+        self.pid.load(Ordering::SeqCst)
+    }
+
+    fn exe(&self) -> PathBuf {
+        self.exe.lock().unwrap().clone()
+    }
+
+    fn stderr(&self) -> PathBuf {
+        self.stderr.lock().unwrap().clone()
+    }
+
+    /// Stop the runner (SIGTERM, then SIGKILL after 30 s) and wait for it.
+    async fn down(&self) {
+        let pid = self.pid().to_string();
+        std::process::Command::new("kill")
+            .args(["-TERM", &pid])
+            .output()
+            .ok();
+        let mut guard = self.child.lock().await;
+        if let Some(child) = guard.as_mut()
+            && tokio::time::timeout(Duration::from_secs(30), child.wait())
+                .await
+                .is_err()
+        {
+            std::process::Command::new("kill")
+                .args(["-KILL", &pid])
+                .output()
+                .ok();
+            child.kill().await.ok();
+        }
+        *guard = None;
+    }
+
+    /// Launch the runner again, as it was first launched (the same binary
+    /// and state store), with the same checks.
+    async fn up(&self) -> Result<()> {
+        let n = self.launches.fetch_add(1, Ordering::SeqCst) + 1;
+        let stderr = self.dir.join(format!("stderr-{n}.log"));
+        let (child, pid, exe) =
+            launch(&self.binary, &self.dir, self.state_dsn.as_deref(), &stderr)
+                .await?;
+        *self.child.lock().await = Some(child);
+        self.pid.store(pid, Ordering::SeqCst);
+        *self.exe.lock().unwrap() = exe;
+        *self.stderr.lock().unwrap() = stderr;
+        Ok(())
     }
 
     /// utime + stime, seconds.
@@ -1306,7 +1404,7 @@ impl Process {
     /// context switches, and the process's minor page faults.
     fn kernel_counts(&self) -> [u64; 5] {
         let read = |file: &str| {
-            std::fs::read_to_string(format!("/proc/{}/{file}", self.pid))
+            std::fs::read_to_string(format!("/proc/{}/{file}", self.pid()))
                 .unwrap_or_default()
         };
         let field = |text: &str, name: &str| {
@@ -1340,7 +1438,7 @@ impl Process {
     /// (utime, stime), seconds.
     fn cpu_split(&self) -> (f64, f64) {
         let Ok(stat) =
-            std::fs::read_to_string(format!("/proc/{}/stat", self.pid))
+            std::fs::read_to_string(format!("/proc/{}/stat", self.pid()))
         else {
             return (0.0, 0.0);
         };
@@ -1355,7 +1453,7 @@ impl Process {
     }
 
     fn rss_kib(&self) -> u64 {
-        std::fs::read_to_string(format!("/proc/{}/status", self.pid))
+        std::fs::read_to_string(format!("/proc/{}/status", self.pid()))
             .ok()
             .and_then(|s| {
                 s.lines()
@@ -1369,24 +1467,27 @@ impl Process {
 
     /// Stop with SIGTERM; jemalloc's total allocation count from its exit
     /// statistics.
-    async fn stop(mut self) -> Option<u64> {
+    async fn stop(self) -> Option<u64> {
+        let stderr = self.stderr();
+        let pid = self.pid().to_string();
         std::process::Command::new("kill")
-            .args(["-TERM", &self.pid.to_string()])
+            .args(["-TERM", &pid])
             .output()
             .ok();
-        if tokio::time::timeout(Duration::from_secs(30), self.child.wait())
+        let mut child = self.child.into_inner()?;
+        if tokio::time::timeout(Duration::from_secs(30), child.wait())
             .await
             .is_err()
         {
             // The runner itself too, when it runs under a wrapper.
             std::process::Command::new("kill")
-                .args(["-KILL", &self.pid.to_string()])
+                .args(["-KILL", &pid])
                 .output()
                 .ok();
-            self.child.kill().await.ok();
+            child.kill().await.ok();
             return None;
         }
-        alloc_requests(&std::fs::read_to_string(&self.stderr).ok()?)
+        alloc_requests(&std::fs::read_to_string(stderr).ok()?)
     }
 }
 
@@ -1736,6 +1837,9 @@ struct Measured {
     lat_p95_ms: Option<f64>,
     lat_p99_ms: Option<f64>,
     lat_max_ms: Option<f64>,
+    /// Seconds from the start of delivery to the first measured row
+    /// (a catch-up's time to resume).
+    first_row_s: Option<f64>,
     /// State-store key-value reads in the measured window (PostgreSQL state
     /// store only).
     kv_reads: Option<u64>,
@@ -1770,6 +1874,7 @@ impl Measured {
             "out_bytes": self.out_bytes, "allocs": self.allocs,
             "lat_p50_ms": self.lat_p50_ms, "lat_p95_ms": self.lat_p95_ms,
             "lat_p99_ms": self.lat_p99_ms, "lat_max_ms": self.lat_max_ms,
+            "first_row_s": self.first_row_s,
             "kv_reads": self.kv_reads, "feedback_reads": self.feedback_reads,
             "feedback_staleness_s": self.feedback_staleness_s,
             "pid": self.pid, "binary": self.binary,
@@ -2049,6 +2154,9 @@ async fn run_inner(
                 .await
                 .map(|_| ()),
                 Sut::Dbz(c) if action == "pause" => c.pause(&name).await,
+                Sut::Dbz(c) if action == "stop" => {
+                    c.stop_connector(&name).await
+                }
                 Sut::Dbz(c) => c.resume(&name).await,
             }
         }
@@ -2111,7 +2219,7 @@ async fn run_inner(
         let (cpu0, db0, reads0, fb0, dc0);
         // The process tree whose threads are attributed.
         let root_pid = match &process {
-            Sut::Df(p) => Some(p.pid),
+            Sut::Df(p) => Some(p.pid()),
             Sut::Dbz(c) => c.pid(),
         };
         let threads0;
@@ -2159,14 +2267,25 @@ async fn run_inner(
             // A marker written before the source started streaming is never
             // delivered: the baseline is what has arrived once the source is
             // quiet, not the number of markers written.
-            if cell.mode == Mode::Cdc {
-                control("pause").await?;
+            match cell.mode {
+                Mode::Cdc => control("pause").await?,
+                Mode::Catchup => {
+                    control("stop").await?;
+                    if !dbz {
+                        wait_status(&name, "stopped").await?;
+                    }
+                }
+                Mode::Restart => match &process {
+                    Sut::Df(p) => p.down().await,
+                    Sut::Dbz(c) => c.down().await?,
+                },
+                Mode::Snapshot | Mode::Latency => {}
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
             let (r, local) = delivered(&mut parquet_seen).await;
             parquet_seen = local;
             base = r?.0;
-            if cell.mode == Mode::Cdc {
+            if matches!(cell.mode, Mode::Cdc | Mode::Catchup | Mode::Restart) {
                 let mut stmts =
                     inserts(engine, &main_table, cell.shape, 0, rows);
                 let last = stmts.pop().expect("at least one insert");
@@ -2178,7 +2297,14 @@ async fn run_inner(
                 (cpu0, db0, reads0, fb0, dc0) = window_start().await;
                 threads0 = root_pid.map(threads::Snapshot::take);
                 t0 = Instant::now();
-                control("resume").await?;
+                match (cell.mode, &process) {
+                    (Mode::Restart, Sut::Df(p)) => {
+                        p.up().await?;
+                        create().await?;
+                    }
+                    (Mode::Restart, Sut::Dbz(c)) => c.up().await?,
+                    _ => control("resume").await?,
+                }
             } else {
                 // Latency: transactions of `tx_rows` rows at `rate` per
                 // second, on one connection (in bursts with idle between
@@ -2276,8 +2402,21 @@ async fn run_inner(
                 .unwrap_or_else(Instant::now)
         };
         let secs = t_end.duration_since(t0).as_secs_f64();
+        let first_row_s = (cell.sink != Sink::Parquet)
+            .then(|| {
+                let times = arrivals.times.lock().unwrap();
+                times
+                    .get(base as usize)
+                    .map(|t| t.saturating_duration_since(t0).as_secs_f64())
+            })
+            .flatten();
         let cpu = process.cpu_secs() - cpu0.0;
         let sys = process.sys_secs() - cpu0.1;
+        // The process tree now (a restart replaced it).
+        let root_pid = match &process {
+            Sut::Df(p) => Some(p.pid()),
+            Sut::Dbz(c) => c.pid(),
+        };
         let threads = match (root_pid, &threads0) {
             (Some(pid), Some(t0)) => {
                 Some(threads::Snapshot::take(pid).since(t0))
@@ -2381,6 +2520,7 @@ async fn run_inner(
             lat_p95_ms: p95,
             lat_p99_ms: p99,
             lat_max_ms: pmax,
+            first_row_s,
             kv_reads,
             feedback_reads: fb_reads,
             feedback_staleness_s: staleness,
@@ -2394,9 +2534,9 @@ async fn run_inner(
     .await;
     let identity = match &process {
         Sut::Df(p) => (
-            Some(p.pid),
-            Some(p.exe.display().to_string()),
-            sha256(&p.exe),
+            Some(p.pid()),
+            Some(p.exe().display().to_string()),
+            sha256(&p.exe()),
         ),
         Sut::Dbz(_) => (
             None,
@@ -2418,7 +2558,7 @@ async fn run_inner(
         Sut::Dbz(c) => c.delete(&name).await,
     }
     let attr_log = match &process {
-        Sut::Df(p) => Some(p.stderr.clone()),
+        Sut::Df(p) => Some(p.stderr()),
         Sut::Dbz(_) => None,
     };
     let allocs = process.stop().await;
