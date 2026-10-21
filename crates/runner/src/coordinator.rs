@@ -647,6 +647,72 @@ fn flushable(b: &BuildingBatch, respect_source_tx: bool) -> bool {
     }
 }
 
+/// What one turn of the accumulation loop waited for. Held only for the
+/// turn: boxing the item would allocate on every turn under load.
+#[allow(clippy::large_enum_variant)]
+enum Step {
+    Cancelled,
+    Tick,
+    /// A pause change; `true` when the pause channel closed.
+    Paused(bool),
+    /// The next source item (`None`: the source ended).
+    Item(Option<SourceItem>),
+    /// A drained batch was flushed, a delivery finished or the flush
+    /// interval ended: check again.
+    Recheck,
+}
+
+/// The drained path, entered when a batch of whole units meets an empty
+/// input. With nothing being delivered and the flush interval since the
+/// previous drained flush elapsed, the batch goes to delivery at once.
+/// Otherwise the turn also waits for the end of the delivery in flight
+/// (registered before `inflight` is read, so one finishing in between still
+/// wakes it) or of the interval; an item arriving wakes it through `recv`.
+#[allow(clippy::too_many_arguments)]
+async fn drained_step(
+    building: &mut Option<BuildingBatch>,
+    last_drained: &mut Option<Instant>,
+    min_flush_interval: Duration,
+    deliver_tx: &tokio::sync::mpsc::Sender<DeliveryItem>,
+    inflight: &std::sync::atomic::AtomicUsize,
+    drained: &tokio::sync::Notify,
+    cancel: &CancellationToken,
+    ticker: &mut tokio::time::Interval,
+    pause_rx: &mut watch::Receiver<PauseState>,
+    event_rx: &mut tokio::sync::mpsc::Receiver<SourceItem>,
+) -> Result<Step> {
+    let delivery_done = drained.notified();
+    tokio::pin!(delivery_done);
+    delivery_done.as_mut().enable();
+    let mut hold_until = None;
+    if inflight.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        let now = Instant::now();
+        match last_drained.map(|t| t + min_flush_interval) {
+            Some(at) if at > now => hold_until = Some(at),
+            _ => {
+                let b = building.take().expect("a flushable batch");
+                send_to_delivery(deliver_tx, inflight, b, "drained").await?;
+                *last_drained = Some(now);
+                return Ok(Step::Recheck);
+            }
+        }
+    }
+    let hold = async {
+        match hold_until {
+            Some(at) => tokio::time::sleep_until(at).await,
+            None => std::future::pending().await,
+        }
+    };
+    Ok(tokio::select! {
+        _ = cancel.cancelled() => Step::Cancelled,
+        _ = delivery_done => Step::Recheck,
+        _ = hold => Step::Recheck,
+        _ = ticker.tick() => Step::Tick,
+        changed = pause_rx.changed() => Step::Paused(changed.is_err()),
+        maybe_ev = event_rx.recv() => Step::Item(maybe_ev),
+    })
+}
+
 async fn send_to_delivery(
     tx: &tokio::sync::mpsc::Sender<DeliveryItem>,
     inflight: &std::sync::atomic::AtomicUsize,
@@ -1708,55 +1774,42 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                     quiesced_acked = false;
                 }
 
-                // Flush a batch of whole units as soon as the input is
-                // drained and nothing is being delivered, but no sooner than
-                // `min_flush_interval` after the previous drained flush: low
-                // latency when the source is quiet, a steady trickle batched
-                // over that window, and under load (a batch in flight, or
-                // input queued) accumulation up to the limits and deadline.
-                // The wake-up for the end of a delivery is registered only
-                // when the input is drained (under load it never is, and a
-                // registered wake-up would pull this task onto the delivery
-                // task's thread mid-burst), and before reading `inflight`, so
-                // a delivery finishing in between still wakes the loop; an
-                // item arriving after the check wakes it through `recv`. A
-                // flush held back by the interval sleeps until the interval
-                // ends.
+                // Under load the input is never drained: the turn waits on
+                // the input, the deadline, a pause and cancellation only.
+                // Once a batch of whole units meets an empty input, the
+                // drained path (its own future, allocated per drain) flushes
+                // it or waits for what lets it flush (see `drained_step`).
                 let drained_input = building
                     .as_ref()
                     .is_some_and(|b| flushable(b, respect_source_tx))
                     && event_rx.is_empty();
-                let delivery_done = drained.notified();
-                tokio::pin!(delivery_done);
-                if drained_input {
-                    delivery_done.as_mut().enable();
-                }
-                let mut hold_until = None;
-                if drained_input
-                    && inflight.load(std::sync::atomic::Ordering::SeqCst) == 0
-                {
-                    let now = Instant::now();
-                    match last_drained.map(|t| t + min_flush_interval) {
-                        Some(at) if at > now => hold_until = Some(at),
-                        _ => {
-                            let b = building.take().expect("checked");
-                            send_to_delivery(&deliver_tx, &inflight, b, "drained")
-                                .await?;
-                            last_drained = Some(now);
-                            continue;
-                        }
-                    }
-                }
-                let hold = async {
-                    match hold_until {
-                        Some(at) => tokio::time::sleep_until(at).await,
-                        None => std::future::pending().await,
+                let step = if drained_input {
+                    Box::pin(drained_step(
+                        &mut building,
+                        &mut last_drained,
+                        min_flush_interval,
+                        &deliver_tx,
+                        &inflight,
+                        &drained,
+                        &cancel,
+                        &mut ticker,
+                        &mut pause_rx,
+                        &mut event_rx,
+                    ))
+                    .await?
+                } else {
+                    tokio::select! {
+                        _ = cancel.cancelled() => Step::Cancelled,
+                        _ = ticker.tick() => Step::Tick,
+                        changed = pause_rx.changed() => Step::Paused(changed.is_err()),
+                        maybe_ev = event_rx.recv() => Step::Item(maybe_ev),
                     }
                 };
-                tokio::pin!(hold);
 
-                tokio::select! {
-                    _ = cancel.cancelled() => {
+                match step {
+                    Step::Recheck => continue,
+
+                    Step::Cancelled => {
                         if let Some(b) = building.take() {
                             if let Some(b) = finalize_batch(
                                 b, respect_source_tx, &coord.pipeline_name,
@@ -1767,12 +1820,7 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                         break;
                     }
 
-                    // A delivery finished while a flushable batch waits, or
-                    // the interval that held it back ended: check again.
-                    _ = delivery_done.as_mut(), if drained_input => continue,
-                    _ = hold.as_mut(), if hold_until.is_some() => continue,
-
-                    _ = ticker.tick() => {
+                    Step::Tick => {
                         if let Some(b) = building.take() {
                             let elapsed = b.started_at.elapsed()
                                 >= Duration::from_millis(tick_ms);
@@ -1786,12 +1834,12 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                         }
                     }
 
-                    changed = pause_rx.changed() => {
-                        if changed.is_err() { break; }
+                    Step::Paused(closed) => {
+                        if closed { break; }
                         continue;
                     }
 
-                    maybe_ev = event_rx.recv() => {
+                    Step::Item(maybe_ev) => {
                         let Some(first) = maybe_ev else {
                             if let Some(b) = building.take() {
                                 if let Some(b) = finalize_batch(
