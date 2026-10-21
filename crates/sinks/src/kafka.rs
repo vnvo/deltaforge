@@ -146,6 +146,20 @@ impl ClientContext for KafkaMetricsContext {
 /// messages) in one burst, so rdkafka batches naturally without needing a long
 /// linger wait. Higher values (20ms+) bottleneck throughput on small batches.
 const DEFAULT_LINGER_MS: &str = "5";
+/// Default linger time of an Avro sink (ms). Its batch is encoded in full
+/// before any record is enqueued, so linger has nothing left to gather:
+/// every batch's requests are already full (as many records per request at
+/// 1 ms as at 5 ms), and a longer linger only delays the batch's last
+/// request, which the batch's acknowledgement waits for.
+const DEFAULT_AVRO_LINGER_MS: &str = "1";
+
+/// The producer's `linger.ms` unless `client_conf` sets it.
+fn default_linger_ms(encoding: &EncodingCfg) -> &'static str {
+    match encoding {
+        EncodingCfg::Avro { .. } => DEFAULT_AVRO_LINGER_MS,
+        _ => DEFAULT_LINGER_MS,
+    }
+}
 const DEFAULT_BATCH_SIZE: &str = "1048576"; // 1 MB — rdkafka default (16 KB) is too small for high throughput
 
 /// Kafka sink with idempotent production and optional exactly-once semantics.
@@ -196,7 +210,8 @@ impl KafkaSink {
     /// The producer is configured with sensible defaults:
     /// - Idempotent production (prevents duplicates on retry)
     /// - LZ4 compression
-    /// - 5ms linger for micro-batching
+    /// - 5ms linger for micro-batching (1ms for Avro: see
+    ///   [`default_linger_ms`])
     /// - Appropriate timeouts for reliability
     ///
     /// User-provided `client_conf` overrides are applied last.
@@ -222,7 +237,7 @@ impl KafkaSink {
         // Batching and compression
         client_cfg
             .set("compression.type", "lz4")
-            .set("linger.ms", DEFAULT_LINGER_MS)
+            .set("linger.ms", default_linger_ms(&cfg.encoding))
             .set("batch.size", DEFAULT_BATCH_SIZE);
 
         // Reliability settings
@@ -1706,6 +1721,16 @@ mod tests {
             let err = sink(&url, Some(0)).err().expect("zero refused");
             assert!(err.to_string().contains("encode_workers"));
         }
+    }
+
+    #[test]
+    fn an_avro_sink_lingers_one_millisecond_and_json_five() {
+        let avro: EncodingCfg = serde_json::from_value(serde_json::json!(
+            {"type": "avro", "schema_registry_url": "http://sr:8081"}
+        ))
+        .unwrap();
+        assert_eq!(default_linger_ms(&avro), "1");
+        assert_eq!(default_linger_ms(&EncodingCfg::Json), "5");
     }
 
     #[test]
