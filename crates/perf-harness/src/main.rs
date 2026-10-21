@@ -2555,6 +2555,15 @@ async fn measure(
                     args.delivery_stats,
                 )
                 .await;
+                if let (false, System::Debezium(_), Some(c)) =
+                    (m.ok, bin, &connect)
+                    && !c.alive().await
+                {
+                    eprintln!(
+                        "the Kafka Connect worker no longer answers: killed"
+                    );
+                    c.kill();
+                }
                 let line = json!({"cell": cell.id(), "version": label, "rep": rep, "rows_target": rows, "result": m.json()});
                 use std::io::Write;
                 writeln!(log, "{line}")?;
