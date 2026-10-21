@@ -21,6 +21,8 @@
 //! shared machine affects both alike. Results go to `<out>/runs.jsonl`
 //! (one line per run) and `<out>/summary.md` (medians per cell).
 
+#![recursion_limit = "256"]
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -214,6 +216,9 @@ struct Load {
     rate: u32,
     tx_rows: usize,
     burst: Option<(usize, u64)>,
+    /// DDL during streaming: an `ALTER TABLE ... ADD COLUMN` after every
+    /// this many transactions.
+    ddl_every: Option<usize>,
 }
 
 impl Load {
@@ -221,6 +226,7 @@ impl Load {
         rate: 200,
         tx_rows: 1,
         burst: None,
+        ddl_every: None,
     };
 }
 
@@ -275,6 +281,9 @@ impl Cell {
             }
             if let Some((n, idle)) = l.burst {
                 id.push_str(&format!("-burst{n}x{idle}ms"));
+            }
+            if let Some(n) = l.ddl_every {
+                id.push_str(&format!("-ddl{n}"));
             }
         }
         id
@@ -460,6 +469,25 @@ fn matrix() -> Vec<Cell> {
                 rows,
                 load: Load {
                     rate,
+                    ..Load::DEFAULT
+                },
+                tables: 1,
+                intra: None,
+            });
+        }
+        // DDL during streaming: a column added every 1,000 transactions at
+        // 200 transactions/s (JSON and Avro).
+        for sink in [Sink::Json, Sink::Avro] {
+            cells.push(Cell {
+                engine,
+                mode: Mode::Latency,
+                sink,
+                shape: Shape::Narrow,
+                batch: None,
+                js: false,
+                rows: 3_000,
+                load: Load {
+                    ddl_every: Some(1_000),
                     ..Load::DEFAULT
                 },
                 tables: 1,
@@ -1587,6 +1615,8 @@ struct Arrivals {
     /// distinct ids show a missing or duplicated row.
     ids: std::sync::Mutex<std::collections::HashSet<i64>>,
     duplicates: AtomicU64,
+    /// The last message's payload.
+    last: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 /// The row id of a JSON change event (a number, or a decimal string for a
@@ -1627,9 +1657,44 @@ async fn create_topic(topic: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether a record is a row change: a JSON record with a row id, or a
+/// Confluent-framed Avro record whose schema is not a DeltaForge DDL event
+/// schema (its subjects, from the registry at `sr`, cached per id). A DDL
+/// record (DeltaForge publishes them; Debezium here does not) is not a row.
+async fn is_row(
+    payload: &[u8],
+    sr: Option<&str>,
+    cache: &mut BTreeMap<u32, bool>,
+) -> bool {
+    match (payload.first(), sr) {
+        (Some(b'{'), _) => row_id(payload).is_some(),
+        (Some(0), Some(sr)) if payload.len() >= 5 => {
+            let id = u32::from_be_bytes([
+                payload[1], payload[2], payload[3], payload[4],
+            ]);
+            if let Some(known) = cache.get(&id) {
+                return *known;
+            }
+            let subjects: Vec<String> =
+                match reqwest::get(format!("{sr}/schemas/ids/{id}/subjects"))
+                    .await
+                {
+                    Ok(r) => r.json().await.unwrap_or_default(),
+                    Err(_) => Vec::new(),
+                };
+            let row =
+                !subjects.iter().any(|s| s.contains("deltaforge.DdlEvent"));
+            cache.insert(id, row);
+            row
+        }
+        _ => true,
+    }
+}
+
 fn consume(
     topics: &[String],
     arrivals: Arc<Arrivals>,
+    sr: Option<String>,
 ) -> Result<tokio::task::JoinHandle<()>> {
     let topic = topics.join(",");
     let c: StreamConsumer = ClientConfig::new()
@@ -1641,6 +1706,7 @@ fn consume(
         .create()?;
     c.subscribe(&topics.iter().map(String::as_str).collect::<Vec<_>>())?;
     Ok(tokio::spawn(async move {
+        let mut kinds = BTreeMap::new();
         loop {
             match c.recv().await {
                 Ok(m) => {
@@ -1648,12 +1714,19 @@ fn consume(
                     let n = m.payload().map_or(0, <[u8]>::len)
                         + m.key().map_or(0, <[u8]>::len);
                     arrivals.bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    // Only row changes count as arrivals.
+                    let Some(payload) = m.payload() else { continue };
+                    if !is_row(payload, sr.as_deref(), &mut kinds).await {
+                        continue;
+                    }
                     if let Some(id) = m.payload().and_then(row_id)
                         && !arrivals.ids.lock().unwrap().insert(id)
                     {
                         arrivals.duplicates.fetch_add(1, Ordering::Relaxed);
                     }
                     arrivals.times.lock().unwrap().push(now);
+                    *arrivals.last.lock().unwrap() =
+                        m.payload().map(<[u8]>::to_vec);
                     arrivals.count.fetch_add(1, Ordering::Release);
                 }
                 Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
@@ -1840,6 +1913,12 @@ struct Measured {
     /// Seconds from the start of delivery to the first measured row
     /// (a catch-up's time to resume).
     first_row_s: Option<f64>,
+    /// DDL during streaming: the statements run, the worst latency of the
+    /// rows committed within 2 s after one, and whether the last row
+    /// (JSON) carries every column added.
+    ddls: Option<usize>,
+    after_ddl_max_ms: Option<f64>,
+    ddl_columns_ok: Option<bool>,
     /// State-store key-value reads in the measured window (PostgreSQL state
     /// store only).
     kv_reads: Option<u64>,
@@ -1875,6 +1954,8 @@ impl Measured {
             "lat_p50_ms": self.lat_p50_ms, "lat_p95_ms": self.lat_p95_ms,
             "lat_p99_ms": self.lat_p99_ms, "lat_max_ms": self.lat_max_ms,
             "first_row_s": self.first_row_s,
+            "ddls": self.ddls, "after_ddl_max_ms": self.after_ddl_max_ms,
+            "ddl_columns_ok": self.ddl_columns_ok,
             "kv_reads": self.kv_reads, "feedback_reads": self.feedback_reads,
             "feedback_staleness_s": self.feedback_staleness_s,
             "pid": self.pid, "binary": self.binary,
@@ -2053,7 +2134,8 @@ async fn run_inner(
         for t in &topics {
             create_topic(t).await?;
         }
-        Some(consume(&topics, Arc::clone(&arrivals))?)
+        let sr = infra.sr_url().await;
+        Some(consume(&topics, Arc::clone(&arrivals), Some(sr))?)
     };
 
     let dsn = match engine {
@@ -2189,6 +2271,9 @@ async fn run_inner(
         let mut base = 0u64;
         let t0;
         let mut commits: Vec<Instant> = Vec::new();
+        // DDL during streaming: how many, and when each completed.
+        let mut ddls = 0usize;
+        let mut ddl_at: Vec<Instant> = Vec::new();
         // The WAL position just before the last measured transaction: the
         // feedback covers that transaction once confirmed_flush passes it.
         let mut last_tx_lsn: Option<u64> = None;
@@ -2323,6 +2408,23 @@ async fn run_inner(
                 let mut row = 0;
                 let mut txs = 0;
                 while row < rows {
+                    if let Some(n) = load.ddl_every
+                        && txs > 0
+                        && txs % n == 0
+                    {
+                        ddls += 1;
+                        let stmt = match engine {
+                            Engine::Mysql => format!(
+                                "ALTER TABLE {main_table} ADD COLUMN x{ddls} INT DEFAULT {ddls}"
+                            ),
+                            Engine::Postgres => format!(
+                                "ALTER TABLE {main_table} ADD COLUMN x{ddls} INT DEFAULT {ddls}"
+                            ),
+                        };
+                        sql.exec(&stmt).await?;
+                        ddl_at.push(Instant::now());
+                        tick.reset();
+                    }
                     if let Some((n, idle)) = load.burst
                         && txs > 0
                         && txs % n == 0
@@ -2479,6 +2581,7 @@ async fn run_inner(
             (Some(a), Some(b)) => Some((b - a) as f64 / 1e6),
             _ => None,
         };
+        let mut after_ddl_max_ms = None;
         let (p50, p95, p99, pmax) = if cell.mode == Mode::Latency {
             let times = arrivals.times.lock().unwrap();
             let mut lat: Vec<f64> = commits
@@ -2490,6 +2593,21 @@ async fn run_inner(
                     })
                 })
                 .collect();
+            // The worst latency of the rows committed within 2 s after a DDL.
+            after_ddl_max_ms = commits
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    ddl_at.iter().any(|d| {
+                        **c >= *d && c.saturating_duration_since(*d) < Duration::from_secs(2)
+                    })
+                })
+                .filter_map(|(i, c)| {
+                    times
+                        .get(base as usize + i)
+                        .map(|a| a.saturating_duration_since(*c).as_secs_f64() * 1e3)
+                })
+                .reduce(f64::max);
             lat.sort_by(f64::total_cmp);
             let q = |p: f64| {
                 lat.get(((lat.len() as f64 - 1.0) * p) as usize).copied()
@@ -2498,6 +2616,18 @@ async fn run_inner(
         } else {
             (None, None, None, None)
         };
+        // After DDL, the last row (JSON) carries every column added.
+        let ddl_columns_ok = (ddls > 0 && cell.sink == Sink::Json).then(|| {
+            arrivals
+                .last
+                .lock()
+                .unwrap()
+                .as_deref()
+                .and_then(|p| serde_json::from_slice::<Value>(p).ok())
+                .is_some_and(|v| {
+                    (1..=ddls).all(|k| v["after"].get(format!("x{k}")).is_some())
+                })
+        });
         Ok::<_, anyhow::Error>(Measured {
             ok: true,
             error: None,
@@ -2521,6 +2651,9 @@ async fn run_inner(
             lat_p99_ms: p99,
             lat_max_ms: pmax,
             first_row_s,
+            ddls: (ddls > 0).then_some(ddls),
+            after_ddl_max_ms,
+            ddl_columns_ok,
             kv_reads,
             feedback_reads: fb_reads,
             feedback_staleness_s: staleness,
