@@ -3265,22 +3265,57 @@ async fn measure(
 
     // One Kafka Connect worker for the invocation, warmed up: each run
     // registers a connector of its own on it.
-    let connect = match binaries.iter().find_map(|(_, s)| match s {
+    let profile = binaries.iter().find_map(|(_, s)| match s {
         System::Debezium(p) => Some(*p),
         _ => None,
-    }) {
-        Some(profile) => Some(
-            debezium::Connect::start(
-                NETWORK,
-                &bootstrap_internal(),
-                "shared",
-                profile,
-                &extras::prepare(&args.cache)?,
-            )
-            .await?,
-        ),
+    });
+    let extras = match profile {
+        Some(_) => Some(extras::prepare(&args.cache)?),
         None => None,
     };
+    let start_worker = |generation: u32| {
+        let extras = extras.clone();
+        async move {
+            match (profile, extras) {
+                (Some(profile), Some(extras)) => Ok::<_, anyhow::Error>(Some(
+                    debezium::Connect::start(
+                        NETWORK,
+                        &bootstrap_internal(),
+                        // A replacement worker has internal topics of its
+                        // own: it never restarts the failed run's connector.
+                        &if generation == 0 {
+                            "shared".to_string()
+                        } else {
+                            format!("shared-{generation}")
+                        },
+                        profile,
+                        &extras,
+                    )
+                    .await?,
+                )),
+                _ => Ok(None),
+            }
+        }
+    };
+    let mut generation = 0u32;
+    let mut connect = start_worker(generation).await?;
+    // After a failed Debezium run the worker is replaced before the next run
+    // (whatever the failure: a worker out of memory may still answer while
+    // it takes CPU from the runs after it). Its log is kept.
+    macro_rules! replace_worker_after {
+        ($m:expr, $system:expr) => {
+            if let (false, System::Debezium(_)) = ($m.ok, $system)
+                && let Some(c) = connect.take()
+            {
+                eprintln!(
+                    "a Debezium run failed: replacing the Kafka Connect worker"
+                );
+                c.stop(&out.join(format!("connect-{generation}.log"))).await;
+                generation += 1;
+                connect = start_worker(generation).await?;
+            }
+        };
+    }
     // Warm-up: one unrecorded run of every cell for every system, so a JIT
     // compiled system is measured warm.
     if args.warmup {
@@ -3303,6 +3338,7 @@ async fn measure(
                     DF_SINK.get().and_then(|m| m.get(label.as_str())),
                 )
                 .await;
+                replace_worker_after!(m, system);
                 eprintln!(
                     "{} {label} warm-up: {}",
                     cell.id(),
@@ -3350,16 +3386,10 @@ async fn measure(
                     DF_SINK.get().and_then(|m| m.get(label.as_str())),
                 )
                 .await;
-                if let (false, System::Debezium(_), Some(c)) =
-                    (m.ok, bin, &connect)
-                    && !c.alive().await
-                {
-                    eprintln!(
-                        "the Kafka Connect worker no longer answers: killed"
-                    );
-                    c.kill();
-                }
-                let line = json!({"cell": cell.id(), "version": label, "rep": rep, "rows_target": rows, "result": m.json()});
+                let worker =
+                    matches!(bin, System::Debezium(_)).then_some(generation);
+                replace_worker_after!(m, bin);
+                let line = json!({"cell": cell.id(), "version": label, "rep": rep, "rows_target": rows, "worker": worker, "result": m.json()});
                 use std::io::Write;
                 writeln!(log, "{line}")?;
                 eprintln!(

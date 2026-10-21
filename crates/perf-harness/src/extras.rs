@@ -91,6 +91,7 @@ pub fn pins() -> serde_json::Value {
 }
 
 /// Host directories to mount into the worker.
+#[derive(Clone)]
 pub struct Extras {
     /// The Avro converter's jars (a Kafka Connect plugin directory).
     pub avro_converter: PathBuf,

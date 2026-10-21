@@ -467,23 +467,8 @@ impl Connect {
         ])
     }
 
-    /// Whether the worker still answers.
-    pub async fn alive(&self) -> bool {
-        self.call(reqwest::Method::GET, "/connectors", None)
-            .await
-            .is_ok()
-    }
-
-    /// Kill a worker that no longer answers (out of memory, say), so it
-    /// takes no CPU from the runs after it; its later runs fail at once.
-    pub fn kill(&self) {
-        std::process::Command::new("docker")
-            .args(["kill", self.container.id()])
-            .output()
-            .ok();
-    }
-
-    /// Stop the worker (at the end of an invocation), keeping its log.
+    /// Stop the worker (at the end of an invocation, or after a failed
+    /// run), keeping its log.
     pub async fn stop(self, log: &std::path::Path) {
         if let Ok(o) = std::process::Command::new("docker")
             .args(["logs", self.container.id()])
