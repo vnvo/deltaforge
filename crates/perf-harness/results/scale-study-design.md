@@ -103,6 +103,9 @@ run, never left to chance:
   - starting offsets of 0, 64, 256 and 960 MiB. "Near 1 GiB" is 960 MiB, so
     that a run's 31 MB of binary log stays within MySQL's 1 GiB file;
   - 3 repetitions, both systems;
+  - no catch-up phase (`--scale-catchup false`): the series measures
+    first-touch cost, and a stop only distorts it once a system is far
+    behind;
   - two paddings, reported apart:
     - `large`: rows of 8 MiB, so few, large events;
     - `small`: single-row transactions like the load's, so many small
@@ -201,3 +204,12 @@ The server's skip cost appears to follow the number of events rather than
 the bytes, so large padding understates an OLTP file. The `small` padding
 was added, and the 1 GiB projection uses the small-padding curve. The
 large-padding run is kept and reported as such.
+
+The first two sensitivity runs (large padding at 0 to 960 MiB, small
+padding at 64 to 960 MiB) included the catch-up phase. Where DeltaForge
+fell far behind (large 960 MiB; small 256 and 960 MiB), the catch-up window
+covered nearly every row. Activation latency there rested on 17 to 165 of
+the 200 first rows, and "steady" on almost none. Both runs are superseded
+and kept, marked so. The series was rerun as a whole without the catch-up
+phase, with both paddings under one condition. Every run now also keeps its
+raw commit and arrival times (`rows.csv`, `phases.json`).

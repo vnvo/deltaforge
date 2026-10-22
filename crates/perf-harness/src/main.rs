@@ -159,6 +159,9 @@ struct Args {
     /// `large` (8 MiB rows) or `small` (single-row transactions).
     #[arg(long, default_value = "large")]
     scale_binlog_pad: String,
+    /// Scaling study: the catch-up phase (a 15 s stop 30 s into the load).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    scale_catchup: bool,
     /// Scaling study: rotate the active sets (not at 100% active).
     #[arg(long)]
     scale_rotate: bool,
@@ -3312,6 +3315,7 @@ async fn main() -> Result<()> {
                 reps: args.reps,
                 seconds: args.scale_seconds,
                 warmup: args.warmup,
+                catchup: args.scale_catchup,
             };
             scale::study(
                 &plan,

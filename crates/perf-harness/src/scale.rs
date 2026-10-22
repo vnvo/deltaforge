@@ -614,6 +614,7 @@ pub async fn run(
     tag: &str,
     dir: &Path,
     base: Duration,
+    catchup_phase: bool,
 ) -> Result<Value> {
     std::fs::create_dir_all(dir)?;
     let name = format!("s-{tag}");
@@ -827,7 +828,7 @@ pub async fn run(
     let mut rot_rng = Rng(seq * 7_919 + 1);
     let mut next_rotation = t_load + ROTATE_EVERY;
     let mut rotations = 0u32;
-    let catchup = point.workload != Workload::Capacity;
+    let catchup = catchup_phase && point.workload != Workload::Capacity;
     let (mut stopped_at, mut resumed_at) = (None, None);
     let mut conns_max = 0u64;
     let mut rss_max = 0u64;
@@ -956,6 +957,45 @@ pub async fn run(
     };
     consumer.await.ok();
     mon.disconnect().await.ok();
+
+    // Raw rows, for any later analysis: each committed row's id, table,
+    // commit and arrival (ms since the load started; empty if it never
+    // arrived).
+    {
+        use std::io::Write;
+        let mut w = std::io::BufWriter::new(std::fs::File::create(
+            dir.join("rows.csv"),
+        )?);
+        writeln!(w, "id,table,commit_ms,arrival_ms")?;
+        let ms = |t: Instant| {
+            t.saturating_duration_since(t_load).as_secs_f64() * 1e3
+        };
+        let s = seen.lock().unwrap();
+        for c in &commits {
+            match s.first.get(&c.id) {
+                Some(a) => writeln!(
+                    w,
+                    "{},{},{:.3},{:.3}",
+                    c.id,
+                    c.table,
+                    ms(c.at),
+                    ms(*a)
+                )?,
+                None => writeln!(w, "{},{},{:.3},", c.id, c.table, ms(c.at))?,
+            }
+        }
+        let markers = |t: Option<Instant>| {
+            t.map_or(String::new(), |t| format!("{:.3}", ms(t)))
+        };
+        std::fs::write(
+            dir.join("phases.json"),
+            serde_json::to_vec_pretty(&json!({
+                "load_s": t_load_end.duration_since(t_load).as_secs_f64(),
+                "stopped_ms": markers(stopped_at), "resumed_ms": markers(resumed_at),
+                "activated_ms": activated.iter().map(|(t, at)| (t.to_string(), json!(ms(*at)))).collect::<serde_json::Map<_, _>>(),
+            }))?,
+        )?;
+    }
 
     // Analysis.
     let s = seen.lock().unwrap();
@@ -1098,6 +1138,7 @@ pub async fn run(
         "tables": point.tables, "active": point.active, "active_tables": n_active,
         "workload": point.workload.name(), "rotate": point.rotate,
         "rotations": rotations, "activated_tables": activated.len(),
+        "catchup_phase": catchup,
         "ready_s": ready_s, "first_event_s": first_event_s,
         "load_s": load_secs, "offered": offered_n, "committed": commits.len(),
         "generator_share": generator_share,
@@ -1254,6 +1295,8 @@ pub struct Plan {
     pub reps: usize,
     pub seconds: u64,
     pub warmup: bool,
+    /// The catch-up phase (a stop and resume during the load).
+    pub catchup: bool,
 }
 
 impl Plan {
@@ -1376,7 +1419,17 @@ pub async fn study(
                         None => bail!("no Kafka Connect worker"),
                     },
                 };
-                let r = run(infra, &sys, &point, seq, &tag, &dir, base).await;
+                let r = run(
+                    infra,
+                    &sys,
+                    &point,
+                    seq,
+                    &tag,
+                    &dir,
+                    base,
+                    plan.catchup,
+                )
+                .await;
                 let failed = !matches!(&r, Ok(v) if v["ok"] == json!(true));
                 let result = r.unwrap_or_else(
                     |e| json!({"ok": false, "error": format!("{e:#}")}),
