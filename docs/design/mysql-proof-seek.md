@@ -54,6 +54,28 @@ then padded to a fixed starting offset (one repetition each):
 | 0 (fresh file) | 2.7 ms | 0.58 s | 1.5 s / 2.9 s | 2.7 s |
 | 960 MiB | 190 ms | 32.2 s | 15.2 s / 29.5 s | 29.4 s |
 
+**The seek follows events, not bytes.** The offsets above were padded with
+8 MiB rows. Padded instead with single-row transactions like an OLTP
+server's (3 repetitions), the seek per proof at 64 MiB was 96 ms p50 (124
+ms p95), against 17 ms with large rows. The server skips event by event, so
+a file of small transactions costs several times more per byte. The
+sensitivity series (`crates/perf-harness/results/scale-study-design.md`)
+measures both paddings. A projection to the 1 GiB default uses the
+small-transaction curve.
+
+**Requests already coalesce, but only under pressure.** A proof can be
+served from the retained record of an earlier scan
+(`"served":"record"` in the trace), instead of scanning. With
+single-row-transaction padding, the physical scans out of 200 proofs were:
+
+- 200 at 64 MiB;
+- 76 to 84 at 256 MiB;
+- 23 at 960 MiB.
+
+So the slower each seek, the more requests queue behind it and share the
+next scan. A fix must bound physical scans by design, not only once the
+pipeline has fallen behind.
+
 **Serial even without the seek.** On a fresh file, activation latency still
 grows linearly with activation order, by decile of the 200 activations:
 205, 582, 868, 1,064, 1,350, 1,627, 1,948, 2,226, 2,527 and 2,840 ms. The
