@@ -6,6 +6,9 @@ identical, deterministic MySQL and PostgreSQL fixtures, delivering to Kafka
 Debezium on Kafka Connect. This is measurement tooling, not a test: it is
 not part of the gate and changes no product behavior.
 
+Results: [`results/2026-10-debezium-comparison.md`](results/2026-10-debezium-comparison.md)
+(DeltaForge against Debezium, including the runs found invalid and why).
+
 ## What a run measures
 
 Each run starts a fresh DeltaForge process, or registers a connector on a
