@@ -136,6 +136,14 @@ recovery time. Recorded per run:
 - `recovery_s`: kill to the first row it delivers;
 - CPU, including the killed process's CPU up to the kill.
 
+What a crash replays depends on how often each system records its position.
+DeltaForge checkpoints after each delivered batch, so a crash replays at
+most the batch in flight. Debezium's worker commits offsets on
+`offset.flush.interval.ms` (60 s by default), and a crash replays what was
+delivered since the last commit. `--debezium-offset-flush-ms` sets that
+interval for a run. With `--delivery-stats`, the cost of a shorter interval
+shows in the offset records and Kafka requests.
+
 ## Layout-randomized qualification
 
 A single link of a version can run a few percent faster or slower than

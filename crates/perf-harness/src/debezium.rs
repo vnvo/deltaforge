@@ -69,6 +69,7 @@ impl Connect {
         bootstrap: &str,
         tag: &str,
         profile: Profile,
+        offset_flush_ms: Option<u64>,
         extras: &crate::extras::Extras,
     ) -> Result<Connect> {
         let mut image = GenericImage::new(CONNECT_IMAGE.0, CONNECT_IMAGE.1)
@@ -128,6 +129,10 @@ impl Connect {
                 .with_env_var("CONNECT_PRODUCER_ENABLE_IDEMPOTENCE", "true")
                 .with_env_var("CONNECT_PRODUCER_COMPRESSION_TYPE", "lz4")
                 .with_env_var("CONNECT_PRODUCER_LINGER_MS", "5");
+        }
+        if let Some(ms) = offset_flush_ms {
+            image =
+                image.with_env_var("OFFSET_FLUSH_INTERVAL_MS", ms.to_string());
         }
         let container =
             image.gate_owned().start().await.context("start connect")?;

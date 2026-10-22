@@ -134,6 +134,12 @@ struct Args {
     /// (`--binary label=debezium`).
     #[arg(long, default_value = "defaults")]
     debezium_profile: String,
+    /// The Kafka Connect worker's offset-commit interval, ms
+    /// (`offset.flush.interval.ms`; the image's default is 60,000). A
+    /// shorter one bounds what a crash replays, at the cost of more offset
+    /// writes.
+    #[arg(long)]
+    debezium_offset_flush_ms: Option<u64>,
     /// After the last row arrives, watch the PostgreSQL slot's
     /// confirmed_flush_lsn to measure WAL-feedback staleness.
     #[arg(long)]
@@ -3377,6 +3383,7 @@ async fn measure(
                             format!("shared-{generation}")
                         },
                         profile,
+                        args.debezium_offset_flush_ms,
                         &extras,
                     )
                     .await?,
