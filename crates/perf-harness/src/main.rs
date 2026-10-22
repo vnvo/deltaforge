@@ -2883,7 +2883,8 @@ async fn run_inner(
         };
         // librdkafka refreshes its statistics every 5 s. Debezium's are
         // read after its CPU (above). Debezium has no batch counters (NaN).
-        let delivery = match (dc0, &process) {
+        // A crash restarts the counters with the process: none for its run.
+        let delivery = match (dc0.filter(|_| carried.is_none()), &process) {
             (Some(a), Sut::Df(_)) => {
                 tokio::time::sleep(Duration::from_millis(5_500)).await;
                 delivery_counters()
