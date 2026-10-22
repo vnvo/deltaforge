@@ -103,16 +103,20 @@ pub struct Point {
     pub active: u32,
     pub workload: Workload,
     pub rotate: bool,
+    /// The binary log's byte offset (MiB) in a fresh file when the run
+    /// starts: 0 is a fresh-file best case for DeltaForge's proofs.
+    pub binlog_mib: u64,
 }
 
 impl Point {
     pub fn id(&self) -> String {
         format!(
-            "t{}-a{}-{}{}",
+            "t{}-a{}-{}{}-o{}",
             self.tables,
             self.active,
             self.workload.name(),
-            if self.rotate { "-rotate" } else { "" }
+            if self.rotate { "-rotate" } else { "" },
+            self.binlog_mib
         )
     }
 
@@ -206,6 +210,11 @@ pub async fn fixture(infra: &Infra, tables: usize) -> Result<f64> {
     c.query_drop("SET GLOBAL sync_binlog = 0").await?;
     c.query_drop("SET GLOBAL innodb_flush_log_at_trx_commit = 2")
         .await?;
+    // Padding for the binary log's starting offset, in a database neither
+    // system captures (outside `scale_*`).
+    c.query_drop("CREATE DATABASE IF NOT EXISTS perfpad")
+        .await?;
+    c.query_drop("CREATE TABLE IF NOT EXISTS perfpad.p (id BIGINT AUTO_INCREMENT PRIMARY KEY, b LONGBLOB)").await?;
     for d in 0..tables.div_ceil(TABLES_PER_DATABASE) {
         c.query_drop(format!("CREATE DATABASE scale_{d:04}"))
             .await?;
@@ -426,6 +435,92 @@ async fn system_connections(c: &mut mysql_async::Conn) -> Result<u64> {
         .unwrap_or(0))
 }
 
+/// The binary log's current file and byte offset.
+async fn binlog_position(c: &mut mysql_async::Conn) -> Result<(String, u64)> {
+    let row: mysql_async::Row = c
+        .query_first("SHOW BINARY LOG STATUS")
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no binary log status"))?;
+    Ok((
+        row.get::<String, _>("File").unwrap_or_default(),
+        row.get::<u64, _>("Position").unwrap_or_default(),
+    ))
+}
+
+/// Start a fresh binary log file (purging the older ones: no system runs
+/// between runs) and pad it to `mib` MiB with rows of a database neither
+/// system captures. Returns the starting file and offset.
+async fn position_binlog(
+    c: &mut mysql_async::Conn,
+    mib: u64,
+) -> Result<(String, u64)> {
+    c.query_drop("FLUSH BINARY LOGS").await?;
+    let (file, _) = binlog_position(c).await?;
+    c.query_drop(format!("PURGE BINARY LOGS TO '{file}'"))
+        .await?;
+    let target = mib << 20;
+    const CHUNK: u64 = 8 << 20;
+    loop {
+        let (f, pos) = binlog_position(c).await?;
+        if f != file {
+            bail!("the binary log rotated while padding to {mib} MiB");
+        }
+        // A row event is the blob plus about 100 bytes of headers.
+        let left = target.saturating_sub(pos);
+        if left < 4096 {
+            break;
+        }
+        let n = left.min(CHUNK).saturating_sub(1024).max(1);
+        c.query_drop(format!(
+            "INSERT INTO perfpad.p (b) VALUES (REPEAT('x', {n}))"
+        ))
+        .await?;
+    }
+    c.query_drop("TRUNCATE TABLE perfpad.p").await?;
+    binlog_position(c).await
+}
+
+/// DeltaForge's proof trace (`deltaforge::proof_trace`, on its standard
+/// output): proofs, scans, total seek, and the seek by decile of the order
+/// in which the proofs ran.
+fn proof_trace(stdout: &Path) -> Value {
+    let Ok(text) = std::fs::read_to_string(stdout) else {
+        return Value::Null;
+    };
+    let (mut proofs, mut seeks) = (0u64, Vec::new());
+    let mut outcomes: HashMap<String, u64> = HashMap::new();
+    for line in text.lines() {
+        let Some(i) = line.find("{\"record\"") else {
+            continue;
+        };
+        let Ok(r) = serde_json::from_str::<Value>(&line[i..]) else {
+            continue;
+        };
+        match r["record"].as_str() {
+            Some("proof") => {
+                proofs += 1;
+                *outcomes
+                    .entry(r["outcome"].as_str().unwrap_or("?").to_string())
+                    .or_default() += 1;
+            }
+            Some("scan") => seeks.push(r["seek_ms"].as_f64().unwrap_or(0.0)),
+            _ => {}
+        }
+    }
+    let deciles: Vec<Value> = (0..10)
+        .map(|d| {
+            let (a, b) = (seeks.len() * d / 10, seeks.len() * (d + 1) / 10);
+            json!({"decile": d, "seek_ms": quantiles(seeks[a..b].to_vec())})
+        })
+        .collect();
+    json!({
+        "proofs": proofs, "outcomes": outcomes, "scans": seeks.len(),
+        "seek_total_ms": seeks.iter().sum::<f64>(),
+        "seek_ms": quantiles(seeks.clone()),
+        "seek_by_decile": deciles,
+    })
+}
+
 fn quantiles(mut v: Vec<f64>) -> Value {
     if v.is_empty() {
         return Value::Null;
@@ -481,6 +576,7 @@ pub async fn run(
     let mut inactive: Vec<usize> = order[n_active..].to_vec();
 
     let mut mon = root(infra).await?;
+    let binlog_start = position_binlog(&mut mon, point.binlog_mib).await?;
     let status0 = mysql_status(&mut mon).await?;
     let binlog0 = binlog_bytes(&mut mon).await?;
     let db_cpu0 = infra.db_cpu_usec(crate::Engine::Mysql);
@@ -763,6 +859,7 @@ pub async fn run(
         Sys::Df(_) => (None, None),
     };
     let status1 = mysql_status(&mut mon).await?;
+    let binlog_end = binlog_position(&mut mon).await?;
     let binlog1 = binlog_bytes(&mut mon).await?;
     let db_cpu = match (db_cpu0, infra.db_cpu_usec(crate::Engine::Mysql)) {
         (Some(a), Some(b)) => Some((b - a) as f64 / 1e6),
@@ -783,6 +880,11 @@ pub async fn run(
             None
         }
         _ => None,
+    };
+    // DeltaForge's proofs, from its trace (its standard output).
+    let proofs = match sys {
+        Sys::Df(_) => proof_trace(&dir.join("state").join("stderr.out")),
+        Sys::Dbz(..) => Value::Null,
     };
     consumer.await.ok();
     mon.disconnect().await.ok();
@@ -945,6 +1047,10 @@ pub async fn run(
         "mysql_connections_max": conns_max,
         "state_store_connections": match sys { Sys::Df(_) => json!("none (SQLite)"), Sys::Dbz(..) => json!("Kafka (offsets topic)") },
         "mysql_cpu_s": db_cpu, "mysql": mysql_delta,
+        "binlog_start": {"file": binlog_start.0, "offset": binlog_start.1},
+        "binlog_end": {"file": binlog_end.0, "offset": binlog_end.1},
+        "binlog_rotated": binlog_start.0 != binlog_end.0,
+        "proof_trace": proofs,
         "binlog_written_bytes": binlog_written, "binlog_retained_bytes": binlog1, "binlog_peak_bytes": binlog_peak,
         "kafka_bytes_consumed": s.bytes,
         "deltaforge": df_delta, "proof_amplification": proof_amplification,
@@ -1075,6 +1181,7 @@ pub struct Plan {
     pub active: Vec<u32>,
     pub workloads: Vec<Workload>,
     pub rotate: bool,
+    pub binlog_mib: Vec<u64>,
     pub reps: usize,
     pub seconds: u64,
     pub warmup: bool,
@@ -1089,12 +1196,15 @@ impl Plan {
                 if self.rotate && active >= 100 {
                     continue;
                 }
-                v.push(Point {
-                    tables,
-                    active,
-                    workload,
-                    rotate: self.rotate,
-                });
+                for &binlog_mib in &self.binlog_mib {
+                    v.push(Point {
+                        tables,
+                        active,
+                        workload,
+                        rotate: self.rotate,
+                        binlog_mib,
+                    });
+                }
             }
         }
         v
@@ -1280,7 +1390,7 @@ fn summary(out: &Path) -> Result<()> {
     let f = |v: Option<f64>| v.map_or("-".to_string(), |x| format!("{x:.2}"));
     let mut md = String::from(
         "Single-instance scaling curves on one host, not a fleet qualification. Medians over the repetitions.\n\n\
-         | point | system | ok | ready s | first event s | steady p50/p99 ms | activation p50/p99 ms | catch-up s | drain s | achieved/s | cpu cores | rss MiB | mysql conns | binlog MiB |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+         | point | system | ok | binlog start MiB | ready s | first event s | steady p50/p99 ms | activation p50/p95/p99 ms | proofs | seek total s | seek p50 ms | catch-up s | drain s | achieved/s | cpu cores | rss MiB | mysql conns | binlog MiB |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for (point, label) in &keys {
         let rs: Vec<&Value> = runs
@@ -1305,11 +1415,15 @@ fn summary(out: &Path) -> Result<()> {
                 .collect())
         };
         md.push_str(&format!(
-            "| {point} | {label} | {}/{} | {} | {} | {}/{} | {}/{} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {point} | {label} | {}/{} | {} | {} | {} | {}/{} | {}/{}/{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             ok.len(), rs.len(),
+            f(m(&["binlog_start", "offset"]).map(|b| b / 1048576.0)),
             f(m(&["ready_s"])), f(m(&["first_event_s"])),
             f(m(&["latency_steady_ms", "p50"])), f(m(&["latency_steady_ms", "p99"])),
-            f(m(&["latency_activation_ms", "p50"])), f(m(&["latency_activation_ms", "p99"])),
+            f(m(&["latency_activation_ms", "p50"])), f(m(&["latency_activation_ms", "p95"])), f(m(&["latency_activation_ms", "p99"])),
+            f(m(&["proof_trace", "proofs"])),
+            f(m(&["proof_trace", "seek_total_ms"]).map(|v| v / 1e3)),
+            f(m(&["proof_trace", "seek_ms", "p50"])),
             f(m(&["catchup_s"])), f(m(&["drain_s"])), f(m(&["achieved_per_s"])),
             f(m(&["cpu_cores"])), f(m(&["rss_peak_mib"])), f(m(&["mysql_connections_max"])),
             f(m(&["binlog_written_bytes"]).map(|b| b / 1048576.0)),
@@ -1345,6 +1459,7 @@ mod tests {
             active,
             workload: Workload::Steady,
             rotate: true,
+            binlog_mib: 0,
         };
         // 20%: 32,000 inactive, 800 replaced per interval: 20 intervals.
         assert_eq!(

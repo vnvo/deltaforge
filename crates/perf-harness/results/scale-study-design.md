@@ -79,6 +79,36 @@ doubles every 30 s. The declared limits:
   offered rate ends the sweep as generator-bound. Capacity is then "at
   least" the last sustained step.
 
+## Binary-log position
+
+DeltaForge proves each newly active table with a binary-log scan whose cost
+grows with the bytes of the current file before it
+(`docs/design/mysql-proof-seek.md`). The position is controlled in every
+run, never left to chance:
+
+- **Every run:** before the system starts, the harness runs `FLUSH BINARY
+  LOGS`, purges the older files (no system runs between runs), and pads the
+  new file to the run's starting offset. The padding rows go to a database
+  neither system captures (`perfpad`). The run records its starting and
+  ending file and offset, and is flagged if the file rotated.
+- **Main matrix:** offset 0, a fresh file. This is a fresh-file best case
+  for DeltaForge and is labeled so. It is never presented alone as
+  production behavior. The headline comparison also includes a 256 MiB
+  point, and the 1 GiB default (`max_binlog_size`) is projected from the
+  sensitivity curve.
+- **Sensitivity series:** run before the matrix, while the seek defect is
+  open. Its shape:
+  - 1,000 tables, 20% active (200 newly active tables), steady load for
+    50 s;
+  - starting offsets of 0, 64, 256 and 960 MiB. "Near 1 GiB" is 960 MiB, so
+    that a run's 31 MB of binary log stays within MySQL's 1 GiB file;
+  - 3 repetitions, both systems.
+- **Recorded per run:**
+  - the starting and ending file and offset;
+  - DeltaForge's proof count, its total seek time, and its seek latency by
+    activation-order decile (from its proof trace);
+  - activation latency, and the steady p99.
+
 ## Phases of every run
 
 1. **Start:** the system starts on the fixture. Recorded:
@@ -131,6 +161,12 @@ Commit to arrival, per row.
   evolves over the run.
 
 ## Staging and repetitions
+
+Paused after the sensitivity series, while the proof-seek defect is open:
+dense scale runs would mostly measure that known serial seek. The staging
+below resumes once it is fixed.
+
+### Stages
 
 1. 100 and 1,000 tables at all four fractions.
 2. 10,000 and 40,000 tables at 1%, 20% and 50%.

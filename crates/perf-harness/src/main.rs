@@ -151,6 +151,10 @@ struct Args {
     /// Scaling study: the workloads (`steady`, `burst`, `capacity`).
     #[arg(long, value_delimiter = ',', default_value = "steady,burst")]
     scale_workload: Vec<String>,
+    /// Scaling study: the binary log's starting offsets (MiB into a fresh
+    /// file); 0 is DeltaForge's fresh-file best case.
+    #[arg(long, value_delimiter = ',', default_value = "0")]
+    scale_binlog_mib: Vec<u64>,
     /// Scaling study: rotate the active sets (not at 100% active).
     #[arg(long)]
     scale_rotate: bool,
@@ -1387,7 +1391,10 @@ async fn launch(
         // `PERF_RUST_LOG` (diagnostics, e.g. the proof trace) or warnings.
         .env(
             "RUST_LOG",
-            std::env::var("PERF_RUST_LOG").unwrap_or_else(|_| "warn".into()),
+            std::env::var("PERF_RUST_LOG")
+                .ok()
+                .or_else(|| RUNNER_LOG.get().cloned())
+                .unwrap_or_else(|| "warn".into()),
         )
         .env("_RJEM_MALLOC_CONF", "stats_print:true")
         .stdout(std::fs::File::create(stderr.with_extension("out"))?)
@@ -2056,6 +2063,10 @@ fn pipeline_spec(
         "spec": spec,
     })
 }
+
+/// The runners' log filter when `PERF_RUST_LOG` is not set (the scaling
+/// study adds the proof trace).
+static RUNNER_LOG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Batch settings added to every DeltaForge pipeline (`--df-batch`).
 static DF_BATCH: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
@@ -3279,6 +3290,10 @@ async fn main() -> Result<()> {
     };
     let work = async {
         if !args.scale_tables.is_empty() {
+            // The proofs' trace (per-proof seek) for every DeltaForge run.
+            RUNNER_LOG
+                .set("warn,deltaforge::proof_trace=info".into())
+                .ok();
             let plan = scale::Plan {
                 tables: args.scale_tables.clone(),
                 active: args.scale_active.clone(),
@@ -3288,6 +3303,7 @@ async fn main() -> Result<()> {
                     .map(|w| scale::Workload::parse(w))
                     .collect::<Result<_>>()?,
                 rotate: args.scale_rotate,
+                binlog_mib: args.scale_binlog_mib.clone(),
                 reps: args.reps,
                 seconds: args.scale_seconds,
                 warmup: args.warmup,
