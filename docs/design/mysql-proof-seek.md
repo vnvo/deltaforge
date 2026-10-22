@@ -46,6 +46,24 @@ active table, all `proven`.
 - Debezium, which never reopens its stream, delivered the first row of a
   table in 30-150 ms in the same runs.
 
+**Controlled offsets.** In the same point, the binary log was flushed and
+then padded to a fixed starting offset (one repetition each):
+
+| Starting offset | Seek per proof, p50 | Seek, total | Activation p50 / p99 | Steady p99 |
+|---|---|---|---|---|
+| 0 (fresh file) | 2.7 ms | 0.58 s | 1.5 s / 2.9 s | 2.7 s |
+| 960 MiB | 190 ms | 32.2 s | 15.2 s / 29.5 s | 29.4 s |
+
+**Serial even without the seek.** On a fresh file, activation latency still
+grows linearly with activation order, by decile of the 200 activations:
+205, 582, 868, 1,064, 1,350, 1,627, 1,948, 2,226, 2,527 and 2,840 ms. The
+total seek is only 0.58 s there. Each proof's other costs are small, about
+13 ms with connect, schema capture, setup and seek, but they run one after
+another. Positioned scanning alone therefore does not meet the regression
+"activation latency does not grow linearly with activation order":
+coalescing or session reuse is needed as well. Debezium's deciles stay flat
+(28-182 ms).
+
 Raw traces: the study's `act-diag` run on the measurement host
 (`runs/*/state/stderr.out`).
 
