@@ -479,6 +479,40 @@ impl Connect {
         ])
     }
 
+    /// The scaling study's worker counters, so far: Kafka requests, offset
+    /// records, bytes produced (every producer), and the JVM's garbage
+    /// collections and their total time (ms).
+    pub fn scale_counters(&self) -> Option<[f64; 5]> {
+        let [requests, offsets] = self.counters()?;
+        Some([
+            requests,
+            offsets,
+            self.jmx_sum(
+                "kafka.producer:type=producer-metrics,client-id=*",
+                "outgoing-byte-total",
+            )?,
+            self.jmx_sum(
+                "java.lang:type=GarbageCollector,name=*",
+                "CollectionCount",
+            )?,
+            self.jmx_sum(
+                "java.lang:type=GarbageCollector,name=*",
+                "CollectionTime",
+            )?,
+        ])
+    }
+
+    /// The bytes of a topic's log segments on the broker `kafka` (a
+    /// container), without the preallocated index files.
+    pub fn topic_bytes(kafka: &str, topic: &str) -> Option<u64> {
+        let out = std::process::Command::new("docker")
+            .args(["exec", kafka, "sh", "-c"])
+            .arg(format!("cat /var/lib/kafka/data/{topic}-*/*.log | wc -c"))
+            .output()
+            .ok()?;
+        String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+    }
+
     /// Stop the worker (at the end of an invocation, or after a failed
     /// run), keeping its log.
     pub async fn stop(self, log: &std::path::Path) {
@@ -651,6 +685,51 @@ pub fn s3_sink(
             "value.converter.schema.registry.url": registry,
         }
     })
+}
+
+/// The scaling study's connector: every table of the databases matching
+/// `databases` (a regular expression), streamed from the binary log's end
+/// (`no_data`), all routed to `topic` (`ByLogicalTableRouter`) as
+/// DeltaForge's sink writes them, in JSON.
+#[allow(clippy::too_many_arguments)]
+pub fn scale_connector(
+    name: &str,
+    tag: &str,
+    mysql_host: &str,
+    password: &str,
+    bootstrap: &str,
+    server_id: u32,
+    databases: &str,
+    topic: &str,
+    profile: Profile,
+) -> Value {
+    let mut c = mysql_connector(
+        name,
+        tag,
+        mysql_host,
+        password,
+        bootstrap,
+        server_id,
+        databases,
+        &[databases.to_string()],
+        &format!("{topic}-prefix"),
+        false,
+        Format::Json,
+        Js::Off,
+        0,
+        profile,
+    );
+    let config = &mut c["config"];
+    if let Some(o) = config.as_object_mut() {
+        // Every table of the matching databases, not a list.
+        o.remove("table.include.list");
+    }
+    config["transforms"] = json!("route");
+    config["transforms.route.type"] =
+        json!("io.debezium.transforms.ByLogicalTableRouter");
+    config["transforms.route.topic.regex"] = json!("(.*)");
+    config["transforms.route.topic.replacement"] = json!(topic);
+    c
 }
 
 /// The JavaScript a cell runs.

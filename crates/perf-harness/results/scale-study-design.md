@@ -50,10 +50,20 @@ table count and the active set. It is not a throughput measurement.
 - **Steady:** 2,000 changes/s for 120 s.
 - **Burst:** the existing burst shape scaled to the same average: 1 s at
   10,000 changes/s, then 4 s idle, for 120 s.
-- **Writers:** several MySQL connections share the offered rate, because
-  one connection cannot commit 2,000 single-row transactions a second. A
-  run whose writers fall below 95% of the offered rate is marked
-  generator-bound, not counted as a result.
+- **Workload-generation settings.** The next two settings exist only to
+  generate the load. They apply equally to both systems, and they are not
+  production recommendations for MySQL or for either system.
+  - **Writers:** 64 MySQL connections share the offered rate, because one
+    connection cannot commit 2,000 single-row transactions a second. A
+    central scheduler issues the changes at the offered rate, and each
+    table's changes go to one connection, so they commit in order. A run
+    whose writers fall below 95% of the offered rate is marked
+    generator-bound, not counted as a result.
+  - **Source durability:** the study's MySQL commits without syncing its
+    logs (`sync_binlog=0`, `innodb_flush_log_at_trx_commit=2`), so that the
+    writers can offer these rates. What either system reads from the
+    binary log is unchanged. The setting applies only to the study's MySQL
+    container, which is removed with the invocation.
 
 **Capacity sweep.** Run at 20%, 50% and 100% active, for the 1,000- and
 40,000-table fixtures. The offered load starts at 2,000 changes/s and
@@ -135,3 +145,11 @@ expanded to 5 repetitions when any of these holds:
 - the two systems' medians are within 10%;
 - a run failed;
 - a repetition differs from its point's median by more than 25%.
+
+## Amendments
+
+Made before any result of the study, after a smoke run showed 16 writers
+on fully durable MySQL reaching only 81% of 2,000 changes/s:
+
+- 64 writers instead of 16;
+- the source's relaxed log syncing (see Workload modes).

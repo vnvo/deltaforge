@@ -47,6 +47,7 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 mod debezium;
 mod extras;
 mod layout;
+mod scale;
 mod threads;
 
 const NETWORK: &str = "df-perf-net";
@@ -140,6 +141,23 @@ struct Args {
     /// writes.
     #[arg(long)]
     debezium_offset_flush_ms: Option<u64>,
+    /// The per-instance scaling study instead of the cell matrix: the
+    /// fixtures' table counts (`results/scale-study-design.md`).
+    #[arg(long, value_delimiter = ',')]
+    scale_tables: Vec<usize>,
+    /// Scaling study: the active fractions, percent.
+    #[arg(long, value_delimiter = ',', default_value = "1,20,50,100")]
+    scale_active: Vec<u32>,
+    /// Scaling study: the workloads (`steady`, `burst`, `capacity`).
+    #[arg(long, value_delimiter = ',', default_value = "steady,burst")]
+    scale_workload: Vec<String>,
+    /// Scaling study: rotate the active sets (not at 100% active).
+    #[arg(long)]
+    scale_rotate: bool,
+    /// Scaling study: seconds of load per run (a rotating run may run
+    /// longer, a capacity sweep runs its steps).
+    #[arg(long, default_value_t = 120)]
+    scale_seconds: u64,
     /// After the last row arrives, watch the PostgreSQL slot's
     /// confirmed_flush_lsn to measure WAL-feedback staleness.
     #[arg(long)]
@@ -1366,7 +1384,11 @@ async fn launch(
         None => cmd.arg("--storage-path").arg(dir.join("state.db")),
     };
     let mut child = cmd
-        .env("RUST_LOG", "warn")
+        // `PERF_RUST_LOG` (diagnostics, e.g. the proof trace) or warnings.
+        .env(
+            "RUST_LOG",
+            std::env::var("PERF_RUST_LOG").unwrap_or_else(|_| "warn".into()),
+        )
         .env("_RJEM_MALLOC_CONF", "stats_print:true")
         .stdout(std::fs::File::create(stderr.with_extension("out"))?)
         .stderr(std::fs::File::create(stderr)?)
@@ -3242,39 +3264,88 @@ async fn main() -> Result<()> {
         serde_json::to_vec_pretty(&invocation(&args, &layouts))?,
     )?;
     let infra = Infra::start(args.state_store == "postgres").await?;
-    let outcome = if layouts.is_empty() {
-        measure(&args, &binaries, &infra, &args.out).await
-    } else {
-        // Seed by seed, the same workload order for each; then over all.
-        let ((la, ma), (lb, mb)) = (&layouts[0], &layouts[1]);
-        let seeds = layout::seeds(ma, mb)?;
-        let mut outcome = Ok(());
-        for (i, seed) in seeds.iter().enumerate() {
-            let pair = [
-                (la.clone(), System::DeltaForge(ma.links[i].1.clone())),
-                (lb.clone(), System::DeltaForge(mb.links[i].1.clone())),
-            ];
-            eprintln!("layout seed {seed} ({}/{})", i + 1, seeds.len());
-            outcome = measure(
-                &args,
-                &pair,
-                &infra,
-                &args.out.join(format!("seed-{seed}")),
-            )
-            .await;
-            if outcome.is_err() {
-                break;
-            }
+    // An interrupt (Ctrl-C, SIGTERM) ends the work like a failure: its
+    // runner and worker are dropped (and so stopped and removed), then the
+    // infrastructure is removed with its volumes below.
+    let interrupted = async {
+        let mut term = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        )
+        .expect("SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
         }
-        outcome.and_then(|_| {
-            layout::aggregate(&args.out, (la, &ma.rev), (lb, &mb.rev), &seeds)?;
-            eprintln!(
-                "layout summary: {}",
-                args.out.join("layout-summary.md").display()
-            );
-            Ok(())
-        })
     };
+    let work = async {
+        if !args.scale_tables.is_empty() {
+            let plan = scale::Plan {
+                tables: args.scale_tables.clone(),
+                active: args.scale_active.clone(),
+                workloads: args
+                    .scale_workload
+                    .iter()
+                    .map(|w| scale::Workload::parse(w))
+                    .collect::<Result<_>>()?,
+                rotate: args.scale_rotate,
+                reps: args.reps,
+                seconds: args.scale_seconds,
+                warmup: args.warmup,
+            };
+            scale::study(
+                &plan,
+                &binaries,
+                &infra,
+                &args.out,
+                &args.cache,
+                args.debezium_offset_flush_ms,
+            )
+            .await
+        } else if layouts.is_empty() {
+            measure(&args, &binaries, &infra, &args.out).await
+        } else {
+            // Seed by seed, the same workload order for each; then over all.
+            let ((la, ma), (lb, mb)) = (&layouts[0], &layouts[1]);
+            let seeds = layout::seeds(ma, mb)?;
+            let mut outcome = Ok(());
+            for (i, seed) in seeds.iter().enumerate() {
+                let pair = [
+                    (la.clone(), System::DeltaForge(ma.links[i].1.clone())),
+                    (lb.clone(), System::DeltaForge(mb.links[i].1.clone())),
+                ];
+                eprintln!("layout seed {seed} ({}/{})", i + 1, seeds.len());
+                outcome = measure(
+                    &args,
+                    &pair,
+                    &infra,
+                    &args.out.join(format!("seed-{seed}")),
+                )
+                .await;
+                if outcome.is_err() {
+                    break;
+                }
+            }
+            outcome.and_then(|_| {
+                layout::aggregate(
+                    &args.out,
+                    (la, &ma.rev),
+                    (lb, &mb.rev),
+                    &seeds,
+                )?;
+                eprintln!(
+                    "layout summary: {}",
+                    args.out.join("layout-summary.md").display()
+                );
+                Ok(())
+            })
+        }
+    };
+    let outcome = tokio::select! {
+        r = work => r,
+        _ = interrupted => Err(anyhow!("interrupted")),
+    };
+    // Let dropped containers finish their removal.
+    tokio::time::sleep(Duration::from_secs(2)).await;
     infra.cleanup();
     outcome
 }
@@ -3310,6 +3381,7 @@ fn invocation(args: &Args, layouts: &[(String, layout::Manifest)]) -> Value {
         },
         "debezium_artifacts": extras::pins(),
         "host": {"cpu": cpu, "kernel": cmd("uname", &["-r"]), "cpus": cmd("nproc", &[])},
+        "perf_rust_log": std::env::var("PERF_RUST_LOG").ok(),
         "layouts": layouts.iter().map(|(label, m)| json!({
             "label": label, "rev": m.rev,
             "links": m.links.iter().map(|(s, p, h)| json!({"seed": s, "path": p, "sha256": h})).collect::<Vec<_>>(),
