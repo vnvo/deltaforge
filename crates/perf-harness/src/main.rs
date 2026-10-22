@@ -155,6 +155,10 @@ struct Args {
     /// file); 0 is DeltaForge's fresh-file best case.
     #[arg(long, value_delimiter = ',', default_value = "0")]
     scale_binlog_mib: Vec<u64>,
+    /// Scaling study: what pads the binary log up to the starting offset:
+    /// `large` (8 MiB rows) or `small` (single-row transactions).
+    #[arg(long, default_value = "large")]
+    scale_binlog_pad: String,
     /// Scaling study: rotate the active sets (not at 100% active).
     #[arg(long)]
     scale_rotate: bool,
@@ -3304,6 +3308,7 @@ async fn main() -> Result<()> {
                     .collect::<Result<_>>()?,
                 rotate: args.scale_rotate,
                 binlog_mib: args.scale_binlog_mib.clone(),
+                pad: scale::Pad::parse(&args.scale_binlog_pad)?,
                 reps: args.reps,
                 seconds: args.scale_seconds,
                 warmup: args.warmup,

@@ -102,7 +102,11 @@ run, never left to chance:
     50 s;
   - starting offsets of 0, 64, 256 and 960 MiB. "Near 1 GiB" is 960 MiB, so
     that a run's 31 MB of binary log stays within MySQL's 1 GiB file;
-  - 3 repetitions, both systems.
+  - 3 repetitions, both systems;
+  - two paddings, reported apart:
+    - `large`: rows of 8 MiB, so few, large events;
+    - `small`: single-row transactions like the load's, so many small
+      events, as an OLTP server's binary log holds.
 - **Recorded per run:**
   - the starting and ending file and offset;
   - DeltaForge's proof count, its total seek time, and its seek latency by
@@ -189,3 +193,11 @@ on fully durable MySQL reaching only 81% of 2,000 changes/s:
 
 - 64 writers instead of 16;
 - the source's relaxed log syncing (see Workload modes).
+
+After the first sensitivity run (large padding), before any projection from
+it: its seek grew by about 0.19 ms per MiB of padding. With the file filled
+by the load's own small transactions, it had grown by about 1.5 ms per MB.
+The server's skip cost appears to follow the number of events rather than
+the bytes, so large padding understates an OLTP file. The `small` padding
+was added, and the 1 GiB projection uses the small-padding curve. The
+large-padding run is kept and reported as such.

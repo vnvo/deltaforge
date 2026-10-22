@@ -106,17 +106,40 @@ pub struct Point {
     /// The binary log's byte offset (MiB) in a fresh file when the run
     /// starts: 0 is a fresh-file best case for DeltaForge's proofs.
     pub binlog_mib: u64,
+    /// What the file is padded with up to that offset.
+    pub pad: Pad,
+}
+
+/// The padding of a run's binary log up to its starting offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pad {
+    /// Rows of 8 MiB: few, large events.
+    Large,
+    /// Single-row transactions like the load's: many small events, as an
+    /// OLTP server's binary log holds.
+    Small,
+}
+
+impl Pad {
+    pub fn parse(s: &str) -> Result<Pad> {
+        Ok(match s {
+            "large" => Pad::Large,
+            "small" => Pad::Small,
+            other => bail!("unknown binary-log padding {other} (large, small)"),
+        })
+    }
 }
 
 impl Point {
     pub fn id(&self) -> String {
         format!(
-            "t{}-a{}-{}{}-o{}",
+            "t{}-a{}-{}{}-o{}{}",
             self.tables,
             self.active,
             self.workload.name(),
             if self.rotate { "-rotate" } else { "" },
-            self.binlog_mib
+            self.binlog_mib,
+            if self.pad == Pad::Small { "s" } else { "" }
         )
     }
 
@@ -215,6 +238,7 @@ pub async fn fixture(infra: &Infra, tables: usize) -> Result<f64> {
     c.query_drop("CREATE DATABASE IF NOT EXISTS perfpad")
         .await?;
     c.query_drop("CREATE TABLE IF NOT EXISTS perfpad.p (id BIGINT AUTO_INCREMENT PRIMARY KEY, b LONGBLOB)").await?;
+    c.query_drop("CREATE TABLE IF NOT EXISTS perfpad.s (id BIGINT AUTO_INCREMENT PRIMARY KEY, a INT, b VARCHAR(32), c DOUBLE)").await?;
     for d in 0..tables.div_ceil(TABLES_PER_DATABASE) {
         c.query_drop(format!("CREATE DATABASE scale_{d:04}"))
             .await?;
@@ -451,14 +475,57 @@ async fn binlog_position(c: &mut mysql_async::Conn) -> Result<(String, u64)> {
 /// between runs) and pad it to `mib` MiB with rows of a database neither
 /// system captures. Returns the starting file and offset.
 async fn position_binlog(
+    infra: &Infra,
     c: &mut mysql_async::Conn,
     mib: u64,
+    pad: Pad,
 ) -> Result<(String, u64)> {
     c.query_drop("FLUSH BINARY LOGS").await?;
     let (file, _) = binlog_position(c).await?;
     c.query_drop(format!("PURGE BINARY LOGS TO '{file}'"))
         .await?;
     let target = mib << 20;
+    if pad == Pad::Small && target > 0 {
+        // Single-row transactions on the writers' connections until the
+        // offset is reached.
+        let done = Arc::new(AtomicBool::new(false));
+        let mut tasks = Vec::new();
+        for _ in 0..WRITERS {
+            let mut w = loadgen(infra).await?;
+            let done = Arc::clone(&done);
+            tasks.push(tokio::spawn(async move {
+                let mut k = 0u64;
+                while !done.load(Ordering::Relaxed) {
+                    k += 1;
+                    w.query_drop(format!(
+                        "INSERT INTO perfpad.s (a, b, c) VALUES ({k}, 'r{k}', {k}.5)"
+                    ))
+                    .await?;
+                }
+                w.disconnect().await.ok();
+                Ok::<_, anyhow::Error>(())
+            }));
+        }
+        let outcome = loop {
+            let (f, pos) = binlog_position(c).await?;
+            if f != file {
+                break Err(anyhow::anyhow!(
+                    "the binary log rotated while padding to {mib} MiB"
+                ));
+            }
+            if pos >= target {
+                break Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        done.store(true, Ordering::Relaxed);
+        for t in tasks {
+            t.await??;
+        }
+        outcome?;
+        c.query_drop("TRUNCATE TABLE perfpad.s").await?;
+        return binlog_position(c).await;
+    }
     const CHUNK: u64 = 8 << 20;
     loop {
         let (f, pos) = binlog_position(c).await?;
@@ -576,7 +643,8 @@ pub async fn run(
     let mut inactive: Vec<usize> = order[n_active..].to_vec();
 
     let mut mon = root(infra).await?;
-    let binlog_start = position_binlog(&mut mon, point.binlog_mib).await?;
+    let binlog_start =
+        position_binlog(infra, &mut mon, point.binlog_mib, point.pad).await?;
     let status0 = mysql_status(&mut mon).await?;
     let binlog0 = binlog_bytes(&mut mon).await?;
     let db_cpu0 = infra.db_cpu_usec(crate::Engine::Mysql);
@@ -1182,6 +1250,7 @@ pub struct Plan {
     pub workloads: Vec<Workload>,
     pub rotate: bool,
     pub binlog_mib: Vec<u64>,
+    pub pad: Pad,
     pub reps: usize,
     pub seconds: u64,
     pub warmup: bool,
@@ -1203,6 +1272,7 @@ impl Plan {
                         workload,
                         rotate: self.rotate,
                         binlog_mib,
+                        pad: self.pad,
                     });
                 }
             }
@@ -1460,6 +1530,7 @@ mod tests {
             workload: Workload::Steady,
             rotate: true,
             binlog_mib: 0,
+            pad: Pad::Large,
         };
         // 20%: 32,000 inactive, 800 replaced per interval: 20 intervals.
         assert_eq!(
