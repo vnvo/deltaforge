@@ -6,6 +6,9 @@ identical, deterministic MySQL and PostgreSQL fixtures, delivering to Kafka
 Debezium on Kafka Connect. This is measurement tooling, not a test: it is
 not part of the gate and changes no product behavior.
 
+Results: [`results/2026-10-debezium-comparison.md`](results/2026-10-debezium-comparison.md)
+(DeltaForge against Debezium, including the runs found invalid and why).
+
 ## What a run measures
 
 Each run starts a fresh DeltaForge process, or registers a connector on a
@@ -35,6 +38,8 @@ from official distributions and verified against the SHA-256 digests in
 `src/extras.rs`:
 
 - Confluent's Avro converter 8.3.2 (Confluent Hub);
+- Confluent's S3 sink connector 12.1.13 (Confluent Hub), Debezium's path to
+  Parquet;
 - GraalJS 25.4.4.1.1 and its runtime jars (Maven Central), the engine of
   Debezium's scripting transformations.
 
@@ -74,8 +79,14 @@ from official distributions and verified against the SHA-256 digests in
 Against Debezium a cell is either:
 
 - **direct:** both systems run the same workload to equivalent output. The
-  JSON and Avro CDC, snapshot and latency cells are direct. Their envelopes
-  differ in bytes, which is reported.
+  JSON and Avro CDC, snapshot, latency, catch-up, restart, crash and DDL
+  cells are direct. Their envelopes differ in bytes, which is reported. So
+  are the JavaScript filtering and routing cells (`-jsroute`): both keep the
+  rows with an even id and route each to one of two topics by `id % 4`
+  (DeltaForge's JavaScript processor; Debezium's `Filter` and
+  `ContentBasedRouter`). The consumer checks every row's topic, and a row
+  that should have been filtered out or arrives on the wrong topic fails
+  the run.
 - **architectural:** the systems do the work in different ways, and
   `summary.md` states how. The JavaScript cells are architectural.
   DeltaForge runs a batch JavaScript processor that adds a field.
@@ -85,6 +96,56 @@ Against Debezium a cell is either:
   is no optimizing Truffle runtime.
 
 DeltaForge against DeltaForge is always direct.
+
+## Parquet end to end
+
+DeltaForge writes Parquet to S3 directly: its durable S3 sink writes one
+object per 2,000-row batch. Debezium has no S3 path of its own. It writes
+Avro to Kafka, and Confluent's S3 sink connector 12.1.13 (Confluent Hub,
+pinned in `src/extras.rs`) writes the topic to the same RustFS server as
+Parquet. That connector is configured to match: 2,000 rows per object
+(`flush.size`), and a partial object every second
+(`rotate.schedule.interval.ms`). The cell is architectural: the paths
+differ, and so do the columns (DeltaForge's flat envelope, Debezium's
+nested one).
+
+The connector checks its rotation only when records arrive, or at the
+worker's offset commit (60 s). The last partial object of a backlog lands
+on that commit. Two times are recorded:
+
+- `secs`: until every row is visible;
+- `bulk_s`: until all but the last object's 2,000 rows are visible.
+
+Each run also records `objects`, the number of Parquet objects written.
+
+## Crash and recovery
+
+The crash cells kill the system mid-backlog: SIGKILL for DeltaForge,
+`docker kill` for the Kafka Connect worker. Completion is by distinct row
+id, and a replayed row counts as a duplicate. Each system first has a
+durable position. DeltaForge has checkpointed the marker row. Debezium is
+crashed only after its worker has committed an offset for the connector
+(`offset.flush.interval.ms`, 60 s by default). Without one, a `no_data`
+connector restarts at the binary log's end, past every row it had not
+delivered.
+
+After the kill, DeltaForge's store gate is still held. By design it does
+not expire. The harness performs the operator step: `store-gate status`,
+a check that the recorded process is gone, then `store-gate break
+--owner`. The run records it (`gate_broken`) and counts it in the
+recovery time. Recorded per run:
+
+- `restart_s`: kill to the restarted system serving again;
+- `recovery_s`: kill to the first row it delivers;
+- CPU, including the killed process's CPU up to the kill.
+
+What a crash replays depends on how often each system records its position.
+DeltaForge checkpoints after each delivered batch, so a crash replays at
+most the batch in flight. Debezium's worker commits offsets on
+`offset.flush.interval.ms` (60 s by default), and a crash replays what was
+delivered since the last commit. `--debezium-offset-flush-ms` sets that
+interval for a run. With `--delivery-stats`, the cost of a shorter interval
+shows in the offset records and Kafka requests.
 
 ## Layout-randomized qualification
 

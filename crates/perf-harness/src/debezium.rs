@@ -13,7 +13,9 @@
 //! - `tuned`: configured as DeltaForge runs: the producer with LZ4 (and
 //!   `acks=all`, idempotence, 5 ms linger stated), and the connector polling
 //!   its queue every 50 ms (DeltaForge's batch deadline) with batches of
-//!   2,048 events (DeltaForge: 2,000).
+//!   2,048 events (DeltaForge: 2,000), and snapshotting up to 8 tables in
+//!   parallel (`snapshot.max.threads`; DeltaForge's `max_parallel_tables`
+//!   default).
 
 use std::time::{Duration, Instant};
 
@@ -54,7 +56,9 @@ const JMX_PORT: u16 = 9012;
 /// A running Kafka Connect worker.
 pub struct Connect {
     container: ContainerAsync<GenericImage>,
-    rest: String,
+    /// Its REST address (resolved again after a restart: the container's
+    /// host port can change).
+    rest: std::sync::Mutex<String>,
 }
 
 impl Connect {
@@ -65,6 +69,7 @@ impl Connect {
         bootstrap: &str,
         tag: &str,
         profile: Profile,
+        offset_flush_ms: Option<u64>,
         extras: &crate::extras::Extras,
     ) -> Result<Connect> {
         let mut image = GenericImage::new(CONNECT_IMAGE.0, CONNECT_IMAGE.1)
@@ -88,6 +93,13 @@ impl Connect {
                 Mount::bind_mount(
                     extras.avro_converter.display().to_string(),
                     "/kafka/connect/confluent-avro-converter",
+                )
+                .with_access_mode(AccessMode::ReadWrite),
+            )
+            .with_mount(
+                Mount::bind_mount(
+                    extras.s3_sink.display().to_string(),
+                    "/kafka/connect/confluent-s3-sink",
                 )
                 .with_access_mode(AccessMode::ReadWrite),
             )
@@ -118,6 +130,10 @@ impl Connect {
                 .with_env_var("CONNECT_PRODUCER_COMPRESSION_TYPE", "lz4")
                 .with_env_var("CONNECT_PRODUCER_LINGER_MS", "5");
         }
+        if let Some(ms) = offset_flush_ms {
+            image =
+                image.with_env_var("OFFSET_FLUSH_INTERVAL_MS", ms.to_string());
+        }
         let container =
             image.gate_owned().start().await.context("start connect")?;
         let port = container.get_host_port_ipv4(8083).await?;
@@ -142,7 +158,10 @@ impl Connect {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        Ok(Connect { container, rest })
+        Ok(Connect {
+            container,
+            rest: std::sync::Mutex::new(rest),
+        })
     }
 
     async fn call(
@@ -154,7 +173,8 @@ impl Connect {
         let c = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()?;
-        let mut req = c.request(method, format!("{}{path}", self.rest));
+        let rest = self.rest.lock().unwrap().clone();
+        let mut req = c.request(method, format!("{rest}{path}"));
         if let Some(b) = body {
             req = req.json(b);
         }
@@ -222,6 +242,108 @@ impl Connect {
                 bail!("connector {name} never reached {state}");
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Stop a connector (Kafka Connect's `stop`: its tasks shut down and
+    /// commit their offsets; `resume` starts it again from them).
+    pub async fn stop_connector(&self, name: &str) -> Result<()> {
+        self.call(
+            reqwest::Method::PUT,
+            &format!("/connectors/{name}/stop"),
+            None,
+        )
+        .await?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if let Ok((c, tasks, _)) = self.status(name).await
+                && c == "STOPPED"
+                && tasks.is_empty()
+            {
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                bail!("connector {name} never stopped");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Stop the worker container (a graceful shutdown: its tasks commit
+    /// their offsets).
+    pub async fn down(&self) -> Result<()> {
+        let ok = std::process::Command::new("docker")
+            .args(["stop", "--time", "60", self.container.id()])
+            .status()?
+            .success();
+        if !ok {
+            bail!("docker stop failed");
+        }
+        Ok(())
+    }
+
+    /// Kill the worker container at once (`docker kill`: no shutdown, no
+    /// final offset commit).
+    pub fn crash(&self) -> Result<()> {
+        let ok = std::process::Command::new("docker")
+            .args(["kill", self.container.id()])
+            .status()?
+            .success();
+        if !ok {
+            bail!("docker kill failed");
+        }
+        Ok(())
+    }
+
+    /// Start the worker again and wait until its REST API answers; its
+    /// connectors start from their stored configuration and offsets.
+    pub async fn up(&self) -> Result<()> {
+        let ok = std::process::Command::new("docker")
+            .args(["start", self.container.id()])
+            .status()?
+            .success();
+        if !ok {
+            bail!("docker start failed");
+        }
+        let port = self.container.get_host_port_ipv4(8083).await?;
+        let rest = format!("http://127.0.0.1:{port}");
+        *self.rest.lock().unwrap() = rest.clone();
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            if let Ok(r) = reqwest::get(format!("{rest}/connectors")).await
+                && r.status().is_success()
+            {
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                bail!("Kafka Connect never answered after a restart");
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// Wait until the worker has committed an offset for the connector
+    /// (`offset.flush.interval.ms`, 60 s by default). Until then a crash
+    /// leaves no offset, and a `no_data` connector restarts at the binlog's
+    /// end, past every row it had not delivered.
+    pub async fn committed(&self, name: &str) -> Result<Duration> {
+        let start = Instant::now();
+        loop {
+            if let Ok(v) = self
+                .call(
+                    reqwest::Method::GET,
+                    &format!("/connectors/{name}/offsets"),
+                    None,
+                )
+                .await
+                && v["offsets"].as_array().is_some_and(|o| !o.is_empty())
+            {
+                return Ok(start.elapsed());
+            }
+            if start.elapsed() > Duration::from_secs(180) {
+                bail!("connector {name} committed no offset");
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
@@ -357,23 +479,8 @@ impl Connect {
         ])
     }
 
-    /// Whether the worker still answers.
-    pub async fn alive(&self) -> bool {
-        self.call(reqwest::Method::GET, "/connectors", None)
-            .await
-            .is_ok()
-    }
-
-    /// Kill a worker that no longer answers (out of memory, say), so it
-    /// takes no CPU from the runs after it; its later runs fail at once.
-    pub fn kill(&self) {
-        std::process::Command::new("docker")
-            .args(["kill", self.container.id()])
-            .output()
-            .ok();
-    }
-
-    /// Stop the worker (at the end of an invocation), keeping its log.
+    /// Stop the worker (at the end of an invocation, or after a failed
+    /// run), keeping its log.
     pub async fn stop(self, log: &std::path::Path) {
         if let Ok(o) = std::process::Command::new("docker")
             .args(["logs", self.container.id()])
@@ -412,10 +519,12 @@ pub fn mysql_connector(
     bootstrap: &str,
     server_id: u32,
     ns: &str,
+    tables: &[String],
     prefix: &str,
     snapshot: bool,
     format: Format,
-    js: bool,
+    js: Js,
+    rows: usize,
     profile: Profile,
 ) -> Value {
     let mut connector = json!({
@@ -430,7 +539,7 @@ pub fn mysql_connector(
             "database.server.id": server_id.to_string(),
             "topic.prefix": prefix,
             "database.include.list": ns,
-            "table.include.list": format!("{ns}.t"),
+            "table.include.list": tables.join(","),
             "include.schema.changes": "false",
             "schema.history.internal.kafka.bootstrap.servers": bootstrap,
             "schema.history.internal.kafka.topic": format!("dbz-history-{tag}"),
@@ -456,25 +565,114 @@ pub fn mysql_connector(
             }
         }
     }
-    // The JavaScript counterpart of DeltaForge's JavaScript processor: a
-    // JavaScript expression evaluated per record that reads the row image
-    // (Debezium's scripting transformations filter or route records; none
-    // adds a field, so this one keeps every record).
-    if js {
-        config["transforms"] = json!("js");
-        config["transforms.js.type"] = json!("io.debezium.transforms.Filter");
-        config["transforms.js.language"] = json!("jsr223.graal.js");
-        config["transforms.js.condition"] =
-            json!("value.after == null || value.after.id != null");
+    match js {
+        Js::Off => {}
+        // The JavaScript counterpart of DeltaForge's JavaScript processor: a
+        // JavaScript expression evaluated per record that reads the row image
+        // (Debezium's scripting transformations filter or route records; none
+        // adds a field, so this one keeps every record).
+        Js::Tag => {
+            config["transforms"] = json!("js");
+            config["transforms.js.type"] =
+                json!("io.debezium.transforms.Filter");
+            config["transforms.js.language"] = json!("jsr223.graal.js");
+            config["transforms.js.condition"] =
+                json!("value.after == null || value.after.id != null");
+        }
+        // The same filter and routing as DeltaForge's script (`Js::Route`):
+        // its Filter, then its ContentBasedRouter, both JavaScript.
+        Js::Route => {
+            let [a, b] = route_topics(prefix);
+            config["transforms"] = json!("filter,route");
+            config["transforms.filter.type"] =
+                json!("io.debezium.transforms.Filter");
+            config["transforms.filter.language"] = json!("jsr223.graal.js");
+            config["transforms.filter.condition"] = json!(format!(
+                "value.after != null && (value.after.id % 2 == 0 || value.after.id > {rows})"
+            ));
+            config["transforms.route.type"] =
+                json!("io.debezium.transforms.ContentBasedRouter");
+            config["transforms.route.language"] = json!("jsr223.graal.js");
+            config["transforms.route.topic.expression"] =
+                json!(format!("value.after.id % 4 == 0 ? '{a}' : '{b}'"));
+        }
     }
     if profile == Profile::Tuned {
         connector["config"]["poll.interval.ms"] = json!("50");
         connector["config"]["max.batch.size"] = json!("2048");
+        // Tables snapshotted in parallel, as many as DeltaForge's default
+        // (`max_parallel_tables`, 8).
+        connector["config"]["snapshot.max.threads"] = json!("8");
     }
     connector
 }
 
-/// The topic a connector of `prefix` writes table `{ns}.t` to.
-pub fn topic(prefix: &str, ns: &str) -> String {
-    format!("{prefix}.{ns}.t")
+/// The Parquet path of a Debezium run: Confluent's S3 sink connector
+/// writing the connector's topic (Avro through `registry`) to `bucket` under
+/// `prefix`, `rows_per_object` rows per Parquet object as DeltaForge's
+/// durable S3 sink writes one object per batch (2,000 rows by default), and a
+/// partial object at least every second (DeltaForge's batch timer delivers a
+/// partial batch too).
+#[allow(clippy::too_many_arguments)]
+pub fn s3_sink(
+    name: &str,
+    topics: &[String],
+    endpoint: &str,
+    bucket: &str,
+    prefix: &str,
+    access_key: &str,
+    secret_key: &str,
+    registry: &str,
+    rows_per_object: usize,
+) -> Value {
+    json!({
+        "name": name,
+        "config": {
+            "connector.class": "io.confluent.connect.s3.S3SinkConnector",
+            "tasks.max": "1",
+            "topics": topics.join(","),
+            "store.url": endpoint,
+            "s3.bucket.name": bucket,
+            "s3.region": "us-east-1",
+            "s3.path.style.access.enabled": "true",
+            "aws.access.key.id": access_key,
+            "aws.secret.access.key": secret_key,
+            "storage.class": "io.confluent.connect.s3.storage.S3Storage",
+            "format.class": "io.confluent.connect.s3.format.parquet.ParquetFormat",
+            "parquet.codec": "snappy",
+            "topics.dir": prefix,
+            "flush.size": rows_per_object.to_string(),
+            "rotate.schedule.interval.ms": "1000",
+            "timezone": "UTC",
+            "schema.compatibility": "NONE",
+            "key.converter": "io.confluent.connect.avro.AvroConverter",
+            "key.converter.schema.registry.url": registry,
+            "value.converter": "io.confluent.connect.avro.AvroConverter",
+            "value.converter.schema.registry.url": registry,
+        }
+    })
+}
+
+/// The JavaScript a cell runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Js {
+    Off,
+    /// DeltaForge adds a field to every row; Debezium, whose scripting
+    /// transformations cannot, evaluates a condition per record that keeps
+    /// every one.
+    Tag,
+    /// Both keep the rows with an even id (and the markers, above the
+    /// fixture's ids) and route each to one of two topics by `id % 4`
+    /// (`route_topics`, the first for 0).
+    Route,
+}
+
+/// The two topics a `Js::Route` cell routes to.
+pub fn route_topics(base: &str) -> [String; 2] {
+    [format!("{base}.a"), format!("{base}.b")]
+}
+
+/// The topic a connector of `prefix` writes `table` (`db.table`) to.
+pub fn topic(prefix: &str, table: &str) -> String {
+    format!("{prefix}.{table}")
 }
