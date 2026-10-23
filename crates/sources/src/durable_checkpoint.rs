@@ -94,6 +94,12 @@ pub const WATERMARK_VERSION: u16 = 1;
 /// refuses them (fails closed) instead of misreading them.
 pub const WATERMARK_VERSION_SNAPSHOT_CHAIN: u16 = 2;
 
+/// The version of MySQL GTID watermarks ([`WmPos::MysqlGtid`]): exact GTID
+/// sets (`crate::mysql::GTID_FORMAT`). An earlier MySQL GTID watermark may
+/// claim transactions the server had not executed, so it is refused
+/// (`Incomparable`, the sink fails closed) rather than trusted.
+pub const WATERMARK_VERSION_MYSQL_GTID: u16 = 3;
+
 /// A durable watermark: source lineage plus a source-specific position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DurableWatermark {
@@ -246,6 +252,7 @@ fn version_of(pos: &WmPos) -> u16 {
         WmPos::SnapshotSeq { .. } | WmPos::SnapshotGenerationAdopted { .. } => {
             WATERMARK_VERSION_SNAPSHOT_CHAIN
         }
+        WmPos::MysqlGtid { .. } => WATERMARK_VERSION_MYSQL_GTID,
         _ => WATERMARK_VERSION,
     }
 }
@@ -1863,5 +1870,31 @@ mod snapshot_chain_watermark_tests {
         let mut cdc = DurableWatermark::pg_commit(7, 10, None);
         cdc.version = WATERMARK_VERSION_SNAPSHOT_CHAIN;
         assert_eq!(DurableWatermark::parse(&cdc.to_bytes()), None);
+    }
+
+    #[test]
+    fn a_mysql_gtid_watermark_from_before_exact_sets_is_refused() {
+        let w = DurableWatermark::mysql_gtid_commit(
+            PersistedLineage::MysqlGtid {
+                source_uuid: [7u8; 16],
+            },
+            "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-8:13".into(),
+        );
+        assert_eq!(w.version, WATERMARK_VERSION_MYSQL_GTID);
+        assert_eq!(DurableWatermark::parse(&w.to_bytes()), Some(w.clone()));
+        // Written by an earlier version (1): its set may over-claim.
+        let mut old = w.clone();
+        old.version = WATERMARK_VERSION;
+        assert_eq!(DurableWatermark::parse(&old.to_bytes()), None);
+        let cmp = SourceCheckpointComparator;
+        assert_eq!(
+            cmp.order(&old.to_bytes(), &w.to_bytes()),
+            CheckpointOrder::Incomparable
+        );
+        // Other kinds keep version 1.
+        assert_eq!(
+            DurableWatermark::pg_commit(7, 10, None).version,
+            WATERMARK_VERSION
+        );
     }
 }

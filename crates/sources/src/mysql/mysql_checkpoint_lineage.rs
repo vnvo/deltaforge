@@ -650,8 +650,9 @@ mod tests {
     #[tokio::test]
     async fn adoption_preserves_every_position_field() {
         let (store, backend, h) = setup(&[UUID_A]).await;
-        let empty_gtid = br#"{"file":"bin.000003","pos":4,"gtid_set":""}"#;
-        let gtid = br#"{"file":"bin.000004","pos":157,"gtid_set":"3e11fa47-71ca-11e1-9e33-c80aa9429562:1-9"}"#;
+        let empty_gtid =
+            br#"{"file":"bin.000003","pos":4,"gtid_set":"","gtid_format":2}"#;
+        let gtid = br#"{"file":"bin.000004","pos":157,"gtid_set":"3e11fa47-71ca-11e1-9e33-c80aa9429562:1-9","gtid_format":2}"#;
         store.put_raw("orders::sink::a", empty_gtid).await.unwrap();
         store.put_raw("orders::sink::b", gtid).await.unwrap();
         run(store.as_ref(), &backend, &h[0], &FakeGtid::ok())
@@ -779,7 +780,8 @@ mod tests {
         let before = snapshot(&store).await;
         refused(
             run(store.as_ref(), &backend, &h[1], &FakeGtid::ok()).await,
-            "unparseable GTID",
+            // The stored set does not parse, so the checkpoint is refused.
+            "malformed",
         );
         assert_eq!(snapshot(&store).await, before);
     }

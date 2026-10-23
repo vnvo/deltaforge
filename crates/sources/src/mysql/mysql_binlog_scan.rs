@@ -936,10 +936,25 @@ async fn read_position(
         .take(1)
         .ok_or_else(|| ProofError::Capture("no binlog position".into()))?;
     let gtid: Option<String> = row.take::<Option<String>, _>(4).flatten();
+    // The server's text (it prints newlines), in the one canonical form.
+    let gtid_set = if gtid_mode {
+        let t = gtid.unwrap_or_default();
+        Some(
+            GtidSet::parse(&t)
+                .ok_or_else(|| {
+                    ProofError::Capture(format!(
+                        "unparseable executed set {t:?}"
+                    ))
+                })?
+                .to_string(),
+        )
+    } else {
+        None
+    };
     Ok(MySqlCheckpoint {
         file,
         pos,
-        gtid_set: gtid_mode.then(|| gtid.unwrap_or_default()),
+        gtid_set,
         lineage: Some(lineage_hash.to_string()),
         snapshot_completed: None,
         snapshot_chain: None,

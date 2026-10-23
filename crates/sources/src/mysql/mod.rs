@@ -87,9 +87,13 @@ use crate::registry_scope::{
 use storage::adapters::LineageDescriptor;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "MySqlCheckpointWire", try_from = "MySqlCheckpointWire")]
 pub struct MySqlCheckpoint {
     pub file: String,
     pub pos: u64,
+    /// GTID mode: the exact executed set (see [`crate::gtid_set`]). Stored
+    /// with `gtid_format` [`GTID_FORMAT`]; a stored GTID set without it was
+    /// written by an earlier version that could over-claim, and is refused.
     pub gtid_set: Option<String>,
     /// Verified registry lineage hash of the server this position belongs to
     /// (MySQL `server_uuid`). `None` only in checkpoints written before
@@ -106,6 +110,77 @@ pub struct MySqlCheckpoint {
     /// generation (absent on completions written before chains).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_chain: Option<String>,
+}
+
+/// The format of a stored MySQL GTID set. Format 2 sets are exact. Earlier
+/// versions merged each new GTID into the set by extending its first
+/// interval, so a set with a gap (`u:1-8:13`) was stored as `u:1-13`,
+/// claiming transactions the server had not executed; resuming from it
+/// skips them when they are committed later. Such a set cannot be repaired
+/// from the server later (once the gap fills it is indistinguishable from a
+/// contiguous one), so it is refused.
+pub const GTID_FORMAT: u16 = 2;
+
+/// [`MySqlCheckpoint`] as stored: the GTID set carries its format.
+#[derive(Serialize, Deserialize)]
+struct MySqlCheckpointWire {
+    file: String,
+    pos: u64,
+    gtid_set: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gtid_format: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lineage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_completed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_chain: Option<String>,
+}
+
+impl From<MySqlCheckpoint> for MySqlCheckpointWire {
+    fn from(c: MySqlCheckpoint) -> Self {
+        Self {
+            gtid_format: c.gtid_set.is_some().then_some(GTID_FORMAT),
+            file: c.file,
+            pos: c.pos,
+            gtid_set: c.gtid_set,
+            lineage: c.lineage,
+            snapshot_completed: c.snapshot_completed,
+            snapshot_chain: c.snapshot_chain,
+        }
+    }
+}
+
+impl TryFrom<MySqlCheckpointWire> for MySqlCheckpoint {
+    type Error = String;
+
+    fn try_from(w: MySqlCheckpointWire) -> Result<Self, String> {
+        if let Some(g) = &w.gtid_set {
+            if w.gtid_format != Some(GTID_FORMAT) {
+                return Err(format!(
+                    "MySQL checkpoint GTID set {g:?} was written before exact \
+                     GTID sets (format {GTID_FORMAT}, found {:?}): it may \
+                     claim transactions the server had not executed, so \
+                     resuming from it could skip rows. Reset this source's \
+                     checkpoints and proof state to start again",
+                    w.gtid_format
+                ));
+            }
+            if crate::gtid_set::GtidSet::parse(g).is_none() {
+                return Err(format!(
+                    "unparseable MySQL checkpoint GTID set {g:?}"
+                ));
+            }
+        }
+        Ok(Self {
+            file: w.file,
+            pos: w.pos,
+            gtid_set: w.gtid_set,
+            lineage: w.lineage,
+            snapshot_completed: w.snapshot_completed,
+            snapshot_chain: w.snapshot_chain,
+        })
+    }
 }
 
 /// A resume position read from the checkpoint store.
@@ -3401,7 +3476,9 @@ mod compare_checkpoints_tests {
     }
 
     fn gcp(file: &str, pos: u64, gtid: &str) -> Vec<u8> {
-        format!(r#"{{"file":"{file}","pos":{pos},"gtid_set":"{gtid}"}}"#)
+        format!(
+            r#"{{"file":"{file}","pos":{pos},"gtid_set":"{gtid}","gtid_format":2}}"#
+        )
             .into_bytes()
     }
 
@@ -3431,6 +3508,50 @@ mod compare_checkpoints_tests {
             ),
             CheckpointOrder::Incomparable
         );
+    }
+
+    /// A GTID checkpoint stored before exact GTID sets is refused: its set
+    /// may claim transactions the server had not executed.
+    #[test]
+    fn a_gtid_checkpoint_without_the_exact_format_is_refused() {
+        let u = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+        let old =
+            format!(r#"{{"file":"bin.000001","pos":4,"gtid_set":"{u}:1-13"}}"#);
+        let err = super::classify_mysql_checkpoint(old.as_bytes()).unwrap_err();
+        assert!(err.contains("written before exact GTID sets"), "{err}");
+        assert!(err.contains("Reset this source's checkpoints"), "{err}");
+        let other = format!(
+            r#"{{"file":"bin.000001","pos":4,"gtid_set":"{u}:1-13","gtid_format":1}}"#
+        );
+        assert!(super::classify_mysql_checkpoint(other.as_bytes()).is_err());
+        // Never ordered either: the runner refuses an incomparable fold.
+        assert_eq!(
+            compare_mysql_checkpoints(
+                old.as_bytes(),
+                &gcp("bin.000001", 4, &format!("{u}:1-13"))
+            ),
+            CheckpointOrder::Incomparable
+        );
+        // A file/position checkpoint carries no GTID set and is unaffected.
+        assert!(matches!(
+            super::classify_mysql_checkpoint(&cp("bin.000001", 4)),
+            Ok(super::MyResumePosition::Stream(_))
+        ));
+        // What this version writes carries the format and reads back.
+        let new = super::MySqlCheckpoint {
+            file: "bin.000001".into(),
+            pos: 4,
+            gtid_set: Some(format!("{u}:1-8:13")),
+            lineage: None,
+            snapshot_completed: None,
+            snapshot_chain: None,
+        };
+        let raw = serde_json::to_vec(&new).unwrap();
+        assert!(String::from_utf8_lossy(&raw).contains(r#""gtid_format":2"#));
+        assert!(matches!(
+            super::classify_mysql_checkpoint(&raw),
+            Ok(super::MyResumePosition::Stream(c)) if c == new
+        ));
     }
 
     /// GTID checkpoints are ordered by set inclusion; the file/pos they also
