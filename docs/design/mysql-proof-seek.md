@@ -483,6 +483,10 @@ so any gap in the executed set collapses.
   The same over-claim also breaks precondition P1 of this design: a proof
   can treat a later transaction as "before A" and skip its DDL.
 
+**Confirmed on Group Replication** (`evidence/mysql-proof-seek/group-replication-*.log`): a two-member multi-primary group with a GTID block size of 100, rows on both members (executed set `group:1-3:101`), a stop, four rows on member 1, a restart, one more row. The main build stored `group:1-101` and lost rows 3 to 7. The fixed build stored `group:1-3:101` and delivered all seven once.
+
+**Fixed** in #170 (`cae39fa1`): one exact `GtidSet`, and old GTID state refused.
+
 **Fix direction:** keep exact GTID sets.
 
 - Insert each transaction's GTID into a parsed interval set (the scanner
