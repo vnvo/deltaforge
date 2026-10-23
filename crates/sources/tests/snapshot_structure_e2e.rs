@@ -156,9 +156,15 @@ fn assert_structure(engine: &str, runs: &[Counts]) {
         let other = c.slot("slot_get", "snapshot_state") - c.shape.owner_checks;
         assert!(other <= 40, "{what}: {other} other control reads");
         // O(1) boundaries; no progress record, no per-table frontier.
+        // The invariant is a bounded, table-count-independent size (linearity
+        // in table count is asserted separately below). 320 bytes holds a
+        // MySQL boundary checkpoint at about 257 bytes: file, offset, the
+        // exact GTID set with its `gtid_format`, lineage and the snapshot
+        // marker. That leaves room for a few short fields, while a frontier
+        // or a per-table list (tens of bytes per table) would still fail it.
         assert!(c.shape.boundaries >= n, "{what}");
         assert!(
-            c.shape.boundary_bytes / c.shape.boundaries.max(1) <= 256,
+            c.shape.boundary_bytes / c.shape.boundaries.max(1) <= 320,
             "{what}: {} bytes per boundary",
             c.shape.boundary_bytes / c.shape.boundaries.max(1)
         );
