@@ -645,8 +645,8 @@ pub(crate) async fn read_stream(
                 let why = if record.format_version < FORMAT_VERSION {
                     "; it was written before exact GTID sets, so its \
                      boundaries may claim transactions the server had not \
-                     executed. Reset this source's proof state and \
-                     checkpoints to prove its tables again"
+                     executed. Configure the source under a new source id \
+                     to start it again with a snapshot"
                 } else {
                     ""
                 };
@@ -1594,7 +1594,7 @@ mod tests {
         let err = read_stream(&b, ACTIVATION_NS, "s3").await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("written before exact GTID sets"), "{msg}");
-        assert!(msg.contains("Reset this source's proof state"), "{msg}");
+        assert!(msg.contains("under a new source id"), "{msg}");
     }
 
     #[tokio::test]

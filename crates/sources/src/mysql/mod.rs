@@ -161,8 +161,9 @@ impl TryFrom<MySqlCheckpointWire> for MySqlCheckpoint {
                     "MySQL checkpoint GTID set {g:?} was written before exact \
                      GTID sets (format {GTID_FORMAT}, found {:?}): it may \
                      claim transactions the server had not executed, so \
-                     resuming from it could skip rows. Reset this source's \
-                     checkpoints and proof state to start again",
+                     resuming from it could skip rows. Configure the \
+                     source under a new source id to start it again with a \
+                     snapshot",
                     w.gtid_format
                 ));
             }
@@ -3519,7 +3520,7 @@ mod compare_checkpoints_tests {
             format!(r#"{{"file":"bin.000001","pos":4,"gtid_set":"{u}:1-13"}}"#);
         let err = super::classify_mysql_checkpoint(old.as_bytes()).unwrap_err();
         assert!(err.contains("written before exact GTID sets"), "{err}");
-        assert!(err.contains("Reset this source's checkpoints"), "{err}");
+        assert!(err.contains("under a new source id"), "{err}");
         let other = format!(
             r#"{{"file":"bin.000001","pos":4,"gtid_set":"{u}:1-13","gtid_format":1}}"#
         );

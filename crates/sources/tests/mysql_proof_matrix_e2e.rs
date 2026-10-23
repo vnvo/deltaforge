@@ -1248,7 +1248,7 @@ async fn a_lazy_baseline_is_written_only_if_it_decides_the_rows() {
     let st = State::new().await;
     let r = run(source(db, port, db, &["t"], &st), &st).await;
     let incomparable = serde_json::json!({
-        "format_version": 1,
+        "format_version": 2,
         "position": { "MysqlGtid": {
             "gtid_set": "4e11fa47-71ca-11e1-9e33-c80aa9429562:1-2"
         } },

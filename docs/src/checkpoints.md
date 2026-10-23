@@ -77,6 +77,18 @@ sqlite3 ./data/deltaforge.db \
 
 Checkpoints are never edited or deleted by hand: a deleted or rewritten checkpoint can skip or lose changes, and the snapshot and continuity state that refers to it would no longer match. To copy a source's data again, use the reviewed, audited [`resnapshot` recovery operation](recovery.md#resnapshot) (it keeps every checkpoint and moves each sink into the new snapshot through its start barrier). To start a source from scratch, configure a new source id (it starts with a snapshot).
 
+### MySQL GTID state from earlier versions
+
+Before exact GTID sets, a MySQL GTID checkpoint could claim transactions
+the server had not executed (a set with a gap, `u:1-8:13`, was stored as
+`u:1-13`), and resuming from it skipped them once they were committed. Such
+state cannot be repaired later, so this version refuses it: a stored MySQL
+GTID checkpoint without `gtid_format: 2` does not load, older MySQL GTID
+durable watermarks (before version 3) are incomparable, and older
+activation records and failover anchors are refused. The source stops with
+an error naming the cause. Configure it under a new source id to start it
+again with a snapshot. File/position checkpoints are unaffected.
+
 ### Best Practices
 
 - Back up `deltaforge.db` regularly - it contains both checkpoints and schema history
