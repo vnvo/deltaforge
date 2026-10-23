@@ -311,8 +311,21 @@ mod tests {
         out
     }
 
-    /// A channel to a local peer that writes `parts`, pausing between them.
-    async fn peer(parts: Vec<Vec<u8>>) -> PacketChannel {
+    /// After the peer's last part.
+    #[derive(Clone, Copy)]
+    enum End {
+        Hold,
+        Close,
+    }
+
+    /// A channel (read timeout `timeout_secs`) to a local peer that writes
+    /// `parts`, pausing `pause` between them, then holds or closes.
+    async fn peer_with(
+        parts: Vec<Vec<u8>>,
+        pause: Duration,
+        end: End,
+        timeout_secs: u64,
+    ) -> PacketChannel {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         async_std::task::spawn(async move {
@@ -320,17 +333,48 @@ mod tests {
             for p in parts {
                 s.write_all(&p).await.unwrap();
                 s.flush().await.unwrap();
-                async_std::task::sleep(Duration::from_millis(100)).await;
+                async_std::task::sleep(pause).await;
             }
-            async_std::task::sleep(Duration::from_secs(5)).await;
+            match end {
+                End::Hold => async_std::task::sleep(Duration::from_secs(30)).await,
+                End::Close => s.shutdown(std::net::Shutdown::Both).unwrap(),
+            }
         });
-        PacketChannel::new("127.0.0.1", &port.to_string(), 5, &None)
+        PacketChannel::new("127.0.0.1", &port.to_string(), timeout_secs, &None)
             .await
             .unwrap()
     }
 
-    /// A read cancelled after part of a packet arrived loses nothing: the
-    /// next read returns that packet whole, then the next one.
+    async fn peer(parts: Vec<Vec<u8>>) -> PacketChannel {
+        peer_with(parts, Duration::from_millis(100), End::Hold, 5).await
+    }
+
+    /// Reads one packet, cancelling every attempt after `wait`; returns the
+    /// packet and how many attempts were cancelled.
+    async fn read_cancelling(ch: &mut PacketChannel, wait: Duration) -> ((Vec<u8>, u8), u32) {
+        let mut cancelled = 0;
+        loop {
+            match timeout(wait, ch.read_with_sequece()).await {
+                Ok(r) => return (r.unwrap(), cancelled),
+                Err(_) => cancelled += 1,
+            }
+        }
+    }
+
+    /// A deterministic generator (no extra dependency).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self, bound: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) % bound
+        }
+    }
+
+    /// A read cancelled after part of a packet's payload arrived loses
+    /// nothing: the next read returns that packet whole, then the next one.
     #[test]
     fn a_cancelled_read_keeps_the_partial_packet() {
         async_std::task::block_on(async {
@@ -349,6 +393,117 @@ mod tests {
                 ch.read_with_sequece().await.unwrap(),
                 (b"second".to_vec(), 2)
             );
+        });
+    }
+
+    /// Cancelled with only part of the 4-byte header read.
+    #[test]
+    fn a_read_cancelled_inside_the_header_continues() {
+        async_std::task::block_on(async {
+            let one = packet(b"header split", 7);
+            let mut ch = peer(vec![one[..2].to_vec(), one[2..].to_vec()]).await;
+            let r = timeout(Duration::from_millis(50), ch.read()).await;
+            assert!(r.is_err());
+            assert_eq!(
+                ch.read_with_sequece().await.unwrap(),
+                (b"header split".to_vec(), 7)
+            );
+        });
+    }
+
+    /// Many cancellations across one packet, in its header and payload.
+    #[test]
+    fn repeated_cancellation_loses_nothing() {
+        async_std::task::block_on(async {
+            let payload: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+            let wire = [packet(&payload, 9), packet(b"after", 10)].concat();
+            // Cut inside the header (after 1 and 3 bytes) and the payload.
+            let parts: Vec<Vec<u8>> = [0usize, 1, 3, 200, 400, 401, wire.len()]
+                .windows(2)
+                .map(|w| wire[w[0]..w[1]].to_vec())
+                .collect();
+            let mut ch = peer_with(parts, Duration::from_millis(60), End::Hold, 5).await;
+            let ((buf, seq), cancelled) = read_cancelling(&mut ch, Duration::from_millis(15)).await;
+            assert_eq!((buf, seq), (payload, 9));
+            assert!(cancelled >= 4, "{cancelled} cancellations");
+            assert_eq!(
+                ch.read_with_sequece().await.unwrap(),
+                (b"after".to_vec(), 10)
+            );
+        });
+    }
+
+    /// Packets arriving a byte at a time.
+    #[test]
+    fn fragmented_packets_are_read_whole() {
+        async_std::task::block_on(async {
+            let wire = [packet(b"one", 1), packet(b"", 2), packet(b"three", 3)].concat();
+            let parts = wire.iter().map(|b| vec![*b]).collect();
+            let mut ch = peer_with(parts, Duration::from_millis(2), End::Hold, 5).await;
+            assert_eq!(ch.read_with_sequece().await.unwrap(), (b"one".to_vec(), 1));
+            assert_eq!(ch.read_with_sequece().await.unwrap(), (Vec::new(), 2));
+            assert_eq!(
+                ch.read_with_sequece().await.unwrap(),
+                (b"three".to_vec(), 3)
+            );
+        });
+    }
+
+    /// A peer that closes inside a packet: the read fails (never a short
+    /// packet); complete packets before the close are still returned.
+    #[test]
+    fn eof_inside_a_packet_is_an_error() {
+        async_std::task::block_on(async {
+            let one = packet(b"complete", 1);
+            let two = packet(b"cut short by the close", 2);
+            let wire = [&one[..], &two[..10]].concat();
+            let mut ch = peer_with(vec![wire], Duration::from_millis(10), End::Close, 1).await;
+            assert_eq!(
+                ch.read_with_sequece().await.unwrap(),
+                (b"complete".to_vec(), 1)
+            );
+            assert!(ch.read().await.is_err());
+        });
+    }
+
+    /// A long stream of packets of random sizes (some spanning several
+    /// socket reads), sent in random fragments and read with random
+    /// cancellations: every packet arrives once, exactly, in order.
+    #[test]
+    fn random_cancellation_neither_loses_nor_duplicates_bytes() {
+        async_std::task::block_on(async {
+            let mut rng = Lcg(42);
+            let packets: Vec<Vec<u8>> = (0..300)
+                .map(|i| {
+                    let len = match rng.next(10) {
+                        0 => 70_000 + rng.next(70_000),
+                        _ => rng.next(300),
+                    } as usize;
+                    (0..len).map(|j| ((i * 31 + j) % 256) as u8).collect()
+                })
+                .collect();
+            let wire: Vec<u8> = packets
+                .iter()
+                .enumerate()
+                .flat_map(|(i, p)| packet(p, i as u8))
+                .collect();
+            let mut parts = Vec::new();
+            let mut at = 0;
+            while at < wire.len() {
+                let n = (1 + rng.next(20_000) as usize).min(wire.len() - at);
+                parts.push(wire[at..at + n].to_vec());
+                at += n;
+            }
+            let mut ch = peer_with(parts, Duration::from_micros(300), End::Hold, 5).await;
+            let mut cancelled = 0;
+            for (i, p) in packets.iter().enumerate() {
+                let wait = Duration::from_micros(50 + rng.next(2_000));
+                let ((buf, seq), c) = read_cancelling(&mut ch, wait).await;
+                cancelled += c;
+                assert_eq!(seq, i as u8, "packet {i}");
+                assert_eq!(&buf, p, "packet {i}");
+            }
+            assert!(cancelled > 0, "the run cancelled reads");
         });
     }
 

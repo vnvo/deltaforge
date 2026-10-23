@@ -98,15 +98,16 @@ source:
 `proofs` bounds the work that proves the schema version of a table's first
 rows (see [Rows are decoded with the definition in effect when they were
 written](#rows-are-decoded-with-the-definition-in-effect-when-they-were-written)).
-Every field is optional:
+Every field is optional. A value outside its range is refused when the
+configuration is loaded:
 
-| Field | Default | Description |
-|-------|---------|-------------|
-| `activation_window_ms` | `50` | How long an activation window reads ahead to batch the first rows of newly active tables. |
-| `activation_window_events` | `10000` | At most this many events buffered by a window. |
-| `activation_window_bytes` | `16777216` | At most this many bytes of events buffered by a window. |
-| `capture_lock_wait_secs` | `30` | How long a window's capture waits for each table's metadata lock. |
-| `max_seek_ms` | `10000` | A proof scan with no known start offset fails closed when the server sends no transaction within this bound. |
+| Field | Default | Range | Description |
+|-------|---------|-------|-------------|
+| `activation_window_ms` | `50` | 1 to 1,000 | How long an activation window reads ahead to batch the first rows of newly active tables. The window holds the stream's dispatch meanwhile. |
+| `activation_window_events` | `10000` | 1 to 100,000 | At most this many events buffered by a window. |
+| `activation_window_bytes` | `16777216` | 65,536 to 268,435,456 | At most this many bytes of events buffered by a window. |
+| `capture_lock_wait_secs` | `30` | 1 to 300 | How long a window's capture waits for each table's metadata lock, on each of its three attempts. |
+| `max_seek_ms` | `10000` | 100 to 600,000 | A proof scan with no known start offset fails closed when the server sends no transaction within this bound. |
 
 ```yaml
 source:

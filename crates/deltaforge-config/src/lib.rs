@@ -552,29 +552,107 @@ pub struct MysqlSrcCfg {
     pub proofs: MysqlProofCfg,
 }
 
-/// Bounds of the MySQL schema proofs (`docs/src/sources/mysql.md`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Bounds of the MySQL schema proofs (`docs/src/sources/mysql.md`,
+/// "Schema proof bounds"). Every field is bounded (see the `MYSQL_PROOF_*`
+/// ranges); a value outside its range fails configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "MysqlProofCfgRaw")]
 pub struct MysqlProofCfg {
     /// How long an activation window reads ahead to batch the first rows
     /// of newly active tables into one capture and one scan.
-    #[serde(default = "MysqlProofCfg::default_window_ms")]
     pub activation_window_ms: u64,
     /// At most this many events buffered by an activation window.
-    #[serde(default = "MysqlProofCfg::default_window_events")]
     pub activation_window_events: usize,
     /// At most this many bytes of events buffered by an activation window.
-    #[serde(default = "MysqlProofCfg::default_window_bytes")]
     pub activation_window_bytes: u64,
     /// A proof scan without a known start offset fails closed when the
     /// server sends no transaction within this bound (its seek through the
     /// binlog file's earlier events).
-    #[serde(default = "MysqlProofCfg::default_max_seek_ms")]
     pub max_seek_ms: u64,
     /// How long a window's capture waits for each table's metadata lock (a
     /// schema change in progress holds it) before the attempt fails.
-    #[serde(default = "MysqlProofCfg::default_lock_wait_secs")]
     pub capture_lock_wait_secs: u32,
+}
+
+/// `activation_window_ms`: at least 1 (no window would mean a capture per
+/// table), at most 1 s (the window holds the stream's dispatch).
+pub const MYSQL_PROOF_WINDOW_MS: std::ops::RangeInclusive<u64> = 1..=1_000;
+/// `activation_window_events`: the queue's memory bound.
+pub const MYSQL_PROOF_WINDOW_EVENTS: std::ops::RangeInclusive<usize> =
+    1..=100_000;
+/// `activation_window_bytes`: 64 KiB to 256 MiB, the queue's memory bound.
+pub const MYSQL_PROOF_WINDOW_BYTES: std::ops::RangeInclusive<u64> =
+    64 * 1024..=256 * 1024 * 1024;
+/// `max_seek_ms`: 100 ms to 600 s (a proof scan's whole time limit).
+pub const MYSQL_PROOF_MAX_SEEK_MS: std::ops::RangeInclusive<u64> =
+    100..=600_000;
+/// `capture_lock_wait_secs`: 1 s (MySQL's least `lock_wait_timeout`) to
+/// 300 s (three attempts hold the stream).
+pub const MYSQL_PROOF_LOCK_WAIT_SECS: std::ops::RangeInclusive<u32> = 1..=300;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MysqlProofCfgRaw {
+    #[serde(default = "MysqlProofCfg::default_window_ms")]
+    activation_window_ms: u64,
+    #[serde(default = "MysqlProofCfg::default_window_events")]
+    activation_window_events: usize,
+    #[serde(default = "MysqlProofCfg::default_window_bytes")]
+    activation_window_bytes: u64,
+    #[serde(default = "MysqlProofCfg::default_max_seek_ms")]
+    max_seek_ms: u64,
+    #[serde(default = "MysqlProofCfg::default_lock_wait_secs")]
+    capture_lock_wait_secs: u32,
+}
+
+fn in_range<T: PartialOrd + std::fmt::Display + Copy>(
+    name: &str,
+    v: T,
+    r: &std::ops::RangeInclusive<T>,
+) -> Result<T, String> {
+    if r.contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!(
+            "proofs.{name} must be between {} and {}, got {v}",
+            r.start(),
+            r.end()
+        ))
+    }
+}
+
+impl TryFrom<MysqlProofCfgRaw> for MysqlProofCfg {
+    type Error = String;
+
+    fn try_from(r: MysqlProofCfgRaw) -> Result<Self, String> {
+        Ok(Self {
+            activation_window_ms: in_range(
+                "activation_window_ms",
+                r.activation_window_ms,
+                &MYSQL_PROOF_WINDOW_MS,
+            )?,
+            activation_window_events: in_range(
+                "activation_window_events",
+                r.activation_window_events,
+                &MYSQL_PROOF_WINDOW_EVENTS,
+            )?,
+            activation_window_bytes: in_range(
+                "activation_window_bytes",
+                r.activation_window_bytes,
+                &MYSQL_PROOF_WINDOW_BYTES,
+            )?,
+            max_seek_ms: in_range(
+                "max_seek_ms",
+                r.max_seek_ms,
+                &MYSQL_PROOF_MAX_SEEK_MS,
+            )?,
+            capture_lock_wait_secs: in_range(
+                "capture_lock_wait_secs",
+                r.capture_lock_wait_secs,
+                &MYSQL_PROOF_LOCK_WAIT_SECS,
+            )?,
+        })
+    }
 }
 
 impl MysqlProofCfg {

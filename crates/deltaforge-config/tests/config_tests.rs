@@ -1265,3 +1265,68 @@ fn postgres_max_message_bytes_is_bounded() {
         assert!(err.to_string().contains("max_message_bytes"), "{err}");
     }
 }
+
+/// `proofs` (MySQL): defaults when absent, every bound enforced, unknown
+/// fields refused.
+#[test]
+fn mysql_proof_bounds_are_validated() {
+    use deltaforge_config::{
+        MYSQL_PROOF_LOCK_WAIT_SECS, MYSQL_PROOF_MAX_SEEK_MS,
+        MYSQL_PROOF_WINDOW_BYTES, MYSQL_PROOF_WINDOW_EVENTS,
+        MYSQL_PROOF_WINDOW_MS, MysqlProofCfg,
+    };
+    let parse = |json: &str| serde_json::from_str::<MysqlProofCfg>(json);
+    let d = parse("{}").unwrap();
+    assert_eq!(d, MysqlProofCfg::default());
+    assert_eq!(
+        (
+            d.activation_window_ms,
+            d.activation_window_events,
+            d.activation_window_bytes,
+            d.max_seek_ms,
+            d.capture_lock_wait_secs
+        ),
+        (50, 10_000, 16 * 1024 * 1024, 10_000, 30)
+    );
+    let fields: [(&str, u64, u64); 5] = [
+        (
+            "activation_window_ms",
+            *MYSQL_PROOF_WINDOW_MS.start(),
+            *MYSQL_PROOF_WINDOW_MS.end(),
+        ),
+        (
+            "activation_window_events",
+            *MYSQL_PROOF_WINDOW_EVENTS.start() as u64,
+            *MYSQL_PROOF_WINDOW_EVENTS.end() as u64,
+        ),
+        (
+            "activation_window_bytes",
+            *MYSQL_PROOF_WINDOW_BYTES.start(),
+            *MYSQL_PROOF_WINDOW_BYTES.end(),
+        ),
+        (
+            "max_seek_ms",
+            *MYSQL_PROOF_MAX_SEEK_MS.start(),
+            *MYSQL_PROOF_MAX_SEEK_MS.end(),
+        ),
+        (
+            "capture_lock_wait_secs",
+            u64::from(*MYSQL_PROOF_LOCK_WAIT_SECS.start()),
+            u64::from(*MYSQL_PROOF_LOCK_WAIT_SECS.end()),
+        ),
+    ];
+    for (name, min, max) in fields {
+        for ok in [min, max] {
+            parse(&format!("{{\"{name}\": {ok}}}"))
+                .unwrap_or_else(|e| panic!("{name}={ok}: {e}"));
+        }
+        for bad in [min - 1, max + 1] {
+            let e = parse(&format!("{{\"{name}\": {bad}}}"))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(name), "{name}={bad}: {e}");
+        }
+    }
+    assert!(parse(r#"{"activation_window": 5}"#).is_err());
+    assert!(parse(r#"{"max_seek_ms": -1}"#).is_err());
+}

@@ -337,28 +337,14 @@ pub(super) async fn maybe_window(
             Err(e) if attempts < CAPTURE_ATTEMPTS => {
                 warn!(source_id = %ctx.source_id, attempt = attempts, error = ?e, tables = tables.len(), "activation window: the batched capture failed; retrying");
             }
-            Err(BatchCaptureError::Contention { code, why }) => {
-                return Err(LoopControl::Fail(
-                    crate::incident_drafts::mysql_capture_contention(
-                        &ctx.source_id,
-                        &tables,
-                        attempts,
-                        code,
-                        &a_head,
-                        &why,
-                    ),
-                ));
-            }
-            Err(BatchCaptureError::Failed(e)) => {
-                return Err(LoopControl::Fail(SourceError::Schema {
-                    details: format!(
-                        "the activation window's capture of {} table(s) failed \
-                         {attempts} times ({e}); nothing of the window was \
-                         dispatched and the checkpoint stays before it",
-                        tables.len()
-                    )
-                    .into(),
-                }));
+            Err(e) => {
+                return Err(LoopControl::Fail(capture_failure(
+                    &ctx.source_id,
+                    &tables,
+                    attempts,
+                    &a_head,
+                    e,
+                )));
             }
         }
     };
@@ -443,6 +429,46 @@ pub(super) async fn maybe_window(
     };
     observe_window(&source_id, &trace, read, captured, scanned);
     Ok(Some(trace))
+}
+
+/// Why a window's batched capture finally failed, keeping its class:
+/// exhausted lock waits or deadlocks are the `mysql_capture_contention`
+/// incident, a connection failure a connection error, anything else a
+/// schema error. Nothing of the window was dispatched.
+fn capture_failure(
+    source_id: &str,
+    tables: &[(String, String)],
+    attempts: u32,
+    at: &MySqlCheckpoint,
+    e: BatchCaptureError,
+) -> SourceError {
+    let unchanged = "nothing of the window was dispatched and the checkpoint \
+                     stays before it";
+    match e {
+        BatchCaptureError::Contention { code, why } => {
+            crate::incident_drafts::mysql_capture_contention(
+                source_id, tables, attempts, code, at, &why,
+            )
+        }
+        BatchCaptureError::Failed(ProofError::Open(why)) => {
+            SourceError::Connect {
+                details: format!(
+                    "the activation window's capture of {} table(s) could not \
+                 connect, {attempts} attempt(s) ({why}); {unchanged}",
+                    tables.len()
+                )
+                .into(),
+            }
+        }
+        BatchCaptureError::Failed(e) => SourceError::Schema {
+            details: format!(
+                "the activation window's capture of {} table(s) failed, \
+                 {attempts} attempt(s) ({e}); {unchanged}",
+                tables.len()
+            )
+            .into(),
+        },
+    }
 }
 
 /// Add each newly touched table that has no positional proof at its rows'
@@ -543,6 +569,42 @@ fn observe_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exhausted lock attempts are the contention incident; other failures
+    /// keep their connection or schema class (never the incident).
+    #[test]
+    fn capture_failures_keep_their_class() {
+        let tables = [("d".to_string(), "t".to_string())];
+        let at = MySqlCheckpoint {
+            file: "binlog.000001".into(),
+            pos: 4,
+            gtid_set: Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5".into()),
+            lineage: None,
+            snapshot_completed: None,
+            snapshot_chain: None,
+        };
+        let fail = |e| capture_failure("s", &tables, 3, &at, e);
+        for code in [1205, 1213] {
+            let e = fail(BatchCaptureError::Contention {
+                code,
+                why: "lock".into(),
+            });
+            assert_eq!(
+                e.draft().map(|d| d.reason_code),
+                Some(deltaforge_core::incident::ReasonCode::MysqlCaptureContention)
+            );
+        }
+        let e = fail(BatchCaptureError::Failed(ProofError::Open(
+            "refused".into(),
+        )));
+        assert!(matches!(e, SourceError::Connect { .. }), "{e:?}");
+        assert!(e.draft().is_none());
+        let e = fail(BatchCaptureError::Failed(ProofError::Capture(
+            "1142".into(),
+        )));
+        assert!(matches!(e, SourceError::Schema { .. }), "{e:?}");
+        assert!(e.draft().is_none());
+    }
 
     #[test]
     fn transaction_control_never_closes_a_window() {

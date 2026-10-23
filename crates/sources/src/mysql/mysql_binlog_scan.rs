@@ -1578,6 +1578,17 @@ fn server_code(e: &mysql_async::Error) -> Option<u16> {
     }
 }
 
+/// A failed statement of a batched capture: the connection (I/O or the
+/// driver) as `Open`, anything the server answered as `Capture`.
+fn batch_error(e: mysql_async::Error, what: &str) -> BatchCaptureError {
+    BatchCaptureError::Failed(match e {
+        mysql_async::Error::Io(_) | mysql_async::Error::Driver(_) => {
+            ProofError::Open(format!("{what}: {e}"))
+        }
+        _ => ProofError::Capture(format!("{what}: {e}")),
+    })
+}
+
 /// One batched capture attempt (see [`BatchCaptured`]); `lock_wait_secs`
 /// bounds each table's lock wait.
 pub(crate) async fn capture_batch(
@@ -1598,17 +1609,17 @@ pub(crate) async fn capture_batch(
         let mut conn = pool
             .get_conn()
             .await
-            .map_err(|e| failed(ProofError::Capture(e.to_string())))?;
+            .map_err(|e| batch_error(e, "connect"))?;
         let mode: Option<String> = conn
             .query_first("SELECT @@GLOBAL.gtid_mode")
             .await
-            .map_err(|e| failed(ProofError::Capture(e.to_string())))?;
+            .map_err(|e| batch_error(e, "gtid_mode"))?;
         let gtid_mode = mode.is_some_and(|m| m.eq_ignore_ascii_case("ON"));
         // Identity first: nothing is locked or read on another server.
         let live: Option<String> = conn
             .query_first("SELECT @@GLOBAL.server_uuid")
             .await
-            .map_err(|e| failed(ProofError::Capture(e.to_string())))?;
+            .map_err(|e| batch_error(e, "server_uuid"))?;
         if !live
             .as_deref()
             .is_some_and(|l| server_uuid.eq_ignore_ascii_case(l.trim()))
@@ -1619,9 +1630,7 @@ pub(crate) async fn capture_batch(
             format!("SET SESSION lock_wait_timeout = {lock_wait_secs}"),
             "START TRANSACTION READ ONLY".to_string(),
         ] {
-            conn.query_drop(&q)
-                .await
-                .map_err(|e| failed(ProofError::Capture(format!("{q}: {e}"))))?;
+            conn.query_drop(&q).await.map_err(|e| batch_error(e, &q))?;
         }
         trace.connect = t0.elapsed();
         // Every table's metadata lock, in sorted order (any other order can
@@ -1644,7 +1653,7 @@ pub(crate) async fn capture_batch(
                             code,
                             why: format!("{lock}: {e}"),
                         },
-                        _ => failed(ProofError::Capture(format!("{lock}: {e}"))),
+                        _ => batch_error(e, &lock),
                     });
                 }
             }
@@ -1685,7 +1694,7 @@ pub(crate) async fn capture_batch(
         }
         conn.query_drop("COMMIT")
             .await
-            .map_err(|e| failed(ProofError::Capture(format!("COMMIT: {e}"))))?;
+            .map_err(|e| batch_error(e, "COMMIT"))?;
         conn.disconnect().await.ok();
         Ok(BatchCaptured {
             from,
