@@ -269,7 +269,7 @@ impl MySqlRotationRuntime {
     pub(crate) fn drive_preflight(&mut self, ctx: &RunCtx) {
         let source_id = self.mgr.source_id().to_string();
         let backend = Arc::clone(&self.backend);
-        let frozen = ctx.last_gtid.clone();
+        let frozen = ctx.gtid_text();
         self.mgr.drive_preflight(|candidate| {
             let dsn = candidate.dsn.clone();
             tokio::spawn(async move {
@@ -317,7 +317,7 @@ impl MySqlRotationRuntime {
         // Both the replacement and a recovery session must prove they are the
         // verified server before their dump command.
         let expected = ctx.expected_uuid()?;
-        let frozen_gtid = ctx.last_gtid.clone().unwrap_or_default();
+        let frozen_gtid = ctx.gtid_text().unwrap_or_default();
         let new_dsn = candidate.dsn.clone();
         let old_dsn = ctx.dsn.clone();
         let source_id = self.mgr.source_id().to_string();

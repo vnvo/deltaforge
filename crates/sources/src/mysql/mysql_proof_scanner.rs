@@ -47,9 +47,9 @@ use super::mysql_binlog_scan::{
     encode_effect, encode_event, scan_digest, scan_interval, trace_enabled,
 };
 use crate::durable_checkpoint::{
-    WmPos, gtid_subseteq, mysql_checkpoint_position, order_positions,
-    parse_gtid_set,
+    WmPos, mysql_checkpoint_position, order_positions,
 };
+use crate::gtid_set::GtidSet;
 
 /// Bounds on the retained record.
 #[derive(Debug, Clone, Copy)]
@@ -163,9 +163,9 @@ fn entry_bytes(s: &Statement) -> usize {
 fn at_or_before(s: &Statement, p: &WmPos) -> Option<bool> {
     match (&s.event, p) {
         (EventIdentity::Gtid { gtid, .. }, WmPos::MysqlGtid { gtid_set }) => {
-            let set = parse_gtid_set(gtid_set)?;
-            let one = parse_gtid_set(gtid)?;
-            Some(gtid_subseteq(&one, &set))
+            let set = GtidSet::parse(gtid_set)?;
+            let one = GtidSet::parse(gtid)?;
+            Some(one.is_subset(&set))
         }
         (EventIdentity::FilePos { file, end_pos, .. }, _) => {
             let here = mysql_checkpoint_position(file, *end_pos, None)?;

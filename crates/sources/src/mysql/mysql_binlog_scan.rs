@@ -37,7 +37,6 @@
 // this allow is removed there.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use mysql_async::prelude::Queryable;
@@ -53,9 +52,9 @@ use super::mysql_schema_loader::{Live, fetch_table_schema_on};
 use super::mysql_session::{SessionError, open_replication_session_abortive};
 use super::mysql_table_schema::MySqlTableSchema;
 use crate::durable_checkpoint::{
-    Intervals, WmPos, gtid_subseteq, merge_intervals,
-    mysql_checkpoint_position, order_positions, parse_gtid_set,
+    WmPos, mysql_checkpoint_position, order_positions,
 };
+use crate::gtid_set::GtidSet;
 use deltaforge_core::CheckpointOrder;
 
 /// Bumped when the classifier's output for a statement can change.
@@ -223,26 +222,17 @@ pub(crate) enum ProofError {
     Capture(String),
 }
 
-type GtidSet = BTreeMap<String, Intervals>;
-
 fn add_gtid(set: &mut GtidSet, gtid: &str) -> Result<(), ProofError> {
-    let (uuid, gno) = gtid
-        .rsplit_once(':')
-        .and_then(|(u, n)| Some((u.trim(), n.trim().parse::<u64>().ok()?)))
-        .filter(|(_, n)| *n > 0)
-        .ok_or_else(|| {
-            ProofError::Framing(format!("malformed GTID {gtid:?}"))
-        })?;
-    let ivs = set.entry(uuid.to_string()).or_default();
-    ivs.push((gno, gno));
-    merge_intervals(ivs);
-    Ok(())
+    if set.insert(gtid) {
+        Ok(())
+    } else {
+        Err(ProofError::Framing(format!("malformed GTID {gtid:?}")))
+    }
 }
 
 fn single(gtid: &str) -> Result<GtidSet, ProofError> {
-    let mut s = GtidSet::new();
-    add_gtid(&mut s, gtid)?;
-    Ok(s)
+    GtidSet::single(gtid)
+        .ok_or_else(|| ProofError::Framing(format!("malformed GTID {gtid:?}")))
 }
 
 fn lp(h: &mut Sha256, bytes: &[u8]) {
@@ -359,13 +349,13 @@ impl Walk {
                 ));
             };
             let to = self.to_set.as_ref().expect("gtid mode has a target set");
-            if !gtid_subseteq(&single(&g)?, to) {
+            if !single(&g)?.is_subset(to) {
                 return Err(ProofError::Overshoot(format!(
                     "transaction {g} is not part of the end position"
                 )));
             }
             add_gtid(&mut self.done, &g)?;
-            if gtid_subseteq(to, &self.done) {
+            if to.is_subset(&self.done) {
                 self.reached = true;
             }
             self.last_completed = Some(g);
@@ -569,7 +559,7 @@ fn observe_scan(
 
 /// The source server's transactions in a GTID set (other UUIDs ignored).
 fn source_txns(set: &GtidSet, server_uuid: &str) -> u64 {
-    set.iter()
+    set.intervals()
         .filter(|(u, _)| u.eq_ignore_ascii_case(server_uuid))
         .flat_map(|(_, ivs)| ivs.iter())
         .map(|(a, b)| b.saturating_sub(*a) + 1)
@@ -635,7 +625,7 @@ async fn scan(
         client.gtid_enabled = true;
         client.gtid_set = from.gtid_set.clone().unwrap_or_default();
         Some(
-            parse_gtid_set(to.gtid_set.as_deref().unwrap_or_default())
+            GtidSet::parse(to.gtid_set.as_deref().unwrap_or_default())
                 .ok_or_else(|| {
                     ProofError::Positions("unparseable end GTID set".into())
                 })?,
@@ -649,7 +639,7 @@ async fn scan(
         None
     };
     let done = if gtid_mode {
-        parse_gtid_set(from.gtid_set.as_deref().unwrap_or_default())
+        GtidSet::parse(from.gtid_set.as_deref().unwrap_or_default())
             .ok_or_else(|| {
                 ProofError::Positions("unparseable start GTID set".into())
             })?
@@ -839,7 +829,7 @@ fn observe_event(
     match (data, start_set) {
         // GTID mode: a transaction already in the start set was decoded.
         (EventData::Gtid(g), Some(set)) => {
-            if single(&g.gtid).is_ok_and(|one| gtid_subseteq(&one, set)) {
+            if single(&g.gtid).is_ok_and(|one| one.is_subset(set)) {
                 d.before_start += 1;
             }
             let source = g.gtid.rsplit_once(':').is_some_and(|(u, _)| {
@@ -1312,20 +1302,14 @@ mod tests {
 
     #[test]
     fn gtid_sets_are_exact_not_ranges() {
-        let mut s = parse_gtid_set(&format!("{U}:1-5")).unwrap();
+        let mut s = GtidSet::parse(&format!("{U}:1-5")).unwrap();
         add_gtid(&mut s, &format!("{U}:9")).unwrap();
         // 6-8 were never seen: the set must not claim them.
-        assert!(!gtid_subseteq(
-            &parse_gtid_set(&format!("{U}:1-9")).unwrap(),
-            &s
-        ));
+        assert!(!GtidSet::parse(&format!("{U}:1-9")).unwrap().is_subset(&s));
         for n in 6..=8 {
             add_gtid(&mut s, &format!("{U}:{n}")).unwrap();
         }
-        assert!(gtid_subseteq(
-            &parse_gtid_set(&format!("{U}:1-9")).unwrap(),
-            &s
-        ));
+        assert!(GtidSet::parse(&format!("{U}:1-9")).unwrap().is_subset(&s));
         assert!(add_gtid(&mut s, "nonsense").is_err());
         assert!(add_gtid(&mut s, &format!("{U}:0")).is_err());
     }
@@ -1345,7 +1329,7 @@ mod tests {
         Walk {
             gtid_mode,
             to_set: gtid_mode
-                .then(|| parse_gtid_set(&format!("{U}:1-9")).unwrap()),
+                .then(|| GtidSet::parse(&format!("{U}:1-9")).unwrap()),
             done: GtidSet::default(),
             current_gtid: None,
             ordinal: 0,
@@ -1499,7 +1483,7 @@ mod tests {
     /// of a dump are protocol, never "decoded before the start".
     #[test]
     fn protocol_events_are_never_decoded_before_the_start() {
-        let start_set = parse_gtid_set(&format!("{U}:1-9")).unwrap();
+        let start_set = GtidSet::parse(&format!("{U}:1-9")).unwrap();
         for gtid_mode in [true, false] {
             let mut d = ScanDetail::default();
             let start = if gtid_mode {
@@ -1531,7 +1515,7 @@ mod tests {
     #[test]
     fn gtid_transactions_before_the_start_and_per_uuid() {
         const OTHER: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-        let start_set = parse_gtid_set(&format!("{U}:1-9")).unwrap();
+        let start_set = GtidSet::parse(&format!("{U}:1-9")).unwrap();
         let mut d = ScanDetail::default();
         for gtid in [format!("{U}:9"), format!("{U}:10"), format!("{OTHER}:1")]
         {
@@ -1573,7 +1557,7 @@ mod tests {
     /// UUIDs carried in the executed set are not counted.
     #[test]
     fn source_transactions_ignore_other_uuids() {
-        let set = parse_gtid_set(&format!(
+        let set = GtidSet::parse(&format!(
             "{U}:1-9:12,AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE:1-100"
         ))
         .unwrap();
@@ -2489,10 +2473,18 @@ mod tests {
             // `to` = from + only the SECOND transaction.
             let u = uuid(&dsn).await;
             let parse = |p: &MySqlCheckpoint| {
-                parse_gtid_set(p.gtid_set.as_deref().unwrap()).unwrap()
+                GtidSet::parse(p.gtid_set.as_deref().unwrap()).unwrap()
             };
             let (f, m, e) = (parse(&from), parse(&mid), parse(&end));
-            let last = |s: &GtidSet| s.get(&u).unwrap().last().unwrap().1;
+            let last = |s: &GtidSet| {
+                s.intervals()
+                    .find(|(uu, _)| uu.eq_ignore_ascii_case(&u))
+                    .unwrap()
+                    .1
+                    .last()
+                    .unwrap()
+                    .1
+            };
             let (first_txn, second_txn) = (last(&m), last(&e));
             assert_eq!(first_txn, last(&f) + 1);
             let mut gap = from.clone();

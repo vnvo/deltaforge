@@ -162,14 +162,12 @@ async fn open_session(
         keepalive_idle_secs: 0,
         keepalive_interval_secs: 0,
     };
-    if start.gtid_enabled {
-        if start.gtid_set.is_empty() {
-            let (_, _, gtid_set) = CommandUtil::fetch_binlog_info(&mut channel)
-                .await
-                .map_err(connect)?;
-            start.gtid_set = gtid_set;
-        }
-    } else {
+    // GTID mode: the set is sent as given. An empty set is exact - nothing
+    // executed - so the server sends from its oldest binary log (and fails
+    // if that history is purged). It is never replaced by the server's
+    // current set, which would skip every transaction committed since the
+    // position was taken.
+    if !start.gtid_enabled {
         if start.binlog_filename.is_empty() {
             let (file, pos, _) = CommandUtil::fetch_binlog_info(&mut channel)
                 .await
