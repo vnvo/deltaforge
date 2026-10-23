@@ -76,3 +76,22 @@ The patched files are formatted with rustfmt; `manual_div_ceil` and
 `bool_assert_comparison` findings in them are fixed (`div_ceil`, `assert!`),
 with no behavior change.
 
+
+## A start position for a GTID dump (`gtid_start`)
+
+`BinlogClient::gtid_start` (default `None`) gives a GTID-mode dump the
+binlog file and offset to start at. `DumpBinlogGtidCommand` sends them in
+the `COM_BINLOG_DUMP_GTID` packet's file name and position fields, which
+the vendored code always sent empty and 4. The server then starts at that
+offset and still skips the transactions in the GTID set. Without it, the
+server picks the first file not covered by the set and reads it from its
+start, which costs time proportional to the file's earlier events (about
+1.8 s per dump at 1 GiB of single-row transactions on a laptop). With
+`None` the packet is byte-identical to before.
+
+DeltaForge's proof scanner sets it only to a transaction boundary it has
+observed in a binlog stream, and validates the first events the server
+sends before trusting the dump (`docs/design/mysql-proof-seek.md`). Changed
+files: `src/binlog_client.rs`, `src/command/command_util.rs` and
+`src/command/dump_binlog_gtid_command.rs`, with two unit tests of the
+packet encoding.

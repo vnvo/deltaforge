@@ -110,6 +110,7 @@ impl CommandUtil {
             let mut command = DumpBinlogGtidCommand {
                 server_id: client.server_id,
                 gtid_set: GtidSet::new(&client.gtid_set)?,
+                start: client.gtid_start.clone(),
             };
             command.to_bytes()?
         } else {
