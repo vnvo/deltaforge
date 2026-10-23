@@ -527,6 +527,7 @@ async fn shape_at_failover(
                 &anchor.current_lineage,
                 &from,
                 &cap.position,
+                None,
                 boundary,
                 &tag,
             )

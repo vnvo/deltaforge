@@ -799,6 +799,9 @@ async fn full_fallback(
         Some(super::mysql_binlog_scan::SharedProofs {
             scanner: &ctx.proof_scanner,
             boundary: ctx.txn_eval_cp.as_ref(),
+            // The capture interval starts at the capture's own position
+            // read, never a stream boundary: no stream anchor.
+            anchor: None,
         }),
     )
     .await

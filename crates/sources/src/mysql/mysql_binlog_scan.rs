@@ -133,6 +133,24 @@ pub(crate) struct ScanReport {
     /// Whether the stream started at an anchor, and where its first GTID
     /// was validated.
     pub positioned_at: Option<(String, u64)>,
+    /// The shared scanner's physical work for the request this answers
+    /// (zero for a direct scan).
+    pub work: ProofWork,
+}
+
+/// The physical work of one scanner round (`docs/design/mysql-proof-seek.md`,
+/// "Exact bounds"), attributed to every request the round serves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ProofWork {
+    /// Extensions of the record the round committed (at most 2).
+    pub extensions_committed: u32,
+    /// Scans opened at an anchor (at most one per extension).
+    pub positioned_attempts: u32,
+    /// GTID-positioned scans without an anchor, under `max_seek` (at most
+    /// one per extension).
+    pub unanchored_attempts: u32,
+    /// Replication streams opened (at most 4).
+    pub stream_openings: u32,
 }
 
 /// Which proof a scan or capture serves (bounded: a metric label).
@@ -227,7 +245,7 @@ pub(crate) struct ScanDetail {
 }
 
 /// Why a scan or capture failed (always fail-closed).
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub(crate) enum ProofError {
     #[error("positions cannot be used: {0}")]
     Positions(String),
@@ -913,6 +931,7 @@ async fn scan(
         frontier: None,
         session_anchor: None,
         positioned_at: None,
+        work: ProofWork::default(),
     };
     match order_positions(&pf, &pt) {
         CheckpointOrder::Equal => return Ok(empty(Vec::new())),
@@ -1224,6 +1243,7 @@ async fn scan(
             .as_ref()
             .and_then(|c| c.passed())
             .map(|(f, o)| (f.to_string(), o)),
+        work: ProofWork::default(),
     })
 }
 
@@ -1610,6 +1630,8 @@ pub(crate) fn covers(cap: &Captured, start: &WmPos, end: &WmPos) -> bool {
 pub(crate) struct SharedProofs<'a> {
     pub scanner: &'a super::mysql_proof_scanner::ProofScanner,
     pub boundary: Option<&'a MySqlCheckpoint>,
+    /// The stream anchor at the interval's start, if one was observed.
+    pub anchor: Option<&'a Anchor>,
 }
 
 /// A capture whose own interval is proven: [`capture`], then a scan of
@@ -1648,6 +1670,7 @@ pub(crate) async fn capture_proven(
                     lineage_hash,
                     &cap.from,
                     &cap.position,
+                    sp.anchor,
                     sp.boundary,
                     tag,
                 )
@@ -3705,7 +3728,7 @@ mod tests {
         #[ignore = "requires docker"]
         async fn a_ddl_filling_a_gtid_gap_after_the_boundary_is_proved() {
             use super::super::super::mysql_proof_scanner::{
-                LiveSegments, ProofScanner,
+                LiveSegments, ProofScanner, Segments,
             };
             let dsn = server(true).await;
             let id = uuid(&dsn).await;
@@ -3779,15 +3802,24 @@ mod tests {
             );
             // Shared and direct agree on the gapped interval.
             let scanner = ProofScanner::default();
-            let segments = LiveSegments {
-                dsn: &dsn,
+            let segments: Arc<dyn Segments> = Arc::new(LiveSegments {
+                dsn: dsn.clone(),
                 server_id: 4_000_151,
-                server_uuid: &id,
-                lineage_hash: LINEAGE,
+                server_uuid: id.clone(),
+                lineage_hash: LINEAGE.into(),
                 limits: ScanLimits::default(),
-            };
+            });
             let shared = scanner
-                .interval(&segments, &id, LINEAGE, &a, &b, Some(&a), &TAG)
+                .interval(
+                    segments.clone(),
+                    &id,
+                    LINEAGE,
+                    &a,
+                    &b,
+                    None,
+                    Some(&a),
+                    &TAG,
+                )
                 .await
                 .unwrap();
             assert_eq!(shared.statements, direct.statements);
@@ -3809,7 +3841,7 @@ mod tests {
 
         async fn shared_equals_direct(gtid: bool, db: &str) {
             use super::super::super::mysql_proof_scanner::{
-                LiveSegments, ProofScanner,
+                LiveSegments, ProofScanner, Segments,
             };
             let dsn = server(gtid).await;
             let id = uuid(&dsn).await;
@@ -3836,23 +3868,24 @@ mod tests {
                 points.push(position(&dsn).await);
             }
             let scanner = ProofScanner::default();
-            let segments = LiveSegments {
-                dsn: &dsn,
+            let segments: Arc<dyn Segments> = Arc::new(LiveSegments {
+                dsn: dsn.clone(),
                 server_id: 4_000_150,
-                server_uuid: &id,
-                lineage_hash: LINEAGE,
+                server_uuid: id.clone(),
+                lineage_hash: LINEAGE.into(),
                 limits: ScanLimits::default(),
-            };
+            });
             let n = points.len();
             for i in 0..n {
                 for j in [i, (i + 3).min(n - 1), n - 1] {
                     let shared = scanner
                         .interval(
-                            &segments,
+                            segments.clone(),
                             &id,
                             LINEAGE,
                             &points[i],
                             &points[j],
+                            None,
                             Some(&points[i]),
                             &TAG,
                         )
@@ -3883,7 +3916,16 @@ mod tests {
             ] {
                 let small = ProofScanner::new(limits);
                 let r = small
-                    .interval(&segments, &id, LINEAGE, first, last, None, &TAG)
+                    .interval(
+                        segments.clone(),
+                        &id,
+                        LINEAGE,
+                        first,
+                        last,
+                        None,
+                        None,
+                        &TAG,
+                    )
                     .await;
                 assert!(matches!(r, Err(ProofError::Limit(_))), "{r:?}");
                 assert_eq!(small.retained().await, None);
@@ -3894,11 +3936,12 @@ mod tests {
             let fresh = ProofScanner::default();
             fresh
                 .interval(
-                    &segments,
+                    segments.clone(),
                     &id,
                     LINEAGE,
                     first,
                     &points[2],
+                    None,
                     Some(first),
                     &TAG,
                 )
@@ -3909,11 +3952,12 @@ mod tests {
             // holds the record and waits on the server; then it is dropped.
             // (A timeout could lose the race to fast local I/O.)
             let mut req = Box::pin(fresh.interval(
-                &segments,
+                segments.clone(),
                 &id,
                 LINEAGE,
                 first,
                 last,
+                None,
                 Some(first),
                 &TAG,
             ));
@@ -3933,11 +3977,12 @@ mod tests {
             assert_eq!(fresh.pinned(), 0);
             let r = fresh
                 .interval(
-                    &segments,
+                    segments.clone(),
                     &id,
                     LINEAGE,
                     first,
                     last,
+                    None,
                     Some(first),
                     &TAG,
                 )
@@ -3951,20 +3996,21 @@ mod tests {
                 lineage: Some(OTHER.into()),
                 ..p.clone()
             };
-            let other = LiveSegments {
-                dsn: &dsn,
+            let other: Arc<dyn Segments> = Arc::new(LiveSegments {
+                dsn: dsn.clone(),
                 server_id: 4_000_152,
-                server_uuid: &id,
-                lineage_hash: OTHER,
+                server_uuid: id.clone(),
+                lineage_hash: OTHER.into(),
                 limits: ScanLimits::default(),
-            };
+            });
             let r = fresh
                 .interval(
-                    &other,
+                    other,
                     &id,
                     OTHER,
                     &relabel(first),
                     &relabel(last),
+                    None,
                     None,
                     &TAG,
                 )
@@ -4001,17 +4047,18 @@ mod tests {
             );
             let shared = ProofScanner::default()
                 .interval(
-                    &LiveSegments {
-                        dsn: &dsn,
+                    Arc::new(LiveSegments {
+                        dsn: dsn.clone(),
                         server_id: 4_000_153,
-                        server_uuid: &id,
-                        lineage_hash: LINEAGE,
+                        server_uuid: id.clone(),
+                        lineage_hash: LINEAGE.into(),
                         limits: ScanLimits::default(),
-                    },
+                    }),
                     &id,
                     LINEAGE,
                     &a,
                     &b,
+                    None,
                     Some(&a),
                     &TAG,
                 )

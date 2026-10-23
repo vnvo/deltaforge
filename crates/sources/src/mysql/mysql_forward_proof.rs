@@ -192,6 +192,7 @@ pub(crate) async fn prove(
         &lineage,
         &d_cp,
         &s_cp,
+        None,
         Some(&d_cp),
         &tag,
     )
