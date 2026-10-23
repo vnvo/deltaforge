@@ -147,6 +147,48 @@ delivered since the last commit. `--debezium-offset-flush-ms` sets that
 interval for a run. With `--delivery-stats`, the cost of a shorter interval
 shows in the offset records and Kafka requests.
 
+## Per-instance scaling study
+
+`--scale-tables` runs the scaling study (`src/scale.rs`) instead of the cell
+matrix. One DeltaForge MySQL source and one Debezium connector cover a
+fixture of many tables, of which a share changes. The design, fixed before
+any result, is `results/scale-study-design.md`. It covers fixtures, active
+sets and rotation, workload modes, the declared capacity limits, the binary
+log's controlled starting offset, and what each run records.
+
+```bash
+canonical-perf --binary df=<runner> --binary dbz=debezium --debezium-profile tuned \
+    --out target/perf/scale --reps 3 --scale-tables 100,1000 \
+    --scale-active 1,20,50,100 --scale-workload steady,burst
+```
+
+Options:
+
+- `--scale-rotate` rotates the active sets.
+- `--scale-binlog-mib` sets the binary log's starting offsets, and
+  `--scale-binlog-pad small|large` what pads the file up to them.
+- `--scale-catchup false` drops the catch-up phase.
+- `--scale-seconds` sets the load's length.
+
+The load-generation settings apply equally to both systems and are not
+production recommendations: 64 writer connections, and a source that does
+not sync its logs.
+
+Each run records:
+
+- correctness (missing, duplicated, out-of-order rows);
+- startup, catch-up and drain times;
+- steady, activation (first row per table) and catch-up latency;
+- DeltaForge's proofs and their seek, from its proof trace;
+- resources, MySQL and Kafka counters;
+- its raw commit and arrival times (`rows.csv`).
+
+An interrupt (Ctrl-C or SIGTERM) stops the runner and removes the
+invocation's containers and their volumes. `PERF_RUST_LOG` sets the
+runners' log filter for diagnostics, and is recorded in `invocation.json`.
+
+Results: `results/2026-10-proof-seek-sensitivity.md`.
+
 ## Layout-randomized qualification
 
 A single link of a version can run a few percent faster or slower than
