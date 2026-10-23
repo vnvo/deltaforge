@@ -189,6 +189,65 @@ fn touched(
     }
 }
 
+/// The tables a rows event (or each rows event of a compressed
+/// transaction) touches, at `at`: names from `table_map`, or from the table
+/// maps the compressed transaction itself carries.
+fn head_tables(
+    table_map: &HashMap<
+        u64,
+        mysql_binlog_connector_rust::event::table_map_event::TableMapEvent,
+    >,
+    data: &EventData,
+    at: &MySqlCheckpoint,
+    out: &mut Vec<(String, String, MySqlCheckpoint)>,
+) {
+    match data {
+        EventData::TransactionPayload(tp) => {
+            let mut inner: HashMap<u64, (&str, &str)> = HashMap::new();
+            for (_, d) in &tp.uncompressed_events {
+                match d {
+                    EventData::TableMap(tm) => {
+                        inner.insert(
+                            tm.table_id,
+                            (tm.database_name.as_str(), tm.table_name.as_str()),
+                        );
+                    }
+                    d => {
+                        if let Some(id) = rows_table(d)
+                            && let Some((db, table)) =
+                                inner.get(&id).copied().or_else(|| {
+                                    table_map.get(&id).map(|tm| {
+                                        (
+                                            tm.database_name.as_str(),
+                                            tm.table_name.as_str(),
+                                        )
+                                    })
+                                })
+                        {
+                            out.push((
+                                db.to_string(),
+                                table.to_string(),
+                                at.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        d => {
+            if let Some(id) = rows_table(d)
+                && let Some(tm) = table_map.get(&id)
+            {
+                out.push((
+                    tm.database_name.clone(),
+                    tm.table_name.clone(),
+                    at.clone(),
+                ));
+            }
+        }
+    }
+}
+
 /// Run a window before `header`'s position advances, when its event is the
 /// first rows of a table without a positional proof (see the module docs).
 /// Returns with nothing done otherwise. On success, the read-ahead events
@@ -209,6 +268,21 @@ pub(super) async fn maybe_window(
     let Some(a_head) = ctx.txn_eval_cp.clone() else {
         return Ok(None);
     };
+    // The head event's tables, from the stream's own table map: no copy
+    // of it unless a window opens (this runs for every rows event).
+    let mut found = Vec::new();
+    head_tables(&ctx.table_map, data, &a_head, &mut found);
+    if found.is_empty() {
+        return Ok(None);
+    }
+    let mut batch: BTreeMap<(String, String), MySqlCheckpoint> =
+        BTreeMap::new();
+    admit(ctx, &mut batch, found)
+        .await
+        .map_err(LoopControl::Fail)?;
+    if batch.is_empty() {
+        return Ok(None);
+    }
     let mut ahead = Ahead {
         file: ctx.last_file.clone(),
         done: ctx.last_gtid.clone(),
@@ -223,19 +297,9 @@ pub(super) async fn maybe_window(
             .collect(),
         broken: false,
     };
-    let mut batch: BTreeMap<(String, String), MySqlCheckpoint> =
-        BTreeMap::new();
-    let mut found = Vec::new();
-    touched(&mut ahead, header, data, &mut found);
-    if found.is_empty() {
-        return Ok(None);
-    }
-    admit(ctx, &mut batch, found)
-        .await
-        .map_err(LoopControl::Fail)?;
-    if batch.is_empty() {
-        return Ok(None);
-    }
+    // The head event's own table maps and boundaries (a compressed
+    // transaction carries them).
+    touched(&mut ahead, header, data, &mut Vec::new());
 
     // Read ahead, without advancing the position or dispatching.
     let cfg = ctx.proofs.clone();
@@ -321,6 +385,7 @@ pub(super) async fn maybe_window(
             &lineage,
             &tables,
             cfg.capture_lock_wait_secs,
+            None,
         )
         .await
         {

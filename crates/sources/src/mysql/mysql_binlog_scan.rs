@@ -1590,13 +1590,16 @@ fn batch_error(e: mysql_async::Error, what: &str) -> BatchCaptureError {
 }
 
 /// One batched capture attempt (see [`BatchCaptured`]); `lock_wait_secs`
-/// bounds each table's lock wait.
+/// bounds each table's lock wait. `after_first_lock` runs once the first
+/// table is locked (tests use it to race a multi-table DDL; production
+/// passes `None`).
 pub(crate) async fn capture_batch(
     dsn: &str,
     server_uuid: &str,
     lineage_hash: &str,
     tables: &[(String, String)],
     lock_wait_secs: u32,
+    after_first_lock: Option<BetweenHook<'_>>,
 ) -> Result<BatchCaptured, BatchCaptureError> {
     let failed = |e: ProofError| BatchCaptureError::Failed(e);
     let mut sorted: Vec<(String, String)> = tables.to_vec();
@@ -1641,7 +1644,14 @@ pub(crate) async fn capture_batch(
         for (db, table) in &sorted {
             let lock = format!("SELECT 1 FROM {} LIMIT 0", quoted(db, table));
             match conn.query_drop(&lock).await {
-                Ok(()) => present.push((db.as_str(), table.as_str())),
+                Ok(()) => {
+                    if present.is_empty()
+                        && let Some(hook) = after_first_lock
+                    {
+                        hook().await;
+                    }
+                    present.push((db.as_str(), table.as_str()))
+                }
                 Err(e) if server_code(&e) == Some(ER_NO_SUCH_TABLE) => {
                     missing.push((db.clone(), table.clone()))
                 }
@@ -3145,6 +3155,66 @@ mod tests {
                 assert_eq!(next.digest, direct.digest);
                 assert_eq!(affected(&next), [format!("{db}.t")]);
                 assert_eq!(next.positioned_at.unwrap().0, c2.file);
+            }
+
+            /// A batched capture locks its tables in sorted order, whatever
+            /// order it is given: a two-table RENAME taking the same locks
+            /// (MySQL locks a multi-table statement's tables in that order)
+            /// waits for it instead of deadlocking (probe 7: the reverse order
+            /// deadlocks, 1213).
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn a_batched_capture_locks_in_sorted_order() {
+                let dsn = server(true).await;
+                let db = "batch_order";
+                sql(
+                    &dsn,
+                    &[
+                        &format!("CREATE DATABASE {db}"),
+                        &format!("CREATE TABLE {db}.t010 (id INT PRIMARY KEY)"),
+                        &format!("CREATE TABLE {db}.t011 (id INT PRIMARY KEY)"),
+                    ],
+                )
+                .await;
+                let rename = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+                let (d, r) = (dsn.clone(), rename.clone());
+                let hook = move || -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+                let (d, r) = (d.clone(), r.clone());
+                Box::pin(async move {
+                    // The RENAME queues behind the first lock; give it time
+                    // to take what it can before the batch's second lock.
+                    let task = tokio::spawn(async move {
+                        let mut c = mysql_async::Conn::from_url(&d).await.unwrap();
+                        c.query_drop(format!(
+                            "RENAME TABLE {db}.t010 TO {db}.r010, {db}.t011 TO {db}.r011"
+                        ))
+                        .await
+                    });
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    *r.lock().await = Some(task);
+                })
+            };
+                let tables = vec![
+                    (db.to_string(), "t011".to_string()),
+                    (db.to_string(), "t010".to_string()),
+                ];
+                let cap = capture_batch(
+                    &dsn,
+                    &uuid(&dsn).await,
+                    LINEAGE,
+                    &tables,
+                    8,
+                    Some(&hook),
+                )
+                .await;
+                assert!(cap.is_ok(), "{cap:?}");
+                let cap = cap.unwrap();
+                assert_eq!(cap.schemas.len(), 2);
+                assert!(cap.missing.is_empty());
+                let task = rename.lock().await.take().expect("the rename ran");
+                task.await
+                    .unwrap()
+                    .expect("the rename waits, then succeeds");
             }
 
             /// A boundary after A, with a DDL in between, never proves:
