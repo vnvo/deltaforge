@@ -70,7 +70,7 @@ pub(crate) async fn prove(
         file: ctx.last_file.clone(),
         pos: ctx.last_pos,
         // The DDL statement completes its transaction: D includes it.
-        gtid_set: ctx.executed_through_current(),
+        gtid_set: ctx.executed_through_current().map(|s| s.to_string()),
         lineage: Some(lineage.clone()),
         snapshot_completed: None,
         snapshot_chain: None,

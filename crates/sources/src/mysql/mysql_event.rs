@@ -1,3 +1,4 @@
+use crate::gtid_set::GtidSet;
 use crate::mysql::LoopControl;
 use crate::mysql::RunCtx;
 use common::{ts_sec_to_ms, watchdog};
@@ -668,6 +669,12 @@ async fn handle_gtid(
 
     // The exact per-transaction GTID (`uuid:gno`) is the immutable identity
     // coordinate - captured before it is merged into the accumulated set below.
+    // Only a well-formed GTID can join the executed set.
+    if GtidSet::single(&gtid_str).is_none() {
+        return Err(SourceError::Other(anyhow::anyhow!(
+            "binlog framing error: malformed GTID {gtid_str:?}"
+        )));
+    }
     ctx.current_gtid = Some(gtid_str.clone());
     ctx.in_explicit_txn = false;
     // New transaction boundary: reset the DDL message ordinal and the
@@ -684,52 +691,6 @@ async fn handle_gtid(
     // or empty) - open it on the coordinator's stream.
     emit_tx_begin(ctx).await;
     Ok(())
-}
-
-/// Merge a single GTID (e.g. "uuid:21") into an existing set (e.g. "uuid:1-20").
-///
-/// Handles both single-source ("uuid:1-N") and multi-source sets
-/// ("uuid1:1-N,uuid2:1-M") by splitting on commas and updating the matching
-/// UUID entry in-place. Appends a new entry if the UUID is not yet present.
-pub(super) fn merge_gtid(existing: &str, new_gtid: &str) -> String {
-    // Parse the incoming single GTID: "uuid:N"
-    let n_colon = match new_gtid.rfind(':') {
-        Some(p) => p,
-        None => return format!("{},{}", existing, new_gtid),
-    };
-    let n_uuid = &new_gtid[..n_colon];
-    let n_seq: u64 = match new_gtid[n_colon + 1..].parse() {
-        Ok(n) if n > 0 => n,
-        _ => return format!("{},{}", existing, new_gtid),
-    };
-
-    // Walk each "uuid:range" entry and update the one that matches.
-    let mut entries: Vec<String> =
-        existing.split(',').map(str::to_owned).collect();
-    let mut found = false;
-    for entry in &mut entries {
-        // find(':') is correct here - individual entries never contain commas,
-        // so find and rfind are equivalent, but find is explicit about intent.
-        if let Some(colon) = entry.find(':') {
-            if &entry[..colon] == n_uuid {
-                let range = &entry[colon + 1..];
-                let start: u64 = if let Some(dash) = range.find('-') {
-                    range[..dash].parse().unwrap_or(1)
-                } else {
-                    range.parse().unwrap_or(1)
-                };
-                *entry = format!("{}:{}-{}", n_uuid, start, n_seq);
-                found = true;
-                break;
-            }
-        }
-    }
-
-    if !found {
-        entries.push(format!("{}:{}", n_uuid, n_seq));
-    }
-
-    entries.join(",")
 }
 
 fn handle_rotate(
@@ -778,7 +739,7 @@ async fn emit_tx_commit(ctx: &mut RunCtx) {
     let checkpoint = make_checkpoint_meta(
         &ctx.last_file,
         ctx.last_pos,
-        &ctx.last_gtid,
+        &ctx.gtid_text(),
         checkpoint_lineage(&ctx.registry_scope),
     );
     // Watermark and checkpoint describe the SAME commit boundary.
@@ -817,7 +778,7 @@ fn build_cdc_watermark(ctx: &RunCtx) -> Option<std::sync::Arc<[u8]>> {
     let lineage = ctx.durable_lineage.clone()?;
     let wm = match &lineage {
         PersistedLineage::MysqlGtid { .. } => {
-            DurableWatermark::mysql_gtid_commit(lineage, ctx.last_gtid.clone()?)
+            DurableWatermark::mysql_gtid_commit(lineage, ctx.gtid_text()?)
         }
         PersistedLineage::MysqlServer { .. } => {
             DurableWatermark::mysql_binlog_commit(
@@ -1016,7 +977,7 @@ async fn emit_ddl_event(
         snapshot: None,
         position: SourcePosition::mysql(
             ctx.server_id as u32,
-            ctx.executed_through_current(),
+            ctx.executed_through_current().map(|s| s.to_string()),
             Some(ctx.last_file.clone()),
             Some(ctx.last_pos),
             None,
@@ -1044,7 +1005,7 @@ async fn emit_ddl_event(
         &ctx.last_file,
         ctx.last_pos,
         // The DDL statement completes its (autocommit) transaction.
-        &ctx.executed_through_current(),
+        &ctx.executed_through_current().map(|s| s.to_string()),
         checkpoint_lineage(&ctx.registry_scope),
     ));
     ev.transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
@@ -1228,7 +1189,7 @@ async fn record_query(
             ctx.last_file, ctx.last_pos
         )))
     };
-    let executed = ctx.executed_through_current();
+    let executed = ctx.executed_through_current().map(|s| s.to_string());
     let position = crate::durable_checkpoint::mysql_checkpoint_position(
         &ctx.last_file,
         ctx.last_pos,
@@ -1545,7 +1506,10 @@ mod tests {
             table_map,
             last_file: "mysql-bin.000001".to_string(),
             last_pos: 1234,
-            last_gtid: Some("GTID-UNIT".to_string()),
+            last_gtid: Some(
+                GtidSet::parse("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-4")
+                    .unwrap(),
+            ),
             // A row event only occurs inside a GTID transaction; the per-tx
             // GTID (a real `uuid:gno`) is the identity stamped on events, the
             // TxBegin, and the TxCommit alike.
@@ -1855,7 +1819,7 @@ mod tests {
         // GTID (used as the per-event identity coordinate).
         ctx.last_file = "mysql-bin.000005".to_string();
         ctx.last_pos = 12345;
-        ctx.last_gtid = Some("abc-123:1-10".to_string());
+        ctx.last_gtid = Some(GtidSet::parse("abc-123:1-10").unwrap());
         // A real per-transaction GTID is always a single valid `uuid:gno`.
         ctx.current_gtid =
             Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:10".to_string());
@@ -2014,7 +1978,7 @@ mod tests {
 
         ctx.last_file = "mysql-bin.000005".to_string();
         ctx.last_pos = 12345;
-        ctx.last_gtid = Some("abc-123:1-10".to_string());
+        ctx.last_gtid = Some(GtidSet::parse("abc-123:1-10").unwrap());
 
         let row = RowEvent {
             column_values: vec![
@@ -2145,72 +2109,6 @@ mod tests {
     }
 
     // =========================================================================
-    // merge_gtid tests
-    // =========================================================================
-
-    #[test]
-    fn merge_gtid_single_source_extends_range() {
-        // Normal case: sequential GTIDs from one server
-        let result = merge_gtid("uuid-a:1-10", "uuid-a:11");
-        assert_eq!(result, "uuid-a:1-11");
-    }
-
-    #[test]
-    fn merge_gtid_single_source_first_event() {
-        // Existing set has a single point, not yet a range
-        let result = merge_gtid("uuid-a:1", "uuid-a:2");
-        assert_eq!(result, "uuid-a:1-2");
-    }
-
-    #[test]
-    fn merge_gtid_multi_source_extends_correct_entry() {
-        // The bug: rfind(':') on the existing set would find the colon in
-        // "uuid-b:1-50" and compute e_uuid = "uuid-a:1-100,uuid-b", failing
-        // the equality check and appending instead of extending.
-        let result = merge_gtid("uuid-a:1-100,uuid-b:1-50", "uuid-a:101");
-        assert_eq!(result, "uuid-a:1-101,uuid-b:1-50");
-    }
-
-    #[test]
-    fn merge_gtid_multi_source_extends_second_entry() {
-        let result = merge_gtid("uuid-a:1-100,uuid-b:1-50", "uuid-b:51");
-        assert_eq!(result, "uuid-a:1-100,uuid-b:1-51");
-    }
-
-    #[test]
-    fn merge_gtid_multi_source_appends_new_uuid() {
-        // A GTID from a third source not yet in the set
-        let result = merge_gtid("uuid-a:1-100,uuid-b:1-50", "uuid-c:1");
-        assert_eq!(result, "uuid-a:1-100,uuid-b:1-50,uuid-c:1");
-    }
-
-    #[test]
-    fn merge_gtid_three_sources_middle_entry() {
-        let result =
-            merge_gtid("uuid-a:1-10,uuid-b:1-20,uuid-c:1-30", "uuid-b:21");
-        assert_eq!(result, "uuid-a:1-10,uuid-b:1-21,uuid-c:1-30");
-    }
-
-    #[test]
-    fn merge_gtid_preserves_nonzero_range_start() {
-        // Existing range does NOT start at 1 - pins the `colon + 1` range
-        // slice. A wrong offset silently falls back to start=1, which every
-        // other test (all start at 1) fails to catch.
-        assert_eq!(merge_gtid("uuid-a:5-10", "uuid-a:11"), "uuid-a:5-11");
-    }
-
-    #[test]
-    fn merge_gtid_rejects_zero_or_unparseable_sequence() {
-        // seq 0 fails the `n > 0` guard → appended verbatim, not merged.
-        assert_eq!(
-            merge_gtid("uuid-a:1-10", "uuid-a:0"),
-            "uuid-a:1-10,uuid-a:0"
-        );
-        // no colon at all → appended verbatim.
-        assert_eq!(merge_gtid("uuid-a:1-10", "garbage"), "uuid-a:1-10,garbage");
-    }
-
-    // =========================================================================
     // QueryEvent helpers
     // =========================================================================
 
@@ -2238,7 +2136,7 @@ mod tests {
         )
         .await
         .unwrap();
-        ctx.last_gtid = Some(format!("{UUID}:1-5"));
+        ctx.last_gtid = Some(GtidSet::parse(&format!("{UUID}:1-5")).unwrap());
     }
 
     async fn table_records(
@@ -2464,7 +2362,7 @@ mod tests {
         let position = crate::durable_checkpoint::mysql_checkpoint_position(
             &ctx.last_file,
             ctx.last_pos,
-            ctx.last_gtid.as_deref(),
+            ctx.gtid_text().as_deref(),
         )
         .unwrap();
         for (db, table) in [("shop", "orders"), ("other", "archived")] {
@@ -3199,7 +3097,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
         let mut ctx = make_runctx(tx);
         ctx.current_gtid = None;
-        ctx.last_gtid = Some("uuid-a:1-10".to_string());
+        ctx.last_gtid = Some(GtidSet::parse("uuid-a:1-10").unwrap());
         ctx.mark_transaction_boundary();
         handle_gtid(
             &mut ctx,
@@ -3210,15 +3108,17 @@ mod tests {
         )
         .await
         .expect("gtid at a clean boundary is accepted");
-        assert_eq!(ctx.last_gtid.as_deref(), Some("uuid-a:1-10"));
+        assert_eq!(ctx.gtid_text().as_deref(), Some("uuid-a:1-10"));
         assert_eq!(ctx.current_gtid.as_deref(), Some("uuid-a:11"));
         assert_eq!(
-            ctx.executed_through_current().as_deref(),
+            ctx.executed_through_current()
+                .map(|s| s.to_string())
+                .as_deref(),
             Some("uuid-a:1-11")
         );
         assert_eq!(ctx.resume_point().2.as_deref(), Some("uuid-a:1-10"));
         emit_tx_commit(&mut ctx).await;
-        assert_eq!(ctx.last_gtid.as_deref(), Some("uuid-a:1-11"));
+        assert_eq!(ctx.gtid_text().as_deref(), Some("uuid-a:1-11"));
         assert_eq!(ctx.resume_point().2.as_deref(), Some("uuid-a:1-11"));
         let mut commit = None;
         while let Ok(item) = rx.try_recv() {
@@ -3233,12 +3133,89 @@ mod tests {
         assert_eq!(cp.gtid_set.as_deref(), Some("uuid-a:1-11"));
     }
 
+    /// Commit one transaction of `gtid` through the stream's path and
+    /// return the checkpoint its commit marker carries.
+    async fn commit_gtid(
+        ctx: &mut RunCtx,
+        rx: &mut mpsc::Receiver<SourceItem>,
+        gtid: &str,
+    ) -> MySqlCheckpoint {
+        ctx.mark_transaction_boundary();
+        handle_gtid(
+            ctx,
+            GtidEvent {
+                flags: 0,
+                gtid: gtid.into(),
+            },
+        )
+        .await
+        .expect("gtid at a clean boundary is accepted");
+        emit_tx_commit(ctx).await;
+        let mut commit = None;
+        while let Ok(item) = rx.try_recv() {
+            if let SourceItem::TxCommit { boundary, .. } = item {
+                commit = Some(boundary);
+            }
+        }
+        serde_json::from_slice(
+            commit.expect("a commit marker").checkpoint.as_bytes(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_executed_set_never_claims_a_gtid_it_did_not_see() {
+        // The defect: u:1-8 then u:13 was checkpointed as u:1-13, so a
+        // restart skipped 9-12 when they were committed later.
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(16);
+        let mut ctx = make_runctx(tx);
+        ctx.current_gtid = None;
+        ctx.last_gtid = Some(GtidSet::parse("uuid-a:1-8").unwrap());
+        let cp = commit_gtid(&mut ctx, &mut rx, "uuid-a:13").await;
+        assert_eq!(cp.gtid_set.as_deref(), Some("uuid-a:1-8:13"));
+        assert_eq!(ctx.resume_point().2.as_deref(), Some("uuid-a:1-8:13"));
+        // The gap fills in any order; each step stays exact.
+        let cp = commit_gtid(&mut ctx, &mut rx, "uuid-a:10").await;
+        assert_eq!(cp.gtid_set.as_deref(), Some("uuid-a:1-8:10:13"));
+        for g in ["uuid-a:9", "uuid-a:12", "uuid-a:11"] {
+            commit_gtid(&mut ctx, &mut rx, g).await;
+        }
+        assert_eq!(ctx.gtid_text().as_deref(), Some("uuid-a:1-13"));
+        // A GTID below the set's end (out of order) never shrinks it.
+        let cp = commit_gtid(&mut ctx, &mut rx, "uuid-a:4").await;
+        assert_eq!(cp.gtid_set.as_deref(), Some("uuid-a:1-13"));
+        // Another server's transactions are kept apart, with their gaps.
+        ctx.last_gtid =
+            Some(GtidSet::parse("uuid-a:1-13,uuid-b:1-3:7").unwrap());
+        let cp = commit_gtid(&mut ctx, &mut rx, "uuid-b:5").await;
+        assert_eq!(cp.gtid_set.as_deref(), Some("uuid-a:1-13,uuid-b:1-3:5:7"));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_gtid_is_a_framing_error() {
+        let (tx, _rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        ctx.current_gtid = None;
+        for bad in ["uuid-a:0", "garbage", "uuid-a:tag:3"] {
+            let r = handle_gtid(
+                &mut ctx,
+                GtidEvent {
+                    flags: 0,
+                    gtid: bad.into(),
+                },
+            )
+            .await;
+            assert!(r.is_err(), "{bad} is refused");
+            assert!(ctx.current_gtid.is_none());
+        }
+    }
+
     #[tokio::test]
     async fn a_reopen_inside_a_transaction_resumes_before_it() {
         let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
         let mut ctx = make_runctx(tx);
         ctx.current_gtid = None;
-        ctx.last_gtid = Some("uuid-a:1-10".to_string());
+        ctx.last_gtid = Some(GtidSet::parse("uuid-a:1-10").unwrap());
         ctx.last_file = "mysql-bin.000004".into();
         ctx.last_pos = 1000;
         ctx.mark_transaction_boundary();
@@ -3255,7 +3232,7 @@ mod tests {
         ctx.last_pos = 1600; // rows read
         ctx.abandon_open_transaction().await.unwrap();
         assert!(!ctx.transaction_open());
-        assert_eq!(ctx.last_gtid.as_deref(), Some("uuid-a:1-10"));
+        assert_eq!(ctx.gtid_text().as_deref(), Some("uuid-a:1-10"));
         assert_eq!(
             (ctx.last_file.as_str(), ctx.last_pos),
             ("mysql-bin.000004", 1000)
@@ -3350,8 +3327,9 @@ mod tests {
         });
         ctx.current_gtid =
             Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:5".to_string());
-        ctx.last_gtid =
-            Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5".to_string());
+        ctx.last_gtid = Some(
+            GtidSet::parse("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5").unwrap(),
+        );
         ctx.last_file = "mysql-bin.000003".to_string();
         ctx.last_pos = 900;
 

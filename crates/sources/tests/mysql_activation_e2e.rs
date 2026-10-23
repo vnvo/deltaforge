@@ -308,7 +308,7 @@ async fn records_precede_events_and_replay_identically(gtid: bool) {
     let recs = ddl(st.table(id, &hash, db, "t").await);
     assert_eq!(recs.len(), 1, "{recs:?}");
     assert_eq!(recs[0]["kind"], "ddl");
-    assert_eq!(recs[0]["format_version"], 1);
+    assert_eq!(recs[0]["format_version"], 2);
 
     sql(port, "", &[&format!("DROP DATABASE {db}_other")]).await;
     ddl_event(&mut r.rx, &format!("DROP DATABASE {db}_other")).await;

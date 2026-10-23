@@ -771,6 +771,15 @@ async fn capture_binlog_position(
         mode.filter(|m| m.eq_ignore_ascii_case("ON"))
             .map(|_| set.unwrap_or_default())
     });
+    // The server's text (it prints newlines), in the one canonical form.
+    let gtid_set = match gtid_set {
+        Some(t) => Some(
+            crate::gtid_set::GtidSet::parse(&t)
+                .with_context(|| format!("unparseable gtid_executed {t:?}"))?
+                .to_string(),
+        ),
+        None => None,
+    };
 
     Ok(MySqlCheckpoint {
         file,

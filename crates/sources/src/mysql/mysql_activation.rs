@@ -37,7 +37,11 @@ pub(crate) const ACTIVATION_NS: &str = "schemas.v1.activation";
 /// Barrier streams (per source lineage and per database).
 pub(crate) const BARRIER_NS: &str = "schemas.v1.activation.barrier";
 
-const FORMAT_VERSION: u32 = 1;
+/// Version 2: positions hold exact GTID sets (`super::GTID_FORMAT`).
+/// Version-1 records may hold a GTID boundary that claims transactions the
+/// server had not executed, so a proof could have skipped a DDL in them:
+/// they are refused, not trusted.
+const FORMAT_VERSION: u32 = 2;
 const CAPTURE_DOMAIN: &[u8] = b"DeltaForge.Activation.v1\0";
 const BASELINE_DOMAIN: &[u8] = b"DeltaForge.Activation.Baseline.v1\0";
 const FORWARD_DOMAIN: &[u8] = b"DeltaForge.Activation.ForwardProof.v1\0";
@@ -638,9 +642,17 @@ pub(crate) async fn read_stream(
                     ))
                 })?;
             if record.format_version != FORMAT_VERSION {
+                let why = if record.format_version < FORMAT_VERSION {
+                    "; it was written before exact GTID sets, so its \
+                     boundaries may claim transactions the server had not \
+                     executed. Configure the source under a new source id \
+                     to start it again with a snapshot"
+                } else {
+                    ""
+                };
                 return Err(TimelineError(format!(
                     "record {} in {stream} has format_version {} (this \
-                     build reads {FORMAT_VERSION})",
+                     build reads {FORMAT_VERSION}){why}",
                     e.seq, record.format_version
                 ))
                 .into());
@@ -1566,6 +1578,23 @@ mod tests {
         .unwrap();
         let err = read_stream(&b, ACTIVATION_NS, "s2").await.unwrap_err();
         assert!(err.to_string().contains("format_version 9"), "{err:#}");
+        // A record from before exact GTID sets (version 1): refused, and
+        // the error says why and what to do.
+        let mut old =
+            serde_json::to_value(Record::new(g(1), Kind::Ddl)).unwrap();
+        old["format_version"] = serde_json::json!(1);
+        b.log_append_if_absent(
+            ACTIVATION_NS,
+            "s3",
+            "z",
+            &serde_json::to_vec(&old).unwrap(),
+        )
+        .await
+        .unwrap();
+        let err = read_stream(&b, ACTIVATION_NS, "s3").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("written before exact GTID sets"), "{msg}");
+        assert!(msg.contains("under a new source id"), "{msg}");
     }
 
     #[tokio::test]

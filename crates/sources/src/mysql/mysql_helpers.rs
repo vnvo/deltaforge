@@ -539,7 +539,17 @@ pub(super) async fn fetch_executed_gtid_set(
         .await
         .map_err(|e| SourceError::Other(e.into()))?;
 
-    Ok(row.and_then(|(s,)| s))
+    // The server's text (it prints newlines), in the one canonical form.
+    match row.and_then(|(s,)| s) {
+        Some(t) => crate::gtid_set::GtidSet::parse(&t)
+            .map(|set| Some(set.to_string()))
+            .ok_or_else(|| {
+                SourceError::Other(anyhow::anyhow!(
+                    "unparseable gtid_executed {t:?}"
+                ))
+            }),
+        None => Ok(None),
+    }
 }
 
 /// The verified registry lineage hash a new checkpoint is stamped with:

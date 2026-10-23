@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use deltaforge_core::{CheckpointComparator, CheckpointOrder};
 use serde::{Deserialize, Serialize};
 
+use crate::gtid_set::GtidSet;
 use crate::snapshot_generation::PersistedLineage;
 
 /// A typed, order-preserving snapshot scan cursor. The kind is carried so two
@@ -92,6 +93,12 @@ pub const WATERMARK_VERSION: u16 = 1;
 /// [`WmPos::SnapshotGenerationAdopted`]): a release that only knows version 1
 /// refuses them (fails closed) instead of misreading them.
 pub const WATERMARK_VERSION_SNAPSHOT_CHAIN: u16 = 2;
+
+/// The version of MySQL GTID watermarks ([`WmPos::MysqlGtid`]): exact GTID
+/// sets (`crate::mysql::GTID_FORMAT`). An earlier MySQL GTID watermark may
+/// claim transactions the server had not executed, so it is refused
+/// (`Incomparable`, the sink fails closed) rather than trusted.
+pub const WATERMARK_VERSION_MYSQL_GTID: u16 = 3;
 
 /// A durable watermark: source lineage plus a source-specific position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,6 +252,7 @@ fn version_of(pos: &WmPos) -> u16 {
         WmPos::SnapshotSeq { .. } | WmPos::SnapshotGenerationAdopted { .. } => {
             WATERMARK_VERSION_SNAPSHOT_CHAIN
         }
+        WmPos::MysqlGtid { .. } => WATERMARK_VERSION_MYSQL_GTID,
         _ => WATERMARK_VERSION,
     }
 }
@@ -269,88 +277,8 @@ pub fn binlog_file_parts(file: &str) -> Option<(String, u64)> {
     Some((base.to_string(), index))
 }
 
-// ── GTID set parsing + inclusion ────────────────────────────────────────────
-
-pub(crate) type Intervals = Vec<(u64, u64)>;
-
-/// Parse a GTID set (`"uuid:1-5:10-12,uuid2:1-3"`) into per-UUID merged
-/// intervals. Returns `None` on any malformed input.
-pub(crate) fn parse_gtid_set(s: &str) -> Option<BTreeMap<String, Intervals>> {
-    let mut map: BTreeMap<String, Intervals> = BTreeMap::new();
-    let s = s.trim();
-    if s.is_empty() {
-        return Some(map);
-    }
-    for entry in s.split(',') {
-        let entry = entry.trim();
-        let mut parts = entry.split(':');
-        let uuid = parts.next()?.trim().to_string();
-        if uuid.is_empty() {
-            return None;
-        }
-        let mut ivs: Intervals = Vec::new();
-        let mut any = false;
-        for iv in parts {
-            any = true;
-            let iv = iv.trim();
-            let (lo, hi) = match iv.split_once('-') {
-                Some((a, b)) => (
-                    a.trim().parse::<u64>().ok()?,
-                    b.trim().parse::<u64>().ok()?,
-                ),
-                None => {
-                    let n = iv.parse::<u64>().ok()?;
-                    (n, n)
-                }
-            };
-            if lo == 0 || hi < lo {
-                return None;
-            }
-            ivs.push((lo, hi));
-        }
-        if !any {
-            return None;
-        }
-        let e = map.entry(uuid).or_default();
-        e.extend(ivs);
-        merge_intervals(e);
-    }
-    Some(map)
-}
-
-pub(crate) fn merge_intervals(ivs: &mut Intervals) {
-    ivs.sort_unstable();
-    let mut out: Intervals = Vec::with_capacity(ivs.len());
-    for &(lo, hi) in ivs.iter() {
-        if let Some(last) = out.last_mut() {
-            // Merge overlapping or contiguous (hi+1 == lo) ranges.
-            if lo <= last.1.saturating_add(1) {
-                last.1 = last.1.max(hi);
-                continue;
-            }
-        }
-        out.push((lo, hi));
-    }
-    *ivs = out;
-}
-
-/// Is every interval of `a` covered by `b` (for every UUID)?
-pub(crate) fn gtid_subseteq(
-    a: &BTreeMap<String, Intervals>,
-    b: &BTreeMap<String, Intervals>,
-) -> bool {
-    for (uuid, a_ivs) in a {
-        let Some(b_ivs) = b.get(uuid) else {
-            return false;
-        };
-        for &(lo, hi) in a_ivs {
-            if !b_ivs.iter().any(|&(blo, bhi)| blo <= lo && hi <= bhi) {
-                return false;
-            }
-        }
-    }
-    true
-}
+// ── GTID set inclusion ──────────────────────────────────────────────────────
+// The set itself is `crate::gtid_set::GtidSet`, the one exact representation.
 
 fn order_from_subset(a_in_b: bool, b_in_a: bool) -> CheckpointOrder {
     match (a_in_b, b_in_a) {
@@ -443,11 +371,10 @@ pub fn order_positions(a: &WmPos, b: &WmPos) -> CheckpointOrder {
         (
             WmPos::MysqlGtid { gtid_set: ga },
             WmPos::MysqlGtid { gtid_set: gb },
-        ) => match (parse_gtid_set(ga), parse_gtid_set(gb)) {
-            (Some(sa), Some(sb)) => order_from_subset(
-                gtid_subseteq(&sa, &sb),
-                gtid_subseteq(&sb, &sa),
-            ),
+        ) => match (GtidSet::parse(ga), GtidSet::parse(gb)) {
+            (Some(sa), Some(sb)) => {
+                order_from_subset(sa.is_subset(&sb), sb.is_subset(&sa))
+            }
             _ => CheckpointOrder::Incomparable,
         },
         (
@@ -843,32 +770,6 @@ impl SnapshotVector {
     }
 }
 
-/// A GTID set in canonical text: UUIDs lowercase and sorted, each with its
-/// merged intervals (`uuid:1-5:7`). `None` when it does not parse.
-fn canonical_gtid_set(s: &str) -> Option<String> {
-    let mut map: BTreeMap<String, Intervals> = BTreeMap::new();
-    for (uuid, ivs) in parse_gtid_set(s)? {
-        let e = map.entry(uuid.to_ascii_lowercase()).or_default();
-        e.extend(ivs);
-        merge_intervals(e);
-    }
-    let entries: Vec<String> = map
-        .into_iter()
-        .map(|(uuid, ivs)| {
-            let mut out = uuid;
-            for (lo, hi) in ivs {
-                if lo == hi {
-                    out.push_str(&format!(":{lo}"));
-                } else {
-                    out.push_str(&format!(":{lo}-{hi}"));
-                }
-            }
-            out
-        })
-        .collect();
-    Some(entries.join(","))
-}
-
 /// The canonical identity of a watermark (see
 /// [`CheckpointComparator::identity`]): the parsed watermark, its GTID set
 /// canonicalized, serialized as key-sorted compact JSON. Never the raw bytes
@@ -878,7 +779,7 @@ pub fn watermark_identity(
 ) -> Option<deltaforge_core::WatermarkIdentity> {
     let mut w = DurableWatermark::parse(raw)?;
     if let WmPos::MysqlGtid { gtid_set } = &mut w.pos {
-        *gtid_set = canonical_gtid_set(gtid_set)?;
+        *gtid_set = GtidSet::parse(gtid_set)?.to_string();
     }
     let (kind, summary) = match &w.pos {
         WmPos::PgLsn { lsn, tx_id, .. } => (
@@ -1300,8 +1201,8 @@ mod tests {
     #[test]
     fn mysql_gtid_contiguous_intervals_merge() {
         // "1-5:6-10" must be treated as 1-10.
-        let m = parse_gtid_set("u:1-5:6-10").unwrap();
-        assert_eq!(m.get("u").unwrap(), &vec![(1, 10)]);
+        let m = GtidSet::parse("u:1-5:6-10").unwrap();
+        assert_eq!(m.to_string(), "u:1-10");
     }
 
     // ── MySQL non-GTID binlog ───────────────────────────────────────────────
@@ -1969,5 +1870,31 @@ mod snapshot_chain_watermark_tests {
         let mut cdc = DurableWatermark::pg_commit(7, 10, None);
         cdc.version = WATERMARK_VERSION_SNAPSHOT_CHAIN;
         assert_eq!(DurableWatermark::parse(&cdc.to_bytes()), None);
+    }
+
+    #[test]
+    fn a_mysql_gtid_watermark_from_before_exact_sets_is_refused() {
+        let w = DurableWatermark::mysql_gtid_commit(
+            PersistedLineage::MysqlGtid {
+                source_uuid: [7u8; 16],
+            },
+            "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-8:13".into(),
+        );
+        assert_eq!(w.version, WATERMARK_VERSION_MYSQL_GTID);
+        assert_eq!(DurableWatermark::parse(&w.to_bytes()), Some(w.clone()));
+        // Written by an earlier version (1): its set may over-claim.
+        let mut old = w.clone();
+        old.version = WATERMARK_VERSION;
+        assert_eq!(DurableWatermark::parse(&old.to_bytes()), None);
+        let cmp = SourceCheckpointComparator;
+        assert_eq!(
+            cmp.order(&old.to_bytes(), &w.to_bytes()),
+            CheckpointOrder::Incomparable
+        );
+        // Other kinds keep version 1.
+        assert_eq!(
+            DurableWatermark::pg_commit(7, 10, None).version,
+            WATERMARK_VERSION
+        );
     }
 }

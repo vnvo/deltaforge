@@ -12,6 +12,7 @@ pub mod credentials;
 pub mod declared_types;
 pub mod durable_checkpoint;
 pub mod failover;
+pub mod gtid_set;
 pub mod identity_resolution;
 pub(crate) mod incident_drafts;
 pub mod mysql;

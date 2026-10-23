@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 use checkpoints::{CheckpointStore, CheckpointStoreExt};
 use common::{AllowList, RetryPolicy, pause_until_resumed};
 
+use crate::gtid_set::GtidSet;
 use crate::snapshot_generation::PersistedLineage;
 use deltaforge_core::incident::{CauseCode, IncidentDraft, Retryability};
 use deltaforge_core::{
@@ -86,9 +87,13 @@ use crate::registry_scope::{
 use storage::adapters::LineageDescriptor;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "MySqlCheckpointWire", try_from = "MySqlCheckpointWire")]
 pub struct MySqlCheckpoint {
     pub file: String,
     pub pos: u64,
+    /// GTID mode: the exact executed set (see [`crate::gtid_set`]). Stored
+    /// with `gtid_format` [`GTID_FORMAT`]; a stored GTID set without it was
+    /// written by an earlier version that could over-claim, and is refused.
     pub gtid_set: Option<String>,
     /// Verified registry lineage hash of the server this position belongs to
     /// (MySQL `server_uuid`). `None` only in checkpoints written before
@@ -105,6 +110,78 @@ pub struct MySqlCheckpoint {
     /// generation (absent on completions written before chains).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_chain: Option<String>,
+}
+
+/// The format of a stored MySQL GTID set. Format 2 sets are exact. Earlier
+/// versions merged each new GTID into the set by extending its first
+/// interval, so a set with a gap (`u:1-8:13`) was stored as `u:1-13`,
+/// claiming transactions the server had not executed; resuming from it
+/// skips them when they are committed later. Such a set cannot be repaired
+/// from the server later (once the gap fills it is indistinguishable from a
+/// contiguous one), so it is refused.
+pub const GTID_FORMAT: u16 = 2;
+
+/// [`MySqlCheckpoint`] as stored: the GTID set carries its format.
+#[derive(Serialize, Deserialize)]
+struct MySqlCheckpointWire {
+    file: String,
+    pos: u64,
+    gtid_set: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gtid_format: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lineage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_completed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_chain: Option<String>,
+}
+
+impl From<MySqlCheckpoint> for MySqlCheckpointWire {
+    fn from(c: MySqlCheckpoint) -> Self {
+        Self {
+            gtid_format: c.gtid_set.is_some().then_some(GTID_FORMAT),
+            file: c.file,
+            pos: c.pos,
+            gtid_set: c.gtid_set,
+            lineage: c.lineage,
+            snapshot_completed: c.snapshot_completed,
+            snapshot_chain: c.snapshot_chain,
+        }
+    }
+}
+
+impl TryFrom<MySqlCheckpointWire> for MySqlCheckpoint {
+    type Error = String;
+
+    fn try_from(w: MySqlCheckpointWire) -> Result<Self, String> {
+        if let Some(g) = &w.gtid_set {
+            if w.gtid_format != Some(GTID_FORMAT) {
+                return Err(format!(
+                    "MySQL checkpoint GTID set {g:?} was written before exact \
+                     GTID sets (format {GTID_FORMAT}, found {:?}): it may \
+                     claim transactions the server had not executed, so \
+                     resuming from it could skip rows. Configure the \
+                     source under a new source id to start it again with a \
+                     snapshot",
+                    w.gtid_format
+                ));
+            }
+            if crate::gtid_set::GtidSet::parse(g).is_none() {
+                return Err(format!(
+                    "unparseable MySQL checkpoint GTID set {g:?}"
+                ));
+            }
+        }
+        Ok(Self {
+            file: w.file,
+            pos: w.pos,
+            gtid_set: w.gtid_set,
+            lineage: w.lineage,
+            snapshot_completed: w.snapshot_completed,
+            snapshot_chain: w.snapshot_chain,
+        })
+    }
 }
 
 /// A resume position read from the checkpoint store.
@@ -197,7 +274,9 @@ pub(crate) struct RunCtx {
     table_map: HashMap<u64, TableMapEvent>,
     last_file: String,
     last_pos: u64,
-    last_gtid: Option<String>,
+    /// The executed set through the last proven transaction boundary (GTID
+    /// mode): exact, holding only transactions seen or resumed past.
+    last_gtid: Option<GtidSet>,
     /// The current transaction's exact GTID (`uuid:gno`), captured from the GTID
     /// event before it is merged into `last_gtid`'s accumulated executed set.
     /// Used as the immutable per-event identity coordinate.
@@ -1510,7 +1589,7 @@ impl MySqlSource {
 
         // binlog streaming - retry prepare_client on transient connection errors
         // (MySQL or toxiproxy may not be ready yet during startup).
-        let (host, default_db, server_id, client) = {
+        let (host, default_db, server_id, mut client) = {
             let mut retry = common::retry::RetryPolicy::default();
             loop {
                 match prepare_client(
@@ -1576,7 +1655,23 @@ impl MySqlSource {
         // the stream opens, against the EXACT position the stream will start
         // from: the (carried-over) checkpoint GTID set. A file/position start
         // across servers cannot be proven and stops there.
-        let init_gtid = client.gtid_enabled.then(|| client.gtid_set.clone());
+        // GTID mode: the start set, exact. The dump command gets its
+        // canonical text.
+        let init_gtid = if client.gtid_enabled {
+            let set = GtidSet::parse(&client.gtid_set).ok_or_else(|| {
+                SourceError::Checkpoint {
+                    details: format!(
+                        "unparseable start GTID set {:?}",
+                        client.gtid_set
+                    )
+                    .into(),
+                }
+            })?;
+            client.gtid_set = set.to_string();
+            Some(set)
+        } else {
+            None
+        };
         let init_file = client.binlog_filename.clone();
         let init_pos = client.binlog_position as u64;
 
@@ -2219,7 +2314,7 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
     let expected = ctx.expected_uuid()?;
     let (gtid_to_use, file_to_use, pos_to_use) = if let Some(g) = &ctx.last_gtid
     {
-        (Some(g.clone()), None, None)
+        (Some(g.to_string()), None, None)
     } else if !ctx.last_file.is_empty() && ctx.last_pos > 0 {
         (None, Some(ctx.last_file.clone()), Some(ctx.last_pos as u32))
     } else {
@@ -2376,11 +2471,21 @@ impl RunCtx {
     /// through the current statement (the position a completed statement -
     /// a commit, an autocommit DDL - records). Not a resume position while a
     /// transaction is open.
-    pub(crate) fn executed_through_current(&self) -> Option<String> {
+    /// The canonical text of the executed set through the last boundary.
+    pub(crate) fn gtid_text(&self) -> Option<String> {
+        self.last_gtid.as_ref().map(GtidSet::to_string)
+    }
+
+    pub(crate) fn executed_through_current(&self) -> Option<GtidSet> {
         match (&self.last_gtid, &self.current_gtid) {
             (_, None) => self.last_gtid.clone(),
-            (None, Some(g)) => Some(g.clone()),
-            (Some(set), Some(g)) => Some(mysql_event::merge_gtid(set, g)),
+            (set, Some(g)) => {
+                // `handle_gtid` admits only well-formed GTIDs.
+                let mut s = set.clone().unwrap_or_default();
+                let added = s.insert(g);
+                debug_assert!(added, "current GTID {g:?} is well formed");
+                Some(s)
+            }
         }
     }
 
@@ -2396,11 +2501,7 @@ impl RunCtx {
     pub(crate) fn resume_point(&self) -> (String, u64, Option<String>) {
         match (&self.txn_eval_cp, self.transaction_open()) {
             (Some(cp), true) => (cp.file.clone(), cp.pos, cp.gtid_set.clone()),
-            _ => (
-                self.last_file.clone(),
-                self.last_pos,
-                self.last_gtid.clone(),
-            ),
+            _ => (self.last_file.clone(), self.last_pos, self.gtid_text()),
         }
     }
 
@@ -2440,7 +2541,15 @@ impl RunCtx {
         self.rows_ordinal = 0;
         self.last_file = file;
         self.last_pos = pos;
-        self.last_gtid = gtid;
+        self.last_gtid = match gtid {
+            Some(g) => Some(GtidSet::parse(&g).ok_or_else(|| {
+                SourceError::Checkpoint {
+                    details: format!("unparseable resume GTID set {g:?}")
+                        .into(),
+                }
+            })?),
+            None => None,
+        };
         Ok(())
     }
 
@@ -2448,15 +2557,16 @@ impl RunCtx {
     /// are evaluated at the current position.
     pub(crate) fn mark_transaction_boundary(&mut self) {
         self.rows_ordinal = 0;
+        let gtid = self.gtid_text();
         self.txn_eval = crate::durable_checkpoint::mysql_checkpoint_position(
             &self.last_file,
             self.last_pos,
-            self.last_gtid.as_deref(),
+            gtid.as_deref(),
         );
         self.txn_eval_cp = Some(MySqlCheckpoint {
             file: self.last_file.clone(),
             pos: self.last_pos,
-            gtid_set: self.last_gtid.clone(),
+            gtid_set: gtid,
             lineage: None,
             snapshot_completed: None,
             snapshot_chain: None,
@@ -2575,10 +2685,11 @@ async fn initialize_sink_checkpoints(ctx: &RunCtx) -> SourceResult<()> {
 /// the same position re-derives it).
 async fn record_stream_start(ctx: &RunCtx) -> SourceResult<()> {
     use mysql_activation::{BarrierScope, EventIdentity, record_barrier};
+    let gtid = ctx.gtid_text();
     let position = crate::durable_checkpoint::mysql_checkpoint_position(
         &ctx.last_file,
         ctx.last_pos,
-        ctx.last_gtid.as_deref(),
+        gtid.as_deref(),
     )
     .ok_or_else(|| SourceError::Checkpoint {
         details: format!(
@@ -3178,7 +3289,12 @@ async fn run_failover_reconciliation(
     // The stream resumes from the proven set: keep it (a later reconnect
     // must not lose the previous server's part of it). File/position
     // coordinates of the previous server mean nothing here.
-    ctx.last_gtid = Some(resume_set.clone());
+    ctx.last_gtid = Some(GtidSet::parse(resume_set).ok_or_else(|| {
+        SourceError::Checkpoint {
+            details: format!("unparseable failover resume set {resume_set:?}")
+                .into(),
+        }
+    })?);
     ctx.current_gtid = None;
     ctx.message_ordinal = 0;
     ctx.query_ordinal = 0;
@@ -3361,7 +3477,9 @@ mod compare_checkpoints_tests {
     }
 
     fn gcp(file: &str, pos: u64, gtid: &str) -> Vec<u8> {
-        format!(r#"{{"file":"{file}","pos":{pos},"gtid_set":"{gtid}"}}"#)
+        format!(
+            r#"{{"file":"{file}","pos":{pos},"gtid_set":"{gtid}","gtid_format":2}}"#
+        )
             .into_bytes()
     }
 
@@ -3391,6 +3509,50 @@ mod compare_checkpoints_tests {
             ),
             CheckpointOrder::Incomparable
         );
+    }
+
+    /// A GTID checkpoint stored before exact GTID sets is refused: its set
+    /// may claim transactions the server had not executed.
+    #[test]
+    fn a_gtid_checkpoint_without_the_exact_format_is_refused() {
+        let u = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+        let old =
+            format!(r#"{{"file":"bin.000001","pos":4,"gtid_set":"{u}:1-13"}}"#);
+        let err = super::classify_mysql_checkpoint(old.as_bytes()).unwrap_err();
+        assert!(err.contains("written before exact GTID sets"), "{err}");
+        assert!(err.contains("under a new source id"), "{err}");
+        let other = format!(
+            r#"{{"file":"bin.000001","pos":4,"gtid_set":"{u}:1-13","gtid_format":1}}"#
+        );
+        assert!(super::classify_mysql_checkpoint(other.as_bytes()).is_err());
+        // Never ordered either: the runner refuses an incomparable fold.
+        assert_eq!(
+            compare_mysql_checkpoints(
+                old.as_bytes(),
+                &gcp("bin.000001", 4, &format!("{u}:1-13"))
+            ),
+            CheckpointOrder::Incomparable
+        );
+        // A file/position checkpoint carries no GTID set and is unaffected.
+        assert!(matches!(
+            super::classify_mysql_checkpoint(&cp("bin.000001", 4)),
+            Ok(super::MyResumePosition::Stream(_))
+        ));
+        // What this version writes carries the format and reads back.
+        let new = super::MySqlCheckpoint {
+            file: "bin.000001".into(),
+            pos: 4,
+            gtid_set: Some(format!("{u}:1-8:13")),
+            lineage: None,
+            snapshot_completed: None,
+            snapshot_chain: None,
+        };
+        let raw = serde_json::to_vec(&new).unwrap();
+        assert!(String::from_utf8_lossy(&raw).contains(r#""gtid_format":2"#));
+        assert!(matches!(
+            super::classify_mysql_checkpoint(&raw),
+            Ok(super::MyResumePosition::Stream(c)) if c == new
+        ));
     }
 
     /// GTID checkpoints are ordered by set inclusion; the file/pos they also

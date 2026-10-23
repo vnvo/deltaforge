@@ -59,7 +59,9 @@ use crate::failover::reconciler::{
 
 pub(crate) const ANCHOR_NS: &str = "schemas.v1.failover.anchor";
 pub(crate) const MARKER_NS: &str = "schemas.v1.failover.drift";
-const FORMAT_VERSION: u32 = 2;
+/// Version 3: anchors and markers hold exact GTID sets
+/// (`super::GTID_FORMAT`); earlier ones may over-claim and are refused.
+const FORMAT_VERSION: u32 = 3;
 
 /// A failover into the current lineage (written once per transition).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

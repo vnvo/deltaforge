@@ -122,7 +122,7 @@ pub(crate) async fn establish(
     let r0_cp = MySqlCheckpoint {
         file: ctx.last_file.clone(),
         pos: ctx.last_pos,
-        gtid_set: ctx.last_gtid.clone(),
+        gtid_set: ctx.gtid_text(),
         lineage: Some(lineage.clone()),
         snapshot_completed: None,
         snapshot_chain: None,
