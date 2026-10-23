@@ -67,6 +67,11 @@ pub(crate) struct ScanLimits {
     pub max_events: u64,
     pub max_bytes: u64,
     pub max_duration: Duration,
+    /// The longest wait from opening the stream to its first transaction.
+    /// A GTID-positioned stream (no anchor) seeks server-side through the
+    /// file's earlier events; past this bound the scan fails closed with
+    /// `SeekLimit` instead of paying an unbounded seek.
+    pub max_seek: Duration,
 }
 
 impl Default for ScanLimits {
@@ -75,8 +80,29 @@ impl Default for ScanLimits {
             max_events: 50_000_000,
             max_bytes: 64 * 1024 * 1024 * 1024,
             max_duration: Duration::from_secs(600),
+            max_seek: Duration::from_secs(10),
         }
     }
+}
+
+/// A physical start for a GTID-mode scan (`docs/design/mysql-proof-seek.md`,
+/// "Positioned GTID scanning"): in `file` of the server `server_uuid`
+/// (lineage `lineage`), the transaction starting at `offset` is the first
+/// one not in `set_before`, and `next_gtid` is its GTID when known.
+///
+/// An anchor is only ever taken from a binlog stream at a transaction
+/// boundary, never from a status read, and lives in memory only. It is a
+/// hint: the scan validates the events the server sends from it, and GTID
+/// accounting (`B ⊆ A ∪ seen`) still decides the proof, so a wrong anchor
+/// costs a refused scan, never an incomplete proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Anchor {
+    pub server_uuid: String,
+    pub lineage: String,
+    pub file: String,
+    pub offset: u64,
+    pub set_before: GtidSet,
+    pub next_gtid: Option<String>,
 }
 
 /// One classified statement found in the interval.
@@ -96,6 +122,16 @@ pub(crate) struct ScanReport {
     pub duration: Duration,
     pub digest: String,
     pub trace: ScanTrace,
+    /// GTID mode, once the end was reached: the boundary after the last
+    /// transaction of `to`, observed at the terminal event (a record
+    /// frontier, to extend the interval from).
+    pub frontier: Option<Anchor>,
+    /// GTID mode: the first transaction the stream sent, observed at its
+    /// GTID event, with the start set (a session anchor).
+    pub session_anchor: Option<Anchor>,
+    /// Whether the stream started at an anchor, and where its first GTID
+    /// was validated.
+    pub positioned_at: Option<(String, u64)>,
 }
 
 /// Which proof a scan or capture serves (bounded: a metric label).
@@ -220,6 +256,16 @@ pub(crate) enum ProofError {
     Unstable(u32),
     #[error("schema capture failed: {0}")]
     Capture(String),
+    /// The stream opened at an anchor did not start as the anchor claims:
+    /// refused before any statement counted (the caller may fall back).
+    #[error("the anchored start was refused: {0}")]
+    AnchorMismatch(String),
+    /// A GTID-positioned stream did not reach its first transaction within
+    /// `max_seek`: the server's seek through the file's earlier events.
+    #[error(
+        "the binlog seek exceeded its bound ({0}); the interval is unproven"
+    )]
+    SeekLimit(String),
 }
 
 fn add_gtid(set: &mut GtidSet, gtid: &str) -> Result<(), ProofError> {
@@ -318,6 +364,212 @@ fn harmless_unparsed(event_type: u8) -> bool {
         | 37 // VIEW_CHANGE
         | 39 // PARTIAL_UPDATE_ROWS
     )
+}
+
+/// STOP_EVENT: the server stopped writing this file (a restart follows).
+const STOP_EVENT: u8 = 3;
+/// INCIDENT_EVENT.
+const INCIDENT_EVENT: u8 = 26;
+
+/// Where a stream opened at an anchor stands, before its first GTID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Chain {
+    /// Nothing yet: the server's artificial Rotate must name the anchor.
+    Opening,
+    /// At the anchor: the first real event must start at its offset.
+    AtAnchor,
+    /// A Stop at the anchor offset: only the file's Rotate may follow.
+    Stopped,
+    /// Rotated to the next file: its setup events, then its first GTID.
+    Rotated,
+    /// The first GTID was validated, at this file and offset.
+    Passed { file: String, offset: u64 },
+}
+
+/// The validation of a stream opened at an [`Anchor`]
+/// (`docs/design/mysql-proof-seek.md`, "Validation after opening a stream at
+/// an anchor"). Fed every event before the first GTID. It accepts only:
+/// - the server's artificial Rotate naming the anchor;
+/// - its Format_description;
+/// - then, starting exactly at the anchor offset, either the GTID event,
+///   or the file's own Rotate (after an optional Stop) to the next file in
+///   sequence, followed by that file's setup events and first GTID (or,
+///   for a file with no transactions, its own Stop and Rotate onward).
+///
+/// The first GTID must not be in the anchor's `set_before`, and must be
+/// `next_gtid` when that is known. Anything transactional before it is
+/// refused. It changes nothing: the walk still sees every event.
+#[derive(Debug)]
+pub(crate) struct AnchorCheck {
+    anchor: Anchor,
+    /// The file the next positioned event belongs to.
+    file: String,
+    state: Chain,
+}
+
+impl AnchorCheck {
+    pub(crate) fn new(anchor: Anchor) -> Self {
+        Self {
+            file: anchor.file.clone(),
+            anchor,
+            state: Chain::Opening,
+        }
+    }
+
+    /// The file and offset of the first GTID, once validated: the
+    /// effective physical start.
+    pub(crate) fn passed(&self) -> Option<(&str, u64)> {
+        match &self.state {
+            Chain::Passed { file, offset } => Some((file, *offset)),
+            _ => None,
+        }
+    }
+
+    fn refuse(&self, why: String) -> ProofError {
+        ProofError::AnchorMismatch(format!(
+            "{why} (anchor {}:{}, state {:?})",
+            self.anchor.file, self.anchor.offset, self.state
+        ))
+    }
+
+    /// Validate one event received before the first GTID.
+    pub(crate) fn check(
+        &mut self,
+        header: &EventHeader,
+        data: &EventData,
+    ) -> Result<(), ProofError> {
+        if self.passed().is_some() {
+            return Ok(());
+        }
+        let artificial = header.next_event_position == 0;
+        let start = u64::from(header.next_event_position)
+            .saturating_sub(u64::from(header.event_length));
+        let at_anchor =
+            |c: &Self| c.file == c.anchor.file && start == c.anchor.offset;
+        match (data, &self.state) {
+            (EventData::HeartBeat, _) => Ok(()),
+            (EventData::Rotate(r), Chain::Opening) if artificial => {
+                if r.binlog_filename == self.anchor.file
+                    && r.binlog_position == self.anchor.offset
+                {
+                    self.state = Chain::AtAnchor;
+                    Ok(())
+                } else {
+                    Err(self.refuse(format!(
+                        "the stream opened at {}:{}",
+                        r.binlog_filename, r.binlog_position
+                    )))
+                }
+            }
+            (_, Chain::Opening) => Err(self.refuse(
+                "the stream did not open with a Rotate to the anchor".into(),
+            )),
+            (
+                EventData::FormatDescription(_),
+                Chain::AtAnchor | Chain::Rotated,
+            ) => Ok(()),
+            (EventData::PreviousGtids(_), Chain::Rotated) => Ok(()),
+            (EventData::NotSupported, Chain::AtAnchor | Chain::Rotated)
+                if header.event_type == STOP_EVENT && !artificial =>
+            {
+                if self.state == Chain::Rotated || at_anchor(self) {
+                    self.state = Chain::Stopped;
+                    Ok(())
+                } else {
+                    Err(self.refuse(format!("a Stop at offset {start}")))
+                }
+            }
+            (
+                EventData::Rotate(r),
+                Chain::AtAnchor | Chain::Stopped | Chain::Rotated,
+            ) if !artificial => {
+                if self.state == Chain::AtAnchor && !at_anchor(self) {
+                    return Err(self.refuse(format!(
+                        "the file's Rotate at offset {start}"
+                    )));
+                }
+                if !is_next_file(&self.file, &r.binlog_filename)
+                    || r.binlog_position != 4
+                {
+                    return Err(self.refuse(format!(
+                        "a Rotate out of sequence, to {}:{}",
+                        r.binlog_filename, r.binlog_position
+                    )));
+                }
+                self.file = r.binlog_filename.clone();
+                self.state = Chain::Rotated;
+                Ok(())
+            }
+            (EventData::Gtid(g), Chain::AtAnchor | Chain::Rotated) => {
+                if self.state == Chain::AtAnchor && !at_anchor(self) {
+                    return Err(self.refuse(format!(
+                        "the first GTID {} starts at offset {start}",
+                        g.gtid
+                    )));
+                }
+                if self.anchor.set_before.contains(&g.gtid) {
+                    return Err(self.refuse(format!(
+                        "the first GTID {} is already in the anchor's set",
+                        g.gtid
+                    )));
+                }
+                if let Some(want) = &self.anchor.next_gtid
+                    && !want.eq_ignore_ascii_case(&g.gtid)
+                {
+                    return Err(self.refuse(format!(
+                        "the first GTID is {}, not {want}",
+                        g.gtid
+                    )));
+                }
+                self.state = Chain::Passed {
+                    file: self.file.clone(),
+                    offset: start,
+                };
+                Ok(())
+            }
+            (EventData::NotSupported, _)
+                if header.event_type == INCIDENT_EVENT =>
+            {
+                Err(ProofError::Incident)
+            }
+            (other, _) => Err(self.refuse(format!(
+                "a {} event before the first GTID",
+                event_kind(header, other)
+            ))),
+        }
+    }
+}
+
+/// `next` is the binlog file after `file`: same base name, index plus one.
+fn is_next_file(file: &str, next: &str) -> bool {
+    use crate::durable_checkpoint::binlog_file_parts;
+    match (binlog_file_parts(file), binlog_file_parts(next)) {
+        (Some((b1, i1)), Some((b2, i2))) => b1 == b2 && i2 == i1 + 1,
+        _ => false,
+    }
+}
+
+/// A short name for an event, for refusals.
+fn event_kind(header: &EventHeader, data: &EventData) -> String {
+    match data {
+        EventData::Query(q) => {
+            format!("query ({})", q.query.chars().take(40).collect::<String>())
+        }
+        EventData::TableMap(_) => "table map".into(),
+        EventData::WriteRows(_)
+        | EventData::UpdateRows(_)
+        | EventData::DeleteRows(_) => "rows".into(),
+        EventData::Xid(_) => "Xid".into(),
+        EventData::TransactionPayload(_) => "transaction payload".into(),
+        EventData::Rotate(_) => "Rotate".into(),
+        EventData::FormatDescription(_) => "Format_description".into(),
+        EventData::PreviousGtids(_) => "Previous_gtids".into(),
+        EventData::Gtid(_) => "GTID".into(),
+        EventData::NotSupported if header.event_type == ANONYMOUS_GTID => {
+            "anonymous GTID".into()
+        }
+        _ => format!("type {}", header.event_type),
+    }
 }
 
 struct Walk {
@@ -478,6 +730,36 @@ pub(crate) async fn scan_interval(
     limits: &ScanLimits,
     tag: &ScanTag<'_>,
 ) -> Result<ScanReport, ProofError> {
+    scan_interval_at(
+        dsn,
+        server_id,
+        server_uuid,
+        lineage_hash,
+        from,
+        to,
+        None,
+        limits,
+        tag,
+    )
+    .await
+}
+
+/// [`scan_interval`], opening a GTID-mode stream at `anchor` when one is
+/// given: an anchor taken at `from` (its set before is exactly `from`'s), of
+/// this server and lineage. Without one, the server seeks from the start of
+/// the file, bounded by `limits.max_seek`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn scan_interval_at(
+    dsn: &str,
+    server_id: u64,
+    server_uuid: &str,
+    lineage_hash: &str,
+    from: &MySqlCheckpoint,
+    to: &MySqlCheckpoint,
+    anchor: Option<&Anchor>,
+    limits: &ScanLimits,
+    tag: &ScanTag<'_>,
+) -> Result<ScanReport, ProofError> {
     let scan_id =
         NEXT_SCAN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let detail = trace_enabled();
@@ -492,6 +774,7 @@ pub(crate) async fn scan_interval(
         lineage_hash,
         from,
         to,
+        anchor,
         limits,
         detail,
         &mut trace,
@@ -574,6 +857,7 @@ async fn scan(
     lineage_hash: &str,
     from: &MySqlCheckpoint,
     to: &MySqlCheckpoint,
+    anchor: Option<&Anchor>,
     limits: &ScanLimits,
     detail: bool,
     trace: &mut ScanTrace,
@@ -601,6 +885,9 @@ async fn scan(
         bytes: 0,
         duration: started.elapsed(),
         trace: ScanTrace::default(),
+        frontier: None,
+        session_anchor: None,
+        positioned_at: None,
     };
     match order_positions(&pf, &pt) {
         CheckpointOrder::Equal => return Ok(empty(Vec::new())),
@@ -646,6 +933,41 @@ async fn scan(
     } else {
         GtidSet::new()
     };
+    // An anchor: the physical start of a GTID-mode stream. Only one taken at
+    // this request's A, of this server and lineage, is used; the stream it
+    // opens is validated before any statement counts (`AnchorCheck`).
+    let mut check = match anchor {
+        None => None,
+        Some(a) => {
+            if !gtid_mode {
+                return Err(ProofError::Positions(
+                    "an anchor for a file/position interval".into(),
+                ));
+            }
+            if !a.server_uuid.eq_ignore_ascii_case(server_uuid)
+                || a.lineage != lineage_hash
+            {
+                return Err(ProofError::OtherServer(format!(
+                    "an anchor of {} (lineage {})",
+                    a.server_uuid, a.lineage
+                )));
+            }
+            if a.set_before != done {
+                return Err(ProofError::Positions(format!(
+                    "an anchor after {} for an interval from {done}",
+                    a.set_before
+                )));
+            }
+            client.gtid_start = Some((
+                a.file.clone(),
+                u32::try_from(a.offset).map_err(|_| {
+                    ProofError::Positions("anchor offset out of range".into())
+                })?,
+            ));
+            Some(AnchorCheck::new(a.clone()))
+        }
+    };
+    let from_set = done.clone();
     // Trace only: the start set (to recognise a transaction decoded before
     // the start) and the source server's transactions in the interval.
     let start_set = (detail && gtid_mode).then(|| done.clone());
@@ -686,6 +1008,8 @@ async fn scan(
     let opened = Instant::now();
     trace.setup = opened - started;
     let mut first_at: Option<Instant> = None;
+    // The first transaction's GTID event: file, start offset and GTID.
+    let mut first_txn: Option<(String, u64, String)> = None;
     // The session's abortive close was armed right after it connected (see
     // `open_replication_session_abortive`): however this scan ends -
     // completion, error, timeout, or the future being cancelled or dropped -
@@ -694,15 +1018,54 @@ async fn scan(
     // thread ends. No connection is ever killed by id (ids can be reused).
     let walked: Result<(u64, u64), ProofError> = async {
         let (mut events, mut bytes) = (0u64, 0u64);
+        // The position of the last heartbeat at or past the end position:
+        // two in a row there, with the end not reached, is the live end.
+        let mut beat_at_end: Option<u64> = None;
         while !walk.reached {
-            let left = limits
+            let mut left = limits
                 .max_duration
                 .checked_sub(started.elapsed())
                 .ok_or_else(|| ProofError::Limit("time".into()))?;
-            let (header, data) = tokio::time::timeout(left, stream.read())
+            // In GTID mode, until the first transaction, the wait is also
+            // bounded by the seek bound (the server's seek through the
+            // file's earlier events, for a stream without an anchor).
+            let seeking = gtid_mode && first_txn.is_none();
+            if seeking {
+                let seek_left =
+                    limits.max_seek.checked_sub(opened.elapsed()).ok_or_else(
+                        || seek_limit(limits.max_seek),
+                    )?;
+                left = left.min(seek_left);
+            }
+            let (header, data) = match tokio::time::timeout(left, stream.read())
                 .await
-                .map_err(|_| ProofError::Limit("time".into()))?
-                .map_err(|e| ProofError::Read(e.to_string()))?;
+            {
+                Ok(r) => r.map_err(|e| ProofError::Read(e.to_string()))?,
+                Err(_) if seeking && opened.elapsed() >= limits.max_seek => {
+                    return Err(seek_limit(limits.max_seek));
+                }
+                Err(_) => return Err(ProofError::Limit("time".into())),
+            };
+            if let Some(c) = check.as_mut() {
+                c.check(&header, &data)?;
+            }
+            if gtid_mode && matches!(data, EventData::HeartBeat) {
+                let here = u64::from(header.next_event_position);
+                if at_or_past(&walk.file, here, to) {
+                    if beat_at_end == Some(here) {
+                        return Err(ProofError::NotReached(format!(
+                            "the stream is at its live end ({}:{here}) without \
+                             the end position",
+                            walk.file
+                        )));
+                    }
+                    beat_at_end = Some(here);
+                } else {
+                    beat_at_end = None;
+                }
+            } else if !matches!(data, EventData::HeartBeat) {
+                beat_at_end = None;
+            }
             if !matches!(data, EventData::HeartBeat) {
                 events += 1;
                 bytes += u64::from(header.event_length);
@@ -732,6 +1095,16 @@ async fn scan(
                 );
             }
             walk.event(&header, &data)?;
+            if let EventData::Gtid(g) = &data
+                && first_txn.is_none()
+            {
+                first_txn = Some((
+                    walk.file.clone(),
+                    u64::from(header.next_event_position)
+                        .saturating_sub(u64::from(header.event_length)),
+                    g.gtid.clone(),
+                ));
+            }
             if !protocol && trace.first.is_none() {
                 first_at = Some(Instant::now());
                 trace.first = Some(DecodedAt {
@@ -794,6 +1167,25 @@ async fn scan(
     }
     trace.detail = det;
     let (events, bytes) = walked?;
+    let anchor_at =
+        |file: String, offset: u64, set_before: GtidSet, next_gtid| Anchor {
+            server_uuid: server_uuid.to_string(),
+            lineage: lineage_hash.to_string(),
+            file,
+            offset,
+            set_before,
+            next_gtid,
+        };
+    // The boundary after the last transaction of `to` (at reach, `done` is
+    // exactly `to`: a GTID outside it is an overshoot).
+    let frontier = (gtid_mode && walk.reached)
+        .then(|| trace.terminal.clone())
+        .flatten()
+        .map(|t| anchor_at(t.file, t.end_pos, walk.done.clone(), None));
+    let session_anchor =
+        first_txn.filter(|_| gtid_mode).map(|(file, offset, gtid)| {
+            anchor_at(file, offset, from_set.clone(), Some(gtid))
+        });
     Ok(ScanReport {
         digest: scan_digest(&pf, &pt, &walk.statements),
         statements: walk.statements,
@@ -801,7 +1193,26 @@ async fn scan(
         bytes,
         duration: started.elapsed(),
         trace: ScanTrace::default(),
+        frontier,
+        session_anchor,
+        positioned_at: check
+            .as_ref()
+            .and_then(|c| c.passed())
+            .map(|(f, o)| (f.to_string(), o)),
     })
+}
+
+fn seek_limit(bound: Duration) -> ProofError {
+    ProofError::SeekLimit(format!("no transaction within {bound:?} of opening"))
+}
+
+/// Is the stream at `(file, pos)` at or past `to`'s binlog position?
+fn at_or_past(file: &str, pos: u64, to: &MySqlCheckpoint) -> bool {
+    use crate::durable_checkpoint::binlog_file_parts;
+    match (binlog_file_parts(file), binlog_file_parts(&to.file)) {
+        (Some((b, i)), Some((tb, ti))) if b == tb => (i, pos) >= (ti, to.pos),
+        _ => false,
+    }
 }
 
 /// Classify one decoded event (trace target only; never fails).
@@ -1337,6 +1748,323 @@ mod tests {
             event_length: 0,
             next_event_position,
             event_flags: 0,
+        }
+    }
+
+    mod anchor_check {
+        use super::*;
+        use mysql_binlog_connector_rust::event::{
+            checksum_type::ChecksumType,
+            format_description_event::FormatDescriptionEvent,
+            gtid_event::GtidEvent, previous_gtids_event::PreviousGtidsEvent,
+            rotate_event::RotateEvent, xid_event::XidEvent,
+        };
+
+        const F1: &str = "binlog.000007";
+        const F2: &str = "binlog.000008";
+
+        fn anchor(file: &str, offset: u64, next_gtid: Option<u64>) -> Anchor {
+            Anchor {
+                server_uuid: U.into(),
+                lineage: "lin".into(),
+                file: file.into(),
+                offset,
+                set_before: GtidSet::parse(&format!("{U}:1-10")).unwrap(),
+                next_gtid: next_gtid.map(|n| format!("{U}:{n}")),
+            }
+        }
+
+        /// An event of `len` bytes starting at `start` (0, 0: artificial).
+        fn at(event_type: u8, start: u32, len: u32) -> EventHeader {
+            EventHeader {
+                event_length: len,
+                next_event_position: if start == 0 { 0 } else { start + len },
+                ..header(event_type, 0)
+            }
+        }
+
+        fn rotate(file: &str, pos: u64) -> EventData {
+            EventData::Rotate(RotateEvent {
+                binlog_filename: file.into(),
+                binlog_position: pos,
+            })
+        }
+
+        fn fde() -> EventData {
+            EventData::FormatDescription(FormatDescriptionEvent {
+                binlog_version: 4,
+                server_version: "8.4.0".into(),
+                create_timestamp: 0,
+                header_length: 19,
+                checksum_type: ChecksumType::None,
+            })
+        }
+
+        fn gtid(n: u64) -> EventData {
+            EventData::Gtid(GtidEvent {
+                flags: 0,
+                gtid: format!("{U}:{n}"),
+            })
+        }
+
+        /// Feed `events`; the result of the last one, and the check.
+        fn feed(
+            a: Anchor,
+            events: Vec<(EventHeader, EventData)>,
+        ) -> (Result<(), ProofError>, AnchorCheck) {
+            let mut c = AnchorCheck::new(a);
+            let mut last = Ok(());
+            for (h, d) in &events {
+                last = c.check(h, d);
+                if last.is_err() {
+                    break;
+                }
+            }
+            (last, c)
+        }
+
+        /// The server's opening: its artificial Rotate and Format_description.
+        fn opening(file: &str, offset: u64) -> Vec<(EventHeader, EventData)> {
+            vec![
+                (at(4, 0, 40), rotate(file, offset)),
+                (at(15, 0, 120), fde()),
+            ]
+        }
+
+        fn mismatch(r: Result<(), ProofError>) -> String {
+            match r {
+                Err(ProofError::AnchorMismatch(why)) => why,
+                other => panic!("expected AnchorMismatch, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_transaction_start_in_the_same_file_passes() {
+            let mut ev = opening(F1, 5000);
+            ev.push((at(27, 0, 20), EventData::HeartBeat));
+            ev.push((at(33, 5000, 79), gtid(11)));
+            let (r, c) = feed(anchor(F1, 5000, Some(11)), ev);
+            r.unwrap();
+            assert_eq!(c.passed(), Some((F1, 5000)));
+            // Later events are not checked again.
+            let mut c = c;
+            c.check(&at(16, 5200, 31), &EventData::Xid(XidEvent { xid: 1 }))
+                .unwrap();
+        }
+
+        /// A frontier at the end of a file: the file's Rotate starts at the
+        /// anchor offset, then the next file's setup events and its first
+        /// GTID, which becomes the effective coordinate.
+        #[test]
+        fn a_frontier_at_a_files_end_passes_the_rotation_chain() {
+            let chain = |stop: bool| {
+                let mut ev = opening(F1, 9000);
+                let mut rot = 9000;
+                if stop {
+                    ev.push((at(3, 9000, 23), EventData::NotSupported));
+                    rot = 9023;
+                }
+                ev.extend([
+                    (at(4, rot, 44), rotate(F2, 4)),
+                    (at(15, 4, 122), fde()),
+                    (
+                        at(35, 126, 71),
+                        EventData::PreviousGtids(PreviousGtidsEvent {
+                            gtid_set: format!("{U}:1-10"),
+                        }),
+                    ),
+                    (at(27, 0, 20), EventData::HeartBeat),
+                    (at(33, 197, 79), gtid(11)),
+                ]);
+                ev
+            };
+            for stop in [false, true] {
+                let (r, c) = feed(anchor(F1, 9000, None), chain(stop));
+                r.unwrap();
+                assert_eq!(c.passed(), Some((F2, 197)), "stop: {stop}");
+            }
+        }
+
+        #[test]
+        fn files_without_transactions_chain_in_sequence() {
+            let mut ev = opening(F1, 9000);
+            ev.extend([
+                (at(4, 9000, 44), rotate(F2, 4)),
+                (at(15, 4, 122), fde()),
+                (at(4, 126, 44), rotate("binlog.000009", 4)),
+                (at(15, 4, 122), fde()),
+                (at(33, 126, 79), gtid(11)),
+            ]);
+            let (r, c) = feed(anchor(F1, 9000, None), ev);
+            r.unwrap();
+            assert_eq!(c.passed(), Some(("binlog.000009", 126)));
+        }
+
+        #[test]
+        fn an_opening_elsewhere_is_refused() {
+            for (file, pos) in [(F1, 5001), (F2, 5000)] {
+                let (r, _) = feed(anchor(F1, 5000, None), opening(file, pos));
+                assert!(mismatch(r).contains("opened at"));
+            }
+            // A real event before the server's artificial Rotate.
+            let (r, _) = feed(
+                anchor(F1, 5000, None),
+                vec![(at(33, 5000, 79), gtid(11))],
+            );
+            mismatch(r);
+        }
+
+        /// Probe 3: an offset inside a transaction streams its `BEGIN` (or
+        /// its rows) without a GTID. Nothing transactional may come first.
+        #[test]
+        fn a_transactional_event_before_the_first_gtid_is_refused() {
+            use mysql_binlog_connector_rust::event::{
+                table_map_event::TableMapEvent,
+                transaction_payload_event::TransactionPayloadEvent,
+                write_rows_event::WriteRowsEvent,
+            };
+            let firsts: Vec<(u8, EventData)> = vec![
+                (2, query("BEGIN")),
+                (2, query("ALTER TABLE t ADD c INT")),
+                (
+                    19,
+                    EventData::TableMap(TableMapEvent {
+                        table_id: 1,
+                        database_name: "d".into(),
+                        table_name: "t".into(),
+                        column_types: vec![],
+                        column_metas: vec![],
+                        null_bits: vec![],
+                        table_metadata: None,
+                    }),
+                ),
+                (
+                    30,
+                    EventData::WriteRows(WriteRowsEvent {
+                        table_id: 1,
+                        included_columns: vec![],
+                        rows: vec![],
+                    }),
+                ),
+                (16, EventData::Xid(XidEvent { xid: 1 })),
+                (
+                    40,
+                    EventData::TransactionPayload(TransactionPayloadEvent {
+                        uncompressed_size: 0,
+                        uncompressed_events: vec![],
+                    }),
+                ),
+                (ANONYMOUS_GTID, EventData::NotSupported),
+            ];
+            for (t, first) in firsts {
+                // At the anchor offset, and after a valid rotation.
+                let mut same = opening(F1, 5000);
+                same.push((at(t, 5000, 60), first.clone()));
+                let mut rotated = opening(F1, 9000);
+                rotated.extend([
+                    (at(4, 9000, 44), rotate(F2, 4)),
+                    (at(15, 4, 122), fde()),
+                    (at(t, 126, 60), first),
+                ]);
+                for (a, ev) in [
+                    (anchor(F1, 5000, None), same),
+                    (anchor(F1, 9000, None), rotated),
+                ] {
+                    let (r, c) = feed(a, ev);
+                    assert!(
+                        mismatch(r).contains("before the first GTID"),
+                        "event type {t}"
+                    );
+                    assert_eq!(c.passed(), None);
+                }
+            }
+        }
+
+        #[test]
+        fn a_first_event_elsewhere_than_the_anchor_is_refused() {
+            let mut ev = opening(F1, 5000);
+            ev.push((at(33, 5079, 79), gtid(11)));
+            assert!(
+                mismatch(feed(anchor(F1, 5000, None), ev).0)
+                    .contains("starts at")
+            );
+            let mut ev = opening(F1, 5000);
+            ev.push((at(4, 5100, 44), rotate(F2, 4)));
+            assert!(
+                mismatch(feed(anchor(F1, 5000, None), ev).0)
+                    .contains("Rotate at")
+            );
+            let mut ev = opening(F1, 5000);
+            ev.push((at(3, 5100, 23), EventData::NotSupported));
+            assert!(
+                mismatch(feed(anchor(F1, 5000, None), ev).0)
+                    .contains("Stop at")
+            );
+        }
+
+        #[test]
+        fn a_rotation_out_of_sequence_is_refused() {
+            for (file, pos) in [
+                ("binlog.000009", 4),
+                ("binlog.000006", 4),
+                (F1, 4),
+                (F2, 120),
+                ("other.000008", 4),
+            ] {
+                let mut ev = opening(F1, 9000);
+                ev.push((at(4, 9000, 44), rotate(file, pos)));
+                assert!(
+                    mismatch(feed(anchor(F1, 9000, None), ev).0)
+                        .contains("out of sequence"),
+                    "{file}:{pos}"
+                );
+            }
+        }
+
+        #[test]
+        fn setup_events_belong_only_to_a_new_file() {
+            let mut ev = opening(F1, 5000);
+            ev.push((
+                at(35, 5000, 71),
+                EventData::PreviousGtids(PreviousGtidsEvent {
+                    gtid_set: String::new(),
+                }),
+            ));
+            mismatch(feed(anchor(F1, 5000, None), ev).0);
+        }
+
+        #[test]
+        fn the_first_gtid_must_be_new_and_the_expected_one() {
+            let first = |n: u64, next: Option<u64>| {
+                let mut ev = opening(F1, 5000);
+                ev.push((at(33, 5000, 79), gtid(n)));
+                feed(anchor(F1, 5000, next), ev).0
+            };
+            assert!(mismatch(first(10, None)).contains("already in"));
+            assert!(mismatch(first(12, Some(11))).contains("not"));
+            first(12, None).unwrap();
+            first(11, Some(11)).unwrap();
+        }
+
+        #[test]
+        fn an_incident_is_refused_as_an_incident() {
+            let mut ev = opening(F1, 5000);
+            ev.push((at(INCIDENT_EVENT, 5000, 30), EventData::NotSupported));
+            assert!(matches!(
+                feed(anchor(F1, 5000, None), ev).0,
+                Err(ProofError::Incident)
+            ));
+        }
+
+        #[test]
+        fn the_live_end_is_at_or_past_the_end_position() {
+            let to = cp(F2, 500, None);
+            assert!(at_or_past(F2, 500, &to));
+            assert!(at_or_past(F2, 501, &to));
+            assert!(at_or_past("binlog.000009", 4, &to));
+            assert!(!at_or_past(F2, 499, &to));
+            assert!(!at_or_past(F1, 9000, &to));
+            assert!(!at_or_past("other.000009", 4, &to));
         }
     }
 

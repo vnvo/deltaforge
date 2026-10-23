@@ -576,6 +576,9 @@ fn answer(
         bytes,
         duration: started.elapsed(),
         trace: Default::default(),
+        frontier: None,
+        session_anchor: None,
+        positioned_at: None,
     }
 }
 
@@ -729,6 +732,9 @@ mod tests {
                 bytes: 100 * (b - a),
                 duration: Default::default(),
                 trace: Default::default(),
+                frontier: None,
+                session_anchor: None,
+                positioned_at: None,
             })
         }
     }
