@@ -411,3 +411,83 @@ Run on throwaway MySQL 8.4 containers, before any production code:
    one batched schema query: its cost for N = 1, 10, 200, and its behavior
    with a concurrent DDL on one of them (it must wait, or time out
    cleanly).
+
+### Probe results (probes 1-6)
+
+MySQL 8.4 in a throwaway container. The evidence is in
+`docs/design/evidence/mysql-proof-seek/`: the logs, the driver scripts, and
+the probe (`seekprobe.rs`, a copy of the vendored client whose GTID dump also
+sends a file name and offset). Boundary A is taken while the server is quiet.
+The interval (A,B] then holds 7 transactions, the 4th a DDL.
+
+At 964 MiB into a file of 3.35 million single-row transactions:
+
+| Probe | Time to the first transaction | Every GTID of B \ A read | Outcome |
+|---|---|---|---|
+| 1. GTID dump, as today (no file name, offset 4) | 1,252 ms | yes | correct |
+| 1. GTID dump with the file name and A's offset | 2.0 ms | yes | correct, statements identical |
+| 2. File/position dump at A's offset | 1.8 ms | yes | correct |
+| 3. Offset inside an event | refused: "binlog truncated in the middle of event" | - | fails closed |
+| 3. Offset just after the GTID event (inside a transaction) | starts at `BEGIN`, no GTID | no (1 missing) | fails closed: `Framing`, and the accounting |
+| 3. Offset past the file's end | refused | - | fails closed |
+| 4. Anchor after the DDL transaction | 1.4 ms, starts at a later GTID | **no (4 missing, the DDL among them)** | the server accepts it silently; only `B ⊆ A ∪ seen` refuses it |
+| 5. Anchor in an older file, across a rotation | 1.8 ms | yes | correct |
+| 5. Anchor in a purged file | refused: "Could not find first log file name" | - | fails closed |
+
+Findings:
+
+- **The protocol supports positioned GTID scanning.**
+  `COM_BINLOG_DUMP_GTID` honors a file name and offset together with the
+  GTID set. The server starts at the offset and still skips in-set
+  transactions. The vendored client never sends them. This one change
+  removes the prefix cost: 1,252 ms becomes 2.0 ms at 964 MiB.
+- **The server validates framing, not history.** It refuses an offset
+  inside an event, past the end, or in a purged file. It accepts any event
+  boundary, including one inside a transaction or after A.
+- **A late anchor is silent at the server.** The client's GTID accounting
+  is the only check that refuses it, which is why the design makes it the
+  authority. The boundary check (the first event must be the expected GTID
+  event at the anchor offset) refuses the inside-transaction case before
+  any statement counts.
+
+### Finding: an over-claimed GTID set loses rows across a restart
+
+This is probe 6. It is a correctness defect of its own, independent of the
+seek, and confirmed end to end with the DeltaForge runner of main
+(`cd716061`), an HTTP sink and SQLite state
+(`evidence/mysql-proof-seek/gtid-gap-restart.log`):
+
+1. The server has executed `u:1-8`. Row 1 is delivered.
+2. Row 2 is committed with an explicit `gtid_next = u:13`, so the server's
+   set is `u:1-8:13`. Row 2 is delivered. **DeltaForge's stored checkpoint
+   is `u:1-13`.**
+3. DeltaForge stops. Rows 3 to 6 are committed. Automatic GTIDs take the
+   lowest free numbers, `u:9-12`.
+4. DeltaForge restarts and resumes from `u:1-13`. The server skips 9-12 as
+   already executed. **Rows 3 to 6 are never delivered.** No error,
+   incident or gap is reported.
+5. Row 7 (`u:14`) is delivered, and the checkpoint moves on.
+
+The cause is `merge_gtid` (`mysql_event.rs:694-733`). It keeps only the
+start of the first interval of the transaction's UUID and its new number,
+so any gap in the executed set collapses.
+
+**When this happens in production:**
+
+- Explicit `gtid_next` is the reproducible trigger here.
+- Executed sets with gaps that fill later also arise under MySQL Group
+  Replication and InnoDB Cluster. Each member assigns GTIDs from its own
+  block (`group_replication_gtid_assignment_block_size`, default 1,000,000).
+  This is from MySQL's documented behavior, not probed here.
+- A source with such gaps can lose rows across any restart or reconnect.
+  The same over-claim also breaks precondition P1 of this design: a proof
+  can treat a later transaction as "before A" and skip its DDL.
+
+**Fix direction:** keep exact GTID sets.
+
+- Insert each transaction's GTID into a parsed interval set (the scanner
+  already has exact set arithmetic, `parse_gtid_set`).
+- Persist the exact set.
+- Never extend an interval over numbers not seen.
+- Regression: the steps above must deliver rows 3 to 6. It also needs a
+  proof test where a DDL fills a gap after A.
