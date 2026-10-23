@@ -1,11 +1,10 @@
 # MySQL proof scans: the seek from the start of the binary log file
 
 Status: open, release-blocking. It blocks dense active-set scaling, T1a and
-rc.1. Design revision 2 (positioned scanning final for review; coalescing
-being finalized): no production code until the safe-anchor and coalescing
-designs are approved. Protocol probes are part of
+rc.1. Design revision 2, final for review (positioned scanning and
+coalescing): no production code until both are approved. Protocol probes are part of
 validating it (section "Probes").
-Base: main `2613e9b1`.
+Base: main `cae39fa1` (exact GTID sets, #170).
 
 ## Defect
 
@@ -361,68 +360,133 @@ There is never a silent scan of an arbitrarily large file prefix:
   the same boundary is positioned. The cost is paid at most once per
   snapshot, failover or refused anchor, never per table.
 
-### Coalescing: from serial proofs to bounded batches
+### Bounded request coalescing, revision 2 (final for review)
 
-Two layers are needed, because proofs never overlap today.
+Revision 2 replaces revision 1's coalescing section, using probe 7.
 
-**Layer 1: an activation window in the source.** When the stream meets a
-row of an unproven table, it does not prove that table at once:
+**Why two layers.** The source is one task: it reads an event, advances
+its position, then dispatches it (`mod.rs:1940-1955`). A row of an
+unproven table is proved inside the dispatch, with the stream paused, so
+proofs never overlap. Two hundred "simultaneous" first touches are 200 rows
+arriving close together in one ordered stream. Coalescing them takes:
 
-- It reads ahead, holding raw events in order in a bounded buffer: at most
-  `activation_window_ms` (default 50 ms), a maximum number of events and a
-  byte budget. While reading ahead it collects every other unproven table
-  first touched in the window.
-- It then proves the whole set at once:
-  - **one capture transaction.** It takes the metadata locks of all the
-    tables, reads the position, reads every schema in one batched catalog
-    query, and reads the position again. The per-table capture semantics
-    hold, because each table's lock is held across both reads.
-  - **one scanner request** (A_head, B], where A_head is the boundary
-    before the window's first first-touch.
-- Each table is answered over its own (A_i, B] from that one record: A_i is
-  the boundary before its first transaction. A_i ≥ A_head, so no further
-  scan is needed. Each answer has its own membership and its own digest.
-- Then the buffered events are dispatched in order. Output order does not
-  change: nothing is emitted until its table is proved, as today.
-- If the window's capture or scan fails, no table of the window is marked
-  proved, and the buffered events are dispatched only after a successful
-  retry, or the source fails closed as today.
+- **Layer 1, an activation window:** it turns a burst of first touches into
+  one batch.
+- **Layer 2, a coalescing scanner:** it answers every request of a batch,
+  and any concurrent requests, from one physical extension.
 
-**Layer 2: a coalescing scanner (state machine).** Layer 1 produces bursts.
-The scanner must also handle concurrent requests (snapshot pages, failover
-drift, future parallel sources) without one physical scan per request:
+#### Layer 1: the activation window
 
-- **Pinning.** A request pins its own A and B before it waits (existing
-  pins). Pruning never drops statements a pinned or running request needs.
-- **Rounds.** At most one physical extension is in flight. When it
-  completes, the next round's target is the greatest B of the requests
-  queued *before that round started*. Requests arriving during a round wait
-  for the next. Each request is therefore served within two rounds, so a
-  continuously advancing frontier cannot starve an earlier request.
-- **Shared work.** One extension serves every waiter of its round. A
-  cancelled waiter unpins itself only. The round continues while any other
-  waiter needs it, and is abandoned (its connection reset) only when none
+**Entry.** Before advancing the position of a rows event, the loop checks
+whether its table is unproven. The check is a cache lookup, the same one
+`select_for_rows` makes. If it is unproven, the loop opens a window instead
+of dispatching:
+
+1. **Read ahead.** The window reads further events from the stream into an
+   in-memory lookahead queue, without advancing the position or
+   dispatching. `read_next_event` serves that queue first afterwards. For
+   each buffered event it tracks:
+   - table-map events, for the tables' names (without touching the
+     dispatcher's `table_map`);
+   - transaction boundaries, keeping a running exact GTID set: A_head,
+     plus each completed buffered transaction's GTID, inserted exactly;
+   - rows events of unproven tables not yet in the batch. Each joins the
+     batch with its own boundary A_i, the running set before its
+     transaction.
+2. **Close.** The window closes at the first of these:
+   - `activation_window_ms` of reading (default 50 ms);
+   - `activation_window_events` buffered (default 10,000);
+   - `activation_window_bytes` buffered (default 16 MiB);
+   - a statement that can change a schema (any query event other than
+     transaction control); the window closes before it;
+   - a heartbeat (the stream is idle, so nothing more is coming).
+3. **Batched capture.** One read-only transaction locks every batch
+   table's metadata in sorted `(schema, table)` order (probe 7: any other
+   order can deadlock against multi-table DDL). It then reads the position,
+   all the batch's schemas in one loader query (`WHERE (TABLE_SCHEMA,
+   TABLE_NAME) IN (...)`), and the position again. Each table's lock is
+   held across both reads, so a table's capture is exactly today's capture.
+   The B for every table of the window is the second read.
+4. **One scanner request.** Interval (A_head, B]. Every table i is answered
+   over its own (A_i, B] from the extended record (layer 2), with its own
+   membership and digest. Since A_head ≤ A_i, nothing more is scanned.
+5. **Dispatch.** Each table is admitted or refused exactly as today, from
+   its own answer (`covers`, the relevant-DDL retry and the full fallback
+   are unchanged). Then the head event and the queue are dispatched in
+   order. Output order and checkpoints are untouched: nothing is emitted
+   until its table is decided, as today, and the position advances only as
+   events are dispatched.
+
+**Failures.**
+
+| Failure | Handling |
+|---|---|
+| The batched capture's lock wait times out (1205: a DDL in progress on one table) | The batch is retried once, then split back into today's per-table captures for that window. Bounded, and correct, since the per-table path is the existing one. |
+| Deadlock (1213) | Retried once in sorted order, then per-table, as above. |
+| The scanner request fails | Handled per table, as today's single requests are. No table of the window is marked proved by a failed request. |
+| The stream is lost during read-ahead | The queue is discarded. The position was never advanced past the head event, so the existing reconnect resumes from the last boundary (`abandon_open_transaction`). |
+| Cancellation (stop) | The queue is discarded, and the checkpoint is the last dispatched boundary. |
+
+**Memory.** The queue is bounded by `activation_window_bytes` and
+`activation_window_events`, apart from the channel. A window holds raw
+events only, no decoded rows.
+
+#### Layer 2: the coalescing scanner (state machine)
+
+The existing scanner keeps its record `Covered { lo, hi, statements }`,
+its pins and its identity check. Revision 2 adds or changes:
+
+- **Pinning before waiting.** A request registers a pin on its A (and the
+  window pins A_head) before it waits for the scanner (existing). Pruning
+  never drops a statement at or after the lowest pin, queued or running.
+- **Rounds, at most one physical extension in flight.** When a round
+  starts, its target is the greatest B among the requests queued before
+  it started. Its left target is the least A among them, when that A is
+  before the record's `lo`. Requests arriving during a round wait for the
+  next one.
+  - Each request is served within two rounds, so a continuously advancing
+    frontier cannot starve an earlier request.
+  - A batch from layer 1 is one request with many answers, so its B is
+    fixed.
+- **A round's physical scans:** at most two, one left and one right
+  extension, each positioned:
+  - the right one at the record's frontier anchor;
+  - the left one at the requesting boundary's stream anchor.
+- **Staging; no partial commit.** A round builds its extensions into a
+  staging record. The shared record, its frontier anchor and its bounds
+  change only when every extension of the round has reached its target.
+  A failed or cancelled extension leaves them exactly as they were. Today
+  the left extension mutates the record before the right one runs
+  (`mysql_proof_scanner.rs:275-280`); that changes.
+- **Shared work and cancellation.** The physical scan of a round runs on
+  the scanner's own task, not on a waiter's. A waiter that is cancelled
+  unpins itself and leaves. The round continues while any waiter needs it,
+  and is aborted (its connection reset, nothing committed) only when none
   does.
-- **No partial commit.** An extension is built into a staging record and
-  committed to the shared record only when it completes. Today's left
-  extension mutates the record before the right one runs
-  (`mysql_proof_scanner.rs:275-280`); that is changed. A failed or
-  cancelled round leaves the record exactly as it was.
-- **Answers.** Each request is answered from the committed record over its
-  own (A,B], with its own digest (as `answer` does today).
-- **Bound.** Per round, at most two physical scans: one left extension and
-  one right extension.
+- **Answers.** Every request, and every table of a batch, is answered from
+  the committed record over its own (A, B] (`answer`, as today). Each gets
+  its own membership and its own digest, statement- and digest-identical
+  to a direct scan.
+- **Bounds.** The record's size bounds (`RecordLimits`) are checked on the
+  staging record before it is committed. Exceeding them fails the round
+  for all its waiters and clears nothing that was committed before.
 
-**Bounds for a burst.** A simultaneous burst of N first touches inside one
-activation window costs:
+#### The upper bound for an activation burst
 
-- one capture transaction;
-- at most two physical scans, or one when the record already reaches A.
-
-Across a burst longer than a window, the number of windows (and so of
-scans) is at most ceil(burst duration / window). The design target is
-explicit: 200 first touches within one window give at most 2 physical scans
-and 1 capture.
+- **Per window:**
+  - one batched capture transaction (at most three attempts, then today's
+    per-table captures);
+  - one scanner request;
+  - at most two physical scans, or one when the record already reaches
+    A_head.
+- **Per burst:** the number of windows is at most
+  `ceil(burst duration / activation_window_ms)`, and at most
+  `ceil(buffered events / activation_window_events)`.
+- **The design target:** 200 first touches inside one window cost one
+  capture transaction and at most two physical scans (one, normally).
+  The study's case (200 first touches within the first ~100 ms at 2,000
+  changes/s) spans two or three windows: 2-3 captures and at most 6
+  physical scans, against 200 of each today.
 
 ### Acceptance targets
 
@@ -437,6 +501,10 @@ The review's targets, each with a measured check:
 | Identity unchanged | Positioned, GTID-positioned and shared answers statement- and digest-identical over the regression matrix |
 | Existing regressions green | Reconnect, failover drift, rotation, purge, cancellation, scan limits, dual coordinate, shared-vs-direct, proof matrix |
 | Mutants caught | Disabling the positioned start, or the activation window, fails the performance regression |
+| A late or wrong anchor never proves | A boundary after A with a DDL in between: `AnchorMismatch` or `NotReached` within seconds (not the 600 s limit), then the bounded alternative; never a proof that omits the DDL |
+| No partial scanner state | Cancellation, a refused anchor and a failed extension (left, right, or both in one round) each leave the record, its frontier and the anchor cache unchanged; the next request equals a direct scan |
+| The batched capture is safe | Locks in sorted order (a reverse-order mutant deadlocks against a two-table `RENAME`); a lock timeout falls back to per-table captures; a DDL on a locked table waits for the commit |
+| Bounded per window | Trace counts: per window, at most 3 capture attempts and 2 physical scans; at most one unanchored scan per snapshot, failover or refused anchor |
 
 ### Probes
 
