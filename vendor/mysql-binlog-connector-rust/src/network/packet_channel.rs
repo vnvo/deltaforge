@@ -16,9 +16,22 @@ use crate::binlog_error::BinlogError;
 
 const MAX_PACKET_LENGTH: usize = 16777215;
 
+/// DeltaForge patch: the size of one read from the socket.
+const READ_CHUNK: usize = 64 * 1024;
+
 pub struct PacketChannel {
     stream: TcpStream,
     timeout_secs: u64,
+    /// DeltaForge patch: bytes read from the socket and not yet returned as
+    /// a packet. They live here, not in a read's future, so a read that is
+    /// cancelled (dropped before it completes) loses nothing: the next read
+    /// continues the same packet. See [`Self::read`].
+    pending: Vec<u8>,
+    /// DeltaForge patch: where the next packet starts in `pending` (the
+    /// bytes before it were returned; compacted now and then).
+    head: usize,
+    /// DeltaForge patch: the buffer one socket read fills.
+    scratch: Vec<u8>,
 }
 
 pub struct KeepAliveConfig {
@@ -53,6 +66,9 @@ impl PacketChannel {
         Ok(Self {
             stream,
             timeout_secs,
+            pending: Vec::new(),
+            head: 0,
+            scratch: vec![0u8; READ_CHUNK],
         })
     }
 
@@ -179,105 +195,182 @@ impl PacketChannel {
         Ok(())
     }
 
-    async fn read_packet_info(&mut self) -> Result<(usize, u8), BinlogError> {
-        let mut buf = vec![0u8; 4];
-        match timeout(
-            Duration::from_secs(self.timeout_secs),
-            self.stream.read_exact(&mut buf),
-        )
-        .await
-        {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => return Err(BinlogError::from(e)),
-            Err(_) => {
-                return Err(BinlogError::UnexpectedData(format!(
-                    "Read binlog header timeout after {}s while waiting for packet header",
-                    self.timeout_secs
-                )));
+    /// DeltaForge patch: a complete packet at `head` in `pending`: its
+    /// payload (chunks of a large packet joined), its first sequence number,
+    /// and how many bytes it takes; `None` until all of it was read.
+    fn complete_packet(&self) -> Result<Option<(Vec<u8>, u8, usize)>, BinlogError> {
+        let mut at = self.head;
+        let mut sequence = None;
+        let mut parts = Vec::new();
+        loop {
+            if self.pending.len() < at + 4 {
+                return Ok(None);
+            }
+            let mut rdr = Cursor::new(&self.pending[at..at + 4]);
+            let length = rdr.read_u24::<LittleEndian>()? as usize;
+            let seq = rdr.read_u8()?;
+            sequence.get_or_insert(seq);
+            if self.pending.len() < at + 4 + length {
+                return Ok(None);
+            }
+            parts.push(at + 4..at + 4 + length);
+            at += 4 + length;
+            if length != MAX_PACKET_LENGTH {
+                break;
             }
         }
-        let mut rdr = Cursor::new(buf);
-        let length = rdr.read_u24::<LittleEndian>()? as usize;
-        let sequence = rdr.read_u8()?;
-        Ok((length, sequence))
+        let mut buf = Vec::with_capacity(parts.iter().map(|r| r.len()).sum());
+        for r in parts {
+            buf.extend_from_slice(&self.pending[r]);
+        }
+        if buf.len() >= MAX_PACKET_LENGTH {
+            trace!("Received big binlog data, full length: {}", buf.len());
+        }
+        Ok(Some((buf, sequence.unwrap_or(0), at - self.head)))
     }
 
+    /// DeltaForge patch: cancel-safe. A packet is taken from `pending` only
+    /// once it is complete; each socket read appends what it read before
+    /// its future completes. Dropping this future at any await point
+    /// therefore leaves every byte read so far in `pending`, and the next
+    /// call returns the same packet. Each socket read is bounded by
+    /// `timeout_secs`, as before.
     pub async fn read_with_sequece(&mut self) -> Result<(Vec<u8>, u8), BinlogError> {
-        let (length, sequence) = self.read_packet_info().await?;
-        let buf = if length == MAX_PACKET_LENGTH {
-            let mut all_buf = self.read_exact(length).await?;
-            loop {
-                let (chunk_length, _) = self.read_packet_info().await?;
-                let mut chunk_buf = self.read_exact(chunk_length).await?;
-                all_buf.append(&mut chunk_buf);
-                if chunk_length != MAX_PACKET_LENGTH {
-                    break;
+        let wait_data_millis = 10;
+        let max_zero_reads = self.timeout_secs * 1000 / wait_data_millis;
+        let mut zero_reads = 0;
+        loop {
+            if let Some((buf, sequence, used)) = self.complete_packet()? {
+                self.head += used;
+                if self.head == self.pending.len() {
+                    self.pending.clear();
+                    self.head = 0;
+                } else if self.head >= READ_CHUNK {
+                    self.pending.drain(..self.head);
+                    self.head = 0;
+                }
+                return Ok((buf, sequence));
+            }
+            match timeout(
+                Duration::from_secs(self.timeout_secs),
+                self.stream.read(&mut self.scratch),
+            )
+            .await
+            {
+                Ok(Ok(0)) => {
+                    zero_reads += 1;
+                    if zero_reads >= max_zero_reads {
+                        return Err(BinlogError::UnexpectedData(format!(
+                            "Too many zero-length reads. Read so far: {}",
+                            self.pending.len() - self.head
+                        )));
+                    }
+                    warn!(
+                        "Stream reading binlog returns zero-length data, read so far: {}",
+                        self.pending.len() - self.head
+                    );
+                    async_std::task::sleep(Duration::from_millis(wait_data_millis)).await;
+                }
+                Ok(Ok(n)) => {
+                    zero_reads = 0;
+                    self.pending.extend_from_slice(&self.scratch[..n]);
+                    trace!(
+                        "Stream reading binlog data, buffered: {}",
+                        self.pending.len()
+                    );
+                }
+                Ok(Err(e)) => return Err(BinlogError::from(e)),
+                Err(_) => {
+                    return Err(BinlogError::UnexpectedData(format!(
+                        "Read binlog timeout after {}s, buffered: {}",
+                        self.timeout_secs,
+                        self.pending.len() - self.head
+                    )));
                 }
             }
-            trace!("Received big binlog data, full length: {}", all_buf.len());
-            all_buf
-        } else {
-            self.read_exact(length).await?
-        };
-        Ok((buf, sequence))
+        }
     }
 
     pub async fn read(&mut self) -> Result<Vec<u8>, BinlogError> {
         let (buf, _sequence) = Self::read_with_sequece(self).await?;
         Ok(buf)
     }
+}
 
-    async fn read_exact(&mut self, length: usize) -> Result<Vec<u8>, BinlogError> {
-        let mut buf = vec![0u8; length];
-        // keep reading data until the complete packet is received
-        // MySQL protocol packets may require multiple reads for complete reception
-        let wait_data_millis = 10;
-        let max_zero_reads = self.timeout_secs * 1000 / wait_data_millis;
-        let mut read_count = 0;
-        let mut zero_reads = 0;
+/// DeltaForge patch: reads are cancel-safe.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_std::net::TcpListener;
 
-        while read_count < length {
-            match timeout(
-                Duration::from_secs(self.timeout_secs),
-                self.stream.read(&mut buf[read_count..]),
-            )
-            .await
-            {
-                Ok(Ok(n)) => {
-                    if n == 0 {
-                        zero_reads += 1;
-                        if zero_reads >= max_zero_reads {
-                            return Err(BinlogError::UnexpectedData(format!(
-                                "Too many zero-length reads. Expected data length: {}, read so far: {}",
-                                length, read_count
-                            )));
-                        }
-                        warn!(
-                            "Stream reading binlog returns zero-length data, Expected data length: {}, read so far: {}",
-                            length, read_count
-                        );
-                        async_std::task::sleep(Duration::from_millis(wait_data_millis)).await;
-                        continue;
-                    }
-                    zero_reads = 0;
-                    read_count += n;
-                    trace!(
-                        "Stream reading binlog data, Expected data length: {}, read so far: {}",
-                        length,
-                        read_count
-                    );
-                }
-                Ok(Err(e)) => {
-                    return Err(BinlogError::from(e));
-                }
-                Err(_) => {
-                    return Err(BinlogError::UnexpectedData(format!(
-                        "Read binlog timeout, expect data length: {}, read so far: {}",
-                        length, read_count
-                    )));
-                }
+    fn packet(payload: &[u8], sequence: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.write_u24::<LittleEndian>(payload.len() as u32).unwrap();
+        out.push(sequence);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// A channel to a local peer that writes `parts`, pausing between them.
+    async fn peer(parts: Vec<Vec<u8>>) -> PacketChannel {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        async_std::task::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            for p in parts {
+                s.write_all(&p).await.unwrap();
+                s.flush().await.unwrap();
+                async_std::task::sleep(Duration::from_millis(100)).await;
             }
-        }
-        Ok(buf)
+            async_std::task::sleep(Duration::from_secs(5)).await;
+        });
+        PacketChannel::new("127.0.0.1", &port.to_string(), 5, &None)
+            .await
+            .unwrap()
+    }
+
+    /// A read cancelled after part of a packet arrived loses nothing: the
+    /// next read returns that packet whole, then the next one.
+    #[test]
+    fn a_cancelled_read_keeps_the_partial_packet() {
+        async_std::task::block_on(async {
+            let one = packet(b"the first packet", 1);
+            let two = packet(b"second", 2);
+            let (head, tail) = one.split_at(7);
+            let mut ch = peer(vec![head.to_vec(), [tail, &two[..]].concat()]).await;
+            // Cancelled while the packet is incomplete.
+            let r = timeout(Duration::from_millis(50), ch.read()).await;
+            assert!(r.is_err(), "the packet is not complete yet");
+            assert_eq!(
+                ch.read_with_sequece().await.unwrap(),
+                (b"the first packet".to_vec(), 1)
+            );
+            assert_eq!(
+                ch.read_with_sequece().await.unwrap(),
+                (b"second".to_vec(), 2)
+            );
+        });
+    }
+
+    /// A packet of the maximum length continues in the next chunk; they are
+    /// joined, also when the chunks arrive in pieces.
+    #[test]
+    fn large_packets_are_joined_across_chunks() {
+        async_std::task::block_on(async {
+            let big: Vec<u8> = (0..MAX_PACKET_LENGTH).map(|i| i as u8).collect();
+            let mut wire = packet(&big, 3);
+            wire.extend(packet(b"tail", 4));
+            wire.extend(packet(b"next", 5));
+            let (a, b) = wire.split_at(MAX_PACKET_LENGTH / 2);
+            let mut ch = peer(vec![a.to_vec(), b.to_vec()]).await;
+            let r = timeout(Duration::from_millis(50), ch.read()).await;
+            assert!(r.is_err());
+            let (buf, seq) = ch.read_with_sequece().await.unwrap();
+            assert_eq!(seq, 3);
+            assert_eq!(buf.len(), MAX_PACKET_LENGTH + 4);
+            assert_eq!(&buf[..MAX_PACKET_LENGTH], &big[..]);
+            assert_eq!(&buf[MAX_PACKET_LENGTH..], b"tail");
+            assert_eq!(ch.read().await.unwrap(), b"next".to_vec());
+        });
     }
 }

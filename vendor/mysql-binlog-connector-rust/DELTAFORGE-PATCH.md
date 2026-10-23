@@ -95,3 +95,20 @@ sends before trusting the dump (`docs/design/mysql-proof-seek.md`). Changed
 files: `src/binlog_client.rs`, `src/command/command_util.rs` and
 `src/command/dump_binlog_gtid_command.rs`, with two unit tests of the
 packet encoding.
+
+## Cancel-safe packet reads
+
+`PacketChannel::read` (and `read_with_sequece`) keep the bytes read from the
+socket in the channel, not in the read's future, and take a packet out only
+once all of it (all chunks of a large packet) has arrived. Each socket read
+appends what it read before its future completes. A read dropped at any
+await point (a `select!` or a timeout around it) therefore loses nothing:
+the next read returns the same packet. The vendored code read the header
+and the body into local buffers with `read_exact`, so a cancelled read
+dropped part of a packet and the next read misframed the stream. Socket
+reads are still bounded by `timeout_secs` each, and zero-length reads are
+still counted the same way. DeltaForge's binlog loop needs this to bound
+an activation window by time (`docs/design/mysql-proof-seek.md`) and
+already raced reads against credential-rotation activity. File:
+`src/network/packet_channel.rs`, with two unit tests (a read cancelled
+inside a packet, and a large packet in chunks).
