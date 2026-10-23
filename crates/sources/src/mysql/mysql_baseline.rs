@@ -425,7 +425,7 @@ pub(crate) async fn establish_at(
         &lineage,
         &e_cp,
         &s_cp,
-        None,
+        ctx.stream_anchor(&server_uuid, &lineage).as_ref(),
         Some(&e_cp),
         &tag,
     )

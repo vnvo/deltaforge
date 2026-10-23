@@ -675,6 +675,19 @@ async fn handle_gtid(
             "binlog framing error: malformed GTID {gtid_str:?}"
         )));
     }
+    // The stream anchor: this GTID event's start is the first transaction
+    // after the executed set (every earlier one was received, or skipped by
+    // the server as in its start set).
+    ctx.txn_anchor = ctx.last_gtid.as_ref().map(|set_before| {
+        super::mysql_binlog_scan::Anchor {
+            server_uuid: String::new(),
+            lineage: String::new(),
+            file: ctx.last_file.clone(),
+            offset: ctx.last_event_start,
+            set_before: set_before.clone(),
+            next_gtid: Some(gtid_str.clone()),
+        }
+    });
     ctx.current_gtid = Some(gtid_str.clone());
     ctx.in_explicit_txn = false;
     // New transaction boundary: reset the DDL message ordinal and the
@@ -1524,6 +1537,8 @@ mod tests {
             lower_case_table_names: 0,
             txn_eval: None,
             txn_eval_cp: None,
+            txn_anchor: None,
+            last_event_start: 0,
             proof_scanner: Default::default(),
             selection: Default::default(),
             failover: None,
@@ -3247,6 +3262,52 @@ mod tests {
         // At a boundary nothing is abandoned.
         ctx.abandon_open_transaction().await.unwrap();
         assert!(rx.try_recv().is_err());
+    }
+
+    /// GTID mode: a transaction's GTID event is its stream anchor - its
+    /// start offset, the executed set before it and its GTID - and only
+    /// while it is open; file/position mode has none.
+    #[tokio::test]
+    async fn a_gtid_event_is_the_open_transactions_stream_anchor() {
+        let (tx, _rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        ctx.current_gtid = None;
+        ctx.in_explicit_txn = false;
+        let before =
+            GtidSet::parse("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-4").unwrap();
+        ctx.last_gtid = Some(before.clone());
+        ctx.last_file = "binlog.000003".into();
+        ctx.last_event_start = 1200;
+        let gtid = "3e11fa47-71ca-11e1-9e33-c80aa9429562:5";
+        handle_gtid(
+            &mut ctx,
+            GtidEvent {
+                flags: 0,
+                gtid: gtid.into(),
+            },
+        )
+        .await
+        .unwrap();
+        let a = ctx.stream_anchor("u", "l").expect("an anchor");
+        assert_eq!((a.server_uuid.as_str(), a.lineage.as_str()), ("u", "l"));
+        assert_eq!((a.file.as_str(), a.offset), ("binlog.000003", 1200));
+        assert_eq!(a.set_before, before);
+        assert_eq!(a.next_gtid.as_deref(), Some(gtid));
+        ctx.mark_transaction_boundary();
+        assert!(ctx.stream_anchor("u", "l").is_none());
+
+        ctx.current_gtid = None;
+        ctx.last_gtid = None;
+        handle_gtid(
+            &mut ctx,
+            GtidEvent {
+                flags: 0,
+                gtid: gtid.into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(ctx.stream_anchor("u", "l").is_none());
     }
 
     #[tokio::test]

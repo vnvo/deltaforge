@@ -315,6 +315,15 @@ pub(crate) struct RunCtx {
     /// The same position as binlog coordinates (lineage left unset): where a
     /// lazy baseline's scan starts.
     txn_eval_cp: Option<MySqlCheckpoint>,
+    /// GTID mode: the physical start of the current transaction (its GTID
+    /// event), the first transaction after `txn_eval_cp`, observed on this
+    /// stream (a stream anchor, `docs/design/mysql-proof-seek.md`). Its
+    /// identity is the run's verified lineage, filled in when it is used;
+    /// it lives only while its transaction is open.
+    txn_anchor: Option<mysql_binlog_scan::Anchor>,
+    /// Where the last positioned event started (`next_event_position -
+    /// event_length`).
+    last_event_start: u64,
     /// The source's shared proof scanner (`mysql_proof_scanner`).
     proof_scanner: mysql_proof_scanner::ProofScanner,
     /// Validated activation timelines and row-time selections.
@@ -1734,6 +1743,8 @@ impl MySqlSource {
             lower_case_table_names,
             txn_eval: None,
             txn_eval_cp: None,
+            txn_anchor: None,
+            last_event_start: 0,
             proof_scanner,
             selection: mysql_selection::Caches::new(&self.pipeline, &self.id),
             failover: None,
@@ -2536,6 +2547,7 @@ impl RunCtx {
                 .map_err(|e| SourceError::Other(e.into()))?;
         }
         self.in_explicit_txn = false;
+        self.txn_anchor = None;
         self.message_ordinal = 0;
         self.query_ordinal = 0;
         self.rows_ordinal = 0;
@@ -2557,6 +2569,7 @@ impl RunCtx {
     /// are evaluated at the current position.
     pub(crate) fn mark_transaction_boundary(&mut self) {
         self.rows_ordinal = 0;
+        self.txn_anchor = None;
         let gtid = self.gtid_text();
         self.txn_eval = crate::durable_checkpoint::mysql_checkpoint_position(
             &self.last_file,
@@ -2571,6 +2584,20 @@ impl RunCtx {
             snapshot_completed: None,
             snapshot_chain: None,
         });
+    }
+
+    /// The stream anchor at `txn_eval_cp`, of the verified identity
+    /// `server_uuid` and `lineage`: the open transaction's GTID event.
+    pub(crate) fn stream_anchor(
+        &self,
+        server_uuid: &str,
+        lineage: &str,
+    ) -> Option<mysql_binlog_scan::Anchor> {
+        self.txn_anchor.as_ref().map(|a| mysql_binlog_scan::Anchor {
+            server_uuid: server_uuid.to_string(),
+            lineage: lineage.to_string(),
+            ..a.clone()
+        })
     }
 
     /// The verified `server_uuid` (the published registry lineage) that every
@@ -2726,6 +2753,8 @@ fn advance_position(
 ) {
     if header.next_event_position != 0 {
         ctx.last_pos = u64::from(header.next_event_position);
+        ctx.last_event_start =
+            ctx.last_pos.saturating_sub(u64::from(header.event_length));
     }
 }
 
