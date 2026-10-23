@@ -503,6 +503,58 @@ Findings:
   event at the anchor offset) refuses the inside-transaction case before
   any statement counts.
 
+### Probe results (probes 7 and 8)
+
+MySQL 8.4 in throwaway containers; evidence in
+`evidence/mysql-proof-seek/batched-capture-probe7.log` and
+`frontier-probe8.log`, with the scripts.
+
+**Probe 7, batched capture.** One transaction takes N tables' metadata locks
+(`SELECT 1 FROM t LIMIT 0`), then the position, then one schema query for
+the N tables (the loader's own query, which already takes a list of
+tables), then the position again. Compared with N captures of one table
+each, each on its own connection as today. Times are wall clock, including
+about 85 ms of `docker exec` per run:
+
+| N | N single captures | One batched capture |
+|---|---|---|
+| 1 | 88-101 ms | 88-89 ms |
+| 10 | 91-118 ms | 83-102 ms |
+| 200 | 576-661 ms | 106-138 ms |
+
+The batch's schema query returned every column of the 200 tables (800
+rows). Under concurrency:
+
+- **A DDL on a table the batch has locked waits** until the batch commits
+  (2.1 s, against 2 s held). The capture semantics hold: no DDL lands
+  between a table's lock and the second position read.
+- **A table locked by another session**, with `lock_wait_timeout = 1`: the
+  batch fails with 1205 and holds no lock afterwards
+  (`performance_schema.metadata_locks` is empty for it).
+- **Lock order matters.** Against a two-table `RENAME TABLE t010 TO ..., t011
+  TO ...`, a batch locking t010 then t011 (sorted) never deadlocks. One
+  locking t011 then t010 deadlocks, and MySQL aborts the batch with 1213.
+  A batched capture must therefore lock in sorted `(schema, table)` order,
+  the order MySQL takes metadata locks for multi-table statements, and
+  treat 1213 as retryable.
+
+**Probe 8, revision 2's assumptions.**
+
+- **(a) Compressed transactions.** A positioned start at a compressed
+  transaction's offset gives Rotate, Format_description, then the
+  transaction's GTID event at exactly the offset, followed by the payload.
+  The GTID event is outside the payload, so the boundary check applies
+  unchanged.
+- **(b) Record frontier.** Opened at B's end offset with set B, the stream
+  sends heartbeats until the next transaction is committed. Then the first
+  event is that transaction's GTID event (`:9`, not in B), starting
+  exactly at the frontier offset. The frontier check (the first GTID must
+  not be in `set_before`) holds.
+- **(c) The live end.** With nothing new, the server sends only heartbeats,
+  each carrying the current end position. A heartbeat at the stream's own
+  position, with B not reached, is the live end. Fail-fast uses exactly
+  this.
+
 ### Finding: an over-claimed GTID set loses rows across a restart
 
 This is probe 6. It is a correctness defect of its own, independent of the
