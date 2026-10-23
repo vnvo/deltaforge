@@ -413,6 +413,7 @@ mod tests {
                 table_options: Default::default(),
                 rotation: None,
                 snapshot_cohort: Default::default(),
+                proofs: Default::default(),
                 type_mapping: deltaforge_core::TypeMapping::V2,
             };
             let (tx, rx) = mpsc::channel(4096);

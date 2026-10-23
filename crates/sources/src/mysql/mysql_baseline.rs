@@ -28,6 +28,7 @@ use super::mysql_activation::{
     self, Kind, Record, Selection, Stored, baseline_capture_id, select,
     table_stream,
 };
+use super::mysql_activation_window::PreparedOutcome;
 use super::mysql_binlog_scan::{
     CLASSIFIER_VERSION, ProofError, ProofKind, ScanReport, ScanTag, Statement,
     capture, covers, observe_capture, trace_proof,
@@ -381,28 +382,39 @@ pub(crate) async fn establish_at(
             return Ok(false);
         }
     };
-    let cap = match capture(
-        ctx.dsn.expose(),
-        &server_uuid,
-        &lineage,
-        db,
-        table,
-        None,
-    )
-    .await
-    {
-        Ok(cap) => {
-            observe_capture(&tag, &cap);
-            cap
-        }
-        Err(ProofError::OtherServer(found)) => {
-            return Err(other_server(&server_uuid, &found));
-        }
-        Err(err) => {
-            warn!(source_id = %ctx.source_id, %db, %table, error = ?err, "no lazy baseline: no capture");
+    // An activation window may have prepared this table's capture and its
+    // answer over (E, S] (`mysql_activation_window`): used in place of a
+    // capture and a scan of its own, and decided exactly the same way.
+    let (cap, prepared) = match ctx.take_prepared(db, table, &e) {
+        Some(PreparedOutcome::Proven { cap, report }) => (*cap, Some(*report)),
+        Some(PreparedOutcome::NoCapture) => {
+            warn!(source_id = %ctx.source_id, %db, %table, "no lazy baseline: the table did not exist at the window's capture");
             trace_proof(&tag, db, table, None, None, lctn, "no_capture");
             return Ok(false);
         }
+        None => match capture(
+            ctx.dsn.expose(),
+            &server_uuid,
+            &lineage,
+            db,
+            table,
+            None,
+        )
+        .await
+        {
+            Ok(cap) => {
+                observe_capture(&tag, &cap);
+                (cap, None)
+            }
+            Err(ProofError::OtherServer(found)) => {
+                return Err(other_server(&server_uuid, &found));
+            }
+            Err(err) => {
+                warn!(source_id = %ctx.source_id, %db, %table, error = ?err, "no lazy baseline: no capture");
+                trace_proof(&tag, db, table, None, None, lctn, "no_capture");
+                return Ok(false);
+            }
+        },
     };
     let s_cp = cap.position.clone();
     let Some(s) = mysql_checkpoint_position(
@@ -417,20 +429,25 @@ pub(crate) async fn establish_at(
         trace_proof(&tag, db, table, Some(&cap), None, lctn, "not_covered");
         return Ok(false);
     }
-    let report = match super::mysql_proof_scanner::shared_interval(
-        &ctx.proof_scanner,
-        ctx.dsn.expose(),
-        &source_id,
-        &server_uuid,
-        &lineage,
-        &e_cp,
-        &s_cp,
-        ctx.stream_anchor(&server_uuid, &lineage).as_ref(),
-        Some(&e_cp),
-        &tag,
-    )
-    .await
-    {
+    let scanned = match prepared {
+        Some(report) => Ok(report),
+        None => {
+            super::mysql_proof_scanner::shared_interval(
+                &ctx.proof_scanner,
+                ctx.dsn.expose(),
+                &source_id,
+                &server_uuid,
+                &lineage,
+                &e_cp,
+                &s_cp,
+                ctx.stream_anchor(&server_uuid, &lineage).as_ref(),
+                Some(&e_cp),
+                &tag,
+            )
+            .await
+        }
+    };
+    let report = match scanned {
         Ok(report) => report,
         Err(ProofError::OtherServer(found)) => {
             return Err(other_server(&server_uuid, &found));
@@ -772,6 +789,7 @@ mod tests {
                 table_options: Default::default(),
                 rotation: None,
                 snapshot_cohort: Default::default(),
+                proofs: Default::default(),
                 type_mapping: deltaforge_core::TypeMapping::V2,
             };
             // One required sink; its barriers commit through the runner's

@@ -219,6 +219,7 @@ mod tests {
                             deltaforge_config::OnSchemaDrift::Adapt,
                         rotation: None,
                         type_mapping: Default::default(),
+                        proofs: Default::default(),
                     }),
                     processors: vec![],
                     sinks: vec![SinkCfg::Redis(RedisSinkCfg {

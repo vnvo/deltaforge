@@ -30,6 +30,7 @@ mod mysql_errors;
 pub use mysql_errors::{LoopControl, MySqlSourceError, MySqlSourceResult};
 
 mod mysql_activation;
+mod mysql_activation_window;
 mod mysql_baseline;
 mod mysql_binlog_scan;
 mod mysql_checkpoint_lineage;
@@ -246,6 +247,8 @@ pub struct MySqlSource {
     /// The commit policy and sink cohort a snapshot generation freezes, set
     /// by the runner before the source runs.
     pub snapshot_cohort: crate::SnapshotCohortSlot,
+    /// Schema-proof bounds: the activation window and the binlog seek.
+    pub proofs: deltaforge_config::MysqlProofCfg,
 }
 
 pub(crate) const HEARTBEAT_INTERVAL_SECS: u64 = 15;
@@ -324,6 +327,17 @@ pub(crate) struct RunCtx {
     /// Where the last positioned event started (`next_event_position -
     /// event_length`).
     last_event_start: u64,
+    /// Events an activation window read ahead, dispatched before the
+    /// stream is read again (`mysql_activation_window`).
+    lookahead: std::collections::VecDeque<(
+        mysql_binlog_connector_rust::event::event_header::EventHeader,
+        mysql_binlog_connector_rust::event::event_data::EventData,
+    )>,
+    /// Proofs an activation window prepared, by table, consumed by the lazy
+    /// baseline of the table's rows.
+    prepared: HashMap<(String, String), mysql_activation_window::Prepared>,
+    /// Schema-proof bounds.
+    proofs: deltaforge_config::MysqlProofCfg,
     /// The source's shared proof scanner (`mysql_proof_scanner`).
     proof_scanner: mysql_proof_scanner::ProofScanner,
     /// Validated activation timelines and row-time selections.
@@ -1517,7 +1531,11 @@ impl MySqlSource {
         // The generation this start ran, if any.
         // One proof scanner for the whole run: the snapshot's drift checks
         // and baselines, then the stream's proofs.
-        let proof_scanner = mysql_proof_scanner::ProofScanner::default();
+        let proof_scanner = mysql_proof_scanner::ProofScanner::default()
+            .with_scan_limits(mysql_binlog_scan::ScanLimits {
+                max_seek: Duration::from_millis(self.proofs.max_seek_ms),
+                ..Default::default()
+            });
         let mut generation_run: Option<MyGenerationRun> = None;
         // The anchor a snapshot of this start, or the completed generation,
         // leaves the stream at.
@@ -1745,6 +1763,9 @@ impl MySqlSource {
             txn_eval_cp: None,
             txn_anchor: None,
             last_event_start: 0,
+            lookahead: Default::default(),
+            prepared: Default::default(),
+            proofs: self.proofs.clone(),
             proof_scanner,
             selection: mysql_selection::Caches::new(&self.pipeline, &self.id),
             failover: None,
@@ -1889,7 +1910,13 @@ impl MySqlSource {
                 // (between transactions, with an established GTID position).
                 if let Some(rt) = rotation.as_mut() {
                     rt.drive_preflight(&ctx);
-                    if ctx.current_gtid.is_none() && ctx.last_gtid.is_some() {
+                    // Never while a window's read-ahead is queued: a new
+                    // stream would resume before those events and send
+                    // them again.
+                    if ctx.current_gtid.is_none()
+                        && ctx.last_gtid.is_some()
+                        && ctx.lookahead.is_empty()
+                    {
                         // A CloseUncertain/FailedClosed outcome returns an error from
                         // this block (gate 6); `loop_result?` re-propagates it before the
                         // teardown checkpoint put, so the checkpoint never advances.
@@ -1943,27 +1970,52 @@ impl MySqlSource {
                     continue;
                 }
 
+                // An activation window's read-ahead, in order, before the
+                // stream is read again.
+                if let Some((header, data)) = ctx.lookahead.pop_front() {
+                    advance_position(&mut ctx, &header);
+                    dispatch_event(&mut ctx, &header, data).await?;
+                    if ctx.lookahead.is_empty() {
+                        ctx.prepared.clear();
+                    }
+                    continue;
+                }
+
                 debug!(source_id=%ctx.source_id, "reading the next event ..");
                 // Idle-source wakeup: race the read against rotation activity so a
                 // rotation applies even when no binlog events are flowing.
                 let control: Result<(), LoopControl> = match rotation.as_mut() {
                     Some(rt) => tokio::select! {
                         r = read_next_event(&mut stream, &ctx) => match r {
-                            Ok((header, data)) => {
+                            Ok((header, data)) => match mysql_activation_window::maybe_window(
+                                &mut ctx, &mut stream, &header, &data,
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    advance_position(&mut ctx, &header);
+                                    dispatch_event(&mut ctx, &header, data).await?;
+                                    Ok(())
+                                }
+                                Err(ctrl) => Err(ctrl),
+                            },
+                            Err(ctrl) => Err(ctrl),
+                        },
+                        _ = rt.wait_activity() => continue,
+                    },
+                    None => match read_next_event(&mut stream, &ctx).await {
+                        Ok((header, data)) => match mysql_activation_window::maybe_window(
+                            &mut ctx, &mut stream, &header, &data,
+                        )
+                        .await
+                        {
+                            Ok(_) => {
                                 advance_position(&mut ctx, &header);
                                 dispatch_event(&mut ctx, &header, data).await?;
                                 Ok(())
                             }
                             Err(ctrl) => Err(ctrl),
                         },
-                        _ = rt.wait_activity() => continue,
-                    },
-                    None => match read_next_event(&mut stream, &ctx).await {
-                        Ok((header, data)) => {
-                            advance_position(&mut ctx, &header);
-                            dispatch_event(&mut ctx, &header, data).await?;
-                            Ok(())
-                        }
                         Err(ctrl) => Err(ctrl),
                     },
                 };
@@ -2524,6 +2576,10 @@ impl RunCtx {
     pub(crate) async fn abandon_open_transaction(
         &mut self,
     ) -> SourceResult<()> {
+        // What a window read ahead is past the position a resume starts
+        // from: never dispatched.
+        self.lookahead.clear();
+        self.prepared.clear();
         if !self.transaction_open() {
             return Ok(());
         }

@@ -488,6 +488,7 @@ fn source(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }
@@ -1621,6 +1622,7 @@ async fn rotation_connections_prove_the_server() {
             apply_timeout_ms: 30_000,
         }),
         type_mapping: Default::default(),
+        proofs: Default::default(),
     };
     let resolver: Arc<dyn SecretResolver> =
         Arc::new(FileResolver::new(FilePolicy {

@@ -45,6 +45,7 @@ parallel   sinks/lib-s3-server-it           -p sinks --lib -- --include-ignored 
 parallel   sources/failover_e2e             -p sources --test failover_e2e
 parallel   sources/pg_failover_topology_e2e -p sources --test pg_failover_topology_e2e
 parallel   sources/mysql_activation_e2e     -p sources --test mysql_activation_e2e
+parallel   sources/mysql_activation_window_e2e -p sources --test mysql_activation_window_e2e
 parallel   sources/mysql_cdc_e2e            -p sources --test mysql_cdc_e2e
 parallel   sources/mysql_checkpoint_lineage_e2e -p sources --test mysql_checkpoint_lineage_e2e
 parallel   sources/mysql_connection_identity_e2e -p sources --test mysql_connection_identity_e2e

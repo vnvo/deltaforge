@@ -90,6 +90,65 @@ pub(crate) fn source_decode_failed(
     )
 }
 
+/// An activation window's batched capture could not lock its tables'
+/// metadata within its attempts (`docs/design/mysql-proof-seek.md`,
+/// "Capture contention fails closed"). Nothing of the window was
+/// dispatched; the checkpoint stays at `at`, the boundary before it. A
+/// restart (the normal recovery policy) retries once the schema change
+/// holding the lock is done.
+pub(crate) fn mysql_capture_contention(
+    source_id: &str,
+    tables: &[(String, String)],
+    attempts: u32,
+    code: u16,
+    at: &crate::mysql::MySqlCheckpoint,
+    details: &str,
+) -> SourceError {
+    let first = tables
+        .first()
+        .map(|(d, t)| format!("{d}.{t}"))
+        .unwrap_or_default();
+    let class = match code {
+        1213 => "deadlock",
+        _ => "lock_wait_timeout",
+    };
+    let position = match &at.gtid_set {
+        Some(g) => g.clone(),
+        None => format!("{}:{}", at.file, at.pos),
+    };
+    let draft = IncidentDraft::new(
+        ReasonCode::MysqlCaptureContention,
+        Component::Source {
+            id: source_id.to_string(),
+        },
+        Retryability::AutoRetry,
+        SafetyState::HaltedSafe,
+        CauseCode::SourceSchema,
+    )
+    .discriminate("boundary", &position)
+    .with_evidence(|e| {
+        e.text(K::SourceId, source_id)
+            .text(K::Table, &first)
+            .count(K::BlockingCount, tables.len() as u64)
+            .count(K::Attempts, u64::from(attempts))
+            .text(K::ReasonClass, class)
+            .text(K::CheckpointPosition, &position);
+    })
+    .with_actions(&[ActionCode::InspectLogs]);
+    SourceError::incident(
+        draft,
+        SourceError::Schema {
+            details: format!(
+                "activation window: the metadata of {} table(s) (first {first}) \
+                 could not be locked for their schema capture after {attempts} \
+                 attempt(s): {details}",
+                tables.len()
+            )
+            .into(),
+        },
+    )
+}
+
 /// A replication message over the source's configured limit. The stream is
 /// abandoned without a reconnect: a reconnect with the same limit would meet
 /// the same message again. Evidence is the sizes and the source only, never

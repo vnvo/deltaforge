@@ -127,6 +127,7 @@ async fn start(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let (tx, mut rx) = test_common::acked_channel(&src, &store, &src.id, 128);

@@ -37,6 +37,7 @@
 // this allow is removed there.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use mysql_async::prelude::Queryable;
@@ -1419,7 +1420,7 @@ async fn read_position(
 
 /// Bound on waiting for the table's metadata lock (a DDL in progress on the
 /// table): a capture that cannot lock fails, never reads unlocked.
-const LOCK_WAIT_SECS: u32 = 30;
+pub(crate) const LOCK_WAIT_SECS: u32 = 30;
 
 fn quoted(db: &str, table: &str) -> String {
     let q = |s: &str| format!("`{}`", s.replace('`', "``"));
@@ -1518,6 +1519,179 @@ pub(crate) async fn capture(
             position,
             schema,
             attempts: 1,
+            trace: CaptureTrace::default(),
+        })
+    }
+    .await;
+    pool.disconnect().await.ok();
+    result.map(|mut c| {
+        c.trace = trace;
+        c
+    })
+}
+
+/// The shapes of a window's tables read between two server positions in one
+/// transaction (`docs/design/mysql-proof-seek.md`, "Batched capture"): every
+/// table's metadata lock is taken first, in sorted `(schema, table)` order,
+/// and held across both position reads, so each table's shape is exactly
+/// what [`capture`] would read over `[from, position]`.
+#[derive(Debug, Clone)]
+pub(crate) struct BatchCaptured {
+    pub from: MySqlCheckpoint,
+    pub position: MySqlCheckpoint,
+    pub schemas: HashMap<(String, String), MySqlTableSchema>,
+    /// Tables that do not exist (dropped since their rows): no shape.
+    pub missing: Vec<(String, String)>,
+    pub trace: CaptureTrace,
+}
+
+impl BatchCaptured {
+    /// One table's capture, as [`capture`] returns it.
+    pub(crate) fn table(&self, db: &str, table: &str) -> Option<Captured> {
+        let schema = self.schemas.get(&(db.to_string(), table.to_string()))?;
+        Some(Captured {
+            from: self.from.clone(),
+            position: self.position.clone(),
+            schema: schema.clone(),
+            attempts: 1,
+            trace: self.trace.clone(),
+        })
+    }
+}
+
+/// Why a batched capture failed: a lock it could not take (a timeout or a
+/// deadlock: retried in the same sorted order) or anything else.
+#[derive(Debug)]
+pub(crate) enum BatchCaptureError {
+    Contention { code: u16, why: String },
+    Failed(ProofError),
+}
+
+const ER_LOCK_WAIT_TIMEOUT: u16 = 1205;
+const ER_LOCK_DEADLOCK: u16 = 1213;
+const ER_NO_SUCH_TABLE: u16 = 1146;
+
+fn server_code(e: &mysql_async::Error) -> Option<u16> {
+    match e {
+        mysql_async::Error::Server(s) => Some(s.code),
+        _ => None,
+    }
+}
+
+/// One batched capture attempt (see [`BatchCaptured`]); `lock_wait_secs`
+/// bounds each table's lock wait.
+pub(crate) async fn capture_batch(
+    dsn: &str,
+    server_uuid: &str,
+    lineage_hash: &str,
+    tables: &[(String, String)],
+    lock_wait_secs: u32,
+) -> Result<BatchCaptured, BatchCaptureError> {
+    let failed = |e: ProofError| BatchCaptureError::Failed(e);
+    let mut sorted: Vec<(String, String)> = tables.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    let pool = mysql_async::Pool::new(dsn);
+    let mut trace = CaptureTrace::default();
+    let t0 = Instant::now();
+    let result = async {
+        let mut conn = pool
+            .get_conn()
+            .await
+            .map_err(|e| failed(ProofError::Capture(e.to_string())))?;
+        let mode: Option<String> = conn
+            .query_first("SELECT @@GLOBAL.gtid_mode")
+            .await
+            .map_err(|e| failed(ProofError::Capture(e.to_string())))?;
+        let gtid_mode = mode.is_some_and(|m| m.eq_ignore_ascii_case("ON"));
+        // Identity first: nothing is locked or read on another server.
+        let live: Option<String> = conn
+            .query_first("SELECT @@GLOBAL.server_uuid")
+            .await
+            .map_err(|e| failed(ProofError::Capture(e.to_string())))?;
+        if !live
+            .as_deref()
+            .is_some_and(|l| server_uuid.eq_ignore_ascii_case(l.trim()))
+        {
+            return Err(failed(ProofError::OtherServer(format!("{live:?}"))));
+        }
+        for q in [
+            format!("SET SESSION lock_wait_timeout = {lock_wait_secs}"),
+            "START TRANSACTION READ ONLY".to_string(),
+        ] {
+            conn.query_drop(&q)
+                .await
+                .map_err(|e| failed(ProofError::Capture(format!("{q}: {e}"))))?;
+        }
+        trace.connect = t0.elapsed();
+        // Every table's metadata lock, in sorted order (any other order can
+        // deadlock against a multi-table DDL), held until COMMIT.
+        let t = Instant::now();
+        let mut present = Vec::with_capacity(sorted.len());
+        let mut missing = Vec::new();
+        for (db, table) in &sorted {
+            let lock = format!("SELECT 1 FROM {} LIMIT 0", quoted(db, table));
+            match conn.query_drop(&lock).await {
+                Ok(()) => present.push((db.as_str(), table.as_str())),
+                Err(e) if server_code(&e) == Some(ER_NO_SUCH_TABLE) => {
+                    missing.push((db.clone(), table.clone()))
+                }
+                Err(e) => {
+                    return Err(match server_code(&e) {
+                        Some(
+                            code @ (ER_LOCK_WAIT_TIMEOUT | ER_LOCK_DEADLOCK),
+                        ) => BatchCaptureError::Contention {
+                            code,
+                            why: format!("{lock}: {e}"),
+                        },
+                        _ => failed(ProofError::Capture(format!("{lock}: {e}"))),
+                    });
+                }
+            }
+        }
+        trace.lock_wait = t.elapsed();
+        let t = Instant::now();
+        let from = read_position(&mut conn, gtid_mode, lineage_hash)
+            .await
+            .map_err(failed)?;
+        trace.positions = t.elapsed();
+        let t = Instant::now();
+        let schemas = super::mysql_schema_loader::fetch_table_schemas_on(
+            &mut conn, &present,
+        )
+        .await
+        .map_err(|e| failed(ProofError::Capture(e.to_string())))?;
+        trace.schema = t.elapsed();
+        for (db, table) in &present {
+            if !schemas.contains_key(&(db.to_string(), table.to_string())) {
+                missing.push((db.to_string(), table.to_string()));
+            }
+        }
+        let t = Instant::now();
+        let position = read_position(&mut conn, gtid_mode, lineage_hash)
+            .await
+            .map_err(failed)?;
+        trace.positions += t.elapsed();
+        match order_positions(
+            &wm(&from).map_err(failed)?,
+            &wm(&position).map_err(failed)?,
+        ) {
+            CheckpointOrder::Before | CheckpointOrder::Equal => {}
+            other => {
+                return Err(failed(ProofError::Positions(format!(
+                    "the server position went backwards during the capture ({other:?})"
+                ))));
+            }
+        }
+        conn.query_drop("COMMIT")
+            .await
+            .map_err(|e| failed(ProofError::Capture(format!("COMMIT: {e}"))))?;
+        conn.disconnect().await.ok();
+        Ok(BatchCaptured {
+            from,
+            position,
+            schemas,
+            missing,
             trace: CaptureTrace::default(),
         })
     }

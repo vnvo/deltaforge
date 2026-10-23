@@ -143,6 +143,7 @@ async fn make_source(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }
@@ -531,6 +532,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let (mut rx, handle) = start_source(src).await?;
@@ -669,6 +671,7 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let (mut rx, handle) = start_source(src).await?;
@@ -2021,6 +2024,7 @@ async fn startup_fails_closed_without_sink_checkpoints() -> Result<()> {
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let ckpt = test_common::unwritable_sink_checkpoints(

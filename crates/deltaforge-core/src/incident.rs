@@ -98,11 +98,15 @@ pub enum ReasonCode {
     /// A PostgreSQL replication message is larger than the source's
     /// configured message limit: the stream stopped before it.
     PgMessageTooLarge,
+    /// A MySQL activation window could not lock its tables' metadata for
+    /// their schema capture (a DDL holds a lock) within its attempts: no
+    /// event of the window was delivered.
+    MysqlCaptureContention,
 }
 
 impl ReasonCode {
     /// Every reason (bounded metric label values).
-    pub const ALL: [ReasonCode; 24] = [
+    pub const ALL: [ReasonCode; 25] = [
         Self::PgDifferentCluster,
         Self::PgContinuityUnproven,
         Self::PgFailoverSlotUnavailable,
@@ -127,6 +131,7 @@ impl ReasonCode {
         Self::SourceDecodeFailed,
         Self::SinkDestinationConflict,
         Self::PgMessageTooLarge,
+        Self::MysqlCaptureContention,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -159,6 +164,7 @@ impl ReasonCode {
             Self::SourceDecodeFailed => "source_decode_failed",
             Self::SinkDestinationConflict => "sink_destination_conflict",
             Self::PgMessageTooLarge => "pg_message_too_large",
+            Self::MysqlCaptureContention => "mysql_capture_contention",
         }
     }
 }
@@ -842,6 +848,17 @@ pub fn explain(
             ev.show(K::GtidSet),
             ev.show(K::ServerUuid),
             ev.show(K::ReasonClass),
+        ),
+        ReasonCode::MysqlCaptureContention => format!(
+            "{component} could not lock the metadata of {} table(s) (first {}) \
+             for their schema capture after {} attempt(s) ({}). It stopped \
+             before the rows that first touched them; the checkpoint stays at \
+             {}. A schema change holding a lock on one of them must finish.",
+            ev.show(K::BlockingCount),
+            ev.show(K::Table),
+            ev.show(K::Attempts),
+            ev.show(K::ReasonClass),
+            ev.show(K::CheckpointPosition),
         ),
         ReasonCode::SchemaDriftBlocked => format!(
             "{component} stopped on a schema change of table {} ({}) under \

@@ -208,6 +208,8 @@ pub(crate) struct ProofScanner {
     pins: Pins,
     next_pin: AtomicU64,
     limits: RecordLimits,
+    /// The bounds of each physical scan on the source's server.
+    scan_limits: ScanLimits,
 }
 
 impl Default for ProofScanner {
@@ -304,7 +306,14 @@ impl ProofScanner {
             pins: Default::default(),
             next_pin: AtomicU64::new(1),
             limits,
+            scan_limits: ScanLimits::default(),
         }
+    }
+
+    /// With each physical scan bounded by `scan_limits`.
+    pub(crate) fn with_scan_limits(mut self, scan_limits: ScanLimits) -> Self {
+        self.scan_limits = scan_limits;
+        self
     }
 
     fn pin(&self, at: &MySqlCheckpoint) -> Pin {
@@ -1111,7 +1120,7 @@ pub(crate) async fn shared_intervals(
         )),
         server_uuid: server_uuid.to_string(),
         lineage_hash: lineage_hash.to_string(),
-        limits: ScanLimits::default(),
+        limits: scanner.scan_limits,
     });
     scanner
         .intervals(

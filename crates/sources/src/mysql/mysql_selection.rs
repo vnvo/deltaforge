@@ -623,6 +623,23 @@ async fn loaded(
     ))
 }
 
+/// Whether `db.table` has no positional proof of its schema at `at` (the
+/// rows of a transaction starting there would need a lazy baseline). The
+/// same cached timeline and selection as [`select_for_rows`].
+pub(crate) async fn unproven_at(
+    ctx: &mut RunCtx,
+    db: &str,
+    table: &str,
+    at: &WmPos,
+) -> SourceResult<bool> {
+    let key = ctx.registry_scope.current()?.key(db, table);
+    let t = timeline(ctx, &key).await?;
+    Ok(matches!(
+        select_decisive(&t.all(), at).0,
+        Selection::Unproven(_)
+    ))
+}
+
 /// The schema to decode `tm`'s rows with (see the module docs).
 pub(crate) async fn select_for_rows(
     ctx: &mut RunCtx,

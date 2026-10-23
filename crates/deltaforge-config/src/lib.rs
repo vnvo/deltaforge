@@ -547,6 +547,64 @@ pub struct MysqlSrcCfg {
     /// lossless.
     #[serde(default)]
     pub type_mapping: deltaforge_core::TypeMapping,
+    /// Schema-proof bounds: the activation window and the binlog seek.
+    #[serde(default)]
+    pub proofs: MysqlProofCfg,
+}
+
+/// Bounds of the MySQL schema proofs (`docs/src/sources/mysql.md`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MysqlProofCfg {
+    /// How long an activation window reads ahead to batch the first rows
+    /// of newly active tables into one capture and one scan.
+    #[serde(default = "MysqlProofCfg::default_window_ms")]
+    pub activation_window_ms: u64,
+    /// At most this many events buffered by an activation window.
+    #[serde(default = "MysqlProofCfg::default_window_events")]
+    pub activation_window_events: usize,
+    /// At most this many bytes of events buffered by an activation window.
+    #[serde(default = "MysqlProofCfg::default_window_bytes")]
+    pub activation_window_bytes: u64,
+    /// A proof scan without a known start offset fails closed when the
+    /// server sends no transaction within this bound (its seek through the
+    /// binlog file's earlier events).
+    #[serde(default = "MysqlProofCfg::default_max_seek_ms")]
+    pub max_seek_ms: u64,
+    /// How long a window's capture waits for each table's metadata lock (a
+    /// schema change in progress holds it) before the attempt fails.
+    #[serde(default = "MysqlProofCfg::default_lock_wait_secs")]
+    pub capture_lock_wait_secs: u32,
+}
+
+impl MysqlProofCfg {
+    fn default_window_ms() -> u64 {
+        50
+    }
+    fn default_window_events() -> usize {
+        10_000
+    }
+    fn default_window_bytes() -> u64 {
+        16 * 1024 * 1024
+    }
+    fn default_max_seek_ms() -> u64 {
+        10_000
+    }
+    fn default_lock_wait_secs() -> u32 {
+        30
+    }
+}
+
+impl Default for MysqlProofCfg {
+    fn default() -> Self {
+        Self {
+            activation_window_ms: Self::default_window_ms(),
+            activation_window_events: Self::default_window_events(),
+            activation_window_bytes: Self::default_window_bytes(),
+            max_seek_ms: Self::default_max_seek_ms(),
+            capture_lock_wait_secs: Self::default_lock_wait_secs(),
+        }
+    }
 }
 
 /// Redacted rendering of an optional inline DSN for `Debug`. `Some` values have
@@ -591,6 +649,7 @@ impl std::fmt::Debug for MysqlSrcCfg {
             .field("snapshot", &self.snapshot)
             .field("on_schema_drift", &self.on_schema_drift)
             .field("type_mapping", &self.type_mapping)
+            .field("proofs", &self.proofs)
             .finish()
     }
 }
