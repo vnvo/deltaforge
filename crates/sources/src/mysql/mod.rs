@@ -1971,7 +1971,15 @@ impl MySqlSource {
                 }
 
                 // An activation window's read-ahead, in order, before the
-                // stream is read again.
+                // stream is read again. A connection drop injected at an
+                // event boundary (test hook) applies here too: the queue
+                // goes with the stream, and the resume starts at the last
+                // proven boundary.
+                if !ctx.lookahead.is_empty() && crate::stream_probe::take_disconnect() {
+                    ctx.abandon_open_transaction().await?;
+                    lost = true;
+                    continue;
+                }
                 if let Some((header, data)) = ctx.lookahead.pop_front() {
                     advance_position(&mut ctx, &header);
                     dispatch_event(&mut ctx, &header, data).await?;
