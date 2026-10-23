@@ -1,8 +1,11 @@
 # MySQL proof scans: the seek from the start of the binary log file
 
 Status: open, release-blocking. It blocks dense active-set scaling, T1a and
-rc.1. Design revision 2, final for review (positioned scanning and
-coalescing): no production code until both are approved. Protocol probes are part of
+rc.1. Design revision 3, final for review (positioned scanning and
+coalescing). Revision 3 corrects revision 2's review findings: frontier
+anchors across a rotation, a real capture bound, exact physical-work bounds
+including failures and fallback, and all-or-nothing batch outcomes. No
+production code until both designs are approved. Protocol probes are part of
 validating it (section "Probes").
 Base: main `cae39fa1` (exact GTID sets, #170).
 
@@ -271,16 +274,38 @@ statement counts:
    existing check, on the session that streams), and the anchor's
    `server_uuid` and `lineage` must match the request's. An anchor of
    another server or lineage is never used, not even as a hint.
-2. **Boundary.** After the server's protocol events (Rotate to the anchor
-   file at the anchor offset, Format_description), the first event must be
-   a GTID event that starts exactly at the anchor offset, in the anchor's
-   file. When `next_gtid` is known it must be that GTID. When it is not
-   known (a frontier), the GTID must not be in the anchor's `set_before`.
-   Anything else is refused with `AnchorMismatch` before any state changes:
+2. **Boundary: a strictly validated chain to the first GTID.** The
+   server opens the stream with an artificial Rotate, which must name the
+   anchor's file and offset, and an artificial Format_description.
+   Artificial events are those whose `next_event_position` is 0. From
+   there, before the first GTID event, only a non-transactional rotation
+   chain may follow:
+   - **The first real event starts exactly at the anchor offset**, in the
+     anchor's file (`next_event_position - event_length`). It is either:
+     - the GTID event, or
+     - the file's own Rotate event (a frontier at the end of a file),
+       possibly after a Stop event (a server that stopped there).
+   - **Each Rotate follows the server's normal file sequence:** same base
+     name, file index plus one, position 4. Then come the new file's
+     Format_description and Previous_gtids events, and possibly
+     heartbeats. No other file, no backwards step, no skipped index.
+   - **Nothing transactional comes first.** Any query event (`BEGIN`
+     included), table map, rows event, Xid, transaction payload or
+     anonymous GTID before the first GTID event is refused. An Incident is
+     refused as today.
+   - **The first GTID must not be in `set_before`.** When `next_gtid` is
+     known, it must be that GTID.
+   - **The effective physical coordinate becomes the observed GTID event's**
+     file and start offset. The anchor cache and the record frontier are
+     updated from it once the scan commits.
+
+   Anything else is refused with `AnchorMismatch` before any statement
+   counts and before any state changes:
    - a `BEGIN` without a GTID (probe 3: an offset inside a transaction);
-   - a Rotate to another file;
+   - a real event starting elsewhere than the anchor offset;
+   - a Rotate out of sequence;
    - another GTID, or an in-set one;
-   - a different start offset.
+   - an artificial Rotate naming another position.
 3. **Accounting.** The scan then runs under today's rules, unchanged:
    membership against A, overshoot against B, and reached only when
    `B ⊆ A ∪ seen`.
@@ -297,7 +322,7 @@ statement counts:
 | Hint | Outcome |
 |---|---|
 | The anchor's file was purged | The server refuses the dump (probe 5). Falls to the bounded alternative once; counted and traced. |
-| The file rotated since (still present) | Valid. The scan starts in the older file and crosses the rotation (probe 5). The boundary check passes. |
+| The file rotated since (still present) | Valid. When the anchor is a transaction start inside the older file, the first real event is its GTID event, and the scan crosses the rotation later (probe 5). When the anchor is a frontier at the older file's end, the chain is: the file's Rotate at the anchor offset, the next file's setup events, its first GTID. Both pass the boundary check, and the effective coordinate becomes the GTID's file and offset. |
 | The offset is inside an event | The server refuses ("truncated in the middle of event", probe 3). Bounded alternative once. |
 | The offset is inside a transaction | The first event is a `BEGIN` without a GTID (probe 3). `AnchorMismatch`, then the bounded alternative once. |
 | The offset is a boundary but after A (stale or wrong) | The boundary check refuses it when `next_gtid` is known. Otherwise GTID accounting cannot reach B (probe 4: 4 GTIDs missing) and the scan stops at the live end (`NotReached`). Bounded alternative once. Never a proof that omits a DDL. |
@@ -417,13 +442,14 @@ of dispatching:
    until its table is decided, as today, and the position advances only as
    events are dispatched.
 
-**Failures.**
+**Outcomes.** A window either admits its batch as a whole or admits
+nothing, and every path is bounded:
 
-| Failure | Handling |
+| Case | Handling |
 |---|---|
-| The batched capture's lock wait times out (1205: a DDL in progress on one table) | The batch is retried once, then split back into today's per-table captures for that window. Bounded, and correct, since the per-table path is the existing one. |
-| Deadlock (1213) | Retried once in sorted order, then per-table, as above. |
-| The scanner request fails | Handled per table, as today's single requests are. No table of the window is marked proved by a failed request. |
+| The batched capture's lock wait times out (1205: a DDL in progress on a batch table), or deadlocks (1213) | Retried in sorted order, at most **three batched-capture attempts in total** per window. If none succeeds, the window **fails closed** with a typed `mysql_capture_contention` incident: the lookahead queue stays undispatched (then discarded), the checkpoint stays at the boundary before the window, and the pipeline recovers only through its normal recovery policy. There is never a fallback to per-table captures, which could add one transaction per table of the window. A bounded subdivision would need a design of its own. |
+| The shared extension fails, or is refused after its attempts (layer 2) | **No table of the window is admitted** from that request, and none is marked proved. The window fails closed like a capture failure, with the scanner's error, and there are no per-table rescans. The record is unchanged (staging). |
+| The shared extension succeeds | Every table receives its own answer over (A_i, B] from the committed record. Each is then decided exactly as today: admitted, refused because its rows contradict the proven shape, or sent to the existing relevant-DDL path when its answer contains a DDL relevant to it. The window closes before any schema-changing statement, so a relevant DDL in (A_i, B] can only come from a statement committed between the window's close and the capture. The relevant-DDL path therefore runs for at most one table per such statement (its own captures are bounded as today), never for every table of the window. |
 | The stream is lost during read-ahead | The queue is discarded. The position was never advanced past the head event, so the existing reconnect resumes from the last boundary (`abandon_open_transaction`). |
 | Cancellation (stop) | The queue is discarded, and the checkpoint is the last dispatched boundary. |
 
@@ -439,19 +465,29 @@ its pins and its identity check. Revision 2 adds or changes:
 - **Pinning before waiting.** A request registers a pin on its A (and the
   window pins A_head) before it waits for the scanner (existing). Pruning
   never drops a statement at or after the lowest pin, queued or running.
-- **Rounds, at most one physical extension in flight.** When a round
-  starts, its target is the greatest B among the requests queued before
-  it started. Its left target is the least A among them, when that A is
-  before the record's `lo`. Requests arriving during a round wait for the
-  next one.
-  - Each request is served within two rounds, so a continuously advancing
-    frontier cannot starve an earlier request.
-  - A batch from layer 1 is one request with many answers, so its B is
-    fixed.
-- **A round's physical scans:** at most two, one left and one right
-  extension, each positioned:
-  - the right one at the record's frontier anchor;
-  - the left one at the requesting boundary's stream anchor.
+- **Rounds, one at a time.** A round's targets are fixed when it starts:
+  - the right target is the greatest B among the requests queued before
+    it started;
+  - the left target is the least A among them, when that A is before the
+    record's `lo`.
+
+  A request queued while no round runs joins the round that starts next.
+  A request queued while a round runs joins **exactly the next round**,
+  never a later one. So every request is served by the first round that
+  starts after it is queued, and a continuously advancing frontier cannot
+  starve it. A batch from layer 1 is one request with many answers.
+- **A round's physical work** is at most two extensions, one left and one
+  right. Each extension makes:
+  - **at most one positioned attempt**, at its anchor: the right one at the
+    record's frontier anchor, the left one at the requesting boundary's
+    stream anchor. There is none when no anchor exists (a snapshot
+    baseline, failover drift);
+  - **at most one bounded unanchored attempt** (the bounded alternative,
+    under `max_seek`): only when there is no anchor, or after its
+    positioned attempt was refused (`AnchorMismatch`, `NotReached`, a
+    purged file) or failed;
+  - **no third attempt.** If the attempts do not reach the target, the
+    extension fails, and with it the round, for all its waiters.
 - **Staging; no partial commit.** A round builds its extensions into a
   staging record. The shared record, its frontier anchor and its bounds
   change only when every extension of the round has reached its target.
@@ -471,22 +507,34 @@ its pins and its identity check. Revision 2 adds or changes:
   staging record before it is committed. Exceeding them fails the round
   for all its waiters and clears nothing that was committed before.
 
-#### The upper bound for an activation burst
+#### Exact bounds
 
-- **Per window:**
-  - one batched capture transaction (at most three attempts, then today's
-    per-table captures);
-  - one scanner request;
-  - at most two physical scans, or one when the record already reaches
-    A_head.
-- **Per burst:** the number of windows is at most
-  `ceil(burst duration / activation_window_ms)`, and at most
-  `ceil(buffered events / activation_window_events)`.
-- **The design target:** 200 first touches inside one window cost one
-  capture transaction and at most two physical scans (one, normally).
-  The study's case (200 first touches within the first ~100 ms at 2,000
-  changes/s) spans two or three windows: 2-3 captures and at most 6
-  physical scans, against 200 of each today.
+Counted separately, and each traced per request and per window:
+
+| Quantity | Normal path (valid anchors) | Worst case (refused anchors, no anchor) |
+|---|---|---|
+| Capture transactions per window (`capture_attempts`) | 1 | 3, then the window fails closed |
+| Rounds that serve a request | exactly 1 (the first to start after it is queued) | exactly 1 |
+| Committed extensions per round (`extensions_committed`) | at most 2 (left and right); normally 1 (right only, when the record already reaches A_head) | at most 2, or 0 when the round fails |
+| Positioned attempts per round (`positioned_attempts`) | at most 2 | at most 2 |
+| Unanchored attempts per round (`unanchored_attempts`) | 0 | at most 2 (one per extension) |
+| Stream openings attributable to one request or window (`stream_openings`) | at most 2; normally 1 | **at most 4** |
+| Unanchored attempts per snapshot, failover or refused anchor | - | at most 1 per extension; each yields a session anchor for later requests |
+
+A request that waits for a running round has no openings attributed to it
+for that round; the round's openings are attributed to the requests that
+started it.
+
+**Per burst.** The number of windows is at most
+`ceil(burst duration / activation_window_ms)`, and at most
+`ceil(buffered events / activation_window_events)`. So the burst costs at
+most 3 capture transactions and 4 stream openings per window. Normally it
+costs 1 capture and 1 or 2 openings per window.
+
+**The study's case.** 200 first touches within the first ~100 ms at 2,000
+changes/s span two or three windows. Normally that is 2-3 captures and 2-6
+openings; at worst 9 captures and 12 openings. Today it is 200 captures
+and 200 scans.
 
 ### Acceptance targets
 
@@ -495,7 +543,7 @@ The review's targets, each with a measured check:
 | Target | Check |
 |---|---|
 | Seek work proportional to the interval, not the preceding file | Seek per proof flat (within 2x) at offsets 0, 64, 256 and 960 MiB, small-transaction padding (the sensitivity series) |
-| Bounded physical scans for a burst | 200 first touches in one window: at most 2 scans and 1 capture (trace counts) |
+| Bounded physical work for a burst | 200 first touches in one window, valid anchors: 1 capture, 1 round, at most 2 committed extensions and 2 stream openings (normally 1). Trace counters `capture_attempts`, `extensions_committed`, `positioned_attempts`, `unanchored_attempts` and `stream_openings` are asserted separately |
 | Activation latency flat by order | Activation-order decile p50s within 2x of each other, no linear trend, at 0 and 256 MiB |
 | The 256 MiB case meets the budget | 1,000 tables, 20% active, 256 MiB small padding: activation p99 under 5 s (now about 51 s) |
 | Identity unchanged | Positioned, GTID-positioned and shared answers statement- and digest-identical over the regression matrix |
@@ -503,8 +551,12 @@ The review's targets, each with a measured check:
 | Mutants caught | Disabling the positioned start, or the activation window, fails the performance regression |
 | A late or wrong anchor never proves | A boundary after A with a DDL in between: `AnchorMismatch` or `NotReached` within seconds (not the 600 s limit), then the bounded alternative; never a proof that omits the DDL |
 | No partial scanner state | Cancellation, a refused anchor and a failed extension (left, right, or both in one round) each leave the record, its frontier and the anchor cache unchanged; the next request equals a direct scan |
-| The batched capture is safe | Locks in sorted order (a reverse-order mutant deadlocks against a two-table `RENAME`); a lock timeout falls back to per-table captures; a DDL on a locked table waits for the commit |
-| Bounded per window | Trace counts: per window, at most 3 capture attempts and 2 physical scans; at most one unanchored scan per snapshot, failover or refused anchor |
+| The batched capture is safe | Locks in sorted order (a reverse-order mutant deadlocks against a two-table `RENAME`); a lock timeout is retried, within three attempts in total, then fails closed (see "Capture contention fails closed"); a DDL on a locked table waits for the commit |
+| Bounded per window, worst case | With every anchor refused: at most 3 capture attempts, 2 positioned and 2 unanchored attempts, and 4 stream openings; never a third attempt per extension. A mutant allowing a third attempt, or a per-table capture fallback, fails on the counts |
+| Rotation at a frontier | `hi` ends at a file's last transaction, and the next transaction starts in the next file. The positioned extension at the frontier passes the chain (the file's Rotate at the anchor offset, the next file's setup events, its first GTID) and continues at the new file's offset. Two mutants must fail: one rejecting the valid rotation, and one accepting a transactional event (a `BEGIN`, a rows event or an anonymous GTID) before the first GTID |
+| Capture contention fails closed | With a batch table write-locked throughout: three sorted capture attempts, then a `mysql_capture_contention` incident, the lookahead undispatched and the checkpoint unchanged; no per-table capture |
+| Batch outcomes are all or nothing | A failed shared extension admits no table of its window and starts no per-table rescan; a successful one gives every table its own answer and digest, identical to a direct scan of (A_i, B] |
+| One round per request | A request queued while a round runs is served by exactly the next round, and its answer is identical to a direct scan |
 
 ### Probes
 
