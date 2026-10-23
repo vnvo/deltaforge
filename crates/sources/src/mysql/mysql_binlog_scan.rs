@@ -43,6 +43,7 @@ use mysql_async::prelude::Queryable;
 use mysql_binlog_connector_rust::binlog_client::BinlogClient;
 use mysql_binlog_connector_rust::event::event_data::EventData;
 use mysql_binlog_connector_rust::event::event_header::EventHeader;
+use mysql_binlog_connector_rust::event::rotate_event::RotateEvent;
 use sha2::{Digest, Sha256};
 
 use super::MySqlCheckpoint;
@@ -392,9 +393,10 @@ enum Chain {
 /// - the server's artificial Rotate naming the anchor;
 /// - its Format_description;
 /// - then, starting exactly at the anchor offset, either the GTID event,
-///   or the file's own Rotate (after an optional Stop) to the next file in
-///   sequence, followed by that file's setup events and first GTID (or,
-///   for a file with no transactions, its own Stop and Rotate onward).
+///   or a rotation to the next file in sequence: the file's own Rotate, or
+///   a Stop and the server's artificial Rotate as it opens the next file.
+///   The next file's artificial Rotate and setup events follow, then its
+///   first GTID (or, for a file with no transactions, its own rotation).
 ///
 /// The first GTID must not be in the anchor's `set_before`, and must be
 /// `next_gtid` when that is known. Anything transactional before it is
@@ -430,6 +432,21 @@ impl AnchorCheck {
             "{why} (anchor {}:{}, state {:?})",
             self.anchor.file, self.anchor.offset, self.state
         ))
+    }
+
+    /// A rotation to the next file of the server's normal sequence.
+    fn rotate_to(&mut self, r: &RotateEvent) -> Result<(), ProofError> {
+        if !is_next_file(&self.file, &r.binlog_filename)
+            || r.binlog_position != 4
+        {
+            return Err(self.refuse(format!(
+                "a Rotate out of sequence, to {}:{}",
+                r.binlog_filename, r.binlog_position
+            )));
+        }
+        self.file = r.binlog_filename.clone();
+        self.state = Chain::Rotated;
+        Ok(())
     }
 
     /// Validate one event received before the first GTID.
@@ -479,26 +496,34 @@ impl AnchorCheck {
                     Err(self.refuse(format!("a Stop at offset {start}")))
                 }
             }
-            (
-                EventData::Rotate(r),
-                Chain::AtAnchor | Chain::Stopped | Chain::Rotated,
-            ) if !artificial => {
+            // The file's own Rotate, at the end of the anchor's file or of
+            // an empty file after it; or, after a Stop (a file the server
+            // stopped writing has no Rotate of its own), the server's
+            // artificial Rotate as it opens the next file.
+            (EventData::Rotate(r), Chain::AtAnchor | Chain::Rotated)
+                if !artificial =>
+            {
                 if self.state == Chain::AtAnchor && !at_anchor(self) {
                     return Err(self.refuse(format!(
                         "the file's Rotate at offset {start}"
                     )));
                 }
-                if !is_next_file(&self.file, &r.binlog_filename)
-                    || r.binlog_position != 4
-                {
-                    return Err(self.refuse(format!(
-                        "a Rotate out of sequence, to {}:{}",
+                self.rotate_to(r)
+            }
+            (EventData::Rotate(r), Chain::Stopped) if artificial => {
+                self.rotate_to(r)
+            }
+            // The server's artificial Rotate as it opens the file the chain
+            // just rotated to.
+            (EventData::Rotate(r), Chain::Rotated) if artificial => {
+                if r.binlog_filename == self.file && r.binlog_position == 4 {
+                    Ok(())
+                } else {
+                    Err(self.refuse(format!(
+                        "the server opened {}:{}",
                         r.binlog_filename, r.binlog_position
-                    )));
+                    )))
                 }
-                self.file = r.binlog_filename.clone();
-                self.state = Chain::Rotated;
-                Ok(())
             }
             (EventData::Gtid(g), Chain::AtAnchor | Chain::Rotated) => {
                 if self.state == Chain::AtAnchor && !at_anchor(self) {
@@ -1857,15 +1882,17 @@ mod tests {
         /// GTID, which becomes the effective coordinate.
         #[test]
         fn a_frontier_at_a_files_end_passes_the_rotation_chain() {
+            // The file's own Rotate at the anchor; or a Stop there and the
+            // server's artificial Rotate as it opens the next file.
             let chain = |stop: bool| {
                 let mut ev = opening(F1, 9000);
-                let mut rot = 9000;
                 if stop {
                     ev.push((at(3, 9000, 23), EventData::NotSupported));
-                    rot = 9023;
+                } else {
+                    ev.push((at(4, 9000, 44), rotate(F2, 4)));
                 }
                 ev.extend([
-                    (at(4, rot, 44), rotate(F2, 4)),
+                    (at(4, 0, 44), rotate(F2, 4)),
                     (at(15, 4, 122), fde()),
                     (
                         at(35, 126, 71),
@@ -1886,12 +1913,47 @@ mod tests {
         }
 
         #[test]
+        fn a_rotation_names_only_the_next_file() {
+            // After a Stop, only the server's opening of the next file.
+            let mut ev = opening(F1, 9000);
+            ev.extend([
+                (at(3, 9000, 23), EventData::NotSupported),
+                (at(4, 9023, 44), rotate(F2, 4)),
+            ]);
+            mismatch(feed(anchor(F1, 9000, None), ev).0);
+            let mut ev = opening(F1, 9000);
+            ev.extend([
+                (at(3, 9000, 23), EventData::NotSupported),
+                (at(4, 0, 44), rotate("binlog.000009", 4)),
+            ]);
+            assert!(
+                mismatch(feed(anchor(F1, 9000, None), ev).0)
+                    .contains("out of sequence")
+            );
+            // After a rotation, the server opens exactly that file.
+            for (file, pos) in [(F1, 4), (F2, 126), ("binlog.000009", 4)] {
+                let mut ev = opening(F1, 9000);
+                ev.extend([
+                    (at(4, 9000, 44), rotate(F2, 4)),
+                    (at(4, 0, 44), rotate(file, pos)),
+                ]);
+                assert!(
+                    mismatch(feed(anchor(F1, 9000, None), ev).0)
+                        .contains("opened"),
+                    "{file}:{pos}"
+                );
+            }
+        }
+
+        #[test]
         fn files_without_transactions_chain_in_sequence() {
             let mut ev = opening(F1, 9000);
             ev.extend([
                 (at(4, 9000, 44), rotate(F2, 4)),
+                (at(4, 0, 44), rotate(F2, 4)),
                 (at(15, 4, 122), fde()),
                 (at(4, 126, 44), rotate("binlog.000009", 4)),
+                (at(4, 0, 44), rotate("binlog.000009", 4)),
                 (at(15, 4, 122), fde()),
                 (at(33, 126, 79), gtid(11)),
             ]);
@@ -2697,6 +2759,324 @@ mod tests {
         #[ignore = "requires docker"]
         async fn file_position_scan_traces() {
             traced(false, "trace_f").await;
+        }
+
+        /// Positioned GTID scans (`docs/design/mysql-proof-seek.md`,
+        /// "Positioned GTID scanning"): a scan opened at an anchor answers
+        /// exactly as a GTID-positioned one, across rotations, and a wrong
+        /// anchor is refused promptly, never a proof that omits a DDL.
+        mod positioned {
+            use super::*;
+
+            async fn at(
+                dsn: &str,
+                from: &MySqlCheckpoint,
+                to: &MySqlCheckpoint,
+                anchor: Option<&Anchor>,
+            ) -> Result<ScanReport, ProofError> {
+                scan_interval_at(
+                    dsn,
+                    4_000_124,
+                    &uuid(dsn).await,
+                    LINEAGE,
+                    from,
+                    to,
+                    anchor,
+                    &ScanLimits {
+                        max_duration: Duration::from_secs(20),
+                        ..ScanLimits::default()
+                    },
+                    &TAG,
+                )
+                .await
+            }
+
+            fn set(p: &MySqlCheckpoint) -> GtidSet {
+                GtidSet::parse(p.gtid_set.as_deref().unwrap()).unwrap()
+            }
+
+            /// Positioned and GTID-positioned answers are statement- and
+            /// digest-identical: at the session anchor a scan yields, and at
+            /// the record frontier where it ended.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn positioned_scans_equal_gtid_positioned_scans() {
+                let dsn = server(true).await;
+                let db = "pos_same";
+                sql(&dsn, &[&format!("CREATE DATABASE {db}")]).await;
+                let a = position(&dsn).await;
+                sql(
+                    &dsn,
+                    &[
+                        &format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)"),
+                        &format!("INSERT INTO {db}.t VALUES (1)"),
+                        &format!("ALTER TABLE {db}.t ADD COLUMN v INT"),
+                    ],
+                )
+                .await;
+                let b = position(&dsn).await;
+                sql(
+                    &dsn,
+                    &[
+                        &format!("INSERT INTO {db}.t VALUES (2, 2)"),
+                        &format!("RENAME TABLE {db}.t TO {db}.u"),
+                    ],
+                )
+                .await;
+                let c = position(&dsn).await;
+
+                let plain = at(&dsn, &a, &b, None).await.unwrap();
+                assert_eq!(plain.positioned_at, None);
+                let session =
+                    plain.session_anchor.clone().expect("a session anchor");
+                assert_eq!(session.set_before, set(&a));
+                let frontier = plain.frontier.clone().expect("a frontier");
+                assert_eq!(frontier.set_before, set(&b));
+                assert_eq!(frontier.next_gtid, None);
+
+                let again = at(&dsn, &a, &b, Some(&session)).await.unwrap();
+                assert_eq!(again.digest, plain.digest);
+                assert_eq!(again.statements, plain.statements);
+                assert_eq!(
+                    again.positioned_at,
+                    Some((session.file.clone(), session.offset))
+                );
+                assert_eq!(again.frontier, plain.frontier);
+
+                let next = at(&dsn, &b, &c, Some(&frontier)).await.unwrap();
+                let direct = at(&dsn, &b, &c, None).await.unwrap();
+                assert_eq!(next.digest, direct.digest);
+                assert_eq!(affected(&next), [format!("{db}.t+{db}.u")]);
+                assert_eq!(
+                    next.positioned_at,
+                    Some((frontier.file.clone(), frontier.offset))
+                );
+            }
+
+            /// `hi` ends at a file's last transaction: the positioned scan
+            /// at its frontier passes the file's Rotate, the next file's
+            /// setup events (and an empty file's), and continues at the
+            /// next transaction's file and offset.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn a_frontier_at_a_files_end_crosses_the_rotation() {
+                let dsn = server(true).await;
+                for (db, flushes) in [("pos_rot1", 1), ("pos_rot2", 2)] {
+                    sql(&dsn, &[&format!("CREATE DATABASE {db}")]).await;
+                    let a = position(&dsn).await;
+                    sql(
+                        &dsn,
+                        &[&format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)")],
+                    )
+                    .await;
+                    let b = position(&dsn).await;
+                    for _ in 0..flushes {
+                        sql(&dsn, &["FLUSH BINARY LOGS"]).await;
+                    }
+                    sql(
+                        &dsn,
+                        &[&format!("ALTER TABLE {db}.t ADD COLUMN v INT")],
+                    )
+                    .await;
+                    let c = position(&dsn).await;
+                    assert_ne!(b.file, c.file);
+
+                    let head = at(&dsn, &a, &b, None).await.unwrap();
+                    let frontier = head.frontier.expect("a frontier");
+                    assert_eq!(
+                        (&frontier.file, frontier.offset),
+                        (&b.file, b.pos)
+                    );
+                    let next = at(&dsn, &b, &c, Some(&frontier)).await.unwrap();
+                    let direct = at(&dsn, &b, &c, None).await.unwrap();
+                    assert_eq!(next.digest, direct.digest, "{flushes} flushes");
+                    assert_eq!(affected(&next), [format!("{db}.t")]);
+                    let (file, offset) =
+                        next.positioned_at.expect("positioned");
+                    assert_eq!(file, c.file, "{flushes} flushes");
+                    assert!(offset > 4);
+                }
+            }
+
+            /// A frontier at the last transaction of a file the server
+            /// stopped writing: the chain is the file's Stop, then the
+            /// server's opening of the next file (a stopped file has no
+            /// Rotate of its own).
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn a_frontier_before_a_stop_crosses_the_restart() {
+                let (c, port) = start(true).await;
+                let dsn = dsn_of(port);
+                let db = "pos_stop";
+                sql(&dsn, &[&format!("CREATE DATABASE {db}")]).await;
+                let a = position(&dsn).await;
+                sql(
+                    &dsn,
+                    &[&format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)")],
+                )
+                .await;
+                let b = position(&dsn).await;
+                let frontier =
+                    at(&dsn, &a, &b, None).await.unwrap().frontier.unwrap();
+
+                c.stop_with_timeout(Some(60)).await.unwrap();
+                c.start().await.unwrap();
+                let port = c.get_host_port_ipv4(3306).await.unwrap();
+                let dsn = dsn_of(port);
+                for _ in 0..120 {
+                    if mysql_async::Conn::from_url(&dsn).await.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                sql(&dsn, &[&format!("ALTER TABLE {db}.t ADD COLUMN v INT")])
+                    .await;
+                let c2 = position(&dsn).await;
+                assert_ne!(b.file, c2.file);
+
+                let next = at(&dsn, &b, &c2, Some(&frontier)).await.unwrap();
+                let direct = at(&dsn, &b, &c2, None).await.unwrap();
+                assert_eq!(next.digest, direct.digest);
+                assert_eq!(affected(&next), [format!("{db}.t")]);
+                assert_eq!(next.positioned_at.unwrap().0, c2.file);
+            }
+
+            /// A boundary after A, with a DDL in between, never proves:
+            /// refused at the first GTID when the next one is known, and
+            /// otherwise at the live end, within seconds.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn a_late_anchor_is_refused_promptly() {
+                let dsn = server(true).await;
+                let db = "pos_late";
+                sql(&dsn, &[&format!("CREATE DATABASE {db}")]).await;
+                let a = position(&dsn).await;
+                sql(
+                    &dsn,
+                    &[&format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)")],
+                )
+                .await;
+                let b = position(&dsn).await;
+                sql(
+                    &dsn,
+                    &[&format!("CREATE TABLE {db}.u (id INT PRIMARY KEY)")],
+                )
+                .await;
+                let c = position(&dsn).await;
+                let head = at(&dsn, &a, &b, None).await.unwrap();
+                let true_next = head.session_anchor.unwrap().next_gtid;
+                // B's frontier, claimed as a start at A.
+                let late = |next_gtid| Anchor {
+                    set_before: set(&a),
+                    next_gtid,
+                    ..head.frontier.clone().unwrap()
+                };
+
+                let err =
+                    at(&dsn, &a, &c, Some(&late(true_next))).await.unwrap_err();
+                assert!(
+                    matches!(err, ProofError::AnchorMismatch(_)),
+                    "{err:?}"
+                );
+
+                let started = Instant::now();
+                let err =
+                    at(&dsn, &a, &c, Some(&late(None))).await.unwrap_err();
+                assert!(matches!(err, ProofError::NotReached(_)), "{err:?}");
+                assert!(started.elapsed() < Duration::from_secs(10));
+
+                // The direct scan has the DDL the late start would omit.
+                let direct = at(&dsn, &a, &c, None).await.unwrap();
+                assert_eq!(
+                    affected(&direct),
+                    [format!("{db}.t"), format!("{db}.u")]
+                );
+            }
+
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn an_anchor_of_another_server_lineage_or_boundary_is_refused()
+             {
+                let dsn = server(true).await;
+                let db = "pos_foreign";
+                sql(&dsn, &[&format!("CREATE DATABASE {db}")]).await;
+                let a = position(&dsn).await;
+                sql(
+                    &dsn,
+                    &[&format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)")],
+                )
+                .await;
+                let b = position(&dsn).await;
+                let good = at(&dsn, &a, &b, None)
+                    .await
+                    .unwrap()
+                    .session_anchor
+                    .unwrap();
+                let other = Anchor {
+                    server_uuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+                    ..good.clone()
+                };
+                assert!(matches!(
+                    at(&dsn, &a, &b, Some(&other)).await,
+                    Err(ProofError::OtherServer(_))
+                ));
+                let lineage = Anchor {
+                    lineage: "ffff".into(),
+                    ..good.clone()
+                };
+                assert!(matches!(
+                    at(&dsn, &a, &b, Some(&lineage)).await,
+                    Err(ProofError::OtherServer(_))
+                ));
+                let boundary = Anchor {
+                    set_before: set(&b),
+                    ..good.clone()
+                };
+                assert!(matches!(
+                    at(&dsn, &a, &b, Some(&boundary)).await,
+                    Err(ProofError::Positions(_))
+                ));
+                // Inside an event: the server refuses the dump.
+                let inside = Anchor {
+                    offset: good.offset + 1,
+                    ..good.clone()
+                };
+                assert!(at(&dsn, &a, &b, Some(&inside)).await.is_err());
+                at(&dsn, &a, &b, Some(&good)).await.unwrap();
+            }
+
+            /// The bounded alternative: no transaction within `max_seek` of
+            /// opening is a typed refusal, not a wait for the time limit.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn the_seek_is_bounded() {
+                let dsn = server(true).await;
+                let db = "pos_seek";
+                sql(&dsn, &[&format!("CREATE DATABASE {db}")]).await;
+                let a = position(&dsn).await;
+                sql(
+                    &dsn,
+                    &[&format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)")],
+                )
+                .await;
+                let b = position(&dsn).await;
+                let r = scan_interval_at(
+                    &dsn,
+                    4_000_125,
+                    &uuid(&dsn).await,
+                    LINEAGE,
+                    &a,
+                    &b,
+                    None,
+                    &ScanLimits {
+                        max_seek: Duration::ZERO,
+                        ..ScanLimits::default()
+                    },
+                    &TAG,
+                )
+                .await;
+                assert!(matches!(r, Err(ProofError::SeekLimit(_))), "{r:?}");
+            }
         }
 
         async fn scenario(gtid: bool, db: &str) {
