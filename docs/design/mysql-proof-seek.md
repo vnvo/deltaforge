@@ -1,8 +1,9 @@
 # MySQL proof scans: the seek from the start of the binary log file
 
 Status: open, release-blocking. It blocks dense active-set scaling, T1a and
-rc.1. Design revision 1, for review: no production code until the
-safe-anchor and coalescing designs are approved. Protocol probes are part of
+rc.1. Design revision 2 (positioned scanning final for review; coalescing
+being finalized): no production code until the safe-anchor and coalescing
+designs are approved. Protocol probes are part of
 validating it (section "Probes").
 Base: main `2613e9b1`.
 
@@ -203,110 +204,162 @@ Under P1-P3, any anchor is safe; a wrong one only costs time or fails
 closed. The design then needs only to make the right anchor the common case,
 and to fail fast rather than slow when it is wrong.
 
-### Where each physical coordinate comes from
+### Positioned GTID scanning, revision 2 (final for review)
 
-Anchors are taken only from the source's own binary-log stream, never from
-`SHOW BINARY LOG STATUS` or another separately read status.
+Revision 2 replaces revision 1's anchor, validation and fallback sections,
+using the probe results. Precondition P1 (exact GTID sets) holds since #170.
 
-- **Lazy, full-fallback and forward proofs (boundary A = `txn_eval_cp`).**
-  The anchor is the start offset of the first transaction after A. When the
-  stream reads that transaction's GTID event, it knows the event's
-  `next_event_position` and `event_length`. Their difference is the
-  transaction's start: the exact end of A, in the current file.
-  - The stream records an `Anchor {file, offset, gtid_of_next_txn,
-    set_before = A, server_uuid, lineage}` at each GTID event.
-  - The transaction whose rows trigger the proof is exactly the first one
-    after A, so the anchor exists whenever a row-triggered proof does.
-- **After a restart or reconnect.** The stream resumes by GTID set, and the
-  server skips in-set transactions before sending anything. The first
-  transaction the stream receives is therefore the first one not in the
-  resume set. Its GTID event gives the anchor above, with `set_before` = the
-  resume set. No separately read position is used.
-  - Before that first transaction arrives, no row-triggered proof can
-    happen.
-  - Today `last_file/last_pos` are stale or empty until the first commit
-    after a resume (`mod.rs:1684`, `helpers.rs:57-91`). Under this design
-    they are never used as an anchor.
-- **Snapshot baselines (A = the stream's start) and failover drift (A = F).**
-  These have no stream-observed anchor when they start. They use the
-  bounded alternative below.
+**The protocol.** Probe 1 established that `COM_BINLOG_DUMP_GTID` honors a
+file name and offset sent together with the GTID set. The server starts at
+the offset and still skips in-set transactions. The vendored dump command
+(`dump_binlog_gtid_command.rs`) gains the file name and offset; today it
+sends an empty name and offset 4. This is a vendored patch, recorded like
+the others. With an empty file name the command behaves exactly as today,
+which is the bounded alternative's path.
 
-### Why the anchor is not after A
+**An anchor** is
+`Anchor { server_uuid, lineage, file, offset, set_before: GtidSet, next_gtid: Option<String> }`.
+It means: in `file` of that server, the transaction starting at `offset`
+is the first one not in `set_before`, and `next_gtid` is its GTID when
+known. It is held in memory only and never persisted; after a restart
+anchors are observed again.
 
-The anchor of A is the start of the first transaction the stream received
-after the boundary it evaluated at A. Two cases:
+#### 1. Where each physical coordinate comes from
 
-- **Within one stream connection,** the server sends transactions in
-  binary-log order without gaps, apart from in-set transactions skipped on
-  a GTID-positioned connect. So every transaction located before the anchor
-  was either received earlier (and is in A) or skipped as in-set (and is in
-  A).
-- **Across a rotation,** the anchor's file is the file where that GTID
-  event was read (the stream's Rotate events keep `last_file` current).
+Every anchor is observed in a binary-log stream at a transaction boundary.
+None is taken from `SHOW BINARY LOG STATUS`, `@@gtid_executed` or any other
+separately read status: those reads are not atomic with their GTID set (the
+code says so, `mysql_proof_scanner.rs:966`). The capture positions of B
+therefore never become anchors.
 
-### Validation after opening the stream at an anchor
+| Anchor | Observed where | `offset` | `set_before` | `next_gtid` |
+|---|---|---|---|---|
+| **Stream anchor** (lazy, full-fallback and forward proofs; A = `txn_eval_cp`) | the main stream, at the GTID event of the transaction after A, the one whose rows trigger the proof | that event's start: `next_event_position - event_length` | A, the executed set at that boundary | that event's GTID |
+| **Record frontier** (the shared record's right end, to extend it) | the scan that reached the record's `hi`, at its terminal event | the terminal event's end offset, the boundary after the last transaction of `hi` (`ScanTrace::terminal`) | `hi`'s GTID set; at reach `done == hi` exactly, because a GTID outside `hi` is an overshoot | not known (the next transaction was not read) |
+| **Session anchor** (the first scan of a GTID-positioned stream: the bounded alternative's yield) | that scan, at the first transaction the server sends | that GTID event's start | the set the stream was opened from | that GTID |
 
-The scan opens a file/position dump (`COM_BINLOG_DUMP` with file and
-offset, or `COM_BINLOG_DUMP_GTID` with file, offset and set, if probe 1
-shows the server honors both). Then, before any statement counts:
+A compressed transaction is one payload event preceded by its own GTID
+event. Its GTID event start and payload end are boundaries, as for any
+transaction (probe 8 below confirms the GTID event is outside the payload).
 
-1. **Identity.** The session's `server_uuid` must be the lineage's
-   (existing check, `mysql_session.rs:137`), and the anchor's lineage must
-   match the request's.
-2. **Boundary.** The first event after the server's protocol events
-   (Rotate, Format_description) must be a GTID event that starts exactly at
-   the anchor offset and carries `gtid_of_next_txn`. Anything else is
-   refused: a Rotate to another file, another GTID, a non-GTID event, or a
-   different offset. This proves the offset is a transaction boundary of
-   the same file and history, and that the file was not rotated away or
-   rewritten.
-3. **Accounting.** The usual rules apply from there: membership against A,
-   overshoot against B, reached when `B ⊆ A ∪ seen`.
-4. **Fail fast.** Today a scan that cannot reach B waits for the 600 s time
-   limit. A positioned scan instead stops with `NotReached` when it reaches
-   the server's live end without completing. That is detected by a
-   heartbeat after the last event, with nothing left to send. A late or
-   wrong anchor therefore costs one short scan, not ten minutes.
+#### 2. Why the anchor is not after boundary A
 
-### Stale, purged, rotated, inconsistent or foreign hints
+- **Stream anchor.** The main stream received every transaction between
+  its connect and this one, in binary-log order. A GTID-positioned connect
+  skips only transactions in its start set. So every transaction located
+  before the anchor offset was either received earlier, and so is in A, or
+  skipped as in-set, and so is in A. The transaction at the anchor is the
+  first one after A.
+- **Record frontier.** The scan reached `hi` at its terminal event. Every
+  transaction before the terminal's end was read and added to `done`, or
+  skipped as in its start set. So `done == hi` covers everything before the
+  offset, and the next transaction is the first one not in `hi`.
+- **Session anchor.** The same argument as for the stream anchor, applied to
+  the scan's own stream.
 
-| Hint | What happens |
+In every case the claim rests on reading the stream, never on a status
+read. An anchor whose claim does not hold is caught by validation, or at
+worst by GTID accounting (section 4).
+
+#### 3. Validation after opening a stream at an anchor
+
+The scan opens `COM_BINLOG_DUMP_GTID` with the anchor's file and offset and
+the request's GTID set A. A uses the anchor's `set_before` when the anchor
+was taken at A; for a frontier anchor, A is the record's `hi`. Before any
+statement counts:
+
+1. **Identity.** The session's `server_uuid` must be the request's (the
+   existing check, on the session that streams), and the anchor's
+   `server_uuid` and `lineage` must match the request's. An anchor of
+   another server or lineage is never used, not even as a hint.
+2. **Boundary.** After the server's protocol events (Rotate to the anchor
+   file at the anchor offset, Format_description), the first event must be
+   a GTID event that starts exactly at the anchor offset, in the anchor's
+   file. When `next_gtid` is known it must be that GTID. When it is not
+   known (a frontier), the GTID must not be in the anchor's `set_before`.
+   Anything else is refused with `AnchorMismatch` before any state changes:
+   - a `BEGIN` without a GTID (probe 3: an offset inside a transaction);
+   - a Rotate to another file;
+   - another GTID, or an in-set one;
+   - a different start offset.
+3. **Accounting.** The scan then runs under today's rules, unchanged:
+   membership against A, overshoot against B, and reached only when
+   `B ⊆ A ∪ seen`.
+4. **Fail fast.** A positioned scan that reaches the server's live end (a
+   heartbeat with nothing more to send, after the last event) without
+   reaching B stops with `NotReached`. B was captured before the scan
+   started, so all of B is already in the binary log, and reaching the end
+   without it means the start was wrong. This turns probe 4's silent late
+   start into a prompt refusal, where today it would wait out the 600 s
+   time limit.
+
+#### 4. Stale, purged, rotated, inconsistent or foreign hints
+
+| Hint | Outcome |
 |---|---|
-| File purged | The server refuses the dump. The request falls to the bounded alternative, and a metric and trace record it. |
-| File rotated since (still present) | The scan starts in the older file and crosses the rotation. This is valid: the boundary check passes. |
-| Boundary check fails (other GTID, offset not a boundary, rewritten file) | Refused with `AnchorMismatch` before any state changes, then the bounded alternative. Counted and traced. |
-| Another server or lineage | Refused by the identity check (existing `OtherServer`), with no fallback: the request fails closed as today. |
-| `NotReached` from a positioned scan | Refused with no partial state, then the bounded alternative once. A second failure fails the request closed. |
+| The anchor's file was purged | The server refuses the dump (probe 5). Falls to the bounded alternative once; counted and traced. |
+| The file rotated since (still present) | Valid. The scan starts in the older file and crosses the rotation (probe 5). The boundary check passes. |
+| The offset is inside an event | The server refuses ("truncated in the middle of event", probe 3). Bounded alternative once. |
+| The offset is inside a transaction | The first event is a `BEGIN` without a GTID (probe 3). `AnchorMismatch`, then the bounded alternative once. |
+| The offset is a boundary but after A (stale or wrong) | The boundary check refuses it when `next_gtid` is known. Otherwise GTID accounting cannot reach B (probe 4: 4 GTIDs missing) and the scan stops at the live end (`NotReached`). Bounded alternative once. Never a proof that omits a DDL. |
+| Another server or lineage | Refused by the identity checks, with no fallback. The request fails closed as today. |
+| The bounded alternative fails too | The request fails closed, as today. |
 
-### The bounded alternative when no safe anchor exists
+A positioned scan that fails changes no scanner state (section 6).
+
+#### 5. How a restart obtains a safe anchor
+
+Anchors are not persisted. After a restart or reconnect the main stream
+opens GTID-positioned from its exact resume set, as today; that seek is
+paid once per connect, not per proof. The first transaction it receives
+gives a stream anchor (section 1): the first transaction not in the resume
+set, at its observed offset. No row-triggered proof can happen before that
+transaction arrives, so every lazy, full-fallback and forward proof after a
+restart has a stream anchor.
+
+Proofs with A at the stream's start (snapshot baselines) or at a failover
+anchor F have no stream anchor. They use the bounded alternative once,
+which yields a session anchor for every later request at that boundary.
+
+#### 6. No partial scanner state
+
+A positioned scan is built into the request's own staging (see the
+coalescing state machine). The shared record, its frontier anchor and the
+anchor cache are updated only when the scan reaches B and its accounting
+holds. A refused anchor, a server error, cancellation or a fallback leaves
+them exactly as they were.
+
+#### 7. Proof identities and digests stay GTID-only and byte-identical
+
+- **Digest inputs unchanged:** the domain, the classifier version, A and B
+  as GTID-set `WmPos`, and the classified statements identified by GTID and
+  ordinal.
+- **The start is not part of the proof.** A positioned scan and a
+  GTID-positioned one read the same transactions of (A,B] under the same
+  membership rule. A start earlier than A only adds skipped in-set
+  transactions; a start later than A is refused.
+- **Excluded from every digest and persisted identity:** anchors, offsets
+  and the start mode (positioned or not).
+- **Regression:** for every interval of the matrix, positioned, unpositioned
+  and shared answers are statement- and digest-identical.
+
+#### 8. The bounded alternative (no safe anchor)
 
 There is never a silent scan of an arbitrarily large file prefix:
 
-- The alternative is today's GTID-positioned scan, run under an explicit
-  cost budget. A new limit, `max_seek`, bounds the time to the first
-  transaction (default: a few seconds, configurable). When it is exceeded
-  the request fails closed with a typed `SeekLimit` error and an incident.
-  It never falls back further.
-- Every alternative scan is counted
-  (`deltaforge_mysql_proof_unanchored_total{kind}`) and traced. The scan
-  that serves a snapshot baseline or failover drift also yields an anchor
-  for every later request: the first transaction it receives gives one, as
-  for the stream. So the unanchored cost is paid at most once per snapshot
-  or failover, not per table.
-
-### Proof identities and digests stay GTID-only and byte-identical
-
-- **Inputs unchanged.** The digest inputs stay `(A, B)` as GTID-set
-  `WmPos`, the classified statements, and the classifier version.
-  Statements are identified by GTID and ordinal. A positioned scan reads
-  the same transactions of (A,B] as a GTID-positioned one, because both
-  apply the same membership rule. Starting earlier only adds skipped
-  in-set transactions.
-- **Offsets excluded.** Anchors and offsets never enter a digest or a
-  persisted identity.
-- **Test.** For every interval of the regression matrix, the positioned and
-  GTID-positioned scans must give identical statements and identical
-  digests, by direct comparison.
+- **When it runs:** only when no anchor exists (a snapshot baseline,
+  failover drift), or after one refused anchor.
+- **Its form:** today's GTID-positioned scan under a new limit, `max_seek`,
+  the time from opening to the first transaction (default 10 s,
+  configurable). When it is exceeded the request fails closed with a typed
+  `SeekLimit` error, and the pipeline stops with an incident whose evidence
+  includes the seek time and the file. A prefix too large to seek within
+  the bound is a visible stop, never a silent cost.
+- **Observability:** every run is counted
+  (`deltaforge_mysql_proof_unanchored_total{kind,reason}`) and traced.
+- **Its yield:** each run yields a session anchor, so the next request at
+  the same boundary is positioned. The cost is paid at most once per
+  snapshot, failover or refused anchor, never per table.
 
 ### Coalescing: from serial proofs to bounded batches
 
