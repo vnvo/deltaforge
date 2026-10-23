@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Probe 6: a GTID gap that later fills, across a DeltaForge restart.
 set -uo pipefail
-P=/tmp/claude-1000/-home-thekeeper-projects-deltaforge/fba67a16-5f4c-4ca7-9977-0a3d6a18c28e/scratchpad/probe; RUNNER=/tmp/claude-1000/-home-thekeeper-projects-deltaforge/fba67a16-5f4c-4ca7-9977-0a3d6a18c28e/scratchpad/perf/runner-avro4
+P=$(cd "$(dirname "$0")" && pwd); RUNNER=${1:?usage: gaps.sh <runner>}
 OUT=$P/gaps; rm -rf "$OUT"; mkdir -p "$OUT"
 NAME=seekprobe6-mysql; PW=pw
 docker rm -f -v $NAME >/dev/null 2>&1
@@ -18,7 +18,7 @@ done
 PORT=$(docker port $NAME 3306 | head -1 | cut -d: -f2)
 sql() { docker exec -i $NAME mysql -uroot -p$PW -N -B -e "$1" 2>/dev/null; }
 log() { echo "$*" | tee -a "$OUT/log"; }
-python3 -I $P/recv/receiver.py 18999 "$OUT/received.jsonl" & RECV=$!
+python3 -I $P/receiver.py 18999 "$OUT/received.jsonl" & RECV=$!
 sql "CREATE DATABASE g; CREATE TABLE g.t (id BIGINT PRIMARY KEY, a INT)"
 start_runner() {
   "$RUNNER" --api-addr 127.0.0.1:18080 --metrics-addr 127.0.0.1:19000 --storage-path "$OUT/state.db" >"$OUT/runner-$1.out" 2>"$OUT/runner-$1.err" & RPID=$!

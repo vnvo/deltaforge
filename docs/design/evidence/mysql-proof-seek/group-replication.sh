@@ -56,7 +56,7 @@ log "members online: $n"
   exit 1
 }
 PORT=$(docker port gr1 3306 | head -1 | cut -d: -f2)
-python3 -I "$P/../probe/recv/receiver.py" 18999 "$OUT/received.jsonl" & RECV=$!
+python3 -I "$P/receiver.py" 18999 "$OUT/received.jsonl" & RECV=$!
 sql gr1 "CREATE DATABASE g; CREATE TABLE g.t (id BIGINT PRIMARY KEY, a INT)"
 sleep 2
 start_runner() {
