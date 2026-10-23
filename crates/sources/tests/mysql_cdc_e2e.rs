@@ -849,6 +849,129 @@ async fn mysql_cdc_checkpoint_resume() -> Result<()> {
     Ok(())
 }
 
+/// The executed set's last transaction number of the server's own UUID.
+async fn last_own_gno(conn: &mut mysql_async::Conn) -> Result<(String, u64)> {
+    let (uuid, set): (String, String) = conn
+        .query_first("SELECT @@GLOBAL.server_uuid, @@GLOBAL.gtid_executed")
+        .await?
+        .expect("server uuid and executed set");
+    let set = set.replace('\n', "");
+    let entry = set
+        .split(',')
+        .find(|e| e.trim().starts_with(&uuid))
+        .expect("the server's own transactions");
+    let last = entry
+        .rsplit(':')
+        .next()
+        .and_then(|iv| iv.rsplit('-').next())
+        .and_then(|n| n.trim().parse().ok())
+        .expect("a transaction number");
+    Ok((uuid, last))
+}
+
+/// A gap in the server's executed set that fills while the source is
+/// down: with an explicit GTID, the server's set becomes `u:1-N:N+5`; then
+/// four rows committed while the source is stopped take `N+1..N+4`. The
+/// stored checkpoint must keep the gap, and after a restart every row of
+/// the gap is delivered exactly once. (Before exact GTID sets the
+/// checkpoint claimed `u:1-N+5`, and the server skipped the four rows.)
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_cdc_rows_filling_a_gtid_gap_are_delivered_after_a_restart()
+-> Result<()> {
+    let (db_name, pool, dsn) = mysql_setup("gtid_gap").await?;
+    let mut conn = pool.get_conn().await?;
+    conn.query_drop(format!("USE {db_name}")).await?;
+    conn.query_drop(
+        "CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64))",
+    )
+    .await?;
+    let tables = vec![format!("{db_name}.orders")];
+    let ckpt_store: Arc<dyn CheckpointStore> =
+        Arc::new(MemCheckpointStore::new()?);
+    let key = "gtid-gap";
+
+    // First run: a normal row, then a row with an explicit GTID past a gap.
+    let (uuid, n) = {
+        let src =
+            make_source(key, &dsn, tables.clone(), AllowList::default()).await;
+        let (tx, mut rx) =
+            test_common::acked_channel(&src, &ckpt_store, key, 128);
+        let handle = src.run(tx, ckpt_store.clone()).await;
+        wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
+        sleep(Duration::from_secs(3)).await;
+        conn.query_drop("INSERT INTO orders VALUES (1, 'normal')")
+            .await?;
+        let (uuid, n) = last_own_gno(&mut conn).await?;
+        conn.query_drop(format!("SET gtid_next = '{uuid}:{}'", n + 5))
+            .await?;
+        conn.query_drop("INSERT INTO orders VALUES (2, 'past-the-gap')")
+            .await?;
+        conn.query_drop("SET gtid_next = 'AUTOMATIC'").await?;
+        let events =
+            collect_events_until(&mut rx, Duration::from_secs(15), |evts| {
+                evts.iter().any(|e| event_has_id(e, 2))
+            })
+            .await;
+        assert!(events.iter().any(|e| event_has_id(e, 2)), "row 2 delivered");
+        // Let the acknowledged checkpoint of row 2 land.
+        sleep(Duration::from_secs(2)).await;
+        handle.stop();
+        let _ = handle.join().await;
+        (uuid, n)
+    };
+
+    // The stored checkpoint is exact: it holds N+5, and not N+1..N+4.
+    let raw = ckpt_store.get_raw(key).await?.expect("a stored checkpoint");
+    let cp: MySqlCheckpoint = serde_json::from_slice(&raw)?;
+    let stored =
+        sources::gtid_set::GtidSet::parse(cp.gtid_set.as_deref().unwrap())
+            .expect("a parseable set");
+    assert!(stored.contains(&format!("{uuid}:{}", n + 5)), "{stored}");
+    for g in n + 1..=n + 4 {
+        assert!(
+            !stored.contains(&format!("{uuid}:{g}")),
+            "the checkpoint claims {uuid}:{g}, never executed: {stored}"
+        );
+    }
+
+    // While the source is down, four rows fill the gap (N+1..N+4).
+    for id in 3..=6 {
+        conn.query_drop(format!(
+            "INSERT INTO orders VALUES ({id}, 'in-the-gap')"
+        ))
+        .await?;
+    }
+    let (_, after) = last_own_gno(&mut conn).await?;
+    assert_eq!(after, n + 5, "the four rows took the gap's numbers");
+
+    // Second run: every row of the gap, exactly once, then a new row.
+    let src = make_source(key, &dsn, tables, AllowList::default()).await;
+    let (tx, mut rx) = test_common::acked_channel(&src, &ckpt_store, key, 128);
+    let handle = src.run(tx, ckpt_store.clone()).await;
+    wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
+    sleep(Duration::from_secs(3)).await;
+    conn.query_drop("INSERT INTO orders VALUES (7, 'after-restart')")
+        .await?;
+    let events =
+        collect_events_until(&mut rx, Duration::from_secs(20), |evts| {
+            evts.iter().any(|e| event_has_id(e, 7))
+        })
+        .await;
+    handle.stop();
+    let _ = handle.join().await;
+    for id in 3..=6 {
+        let got = events.iter().filter(|e| event_has_id(e, id)).count();
+        assert_eq!(got, 1, "row {id} (in the gap) delivered {got} times");
+    }
+    assert!(
+        events.iter().any(|e| event_has_id(e, 7)),
+        "the stream is live"
+    );
+    mysql_drop_db(&pool, &db_name).await;
+    Ok(())
+}
+
 /// A compressed transaction (`binlog_transaction_compression = ON`) is
 /// delivered like any other: every row, then its commit boundary at the
 /// position after the transaction. Resuming from that boundary neither

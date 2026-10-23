@@ -2589,6 +2589,116 @@ mod tests {
         /// The shared proof scanner equals direct scans on a real server:
         /// nested and overlapping requests over a workload with DDL (create,
         /// alter, rename, a database operation) between DML.
+        /// A DDL committed inside a gap of boundary A's GTID set (with a
+        /// number below A's highest) belongs to (A,B]: it is proved, and the
+        /// shared and direct scans agree. An A that over-claims the gap (as
+        /// `merge_gtid` once produced) would have the server skip it.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_ddl_filling_a_gtid_gap_after_the_boundary_is_proved() {
+            use super::super::super::mysql_proof_scanner::{
+                LiveSegments, ProofScanner,
+            };
+            let dsn = server(true).await;
+            let id = uuid(&dsn).await;
+            let db = "scan_gtid_gap";
+            sql(
+                &dsn,
+                &[
+                    &format!("CREATE DATABASE IF NOT EXISTS {db}"),
+                    &format!(
+                        "CREATE TABLE IF NOT EXISTS {db}.t (a INT PRIMARY KEY)"
+                    ),
+                    &format!("DELETE FROM {db}.t"),
+                ],
+            )
+            .await;
+            let own_last = |p: &MySqlCheckpoint| {
+                GtidSet::parse(p.gtid_set.as_deref().unwrap())
+                    .unwrap()
+                    .intervals()
+                    .find(|(u, _)| u.eq_ignore_ascii_case(&id))
+                    .and_then(|(_, ivs)| ivs.last().map(|iv| iv.1))
+                    .unwrap()
+            };
+            let n = own_last(&position(&dsn).await);
+            // Leave a gap: a transaction with an explicit, later number.
+            // Other tests' automatic GTIDs take the lowest free numbers, so
+            // the gap is wide and the DDL's number explicit too.
+            sql(
+                &dsn,
+                &[
+                    &format!("SET gtid_next = '{id}:{}'", n + 100),
+                    &format!("INSERT INTO {db}.t VALUES (1)"),
+                    "SET gtid_next = 'AUTOMATIC'",
+                ],
+            )
+            .await;
+            let a = position(&dsn).await;
+            let in_gap = format!("{id}:{}", n + 50);
+            let a_set = GtidSet::parse(a.gtid_set.as_deref().unwrap()).unwrap();
+            assert!(!a_set.contains(&in_gap), "A keeps the gap: {a_set}");
+            sql(
+                &dsn,
+                &[
+                    &format!("SET gtid_next = '{in_gap}'"),
+                    &format!("ALTER TABLE {db}.t ADD COLUMN c INT"),
+                    "SET gtid_next = 'AUTOMATIC'",
+                ],
+            )
+            .await;
+            // The rest of the gap fills, as it does later on a real server
+            // (then an A over-claiming the gap is ordered before B).
+            let mut fill = Vec::new();
+            for g in (n + 1..n + 100).filter(|g| *g != n + 50) {
+                fill.push(format!("SET gtid_next = '{id}:{g}'"));
+                fill.push(format!("INSERT INTO {db}.t (a) VALUES ({g})"));
+            }
+            fill.push("SET gtid_next = 'AUTOMATIC'".into());
+            sql(&dsn, &fill.iter().map(String::as_str).collect::<Vec<_>>())
+                .await;
+            let b = position(&dsn).await;
+            let direct = scan(&dsn, &a, &b).await.unwrap();
+            let in_proof = |r: &ScanReport| {
+                r.statements.iter().any(|st| {
+                    matches!(&st.event, EventIdentity::Gtid { gtid, .. } if *gtid == in_gap)
+                })
+            };
+            assert!(
+                in_proof(&direct),
+                "the DDL in the gap is proved: {:?}",
+                direct.statements
+            );
+            // Shared and direct agree on the gapped interval.
+            let scanner = ProofScanner::default();
+            let segments = LiveSegments {
+                dsn: &dsn,
+                server_id: 4_000_151,
+                server_uuid: &id,
+                lineage_hash: LINEAGE,
+                limits: ScanLimits::default(),
+            };
+            let shared = scanner
+                .interval(&segments, &id, LINEAGE, &a, &b, Some(&a), &TAG)
+                .await
+                .unwrap();
+            assert_eq!(shared.statements, direct.statements);
+            assert_eq!(shared.digest, direct.digest);
+            // What the defect did: an A claiming the gap is ordered before
+            // B, and its scan silently misses the DDL.
+            let mut over = a.clone();
+            let mut claimed = a_set.clone();
+            for g in n + 1..=n + 100 {
+                assert!(claimed.insert(&format!("{id}:{g}")));
+            }
+            over.gtid_set = Some(claimed.to_string());
+            let missed = scan(&dsn, &over, &b).await.unwrap();
+            assert!(
+                !in_proof(&missed),
+                "an over-claimed A skips the gap's DDL"
+            );
+        }
+
         async fn shared_equals_direct(gtid: bool, db: &str) {
             use super::super::super::mysql_proof_scanner::{
                 LiveSegments, ProofScanner,
