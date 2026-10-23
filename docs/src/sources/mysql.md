@@ -102,6 +102,15 @@ DeltaForge automatically checkpoints progress and resumes from the last position
 
 Checkpoints are stored using the `id` field as the key.
 
+### GTID sets are exact
+
+A GTID checkpoint holds exactly the transactions DeltaForge has seen or resumed past, gaps included. Gaps in a server's executed set are normal:
+
+- **Group Replication and InnoDB Cluster** members assign GTIDs of the group's UUID from their own blocks (`group_replication_gtid_assignment_block_size`, 1,000,000 by default). A group whose members both write has an executed set such as `group:1-3:1000001`, and the gap fills as the first member commits more.
+- **An explicitly assigned GTID** (`SET gtid_next`) leaves the numbers below it free for later transactions.
+
+A checkpoint that claimed such a gap would make the server skip the transactions that fill it on resume. Earlier versions stored `group:1-3:1000001` as `group:1-1000001`; on a group, every row the first member committed after a restart was then lost. Such checkpoints are refused (see [MySQL GTID state from earlier versions](../checkpoints.md#mysql-gtid-state-from-earlier-versions)).
+
 ## Snapshot (Initial Load)
 
 DeltaForge can perform a consistent initial snapshot of existing table data before
