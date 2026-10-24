@@ -125,6 +125,36 @@ impl FaultBackend {
 
 #[async_trait::async_trait]
 impl StorageBackend for FaultBackend {
+    async fn read_batch(
+        &self,
+        reads: &[crate::BatchRead],
+    ) -> Result<Vec<crate::BatchReadResult>> {
+        self.inner.read_batch(reads).await
+    }
+    /// A write fault in any op's namespace fails the whole batch before it
+    /// reaches the store: an atomic batch writes all or nothing.
+    async fn apply_batch(
+        &self,
+        batch: &crate::AtomicBatch,
+    ) -> Result<crate::BatchOutcome> {
+        for op in &batch.ops {
+            let ns = match op {
+                crate::BatchOp::LogAppendIfAbsent { ns, .. }
+                | crate::BatchOp::KvPut { ns, .. }
+                | crate::BatchOp::KvMaxSeq { ns, .. } => ns,
+            };
+            self.write(ns)?;
+        }
+        self.inner.apply_batch(batch).await
+    }
+    async fn log_find_capture(
+        &self,
+        ns: &str,
+        key: &str,
+        capture_id: &str,
+    ) -> Result<Option<(u64, Vec<u8>)>> {
+        self.inner.log_find_capture(ns, key, capture_id).await
+    }
     async fn kv_get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {
         anyhow::ensure!(
             !self.fail_kv_get.load(Ordering::SeqCst),

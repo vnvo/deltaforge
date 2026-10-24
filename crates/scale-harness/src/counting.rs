@@ -192,6 +192,36 @@ impl CountingBackend {
 
 #[async_trait]
 impl StorageBackend for CountingBackend {
+    async fn read_batch(
+        &self,
+        reads: &[storage::BatchRead],
+    ) -> Result<Vec<storage::BatchReadResult>> {
+        for r in reads {
+            let (storage::BatchRead::KvGet { ns, key }
+            | storage::BatchRead::LogLatest { ns, key }
+            | storage::BatchRead::LogHead { ns, key }
+            | storage::BatchRead::LogLen { ns, key }) = r;
+            if !self.is_uncounted(ns, key) {
+                self.read("read_batch", ns, key);
+            }
+        }
+        self.inner.read_batch(reads).await
+    }
+    async fn apply_batch(
+        &self,
+        batch: &storage::AtomicBatch,
+    ) -> Result<storage::BatchOutcome> {
+        self.inner.apply_batch(batch).await
+    }
+    async fn log_find_capture(
+        &self,
+        ns: &str,
+        key: &str,
+        capture_id: &str,
+    ) -> Result<Option<(u64, Vec<u8>)>> {
+        self.read("log_find_capture", ns, key);
+        self.inner.log_find_capture(ns, key, capture_id).await
+    }
     async fn kv_get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {
         if self.is_uncounted(ns, key) {
             return self.inner.kv_get(ns, key).await;

@@ -221,6 +221,395 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
         key: &str,
         count: usize,
     ) -> Result<usize>;
+
+    /// Read `reads` from one consistent snapshot (see [`AtomicBatch`]). The
+    /// default reads them one by one and is for test doubles only; every
+    /// production backend overrides it.
+    async fn read_batch(
+        &self,
+        reads: &[BatchRead],
+    ) -> Result<Vec<BatchReadResult>> {
+        let mut out = Vec::with_capacity(reads.len());
+        for r in reads {
+            out.push(match r {
+                BatchRead::KvGet { ns, key } => {
+                    BatchReadResult::Kv(self.kv_get(ns, key).await?)
+                }
+                BatchRead::LogLatest { ns, key } => {
+                    BatchReadResult::Latest(self.log_latest(ns, key).await?)
+                }
+                BatchRead::LogHead { ns, key } => BatchReadResult::Head(
+                    self.log_latest(ns, key).await?.map_or(0, |(seq, _)| seq),
+                ),
+                BatchRead::LogLen { ns, key } => BatchReadResult::Len(
+                    self.log_stream_meta(ns, key).await?.len,
+                ),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Apply `batch` atomically (see [`AtomicBatch`]). The default refuses:
+    /// a backend that cannot commit atomically never pretends to.
+    async fn apply_batch(&self, _batch: &AtomicBatch) -> Result<BatchOutcome> {
+        Err(anyhow::anyhow!(
+            "this storage backend does not support atomic batches"
+        ))
+    }
+
+    /// The entry stored under `capture_id` in `(ns, key)`, if any.
+    async fn log_find_capture(
+        &self,
+        ns: &str,
+        key: &str,
+        capture_id: &str,
+    ) -> Result<Option<(u64, Vec<u8>)>> {
+        let mut since = 0;
+        loop {
+            let page = self.log_read_meta_since(ns, key, since, 1024).await?;
+            for e in &page {
+                if e.capture_id.as_deref() == Some(capture_id) {
+                    return Ok(Some((e.seq, e.value.clone())));
+                }
+            }
+            match page.last() {
+                Some(last) if page.len() == 1024 => since = last.seq,
+                _ => return Ok(None),
+            }
+        }
+    }
+}
+
+// ---- atomic batches ---------------------------------------------------------
+
+/// One read of [`StorageBackend::read_batch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchRead {
+    KvGet {
+        ns: String,
+        key: String,
+    },
+    /// The last entry of a stream.
+    LogLatest {
+        ns: String,
+        key: String,
+    },
+    /// The sequence of a stream's last entry (0 when empty).
+    LogHead {
+        ns: String,
+        key: String,
+    },
+    /// The number of entries a stream retains.
+    LogLen {
+        ns: String,
+        key: String,
+    },
+}
+
+/// The result of one [`BatchRead`], in the same position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchReadResult {
+    Kv(Option<Vec<u8>>),
+    Latest(Option<(u64, Vec<u8>)>),
+    Head(u64),
+    Len(u64),
+}
+
+/// What a batch's decisions rest on, checked inside its transaction before
+/// any write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Precondition {
+    /// The stream's last sequence is still `seq` (0: still empty).
+    LogHead { ns: String, key: String, seq: u64 },
+    /// The key is still absent (`None`) or holds exactly these bytes.
+    KvIs {
+        ns: String,
+        key: String,
+        value: Option<Vec<u8>>,
+    },
+}
+
+/// A KV value: bytes, or a template into which the backend renders the
+/// sequence of the batch's log write `of` (in place of the decimal digits
+/// of [`SEQ_SENTINEL`], which must occur exactly once).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchValue {
+    Bytes(Vec<u8>),
+    SeqTemplate { template: Vec<u8>, of: usize },
+}
+
+/// The number whose decimal digits a [`BatchValue::SeqTemplate`] carries in
+/// place of a sequence.
+pub const SEQ_SENTINEL: u64 = u64::MAX;
+
+/// One write of an [`AtomicBatch`]. `of` names an earlier log write of the
+/// same batch by its position in `ops`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchOp {
+    /// A new entry under a capture identity that must not exist yet.
+    LogAppendIfAbsent {
+        ns: String,
+        key: String,
+        capture_id: String,
+        value: Vec<u8>,
+    },
+    KvPut {
+        ns: String,
+        key: String,
+        value: BatchValue,
+    },
+    /// The key becomes the larger of its current number (JSON) and the
+    /// sequence of log write `of`.
+    KvMaxSeq { ns: String, key: String, of: usize },
+}
+
+/// Writes decided from reads, committed atomically:
+///
+/// - every precondition is checked first, inside the transaction; any
+///   failure writes nothing ([`BatchOutcome::Conflict`]);
+/// - the log writes receive one contiguous range of global sequences, in
+///   the order of `ops`, invisible until the commit;
+/// - all writes commit together or none do.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AtomicBatch {
+    pub preconditions: Vec<Precondition>,
+    pub ops: Vec<BatchOp>,
+}
+
+/// The outcome of [`StorageBackend::apply_batch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchOutcome {
+    /// The committed sequence of every op (`Some` for log writes).
+    Committed { seqs: Vec<Option<u64>> },
+    /// Nothing was written: a precondition no longer holds (or a log write's
+    /// identity already exists).
+    Conflict { why: String },
+}
+
+/// A batch whose read-back finds only part of it, or different bytes: the
+/// store did not behave atomically.
+#[derive(Debug, thiserror::Error)]
+#[error("atomic batch violated: {0}")]
+pub struct AtomicityViolation(pub String);
+
+impl AtomicBatch {
+    /// Check the batch's own shape before any backend work: every `of`
+    /// names an earlier log write, and every template carries the sentinel
+    /// exactly once.
+    pub fn validate(&self) -> Result<()> {
+        let sentinel = SEQ_SENTINEL.to_string();
+        for (i, op) in self.ops.iter().enumerate() {
+            let of = match op {
+                BatchOp::LogAppendIfAbsent { .. } => continue,
+                BatchOp::KvPut {
+                    value: BatchValue::Bytes(_),
+                    ..
+                } => continue,
+                BatchOp::KvPut {
+                    value: BatchValue::SeqTemplate { template, of },
+                    ..
+                } => {
+                    let text = String::from_utf8_lossy(template);
+                    anyhow::ensure!(
+                        text.matches(&sentinel).count() == 1,
+                        "batch op {i}: the template must carry the sequence sentinel once"
+                    );
+                    *of
+                }
+                BatchOp::KvMaxSeq { of, .. } => *of,
+            };
+            anyhow::ensure!(
+                of < i
+                    && matches!(
+                        self.ops[of],
+                        BatchOp::LogAppendIfAbsent { .. }
+                    ),
+                "batch op {i}: `of` {of} is not an earlier log write"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `template` with the sequence `seq` in place of the sentinel.
+pub fn render_seq(template: &[u8], seq: u64) -> Vec<u8> {
+    let text = String::from_utf8_lossy(template);
+    text.replacen(&SEQ_SENTINEL.to_string(), &seq.to_string(), 1)
+        .into_bytes()
+}
+
+/// The larger of a stored JSON number (absent: 0) and `seq`, as JSON.
+pub fn max_seq_value(current: Option<&[u8]>, seq: u64) -> Result<Vec<u8>> {
+    let cur = match current {
+        Some(b) => serde_json::from_slice::<u64>(b).map_err(|e| {
+            anyhow::anyhow!("a sequence value is not a number: {e}")
+        })?,
+        None => 0,
+    };
+    Ok(serde_json::to_vec(&cur.max(seq))?)
+}
+
+/// The result of [`commit_atomic`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitResult {
+    /// Committed (now, or by an earlier attempt whose acknowledgement was
+    /// lost): the sequence of every op.
+    Committed(Vec<Option<u64>>),
+    /// A precondition failed: re-read, decide again and retry.
+    Conflict(String),
+}
+
+/// Commit `batch`, resolving ambiguous outcomes. An `apply_batch` error may
+/// or may not have committed, so every log write's identity is read back:
+/// none stored, the same batch is applied again (at most `retries` more
+/// times); all stored with exactly the intended bytes, the earlier commit
+/// succeeded and its stored sequences are returned (templated KV values
+/// checked against them, no new allocation); anything else is an
+/// [`AtomicityViolation`].
+pub async fn commit_atomic(
+    be: &dyn StorageBackend,
+    batch: &AtomicBatch,
+    retries: usize,
+) -> Result<CommitResult> {
+    batch.validate()?;
+    let mut attempt = 0;
+    loop {
+        let err = match be.apply_batch(batch).await {
+            Ok(BatchOutcome::Committed { seqs }) => {
+                return Ok(CommitResult::Committed(seqs));
+            }
+            Ok(BatchOutcome::Conflict { why }) => {
+                return Ok(CommitResult::Conflict(why));
+            }
+            Err(e) => e,
+        };
+        attempt += 1;
+        // The read-back itself may fail transiently: retried, never skipped.
+        let mut reads = 0;
+        let found = loop {
+            match read_back(be, batch).await {
+                Ok(found) => break found,
+                Err(e) if reads < retries => {
+                    reads += 1;
+                    tracing::warn!(error = %e, "atomic batch: read-back failed; retrying it");
+                }
+                Err(e) => {
+                    return Err(e.context(format!(
+                        "atomic batch: outcome unknown after the error {err:#}"
+                    )));
+                }
+            }
+        };
+        match found {
+            ReadBack::None if attempt <= retries => {
+                tracing::warn!(error = %err, attempt, "atomic batch: not committed; applying it again");
+            }
+            ReadBack::None => {
+                return Err(err.context(format!(
+                    "atomic batch: not committed after {attempt} attempts"
+                )));
+            }
+            ReadBack::All(seqs) => return Ok(CommitResult::Committed(seqs)),
+            ReadBack::Partial(why) => {
+                return Err(AtomicityViolation(why).into());
+            }
+        }
+    }
+}
+
+enum ReadBack {
+    None,
+    All(Vec<Option<u64>>),
+    Partial(String),
+}
+
+async fn read_back(
+    be: &dyn StorageBackend,
+    batch: &AtomicBatch,
+) -> Result<ReadBack> {
+    let mut seqs = vec![None; batch.ops.len()];
+    let (mut present, mut absent) = (0usize, 0usize);
+    for (i, op) in batch.ops.iter().enumerate() {
+        if let BatchOp::LogAppendIfAbsent {
+            ns,
+            key,
+            capture_id,
+            value,
+        } = op
+        {
+            match be.log_find_capture(ns, key, capture_id).await? {
+                Some((seq, stored)) if &stored == value => {
+                    seqs[i] = Some(seq);
+                    present += 1;
+                }
+                Some(_) => {
+                    return Ok(ReadBack::Partial(format!(
+                        "{capture_id} in {key} holds other bytes"
+                    )));
+                }
+                None => absent += 1,
+            }
+        }
+    }
+    if present == 0 {
+        return Ok(ReadBack::None);
+    }
+    if absent > 0 {
+        return Ok(ReadBack::Partial(format!(
+            "{present} of {} log writes are stored",
+            present + absent
+        )));
+    }
+    // Every log write is stored: its KV writes must be too.
+    for op in &batch.ops {
+        match op {
+            BatchOp::KvPut { ns, key, value } => {
+                let want = match value {
+                    BatchValue::Bytes(b) => b.clone(),
+                    BatchValue::SeqTemplate { template, of } => {
+                        render_seq(template, seqs[*of].expect("validated"))
+                    }
+                };
+                if be.kv_get(ns, key).await?.as_deref() != Some(want.as_slice())
+                {
+                    return Ok(ReadBack::Partial(format!(
+                        "{key} does not hold its write"
+                    )));
+                }
+            }
+            BatchOp::KvMaxSeq { ns, key, of } => {
+                let stored = be.kv_get(ns, key).await?;
+                let n = stored
+                    .as_deref()
+                    .map(serde_json::from_slice::<u64>)
+                    .transpose()?
+                    .unwrap_or(0);
+                if n < seqs[*of].expect("validated") {
+                    return Ok(ReadBack::Partial(format!(
+                        "{key} is below its write"
+                    )));
+                }
+            }
+            BatchOp::LogAppendIfAbsent { .. } => {}
+        }
+    }
+    Ok(ReadBack::All(seqs))
+}
+
+/// Test-only fault points of `apply_batch` (each backend honors them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchFault {
+    /// Fail before the transaction starts.
+    BeforeTransaction,
+    /// Fail after this many writes are staged, before the commit.
+    AfterWrites(usize),
+    /// Commit, then report an error (an acknowledgement lost).
+    AfterCommit,
+}
+
+/// Fault injection into `apply_batch`, for the conformance suite.
+pub trait BatchFaults {
+    fn set_batch_fault(&self, fault: Option<BatchFault>);
 }
 
 pub type ArcStorageBackend = Arc<dyn StorageBackend>;
@@ -1058,5 +1447,329 @@ pub(crate) mod slot_list_contract_suite {
                 be.slot_list(ns, Some("p"), Some(bad), 2).await.unwrap_err();
             assert!(is_malformed(&e), "arbitrary input {bad:?}: {e}");
         }
+    }
+}
+
+/// Shared conformance suite of atomic batches, run against every backend.
+#[cfg(test)]
+pub(crate) mod atomic_batch_suite {
+    use super::*;
+
+    fn log(ns: &str, key: &str, id: &str, value: &[u8]) -> BatchOp {
+        BatchOp::LogAppendIfAbsent {
+            ns: ns.into(),
+            key: key.into(),
+            capture_id: id.into(),
+            value: value.to_vec(),
+        }
+    }
+
+    /// Two log writes, a version-index template and a high-water maximum.
+    fn sample(ns: &str, tag: &str) -> AtomicBatch {
+        AtomicBatch {
+            preconditions: vec![
+                Precondition::LogHead {
+                    ns: ns.into(),
+                    key: format!("{tag}/a"),
+                    seq: 0,
+                },
+                Precondition::KvIs {
+                    ns: ns.into(),
+                    key: format!("{tag}/idx"),
+                    value: None,
+                },
+            ],
+            ops: vec![
+                log(ns, &format!("{tag}/a"), "reg/1/h", b"entry-a"),
+                log(ns, &format!("{tag}/b"), "act/1", b"record-b"),
+                BatchOp::KvPut {
+                    ns: ns.into(),
+                    key: format!("{tag}/idx"),
+                    value: BatchValue::SeqTemplate {
+                        template: format!("{{\"sequence\":{SEQ_SENTINEL}}}")
+                            .into_bytes(),
+                        of: 0,
+                    },
+                },
+                BatchOp::KvMaxSeq {
+                    ns: ns.into(),
+                    key: format!("{tag}/hw"),
+                    of: 1,
+                },
+            ],
+        }
+    }
+
+    async fn nothing_written(be: &dyn StorageBackend, ns: &str, tag: &str) {
+        assert_eq!(
+            be.log_find_capture(ns, &format!("{tag}/a"), "reg/1/h")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            be.log_find_capture(ns, &format!("{tag}/b"), "act/1")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(be.kv_get(ns, &format!("{tag}/idx")).await.unwrap(), None);
+        assert_eq!(be.kv_get(ns, &format!("{tag}/hw")).await.unwrap(), None);
+    }
+
+    fn committed(o: BatchOutcome) -> Vec<Option<u64>> {
+        match o {
+            BatchOutcome::Committed { seqs } => seqs,
+            other => panic!("expected a commit: {other:?}"),
+        }
+    }
+
+    /// One contiguous range in the batch's order; templates rendered with
+    /// the committed sequences; the reads see it all.
+    pub async fn commits_atomically(be: Arc<dyn StorageBackend>, ns: &str) {
+        let seqs = committed(be.apply_batch(&sample(ns, "ok")).await.unwrap());
+        let (a, b) = (seqs[0].unwrap(), seqs[1].unwrap());
+        assert_eq!(b, a + 1, "contiguous, in order: {seqs:?}");
+        assert_eq!((seqs[2], seqs[3]), (None, None));
+        let reads = be
+            .read_batch(&[
+                BatchRead::LogHead {
+                    ns: ns.into(),
+                    key: "ok/a".into(),
+                },
+                BatchRead::LogLatest {
+                    ns: ns.into(),
+                    key: "ok/b".into(),
+                },
+                BatchRead::KvGet {
+                    ns: ns.into(),
+                    key: "ok/idx".into(),
+                },
+                BatchRead::KvGet {
+                    ns: ns.into(),
+                    key: "ok/hw".into(),
+                },
+                BatchRead::LogLen {
+                    ns: ns.into(),
+                    key: "ok/a".into(),
+                },
+                BatchRead::LogHead {
+                    ns: ns.into(),
+                    key: "ok/none".into(),
+                },
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            reads,
+            vec![
+                BatchReadResult::Head(a),
+                BatchReadResult::Latest(Some((b, b"record-b".to_vec()))),
+                BatchReadResult::Kv(Some(
+                    format!("{{\"sequence\":{a}}}").into_bytes()
+                )),
+                BatchReadResult::Kv(Some(b.to_string().into_bytes())),
+                BatchReadResult::Len(1),
+                BatchReadResult::Head(0),
+            ]
+        );
+        assert_eq!(
+            be.log_find_capture(ns, "ok/a", "reg/1/h").await.unwrap(),
+            Some((a, b"entry-a".to_vec()))
+        );
+    }
+
+    /// A stale precondition, or an identity that already exists, writes
+    /// nothing at all.
+    pub async fn conflicts_write_nothing(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
+        // The stream moved since it was read.
+        be.log_append(ns, "c1/a", b"other").await.unwrap();
+        let o = be.apply_batch(&sample(ns, "c1")).await.unwrap();
+        assert!(matches!(o, BatchOutcome::Conflict { .. }), "{o:?}");
+        assert_eq!(
+            be.log_find_capture(ns, "c1/b", "act/1").await.unwrap(),
+            None
+        );
+        assert_eq!(be.kv_get(ns, "c1/idx").await.unwrap(), None);
+        // A key that is no longer absent.
+        be.kv_put(ns, "c2/idx", b"x").await.unwrap();
+        let o = be.apply_batch(&sample(ns, "c2")).await.unwrap();
+        assert!(matches!(o, BatchOutcome::Conflict { .. }), "{o:?}");
+        assert_eq!(
+            be.log_find_capture(ns, "c2/a", "reg/1/h").await.unwrap(),
+            None
+        );
+        assert_eq!(be.kv_get(ns, "c2/hw").await.unwrap(), None);
+        // An identity of the batch already stored (a later write's).
+        be.log_append_if_absent(ns, "c3/b", "act/1", b"record-b")
+            .await
+            .unwrap();
+        let o = be.apply_batch(&sample(ns, "c3")).await.unwrap();
+        assert!(matches!(o, BatchOutcome::Conflict { .. }), "{o:?}");
+        assert_eq!(
+            be.log_find_capture(ns, "c3/a", "reg/1/h").await.unwrap(),
+            None
+        );
+        assert_eq!(be.kv_get(ns, "c3/idx").await.unwrap(), None);
+    }
+
+    /// A failure before the transaction, or midway through its writes,
+    /// leaves nothing; `commit_atomic` then applies the batch again.
+    pub async fn failures_leave_nothing(
+        be: Arc<dyn StorageBackend>,
+        faults: &dyn BatchFaults,
+        ns: &str,
+    ) {
+        faults.set_batch_fault(Some(BatchFault::BeforeTransaction));
+        assert!(be.apply_batch(&sample(ns, "f0")).await.is_err());
+        nothing_written(be.as_ref(), ns, "f0").await;
+        for at in 0..=4 {
+            let tag = format!("f{}", at + 1);
+            faults.set_batch_fault(Some(BatchFault::AfterWrites(at)));
+            assert!(be.apply_batch(&sample(ns, &tag)).await.is_err(), "{at}");
+            nothing_written(be.as_ref(), ns, &tag).await;
+        }
+        // Resolved: nothing was committed, so the batch is applied again.
+        faults.set_batch_fault(Some(BatchFault::AfterWrites(2)));
+        match commit_atomic(be.as_ref(), &sample(ns, "f9"), 3)
+            .await
+            .unwrap()
+        {
+            CommitResult::Committed(seqs) => assert!(seqs[0].is_some()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A commit whose acknowledgement was lost is recognized by read-back,
+    /// with its original sequences; nothing new is allocated.
+    pub async fn lost_acknowledgement_is_recovered(
+        be: Arc<dyn StorageBackend>,
+        faults: &dyn BatchFaults,
+        ns: &str,
+    ) {
+        faults.set_batch_fault(Some(BatchFault::AfterCommit));
+        let batch = sample(ns, "ack");
+        let seqs = match commit_atomic(be.as_ref(), &batch, 3).await.unwrap() {
+            CommitResult::Committed(seqs) => seqs,
+            other => panic!("{other:?}"),
+        };
+        let stored = be
+            .log_find_capture(ns, "ack/a", "reg/1/h")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(seqs[0], Some(stored.0));
+        assert_eq!(seqs[1], Some(stored.0 + 1));
+        // Nothing allocated after the original commit.
+        let next = be.log_append(ns, "ack/next", b"n").await.unwrap();
+        assert_eq!(
+            next,
+            stored.0 + 2,
+            "no replacement sequences were allocated"
+        );
+        assert_eq!(be.log_stream_meta(ns, "ack/a").await.unwrap().len, 1);
+    }
+
+    /// Only part of a batch stored is an atomicity violation, never a
+    /// success and never a retry.
+    pub async fn partial_read_back_is_a_violation(
+        be: Arc<dyn StorageBackend>,
+        faults: &dyn BatchFaults,
+        ns: &str,
+    ) {
+        be.log_append_if_absent(ns, "p/a", "reg/1/h", b"entry-a")
+            .await
+            .unwrap();
+        let mut batch = sample(ns, "p");
+        batch.preconditions.clear();
+        faults.set_batch_fault(Some(BatchFault::BeforeTransaction));
+        let err = commit_atomic(be.as_ref(), &batch, 3).await.unwrap_err();
+        assert!(
+            err.downcast_ref::<AtomicityViolation>().is_some(),
+            "{err:#}"
+        );
+        // Other bytes under an intended identity: also a violation.
+        be.log_append_if_absent(ns, "q/a", "reg/1/h", b"other")
+            .await
+            .unwrap();
+        let mut batch = sample(ns, "q");
+        batch.preconditions.clear();
+        faults.set_batch_fault(Some(BatchFault::BeforeTransaction));
+        let err = commit_atomic(be.as_ref(), &batch, 3).await.unwrap_err();
+        assert!(
+            err.downcast_ref::<AtomicityViolation>().is_some(),
+            "{err:#}"
+        );
+    }
+
+    /// Concurrent batches each take one contiguous range; the ranges are
+    /// disjoint.
+    pub async fn concurrent_batches_take_disjoint_ranges(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
+        let mut tasks = Vec::new();
+        for t in 0..8 {
+            let (be, ns) = (be.clone(), ns.to_string());
+            tasks.push(tokio::spawn(async move {
+                let ops = (0..5)
+                    .map(|i| {
+                        log(&ns, &format!("cc{t}/{i}"), &format!("id{i}"), b"v")
+                    })
+                    .collect();
+                let batch = AtomicBatch {
+                    preconditions: vec![],
+                    ops,
+                };
+                committed(be.apply_batch(&batch).await.unwrap())
+                    .into_iter()
+                    .map(|s| s.unwrap())
+                    .collect::<Vec<u64>>()
+            }));
+        }
+        let mut all = Vec::new();
+        for t in tasks {
+            let seqs = t.await.unwrap();
+            assert!(
+                seqs.windows(2).all(|w| w[1] == w[0] + 1),
+                "contiguous: {seqs:?}"
+            );
+            all.extend(seqs);
+        }
+        let n = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), n, "disjoint");
+    }
+
+    /// The whole suite.
+    pub async fn all(
+        be: Arc<dyn StorageBackend>,
+        faults: &dyn BatchFaults,
+        ns: &str,
+    ) {
+        commits_atomically(be.clone(), &format!("{ns}_ok")).await;
+        conflicts_write_nothing(be.clone(), &format!("{ns}_conf")).await;
+        failures_leave_nothing(be.clone(), faults, &format!("{ns}_fail")).await;
+        lost_acknowledgement_is_recovered(
+            be.clone(),
+            faults,
+            &format!("{ns}_ack"),
+        )
+        .await;
+        partial_read_back_is_a_violation(
+            be.clone(),
+            faults,
+            &format!("{ns}_part"),
+        )
+        .await;
+        concurrent_batches_take_disjoint_ranges(
+            be.clone(),
+            &format!("{ns}_conc"),
+        )
+        .await;
     }
 }

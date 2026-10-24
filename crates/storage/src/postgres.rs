@@ -21,9 +21,19 @@ use tokio::task::JoinHandle;
 use tracing::{error, info};
 
 use crate::{
-    AppendStatus, LogAppendOutcome, LogEntryMeta, LogError, LogStreamMeta,
-    LogTruncateOutcome, LogTruncateRequest, StorageBackend, content_digest,
+    AppendStatus, AtomicBatch, BatchFault, BatchFaults, BatchOp, BatchOutcome,
+    BatchRead, BatchReadResult, BatchValue, LogAppendOutcome, LogEntryMeta,
+    LogError, LogStreamMeta, LogTruncateOutcome, LogTruncateRequest,
+    Precondition, StorageBackend, content_digest, max_seq_value, render_seq,
 };
+
+/// The transaction-scoped advisory lock every log writer takes before it
+/// allocates a sequence: allocation, and so commit, order is serialized, and
+/// one transaction's entries take a contiguous range. A reader never sees a
+/// sequence before a lower one that commits later.
+const LOG_ALLOCATION_LOCK: i64 = 0x6466_5f6c_6f67; // "df_log"
+
+const LOCK_LOG_SQL: &str = "SELECT pg_advisory_xact_lock($1)";
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -125,6 +135,14 @@ const SLOT_LIST_SQL: &str = "SELECT key, version, state FROM df_slot
 pub struct PostgresStorageBackend {
     pool: Pool,
     _sweep_handle: JoinHandle<()>,
+    /// Test-only fault point of `apply_batch` (one shot).
+    batch_fault: std::sync::Mutex<Option<BatchFault>>,
+}
+
+impl BatchFaults for PostgresStorageBackend {
+    fn set_batch_fault(&self, fault: Option<BatchFault>) {
+        *self.batch_fault.lock().expect("batch fault") = fault;
+    }
 }
 
 impl std::fmt::Debug for PostgresStorageBackend {
@@ -182,11 +200,63 @@ impl PostgresStorageBackend {
         Ok(Arc::new(Self {
             pool,
             _sweep_handle: sweep_handle,
+            batch_fault: std::sync::Mutex::new(None),
         }))
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// A key's live value inside `tx` (an expired one reads as absent).
+async fn pg_kv_live(
+    tx: &deadpool_postgres::tokio_postgres::Transaction<'_>,
+    ns: &str,
+    key: &str,
+    now: i64,
+) -> Result<Option<Vec<u8>>> {
+    let row = tx
+        .query_opt(
+            "SELECT val, expires_at FROM df_kv WHERE ns=$1 AND key=$2",
+            &[&ns, &key],
+        )
+        .await?;
+    Ok(row.and_then(|r| {
+        let exp: Option<i64> = r.get(1);
+        (!exp.is_some_and(|e| e <= now)).then(|| r.get(0))
+    }))
+}
+
+/// A stream's last sequence inside `tx` (0 when empty).
+async fn pg_log_head(
+    tx: &deadpool_postgres::tokio_postgres::Transaction<'_>,
+    ns: &str,
+    key: &str,
+) -> Result<u64> {
+    Ok(tx
+        .query_opt(
+            "SELECT seq FROM df_log WHERE ns=$1 AND key=$2 ORDER BY seq DESC LIMIT 1",
+            &[&ns, &key],
+        )
+        .await?
+        .map_or(0, |r| r.get::<_, i64>(0) as u64))
+}
+
+async fn pg_kv_put(
+    tx: &deadpool_postgres::tokio_postgres::Transaction<'_>,
+    ns: &str,
+    key: &str,
+    value: &[u8],
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO df_kv(ns, key, val, updated_at, expires_at)
+         VALUES($1, $2, $3, $4, NULL)
+         ON CONFLICT(ns, key) DO UPDATE SET
+           val=EXCLUDED.val, updated_at=EXCLUDED.updated_at, expires_at=NULL",
+        &[&ns, &key, &value, &now_secs()],
+    )
+    .await?;
+    Ok(())
+}
 
 macro_rules! client {
     ($self:expr) => {
@@ -202,6 +272,163 @@ macro_rules! client {
 
 #[async_trait]
 impl StorageBackend for PostgresStorageBackend {
+    async fn read_batch(
+        &self,
+        reads: &[BatchRead],
+    ) -> Result<Vec<BatchReadResult>> {
+        let mut c = client!(self);
+        // One snapshot.
+        let tx = c
+            .build_transaction()
+            .isolation_level(deadpool_postgres::tokio_postgres::IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .await?;
+        let now = now_secs();
+        let mut out = Vec::with_capacity(reads.len());
+        for r in reads {
+            out.push(match r {
+                BatchRead::KvGet { ns, key } => BatchReadResult::Kv(pg_kv_live(&tx, ns, key, now).await?),
+                BatchRead::LogLatest { ns, key } => BatchReadResult::Latest(
+                    tx.query_opt(
+                        "SELECT seq, val FROM df_log WHERE ns=$1 AND key=$2 ORDER BY seq DESC LIMIT 1",
+                        &[ns, key],
+                    )
+                    .await?
+                    .map(|r| (r.get::<_, i64>(0) as u64, r.get(1))),
+                ),
+                BatchRead::LogHead { ns, key } => BatchReadResult::Head(pg_log_head(&tx, ns, key).await?),
+                BatchRead::LogLen { ns, key } => BatchReadResult::Len(
+                    tx.query_one(
+                        "SELECT COUNT(*) FROM df_log WHERE ns=$1 AND key=$2",
+                        &[ns, key],
+                    )
+                    .await?
+                    .get::<_, i64>(0) as u64,
+                ),
+            });
+        }
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    async fn apply_batch(&self, batch: &AtomicBatch) -> Result<BatchOutcome> {
+        batch.validate()?;
+        let fault = self.batch_fault.lock().expect("batch fault").take();
+        if fault == Some(BatchFault::BeforeTransaction) {
+            anyhow::bail!("injected failure before the transaction");
+        }
+        let mut c = client!(self);
+        // Serializable: a concurrent change to anything the preconditions
+        // read aborts this transaction (an error the caller resolves by
+        // read-back). Dropped without a commit, it rolls back.
+        let tx = c
+            .build_transaction()
+            .isolation_level(
+                deadpool_postgres::tokio_postgres::IsolationLevel::Serializable,
+            )
+            .start()
+            .await?;
+        tx.execute(LOCK_LOG_SQL, &[&LOG_ALLOCATION_LOCK]).await?;
+        let now = now_secs();
+        for (i, p) in batch.preconditions.iter().enumerate() {
+            let holds = match p {
+                Precondition::LogHead { ns, key, seq } => {
+                    pg_log_head(&tx, ns, key).await? == *seq
+                }
+                Precondition::KvIs { ns, key, value } => {
+                    pg_kv_live(&tx, ns, key, now).await? == *value
+                }
+            };
+            if !holds {
+                return Ok(BatchOutcome::Conflict {
+                    why: format!("precondition {i} no longer holds ({p:?})"),
+                });
+            }
+        }
+        let mut seqs: Vec<Option<u64>> = vec![None; batch.ops.len()];
+        for (i, op) in batch.ops.iter().enumerate() {
+            if fault == Some(BatchFault::AfterWrites(i)) {
+                anyhow::bail!("injected failure after {i} staged writes");
+            }
+            match op {
+                BatchOp::LogAppendIfAbsent {
+                    ns,
+                    key,
+                    capture_id,
+                    value,
+                } => {
+                    tx.execute(ENSURE_LOG_META_SQL, &[ns, key]).await?;
+                    let inserted = tx
+                        .query_opt(
+                            "INSERT INTO df_log(ns, key, val, ts, ts_ms, capture_id, content_hash)
+                             VALUES($1, $2, $3, $4, $5, $6, $7)
+                             ON CONFLICT (ns, key, capture_id) WHERE capture_id IS NOT NULL
+                             DO NOTHING
+                             RETURNING seq",
+                            &[ns, key, value, &now_secs(), &now_ms(), capture_id, &content_digest(value)],
+                        )
+                        .await?;
+                    let Some(row) = inserted else {
+                        return Ok(BatchOutcome::Conflict {
+                            why: format!(
+                                "{capture_id} already exists in {key}"
+                            ),
+                        });
+                    };
+                    let seq: i64 = row.get(0);
+                    tx.execute(
+                        "UPDATE df_log_meta SET head_seq=GREATEST(head_seq, $3) WHERE ns=$1 AND key=$2",
+                        &[ns, key, &seq],
+                    )
+                    .await?;
+                    seqs[i] = Some(seq as u64);
+                }
+                BatchOp::KvPut { ns, key, value } => {
+                    let bytes = match value {
+                        BatchValue::Bytes(b) => b.clone(),
+                        BatchValue::SeqTemplate { template, of } => {
+                            render_seq(template, seqs[*of].expect("validated"))
+                        }
+                    };
+                    pg_kv_put(&tx, ns, key, &bytes).await?;
+                }
+                BatchOp::KvMaxSeq { ns, key, of } => {
+                    let current = pg_kv_live(&tx, ns, key, now).await?;
+                    let bytes = max_seq_value(
+                        current.as_deref(),
+                        seqs[*of].expect("validated"),
+                    )?;
+                    pg_kv_put(&tx, ns, key, &bytes).await?;
+                }
+            }
+        }
+        if fault == Some(BatchFault::AfterWrites(batch.ops.len())) {
+            anyhow::bail!("injected failure after every write was staged");
+        }
+        tx.commit().await?;
+        if fault == Some(BatchFault::AfterCommit) {
+            anyhow::bail!("injected failure after the commit");
+        }
+        Ok(BatchOutcome::Committed { seqs })
+    }
+
+    async fn log_find_capture(
+        &self,
+        ns: &str,
+        key: &str,
+        capture_id: &str,
+    ) -> Result<Option<(u64, Vec<u8>)>> {
+        let c = client!(self);
+        Ok(c
+            .query_opt(
+                "SELECT seq, val FROM df_log WHERE ns=$1 AND key=$2 AND capture_id=$3",
+                &[&ns, &key, &capture_id],
+            )
+            .await?
+            .map(|r| (r.get::<_, i64>(0) as u64, r.get(1))))
+    }
+
     // ── KV ──────────────────────────────────────────────────────────────────
 
     async fn kv_get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {
@@ -314,6 +541,7 @@ impl StorageBackend for PostgresStorageBackend {
     ) -> Result<u64> {
         let mut c = client!(self);
         let tx = c.transaction().await?;
+        tx.execute(LOCK_LOG_SQL, &[&LOG_ALLOCATION_LOCK]).await?;
         let row = tx
             .query_one(
                 "INSERT INTO df_log(ns, key, val, ts, ts_ms) VALUES($1, $2, $3, $4, $5) RETURNING seq",
@@ -404,6 +632,7 @@ impl StorageBackend for PostgresStorageBackend {
         let digest = content_digest(value);
         let mut c = client!(self);
         let tx = c.transaction().await?;
+        tx.execute(LOCK_LOG_SQL, &[&LOG_ALLOCATION_LOCK]).await?;
         tx.execute(ENSURE_LOG_META_SQL, &[&ns, &key]).await?;
         // Race-safe insert: attempt it directly and let the partial unique index
         // arbitrate. A concurrent inserter with the same capture_id makes this a
@@ -907,6 +1136,23 @@ mod tests {
         suite::empty_vs_truncated(be.clone(), &format!("it{base}_empty")).await;
         suite::concurrent_appends(be.clone(), &format!("it{base}_conc")).await;
         suite::ns_max_seq_scoped(be.clone(), &format!("it{base}_nsmax")).await;
+    }
+
+    /// The shared atomic-batch conformance suite against a live PostgreSQL
+    /// (env-gated like the log contracts).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires a live PostgreSQL (DELTAFORGE_IT_PG_DSN)"]
+    async fn pg_atomic_batch_conformance() {
+        let dsn = std::env::var("DELTAFORGE_IT_PG_DSN")
+            .expect("DELTAFORGE_IT_PG_DSN must be set to run this test");
+        let be = PostgresStorageBackend::connect(&dsn).await.unwrap();
+        let dynbe: Arc<dyn StorageBackend> = be.clone();
+        crate::atomic_batch_suite::all(
+            dynbe,
+            be.as_ref(),
+            &format!("it{}_batch", now_ms()),
+        )
+        .await;
     }
 
     /// A fresh database whose default collation is NOT "C", with the schema

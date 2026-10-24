@@ -3,8 +3,10 @@
 //! State is lost on drop. Not suitable for production.
 
 use crate::{
-    AppendStatus, LogAppendOutcome, LogEntryMeta, LogError, LogStreamMeta,
-    LogTruncateOutcome, LogTruncateRequest, StorageBackend, content_digest,
+    AppendStatus, AtomicBatch, BatchFault, BatchFaults, BatchOp, BatchOutcome,
+    BatchRead, BatchReadResult, BatchValue, LogAppendOutcome, LogEntryMeta,
+    LogError, LogStreamMeta, LogTruncateOutcome, LogTruncateRequest,
+    Precondition, StorageBackend, content_digest, max_seq_value, render_seq,
 };
 use anyhow::Result;
 
@@ -108,6 +110,14 @@ pub struct MemoryStorageBackend {
     queue: RwLock<QueueStore>,
     global_seq: AtomicU64,
     queue_id: AtomicU64,
+    /// Test-only fault point of `apply_batch` (one shot).
+    batch_fault: std::sync::Mutex<Option<BatchFault>>,
+}
+
+impl BatchFaults for MemoryStorageBackend {
+    fn set_batch_fault(&self, fault: Option<BatchFault>) {
+        *self.batch_fault.lock().expect("batch fault") = fault;
+    }
 }
 
 impl MemoryStorageBackend {
@@ -126,6 +136,193 @@ impl MemoryStorageBackend {
 
 #[async_trait]
 impl StorageBackend for MemoryStorageBackend {
+    async fn read_batch(
+        &self,
+        reads: &[BatchRead],
+    ) -> Result<Vec<BatchReadResult>> {
+        // One snapshot: both stores held for the whole batch.
+        let log = self.log.read().await;
+        let kv = self.kv.read().await;
+        Ok(reads
+            .iter()
+            .map(|r| match r {
+                BatchRead::KvGet { ns, key } => BatchReadResult::Kv(
+                    kv.0.get(&(ns.clone(), key.clone()))
+                        .filter(|e| !e.is_expired())
+                        .map(|e| e.value.clone()),
+                ),
+                BatchRead::LogLatest { ns, key } => BatchReadResult::Latest(
+                    log.entries
+                        .get(&(ns.clone(), key.clone()))
+                        .and_then(|v| v.last())
+                        .map(|e| (e.seq, e.value.clone())),
+                ),
+                BatchRead::LogHead { ns, key } => BatchReadResult::Head(
+                    log.entries
+                        .get(&(ns.clone(), key.clone()))
+                        .and_then(|v| v.last())
+                        .map_or(0, |e| e.seq),
+                ),
+                BatchRead::LogLen { ns, key } => BatchReadResult::Len(
+                    log.entries
+                        .get(&(ns.clone(), key.clone()))
+                        .map_or(0, |v| v.len() as u64),
+                ),
+            })
+            .collect())
+    }
+
+    async fn apply_batch(&self, batch: &AtomicBatch) -> Result<BatchOutcome> {
+        batch.validate()?;
+        let fault = self.batch_fault.lock().expect("batch fault").take();
+        if fault == Some(BatchFault::BeforeTransaction) {
+            anyhow::bail!("injected failure before the transaction");
+        }
+        // One critical section: the log lock is held across allocation and
+        // application, so the range is contiguous and nothing interleaves.
+        let mut log = self.log.write().await;
+        let mut kv = self.kv.write().await;
+        let kv_value = |kv: &KvStore, ns: &str, key: &str| {
+            kv.0.get(&(ns.to_string(), key.to_string()))
+                .filter(|e| !e.is_expired())
+                .map(|e| e.value.clone())
+        };
+        for (i, p) in batch.preconditions.iter().enumerate() {
+            let holds = match p {
+                Precondition::LogHead { ns, key, seq } => {
+                    log.entries
+                        .get(&(ns.clone(), key.clone()))
+                        .and_then(|v| v.last())
+                        .map_or(0, |e| e.seq)
+                        == *seq
+                }
+                Precondition::KvIs { ns, key, value } => {
+                    kv_value(&kv, ns, key) == *value
+                }
+            };
+            if !holds {
+                return Ok(BatchOutcome::Conflict {
+                    why: format!("precondition {i} no longer holds ({p:?})"),
+                });
+            }
+        }
+        // Stage every write; apply only once all are staged.
+        let base = self.global_seq.load(Ordering::SeqCst);
+        let mut seqs: Vec<Option<u64>> = vec![None; batch.ops.len()];
+        let mut next = base;
+        let mut staged_logs: Vec<(NsKey, MemLogEntry)> = Vec::new();
+        let mut staged_kv: Vec<(NsKey, Vec<u8>)> = Vec::new();
+        for (i, op) in batch.ops.iter().enumerate() {
+            if fault == Some(BatchFault::AfterWrites(i)) {
+                anyhow::bail!("injected failure after {i} staged writes");
+            }
+            match op {
+                BatchOp::LogAppendIfAbsent {
+                    ns,
+                    key,
+                    capture_id,
+                    value,
+                } => {
+                    let k = (ns.clone(), key.clone());
+                    let exists = log.entries.get(&k).is_some_and(|v| {
+                        v.iter().any(|e| {
+                            e.capture_id.as_deref() == Some(capture_id)
+                        })
+                    }) || staged_logs.iter().any(|(sk, e)| {
+                        sk == &k && e.capture_id.as_deref() == Some(capture_id)
+                    });
+                    if exists {
+                        return Ok(BatchOutcome::Conflict {
+                            why: format!(
+                                "{capture_id} already exists in {key}"
+                            ),
+                        });
+                    }
+                    next += 1;
+                    seqs[i] = Some(next);
+                    staged_logs.push((
+                        k,
+                        MemLogEntry {
+                            seq: next,
+                            value: value.clone(),
+                            capture_id: Some(capture_id.clone()),
+                            content_hash: Some(content_digest(value)),
+                            ts_ms: now_ms(),
+                        },
+                    ));
+                }
+                BatchOp::KvPut { ns, key, value } => {
+                    let bytes = match value {
+                        BatchValue::Bytes(b) => b.clone(),
+                        BatchValue::SeqTemplate { template, of } => {
+                            render_seq(template, seqs[*of].expect("validated"))
+                        }
+                    };
+                    staged_kv.push(((ns.clone(), key.clone()), bytes));
+                }
+                BatchOp::KvMaxSeq { ns, key, of } => {
+                    let k = (ns.clone(), key.clone());
+                    let current = staged_kv
+                        .iter()
+                        .rev()
+                        .find(|(sk, _)| sk == &k)
+                        .map(|(_, v)| v.clone())
+                        .or_else(|| kv_value(&kv, ns, key));
+                    staged_kv.push((
+                        k,
+                        max_seq_value(
+                            current.as_deref(),
+                            seqs[*of].expect("validated"),
+                        )?,
+                    ));
+                }
+            }
+        }
+        if fault == Some(BatchFault::AfterWrites(batch.ops.len())) {
+            anyhow::bail!("injected failure after every write was staged");
+        }
+        // Commit.
+        for (k, e) in staged_logs {
+            let seq = e.seq;
+            log.ensure_meta(&k);
+            log.entries.entry(k.clone()).or_default().push(e);
+            if let Some(m) = log.meta.get_mut(&k) {
+                m.head_seq = m.head_seq.max(seq);
+            }
+        }
+        for (k, v) in staged_kv {
+            kv.0.insert(
+                k,
+                KvEntry {
+                    value: v,
+                    expires_at: None,
+                },
+            );
+        }
+        self.global_seq.store(next, Ordering::SeqCst);
+        if fault == Some(BatchFault::AfterCommit) {
+            anyhow::bail!("injected failure after the commit");
+        }
+        Ok(BatchOutcome::Committed { seqs })
+    }
+
+    async fn log_find_capture(
+        &self,
+        ns: &str,
+        key: &str,
+        capture_id: &str,
+    ) -> Result<Option<(u64, Vec<u8>)>> {
+        let log = self.log.read().await;
+        Ok(log
+            .entries
+            .get(&(ns.to_string(), key.to_string()))
+            .and_then(|v| {
+                v.iter()
+                    .find(|e| e.capture_id.as_deref() == Some(capture_id))
+            })
+            .map(|e| (e.seq, e.value.clone())))
+    }
+
     // ── KV ──────────────────────────────────────────────────────────────────
 
     async fn kv_get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {
@@ -204,8 +401,9 @@ impl StorageBackend for MemoryStorageBackend {
         key: &str,
         value: &[u8],
     ) -> Result<u64> {
-        let seq = self.next_seq();
+        // Allocated under the log lock: entries are stored in sequence order.
         let mut store = self.log.write().await;
+        let seq = self.next_seq();
         let k = (ns.to_string(), key.to_string());
         store
             .entries
@@ -775,5 +973,12 @@ mod tests {
     #[tokio::test]
     async fn slot_list_cursor_validation() {
         crate::slot_list_contract_suite::cursor_validation(be(), "slots").await;
+    }
+
+    /// The shared atomic-batch conformance suite.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn atomic_batch_conformance() {
+        let b = Arc::new(MemoryStorageBackend::new());
+        crate::atomic_batch_suite::all(b.clone(), b.as_ref(), "batch").await;
     }
 }
