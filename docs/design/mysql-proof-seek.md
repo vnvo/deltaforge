@@ -721,9 +721,9 @@ so any gap in the executed set collapses.
 - Regression: the steps above must deliver rows 3 to 6. It also needs a
   proof test where a DDL fills a gap after A.
 
-## Revision 4 (proposed): one atomic state-store batch per window
+## Revision 4: one atomic state-store batch per window
 
-Status: design for review. Nothing below is implemented.
+Status: reviewed; the rulings and the batch contract below are binding.
 
 ### Why
 
@@ -784,95 +784,152 @@ of a window's durable writes commit in one state-store transaction.
    admitted table's rows now find their baseline in the timeline
    (`Selection::Proven`) and do no admission work.
 
-### State-store API
+### The atomic batch contract
 
-A new backend operation, implemented by every backend in one transaction:
+A window's admission is one **atomic batch**: a set of reads, the
+preconditions they establish, and the writes decided from them. The
+backend operations:
 
 ```text
-apply_batch(ops: Vec<BatchOp>) -> Vec<BatchOutcome>
-BatchOp = LogAppend { ns, key, value }
-        | LogAppendIfAbsent { ns, key, capture_id, value }
-        | KvPut { ns, key, value }
+read_batch(reads)            -> results           one consistent snapshot
+apply_batch(preconditions, ops) -> Committed { seqs } | Conflict { which }
+log_find_capture(ns, key, capture_id) -> Option<(seq, bytes)>
 ```
 
-- SQLite: one `spawn_blocking`, one `BEGIN IMMEDIATE ... COMMIT`.
-- PostgreSQL: one transaction.
+**Reads.** `read_batch` returns, in one snapshot, every value a decision
+uses: KV values, stream heads (the last sequence of a stream, 0 when
+empty), the latest entry of a stream, and a stream's length. Each result
+carries what its precondition needs.
+
+**Preconditions.** Every read a decision rests on becomes a precondition
+of the commit:
+
+- `LogHead { ns, key, seq }`: the stream's last sequence is still `seq`;
+- `KvIs { ns, key, value }`: the key is still absent, or holds exactly
+  these bytes.
+
+`apply_batch` checks all of them inside its transaction, before any write.
+If any fails it writes nothing and returns `Conflict` naming it. The
+caller re-reads, recomputes every decision, and tries again, at most
+`BATCH_CONFLICT_RETRIES` (3) times; then the window fails closed.
+
+**Writes.** All in one transaction: all of them commit, or none do.
+
+- `LogAppendIfAbsent { ns, key, capture_id, value }`: every log write
+  carries a deterministic capture identity, registry entries included
+  (`reg/<version>/<hash>`), so a commit can be read back. Inside a batch
+  the identity must be new: the preconditions guarantee it was absent when
+  read, and finding it present fails the batch as a conflict.
+- `KvPut { ns, key, value }`, where `value` may be a template naming a log
+  write of the same batch: the backend renders that write's sequence into
+  it (a version index records its entry's sequence).
+- `KvMaxSeq { ns, key, of }`: the key becomes the larger of its current
+  number and the sequence of log write `of` (the registry's high-water).
+
+**Sequence allocation.** The log writes of a batch receive one contiguous
+range of global sequences, in the batch's order, allocated inside the
+transaction and invisible until it commits. The order is deterministic:
+the window's tables in first-touch order (the stream order of each table's
+first rows), each table's registry entry and then its activation record.
+
+- SQLite: one connection serializes all writers, so the inserts of one
+  transaction are contiguous.
+- PostgreSQL: `BIGSERIAL` is shared by concurrent transactions, so every
+  log writer (`log_append`, `log_append_if_absent`, `apply_batch`) takes
+  one transaction-scoped advisory lock before allocating. Allocation, and
+  therefore commit, order is serialized: a reader never sees a sequence
+  before a lower one that commits later.
 - Memory: under its lock.
-- Bounded: at most `MAX_BATCH_TABLES` tables a batch (the window already
-  closes there) and a byte bound; beyond either the window fails closed.
 
-The schema registry gains a planning form of `register_with_checkpoint`:
-it computes versions from the batched reads and returns the operations
-instead of executing them. The existing one-table path stays and is
-unchanged for every other caller (snapshots, forward proofs, FULL).
+`Committed { seqs }` returns the committed sequence of every log write.
+Nothing reads a sequence earlier.
 
-### Equivalence and what changes
+**Ambiguous outcomes.** An `apply_batch` that returns an error may or may
+not have committed (a commit whose acknowledgement was lost). The caller
+then reads back every log write's identity with `log_find_capture`:
 
-- **Decisions:** identical. Each table's decision uses the same functions
-  on the same inputs. Within a window the tables are distinct, and no
-  barrier or DDL can fall inside it (a statement closes the window), so one
-  table's admission cannot change another's inputs.
-- **Durable content:** identical bytes for every record and registry entry:
-  the same versions, hashes, capture identities, positions and proof
-  bindings.
-- **Ordering changes, and needs a decision.** Today a window's writes
-  interleave per table (registry entry, activation record, next table).
-  Batched, all of a window's registry entries come first, then its
-  activation records. The registry's global sequence numbers therefore
-  differ from today's for the same input, and `schema_sequence` on events
-  carries those numbers. Each is still its version's own registry sequence,
-  monotonic per table. Equivalence would be pinned on decisions and
-  record content, not on sequence values.
-- **When records are written:** at the window's close, before any of its
-  events is dispatched, instead of just before each table's first row is
-  decoded. Both are before the row is emitted and before the checkpoint
-  can pass it. A crash after the commit and before dispatch leaves records
-  ahead of the checkpoint; this happens today too (a crash after
-  admission, before the row's batch is acknowledged), and a restart reads
-  them as valid proofs of positions it has not yet reached.
-- **Failover drift:** today checked at the row. The window would apply
-  the drift check per table before deciding. A drift incident then stops
-  the source at the window's close instead of at the table's first row;
-  nothing of the window has been dispatched, and the checkpoint is the
-  same.
-- **Failure:** a batch that fails (store error, identity conflict) fails
-  the window closed, as a failed shared scan does today: nothing
-  dispatched, the checkpoint before the window, every batch key's cache
-  discarded.
+- **none exists:** nothing committed; apply the same batch again (the same
+  bytes, the same preconditions);
+- **every one exists with exactly the intended bytes:** the original
+  commit succeeded; its sequences are the stored ones, and the templated
+  KV writes are checked against them. No new sequence is allocated;
+- **some exist, or any differs:** an atomicity violation; the window fails
+  closed with that error.
+
+Retries of a storage error that is retryable (a dropped connection, a
+busy database) re-run this read-back first, at most
+`BATCH_STORAGE_RETRIES` (3) times. A batch is never broken into per-table
+writes.
+
+**Caches.** The registry cache and the selection caches change only from a
+confirmed `Committed` result (or a read-back that confirmed the original
+commit), never before and never from a failed or ambiguous attempt. Any
+failure discards the cached timeline of every table in the batch.
+
+**One implementation of the semantics, three backends.** SQLite (one
+`spawn_blocking`, `BEGIN IMMEDIATE ... COMMIT`), PostgreSQL (one
+transaction with the advisory lock) and Memory (one critical section).
+A shared conformance suite runs against all three: preconditions,
+atomicity, templates, contiguous and deterministic allocation, concurrent
+batches, and read-back.
+
+### Where it is used
+
+- The schema registry gains a planning form of registration: from the
+  batched reads it computes the version (with the same numbering, floor,
+  lineage and repair rules as `register_with_checkpoint`), the entry and
+  index writes, and the preconditions, without executing anything. The
+  one-table `register_with_checkpoint` stays for every other caller.
+- Decisions validate against the registry plus the batch's planned
+  versions (an overlay), so a planned baseline validates exactly as it
+  would once registered.
+- Activation records are the same bytes and identities as today.
+
+### Failover drift
+
+Checked for every table at the window's close, before any decision. A
+drift incident from any table stops the whole window: no registry or
+activation write of the window commits, nothing of it is dispatched, and
+the checkpoint stays at the boundary before it.
+
+### Ordering, as an internal change
+
+The global sequence is an allocation identity, not a promise that the same
+input receives the same number in another execution. Batched, a window's
+registry entries and activation records take one contiguous range in
+first-touch order; their content (versions, hashes, capture identities,
+positions, proof bindings) is unchanged. Every schema version still
+carries its own unique, monotonic registry sequence, which events report
+as `schema_sequence`.
+
+### Failure
+
+A batch that cannot commit (a conflict after its retries, a storage error
+after its retries, an atomicity violation, a drift incident) fails the
+window closed: nothing of it is dispatched, the checkpoint stays before
+it, and the caches of its tables are discarded. There is no fallback to
+per-table admission.
 
 ### Expected effect
 
 Per window, a fixed number of read round trips and one write transaction
 replace about 16 round trips a table. For about 150 tables: about 300 ms
 of serial admission becomes one commit of roughly 10-20 ms. What remains in
-the activation-order spread is the window sequence itself (about 120-130 ms
-a window, two or three windows in the study's burst), so the deciles should
-fall within 2x. This is an estimate to be measured, not a result.
+the activation-order spread is the window sequence itself, so the deciles
+should fall within 2x. This is an estimate to be measured.
 
-### Regressions this would need
+### Regressions and mutants
 
-- Batch atomicity: a failure injected at every operation of a batch
-  (SQLite, PostgreSQL, Memory) leaves none of its writes visible and every
-  batch key's cache discarded.
-- Equivalence: for windows of accepted, refused (not decisive, relevant
-  DDL), drifted and conflicting tables, the batch path's decisions and
-  stored bytes equal the one-table path's.
-- Crash: kill after the commit and before dispatch, and after a partial
-  dispatch; the restart delivers every row once (at-least-once as today)
-  with every proof valid.
-- Bounds: a batch at `MAX_BATCH_TABLES` and at the byte bound; beyond them
-  the window fails closed.
-- Mutants: a non-atomic batch (operations committed one by one), caches
-  installed before the commit, and a refused table written anyway; each
-  must fail a test.
-- The full acceptance series at 0, 64, 256 and 960 MiB.
-
-### Decisions for review
-
-1. Whether `schema_sequence` values may differ from the one-table path's,
-   given decisions and record content are identical.
-2. Whether moving the failover drift check from the row to the window's
-   close is acceptable.
-3. Whether the window fails closed on a batch failure, or its tables fall
-   back to today's one-table admission at dispatch (bounded by the window's
-   table count, and not silent: counted and logged).
+- Conformance (all three backends): a precondition conflict writes
+  nothing; a failure before the transaction, and one midway through its
+  writes, leave nothing; a commit whose acknowledgement is lost is
+  recovered by read-back with its original sequences (never new ones);
+  concurrent batches get disjoint contiguous ranges; allocation follows
+  the batch's order; a partial read-back is an atomicity violation.
+- Window: a later table's drift leaves no write and no row of any earlier
+  table visible; no cache changes on any failure; decisions and stored
+  bytes equal the one-table path's for accepted and refused tables.
+- Mutants: the batch without its transaction (a midway failure leaves a
+  partial write); caches updated before the commit; a retry after an
+  ambiguous success allocating new sequences; a refused table written.
+- Then the acceptance series at 0, 64, 256 and 960 MiB.
