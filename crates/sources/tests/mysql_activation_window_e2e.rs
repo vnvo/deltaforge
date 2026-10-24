@@ -136,6 +136,8 @@ struct Running {
     id: String,
     handle: SourceHandle,
     firsts: Arc<Mutex<BTreeMap<String, (i64, i64)>>>,
+    /// Every delivered row of the `t*` tables.
+    rows: Arc<std::sync::atomic::AtomicUsize>,
     drain: tokio::task::JoinHandle<()>,
 }
 
@@ -176,12 +178,15 @@ async fn run(port: u16, id: &str, proofs: MysqlProofCfg) -> Running {
     }
     let firsts: Arc<Mutex<BTreeMap<String, (i64, i64)>>> = Default::default();
     let seen = firsts.clone();
+    let rows: Arc<std::sync::atomic::AtomicUsize> = Default::default();
+    let counted = rows.clone();
     let drain = tokio::spawn(async move {
         while let Some(item) = rx.recv().await {
             if let SourceItem::Event(e) = item
                 && e.source.table.starts_with('t')
                 && let Some(a) = e.after.as_ref().map(test_common::row_view)
             {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 seen.lock()
                     .unwrap()
                     .entry(e.source.table.clone())
@@ -196,6 +201,7 @@ async fn run(port: u16, id: &str, proofs: MysqlProofCfg) -> Running {
         id: id.into(),
         handle,
         firsts,
+        rows,
         drain,
     }
 }
@@ -434,4 +440,99 @@ async fn an_idle_first_touch_is_not_held_for_a_heartbeat() {
     let windows = records(id, "window");
     assert_eq!(windows.len(), 1, "{windows:?}");
     assert_eq!(windows[0]["closed_by"], "time", "{windows:?}");
+}
+
+/// Window 1 (`t0000`) waits for a lock while the other 19 tables arrive in
+/// one transaction; `drop` cuts the stream right after window 1's
+/// transaction is dispatched, with window 2's events held. Every table's
+/// row arrives exactly once. Returns the source's window records.
+async fn admission_meanwhile(id: &str, drop: bool) -> Vec<serde_json::Value> {
+    let (container, port) = start(true).await;
+    let mut c = conn(port).await;
+    let n = 20;
+    tables(&mut c, n).await;
+    sources::stream_probe::reset_streams_opened();
+    let r = run(port, id, MysqlProofCfg::default()).await;
+    r.handle.pause();
+    c.query_drop("INSERT INTO t0000 VALUES (1, 0)")
+        .await
+        .unwrap();
+    let mut locker = conn(port).await;
+    locker.query_drop("LOCK TABLES t0000 WRITE").await.unwrap();
+    if drop {
+        sources::stream_probe::reset_event_hooks();
+        sources::stream_probe::disconnect_after(
+            sources::stream_probe::Point::AfterXid,
+            1,
+        );
+    }
+    r.handle.resume();
+    // Window 1 has closed and its capture waits for the lock.
+    sleep(Duration::from_millis(500)).await;
+    let mut txn = vec!["BEGIN".to_string()];
+    for i in 1..n {
+        txn.push(format!("INSERT INTO t{i:04} VALUES (1, {i})"));
+    }
+    txn.push("COMMIT".to_string());
+    c.query_drop(txn.join("; ")).await.unwrap();
+    sleep(Duration::from_millis(300)).await;
+    locker.query_drop("UNLOCK TABLES").await.unwrap();
+    r.delivered(n, Duration::from_secs(60)).await;
+    // Anything delivered twice would have arrived by now.
+    sleep(Duration::from_secs(2)).await;
+    let got = r.firsts.lock().unwrap().clone();
+    for i in 0..n as i64 {
+        assert_eq!(got.get(&format!("t{i:04}")), Some(&(1, i)), "t{i:04}");
+    }
+    assert_eq!(
+        r.rows.load(std::sync::atomic::Ordering::SeqCst),
+        n,
+        "every row exactly once"
+    );
+    assert_eq!(
+        sources::stream_probe::streams_opened(),
+        if drop { 2 } else { 1 },
+        "streams opened"
+    );
+    sources::stream_probe::reset_event_hooks();
+    r.stop().await;
+    container.rm().await.ok();
+    records(id, "window")
+}
+
+/// The stream is read while a window is admitted: tables first touched
+/// meanwhile are held with when they were received, and the next window
+/// takes them without waiting again for its time bound, which counts from
+/// its first event's receipt: window 2 has all 19 tables and closes by
+/// time at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn tables_touched_during_an_admission_are_prefetched() {
+    let n = 20;
+    let windows = admission_meanwhile("prefetch", false).await;
+    assert_eq!(windows.len(), 2, "{windows:?}");
+    assert_eq!(count(&windows[0], "tables"), 1, "{windows:?}");
+    assert!(
+        count(&windows[0], "prefetched") >= (n - 1),
+        "the second window's events read during the first's admission: \
+         {windows:?}"
+    );
+    assert_eq!(count(&windows[1], "tables"), n - 1, "{windows:?}");
+    assert_eq!(windows[1]["closed_by"], "time", "{windows:?}");
+    let read_ms = windows[1]["read_ms"].as_f64().unwrap();
+    assert!(
+        read_ms < 25.0,
+        "the second window does not wait again for its bound: {read_ms} ms"
+    );
+}
+
+/// Prefetched events go with a dropped stream: the resume reads them from
+/// the server again, and none is delivered twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn prefetched_events_go_with_a_dropped_stream() {
+    let windows = admission_meanwhile("prefetch-drop", true).await;
+    assert!(count(&windows[0], "prefetched") > 0, "{windows:?}");
+    let tabled: u64 = windows.iter().map(|w| count(w, "tables")).sum();
+    assert_eq!(tabled, 20, "{windows:?}");
 }

@@ -80,6 +80,9 @@ pub(crate) struct WindowTrace {
     pub closed_by: &'static str,
     pub capture_attempts: u32,
     pub work: ProofWork,
+    /// Events read from the stream during the admission, for the next
+    /// window.
+    pub prefetched: usize,
 }
 
 /// Transaction control: neither a schema change nor a statement that could
@@ -304,67 +307,195 @@ pub(super) async fn maybe_window(
     // transaction carries them).
     touched(&mut ahead, header, data, &mut Vec::new());
 
-    // Read ahead, without advancing the position or dispatching.
+    // Read ahead, without advancing the position or dispatching. The
+    // time bound counts from when the head event was received: events
+    // prefetched during the previous window's admission were received
+    // within it if their receipt is, and are taken without waiting.
     let cfg = ctx.proofs.clone();
-    let opened = Instant::now();
-    let bound = Duration::from_millis(cfg.activation_window_ms);
+    let started = Instant::now();
+    let deadline =
+        ctx.last_received + Duration::from_millis(cfg.activation_window_ms);
     let mut queue: VecDeque<(EventHeader, EventData)> = VecDeque::new();
     let mut bytes = 0u64;
-    let closed_by =
-        loop {
-            if full {
-                break "tables";
-            }
-            if queue.len() >= cfg.activation_window_events {
-                break "events";
-            }
-            if bytes >= cfg.activation_window_bytes {
-                break "bytes";
-            }
-            let Some(left) = bound.checked_sub(opened.elapsed()) else {
+    let closed_by = loop {
+        if full {
+            break "tables";
+        }
+        if queue.len() >= cfg.activation_window_events {
+            break "events";
+        }
+        if bytes >= cfg.activation_window_bytes {
+            break "bytes";
+        }
+        let received_in_time = ctx
+            .prefetched
+            .front()
+            .is_some_and(|(received, ..)| *received <= deadline);
+        let next = if received_in_time {
+            read_next_event(stream, ctx).await
+        } else {
+            let Some(left) = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+            else {
                 break "time";
             };
-            // A cancelled read loses nothing (the vendored channel keeps what
-            // it read), so the window's time bound can interrupt it.
-            let (h, d) =
-                match tokio::time::timeout(left, read_next_event(stream, ctx))
-                    .await
-                {
-                    Err(_) => break "time",
-                    Ok(Ok(ev)) => ev,
-                    Ok(Err(control)) => return Err(control),
-                };
-            bytes += u64::from(h.event_length);
-            let close = match &d {
-                EventData::HeartBeat => Some("heartbeat"),
-                EventData::Query(q) if !is_transaction_control(&q.query) => {
-                    Some("statement")
-                }
-                EventData::Rotate(r) => {
-                    ahead.file = r.binlog_filename.clone();
-                    None
-                }
-                _ => None,
-            };
-            if close.is_none() {
-                let mut found = Vec::new();
-                touched(&mut ahead, &h, &d, &mut found);
-                if !ahead.broken {
-                    full = admit(ctx, &mut batch, &mut order, found)
-                        .await
-                        .map_err(LoopControl::Fail)?;
-                }
-            }
-            queue.push_back((h, d));
-            if let Some(why) = close {
-                break why;
-            }
-            if ahead.broken {
-                break "framing";
+            // A cancelled read loses nothing (the vendored channel keeps
+            // what it read), so the time bound can interrupt it.
+            match tokio::time::timeout(left, read_next_event(stream, ctx)).await
+            {
+                Err(_) => break "time",
+                Ok(next) => next,
             }
         };
-    let read = opened.elapsed();
+        let (h, d) = match next {
+            Ok(ev) => ev,
+            Err(control) => return Err(control),
+        };
+        bytes += u64::from(h.event_length);
+        let close = match &d {
+            EventData::HeartBeat => Some("heartbeat"),
+            EventData::Query(q) if !is_transaction_control(&q.query) => {
+                Some("statement")
+            }
+            EventData::Rotate(r) => {
+                ahead.file = r.binlog_filename.clone();
+                None
+            }
+            _ => None,
+        };
+        if close.is_none() {
+            let mut found = Vec::new();
+            touched(&mut ahead, &h, &d, &mut found);
+            if !ahead.broken {
+                full = admit(ctx, &mut batch, &mut order, found)
+                    .await
+                    .map_err(LoopControl::Fail)?;
+            }
+        }
+        queue.push_back((h, d));
+        if let Some(why) = close {
+            break why;
+        }
+        if ahead.broken {
+            break "framing";
+        }
+    };
+    let read = started.elapsed();
 
+    // The admission, with the stream read meanwhile: what arrives while it
+    // captures, scans and commits is held (never dispatched or decoded
+    // past its framing) for the next window.
+    let mut prefetch = Prefetch::new(ctx, &cfg);
+    let admitted = prefetch
+        .during(stream, admit_window(ctx, &cfg, &a_head, batch, order))
+        .await;
+    let prefetched = prefetch.events.len();
+    ctx.prefetched.extend(prefetch.events);
+    if prefetch.error.is_some() {
+        ctx.prefetch_error = prefetch.error;
+    }
+    let admitted = admitted?;
+    ctx.lookahead = queue;
+    let trace = WindowTrace {
+        tables: admitted.tables,
+        events: ctx.lookahead.len(),
+        bytes,
+        closed_by,
+        capture_attempts: admitted.attempts,
+        work: admitted.work,
+        prefetched,
+    };
+    observe_window(&ctx.source_id, &trace, read, &admitted);
+    Ok(Some(trace))
+}
+
+/// What reading the stream during an admission may hold: at most a
+/// window's events and bytes in all (with what is already held); nothing
+/// after a read error, which is kept and raised where the stream is read
+/// next.
+struct Prefetch {
+    events: VecDeque<(Instant, EventHeader, EventData)>,
+    error: Option<mysql_binlog_connector_rust::binlog_error::BinlogError>,
+    events_left: usize,
+    bytes_left: u64,
+}
+
+impl Prefetch {
+    fn new(ctx: &RunCtx, cfg: &deltaforge_config::MysqlProofCfg) -> Self {
+        let held: u64 = ctx
+            .prefetched
+            .iter()
+            .map(|(_, h, _)| u64::from(h.event_length))
+            .sum();
+        let stopped = ctx.prefetch_error.is_some();
+        Self {
+            events: VecDeque::new(),
+            error: None,
+            events_left: if stopped {
+                0
+            } else {
+                cfg.activation_window_events
+                    .saturating_sub(ctx.prefetched.len())
+            },
+            bytes_left: cfg.activation_window_bytes.saturating_sub(held),
+        }
+    }
+
+    /// Run `admission` to completion, reading the stream while it runs and
+    /// within bounds. A read in flight when it completes is cancelled,
+    /// losing nothing (the vendored channel keeps what it read).
+    async fn during<T>(
+        &mut self,
+        stream: &mut BinlogStream,
+        admission: impl std::future::Future<Output = T>,
+    ) -> T {
+        tokio::pin!(admission);
+        loop {
+            if self.events_left == 0 || self.bytes_left == 0 {
+                return admission.await;
+            }
+            tokio::select! {
+                biased;
+                done = &mut admission => return done,
+                read = stream.read() => match read {
+                    Ok((h, d)) => {
+                        self.events_left -= 1;
+                        self.bytes_left =
+                            self.bytes_left.saturating_sub(u64::from(h.event_length));
+                        self.events.push_back((Instant::now(), h, d));
+                    }
+                    Err(e) => {
+                        self.error = Some(e);
+                        self.events_left = 0;
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// A window's admission as done: how long each part took.
+struct Admitted {
+    tables: usize,
+    attempts: u32,
+    work: ProofWork,
+    captured: Duration,
+    scanned: Duration,
+    committed: Duration,
+    capture: super::mysql_binlog_scan::CaptureTrace,
+}
+
+/// One batched capture (retried in the same sorted order), one scanner
+/// request answering every table over its own `(A_i, B]`, and the atomic
+/// admission of all of them.
+async fn admit_window(
+    ctx: &mut RunCtx,
+    cfg: &deltaforge_config::MysqlProofCfg,
+    a_head: &MySqlCheckpoint,
+    batch: BTreeMap<(String, String), MySqlCheckpoint>,
+    order: Vec<(String, String)>,
+) -> Result<Admitted, LoopControl> {
     let server_uuid = ctx.expected_uuid().map_err(LoopControl::Fail)?;
     let lineage = ctx
         .registry_scope
@@ -379,7 +510,6 @@ pub(super) async fn maybe_window(
         kind: ProofKind::Lazy,
     };
 
-    // One batched capture, retried in the same sorted order.
     let tables: Vec<(String, String)> = batch.keys().cloned().collect();
     let mut attempts = 0;
     let t = Instant::now();
@@ -413,7 +543,7 @@ pub(super) async fn maybe_window(
                     &ctx.source_id,
                     &tables,
                     attempts,
-                    &a_head,
+                    a_head,
                     e,
                 )));
             }
@@ -421,7 +551,6 @@ pub(super) async fn maybe_window(
     };
     let captured = t.elapsed();
 
-    // One scanner request: every table over its own (A_i, B].
     let t = Instant::now();
     let froms: Vec<MySqlCheckpoint> = batch
         .values()
@@ -488,20 +617,15 @@ pub(super) async fn maybe_window(
     admit_batch(ctx, &lineage, &cap, tables_in_order)
         .await
         .map_err(LoopControl::Fail)?;
-    let committed = t.elapsed();
-    ctx.lookahead = queue;
-    let trace = WindowTrace {
+    Ok(Admitted {
         tables: tables.len(),
-        events: ctx.lookahead.len(),
-        bytes,
-        closed_by,
-        capture_attempts: attempts,
+        attempts,
         work,
-    };
-    observe_window(
-        &source_id, &trace, read, captured, scanned, committed, &cap.trace,
-    );
-    Ok(Some(trace))
+        captured,
+        scanned,
+        committed: t.elapsed(),
+        capture: cap.trace,
+    })
 }
 
 /// Conflicting re-reads of an atomic batch before the window fails closed.
@@ -973,11 +1097,15 @@ fn observe_window(
     source_id: &str,
     t: &WindowTrace,
     read: Duration,
-    captured: Duration,
-    scanned: Duration,
-    committed: Duration,
-    capture: &super::mysql_binlog_scan::CaptureTrace,
+    admitted: &Admitted,
 ) {
+    let Admitted {
+        captured,
+        scanned,
+        committed,
+        capture,
+        ..
+    } = admitted;
     let source = [("source", source_id.to_string())];
     metrics::counter!(
         "deltaforge_mysql_activation_windows_total",
@@ -988,7 +1116,7 @@ fn observe_window(
     metrics::histogram!("deltaforge_mysql_activation_window_tables", &source)
         .record(t.tables as f64);
     metrics::histogram!("deltaforge_mysql_activation_window_seconds", &source)
-        .record((read + captured + scanned + committed).as_secs_f64());
+        .record((read + *captured + *scanned + *committed).as_secs_f64());
     info!(
         source_id,
         tables = t.tables,
@@ -1008,6 +1136,7 @@ fn observe_window(
         "bytes": t.bytes,
         "closed_by": t.closed_by,
         "capture_attempts": t.capture_attempts,
+        "prefetched": t.prefetched,
         "extensions_committed": t.work.extensions_committed,
         "positioned_attempts": t.work.positioned_attempts,
         "unanchored_attempts": t.work.unanchored_attempts,

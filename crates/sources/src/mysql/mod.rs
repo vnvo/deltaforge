@@ -333,6 +333,20 @@ pub(crate) struct RunCtx {
         mysql_binlog_connector_rust::event::event_header::EventHeader,
         mysql_binlog_connector_rust::event::event_data::EventData,
     )>,
+    /// Events read from the stream while a window was admitted, with when
+    /// each was received; read before the stream is read again
+    /// (`mysql_activation_window`).
+    prefetched: std::collections::VecDeque<(
+        std::time::Instant,
+        mysql_binlog_connector_rust::event::event_header::EventHeader,
+        mysql_binlog_connector_rust::event::event_data::EventData,
+    )>,
+    /// The read error that ended a prefetch: raised where the stream is
+    /// read next, once `prefetched` is empty.
+    prefetch_error:
+        Option<mysql_binlog_connector_rust::binlog_error::BinlogError>,
+    /// When the event `read_next_event` last returned was received.
+    last_received: std::time::Instant,
     /// Proofs an activation window prepared, by table, consumed by the lazy
     /// baseline of the table's rows.
     prepared: HashMap<(String, String), mysql_activation_window::Prepared>,
@@ -1764,6 +1778,9 @@ impl MySqlSource {
             txn_anchor: None,
             last_event_start: 0,
             lookahead: Default::default(),
+            prefetched: Default::default(),
+            prefetch_error: None,
+            last_received: std::time::Instant::now(),
             prepared: Default::default(),
             proofs: self.proofs.clone(),
             proof_scanner,
@@ -1910,12 +1927,14 @@ impl MySqlSource {
                 // (between transactions, with an established GTID position).
                 if let Some(rt) = rotation.as_mut() {
                     rt.drive_preflight(&ctx);
-                    // Never while a window's read-ahead is queued: a new
-                    // stream would resume before those events and send
-                    // them again.
+                    // Never while a window's read-ahead or prefetch is
+                    // queued: a new stream would resume before those
+                    // events and send them again.
                     if ctx.current_gtid.is_none()
                         && ctx.last_gtid.is_some()
                         && ctx.lookahead.is_empty()
+                        && ctx.prefetched.is_empty()
+                        && ctx.prefetch_error.is_none()
                     {
                         // A CloseUncertain/FailedClosed outcome returns an error from
                         // this block (gate 6); `loop_result?` re-propagates it before the
@@ -1994,7 +2013,7 @@ impl MySqlSource {
                 // rotation applies even when no binlog events are flowing.
                 let control: Result<(), LoopControl> = match rotation.as_mut() {
                     Some(rt) => tokio::select! {
-                        r = read_next_event(&mut stream, &ctx) => match r {
+                        r = read_next_event(&mut stream, &mut ctx) => match r {
                             Ok((header, data)) => match mysql_activation_window::maybe_window(
                                 &mut ctx, &mut stream, &header, &data,
                             )
@@ -2011,7 +2030,7 @@ impl MySqlSource {
                         },
                         _ = rt.wait_activity() => continue,
                     },
-                    None => match read_next_event(&mut stream, &ctx).await {
+                    None => match read_next_event(&mut stream, &mut ctx).await {
                         Ok((header, data)) => match mysql_activation_window::maybe_window(
                             &mut ctx, &mut stream, &header, &data,
                         )
@@ -2584,9 +2603,11 @@ impl RunCtx {
     pub(crate) async fn abandon_open_transaction(
         &mut self,
     ) -> SourceResult<()> {
-        // What a window read ahead is past the position a resume starts
-        // from: never dispatched.
+        // What a window read ahead (or prefetched) is past the position a
+        // resume starts from: never dispatched.
         self.lookahead.clear();
+        self.prefetched.clear();
+        self.prefetch_error = None;
         self.prepared.clear();
         if !self.transaction_open() {
             return Ok(());

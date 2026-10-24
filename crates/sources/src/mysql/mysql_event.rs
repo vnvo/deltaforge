@@ -47,16 +47,30 @@ async fn send_event(
 
 pub(super) async fn read_next_event(
     stream: &mut BinlogStream,
-    ctx: &RunCtx,
+    ctx: &mut RunCtx,
 ) -> Result<(EventHeader, EventData), LoopControl> {
     // Test hook: the connection "dropped" right here.
     if crate::stream_probe::take_disconnect() {
         return Err(LoopControl::Reconnect);
     }
-    match watchdog(stream.read(), ctx.inactivity, &ctx.cancel, "binlog_read")
-        .await
-    {
-        Ok(event) => Ok(event),
+    // What a window prefetched comes first, then the error that ended
+    // the prefetch, then the stream.
+    if let Some((received, header, data)) = ctx.prefetched.pop_front() {
+        ctx.last_received = received;
+        return Ok((header, data));
+    }
+    let read = match ctx.prefetch_error.take() {
+        Some(e) => Err(common::RetryOutcome::Failed(e)),
+        None => {
+            watchdog(stream.read(), ctx.inactivity, &ctx.cancel, "binlog_read")
+                .await
+        }
+    };
+    match read {
+        Ok(event) => {
+            ctx.last_received = std::time::Instant::now();
+            Ok(event)
+        }
         Err(outcome) => {
             // The server purged the binlog the resume position needs: the
             // position is gone (an operator incident, not a retry).
@@ -1540,6 +1554,9 @@ pub(crate) mod tests {
             txn_anchor: None,
             last_event_start: 0,
             lookahead: Default::default(),
+            prefetched: Default::default(),
+            prefetch_error: None,
+            last_received: std::time::Instant::now(),
             prepared: Default::default(),
             proofs: Default::default(),
             proof_scanner: Default::default(),
