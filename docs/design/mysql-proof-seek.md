@@ -892,6 +892,17 @@ drift incident from any table stops the whole window: no registry or
 activation write of the window commits, nothing of it is dispatched, and
 the checkpoint stays at the boundary before it.
 
+One narrow exception: drift outcomes are recorded before the window's
+batch, once every table's assessment has succeeded. A table's outcome (its
+proof-bound marker, and the live shape registered at the failover
+position) is a completed fact of its own, not part of the window, and may
+remain after the batch then fails. It never admits a table, authorizes a
+row, advances the checkpoint or creates an activation record. The next
+attempt reuses it only after validating it against the same lineage
+transition and the same schema versions and hashes (the marker check at
+the start of every assessment); the window's admission is recomputed in
+full.
+
 ### Ordering, as an internal change
 
 The global sequence is an allocation identity, not a promise that the same
@@ -927,9 +938,12 @@ should fall within 2x. This is an estimate to be measured.
   concurrent batches get disjoint contiguous ranges; allocation follows
   the batch's order; a partial read-back is an atomicity violation.
 - Window: a later table's drift leaves no write and no row of any earlier
-  table visible; no cache changes on any failure; decisions and stored
+  table visible; drift outcomes committed before a failed batch are reused
+  unchanged on restart while the whole admission is recomputed; no cache changes on any failure; decisions and stored
   bytes equal the one-table path's for accepted and refused tables.
 - Mutants: the batch without its transaction (a midway failure leaves a
   partial write); caches updated before the commit; a retry after an
-  ambiguous success allocating new sequences; a refused table written.
+  ambiguous success allocating new sequences; a refused table written;
+  earlier tables' drift outcomes written before every table's assessment
+  succeeds.
 - Then the acceptance series at 0, 64, 256 and 960 MiB.
