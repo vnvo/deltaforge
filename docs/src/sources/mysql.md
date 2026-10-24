@@ -342,7 +342,13 @@ early. One read-only transaction then captures all of these tables: it
 locks their metadata in sorted order, which avoids deadlocking against a
 multi-table DDL, and reads every definition between the same two binlog
 positions. One binlog scan proves them all, and each table is admitted or
-refused exactly as it would be on its own. If the locks are not granted
+refused exactly as it would be on its own. The admitted tables' schema
+versions and proofs are then written in one state-store transaction: all of
+them or none. A failover drift check runs for every table of the window
+first, so a drift incident stops the whole window with nothing of it
+written. If the store cannot commit the window (after a few retries of the
+whole transaction), the source stops; it never falls back to admitting the
+tables one by one. If the locks are not granted
 within `proofs.capture_lock_wait_secs` on three attempts, the source stops
 with a `mysql_capture_contention` incident: nothing of the window is
 emitted, the checkpoint stays before it, and a restart retries once the

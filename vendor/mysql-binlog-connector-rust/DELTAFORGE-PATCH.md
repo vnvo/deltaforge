@@ -107,13 +107,15 @@ the next read returns the same packet. The vendored code read the header
 and the body into local buffers with `read_exact`, so a cancelled read
 dropped part of a packet and the next read misframed the stream. Socket
 reads are still bounded by `timeout_secs` each, and zero-length reads are
-still counted the same way. DeltaForge's binlog loop needs this to bound
+still counted the same way, inside a packet's body. DeltaForge's binlog loop needs this to bound
 an activation window by time (`docs/design/mysql-proof-seek.md`) and
 already raced reads against credential-rotation activity. File:
 `src/network/packet_channel.rs`. Unit tests: a read cancelled inside the
 header and inside the payload, repeated cancellation across one packet,
 packets arriving a byte at a time, a peer closing inside a packet (an error,
-never a short packet), a large packet in chunks, and 300 packets of random
+never a short packet), a peer closing at a packet boundary (an error at
+once: as in the vendored code, end of stream before a complete header fails
+immediately, and zero-length reads are retried only inside a packet's body), a large packet in chunks, and 300 packets of random
 sizes sent in random fragments and read with random cancellations (each
 arrives once, exactly, in order). The five cancellation tests fail against
 the vendored code. Upstream: not yet proposed; a follow-up is to offer it to

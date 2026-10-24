@@ -258,6 +258,15 @@ impl PacketChannel {
             .await
             {
                 Ok(Ok(0)) => {
+                    // As the vendored code read them: a closed stream before a
+                    // packet's header is complete fails at once (its header
+                    // was read with `read_exact`); inside a packet's body,
+                    // zero-length reads are retried, then fail.
+                    if self.pending.len() - self.head < 4 {
+                        return Err(BinlogError::from(std::io::Error::from(
+                            std::io::ErrorKind::UnexpectedEof,
+                        )));
+                    }
                     zero_reads += 1;
                     if zero_reads >= max_zero_reads {
                         return Err(BinlogError::UnexpectedData(format!(
@@ -446,6 +455,32 @@ mod tests {
                 ch.read_with_sequece().await.unwrap(),
                 (b"three".to_vec(), 3)
             );
+        });
+    }
+
+    /// A peer that closes at a packet boundary (or inside a header): the
+    /// read fails at once, as the vendored header read did, not after the
+    /// read timeout.
+    #[test]
+    fn eof_at_a_packet_boundary_fails_at_once() {
+        async_std::task::block_on(async {
+            for wire in [
+                packet(b"complete", 1),
+                [&packet(b"complete", 1)[..], &[3u8, 0][..]].concat(),
+            ] {
+                let mut ch = peer_with(vec![wire], Duration::from_millis(10), End::Close, 30).await;
+                assert_eq!(
+                    ch.read_with_sequece().await.unwrap(),
+                    (b"complete".to_vec(), 1)
+                );
+                let started = std::time::Instant::now();
+                assert!(ch.read().await.is_err());
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "{:?}",
+                    started.elapsed()
+                );
+            }
         });
     }
 

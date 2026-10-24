@@ -242,7 +242,7 @@ async fn make_mysql_source(
         tables: vec![format!("{db}.orders")],
         tenant: "acme".into(),
         pipeline: "test".into(),
-        registry: make_registry().await,
+        registry: test_common::registry_on(&backend).await,
         registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         backend,
         outbox_tables: AllowList::default(),
@@ -868,7 +868,7 @@ async fn mysql_failover_schema_drift_halt_no_drift_continues() -> Result<()> {
             tables: vec![format!("{DB}.orders")],
             tenant: "acme".into(),
             pipeline: "test".into(),
-            registry: make_registry().await,
+            registry: test_common::registry_on(&backend).await,
             registry_scope:
                 sources::registry_scope::SharedRegistryScope::default(),
             backend: Arc::clone(&backend),

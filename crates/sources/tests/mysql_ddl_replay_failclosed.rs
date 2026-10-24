@@ -37,9 +37,7 @@ use sources::mysql::MySqlSource;
 use tokio::time::{Duration, timeout};
 
 mod test_common;
-use test_common::{
-    make_registry, make_storage_backend, mysql_drop_db, mysql_setup,
-};
+use test_common::{make_storage_backend, mysql_drop_db, mysql_setup};
 
 #[dtor]
 fn cleanup() {
@@ -88,17 +86,18 @@ async fn replay(
 ) -> Result<Replay> {
     let store: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     store.put(SOURCE_ID, checkpoint).await?;
+    let shared_store = make_storage_backend().await;
     let src = MySqlSource {
         id: SOURCE_ID.into(),
         dsn: dsn.to_string().into(),
         tables: vec![format!("{db}.t")],
         tenant: "acme".into(),
         pipeline: "ddl-replay".into(),
-        registry: make_registry().await,
+        registry: test_common::registry_on(&shared_store).await,
         registry_scope: sources::registry_scope::SharedRegistryScope::new(
             SOURCE_ID,
         ),
-        backend: make_storage_backend().await,
+        backend: shared_store.clone(),
         outbox_tables: AllowList::default(),
         snapshot_cfg: SnapshotCfg::default(),
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
@@ -271,17 +270,18 @@ async fn replay_without_ddl_decodes_normally() -> Result<()> {
     // Stop as soon as both rows arrive (the source keeps running otherwise).
     let store: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     store.put(SOURCE_ID, checkpoint).await?;
+    let shared_store = make_storage_backend().await;
     let src = MySqlSource {
         id: SOURCE_ID.into(),
         dsn: dsn.clone().into(),
         tables: vec![format!("{db}.t")],
         tenant: "acme".into(),
         pipeline: "ddl-replay".into(),
-        registry: make_registry().await,
+        registry: test_common::registry_on(&shared_store).await,
         registry_scope: sources::registry_scope::SharedRegistryScope::new(
             SOURCE_ID,
         ),
-        backend: make_storage_backend().await,
+        backend: shared_store.clone(),
         outbox_tables: AllowList::default(),
         snapshot_cfg: SnapshotCfg::default(),
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,

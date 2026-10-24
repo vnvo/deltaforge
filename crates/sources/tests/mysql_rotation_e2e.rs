@@ -464,7 +464,7 @@ async fn start_rotation_harness(
         tables: vec![format!("{db}.orders")],
         tenant: "acme".to_string(),
         pipeline: "test".to_string(),
-        registry: make_registry().await,
+        registry: test_common::registry_on(&backend).await,
         registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         backend: Arc::clone(&backend),
         outbox_tables: AllowList::default(),

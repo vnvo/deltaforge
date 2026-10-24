@@ -34,9 +34,7 @@ use storage::adapters::{LineageDescriptor, source_lineage};
 use tokio::time::{Duration, timeout};
 
 mod test_common;
-use test_common::{
-    make_registry, make_storage_backend, mysql_drop_db, mysql_setup,
-};
+use test_common::{make_storage_backend, mysql_drop_db, mysql_setup};
 
 #[dtor]
 fn cleanup() {
@@ -116,7 +114,7 @@ async fn start(
         tables: vec![format!("{db}.t")],
         tenant: TENANT.into(),
         pipeline: "ckpt-lineage".into(),
-        registry: make_registry().await,
+        registry: test_common::registry_on(&backend).await,
         registry_scope: sources::registry_scope::SharedRegistryScope::new(
             SOURCE_ID,
         ),
