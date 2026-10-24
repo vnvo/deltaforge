@@ -31,11 +31,10 @@ fn kv_live(
     key: &str,
 ) -> rusqlite::Result<Option<Vec<u8>>> {
     let row: Option<(Vec<u8>, Option<i64>)> = conn
-        .query_row(
+        .prepare_cached(
             "SELECT val, expires_at FROM df_kv WHERE ns=?1 AND key=?2",
-            params![ns, key],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+        )?
+        .query_row(params![ns, key], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
     let now = now_secs();
     Ok(row.and_then(|(v, exp)| (!exp.is_some_and(|e| e <= now)).then_some(v)))
@@ -44,11 +43,10 @@ fn kv_live(
 /// A stream's last sequence (0 when empty).
 fn log_head(conn: &Connection, ns: &str, key: &str) -> rusqlite::Result<u64> {
     let seq: Option<i64> = conn
-        .query_row(
+        .prepare_cached(
             "SELECT seq FROM df_log WHERE ns=?1 AND key=?2 ORDER BY seq DESC LIMIT 1",
-            params![ns, key],
-            |r| r.get(0),
-        )
+        )?
+        .query_row(params![ns, key], |r| r.get(0))
         .optional()?;
     Ok(seq.map_or(0, |s| s as u64))
 }
@@ -97,12 +95,12 @@ fn ensure_log_meta(
     ns: &str,
     key: &str,
 ) -> rusqlite::Result<()> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT OR IGNORE INTO df_log_meta(ns, key, min_valid_from_seq, head_seq)
          VALUES(?1, ?2, 0,
                 COALESCE((SELECT MAX(seq) FROM df_log WHERE ns=?1 AND key=?2), 0))",
-        params![ns, key],
-    )?;
+    )?
+    .execute(params![ns, key])?;
     Ok(())
 }
 
@@ -400,9 +398,11 @@ impl StorageBackend for SqliteStorageBackend {
                             });
                         }
                         ensure_log_meta(&tx, ns, key)?;
-                        tx.execute(
+                        tx.prepare_cached(
                             "INSERT INTO df_log(ns, key, val, ts, ts_ms, capture_id, content_hash)
                              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                            )?
+                            .execute(
                             params![
                                 ns,
                                 key,
@@ -414,8 +414,10 @@ impl StorageBackend for SqliteStorageBackend {
                             ],
                         )?;
                         let seq = tx.last_insert_rowid() as u64;
-                        tx.execute(
+                        tx.prepare_cached(
                             "UPDATE df_log_meta SET head_seq=MAX(head_seq, ?3) WHERE ns=?1 AND key=?2",
+                            )?
+                            .execute(
                             params![ns, key, seq as i64],
                         )?;
                         seqs[i] = Some(seq);
@@ -430,11 +432,13 @@ impl StorageBackend for SqliteStorageBackend {
                                 )
                             }
                         };
-                        tx.execute(
+                        tx.prepare_cached(
                             "INSERT INTO df_kv(ns, key, val, updated_at, expires_at)
                              VALUES(?1, ?2, ?3, ?4, NULL)
                              ON CONFLICT(ns, key) DO UPDATE SET
                                val=excluded.val, updated_at=excluded.updated_at, expires_at=NULL",
+                            )?
+                            .execute(
                             params![ns, key, bytes, now_secs()],
                         )?;
                     }
@@ -444,11 +448,13 @@ impl StorageBackend for SqliteStorageBackend {
                             current.as_deref(),
                             seqs[*of].expect("validated"),
                         )?;
-                        tx.execute(
+                        tx.prepare_cached(
                             "INSERT INTO df_kv(ns, key, val, updated_at, expires_at)
                              VALUES(?1, ?2, ?3, ?4, NULL)
                              ON CONFLICT(ns, key) DO UPDATE SET
                                val=excluded.val, updated_at=excluded.updated_at, expires_at=NULL",
+                            )?
+                            .execute(
                             params![ns, key, bytes, now_secs()],
                         )?;
                     }

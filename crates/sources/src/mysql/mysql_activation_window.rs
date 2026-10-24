@@ -498,7 +498,9 @@ pub(super) async fn maybe_window(
         capture_attempts: attempts,
         work,
     };
-    observe_window(&source_id, &trace, read, captured, scanned, committed);
+    observe_window(
+        &source_id, &trace, read, captured, scanned, committed, &cap.trace,
+    );
     Ok(Some(trace))
 }
 
@@ -974,6 +976,7 @@ fn observe_window(
     captured: Duration,
     scanned: Duration,
     committed: Duration,
+    capture: &super::mysql_binlog_scan::CaptureTrace,
 ) {
     let source = [("source", source_id.to_string())];
     metrics::counter!(
@@ -1013,6 +1016,10 @@ fn observe_window(
         "capture_ms": captured.as_secs_f64() * 1e3,
         "scan_ms": scanned.as_secs_f64() * 1e3,
         "commit_ms": committed.as_secs_f64() * 1e3,
+        "capture_connect_ms": capture.connect.as_secs_f64() * 1e3,
+        "capture_lock_ms": capture.lock_wait.as_secs_f64() * 1e3,
+        "capture_schema_ms": capture.schema.as_secs_f64() * 1e3,
+        "capture_positions_ms": capture.positions.as_secs_f64() * 1e3,
     });
     tracing::info!(target: "deltaforge::proof_trace", "{record}");
 }

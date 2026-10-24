@@ -821,12 +821,21 @@ pub(crate) fn select_decisive(
     records: &[Stored],
     row: &WmPos,
 ) -> (Selection, Option<String>) {
+    select_decisive_in(records.iter(), row)
+}
+
+/// [`select_decisive`] over records given by reference (a timeline's own
+/// records and barriers, without copying them).
+pub(crate) fn select_decisive_in<'a>(
+    records: impl IntoIterator<Item = &'a Stored>,
+    row: &WmPos,
+) -> (Selection, Option<String>) {
     let (selection, decisive) = select_inner(records, row);
     (selection, decisive.map(|d| d.capture_id.clone()))
 }
 
 fn select_inner<'a>(
-    records: &'a [Stored],
+    records: impl IntoIterator<Item = &'a Stored>,
     row: &WmPos,
 ) -> (Selection, Option<&'a Stored>) {
     let mut applicable: Vec<&Stored> = Vec::new();

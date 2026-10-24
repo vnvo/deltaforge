@@ -70,6 +70,17 @@ pub(crate) struct Timeline {
 pub(crate) type PlannedVersions = std::collections::HashMap<i32, String>;
 
 impl Timeline {
+    /// Selection at `row` over this timeline, without copying it.
+    pub(crate) fn select_decisive(
+        &self,
+        row: &WmPos,
+    ) -> (Selection, Option<String>) {
+        mysql_activation::select_decisive_in(
+            self.records.iter().chain(self.barriers.iter()),
+            row,
+        )
+    }
+
     pub(crate) fn all(&self) -> Vec<Stored> {
         self.records
             .iter()
@@ -101,7 +112,9 @@ enum CacheKey {
 
 #[derive(Debug, Clone)]
 enum Cached {
-    Timeline(Arc<Timeline>),
+    /// A timeline, and whether the table's last selection over it proved a
+    /// version (then an activation window need not select it again).
+    Timeline(Arc<Timeline>, bool),
     Selection(Arc<LoadedSchema>),
 }
 
@@ -160,13 +173,33 @@ impl Caches {
 
     fn timeline(&mut self, key: &str) -> Option<Arc<Timeline>> {
         match self.entries.get(&CacheKey::Timeline(key.to_string()))? {
-            Cached::Timeline(t) => Some(t.clone()),
-            Cached::Selection(_) => None,
+            Cached::Timeline(t, _) => Some(t.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether the table's last selection proved a version since its
+    /// timeline last changed.
+    pub(crate) fn is_proven(&mut self, key: &SchemaKey) -> bool {
+        matches!(
+            self.entries.peek(&CacheKey::Timeline(key.backend_key())),
+            Some(Cached::Timeline(_, true))
+        )
+    }
+
+    /// The table's last selection proved a version over its cached
+    /// timeline (no extra entry: a flag on that timeline's).
+    fn mark_proven(&mut self, key: &SchemaKey) {
+        if let Some(Cached::Timeline(_, proven)) = self
+            .entries
+            .peek_mut(&CacheKey::Timeline(key.backend_key()))
+        {
+            *proven = true;
         }
     }
 
     fn put_timeline(&mut self, key: String, timeline: Arc<Timeline>) {
-        self.put(CacheKey::Timeline(key), Cached::Timeline(timeline));
+        self.put(CacheKey::Timeline(key), Cached::Timeline(timeline, false));
     }
 
     fn selection(
@@ -180,7 +213,7 @@ impl Caches {
         );
         match self.entries.get(&key)? {
             Cached::Selection(s) => Some(s.clone()),
-            Cached::Timeline(_) => None,
+            _ => None,
         }
     }
 
@@ -683,11 +716,12 @@ pub(crate) async fn unproven_at(
     at: &WmPos,
 ) -> SourceResult<bool> {
     let key = ctx.registry_scope.current()?.key(db, table);
+    // Proven at its last selection, and unchanged since: still proven.
+    if ctx.selection.is_proven(&key) {
+        return Ok(false);
+    }
     let t = timeline(ctx, &key).await?;
-    Ok(matches!(
-        select_decisive(&t.all(), at).0,
-        Selection::Unproven(_)
-    ))
+    Ok(matches!(t.select_decisive(at).0, Selection::Unproven(_)))
 }
 
 /// The schema to decode `tm`'s rows with (see the module docs).
@@ -704,8 +738,11 @@ pub(crate) async fn select_for_rows(
     let sig_digest = signature.digest();
     let mut t = timeline(ctx, &key).await?;
     // After a failover, the table's drift policy applies before anything is
-    // registered, baselined, decoded or emitted for these rows.
-    if let Some(row_cp) = ctx.txn_eval_cp.clone() {
+    // registered, baselined, decoded or emitted for these rows (once per
+    // table and run: a checked table needs no copy of its timeline).
+    if let Some(row_cp) = ctx.txn_eval_cp.clone()
+        && !ctx.drift_checked.contains(&key.backend_key())
+    {
         let all = t.all();
         super::mysql_failover_drift::check_in_stream(
             ctx,
@@ -719,17 +756,18 @@ pub(crate) async fn select_for_rows(
         )
         .await?;
     }
-    let (mut selection, mut decisive) = select_decisive(&t.all(), &row);
+    let (mut selection, mut decisive) = t.select_decisive(&row);
     // No positional proof yet: a lazy baseline at the rows' position, if it
     // can be proven and decides the rows (before any FULL fallback).
     if let Selection::Unproven(_) = selection
         && super::mysql_baseline::establish_at(ctx, db, table, &key, &t).await?
     {
         t = timeline(ctx, &key).await?;
-        (selection, decisive) = select_decisive(&t.all(), &row);
+        (selection, decisive) = t.select_decisive(&row);
     }
     match selection {
         Selection::Proven { version } => {
+            ctx.selection.mark_proven(&key);
             let decisive = decisive.unwrap_or_default();
             let cache_key = (key.backend_key(), decisive, sig_digest);
             if let Some(hit) = ctx.selection.selection(&cache_key) {
@@ -1605,6 +1643,42 @@ mod tests {
         .await;
         let err = admit(vec![], vec![], invalid).await.unwrap_err();
         assert!(err.contains("not at or after the row"), "{err}");
+    }
+
+    /// A table's proven flag lives on its cached timeline, so it goes when
+    /// the timeline changes (or a barrier changes every timeline), and costs
+    /// no cache entry of its own.
+    #[test]
+    fn the_proven_marker_goes_with_its_timeline() {
+        let key = SchemaKey::new(
+            "t",
+            "s",
+            "0123456789abcdef0123456789abcdef",
+            "d",
+            "x",
+        );
+        let other = SchemaKey::new(
+            "t",
+            "s",
+            "0123456789abcdef0123456789abcdef",
+            "d",
+            "y",
+        );
+        let mut c = Caches::with_budget_for_test(16);
+        // A flag on the cached timeline: none cached, nothing to mark.
+        c.mark_proven(&key);
+        assert!(!c.is_proven(&key));
+        c.seed_for_test(&key);
+        c.seed_for_test(&other);
+        assert!(!c.is_proven(&key));
+        c.mark_proven(&key);
+        c.mark_proven(&other);
+        assert!(c.is_proven(&key));
+        c.invalidate(&key);
+        assert!(!c.is_proven(&key));
+        assert!(c.is_proven(&other));
+        c.invalidate_all();
+        assert!(!c.is_proven(&other));
     }
 
     mod admitted {
