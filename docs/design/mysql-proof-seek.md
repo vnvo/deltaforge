@@ -1240,3 +1240,35 @@ estimate, and the full series decides.
 - Then the full final-binary series at 0, 64, 256 and 960 MiB. Every
   repetition must meet the 2x decile bound, with no linear trend and no
   material CPU regression, before mutants or the gate.
+
+### Probe 9: one statement for a window's metadata locks
+
+The question was whether one `SELECT 1 FROM t1 WHERE FALSE UNION ALL ...`
+statement could replace the window's one `SELECT 1 FROM t LIMIT 0` per
+table, with the same locking semantics, to shorten a large window's
+capture. MySQL 8.4.9, 2,056 tables, observed through
+`performance_schema.metadata_locks` (`evidence/mysql-proof-seek/
+lockstatement-probe9.log`):
+
+- **Order: textual, not sorted by the server.** With one table held by
+  another session, a capture naming the tables in sorted order held exactly
+  the tables before it and waited on it (N = 10, 200, 2,048, three runs
+  each). Named in reverse, it held exactly the tables after it. The client's
+  sorted order is therefore the acquisition order, as with one statement
+  per table.
+- **Locks and cleanup are the same.** Every lock is `SHARED_READ` for the
+  transaction, released at commit. After a missing table (1146) or a lock
+  timeout (1205) the session holds no lock.
+- **Concurrency.** A RENAME spanning one capture's set (five runs) and one
+  spanning two disjoint captures (ten runs, both release orders) never
+  deadlocked. A DDL on a locked table waited until the capture committed
+  (1.06 s against 1.03 s held).
+- **Cost: no gain, and worse at scale.** At 200 tables it took 20-25 ms
+  (45 ms cold) against 26-31 ms for one statement per table; at 2,048, 640-700
+  ms against 270-290 ms. The cost grows about quadratically with references
+  (8,192: 3.9 s; 32,768: 100 s), within `max_allowed_packet`. 2,048
+  64-character names encode in 221 KB, 21% of the 1 MiB request bound.
+
+The safety argument holds, but the statement does not shorten a window's
+capture and is far slower at the window's maximum, so it is not used. The
+per-table statements stay.
