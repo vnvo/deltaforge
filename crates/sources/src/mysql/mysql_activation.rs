@@ -729,6 +729,35 @@ pub(crate) async fn appended_alone(
     Ok(matches!(after.as_slice(), [one] if one.seq == seq))
 }
 
+/// The barrier streams that apply to `key`: its lineage's, its database's.
+pub(crate) fn barrier_streams(key: &SchemaKey) -> [String; 2] {
+    [
+        barrier_stream(key, &BarrierScope::Lineage),
+        barrier_stream(key, &BarrierScope::Database { db: key.db.clone() }),
+    ]
+}
+
+/// [`read_barriers`], with each barrier stream's last sequence.
+pub(crate) async fn read_barriers_head(
+    backend: &ArcStorageBackend,
+    key: &SchemaKey,
+) -> Result<(Vec<Stored>, Vec<(String, u64)>)> {
+    let mut out = Vec::new();
+    let mut heads = Vec::new();
+    for stream in barrier_streams(key) {
+        let (records, head) =
+            read_stream_head(backend, BARRIER_NS, &stream).await?;
+        out.extend(records);
+        heads.push((stream, head));
+    }
+    Ok((out, heads))
+}
+
+/// The bytes a record is stored as.
+pub(crate) fn encode_record(record: &Record) -> Result<Vec<u8>> {
+    encode(record)
+}
+
 /// Read the barriers that apply to `key` (its lineage and its database).
 pub(crate) async fn read_barriers(
     backend: &ArcStorageBackend,

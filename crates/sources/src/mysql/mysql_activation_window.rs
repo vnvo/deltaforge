@@ -35,11 +35,13 @@ use deltaforge_core::{CheckpointOrder, SourceError};
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
 use mysql_binlog_connector_rust::event::event_data::EventData;
 use mysql_binlog_connector_rust::event::event_header::EventHeader;
+use schema_registry::SourceSchema as _;
 use tracing::{info, warn};
 
 use super::mysql_binlog_scan::{
-    BatchCaptureError, Captured, MAX_BATCH_TABLES, ProofError, ProofKind,
-    ProofWork, ScanReport, ScanTag, capture_batch, trace_enabled,
+    BatchCaptureError, BatchCaptured, CLASSIFIER_VERSION, MAX_BATCH_TABLES,
+    ProofError, ProofKind, ProofWork, ScanReport, ScanTag, capture_batch,
+    trace_enabled, trace_proof,
 };
 use super::mysql_event::read_next_event;
 use super::{LoopControl, MySqlCheckpoint, RunCtx};
@@ -61,11 +63,10 @@ pub(crate) struct Prepared {
 
 #[derive(Debug, Clone)]
 pub(crate) enum PreparedOutcome {
-    /// Its capture, and the scanner's answer over `(at, B]`.
-    Proven {
-        cap: Box<Captured>,
-        report: Box<ScanReport>,
-    },
+    /// The window decided the table's lazy baseline is not established
+    /// (the outcome as traced: `not_covered`, `relevant_ddl`,
+    /// `not_decisive`, or `no_binding`); its rows go on as without one.
+    Refused(&'static str),
     /// The table did not exist when the window captured.
     NoCapture,
 }
@@ -277,7 +278,9 @@ pub(super) async fn maybe_window(
     }
     let mut batch: BTreeMap<(String, String), MySqlCheckpoint> =
         BTreeMap::new();
-    let mut full = admit(ctx, &mut batch, found)
+    // First-touch order: the order the batch commits in.
+    let mut order: Vec<(String, String)> = Vec::new();
+    let mut full = admit(ctx, &mut batch, &mut order, found)
         .await
         .map_err(LoopControl::Fail)?;
     if batch.is_empty() {
@@ -347,7 +350,7 @@ pub(super) async fn maybe_window(
                 let mut found = Vec::new();
                 touched(&mut ahead, &h, &d, &mut found);
                 if !ahead.broken {
-                    full = admit(ctx, &mut batch, found)
+                    full = admit(ctx, &mut batch, &mut order, found)
                         .await
                         .map_err(LoopControl::Fail)?;
                 }
@@ -471,21 +474,21 @@ pub(super) async fn maybe_window(
     let scanned = t.elapsed();
 
     let work = answers.first().map(|r| r.work).unwrap_or_default();
-    for (((db, table), at), report) in batch.into_iter().zip(answers) {
-        let Some(at) =
-            mysql_checkpoint_position(&at.file, at.pos, at.gtid_set.as_deref())
-        else {
-            continue;
-        };
-        let outcome = match cap.table(&db, &table) {
-            Some(cap) => PreparedOutcome::Proven {
-                cap: Box::new(cap),
-                report: Box::new(report),
-            },
-            None => PreparedOutcome::NoCapture,
-        };
-        ctx.prepared.insert((db, table), Prepared { at, outcome });
-    }
+    let mut proved: HashMap<(String, String), (MySqlCheckpoint, ScanReport)> =
+        batch
+            .into_iter()
+            .zip(answers)
+            .map(|((k, at), r)| (k, (at, r)))
+            .collect();
+    let tables_in_order: Vec<_> = order
+        .into_iter()
+        .filter_map(|k| proved.remove(&k).map(|(at, r)| (k, at, r)))
+        .collect();
+    let t = Instant::now();
+    admit_batch(ctx, &lineage, &cap, tables_in_order)
+        .await
+        .map_err(LoopControl::Fail)?;
+    let committed = t.elapsed();
     ctx.lookahead = queue;
     let trace = WindowTrace {
         tables: tables.len(),
@@ -495,8 +498,362 @@ pub(super) async fn maybe_window(
         capture_attempts: attempts,
         work,
     };
-    observe_window(&source_id, &trace, read, captured, scanned);
+    observe_window(&source_id, &trace, read, captured, scanned, committed);
     Ok(Some(trace))
+}
+
+/// Conflicting re-reads of an atomic batch before the window fails closed.
+const BATCH_CONFLICT_RETRIES: usize = 3;
+/// Retries of a batch whose outcome a storage error left unknown.
+const BATCH_STORAGE_RETRIES: usize = 3;
+
+/// One table's decision before the batch: refused (and why), or a
+/// candidate whose shape is registered and whose baseline is proposed.
+enum Decision {
+    Refused(&'static str),
+    Candidate { binds: Option<String>, s: WmPos },
+}
+
+/// Admit the window's tables in one atomic state-store batch
+/// (`docs/design/mysql-proof-seek.md`, revision 4). Every table is decided
+/// exactly as its lazy baseline decides (`establish_at`), from the same
+/// capture, scan answer and timeline; then all registrations and baseline
+/// records commit together, in first-touch order, or none do. A conflict
+/// re-reads and decides again (bounded); any other failure fails the
+/// window closed, with every table's cached timeline discarded. Caches
+/// change only from the committed result.
+async fn admit_batch(
+    ctx: &mut RunCtx,
+    lineage: &str,
+    cap: &BatchCaptured,
+    tables: Vec<((String, String), MySqlCheckpoint, ScanReport)>,
+) -> Result<(), SourceError> {
+    use super::mysql_activation::{
+        ACTIVATION_NS, BARRIER_NS, Kind, Record, Stored, baseline_capture_id,
+        encode_record, table_stream,
+    };
+    use super::mysql_baseline::{affects, barrier_to_bind};
+    use super::mysql_selection::{
+        PlannedVersions, admit_decisive_planned, timeline,
+    };
+    use storage::adapters::{RegistrationPlanning, RegistrationRequest};
+    use storage::{
+        AtomicBatch, BatchOp, CommitResult, Precondition, commit_atomic,
+    };
+
+    let source_id = ctx.source_id.clone();
+    let tag = ScanTag {
+        source_id: &source_id,
+        kind: ProofKind::Lazy,
+    };
+    let lctn = ctx.lower_case_table_names;
+    // A table gone before the capture has no shape: nothing to decide.
+    let (tables, gone): (Vec<_>, Vec<_>) = tables
+        .into_iter()
+        .partition(|((db, table), _, _)| cap.table(db, table).is_some());
+    for ((db, table), at, _) in gone {
+        warn!(source_id = %ctx.source_id, %db, %table, "no lazy baseline: the table did not exist at the window's capture");
+        trace_proof(&tag, &db, &table, None, None, lctn, "no_capture");
+        if let Some(e) =
+            mysql_checkpoint_position(&at.file, at.pos, at.gtid_set.as_deref())
+        {
+            ctx.prepared.insert(
+                (db, table),
+                Prepared {
+                    at: e,
+                    outcome: PreparedOutcome::NoCapture,
+                },
+            );
+        }
+    }
+    let scope = ctx.registry_scope.current()?;
+    let keys: Vec<_> = tables
+        .iter()
+        .map(|((db, table), _, _)| scope.key(db, table))
+        .collect();
+    let discard = |ctx: &mut RunCtx| {
+        for k in &keys {
+            ctx.selection.invalidate(k);
+        }
+    };
+    let pos = |at: &MySqlCheckpoint| {
+        mysql_checkpoint_position(&at.file, at.pos, at.gtid_set.as_deref())
+            .ok_or_else(|| {
+                SourceError::Other(anyhow::anyhow!(
+                    "unparseable window position {at:?}"
+                ))
+            })
+    };
+
+    // Failover drift, for every table, before anything is decided: an
+    // incident stops the whole window with nothing of it written.
+    for (((db, table), at, _), key) in tables.iter().zip(&keys) {
+        let t = timeline(ctx, key).await?;
+        let all = t.all();
+        let at_cp = MySqlCheckpoint {
+            lineage: Some(lineage.to_string()),
+            ..at.clone()
+        };
+        super::mysql_failover_drift::check_in_stream(
+            ctx,
+            db,
+            table,
+            super::mysql_failover_drift::FirstEvent::Rows {
+                at: &pos(at)?,
+                at_cp: &at_cp,
+                timeline: &all,
+            },
+        )
+        .await?;
+    }
+
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        // Decide, as `establish_at` does, up to the registration.
+        let mut decisions = Vec::with_capacity(tables.len());
+        let mut reqs = Vec::new();
+        let mut req_of = Vec::with_capacity(tables.len());
+        let mut timelines = Vec::with_capacity(tables.len());
+        for (((db, table), at, report), key) in tables.iter().zip(&keys) {
+            let t = timeline(ctx, key).await?;
+            let e = pos(at)?;
+            let tcap = cap.table(db, table).expect("captured tables only");
+            let decision = match barrier_to_bind(&t.records, &t.barriers, &e) {
+                Err(why) => {
+                    info!(source_id = %ctx.source_id, %db, %table, why, "no lazy baseline");
+                    Decision::Refused("no_binding")
+                }
+                Ok(binds) => {
+                    let s = pos(&tcap.position)?;
+                    if !super::mysql_binlog_scan::covers(&tcap, &e, &s) {
+                        Decision::Refused("not_covered")
+                    } else if report
+                        .statements
+                        .iter()
+                        .any(|st| affects(st, db, table, lctn))
+                    {
+                        Decision::Refused("relevant_ddl")
+                    } else {
+                        Decision::Candidate { binds, s }
+                    }
+                }
+            };
+            req_of.push(match &decision {
+                Decision::Candidate { .. } => {
+                    let e_cp = MySqlCheckpoint {
+                        lineage: Some(lineage.to_string()),
+                        ..at.clone()
+                    };
+                    reqs.push(RegistrationRequest {
+                        key: key.clone(),
+                        hash: tcap.schema.fingerprint().to_string(),
+                        schema_json: serde_json::to_value(&tcap.schema)
+                            .map_err(|e| SourceError::Other(e.into()))?,
+                        checkpoint: Some(
+                            serde_json::to_vec(&e_cp)
+                                .map_err(|e| SourceError::Other(e.into()))?,
+                        ),
+                    });
+                    Some(reqs.len() - 1)
+                }
+                Decision::Refused(_) => None,
+            });
+            decisions.push(decision);
+            timelines.push(t);
+        }
+        let registry = ctx.schema.registry();
+        let planning = registry
+            .plan_registrations(&reqs, chrono::Utc::now())
+            .await
+            .map_err(|e| {
+                SourceError::Other(e.context("plan the window's registrations"))
+            })?;
+        let (reg_pre, regs) = match planning {
+            RegistrationPlanning::Planned {
+                preconditions,
+                registrations,
+            } => (preconditions, registrations),
+            RegistrationPlanning::NeedsRepair(broken) => {
+                for k in &broken {
+                    registry.repair_key(k).await.map_err(SourceError::Other)?;
+                }
+                if attempt > BATCH_CONFLICT_RETRIES {
+                    discard(ctx);
+                    return Err(SourceError::Other(anyhow::anyhow!(
+                        "the activation window's registrations still need repair after \
+                         {attempt} attempts"
+                    )));
+                }
+                continue;
+            }
+        };
+        // Each candidate's baseline, decided against its planned version.
+        let mut batch = AtomicBatch {
+            preconditions: reg_pre,
+            ops: Vec::new(),
+        };
+        let mut admitted: Vec<
+            Option<(usize, Stored, super::mysql_selection::Timeline)>,
+        > = Vec::with_capacity(tables.len());
+        let mut reg_entry: Vec<Option<(usize, usize)>> = vec![None; regs.len()];
+        let mut outcomes: Vec<&'static str> = Vec::with_capacity(tables.len());
+        for (i, (((db, table), at, report), key)) in
+            tables.iter().zip(&keys).enumerate()
+        {
+            let t = &timelines[i];
+            let Decision::Candidate { binds, s } = &decisions[i] else {
+                let Decision::Refused(why) = decisions[i] else {
+                    unreachable!()
+                };
+                admitted.push(None);
+                outcomes.push(why);
+                continue;
+            };
+            let reg = &regs[req_of[i].expect("a candidate's request")];
+            let base = batch.push_group(reg.ops.clone());
+            if let Some(e) = reg.entry_op {
+                reg_entry[req_of[i].unwrap()] = Some((base, base + e));
+            }
+            let stream = table_stream(key);
+            let record = Record::new(
+                pos(at)?,
+                Kind::Baseline {
+                    version: reg.version,
+                    schema_hash: reg.hash.clone(),
+                    to: s.clone(),
+                    scan_digest: report.digest.clone(),
+                    binds: binds.clone(),
+                    classifier_version: CLASSIFIER_VERSION.to_string(),
+                },
+            );
+            let id = baseline_capture_id(lineage, &stream, &record)
+                .map_err(SourceError::Other)?;
+            let proposed = Stored {
+                capture_id: id.clone(),
+                record: record.clone(),
+            };
+            let planned =
+                PlannedVersions::from([(reg.version, reg.hash.clone())]);
+            match admit_decisive_planned(
+                registry,
+                key,
+                t,
+                proposed.clone(),
+                &pos(at)?,
+                &planned,
+            )
+            .await
+            {
+                Ok(augmented) => {
+                    batch.preconditions.push(Precondition::LogHead {
+                        ns: ACTIVATION_NS.into(),
+                        key: stream.clone(),
+                        seq: t.table_head,
+                    });
+                    for (b, head) in &t.barrier_heads {
+                        batch.preconditions.push(Precondition::LogHead {
+                            ns: BARRIER_NS.into(),
+                            key: b.clone(),
+                            seq: *head,
+                        });
+                    }
+                    let op = batch.ops.len();
+                    batch.ops.push(BatchOp::LogAppendIfAbsent {
+                        ns: ACTIVATION_NS.into(),
+                        key: stream,
+                        capture_id: id,
+                        value: encode_record(&record)
+                            .map_err(SourceError::Other)?,
+                    });
+                    admitted.push(Some((op, proposed, augmented)));
+                    outcomes.push("proven");
+                }
+                Err(why) => {
+                    info!(source_id = %ctx.source_id, %db, %table, why, "no lazy baseline");
+                    admitted.push(None);
+                    outcomes.push("not_decisive");
+                }
+            }
+        }
+        let committed =
+            if batch.ops.is_empty() && batch.preconditions.is_empty() {
+                CommitResult::Committed(Vec::new())
+            } else {
+                match commit_atomic(
+                    ctx.registry_backend.as_ref(),
+                    &batch,
+                    BATCH_STORAGE_RETRIES,
+                )
+                .await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        discard(ctx);
+                        return Err(SourceError::Other(e.context(
+                            "commit the activation window's admissions",
+                        )));
+                    }
+                }
+            };
+        let seqs = match committed {
+            CommitResult::Committed(seqs) => seqs,
+            CommitResult::Conflict(why) => {
+                discard(ctx);
+                if attempt > BATCH_CONFLICT_RETRIES {
+                    return Err(SourceError::Other(anyhow::anyhow!(
+                        "the activation window's admissions conflicted {attempt} times \
+                         (last: {why}); nothing of the window was written"
+                    )));
+                }
+                warn!(source_id = %ctx.source_id, attempt, why, "activation window: the batch conflicted; deciding again");
+                continue;
+            }
+        };
+        // Committed: the caches learn it, and only now.
+        for (reg, entry) in regs.iter().zip(&reg_entry) {
+            if let Some((_, op)) = entry {
+                registry.admit_committed(
+                    reg,
+                    seqs[*op].expect("a committed log write"),
+                );
+            }
+        }
+        for (i, (((db, table), at, report), key)) in
+            tables.iter().zip(&keys).enumerate()
+        {
+            let tcap = cap.table(db, table);
+            match admitted[i].take() {
+                Some((op, _, mut augmented)) => {
+                    augmented.table_head =
+                        seqs[op].expect("a committed log write");
+                    ctx.selection
+                        .install_committed(key, std::sync::Arc::new(augmented));
+                }
+                None => {
+                    if let Ok(e) = pos(at) {
+                        ctx.prepared.insert(
+                            (db.clone(), table.clone()),
+                            Prepared {
+                                at: e,
+                                outcome: PreparedOutcome::Refused(outcomes[i]),
+                            },
+                        );
+                    }
+                }
+            }
+            trace_proof(
+                &tag,
+                db,
+                table,
+                tcap.as_ref(),
+                Some(report),
+                lctn,
+                outcomes[i],
+            );
+        }
+        return Ok(());
+    }
 }
 
 /// Why a window's batched capture finally failed, keeping its class:
@@ -548,6 +905,7 @@ fn capture_failure(
 async fn admit(
     ctx: &mut RunCtx,
     batch: &mut BTreeMap<(String, String), MySqlCheckpoint>,
+    order: &mut Vec<(String, String)>,
     found: Vec<(String, String, MySqlCheckpoint)>,
 ) -> Result<bool, SourceError> {
     for (db, table, at) in found {
@@ -572,6 +930,7 @@ async fn admit(
             .increment(1);
             continue;
         }
+        order.push(k.clone());
         batch.insert(k, at);
     }
     Ok(batch.len() >= MAX_BATCH_TABLES)
@@ -606,6 +965,7 @@ fn observe_window(
     read: Duration,
     captured: Duration,
     scanned: Duration,
+    committed: Duration,
 ) {
     let source = [("source", source_id.to_string())];
     metrics::counter!(
@@ -617,7 +977,7 @@ fn observe_window(
     metrics::histogram!("deltaforge_mysql_activation_window_tables", &source)
         .record(t.tables as f64);
     metrics::histogram!("deltaforge_mysql_activation_window_seconds", &source)
-        .record((read + captured + scanned).as_secs_f64());
+        .record((read + captured + scanned + committed).as_secs_f64());
     info!(
         source_id,
         tables = t.tables,
@@ -644,6 +1004,7 @@ fn observe_window(
         "read_ms": read.as_secs_f64() * 1e3,
         "capture_ms": captured.as_secs_f64() * 1e3,
         "scan_ms": scanned.as_secs_f64() * 1e3,
+        "commit_ms": committed.as_secs_f64() * 1e3,
     });
     tracing::info!(target: "deltaforge::proof_trace", "{record}");
 }

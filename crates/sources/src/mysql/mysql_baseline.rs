@@ -79,7 +79,7 @@ pub(crate) fn affects(
 /// discontinuity barrier) for the baseline to bind. `Err` when the position
 /// is shared with anything a baseline cannot supersede: several barriers, or
 /// a table record.
-fn barrier_to_bind(
+pub(crate) fn barrier_to_bind(
     table: &[Stored],
     barriers: &[Stored],
     r0: &WmPos,
@@ -382,39 +382,39 @@ pub(crate) async fn establish_at(
             return Ok(false);
         }
     };
-    // An activation window may have prepared this table's capture and its
-    // answer over (E, S] (`mysql_activation_window`): used in place of a
-    // capture and a scan of its own, and decided exactly the same way.
-    let (cap, prepared) = match ctx.take_prepared(db, table, &e) {
-        Some(PreparedOutcome::Proven { cap, report }) => (*cap, Some(*report)),
-        Some(PreparedOutcome::NoCapture) => {
-            warn!(source_id = %ctx.source_id, %db, %table, "no lazy baseline: the table did not exist at the window's capture");
+    // An activation window already decided this table (refused, or not
+    // captured): its rows go on as without a lazy baseline. One it admitted
+    // is proven by its committed baseline and never reaches here.
+    if let Some(outcome) = ctx.take_prepared(db, table, &e) {
+        let why = match outcome {
+            PreparedOutcome::Refused(why) => why,
+            PreparedOutcome::NoCapture => "no_capture",
+        };
+        info!(source_id = %ctx.source_id, %db, %table, why, "no lazy baseline (decided by the activation window)");
+        return Ok(false);
+    }
+    let cap = match capture(
+        ctx.dsn.expose(),
+        &server_uuid,
+        &lineage,
+        db,
+        table,
+        None,
+    )
+    .await
+    {
+        Ok(cap) => {
+            observe_capture(&tag, &cap);
+            cap
+        }
+        Err(ProofError::OtherServer(found)) => {
+            return Err(other_server(&server_uuid, &found));
+        }
+        Err(err) => {
+            warn!(source_id = %ctx.source_id, %db, %table, error = ?err, "no lazy baseline: no capture");
             trace_proof(&tag, db, table, None, None, lctn, "no_capture");
             return Ok(false);
         }
-        None => match capture(
-            ctx.dsn.expose(),
-            &server_uuid,
-            &lineage,
-            db,
-            table,
-            None,
-        )
-        .await
-        {
-            Ok(cap) => {
-                observe_capture(&tag, &cap);
-                (cap, None)
-            }
-            Err(ProofError::OtherServer(found)) => {
-                return Err(other_server(&server_uuid, &found));
-            }
-            Err(err) => {
-                warn!(source_id = %ctx.source_id, %db, %table, error = ?err, "no lazy baseline: no capture");
-                trace_proof(&tag, db, table, None, None, lctn, "no_capture");
-                return Ok(false);
-            }
-        },
     };
     let s_cp = cap.position.clone();
     let Some(s) = mysql_checkpoint_position(
@@ -429,24 +429,19 @@ pub(crate) async fn establish_at(
         trace_proof(&tag, db, table, Some(&cap), None, lctn, "not_covered");
         return Ok(false);
     }
-    let scanned = match prepared {
-        Some(report) => Ok(report),
-        None => {
-            super::mysql_proof_scanner::shared_interval(
-                &ctx.proof_scanner,
-                ctx.dsn.expose(),
-                &source_id,
-                &server_uuid,
-                &lineage,
-                &e_cp,
-                &s_cp,
-                ctx.stream_anchor(&server_uuid, &lineage).as_ref(),
-                Some(&e_cp),
-                &tag,
-            )
-            .await
-        }
-    };
+    let scanned = super::mysql_proof_scanner::shared_interval(
+        &ctx.proof_scanner,
+        ctx.dsn.expose(),
+        &source_id,
+        &server_uuid,
+        &lineage,
+        &e_cp,
+        &s_cp,
+        ctx.stream_anchor(&server_uuid, &lineage).as_ref(),
+        Some(&e_cp),
+        &tag,
+    )
+    .await;
     let report = match scanned {
         Ok(report) => report,
         Err(ProofError::OtherServer(found)) => {

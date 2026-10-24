@@ -59,10 +59,18 @@ pub(crate) struct Timeline {
     /// The sequence of the table stream's last record when it was read (0
     /// when empty): an append's proof that nothing else was stored since.
     pub table_head: u64,
+    /// The barrier streams read, with their last sequences: what an atomic
+    /// batch's preconditions rest on.
+    pub barrier_heads: Vec<(String, u64)>,
 }
 
+/// Versions an atomic batch plans for one table but has not committed:
+/// version to schema hash. Validation of a proposed record reads them in
+/// place of the registry; nothing else ever sees them.
+pub(crate) type PlannedVersions = std::collections::HashMap<i32, String>;
+
 impl Timeline {
-    fn all(&self) -> Vec<Stored> {
+    pub(crate) fn all(&self) -> Vec<Stored> {
         self.records
             .iter()
             .chain(self.barriers.iter())
@@ -200,6 +208,7 @@ impl Caches {
                 records: Vec::new(),
                 barriers: Vec::new(),
                 table_head: 0,
+                barrier_heads: Vec::new(),
             }),
         );
     }
@@ -231,6 +240,16 @@ impl Caches {
     fn install(&mut self, key: &SchemaKey, timeline: Arc<Timeline>) {
         self.invalidate(key);
         self.put_timeline(key.backend_key(), timeline);
+    }
+
+    /// An atomic batch committed the record admitted into `timeline`: it is
+    /// the table's timeline now (see [`Self::install`]).
+    pub(crate) fn install_committed(
+        &mut self,
+        key: &SchemaKey,
+        timeline: Arc<Timeline>,
+    ) {
+        self.install(key, timeline);
     }
 
     /// A barrier (or anything lineage-wide) was appended.
@@ -318,6 +337,16 @@ pub(crate) async fn validate(
     key: &SchemaKey,
     timeline: &Timeline,
 ) -> anyhow::Result<()> {
+    validate_planned(registry, key, timeline, &PlannedVersions::new()).await
+}
+
+/// [`validate`], with `planned` versions read before the registry's.
+pub(crate) async fn validate_planned(
+    registry: &DurableSchemaRegistry,
+    key: &SchemaKey,
+    timeline: &Timeline,
+    planned: &PlannedVersions,
+) -> anyhow::Result<()> {
     let stream = table_stream(key);
     let mut full_positions: Vec<&WmPos> = Vec::new();
     let mut bound_barriers: Vec<&str> = Vec::new();
@@ -385,7 +414,8 @@ pub(crate) async fn validate(
                 }
             },
             Kind::Baseline { .. } => {
-                validate_baseline(registry, key, &stream, s, timeline).await?
+                validate_baseline(registry, key, &stream, s, timeline, planned)
+                    .await?
             }
             Kind::Ddl | Kind::Unknown | Kind::Barrier { .. } => {}
         }
@@ -399,6 +429,7 @@ async fn validate_baseline(
     stream: &str,
     s: &Stored,
     timeline: &Timeline,
+    planned: &PlannedVersions,
 ) -> anyhow::Result<()> {
     let Kind::Baseline {
         version,
@@ -417,9 +448,11 @@ async fn validate_baseline(
             format!("baseline classifier {classifier_version:?} unsupported"),
         ));
     }
-    if registry.version_hash(key, *version).await?.as_deref()
-        != Some(schema_hash.as_str())
-    {
+    let hash = match planned.get(version) {
+        Some(h) => Some(h.clone()),
+        None => registry.version_hash(key, *version).await?,
+    };
+    if hash.as_deref() != Some(schema_hash.as_str()) {
         return Err(invalid(key, "baseline schema hash is not its version's"));
     }
     if !matches!(
@@ -569,7 +602,7 @@ async fn validate_full(
     Ok(())
 }
 
-async fn timeline(
+pub(crate) async fn timeline(
     ctx: &mut RunCtx,
     key: &SchemaKey,
 ) -> SourceResult<Arc<Timeline>> {
@@ -582,13 +615,15 @@ async fn timeline(
         mysql_activation::read_table_head(&ctx.registry_backend, registry, key)
             .await
             .map_err(timeline_error)?;
-    let barriers = mysql_activation::read_barriers(&ctx.registry_backend, key)
-        .await
-        .map_err(timeline_error)?;
+    let (barriers, barrier_heads) =
+        mysql_activation::read_barriers_head(&ctx.registry_backend, key)
+            .await
+            .map_err(timeline_error)?;
     let t = Timeline {
         records,
         barriers,
         table_head,
+        barrier_heads,
     };
     validate(registry, key, &t).await.map_err(timeline_error)?;
     let t = Arc::new(t);
@@ -758,6 +793,27 @@ pub(crate) async fn admit_decisive_timeline(
     proposed: Stored,
     row: &WmPos,
 ) -> Result<Timeline, String> {
+    admit_decisive_planned(
+        registry,
+        key,
+        current,
+        proposed,
+        row,
+        &PlannedVersions::new(),
+    )
+    .await
+}
+
+/// [`admit_decisive_timeline`] for an atomic batch: the proposed record's
+/// version is `planned`, not yet registered.
+pub(crate) async fn admit_decisive_planned(
+    registry: &DurableSchemaRegistry,
+    key: &SchemaKey,
+    current: &Timeline,
+    proposed: Stored,
+    row: &WmPos,
+    planned: &PlannedVersions,
+) -> Result<Timeline, String> {
     let version = match &proposed.record.kind {
         Kind::Observed { version, .. } | Kind::Baseline { version, .. } => {
             *version
@@ -768,9 +824,10 @@ pub(crate) async fn admit_decisive_timeline(
         records: current.records.clone(),
         barriers: current.barriers.clone(),
         table_head: current.table_head,
+        barrier_heads: current.barrier_heads.clone(),
     };
     augmented.records.push(proposed.clone());
-    validate(registry, key, &augmented)
+    validate_planned(registry, key, &augmented, planned)
         .await
         .map_err(|e| format!("{e:#}"))?;
     match select_decisive(&augmented.all(), row) {
@@ -1040,6 +1097,7 @@ mod tests {
                 records: Vec::new(),
                 barriers: Vec::new(),
                 table_head: 0,
+                barrier_heads: Vec::new(),
             });
             let loaded = Arc::new(LoadedSchema::new(
                 MySqlTableSchema::new(Vec::new()),
@@ -1087,6 +1145,7 @@ mod tests {
             records: Vec::new(),
             barriers: Vec::new(),
             table_head: 0,
+            barrier_heads: Vec::new(),
         });
         let loaded = Arc::new(LoadedSchema::new(
             MySqlTableSchema::new(Vec::new()),
@@ -1330,6 +1389,7 @@ mod tests {
             records,
             barriers: Vec::new(),
             table_head: 0,
+            barrier_heads: Vec::new(),
         };
         validate(&f.reg, &f.key, &t)
             .await
@@ -1451,6 +1511,7 @@ mod tests {
                 records,
                 barriers,
                 table_head: 0,
+                barrier_heads: Vec::new(),
             };
             let (f, row) = (&f, row.clone());
             async move { admit_decisive(&f.reg, &f.key, &current, p, &row).await }
@@ -1518,6 +1579,7 @@ mod tests {
             records: vec![later],
             barriers: Vec::new(),
             table_head: 0,
+            barrier_heads: Vec::new(),
         };
         let err = admit_decisive(
             &f.reg,
@@ -1562,6 +1624,7 @@ mod tests {
                 records,
                 barriers,
                 table_head,
+                barrier_heads: Vec::new(),
             }
         }
 
@@ -1730,6 +1793,7 @@ mod tests {
                     records: Vec::new(),
                     barriers: Vec::new(),
                     table_head: 0,
+                    barrier_heads: Vec::new(),
                 }),
             );
             let current = Timeline::clone(
@@ -1784,6 +1848,7 @@ mod tests {
                     records: Vec::new(),
                     barriers: Vec::new(),
                     table_head: 0,
+                    barrier_heads: Vec::new(),
                 }),
             );
             let current = Timeline::clone(
