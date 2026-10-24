@@ -1014,13 +1014,30 @@ stay strictly sequential.
    rows are dispatched in order, the stream reaches S's head event. S's
    batch is then recomputed with the unchanged functions, from the real
    dispatch state (`txn_eval_cp`, `unproven_at`, `head_tables`, `touched`,
-   `admit`) over S's held events. That gives the authoritative batch B'
-   and each table's start A_i. Every table of B' must be in S's
-   speculative batch with an identical A_i; S's capture and scan answers
-   are then used for B' only. Otherwise the window fails closed as an
-   internal inconsistency; there is no fallback capture. Then
-   `admit_batch` re-reads every registry and activation precondition and
-   runs the unchanged decision functions, as in revision 4.
+   `admit`, and the coverage rule below) over S's held events. That gives
+   the authoritative required set B' and each required table's start A_i.
+   Then `admit_batch` re-reads every registry and activation precondition
+   and runs the unchanged decision functions, as in revision 4.
+
+   **The rule: the authoritative required set must be a subset of the
+   speculative candidate set. Required entries must match exactly; unused
+   candidates are discarded. One successful stable decision governs all
+   held rows it covers. Any uncertain outcome fails the window closed.**
+
+   - Every table of B' must be among S's captured candidates, with exactly
+     the same A_i, the same source relation (`schema`, `table`) and the
+     same lineage, and S's capture and scan answer for it must be bound
+     to that table and that interval `(A_i, B_S]`.
+   - A captured schema or proof answer is used only for the table and
+     boundary it was obtained for, never for another.
+   - Candidates outside B' (for example a table the snapshot did not flag
+     but a full selection finds proven) are discarded silently, with no
+     state change.
+   - A required table missing from S, a different A_i, relation or
+     lineage, or an answer bound to another table or interval, is an
+     internal invariant violation: the speculative state machine disagreed
+     with the authoritative reading of the stream. The window fails
+     closed. There is never a fresh capture after such a mismatch.
 5. **Sequences only at commit.** Sequences are allocated only inside the
    window's own atomic commit (revision 4), never during speculation.
 6. **Stream order.** Output, admission and checkpoint order remain stream
@@ -1028,18 +1045,59 @@ stay strictly sequential.
    then the held events, then the stream. S never dispatches anything;
    its events wait in the held queue.
 
-Why every table of B' is in S's speculative batch: S's candidates are the
+Why every required table is a candidate of S: S's candidates are the
 allowed, unreserved tables whose rows S's events touch and that are not
 flagged proven in the snapshot. Nothing changes the proven state of an
 unreserved table between the snapshot and S's decision: C's commit writes
 only C's tables, and no event is dispatched between the snapshot and the
-end of C's admission. Every table of B' is unproven (so not flagged),
-allowed, and either unreserved (so captured by S) or reserved by C (so
-excluded from B' by the refusal rule or by being proven, below). The
+end of C's admission. So every required table is unproven (so not
+flagged), allowed, and either unreserved (so a candidate) or reserved by
+C. A table reserved by C is required in S only when C's decisions do not
+cover its rows in S's events, and that case abandons S before it decides
+(the planned abandonment below), so no non-abandoned S meets it. The
 starts agree because S tracks boundaries with the same `Ahead` state that
 C's read-ahead uses, continued from C's last held event, and C's queue is
 dispatched before S's head. A difference would be a defect, so it fails
 closed instead of being repaired.
+
+### Which decisions govern which held rows
+
+A window decides each table at its first boundary A_i in the window. The
+decision is applied to the table's other held rows only where one decision
+provably covers them; no held row ever triggers a capture of its own.
+
+| Outcome of the decision at A_i | Classification | Held rows it governs |
+|---|---|---|
+| Admitted (proven baseline) | Successful | The table's held rows from A_i up to the first statement affecting it in the proof answer, or with none, every later held row. Selection proves them over the committed timeline; nothing more is decided. |
+| `relevant_ddl`: the proof answer holds a statement affecting the table at d in `(A_i, B]` | Stable exclusion | Rows in `[A_i, d)`: no capture, taken at any time, can give their shape (every capture is after d). They go on without a lazy baseline, exactly as refused rows do today (a FULL signature selection, or the fail-closed error without FULL metadata). Rows after d belong to that statement's own path, not to this decision. |
+| `NoCapture`, with a statement in the proof answer that drops or renames the table at d | Stable exclusion | Rows in `[A_i, d)`, as above. |
+| `no_binding` or `not_decisive` | Stable, but position-specific | Only the rows of A_i's own transaction. The table's rows at later boundaries are not covered: they are decided by a later window, with its own batched capture (below). |
+| `NoCapture` with no such statement in the answer; `not_covered` (the capture does not contain the rows' position) | Uncertain | None: the window fails closed. Neither can happen when the stream and the capture agree. |
+| A capture, scan or state-store failure (after revision 4's bounded retries) | Transient | None: the window fails closed, as in revision 4. |
+
+The window closes before any schema-changing statement, so its own queue
+holds no statement, and a statement in `(A_i, B]` lies after the window's
+close. Rows covered by one capture and proof interval therefore share its
+result, except for the position-specific outcomes.
+
+**Uncovered held rows.** After C's decisions and before dispatch resumes:
+
+- **In C's own queue:** if a row of a C table is uncovered (only after a
+  position-specific outcome) and still unproven, C's queue is cut just
+  before that row. The rest of the queue returns to the front of the held
+  events with its receipt times, and an ordinary window forms at that row
+  when the stream reaches it. That window decides it with one batched
+  capture.
+- **In S's events:** if a C table has uncovered rows in S's events, S
+  cannot hold that table (it was reserved when S formed).
+
+In either case S is **abandoned** before it decides: its task is aborted,
+its capture and answers are discarded unused, its reservations end, and
+its events stay held for an ordinary window. Abandonment follows from C's
+decisions, never from a comparison with S's results, so it is not a
+mismatch. It costs at most one discarded speculative capture, never a
+per-table capture. It needs a position-specific refusal of a table with
+more rows in the held events, which is rare.
 
 ### Lifecycle
 
@@ -1075,8 +1133,8 @@ closed instead of being repaired.
 | C fails before or during its commit, or is cancelled (stop) | S's task is aborted: its capture connection is dropped, so the server rolls back its read-only transaction and releases its metadata locks. Every held event and both windows' reservations are discarded. The source resumes from the last dispatched boundary (`abandon_open_transaction`, or the stop path), exactly as for a failed window today. |
 | C's commit is ambiguous (acknowledgement lost) | Resolved by revision 4's read-back inside C's admission, before C returns. S cannot decide before that, because it decides only after C has returned and its held rows are dispatched. |
 | S's capture or scan fails, before or after C commits | Remembered in S's task result. Nothing surfaces while C is current. When the stream reaches S's head (every preceding window completed, and its rows dispatched in order), the failure surfaces with revision 4's classification: exhausted lock waits or deadlocks are `mysql_capture_contention`, a connection failure a connection error, a scan failure the scanner's error. The window fails closed; there is no per-table capture. |
-| C refuses a table, or finds it missing (`NoCapture`) | That outcome governs every held row of the table up to the last held event when C decides, including rows in C's own queue at later positions. They go on without a lazy baseline, exactly as the refused rows do, and are never captured on their own. This also removes today's per-table capture for later rows of a refused table within one window. Rows read after that point are new and may join a later window. |
-| A held row of a table reserved by C appears in S's events | Not a candidate for S. After C, the table is either admitted (its later rows select over C's committed timeline) or governed by the refusal rule above. |
+| C refuses a table, or finds it missing (`NoCapture`) | Governed by the classification above: a stable outcome governs exactly the held rows it covers, an uncertain one fails the window closed, and uncovered rows go to a later window (planned abandonment of S). No held row is ever captured on its own. |
+| A held row of a table reserved by C appears in S's events | Not a candidate for S. After C, the row is covered by C's decision, or, if C's decision does not cover it, S is abandoned and a later window decides it. |
 | Disconnect (any read error or injected drop) with two windows present | S's task is aborted. The held events, both reservations and the refusal record are discarded. The resume reads the events from the server again. |
 | Credential rotation | Deferred while any event is held or any window exists, as in revision 4's follow-up. |
 
@@ -1112,7 +1170,9 @@ every request does today. S's answers themselves are discarded with S.
   at most two windows' worth of events.
 - Captures: one batched capture per window, at most three attempts. The
   speculative capture is that capture; there is never a second capture
-  for the same window.
+  for the same window. An abandoned speculation's capture is discarded,
+  and the ordinary window that later forms over its events takes its own
+  single batched capture.
 - Scans: one shared scanner request per window.
 - Per-table captures: none from any window path.
 
@@ -1139,6 +1199,19 @@ estimate, and the full series decides.
   its class.
 - **The same table appears again while reserved:** its held rows follow
   C's outcome (admitted, or refused without a capture).
+- **Several transactions of one table in a window:** after admission, after
+  a stable exclusion, and after a position-specific refusal (the later
+  transactions go to one later batched window; S is abandoned).
+- **DDL immediately before the window and immediately after it:** rows
+  before an affecting statement are governed by the exclusion; rows after
+  it follow the statement's path; nothing is captured per table.
+- **Exclusion, proof refusal and transient failure** of one table while
+  others are admitted: the first two govern exactly their covered rows,
+  the third fails the window closed.
+- **Harmless extra candidate:** a speculatively captured table found proven
+  at decision time is discarded and the window commits.
+- **Invariant violation:** a required table missing from S (injected) fails
+  the window closed without a fresh capture.
 - **Disconnect and cancellation with two windows present:** every held
   event discarded, S's task aborted, every row delivered exactly once
   after the resume.
@@ -1157,7 +1230,9 @@ estimate, and the full series decides.
   ignored (a C table joins S); a speculative cache write; a held row of a
   refused table captured on its own; S's task not aborted when C fails;
   a mismatched speculation repaired by a fresh capture instead of failing
-  closed.
+  closed; a harmless extra candidate treated as a mismatch; a
+  position-specific refusal applied to later transactions of its table;
+  an uncertain outcome treated as a refusal.
 - Then the full final-binary series at 0, 64, 256 and 960 MiB. Every
   repetition must meet the 2x decile bound, with no linear trend and no
   material CPU regression, before mutants or the gate.
