@@ -1405,7 +1405,7 @@ fn source_event_labels(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::failover::reconciler::SchemaReconciler;
     use crate::mysql::mysql_schema_loader::MySqlSchemaLoader;
@@ -1453,7 +1453,7 @@ mod tests {
         .flatten()
     }
 
-    fn make_runctx(tx: mpsc::Sender<SourceItem>) -> RunCtx {
+    pub(crate) fn make_runctx(tx: mpsc::Sender<SourceItem>) -> RunCtx {
         // A static test schema: `id BIGINT`, `sku VARCHAR(255)` (utf8mb4).
         let mut sku = crate::mysql::MySqlColumn::new(
             "sku",

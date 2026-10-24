@@ -1132,6 +1132,11 @@ impl DurableSchemaRegistry {
         })
     }
 
+    /// The store this registry reads and writes.
+    pub fn backend(&self) -> &ArcStorageBackend {
+        &self.backend
+    }
+
     /// Repair a key whose latest entry is not indexed (an earlier
     /// registration cut short): the registry's own idempotent repair.
     pub async fn repair_key(&self, key: &SchemaKey) -> Result<()> {

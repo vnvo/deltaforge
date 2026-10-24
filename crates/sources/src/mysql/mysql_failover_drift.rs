@@ -813,7 +813,10 @@ pub(crate) async fn check_window(
     let scope = ctx.registry_scope.current()?;
     let pending: Vec<_> = tables
         .iter()
-        .filter(|(db, table, ..)| !ctx.drift_checked.contains(&scope.key(db, table).backend_key()))
+        .filter(|(db, table, ..)| {
+            !ctx.drift_checked
+                .contains(&scope.key(db, table).backend_key())
+        })
         .collect();
     if pending.is_empty() {
         return Ok(());

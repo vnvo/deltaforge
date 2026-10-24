@@ -541,6 +541,17 @@ async fn admit_batch(
         AtomicBatch, BatchOp, CommitResult, Precondition, commit_atomic,
     };
 
+    // One store holds the registry and the activation records, or no
+    // batch can commit them together.
+    if !std::sync::Arc::ptr_eq(
+        ctx.schema.registry().backend(),
+        &ctx.registry_backend,
+    ) {
+        return Err(SourceError::Other(anyhow::anyhow!(
+            "the activation window needs the schema registry and the activation \
+             records in one state store"
+        )));
+    }
     let source_id = ctx.source_id.clone();
     let tag = ScanTag {
         source_id: &source_id,
@@ -1009,6 +1020,465 @@ fn observe_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod batch {
+        //! The window's atomic admission on a real (in-memory) store.
+        use super::*;
+        use crate::gtid_set::GtidSet;
+        use crate::mysql::mysql_activation::{
+            ACTIVATION_NS, Kind, Record, Stored, append, read_table_head,
+            table_stream,
+        };
+        use crate::mysql::mysql_ddl_attribution::{DdlEffect, TableName};
+        use crate::mysql::mysql_schema_loader::MySqlSchemaLoader;
+        use crate::mysql::mysql_table_schema::{MySqlColumn, MySqlTableSchema};
+        use storage::ArcStorageBackend;
+        use tokio::sync::mpsc;
+
+        const U: &str = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+
+        async fn ctx_on(backend: ArcStorageBackend) -> RunCtx {
+            let (tx, _rx) = mpsc::channel(8);
+            let mut ctx = crate::mysql::mysql_event::tests::make_runctx(tx);
+            ctx.registry_backend = backend.clone();
+            let registry = storage::DurableSchemaRegistry::new(backend.clone())
+                .await
+                .unwrap();
+            ctx.schema = MySqlSchemaLoader::new(
+                "mysql://fake",
+                registry,
+                &ctx.tenant,
+                ctx.registry_scope.clone(),
+            );
+            crate::registry_scope::establish_scope(
+                &backend,
+                &ctx.registry_scope,
+                &ctx.tenant,
+                &ctx.source_id,
+                storage::adapters::LineageDescriptor::mysql(U).unwrap(),
+            )
+            .await
+            .unwrap();
+            ctx.last_gtid = Some(GtidSet::parse(&format!("{U}:1-50")).unwrap());
+            ctx
+        }
+
+        fn at(k: u64) -> MySqlCheckpoint {
+            MySqlCheckpoint {
+                file: "mysql-bin.000001".into(),
+                pos: 4 + 100 * k,
+                gtid_set: Some(format!("{U}:1-{k}")),
+                lineage: None,
+                snapshot_completed: None,
+                snapshot_chain: None,
+            }
+        }
+
+        fn wm(k: u64) -> WmPos {
+            let p = at(k);
+            mysql_checkpoint_position(&p.file, p.pos, p.gtid_set.as_deref())
+                .unwrap()
+        }
+
+        fn schema(cols: &[&str]) -> MySqlTableSchema {
+            MySqlTableSchema::new(
+                cols.iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        MySqlColumn::new(*c, "int", "int", true, i as u32 + 1)
+                    })
+                    .collect(),
+            )
+        }
+
+        fn capture(ctx: &RunCtx, tables: &[&str]) -> BatchCaptured {
+            let lineage = ctx
+                .registry_scope
+                .current()
+                .unwrap()
+                .lineage()
+                .lineage_hash
+                .clone();
+            let mut from = at(50);
+            from.lineage = Some(lineage.clone());
+            let mut position = at(60);
+            position.lineage = Some(lineage);
+            BatchCaptured {
+                from,
+                position,
+                schemas: tables
+                    .iter()
+                    .map(|t| {
+                        (("d".to_string(), t.to_string()), schema(&["id", t]))
+                    })
+                    .collect(),
+                missing: Vec::new(),
+                trace: Default::default(),
+            }
+        }
+
+        fn report(
+            statements: Vec<super::super::super::mysql_binlog_scan::Statement>,
+        ) -> ScanReport {
+            ScanReport {
+                statements,
+                events: 0,
+                bytes: 0,
+                duration: Duration::ZERO,
+                digest: "digest".into(),
+                trace: Default::default(),
+                frontier: None,
+                session_anchor: None,
+                positioned_at: None,
+                work: Default::default(),
+            }
+        }
+
+        fn entry(
+            t: &str,
+            k: u64,
+        ) -> ((String, String), MySqlCheckpoint, ScanReport) {
+            (("d".into(), t.into()), at(k), report(Vec::new()))
+        }
+
+        fn key(ctx: &RunCtx, t: &str) -> storage::adapters::SchemaKey {
+            ctx.registry_scope.current().unwrap().key("d", t)
+        }
+
+        /// (registry entry sequence, activation record sequence) of a table.
+        async fn seqs(ctx: &RunCtx, t: &str) -> (Option<u64>, Option<u64>) {
+            let k = key(ctx, t);
+            let reg = ctx
+                .schema
+                .registry()
+                .get_latest(&k)
+                .await
+                .unwrap()
+                .map(|v| v.sequence);
+            let (records, head) = read_table_head(
+                &ctx.registry_backend,
+                ctx.schema.registry(),
+                &k,
+            )
+            .await
+            .unwrap();
+            (reg, (!records.is_empty()).then_some(head))
+        }
+
+        async fn admit(
+            ctx: &mut RunCtx,
+            tables: &[&str],
+            entries: Vec<((String, String), MySqlCheckpoint, ScanReport)>,
+        ) -> Result<(), SourceError> {
+            let lineage = ctx
+                .registry_scope
+                .current()
+                .unwrap()
+                .lineage()
+                .lineage_hash
+                .clone();
+            let cap = capture(ctx, tables);
+            admit_batch(ctx, &lineage, &cap, entries).await
+        }
+
+        /// Every table admitted, its registry entry then its baseline, in
+        /// first-touch order (not name order), one contiguous range; each
+        /// table's cached timeline is the committed one and proves its rows.
+        #[tokio::test]
+        async fn tables_commit_together_in_first_touch_order() {
+            let mut ctx = ctx_on(std::sync::Arc::new(
+                storage::MemoryStorageBackend::new(),
+            ))
+            .await;
+            admit(
+                &mut ctx,
+                &["t1", "t2"],
+                vec![entry("t2", 3), entry("t1", 5)],
+            )
+            .await
+            .unwrap();
+            let (r2, a2) = seqs(&ctx, "t2").await;
+            let (r1, a1) = seqs(&ctx, "t1").await;
+            let all = [r2.unwrap(), a2.unwrap(), r1.unwrap(), a1.unwrap()];
+            assert!(
+                all.windows(2).all(|w| w[1] == w[0] + 1),
+                "contiguous, first touch first: {all:?}"
+            );
+            for (t, k) in [("t2", 3), ("t1", 5)] {
+                let kt = key(&ctx, t);
+                let cached = super::super::super::mysql_selection::timeline(
+                    &mut ctx, &kt,
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    crate::mysql::mysql_activation::select(
+                        &cached.all(),
+                        &wm(k)
+                    ),
+                    crate::mysql::mysql_activation::Selection::Proven {
+                        version: 1
+                    }
+                ));
+            }
+            assert!(ctx.prepared.is_empty());
+        }
+
+        async fn stored(
+            c: &RunCtx,
+        ) -> (Vec<Stored>, i32, String, serde_json::Value, Option<Vec<u8>>)
+        {
+            let k = key(c, "t1");
+            let records = crate::mysql::mysql_activation::read_stream(
+                &c.registry_backend,
+                ACTIVATION_NS,
+                &table_stream(&k),
+            )
+            .await
+            .unwrap();
+            let v = c.schema.registry().get_latest(&k).await.unwrap().unwrap();
+            (records, v.version, v.hash, v.schema_json, v.checkpoint)
+        }
+
+        /// The batch stores what the one-table steps store (`establish_at`:
+        /// register the captured shape, then append the decided baseline):
+        /// the same version and hash, and the same record bytes and identity.
+        #[tokio::test]
+        async fn the_batch_stores_what_one_table_admission_stores() {
+            let mut batch = ctx_on(std::sync::Arc::new(
+                storage::MemoryStorageBackend::new(),
+            ))
+            .await;
+            admit(&mut batch, &["t1"], vec![entry("t1", 5)])
+                .await
+                .unwrap();
+            let one = ctx_on(std::sync::Arc::new(
+                storage::MemoryStorageBackend::new(),
+            ))
+            .await;
+            let k = key(&one, "t1");
+            let e_cp = MySqlCheckpoint {
+                lineage: Some(k.lineage_hash.clone()),
+                ..at(5)
+            };
+            let (version, hash) = one
+                .schema
+                .register_captured(
+                    "d",
+                    "t1",
+                    &schema(&["id", "t1"]),
+                    &serde_json::to_vec(&e_cp).unwrap(),
+                )
+                .await
+                .unwrap();
+            let record = Record::new(
+                wm(5),
+                Kind::Baseline {
+                    version,
+                    schema_hash: hash.clone(),
+                    to: wm(60),
+                    scan_digest: "digest".into(),
+                    binds: None,
+                    classifier_version: CLASSIFIER_VERSION.into(),
+                },
+            );
+            let id = crate::mysql::mysql_activation::baseline_capture_id(
+                &k.lineage_hash,
+                &table_stream(&k),
+                &record,
+            )
+            .unwrap();
+            append(
+                &one.registry_backend,
+                one.schema.registry(),
+                &k,
+                ACTIVATION_NS,
+                &table_stream(&k),
+                &id,
+                &record,
+            )
+            .await
+            .unwrap();
+            assert_eq!(stored(&batch).await, stored(&one).await);
+        }
+
+        /// Refused tables: a relevant DDL is decided before registering
+        /// (nothing written for it); a baseline that is not decisive (a
+        /// record incomparable with the rows) is registered, as one table at
+        /// a time registers it, but no record is written. Both leave their outcome for their rows; the other table
+        /// of the batch is admitted.
+        #[tokio::test]
+        async fn refused_tables_write_no_baseline() {
+            let mut ctx = ctx_on(std::sync::Arc::new(
+                storage::MemoryStorageBackend::new(),
+            ))
+            .await;
+            let k4 = key(&ctx, "t4");
+            append(
+                &ctx.registry_backend,
+                ctx.schema.registry(),
+                &k4,
+                ACTIVATION_NS,
+                &table_stream(&k4),
+                "incomparable-ddl",
+                &Record::new(
+                    WmPos::MysqlGtid {
+                        gtid_set: "4e11fa47-71ca-11e1-9e33-c80aa9429562:1-2"
+                            .into(),
+                    },
+                    Kind::Ddl,
+                ),
+            )
+            .await
+            .unwrap();
+            let relevant = super::super::super::mysql_binlog_scan::Statement {
+                event: crate::mysql::mysql_activation::EventIdentity::Gtid {
+                    gtid: format!("{U}:55"),
+                    ordinal: 1,
+                },
+                effect: DdlEffect::Tables(vec![TableName {
+                    db: "d".into(),
+                    table: "t3".into(),
+                }]),
+            };
+            admit(
+                &mut ctx,
+                &["t1", "t3", "t4"],
+                vec![
+                    entry("t1", 5),
+                    (("d".into(), "t3".into()), at(5), report(vec![relevant])),
+                    entry("t4", 4),
+                ],
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                seqs(&ctx, "t3").await,
+                (None, None),
+                "relevant DDL: nothing written"
+            );
+            let (r4, _) = seqs(&ctx, "t4").await;
+            assert!(r4.is_some(), "registered");
+            let records = crate::mysql::mysql_activation::read_table(
+                &ctx.registry_backend,
+                ctx.schema.registry(),
+                &k4,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                records.len(),
+                1,
+                "no baseline beside the incomparable ddl"
+            );
+            assert!(matches!(
+                ctx.take_prepared("d", "t3", &wm(5)),
+                Some(PreparedOutcome::Refused("relevant_ddl"))
+            ));
+            assert!(matches!(
+                ctx.take_prepared("d", "t4", &wm(4)),
+                Some(PreparedOutcome::Refused("not_decisive"))
+            ));
+            assert!(
+                seqs(&ctx, "t1").await.1.is_some(),
+                "the other table is admitted"
+            );
+        }
+
+        /// A store that cannot commit: the window fails closed, nothing of it
+        /// is written, and no cached timeline holds an uncommitted record.
+        #[tokio::test]
+        async fn a_failed_batch_writes_nothing_and_caches_nothing() {
+            let fault = std::sync::Arc::new(
+                storage::adapters::test_util::FaultBackend::new(),
+            );
+            let backend: ArcStorageBackend = fault.clone();
+            let mut ctx = ctx_on(backend).await;
+            fault
+                .fail_writes_to
+                .lock()
+                .unwrap()
+                .push(ACTIVATION_NS.to_string());
+            let err = admit(
+                &mut ctx,
+                &["t1", "t2"],
+                vec![entry("t1", 5), entry("t2", 6)],
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("commit the activation window"),
+                "{err:#}"
+            );
+            fault.fail_writes_to.lock().unwrap().clear();
+            for t in ["t1", "t2"] {
+                assert_eq!(
+                    seqs(&ctx, t).await,
+                    (None, None),
+                    "{t}: nothing written"
+                );
+                let kt = key(&ctx, t);
+                let t = super::super::super::mysql_selection::timeline(
+                    &mut ctx, &kt,
+                )
+                .await
+                .unwrap();
+                assert!(t.records.is_empty(), "no uncommitted record cached");
+            }
+            assert!(ctx.prepared.is_empty());
+        }
+
+        /// A conflict (the store changed after the decision was read):
+        /// nothing is written by that attempt, the cached timelines are
+        /// discarded, and the decision is made again from a fresh read.
+        #[tokio::test]
+        async fn a_conflict_is_decided_again_from_a_fresh_read() {
+            let mut ctx = ctx_on(std::sync::Arc::new(
+                storage::MemoryStorageBackend::new(),
+            ))
+            .await;
+            let k1 = key(&ctx, "t1");
+            // The cache holds the empty timeline; the store gains a record.
+            super::super::super::mysql_selection::timeline(&mut ctx, &k1)
+                .await
+                .unwrap();
+            append(
+                &ctx.registry_backend,
+                ctx.schema.registry(),
+                &k1,
+                ACTIVATION_NS,
+                &table_stream(&k1),
+                "unknown-at-2",
+                &Record::new(wm(2), Kind::Unknown),
+            )
+            .await
+            .unwrap();
+            admit(&mut ctx, &["t1"], vec![entry("t1", 5)])
+                .await
+                .unwrap();
+            let records = crate::mysql::mysql_activation::read_table(
+                &ctx.registry_backend,
+                ctx.schema.registry(),
+                &k1,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                records.len(),
+                2,
+                "the record read again, then the baseline"
+            );
+            let cached =
+                super::super::super::mysql_selection::timeline(&mut ctx, &k1)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                cached.records, records,
+                "the cache is the committed timeline"
+            );
+            let _ = Stored::clone(&records[0]);
+        }
+    }
 
     /// Exhausted lock attempts are the contention incident; other failures
     /// keep their connection or schema class (never the incident).
