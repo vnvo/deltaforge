@@ -393,6 +393,35 @@ pub enum BatchOutcome {
 pub struct AtomicityViolation(pub String);
 
 impl AtomicBatch {
+    /// Append a group of ops whose `of` indices are local to the group;
+    /// returns the position of its first op in the batch.
+    pub fn push_group(&mut self, ops: Vec<BatchOp>) -> usize {
+        let base = self.ops.len();
+        for op in ops {
+            self.ops.push(match op {
+                BatchOp::KvPut {
+                    ns,
+                    key,
+                    value: BatchValue::SeqTemplate { template, of },
+                } => BatchOp::KvPut {
+                    ns,
+                    key,
+                    value: BatchValue::SeqTemplate {
+                        template,
+                        of: of + base,
+                    },
+                },
+                BatchOp::KvMaxSeq { ns, key, of } => BatchOp::KvMaxSeq {
+                    ns,
+                    key,
+                    of: of + base,
+                },
+                other => other,
+            });
+        }
+        base
+    }
+
     /// Check the batch's own shape before any backend work: every `of`
     /// names an earlier log write, and every template carries the sentinel
     /// exactly once.

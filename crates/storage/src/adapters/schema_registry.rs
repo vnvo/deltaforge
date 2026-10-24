@@ -201,6 +201,38 @@ struct VersionIndex {
     sequence: u64,
 }
 
+/// One registration an atomic batch plans.
+#[derive(Debug, Clone)]
+pub struct RegistrationRequest {
+    pub key: SchemaKey,
+    pub hash: String,
+    pub schema_json: Value,
+    pub checkpoint: Option<Vec<u8>>,
+}
+
+/// A planned registration: the version it receives and its writes (their
+/// `of` indices local to `ops`; `entry_op` is its log entry's position).
+#[derive(Debug, Clone)]
+pub struct PlannedRegistration {
+    pub key: SchemaKey,
+    pub version: i32,
+    pub hash: String,
+    pub ops: Vec<crate::BatchOp>,
+    pub entry_op: Option<usize>,
+    entry: Option<LogEntry>,
+}
+
+/// The outcome of [`DurableSchemaRegistry::plan_registrations`].
+#[derive(Debug, Clone)]
+pub enum RegistrationPlanning {
+    Planned {
+        preconditions: Vec<crate::Precondition>,
+        registrations: Vec<PlannedRegistration>,
+    },
+    /// These keys' latest entries need their indexes repaired first.
+    NeedsRepair(Vec<SchemaKey>),
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct KeyMeta {
     legacy_floor: i32,
@@ -716,6 +748,419 @@ impl DurableSchemaRegistry {
         self.bump_hw(seq).await?;
         self.cache_admit(bkey, key, sv);
         Ok(version)
+    }
+
+    // ---- planned registration (one atomic batch) --------------------------
+
+    /// Plan the registration of every request for one atomic batch (see
+    /// `docs/design/mysql-proof-seek.md`, "The atomic batch contract"):
+    /// the same version numbering as [`Self::register_with_checkpoint`]
+    /// (latest, numbering floor, other lineages), computed from two batched
+    /// reads, returned as writes and the preconditions they rest on.
+    /// Nothing is written. A key whose latest entry is not indexed (an
+    /// earlier registration cut short) is reported for repair instead.
+    pub async fn plan_registrations(
+        &self,
+        reqs: &[RegistrationRequest],
+        registered_at: chrono::DateTime<Utc>,
+    ) -> Result<RegistrationPlanning> {
+        use crate::{BatchRead as R, BatchReadResult as RR};
+        let lineage_key =
+            |k: &SchemaKey| source_lineage::record_key(&k.tenant, &k.source_id);
+        // Phase 1: each key's streams, its new hash's index, its numbering
+        // floor and legacy stream, and the source's lineage record.
+        let mut reads = Vec::new();
+        for r in reqs {
+            let bkey = r.key.backend_key();
+            let lk = legacy_key_for_numbering(
+                &r.key.tenant,
+                &r.key.db,
+                &r.key.table,
+            );
+            reads.extend([
+                R::LogLatest {
+                    ns: V1_NS.into(),
+                    key: bkey.clone(),
+                },
+                R::LogLatest {
+                    ns: V1_NS.into(),
+                    key: stream_key(&bkey, HistoryStream::Side),
+                },
+                R::KvGet {
+                    ns: INDEX_NS.into(),
+                    key: format!("h/{bkey}/{}", r.hash),
+                },
+                R::KvGet {
+                    ns: INDEX_NS.into(),
+                    key: format!("f/{bkey}"),
+                },
+                R::LogHead {
+                    ns: LEGACY_NS.into(),
+                    key: lk.clone(),
+                },
+                R::LogLen {
+                    ns: LEGACY_NS.into(),
+                    key: lk,
+                },
+                R::KvGet {
+                    ns: source_lineage::NS.into(),
+                    key: lineage_key(&r.key),
+                },
+            ]);
+        }
+        let got = self.backend.read_batch(&reads).await?;
+        anyhow::ensure!(
+            got.len() == reads.len(),
+            "schema registry: short batch read"
+        );
+        struct Seen {
+            main: Option<(u64, Vec<u8>)>,
+            side: Option<(u64, Vec<u8>)>,
+            hash_idx: Option<Vec<u8>>,
+            floor: Option<Vec<u8>>,
+            legacy_head: u64,
+            legacy_len: u64,
+            lineage: Option<Vec<u8>>,
+        }
+        let mut seen = Vec::with_capacity(reqs.len());
+        for chunk in got.chunks(7) {
+            let latest = |r: &RR| match r {
+                RR::Latest(v) => Ok(v.clone()),
+                other => Err(anyhow::anyhow!(
+                    "schema registry: unexpected read {other:?}"
+                )),
+            };
+            let kv = |r: &RR| match r {
+                RR::Kv(v) => Ok(v.clone()),
+                other => Err(anyhow::anyhow!(
+                    "schema registry: unexpected read {other:?}"
+                )),
+            };
+            seen.push(Seen {
+                main: latest(&chunk[0])?,
+                side: latest(&chunk[1])?,
+                hash_idx: kv(&chunk[2])?,
+                floor: kv(&chunk[3])?,
+                legacy_head: match chunk[4] {
+                    RR::Head(h) => h,
+                    _ => anyhow::bail!("schema registry: unexpected read"),
+                },
+                legacy_len: match chunk[5] {
+                    RR::Len(n) => n,
+                    _ => anyhow::bail!("schema registry: unexpected read"),
+                },
+                lineage: kv(&chunk[6])?,
+            });
+        }
+        // Phase 2: the indexes of each latest entry (a cut-short registration
+        // needs repair), and the other lineages' heads.
+        let mut reads = Vec::new();
+        let mut parsed = Vec::with_capacity(reqs.len());
+        for (r, s) in reqs.iter().zip(&seen) {
+            let bkey = r.key.backend_key();
+            let main = s
+                .main
+                .as_ref()
+                .map(|(seq, b)| parse_v1(b, *seq, &bkey))
+                .transpose()?;
+            let side_key = stream_key(&bkey, HistoryStream::Side);
+            let side = s
+                .side
+                .as_ref()
+                .map(|(seq, b)| parse_v1(b, *seq, &side_key))
+                .transpose()?;
+            for sv in main.iter().chain(side.iter()) {
+                reads.push(R::KvGet {
+                    ns: INDEX_NS.into(),
+                    key: format!("v/{bkey}/{}", sv.version),
+                });
+                reads.push(R::KvGet {
+                    ns: INDEX_NS.into(),
+                    key: format!("h/{bkey}/{}", sv.hash),
+                });
+            }
+            let others: Vec<String> = match &s.lineage {
+                Some(b) => {
+                    let rec: source_lineage::SourceLineageRecord =
+                        serde_json::from_slice(b).map_err(|e| {
+                            anyhow::Error::new(CorruptRecord(format!(
+                                "source lineage: corrupt lineage record: {e}"
+                            )))
+                        })?;
+                    rec.all_lineage_hashes()
+                        .filter(|h| *h != r.key.lineage_hash)
+                        .map(|h| {
+                            SchemaKey {
+                                lineage_hash: h.to_string(),
+                                ..r.key.clone()
+                            }
+                            .backend_key()
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
+            };
+            for o in &others {
+                reads.push(R::LogLatest {
+                    ns: V1_NS.into(),
+                    key: o.clone(),
+                });
+            }
+            parsed.push((main, side, others));
+        }
+        let got = if reads.is_empty() {
+            Vec::new()
+        } else {
+            self.backend.read_batch(&reads).await?
+        };
+        anyhow::ensure!(
+            got.len() == reads.len(),
+            "schema registry: short batch read"
+        );
+        let mut got = got.into_iter();
+        let mut next = || {
+            got.next().ok_or_else(|| {
+                anyhow::anyhow!("schema registry: short batch read")
+            })
+        };
+        let mut needs_repair = Vec::new();
+        let mut preconditions = Vec::new();
+        let mut registrations = Vec::with_capacity(reqs.len());
+        for ((r, s), (main, side, others)) in
+            reqs.iter().zip(&seen).zip(&parsed)
+        {
+            let bkey = r.key.backend_key();
+            let mut repair = false;
+            for sv in main.iter().chain(side.iter()) {
+                match next()? {
+                    RR::Kv(Some(b)) => {
+                        let idx: VersionIndex = serde_json::from_slice(&b)?;
+                        anyhow::ensure!(
+                            idx.hash == sv.hash,
+                            "schema registry: version index conflict for {bkey} v{}",
+                            sv.version
+                        );
+                    }
+                    RR::Kv(None) => repair = true,
+                    other => anyhow::bail!(
+                        "schema registry: unexpected read {other:?}"
+                    ),
+                }
+                if matches!(next()?, RR::Kv(None)) {
+                    repair = true;
+                }
+            }
+            let mut other_head = 0;
+            let mut other_heads = Vec::new();
+            for o in others {
+                match next()? {
+                    RR::Latest(v) => {
+                        let seq = v.as_ref().map_or(0, |(seq, _)| *seq);
+                        if let Some((seq, b)) = &v {
+                            other_head =
+                                other_head.max(parse_v1(b, *seq, o)?.version);
+                        }
+                        other_heads.push((o.clone(), seq));
+                    }
+                    other => anyhow::bail!(
+                        "schema registry: unexpected read {other:?}"
+                    ),
+                }
+            }
+            if repair {
+                needs_repair.push(r.key.clone());
+                continue;
+            }
+            let hash_key = format!("h/{bkey}/{}", r.hash);
+            // The shape is registered already: its first version, no write.
+            if let Some(b) = &s.hash_idx {
+                preconditions.push(crate::Precondition::KvIs {
+                    ns: INDEX_NS.into(),
+                    key: hash_key,
+                    value: Some(b.clone()),
+                });
+                registrations.push(PlannedRegistration {
+                    key: r.key.clone(),
+                    version: serde_json::from_slice(b)?,
+                    hash: r.hash.clone(),
+                    ops: Vec::new(),
+                    entry_op: None,
+                    entry: None,
+                });
+                continue;
+            }
+            let mut ops = Vec::new();
+            let floor_key = format!("f/{bkey}");
+            let floor = match &s.floor {
+                Some(b) => {
+                    preconditions.push(crate::Precondition::KvIs {
+                        ns: INDEX_NS.into(),
+                        key: floor_key,
+                        value: Some(b.clone()),
+                    });
+                    serde_json::from_slice::<KeyMeta>(b)?.legacy_floor
+                }
+                None => {
+                    let len = if s.legacy_head > 0 { s.legacy_len } else { 0 };
+                    let legacy_floor = i32::try_from(len)
+                        .context("schema registry: legacy stream too long")?;
+                    preconditions.push(crate::Precondition::KvIs {
+                        ns: INDEX_NS.into(),
+                        key: floor_key.clone(),
+                        value: None,
+                    });
+                    preconditions.push(crate::Precondition::LogHead {
+                        ns: LEGACY_NS.into(),
+                        key: legacy_key_for_numbering(
+                            &r.key.tenant,
+                            &r.key.db,
+                            &r.key.table,
+                        ),
+                        seq: s.legacy_head,
+                    });
+                    ops.push(crate::BatchOp::KvPut {
+                        ns: INDEX_NS.into(),
+                        key: floor_key,
+                        value: crate::BatchValue::Bytes(serde_json::to_vec(
+                            &KeyMeta { legacy_floor },
+                        )?),
+                    });
+                    legacy_floor
+                }
+            };
+            preconditions.push(crate::Precondition::KvIs {
+                ns: source_lineage::NS.into(),
+                key: lineage_key(&r.key),
+                value: s.lineage.clone(),
+            });
+            for (o, seq) in other_heads {
+                preconditions.push(crate::Precondition::LogHead {
+                    ns: V1_NS.into(),
+                    key: o,
+                    seq,
+                });
+            }
+            let main_max = main.as_ref().map_or(0, |v| v.version);
+            let version = main_max
+                .max(floor)
+                .max(other_head)
+                .checked_add(1)
+                .context("schema registry: version number overflow")?;
+            preconditions.extend([
+                crate::Precondition::LogHead {
+                    ns: V1_NS.into(),
+                    key: bkey.clone(),
+                    seq: s.main.as_ref().map_or(0, |(seq, _)| *seq),
+                },
+                crate::Precondition::LogHead {
+                    ns: V1_NS.into(),
+                    key: stream_key(&bkey, HistoryStream::Side),
+                    seq: s.side.as_ref().map_or(0, |(seq, _)| *seq),
+                },
+                crate::Precondition::KvIs {
+                    ns: INDEX_NS.into(),
+                    key: hash_key.clone(),
+                    value: None,
+                },
+                crate::Precondition::KvIs {
+                    ns: INDEX_NS.into(),
+                    key: format!("v/{bkey}/{version}"),
+                    value: None,
+                },
+            ]);
+            if main.is_none() {
+                ops.push(crate::BatchOp::KvPut {
+                    ns: V1_NS.into(),
+                    key: bkey.clone(),
+                    value: crate::BatchValue::Bytes(b"1".to_vec()),
+                });
+            }
+            let entry = LogEntry {
+                format_version: CURRENT_FORMAT_VERSION,
+                record_version: CURRENT_RECORD_VERSION,
+                version: Some(version),
+                origin_sequence: None,
+                hash: r.hash.clone(),
+                schema_json: r.schema_json.clone(),
+                registered_at,
+                checkpoint: r.checkpoint.clone(),
+            };
+            let entry_op = ops.len();
+            ops.push(crate::BatchOp::LogAppendIfAbsent {
+                ns: V1_NS.into(),
+                key: bkey.clone(),
+                capture_id: format!("reg/{version}/{}", r.hash),
+                value: serde_json::to_vec(&entry)?,
+            });
+            ops.push(crate::BatchOp::KvPut {
+                ns: INDEX_NS.into(),
+                key: format!("v/{bkey}/{version}"),
+                value: crate::BatchValue::SeqTemplate {
+                    template: serde_json::to_vec(&VersionIndex {
+                        stream: HistoryStream::Main,
+                        hash: r.hash.clone(),
+                        sequence: crate::SEQ_SENTINEL,
+                    })?,
+                    of: entry_op,
+                },
+            });
+            ops.push(crate::BatchOp::KvPut {
+                ns: INDEX_NS.into(),
+                key: hash_key,
+                value: crate::BatchValue::Bytes(serde_json::to_vec(&version)?),
+            });
+            ops.push(crate::BatchOp::KvMaxSeq {
+                ns: INDEX_NS.into(),
+                key: HW_KEY.into(),
+                of: entry_op,
+            });
+            registrations.push(PlannedRegistration {
+                key: r.key.clone(),
+                version,
+                hash: r.hash.clone(),
+                ops,
+                entry_op: Some(entry_op),
+                entry: Some(entry),
+            });
+        }
+        if !needs_repair.is_empty() {
+            return Ok(RegistrationPlanning::NeedsRepair(needs_repair));
+        }
+        Ok(RegistrationPlanning::Planned {
+            preconditions,
+            registrations,
+        })
+    }
+
+    /// Repair a key whose latest entry is not indexed (an earlier
+    /// registration cut short): the registry's own idempotent repair.
+    pub async fn repair_key(&self, key: &SchemaKey) -> Result<()> {
+        let bkey = key.backend_key();
+        let lock = self.key_lock(&bkey);
+        let guard = lock.lock().await;
+        let out = self.repair_indexes(&bkey).await.map(drop);
+        drop(guard);
+        self.release_key_lock(&bkey, &lock);
+        out
+    }
+
+    /// A planned registration committed with its entry at `seq`: the cache
+    /// and the sequence high-water learn it. Only after the commit.
+    pub fn admit_committed(&self, reg: &PlannedRegistration, seq: u64) {
+        let Some(entry) = &reg.entry else { return };
+        self.sequence.fetch_max(seq, Ordering::SeqCst);
+        self.cache_admit(
+            &reg.key.backend_key(),
+            &reg.key,
+            SchemaVersion {
+                version: reg.version,
+                hash: entry.hash.clone(),
+                schema_json: entry.schema_json.clone(),
+                registered_at: entry.registered_at,
+                sequence: seq,
+                checkpoint: entry.checkpoint.clone(),
+            },
+        );
     }
 
     // ---- legacy reads + proof-gated adoption mechanics --------------------
@@ -2175,5 +2620,214 @@ mod tests {
                 .is_err()
         );
         assert!(r.mark_migrated(&skey("s", "lin", "orders")).await.is_err());
+    }
+
+    mod planned {
+        use super::*;
+        use crate::{AtomicBatch, CommitResult, commit_atomic};
+
+        /// Plan `reqs`, commit them as one batch, admit the result; the
+        /// versions and each entry's committed sequence.
+        async fn plan_and_commit(
+            r: &DurableSchemaRegistry,
+            b: &ArcStorageBackend,
+            reqs: &[RegistrationRequest],
+        ) -> Result<Vec<(i32, Option<u64>)>, String> {
+            let RegistrationPlanning::Planned {
+                preconditions,
+                registrations,
+            } = r.plan_registrations(reqs, Utc::now()).await.unwrap()
+            else {
+                return Err("needs repair".into());
+            };
+            let mut batch = AtomicBatch {
+                preconditions,
+                ops: Vec::new(),
+            };
+            let bases: Vec<usize> = registrations
+                .iter()
+                .map(|p| batch.push_group(p.ops.clone()))
+                .collect();
+            match commit_atomic(b.as_ref(), &batch, 3).await.unwrap() {
+                CommitResult::Committed(seqs) => Ok(registrations
+                    .iter()
+                    .zip(bases)
+                    .map(|(p, base)| {
+                        let seq = p.entry_op.map(|e| seqs[base + e].unwrap());
+                        if let Some(seq) = seq {
+                            r.admit_committed(p, seq);
+                        }
+                        (p.version, seq)
+                    })
+                    .collect()),
+                CommitResult::Conflict(why) => Err(why),
+            }
+        }
+
+        fn req(key: &SchemaKey, hash: &str) -> RegistrationRequest {
+            RegistrationRequest {
+                key: key.clone(),
+                hash: hash.into(),
+                schema_json: json!({"cols": [hash]}),
+                checkpoint: Some(b"cp".to_vec()),
+            }
+        }
+
+        /// A new table, a new shape of a known table and a known shape:
+        /// the same versions and stored content as one registration at a
+        /// time; the new entries take a contiguous range.
+        #[tokio::test]
+        async fn planned_registrations_match_the_one_table_path() {
+            let (k1, k2, k3) = (
+                skey("s", "l", "t1"),
+                skey("s", "l", "t2"),
+                skey("s", "l", "t3"),
+            );
+            let (_fa, a) = backend();
+            let (_fb, b) = backend();
+            let (ra, rb) = (reg(&a).await, reg(&b).await);
+            for r in [&ra, &rb] {
+                r.register_with_checkpoint(
+                    &k2,
+                    "h2a",
+                    &json!({"cols": ["h2a"]}),
+                    None,
+                )
+                .await
+                .unwrap();
+                r.register_with_checkpoint(
+                    &k3,
+                    "h3",
+                    &json!({"cols": ["h3"]}),
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+            let reqs = [req(&k1, "h1"), req(&k2, "h2b"), req(&k3, "h3")];
+            let mut one = Vec::new();
+            for q in &reqs {
+                one.push(
+                    ra.register_with_checkpoint(
+                        &q.key,
+                        &q.hash,
+                        &q.schema_json,
+                        q.checkpoint.as_deref(),
+                    )
+                    .await
+                    .unwrap(),
+                );
+            }
+            let planned = plan_and_commit(&rb, &b, &reqs).await.unwrap();
+            assert_eq!(planned.iter().map(|p| p.0).collect::<Vec<_>>(), one);
+            assert_eq!(planned[2].1, None, "a known shape writes nothing");
+            assert_eq!(
+                planned[1].1,
+                Some(planned[0].1.unwrap() + 1),
+                "contiguous"
+            );
+            // The same stored versions, read through a fresh registry.
+            let fresh = reg(&b).await;
+            for (q, v) in reqs.iter().zip(&one) {
+                let x = ra.get_version(&q.key, *v).await.unwrap().unwrap();
+                let y = fresh.get_version(&q.key, *v).await.unwrap().unwrap();
+                assert_eq!(
+                    (&x.hash, &x.schema_json, &x.checkpoint),
+                    (&y.hash, &y.schema_json, &y.checkpoint)
+                );
+                assert_eq!(
+                    fresh.version_hash(&q.key, *v).await.unwrap(),
+                    Some(q.hash.clone())
+                );
+                assert_eq!(
+                    fresh
+                        .get_by_hash(&q.key, &q.hash)
+                        .await
+                        .unwrap()
+                        .map(|s| s.version),
+                    Some(*v)
+                );
+            }
+            let latest = fresh.get_latest(&k2).await.unwrap().unwrap();
+            assert_eq!(
+                (latest.version, latest.sequence),
+                (one[1], planned[1].1.unwrap())
+            );
+            assert!(
+                fresh.current_sequence() >= planned[1].1.unwrap(),
+                "high-water"
+            );
+        }
+
+        /// A registration of the same table between the plan and the commit
+        /// makes the batch conflict: nothing of it is written.
+        #[tokio::test]
+        async fn a_concurrent_registration_conflicts() {
+            let k = skey("s", "l", "t");
+            let (_f, b) = backend();
+            let r = reg(&b).await;
+            let RegistrationPlanning::Planned {
+                preconditions,
+                registrations,
+            } = r
+                .plan_registrations(&[req(&k, "h1")], Utc::now())
+                .await
+                .unwrap()
+            else {
+                panic!("planned");
+            };
+            r.register_with_checkpoint(&k, "other", &json!({}), None)
+                .await
+                .unwrap();
+            let mut batch = AtomicBatch {
+                preconditions,
+                ops: Vec::new(),
+            };
+            batch.push_group(registrations[0].ops.clone());
+            assert!(matches!(
+                commit_atomic(b.as_ref(), &batch, 3).await.unwrap(),
+                CommitResult::Conflict(_)
+            ));
+            assert!(r.get_by_hash(&k, "h1").await.unwrap().is_none());
+        }
+
+        /// An entry stored without its indexes (a registration cut short)
+        /// is repaired by the registry's own repair, then planned.
+        #[tokio::test]
+        async fn a_cut_short_registration_is_repaired_before_planning() {
+            let k = skey("s", "l", "t");
+            let (_f, b) = backend();
+            let entry = LogEntry {
+                format_version: CURRENT_FORMAT_VERSION,
+                record_version: CURRENT_RECORD_VERSION,
+                version: Some(1),
+                origin_sequence: None,
+                hash: "h0".into(),
+                schema_json: json!({}),
+                registered_at: Utc::now(),
+                checkpoint: None,
+            };
+            b.log_append(
+                V1_NS,
+                &k.backend_key(),
+                &serde_json::to_vec(&entry).unwrap(),
+            )
+            .await
+            .unwrap();
+            let r = reg(&b).await;
+            match r
+                .plan_registrations(&[req(&k, "h1")], Utc::now())
+                .await
+                .unwrap()
+            {
+                RegistrationPlanning::NeedsRepair(keys) => {
+                    assert_eq!(keys, vec![k.clone()])
+                }
+                other => panic!("{other:?}"),
+            }
+            r.repair_key(&k).await.unwrap();
+            let got = plan_and_commit(&r, &b, &[req(&k, "h1")]).await.unwrap();
+            assert_eq!(got[0].0, 2);
+        }
     }
 }

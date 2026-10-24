@@ -14,8 +14,9 @@ pub use schema_key::{FORMAT_VERSION, LineageDescriptor, SchemaKey};
 pub use schema_registry::{
     AdoptOutcome, DurableSchemaRegistry, HistoryCursor, HistoryPage,
     HistoryStream, LegacyCursor, LegacyPage, LegacyReadRefused, LegacyVersion,
-    MAX_HISTORY_PAGE, MigrationMarkerInfo, MigrationProvenance, RegistryConfig,
-    RegistryMetrics,
+    MAX_HISTORY_PAGE, MigrationMarkerInfo, MigrationProvenance,
+    PlannedRegistration, RegistrationPlanning, RegistrationRequest,
+    RegistryConfig, RegistryMetrics,
 };
 pub use source_lineage::{Established, LineageRef, SourceLineageRecord};
 
