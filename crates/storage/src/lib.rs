@@ -249,6 +249,34 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
         Ok(out)
     }
 
+    /// Every entry of each `(ns, key)` stream, exactly as
+    /// `log_read_meta_since(ns, key, 0, ..)` pages them out, all from one
+    /// consistent snapshot; one result per request, in request order (a
+    /// repeated request is answered twice). The default reads stream by
+    /// stream and is for test doubles only; every production backend
+    /// overrides it.
+    async fn log_read_streams(
+        &self,
+        streams: &[(String, String)],
+    ) -> Result<Vec<Vec<LogEntryMeta>>> {
+        let mut out = Vec::with_capacity(streams.len());
+        for (ns, key) in streams {
+            let mut entries: Vec<LogEntryMeta> = Vec::new();
+            loop {
+                let since = entries.last().map_or(0, |e| e.seq);
+                let page =
+                    self.log_read_meta_since(ns, key, since, 1024).await?;
+                let done = page.len() < 1024;
+                entries.extend(page);
+                if done {
+                    break;
+                }
+            }
+            out.push(entries);
+        }
+        Ok(out)
+    }
+
     /// Apply `batch` atomically (see [`AtomicBatch`]). The default refuses:
     /// a backend that cannot commit atomically never pretends to.
     async fn apply_batch(&self, _batch: &AtomicBatch) -> Result<BatchOutcome> {
@@ -1812,5 +1840,113 @@ pub(crate) mod atomic_batch_suite {
             &format!("{ns}_conc"),
         )
         .await;
+        stream_reads_match_individual_reads(be.clone(), &format!("{ns}_sr"))
+            .await;
+        stream_reads_are_one_snapshot(be.clone(), &format!("{ns}_srsnap"))
+            .await;
+    }
+
+    /// Every stream as paged out one by one.
+    async fn one_by_one(
+        be: &Arc<dyn StorageBackend>,
+        streams: &[(String, String)],
+    ) -> Vec<Vec<LogEntryMeta>> {
+        let mut out = Vec::new();
+        for (ns, key) in streams {
+            let mut entries: Vec<LogEntryMeta> = Vec::new();
+            loop {
+                let since = entries.last().map_or(0, |e| e.seq);
+                let page =
+                    be.log_read_meta_since(ns, key, since, 7).await.unwrap();
+                let done = page.len() < 7;
+                entries.extend(page);
+                if done {
+                    break;
+                }
+            }
+            out.push(entries);
+        }
+        out
+    }
+
+    /// `log_read_streams` returns, byte for byte, what reading each stream
+    /// on its own returns: empty streams, streams of several lengths across
+    /// two namespaces, a repeated request (answered twice, in place), and
+    /// 2,048 streams in one request.
+    pub async fn stream_reads_match_individual_reads(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
+        let other = format!("{ns}_b");
+        for k in 0..40usize {
+            let n = if k % 2 == 1 { &other } else { ns };
+            for e in 0..(k % 9) {
+                be.log_append_if_absent(
+                    n,
+                    &format!("s{k}"),
+                    &format!("c{e}"),
+                    format!("{k}-{e}").repeat(1 + e).as_bytes(),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let mut streams: Vec<(String, String)> = (0..40usize)
+            .map(|k| {
+                let n = if k % 2 == 1 { &other } else { ns };
+                (n.to_string(), format!("s{k}"))
+            })
+            .collect();
+        streams.push((ns.to_string(), "never".into()));
+        streams.push((ns.to_string(), "s4".into()));
+        streams.insert(0, (other.clone(), "s3".into()));
+        assert_eq!(
+            be.log_read_streams(&streams).await.unwrap(),
+            one_by_one(&be, &streams).await
+        );
+        let big: Vec<(String, String)> = (0..2048usize)
+            .map(|k| (ns.to_string(), format!("s{}", k % 50)))
+            .collect();
+        let got = be.log_read_streams(&big).await.unwrap();
+        assert_eq!(got.len(), 2048);
+        assert_eq!(got, one_by_one(&be, &big).await);
+    }
+
+    /// One snapshot: while atomic batches append to two streams together,
+    /// every read of both sees them at the same length.
+    pub async fn stream_reads_are_one_snapshot(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
+        let streams = vec![
+            (ns.to_string(), "a".to_string()),
+            (ns.to_string(), "b".to_string()),
+        ];
+        let writer = {
+            let be = be.clone();
+            let ns = ns.to_string();
+            tokio::spawn(async move {
+                for i in 0..60 {
+                    let batch = AtomicBatch {
+                        preconditions: vec![],
+                        ops: vec![
+                            log(&ns, "a", &format!("a{i}"), b"x"),
+                            log(&ns, "b", &format!("b{i}"), b"y"),
+                        ],
+                    };
+                    be.apply_batch(&batch).await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        let mut reads = 0;
+        while !writer.is_finished() || reads < 5 {
+            let got = be.log_read_streams(&streams).await.unwrap();
+            assert_eq!(got[0].len(), got[1].len(), "one snapshot: {got:?}");
+            reads += 1;
+        }
+        writer.await.unwrap();
+        let got = be.log_read_streams(&streams).await.unwrap();
+        assert_eq!((got[0].len(), got[1].len()), (60, 60));
     }
 }

@@ -312,6 +312,44 @@ impl StorageBackend for PostgresStorageBackend {
         Ok(out)
     }
 
+    async fn log_read_streams(
+        &self,
+        streams: &[(String, String)],
+    ) -> Result<Vec<Vec<LogEntryMeta>>> {
+        let mut out: Vec<Vec<LogEntryMeta>> = vec![Vec::new(); streams.len()];
+        if streams.is_empty() {
+            return Ok(out);
+        }
+        let (nss, keys): (Vec<&str>, Vec<&str>) = streams
+            .iter()
+            .map(|(n, k)| (n.as_str(), k.as_str()))
+            .unzip();
+        let c = client!(self);
+        // One statement, so one snapshot and one round trip for every
+        // stream; a repeated request is answered under each ordinal.
+        let rows = c
+            .query(
+                "SELECT r.i, l.seq, COALESCE(l.ts_ms, l.ts*1000), l.capture_id,
+                        l.content_hash, l.val
+                 FROM unnest($1::text[], $2::text[]) WITH ORDINALITY AS r(ns, key, i)
+                 JOIN df_log l ON l.ns = r.ns AND l.key = r.key
+                 ORDER BY r.i, l.seq",
+                &[&nss, &keys],
+            )
+            .await?;
+        for r in rows {
+            let i = r.get::<_, i64>(0) as usize - 1;
+            out[i].push(LogEntryMeta {
+                seq: r.get::<_, i64>(1) as u64,
+                stored_at_ms: r.get(2),
+                capture_id: r.get(3),
+                content_hash: r.get(4),
+                value: r.get(5),
+            });
+        }
+        Ok(out)
+    }
+
     async fn apply_batch(&self, batch: &AtomicBatch) -> Result<BatchOutcome> {
         batch.validate()?;
         let fault = self.batch_fault.lock().expect("batch fault").take();

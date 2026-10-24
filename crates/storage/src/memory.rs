@@ -142,6 +142,35 @@ impl MemoryStorageBackend {
 
 #[async_trait]
 impl StorageBackend for MemoryStorageBackend {
+    async fn log_read_streams(
+        &self,
+        streams: &[(String, String)],
+    ) -> Result<Vec<Vec<LogEntryMeta>>> {
+        // One snapshot: the log held for every stream.
+        let store = self.log.read().await;
+        Ok(streams
+            .iter()
+            .map(|(ns, key)| {
+                store
+                    .entries
+                    .get(&(ns.clone(), key.clone()))
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .map(|e| LogEntryMeta {
+                                seq: e.seq,
+                                stored_at_ms: e.ts_ms,
+                                capture_id: e.capture_id.clone(),
+                                content_hash: e.content_hash.clone(),
+                                value: e.value.clone(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect())
+    }
+
     async fn read_batch(
         &self,
         reads: &[BatchRead],

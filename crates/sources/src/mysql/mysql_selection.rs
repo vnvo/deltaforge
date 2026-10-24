@@ -52,7 +52,7 @@ use crate::durable_checkpoint::{WmPos, order_positions};
 const CAPTURE_ATTEMPTS: u32 = 5;
 
 /// A table's validated timeline: its records and the barriers that apply.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Timeline {
     pub records: Vec<Stored>,
     pub barriers: Vec<Stored>,
@@ -171,7 +171,7 @@ impl Caches {
         }
     }
 
-    fn timeline(&mut self, key: &str) -> Option<Arc<Timeline>> {
+    pub(crate) fn timeline(&mut self, key: &str) -> Option<Arc<Timeline>> {
         match self.entries.get(&CacheKey::Timeline(key.to_string()))? {
             Cached::Timeline(t, _) => Some(t.clone()),
             _ => None,
@@ -676,6 +676,49 @@ pub(crate) async fn timeline(
     let t = Arc::new(t);
     ctx.selection.put_timeline(k, t.clone());
     Ok(t)
+}
+
+/// Read the timelines of `keys` not already cached in one store snapshot
+/// ([`mysql_activation::read_timelines`]) and install each one that
+/// decodes and validates exactly as [`timeline`] would. A table whose read
+/// or validation fails is left out (its own [`timeline`] read reports it
+/// as it always does); a failed store read installs nothing. Called only
+/// once a window is current: a speculative window never touches the cache.
+pub(crate) async fn load_timelines(ctx: &mut RunCtx, keys: &[SchemaKey]) {
+    let missing: Vec<SchemaKey> = keys
+        .iter()
+        .filter(|k| ctx.selection.timeline(&k.backend_key()).is_none())
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let registry = ctx.schema.registry();
+    let Ok(read) = mysql_activation::read_timelines(
+        &ctx.registry_backend,
+        registry,
+        &missing,
+    )
+    .await
+    else {
+        return;
+    };
+    let by_key: std::collections::HashMap<String, &SchemaKey> =
+        missing.iter().map(|k| (k.backend_key(), k)).collect();
+    for (bk, parts) in read {
+        let Ok((records, table_head, barriers, barrier_heads)) = parts else {
+            continue;
+        };
+        let t = Timeline {
+            records,
+            barriers,
+            table_head,
+            barrier_heads,
+        };
+        if validate(registry, by_key[&bk], &t).await.is_ok() {
+            ctx.selection.put_timeline(bk, Arc::new(t));
+        }
+    }
 }
 
 fn timeline_error(e: anyhow::Error) -> SourceError {

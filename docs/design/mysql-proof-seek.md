@@ -1277,3 +1277,38 @@ lockstatement-probe9.log`):
 The safety argument holds, but the statement does not shorten a window's
 capture and is far slower at the window's maximum, so it is not used. The
 per-table statements stay.
+
+### Batched timeline reads
+
+When a speculative window becomes current, it recomputes its required set
+with `unproven_at`, which reads each table's timeline. Read one by one,
+that was several store calls per table (its activation stream and both
+barrier streams, which every table of a database shares): 36-39 ms for 120
+new tables on SQLite against 7 ms on the in-memory store, on the serial
+path after the first window commits.
+
+Now the window's candidate tables are read first, in one store snapshot
+(`StorageBackend::log_read_streams`: one read transaction with a prepared
+statement on SQLite, one statement with `unnest ... WITH ORDINALITY` on
+PostgreSQL, one lock on the in-memory store). The requested keys are
+deduplicated and canonically ordered, each table stream and each shared
+barrier stream is read exactly once, and the request is bounded like a
+window (2,048 tables, 1 MiB of stream keys). Every stream is decoded and
+every timeline validated by the same functions as the per-table read, so
+contents and decisions are identical; each timeline keeps its stream heads,
+which the window's atomic commit checks as preconditions, so a change after
+the read is a conflict decided again from a fresh read. A table whose
+timeline fails to decode or validate is left out, and its own read reports
+the failure with its usual classification; a failed store read installs
+nothing. The read installs timelines only for the current window: a
+speculative window never touches the cache.
+
+Tests: the conformance suite of all three backends compares the batched
+read with stream-by-stream reads (empty streams, several histories, two
+namespaces, a repeated request, 2,048 streams) and checks one snapshot
+under concurrent atomic writes. The window's unit tests compare it with the
+per-table reads (shared database and lineage barriers, table histories,
+duplicates), count the store calls (one call, 33 streams, none twice, for
+30 tables in two databases), keep a malformed record's classification, use
+nothing from a failed read, refuse 2,049 tables, and catch a change after
+the read at commit.

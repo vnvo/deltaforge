@@ -315,6 +315,16 @@ pub(super) async fn maybe_window(
         .pending
         .as_ref()
         .is_some_and(|p| p.head_seq == ctx.last_seq);
+    // The speculative window is current now: its tables' timelines are
+    // read in one snapshot before its required set is recomputed.
+    if at_pending_head && let Ok(scope) = ctx.registry_scope.current() {
+        let keys: Vec<_> = ctx
+            .pending
+            .as_ref()
+            .map(|p| p.batch.keys().map(|(db, t)| scope.key(db, t)).collect())
+            .unwrap_or_default();
+        super::mysql_selection::load_timelines(ctx, &keys).await;
+    }
     let not_here = |ctx: &mut RunCtx| {
         if at_pending_head {
             ctx.pending = None;
@@ -1759,6 +1769,300 @@ mod tests {
                 .clone();
             let cap = capture(ctx, tables);
             admit_batch(ctx, &lineage, &cap, entries).await
+        }
+
+        mod timelines {
+            //! The batched timeline read against the per-table reads.
+            use super::*;
+            use crate::mysql::mysql_activation::{
+                BARRIER_NS, BarrierScope, barrier_stream, read_barriers_head,
+                read_timelines,
+            };
+            use storage::StorageBackend as _;
+            use storage::adapters::test_util::FaultBackend;
+
+            fn key_in(
+                ctx: &RunCtx,
+                db: &str,
+                t: &str,
+            ) -> storage::adapters::SchemaKey {
+                ctx.registry_scope.current().unwrap().key(db, t)
+            }
+
+            /// Tables in two databases: empty streams, several table
+            /// histories, a lineage barrier and a barrier of each database.
+            async fn fixture(
+                ctx: &RunCtx,
+            ) -> Vec<storage::adapters::SchemaKey> {
+                let mut keys = Vec::new();
+                for (i, db) in ["d", "e"].iter().enumerate() {
+                    for t in 0..15 {
+                        let k = key_in(ctx, db, &format!("t{t:02}"));
+                        for r in 0..(t % 4) {
+                            append(
+                                &ctx.registry_backend,
+                                ctx.schema.registry(),
+                                &k,
+                                ACTIVATION_NS,
+                                &table_stream(&k),
+                                &format!("ddl-{r}"),
+                                &Record::new(wm(10 + r as u64), Kind::Ddl),
+                            )
+                            .await
+                            .unwrap();
+                        }
+                        keys.push(k);
+                    }
+                    let scope = BarrierScope::Database { db: db.to_string() };
+                    append(
+                        &ctx.registry_backend,
+                        ctx.schema.registry(),
+                        &keys[i * 15],
+                        BARRIER_NS,
+                        &barrier_stream(&keys[i * 15], &scope),
+                        "db-barrier",
+                        &Record::new(wm(7), Kind::Barrier { scope }),
+                    )
+                    .await
+                    .unwrap();
+                }
+                append(
+                    &ctx.registry_backend,
+                    ctx.schema.registry(),
+                    &keys[0],
+                    BARRIER_NS,
+                    &barrier_stream(&keys[0], &BarrierScope::Lineage),
+                    "lineage-barrier",
+                    &Record::new(
+                        wm(3),
+                        Kind::Barrier {
+                            scope: BarrierScope::Lineage,
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+                keys
+            }
+
+            /// One snapshot read gives byte for byte what each table's own
+            /// reads give, duplicates requested included; each table stream
+            /// and each shared barrier stream is read exactly once, in one
+            /// call.
+            #[tokio::test]
+            async fn the_batch_equals_the_per_table_reads_reading_each_stream_once()
+             {
+                let faults = std::sync::Arc::new(FaultBackend::new());
+                let ctx = ctx_on(faults.clone()).await;
+                let keys = fixture(&ctx).await;
+                let mut asked = keys.clone();
+                asked.extend(keys[..5].iter().cloned());
+                asked.reverse();
+                faults.stream_reads.lock().unwrap().clear();
+                let got = read_timelines(
+                    &ctx.registry_backend,
+                    ctx.schema.registry(),
+                    &asked,
+                )
+                .await
+                .unwrap();
+                let reads = faults.stream_reads.lock().unwrap().clone();
+                assert_eq!(
+                    faults
+                        .batched_stream_reads
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    1
+                );
+                // 30 table streams, one lineage barrier, two database barriers.
+                assert_eq!(reads.len(), 33, "{reads:?}");
+                let unique: std::collections::BTreeSet<_> =
+                    reads.iter().collect();
+                assert_eq!(unique.len(), reads.len(), "no stream read twice");
+                let mut sorted = reads.clone();
+                sorted.sort();
+                let (tables, barriers): (Vec<_>, Vec<_>) =
+                    reads.iter().partition(|(ns, _)| ns == ACTIVATION_NS);
+                assert!(
+                    tables.windows(2).all(|w| w[0] <= w[1]),
+                    "canonical order"
+                );
+                assert!(
+                    barriers.windows(2).all(|w| w[0] <= w[1]),
+                    "canonical order"
+                );
+                assert_eq!(got.len(), 30);
+                for k in &keys {
+                    let (records, head, barriers, heads) =
+                        got[&k.backend_key()].as_ref().unwrap().clone();
+                    let one = read_table_head(
+                        &ctx.registry_backend,
+                        ctx.schema.registry(),
+                        k,
+                    )
+                    .await
+                    .unwrap();
+                    let b = read_barriers_head(&ctx.registry_backend, k)
+                        .await
+                        .unwrap();
+                    assert_eq!((records, head), one, "{}", k.backend_key());
+                    assert_eq!((barriers, heads), b, "{}", k.backend_key());
+                }
+            }
+
+            /// A malformed record fails its table exactly as its own read
+            /// does; the other tables are unaffected. A failed store read
+            /// gives nothing, and installs nothing.
+            #[tokio::test]
+            async fn failures_keep_their_classification_and_nothing_partial_is_used()
+             {
+                let faults = std::sync::Arc::new(FaultBackend::new());
+                let mut ctx = ctx_on(faults.clone()).await;
+                let keys = fixture(&ctx).await;
+                faults
+                    .log_append_if_absent(
+                        ACTIVATION_NS,
+                        &table_stream(&keys[3]),
+                        "bad",
+                        b"{not json",
+                    )
+                    .await
+                    .unwrap();
+                let got = read_timelines(
+                    &ctx.registry_backend,
+                    ctx.schema.registry(),
+                    &keys,
+                )
+                .await
+                .unwrap();
+                let own = read_table_head(
+                    &ctx.registry_backend,
+                    ctx.schema.registry(),
+                    &keys[3],
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    got[&keys[3].backend_key()]
+                        .as_ref()
+                        .unwrap_err()
+                        .to_string(),
+                    own.to_string()
+                );
+                assert!(got[&keys[4].backend_key()].is_ok());
+                super::super::super::super::mysql_selection::load_timelines(
+                    &mut ctx, &keys,
+                )
+                .await;
+                assert!(
+                    ctx.selection.timeline(&keys[3].backend_key()).is_none()
+                );
+                assert!(
+                    ctx.selection.timeline(&keys[4].backend_key()).is_some()
+                );
+
+                let mut fresh = ctx_on(faults.clone()).await;
+                faults
+                    .fail_log_read_meta
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    read_timelines(
+                        &fresh.registry_backend,
+                        fresh.schema.registry(),
+                        &keys
+                    )
+                    .await
+                    .is_err()
+                );
+                super::super::super::super::mysql_selection::load_timelines(
+                    &mut fresh, &keys,
+                )
+                .await;
+                for k in &keys {
+                    assert!(
+                        fresh.selection.timeline(&k.backend_key()).is_none()
+                    );
+                }
+            }
+
+            /// Installed timelines equal what `timeline` reads, and 2,048
+            /// tables fit one read while 2,049 are refused.
+            #[tokio::test]
+            async fn installed_timelines_equal_individual_reads_up_to_the_bound()
+             {
+                let backend: ArcStorageBackend =
+                    std::sync::Arc::new(storage::MemoryStorageBackend::new());
+                let mut ctx = ctx_on(backend.clone()).await;
+                let keys = fixture(&ctx).await;
+                super::super::super::super::mysql_selection::load_timelines(
+                    &mut ctx, &keys,
+                )
+                .await;
+                let mut other = ctx_on(backend.clone()).await;
+                for k in &keys {
+                    let a = ctx.selection.timeline(&k.backend_key()).unwrap();
+                    let b =
+                        super::super::super::super::mysql_selection::timeline(
+                            &mut other, k,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(*a, *b, "{}", k.backend_key());
+                }
+                let many: Vec<_> = (0..2049)
+                    .map(|i| key_in(&ctx, "d", &format!("m{i:04}")))
+                    .collect();
+                assert_eq!(
+                    read_timelines(
+                        &ctx.registry_backend,
+                        ctx.schema.registry(),
+                        &many[..2048]
+                    )
+                    .await
+                    .unwrap()
+                    .len(),
+                    2048
+                );
+                assert!(
+                    read_timelines(
+                        &ctx.registry_backend,
+                        ctx.schema.registry(),
+                        &many
+                    )
+                    .await
+                    .is_err()
+                );
+            }
+
+            /// A change between the batched read and the commit is caught by
+            /// the batch's preconditions: decided again from a fresh read.
+            #[tokio::test]
+            async fn a_change_after_the_batched_read_is_caught_at_commit() {
+                let backend: ArcStorageBackend =
+                    std::sync::Arc::new(storage::MemoryStorageBackend::new());
+                let mut ctx = ctx_on(backend).await;
+                let k1 = key(&ctx, "t1");
+                super::super::super::super::mysql_selection::load_timelines(
+                    &mut ctx,
+                    std::slice::from_ref(&k1),
+                )
+                .await;
+                assert!(ctx.selection.timeline(&k1.backend_key()).is_some());
+                append(
+                    &ctx.registry_backend,
+                    ctx.schema.registry(),
+                    &k1,
+                    ACTIVATION_NS,
+                    &table_stream(&k1),
+                    "unknown-at-2",
+                    &Record::new(wm(2), Kind::Unknown),
+                )
+                .await
+                .unwrap();
+                let (stats, _) = admit(&mut ctx, &["t1"], vec![entry("t1", 5)])
+                    .await
+                    .unwrap();
+                assert_eq!(stats.conflicts, 1, "the stale timeline conflicted");
+            }
         }
 
         /// Every table admitted, its registry entry then its baseline, in

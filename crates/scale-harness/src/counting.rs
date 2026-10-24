@@ -213,6 +213,29 @@ impl StorageBackend for CountingBackend {
     ) -> Result<storage::BatchOutcome> {
         self.inner.apply_batch(batch).await
     }
+    async fn log_read_streams(
+        &self,
+        streams: &[(String, String)],
+    ) -> Result<Vec<Vec<storage::LogEntryMeta>>> {
+        let out = self.inner.log_read_streams(streams).await?;
+        let (mut raw, mut norm, mut counted) = (0, 0, false);
+        for ((ns, key), entries) in streams.iter().zip(&out) {
+            if self.is_uncounted(ns, key) {
+                continue;
+            }
+            counted = true;
+            self.read("log_read_streams", ns, key);
+            let (r, n) =
+                self.records(entries.iter().map(|e| e.value.as_slice()));
+            raw += r;
+            norm += n;
+        }
+        if counted {
+            // One call, however many streams it reads.
+            self.count_n("log_read_streams", raw, norm, 0);
+        }
+        Ok(out)
+    }
     async fn log_find_capture(
         &self,
         ns: &str,

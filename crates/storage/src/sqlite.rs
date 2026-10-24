@@ -342,6 +342,39 @@ impl StorageBackend for SqliteStorageBackend {
         })
     }
 
+    async fn log_read_streams(
+        &self,
+        streams: &[(String, String)],
+    ) -> Result<Vec<Vec<LogEntryMeta>>> {
+        let streams = streams.to_vec();
+        db!(self, move |conn: &Connection| {
+            // One snapshot: every stream inside one read transaction, with
+            // one prepared statement.
+            let tx = conn.unchecked_transaction()?;
+            let mut out = Vec::with_capacity(streams.len());
+            {
+                let mut stmt = tx.prepare_cached(
+                    "SELECT seq, COALESCE(ts_ms, ts*1000), capture_id, content_hash, val
+                     FROM df_log WHERE ns=?1 AND key=?2 ORDER BY seq ASC",
+                )?;
+                for (ns, key) in &streams {
+                    let rows = stmt.query_map(params![ns, key], |r| {
+                        Ok(LogEntryMeta {
+                            seq: r.get::<_, i64>(0)? as u64,
+                            stored_at_ms: r.get(1)?,
+                            capture_id: r.get(2)?,
+                            content_hash: r.get(3)?,
+                            value: r.get(4)?,
+                        })
+                    })?;
+                    out.push(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+                }
+            }
+            tx.commit()?;
+            Ok(out)
+        })
+    }
+
     async fn apply_batch(&self, batch: &AtomicBatch) -> Result<BatchOutcome> {
         batch.validate()?;
         let batch = batch.clone();
