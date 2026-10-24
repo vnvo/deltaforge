@@ -111,10 +111,10 @@ pub(crate) fn covers_row(
 }
 
 /// The first statement of `statements` that `affects` the table.
-pub(crate) fn first_affecting<'a>(
-    statements: &'a [super::mysql_binlog_scan::Statement],
+pub(crate) fn first_affecting(
+    statements: &[super::mysql_binlog_scan::Statement],
     affects: impl Fn(&super::mysql_binlog_scan::Statement) -> bool,
-) -> Option<&'a EventIdentity> {
+) -> Option<&EventIdentity> {
     statements.iter().find(|s| affects(s)).map(|s| &s.event)
 }
 
