@@ -720,3 +720,159 @@ so any gap in the executed set collapses.
 - Never extend an interval over numbers not seen.
 - Regression: the steps above must deliver rows 3 to 6. It also needs a
   proof test where a DDL fills a gap after A.
+
+## Revision 4 (proposed): one atomic state-store batch per window
+
+Status: design for review. Nothing below is implemented.
+
+### Why
+
+Positioned scanning and coalescing remove the seek. Measured on
+`proof-seek-fix` (`d1090c02`), small padding at offset 0, 200 first touches:
+four or five windows, then every table of a window admitted one at a time.
+Per table (medians over 200, instrumented build):
+
+| Step | Time | State-store operations |
+|---|---|---|
+| `register_captured` (schema registry) | 1.21 ms | about 12: index repair (2 stream reads), hash index, numbering floor (and legacy length), lineage record, marker write, log append, version and hash index writes, high-water write |
+| activation `append` | 0.42 ms | about 4: version check, digest check, insert, head update |
+| decision (`admit_decisive`) | 0.09 ms | 1 (version hash) |
+| timeline lookups | 2 µs | 0 (cached since `d1090c02`) |
+
+Every operation is its own `spawn_blocking` call on the one SQLite
+connection, with its own commit: about 0.1 ms each. So admission is about
+2 ms a table, serial, in activation order. That is the decile slope
+(180 to 539 ms, 3.0x), and 2,000 newly active tables would spread over
+about 4 s. Revision 3's optimizations removed the duplicate timeline read
+(2.35 to 2.03 ms a table) and made the window's locks one request (capture
+122 to 73 ms for about 150 tables); they cannot remove a per-table cost of
+about 16 round trips.
+
+### The change
+
+Admission moves from each table's first row to the window's close, and all
+of a window's durable writes commit in one state-store transaction.
+
+1. **Decide in memory.** After the batched capture and the shared scan,
+   for each prepared table in batch order, the source computes exactly what
+   `establish_at` computes today, from the same inputs:
+   - the barrier to bind, `covers`, the relevant-DDL check, the failover
+     drift policy (moved forward from the row: see "Equivalence");
+   - the registry version the captured shape would receive;
+   - the baseline record, its capture identity, and `admit_decisive` on the
+     table's timeline plus that record.
+
+   A table whose decision is anything but "admitted" gets no write and no
+   prepared proof: its rows take today's path when dispatched (relevant-DDL
+   retry, FULL fallback, or the schema error).
+2. **One read batch.** Everything the decisions read from the store (each
+   key's registry head, hash index, numbering floor, the lineage record,
+   each table's activation stream and the barriers) is read in one call
+   per kind, keys in batch order: a fixed number of round trips per window,
+   not per table.
+3. **One write transaction.** The registry entries (log append plus its
+   index and high-water writes) and the activation records of every
+   admitted table are applied as one atomic batch: all of them or none.
+   Activation records keep `log_append_if_absent` semantics inside it (an
+   identical record already present is fine; different bytes under the
+   same identity fail the batch).
+4. **Then the caches.** Only after the batch commits: each admitted table's
+   validated timeline is installed (with the stream heads the batch
+   returned), and the registry cache admits its versions. A failed batch
+   installs nothing and discards every batch key's cached timeline.
+5. **Dispatch.** The head event and the queue are dispatched as now. An
+   admitted table's rows now find their baseline in the timeline
+   (`Selection::Proven`) and do no admission work.
+
+### State-store API
+
+A new backend operation, implemented by every backend in one transaction:
+
+```text
+apply_batch(ops: Vec<BatchOp>) -> Vec<BatchOutcome>
+BatchOp = LogAppend { ns, key, value }
+        | LogAppendIfAbsent { ns, key, capture_id, value }
+        | KvPut { ns, key, value }
+```
+
+- SQLite: one `spawn_blocking`, one `BEGIN IMMEDIATE ... COMMIT`.
+- PostgreSQL: one transaction.
+- Memory: under its lock.
+- Bounded: at most `MAX_BATCH_TABLES` tables a batch (the window already
+  closes there) and a byte bound; beyond either the window fails closed.
+
+The schema registry gains a planning form of `register_with_checkpoint`:
+it computes versions from the batched reads and returns the operations
+instead of executing them. The existing one-table path stays and is
+unchanged for every other caller (snapshots, forward proofs, FULL).
+
+### Equivalence and what changes
+
+- **Decisions:** identical. Each table's decision uses the same functions
+  on the same inputs. Within a window the tables are distinct, and no
+  barrier or DDL can fall inside it (a statement closes the window), so one
+  table's admission cannot change another's inputs.
+- **Durable content:** identical bytes for every record and registry entry:
+  the same versions, hashes, capture identities, positions and proof
+  bindings.
+- **Ordering changes, and needs a decision.** Today a window's writes
+  interleave per table (registry entry, activation record, next table).
+  Batched, all of a window's registry entries come first, then its
+  activation records. The registry's global sequence numbers therefore
+  differ from today's for the same input, and `schema_sequence` on events
+  carries those numbers. Each is still its version's own registry sequence,
+  monotonic per table. Equivalence would be pinned on decisions and
+  record content, not on sequence values.
+- **When records are written:** at the window's close, before any of its
+  events is dispatched, instead of just before each table's first row is
+  decoded. Both are before the row is emitted and before the checkpoint
+  can pass it. A crash after the commit and before dispatch leaves records
+  ahead of the checkpoint; this happens today too (a crash after
+  admission, before the row's batch is acknowledged), and a restart reads
+  them as valid proofs of positions it has not yet reached.
+- **Failover drift:** today checked at the row. The window would apply
+  the drift check per table before deciding. A drift incident then stops
+  the source at the window's close instead of at the table's first row;
+  nothing of the window has been dispatched, and the checkpoint is the
+  same.
+- **Failure:** a batch that fails (store error, identity conflict) fails
+  the window closed, as a failed shared scan does today: nothing
+  dispatched, the checkpoint before the window, every batch key's cache
+  discarded.
+
+### Expected effect
+
+Per window, a fixed number of read round trips and one write transaction
+replace about 16 round trips a table. For about 150 tables: about 300 ms
+of serial admission becomes one commit of roughly 10-20 ms. What remains in
+the activation-order spread is the window sequence itself (about 120-130 ms
+a window, two or three windows in the study's burst), so the deciles should
+fall within 2x. This is an estimate to be measured, not a result.
+
+### Regressions this would need
+
+- Batch atomicity: a failure injected at every operation of a batch
+  (SQLite, PostgreSQL, Memory) leaves none of its writes visible and every
+  batch key's cache discarded.
+- Equivalence: for windows of accepted, refused (not decisive, relevant
+  DDL), drifted and conflicting tables, the batch path's decisions and
+  stored bytes equal the one-table path's.
+- Crash: kill after the commit and before dispatch, and after a partial
+  dispatch; the restart delivers every row once (at-least-once as today)
+  with every proof valid.
+- Bounds: a batch at `MAX_BATCH_TABLES` and at the byte bound; beyond them
+  the window fails closed.
+- Mutants: a non-atomic batch (operations committed one by one), caches
+  installed before the commit, and a refused table written anyway; each
+  must fail a test.
+- The full acceptance series at 0, 64, 256 and 960 MiB.
+
+### Decisions for review
+
+1. Whether `schema_sequence` values may differ from the one-table path's,
+   given decisions and record content are identical.
+2. Whether moving the failover drift check from the row to the window's
+   close is acceptable.
+3. Whether the window fails closed on a batch failure, or its tables fall
+   back to today's one-table admission at dispatch (bounded by the window's
+   table count, and not silent: counted and logged).
