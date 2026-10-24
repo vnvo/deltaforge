@@ -585,27 +585,24 @@ async fn admit_batch(
             })
     };
 
-    // Failover drift, for every table, before anything is decided: an
-    // incident stops the whole window with nothing of it written.
+    // Failover drift, for every table, before anything is decided: every
+    // table is assessed first, so an incident from any of them stops the
+    // whole window with nothing written.
+    let mut drift_tables = Vec::with_capacity(tables.len());
     for (((db, table), at, _), key) in tables.iter().zip(&keys) {
         let t = timeline(ctx, key).await?;
-        let all = t.all();
-        let at_cp = MySqlCheckpoint {
-            lineage: Some(lineage.to_string()),
-            ..at.clone()
-        };
-        super::mysql_failover_drift::check_in_stream(
-            ctx,
-            db,
-            table,
-            super::mysql_failover_drift::FirstEvent::Rows {
-                at: &pos(at)?,
-                at_cp: &at_cp,
-                timeline: &all,
+        drift_tables.push((
+            db.clone(),
+            table.clone(),
+            pos(at)?,
+            MySqlCheckpoint {
+                lineage: Some(lineage.to_string()),
+                ..at.clone()
             },
-        )
-        .await?;
+            t.all(),
+        ));
     }
+    super::mysql_failover_drift::check_window(ctx, &drift_tables).await?;
 
     let mut attempt = 0;
     loop {

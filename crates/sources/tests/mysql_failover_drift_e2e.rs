@@ -676,3 +676,98 @@ async fn drift_is_proven_on_a_busy_server() {
         assert_eq!(m["outcome"], outcome, "{id}: {m}");
     }
 }
+
+/// Drift is checked for every table of an activation window at its close:
+/// a later table's drift stops the whole window. `orders` (unchanged on B)
+/// is touched first and `items` (a column added on B) after it, in one
+/// transaction, so both are in one window. Under halt the source stops on
+/// `items`, and nothing of `orders` becomes visible: no row, no schema
+/// version and no activation record under B's lineage.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn a_later_tables_drift_stops_the_whole_window() {
+    init_test_tracing();
+    let (a, b) = servers().await;
+    let db = "fd_window";
+    let sc = Scenario {
+        id: "fd_window",
+        db,
+        tables: vec![format!("{db}.orders"), format!("{db}.items")],
+    };
+    const ITEMS: &str = "CREATE TABLE items (id INT PRIMARY KEY, n INT)";
+    let st = State::new().await;
+    // Run 1 on A: both tables' schemas registered under A's lineage.
+    sql(
+        a,
+        &[
+            format!("DROP DATABASE IF EXISTS {db}"),
+            format!("CREATE DATABASE {db}"),
+            format!("USE {db}"),
+            ORDERS.to_string(),
+            ITEMS.to_string(),
+        ],
+    )
+    .await;
+    let src = source(&sc, a, &st, OnSchemaDrift::Adapt, SnapshotMode::Never);
+    let (items, _) = run(
+        src,
+        &st,
+        a,
+        &[
+            format!("INSERT INTO {db}.orders VALUES (1, 'on-a')"),
+            format!("INSERT INTO {db}.items VALUES (1, 1)"),
+        ],
+        Duration::from_secs(4),
+    )
+    .await;
+    assert_eq!(rows(&items).len(), 2, "run 1 on A");
+    // B: `items` drifted before the failover position, `orders` did not.
+    sql(
+        b,
+        &[
+            format!("DROP DATABASE IF EXISTS {db}"),
+            format!("CREATE DATABASE {db}"),
+            format!("USE {db}"),
+            ORDERS.to_string(),
+            ITEMS.to_string(),
+            "ALTER TABLE items ADD COLUMN extra INT".to_string(),
+        ],
+    )
+    .await;
+    let executed = query_one(a, "SELECT @@GLOBAL.gtid_executed").await;
+    sql(
+        b,
+        &[
+            "RESET BINARY LOGS AND GTIDS".to_string(),
+            format!("SET GLOBAL gtid_purged = '{executed}'"),
+        ],
+    )
+    .await;
+    let src = source(&sc, b, &st, OnSchemaDrift::Halt, SnapshotMode::Never);
+    let (items, ended) = run(
+        src,
+        &st,
+        b,
+        &[
+            "BEGIN".to_string(),
+            format!("INSERT INTO {db}.orders VALUES (2, 'on-b')"),
+            format!("INSERT INTO {db}.items VALUES (2, 2, 2)"),
+            "COMMIT".to_string(),
+        ],
+        Duration::from_secs(20),
+    )
+    .await;
+    halted(&ended, "schema drift since the failover");
+    assert!(rows(&items).is_empty(), "no row of the window: {items:?}");
+    assert!(
+        st.activation(b, sc.id, db, "orders").await.is_empty(),
+        "no activation record of the earlier table"
+    );
+    let uuid = query_one(b, "SELECT @@GLOBAL.server_uuid").await;
+    let hash = LineageDescriptor::mysql(&uuid).unwrap().lineage_hash();
+    let key = SchemaKey::new(TENANT, sc.id, &hash, db, "orders");
+    assert!(
+        st.registry.get_latest(&key).await.unwrap().is_none(),
+        "no schema version of the earlier table under B's lineage"
+    );
+}
