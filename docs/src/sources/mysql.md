@@ -103,7 +103,7 @@ configuration is loaded:
 
 | Field | Default | Range | Description |
 |-------|---------|-------|-------------|
-| `activation_window_ms` | `50` | 1 to 1,000 | How long an activation window reads ahead to batch the first rows of newly active tables. The window holds the stream's dispatch meanwhile. |
+| `activation_window_ms` | `50` | 1 to 1,000 | How long after its first event was received an activation window reads ahead to batch the first rows of newly active tables. The window holds the stream's dispatch meanwhile. |
 | `activation_window_events` | `10000` | 1 to 100,000 | At most this many events buffered by a window. |
 | `activation_window_bytes` | `16777216` | 65,536 to 268,435,456 | At most this many bytes of events buffered by a window. |
 | `capture_lock_wait_secs` | `30` | 1 to 300 | How long a window's capture waits for each table's metadata lock, on each of its three attempts. |
@@ -341,7 +341,10 @@ statement that can change a schema, or an idle stream, closes the window
 early. One read-only transaction then captures all of these tables: it
 locks their metadata in sorted order, which avoids deadlocking against a
 multi-table DDL, and reads every definition between the same two binlog
-positions. One binlog scan proves them all, and each table is admitted or
+positions. Meanwhile the source keeps reading the stream, holding what
+arrives for the next window without emitting it, so tables first touched
+during an admission are not held for a second full window. One binlog
+scan proves them all, and each table is admitted or
 refused exactly as it would be on its own. The admitted tables' schema
 versions and proofs are then written in one state-store transaction: all of
 them or none. A failover drift check runs for every table of the window

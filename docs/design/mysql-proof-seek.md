@@ -419,7 +419,8 @@ of dispatching:
      batch with its own boundary A_i, the running set before its
      transaction.
 2. **Close.** The window closes at the first of these:
-   - `activation_window_ms` of reading (default 50 ms);
+   - `activation_window_ms` (default 50 ms) after its head event was
+     received;
    - `activation_window_events` buffered (default 10,000);
    - `activation_window_bytes` buffered (default 16 MiB);
    - a statement that can change a schema (any query event other than
@@ -450,12 +451,28 @@ nothing, and every path is bounded:
 | The batched capture's lock wait times out (1205: a DDL in progress on a batch table), or deadlocks (1213) | Retried in sorted order, at most **three batched-capture attempts in total** per window. If none succeeds, the window **fails closed** with a typed `mysql_capture_contention` incident: the lookahead queue stays undispatched (then discarded), the checkpoint stays at the boundary before the window, and the pipeline recovers only through its normal recovery policy. There is never a fallback to per-table captures, which could add one transaction per table of the window. A bounded subdivision would need a design of its own. |
 | The shared extension fails, or is refused after its attempts (layer 2) | **No table of the window is admitted** from that request, and none is marked proved. The window fails closed like a capture failure, with the scanner's error, and there are no per-table rescans. The record is unchanged (staging). |
 | The shared extension succeeds | Every table receives its own answer over (A_i, B] from the committed record. Each is then decided exactly as today: admitted, refused because its rows contradict the proven shape, or sent to the existing relevant-DDL path when its answer contains a DDL relevant to it. The window closes before any schema-changing statement, so a relevant DDL in (A_i, B] can only come from a statement committed between the window's close and the capture. The relevant-DDL path therefore runs for at most one table per such statement (its own captures are bounded as today), never for every table of the window. |
-| The stream is lost during read-ahead | The queue is discarded. The position was never advanced past the head event, so the existing reconnect resumes from the last boundary (`abandon_open_transaction`). |
+| The stream is lost during read-ahead or the prefetch | The queue and the held events are discarded. The position was never advanced past the head event, so the existing reconnect resumes from the last boundary (`abandon_open_transaction`). |
 | Cancellation (stop) | The queue is discarded, and the checkpoint is the last dispatched boundary. |
 
+**Prefetch during the admission.** Steps 3 to 5 do not need the stream,
+so it is read while they run: events that arrive are held raw, with the
+time each was received, and nothing about them is decided, dispatched or
+advanced. `read_next_event` serves them after the window's queue and
+before the stream. A read error ends the prefetch and is raised where the
+stream is read next, after the held events. The next window's time bound
+counts from its head event's receipt, and it takes the held events
+received within that bound without waiting: tables first touched while a
+window was admitted have already waited, and are not held for a second
+bound. A dropped stream (`abandon_open_transaction`) discards held events
+with the queue; the resume reads them from the server again. Rotation
+applies only when nothing is held. Without it, measured on the burst at
+offset 0, the tables of the second window of a burst waited for the
+first window's whole admission and then a full bound of their own:
+the slowest activation decile reached 2.01x the fastest.
+
 **Memory.** The queue is bounded by `activation_window_bytes` and
-`activation_window_events`, apart from the channel. A window holds raw
-events only, no decoded rows.
+`activation_window_events`, apart from the channel, and so are the held
+events. A window holds raw events only, no decoded rows.
 
 #### Layer 2: the coalescing scanner (state machine)
 
