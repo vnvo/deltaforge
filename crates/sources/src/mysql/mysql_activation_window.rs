@@ -321,9 +321,9 @@ pub(super) async fn maybe_window(
     let mut full = admit(ctx, &mut batch, &mut order, found)
         .await
         .map_err(LoopControl::Fail)?;
-    if batch.is_empty() {
-        // Every speculated table is proven or governed: nothing is
-        // required, the speculation is discarded unused.
+    // At a speculative window's head the required set is computed over
+    // all its held events, not just the head's tables.
+    if batch.is_empty() && !at_pending_head {
         return not_here(ctx);
     }
     let pending = if at_pending_head {
@@ -466,6 +466,14 @@ pub(super) async fn maybe_window(
         }
     };
     let read = started.elapsed();
+    if batch.is_empty() {
+        // A speculative window none of whose tables is required (all
+        // proven or governed): discarded unused, its events dispatched in
+        // order with nothing admitted.
+        drop(pending);
+        ctx.lookahead = queue;
+        return Ok(None);
+    }
 
     let scope = ctx
         .registry_scope
@@ -522,6 +530,7 @@ pub(super) async fn maybe_window(
         collector.observe(*seq, *received, h, d);
     }
     let mut prefetch = Prefetch::new(ctx, &cfg);
+    let cancel = ctx.cancel.clone();
     let admission = async {
         match pending {
             Some(p) => admit_speculated(ctx, p, &lineage, &batch, order).await,
@@ -530,14 +539,20 @@ pub(super) async fn maybe_window(
             }
         }
     };
-    let admitted = prefetch.during(stream, admission, &mut collector).await;
+    let admitted = prefetch
+        .during(stream, admission, &mut collector, &cancel)
+        .await;
     let prefetched = prefetch.events.len();
     ctx.next_held_seq = prefetch.next_seq;
     ctx.prefetched.extend(prefetch.events);
     if prefetch.error.is_some() {
         ctx.prefetch_error = prefetch.error;
     }
-    // A failed admission drops the collector: its task is aborted.
+    // A failed or cancelled admission drops the collector: its task is
+    // aborted. Nothing of the window was dispatched.
+    let Some(admitted) = admitted else {
+        return Err(LoopControl::Stop);
+    };
     let admitted = admitted?;
 
     // How each decision governs the table's other held rows: the queue is
@@ -638,13 +653,15 @@ impl Prefetch {
     /// Run `admission` to completion, reading the stream while it runs and
     /// within bounds, and feeding the next window's collector. A read in
     /// flight when it completes is cancelled, losing nothing (the vendored
-    /// channel keeps what it read).
+    /// channel keeps what it read). `None`: the run was stopped first (the
+    /// admission is dropped).
     async fn during<T>(
         &mut self,
         stream: &mut BinlogStream,
         admission: impl std::future::Future<Output = T>,
         collector: &mut Collector,
-    ) -> T {
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Option<T> {
         tokio::pin!(admission);
         loop {
             let reading = self.events_left > 0 && self.bytes_left > 0;
@@ -657,7 +674,8 @@ impl Prefetch {
             };
             tokio::select! {
                 biased;
-                done = &mut admission => return done,
+                done = &mut admission => return Some(done),
+                _ = cancel.cancelled() => return None,
                 _ = time_up => collector.time_up(),
                 read = stream.read(), if reading => match read {
                     Ok((h, d)) => {

@@ -121,6 +121,12 @@ impl BatchFaults for MemoryStorageBackend {
 }
 
 impl MemoryStorageBackend {
+    /// Whether a fault set with [`BatchFaults::set_batch_fault`] has not
+    /// fired yet (tests check it reached the batch they aimed at).
+    pub fn batch_fault_armed(&self) -> bool {
+        self.batch_fault.lock().expect("batch fault").is_some()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

@@ -1530,6 +1530,36 @@ pub(crate) async fn capture(
     })
 }
 
+/// Kills its connection on the server when dropped while armed (`id`
+/// non-zero), from a detached task, bounded in time.
+struct KillOnDrop {
+    dsn: String,
+    id: u32,
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if self.id == 0 {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (dsn, id) = (std::mem::take(&mut self.dsn), self.id);
+        rt.spawn(async move {
+            let kill = async {
+                let mut c =
+                    mysql_async::Conn::from_url(dsn.as_str()).await.ok()?;
+                c.query_drop(format!("KILL {id}")).await.ok();
+                c.disconnect().await.ok()
+            };
+            tokio::time::timeout(Duration::from_secs(10), kill)
+                .await
+                .ok();
+        });
+    }
+}
+
 /// The shapes of a window's tables read between two server positions in one
 /// transaction (`docs/design/mysql-proof-seek.md`, "Batched capture"): every
 /// table's metadata lock is taken first, in sorted `(schema, table)` order,
@@ -1675,11 +1705,20 @@ pub(crate) async fn capture_batch(
     let pool = mysql_async::Pool::new(dsn);
     let mut trace = CaptureTrace::default();
     let t0 = Instant::now();
+    // A capture dropped mid-flight (its window failed, was abandoned or
+    // the run stopped) is killed on the server: its read-only transaction
+    // rolls back and its metadata locks are released at once, instead of
+    // when its query ends.
+    let mut guard = KillOnDrop {
+        dsn: dsn.to_string(),
+        id: 0,
+    };
     let result = async {
         let mut conn = pool
             .get_conn()
             .await
             .map_err(|e| batch_error(e, "connect"))?;
+        guard.id = conn.id();
         let mode: Option<String> = conn
             .query_first("SELECT @@GLOBAL.gtid_mode")
             .await
@@ -1801,6 +1840,7 @@ pub(crate) async fn capture_batch(
         })
     }
     .await;
+    guard.id = 0;
     pool.disconnect().await.ok();
     result.map(|mut c| {
         c.trace = trace;

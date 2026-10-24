@@ -1130,7 +1130,7 @@ more rows in the held events, which is rare.
 
 | Case | Handling |
 |---|---|
-| C fails before or during its commit, or is cancelled (stop) | S's task is aborted: its capture connection is dropped, so the server rolls back its read-only transaction and releases its metadata locks. Every held event and both windows' reservations are discarded. The source resumes from the last dispatched boundary (`abandon_open_transaction`, or the stop path), exactly as for a failed window today. |
+| C fails before or during its commit, or is cancelled (stop) | S's task is aborted. A capture dropped mid-flight kills its own server session (`KILL <connection id>`, from a detached task bounded to 10 s), so the server rolls back its read-only transaction and releases its metadata locks at once instead of when its lock wait ends; dropping the client connection alone leaves the session waiting. A stop also drops C's admission: it is cancellable, and C's capture, if in flight, is killed the same way. Every held event and both windows' reservations are discarded. The source resumes from the last dispatched boundary (`abandon_open_transaction`, or the stop path), exactly as for a failed window today. |
 | C's commit is ambiguous (acknowledgement lost) | Resolved by revision 4's read-back inside C's admission, before C returns. S cannot decide before that, because it decides only after C has returned and its held rows are dispatched. |
 | S's capture or scan fails, before or after C commits | Remembered in S's task result. Nothing surfaces while C is current. When the stream reaches S's head (every preceding window completed, and its rows dispatched in order), the failure surfaces with revision 4's classification: exhausted lock waits or deadlocks are `mysql_capture_contention`, a connection failure a connection error, a scan failure the scanner's error. The window fails closed; there is no per-table capture. |
 | C refuses a table, or finds it missing (`NoCapture`) | Governed by the classification above: a stable outcome governs exactly the held rows it covers, an uncertain one fails the window closed, and uncovered rows go to a later window (planned abandonment of S). No held row is ever captured on its own. |
@@ -1210,8 +1210,12 @@ estimate, and the full series decides.
   the third fails the window closed.
 - **Harmless extra candidate:** a speculatively captured table found proven
   at decision time is discarded and the window commits.
-- **Invariant violation:** a required table missing from S (injected) fails
-  the window closed without a fresh capture.
+- **Invariant violation:** a required table missing from S, or at another
+  start, fails the window closed without a fresh capture (unit-tested on
+  the decision rule).
+- **Extra candidates at S's head:** when S's first event touches only
+  extra candidates, the required set is still computed over all of S's
+  events; if it is empty, S's events are dispatched with nothing admitted.
 - **Disconnect and cancellation with two windows present:** every held
   event discarded, S's task aborted, every row delivered exactly once
   after the resume.

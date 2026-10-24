@@ -343,7 +343,13 @@ locks their metadata in sorted order, which avoids deadlocking against a
 multi-table DDL, and reads every definition between the same two binlog
 positions. Meanwhile the source keeps reading the stream, holding what
 arrives for the next window without emitting it, so tables first touched
-during an admission are not held for a second full window. One binlog
+during an admission are not held for a second full window. The next
+window's capture and proof scan also start while the current window is
+still being admitted. It is decided and written only after the current
+window commits, in stream order: tables it captured that turn out to be
+proven already are dropped, and any table it should have captured but did
+not stops the source (an internal error, never repaired by guessing). At
+most two windows exist at a time. One binlog
 scan proves them all, and each table is admitted or
 refused exactly as it would be on its own. The admitted tables' schema
 versions and proofs are then written in one state-store transaction: all of
