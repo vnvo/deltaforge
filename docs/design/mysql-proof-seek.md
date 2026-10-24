@@ -964,3 +964,200 @@ should fall within 2x. This is an estimate to be measured.
   earlier tables' drift outcomes written before every table's assessment
   succeeds.
 - Then the acceptance series at 0, 64, 256 and 960 MiB.
+
+## Revision 5: overlapping the next window's capture and scan
+
+### Why
+
+The final-binary series met every target but one: one repetition of 12
+had an activation-decile ratio of 2.09. The cause is serial admission.
+When a large window (about 130 tables) takes 85-120 ms to admit, the
+tables first touched meanwhile wait for all of it, then for their own
+window's capture (44-81 ms under load) and commit. Those two windows share
+no state: their table sets are disjoint and only their decisions and
+commits depend on order. Revision 5 overlaps the next window's capture and
+scan with the current window's admission. Decisions and durable commits
+stay strictly sequential.
+
+### Terms
+
+- **Current window** (C): the window being captured, scanned, decided
+  and committed, exactly as in revision 4.
+- **Speculative window** (S): the next window, collected from events held
+  during C's admission (the prefetch of revision 4's follow-up), whose
+  capture and scan run while C is admitted.
+- **Held events**: events read from the stream and not yet dispatched:
+  C's lookahead queue and the prefetched events, each with its receipt
+  time and a held sequence number.
+
+### Invariants
+
+1. **At most two windows.** One current, at most one speculative. A
+   speculative window becomes current only when the stream reaches its
+   head event (below); only then may a new speculative window form.
+2. **Disjoint table sets, by reservation.** Opening C reserves its batch's
+   tables; closing S reserves S's. A reserved table cannot join another
+   window while its owner exists: a rows event of a table reserved by C is
+   not a candidate for S, whatever its position. Reservations end when
+   their window's held rows are all dispatched (or the window is
+   discarded).
+3. **Speculation is read-only.** S may capture schemas (its own read-only
+   MySQL transaction) and obtain proof data from the shared scanner. It
+   cannot decide a table, write the state store, allocate a sequence,
+   change a selection or registry cache, dispatch an event or move a
+   checkpoint. Its candidate filter reads a snapshot of the cache's
+   proven flags taken when C's admission starts (read-only, with no
+   recency change), never the cache itself: a table not flagged is
+   captured, even if a full selection would find it proven; such a table
+   is dropped at decision time, below.
+4. **Decisions are fresh and unchanged.** After C commits and its held
+   rows are dispatched in order, the stream reaches S's head event. S's
+   batch is then recomputed with the unchanged functions, from the real
+   dispatch state (`txn_eval_cp`, `unproven_at`, `head_tables`, `touched`,
+   `admit`) over S's held events. That gives the authoritative batch B'
+   and each table's start A_i. Every table of B' must be in S's
+   speculative batch with an identical A_i; S's capture and scan answers
+   are then used for B' only. Otherwise the window fails closed as an
+   internal inconsistency; there is no fallback capture. Then
+   `admit_batch` re-reads every registry and activation precondition and
+   runs the unchanged decision functions, as in revision 4.
+5. **Sequences only at commit.** Sequences are allocated only inside the
+   window's own atomic commit (revision 4), never during speculation.
+6. **Stream order.** Output, admission and checkpoint order remain stream
+   order: events are dispatched one at a time, in order, from C's queue,
+   then the held events, then the stream. S never dispatches anything;
+   its events wait in the held queue.
+
+Why every table of B' is in S's speculative batch: S's candidates are the
+allowed, unreserved tables whose rows S's events touch and that are not
+flagged proven in the snapshot. Nothing changes the proven state of an
+unreserved table between the snapshot and S's decision: C's commit writes
+only C's tables, and no event is dispatched between the snapshot and the
+end of C's admission. Every table of B' is unproven (so not flagged),
+allowed, and either unreserved (so captured by S) or reserved by C (so
+excluded from B' by the refusal rule or by being proven, below). The
+starts agree because S tracks boundaries with the same `Ahead` state that
+C's read-ahead uses, continued from C's last held event, and C's queue is
+dispatched before S's head. A difference would be a defect, so it fails
+closed instead of being repaired.
+
+### Lifecycle
+
+1. **C closes** (any revision-4 close condition). C's tables are
+   reserved. The proven-flag snapshot is taken.
+2. **C's admission runs, with the stream read meanwhile.** Every event
+   read is held with its receipt time. S's collection runs over the held
+   events in order: it continues C's `Ahead` state and finds candidate
+   rows. The first candidate is S's head; S's time bound counts from its
+   receipt. S closes under the same conditions as any window: time,
+   events, bytes, a statement, a heartbeat, framing, or the table limit.
+3. **S closes while C is still admitting.** S's tables are reserved and
+   its capture and scan start in an owned task: one batched capture of
+   its sorted tables (at most three attempts, revision 4), then one
+   shared scanner request over its tables' intervals. The task holds
+   nothing of `RunCtx`. If C finishes before S closes, S is dropped
+   unformed and its events stay held: when the stream reaches them, an
+   ordinary window forms over them, with its time bound counted from
+   receipt.
+4. **C's outcome.**
+   - **Committed:** S's task and its held events stay. C's queue and
+     then the held events are dispatched in order.
+   - **Failed or cancelled:** the C failure rules below.
+5. **The stream reaches S's head event.** S becomes current: B' is
+   recomputed (invariant 4), S's task is awaited, and its outcome is
+   used. A remembered failure surfaces here, in order. A new speculative
+   window may now form during S's admission.
+
+### Failure rules
+
+| Case | Handling |
+|---|---|
+| C fails before or during its commit, or is cancelled (stop) | S's task is aborted: its capture connection is dropped, so the server rolls back its read-only transaction and releases its metadata locks. Every held event and both windows' reservations are discarded. The source resumes from the last dispatched boundary (`abandon_open_transaction`, or the stop path), exactly as for a failed window today. |
+| C's commit is ambiguous (acknowledgement lost) | Resolved by revision 4's read-back inside C's admission, before C returns. S cannot decide before that, because it decides only after C has returned and its held rows are dispatched. |
+| S's capture or scan fails, before or after C commits | Remembered in S's task result. Nothing surfaces while C is current. When the stream reaches S's head (every preceding window completed, and its rows dispatched in order), the failure surfaces with revision 4's classification: exhausted lock waits or deadlocks are `mysql_capture_contention`, a connection failure a connection error, a scan failure the scanner's error. The window fails closed; there is no per-table capture. |
+| C refuses a table, or finds it missing (`NoCapture`) | That outcome governs every held row of the table up to the last held event when C decides, including rows in C's own queue at later positions. They go on without a lazy baseline, exactly as the refused rows do, and are never captured on their own. This also removes today's per-table capture for later rows of a refused table within one window. Rows read after that point are new and may join a later window. |
+| A held row of a table reserved by C appears in S's events | Not a candidate for S. After C, the table is either admitted (its later rows select over C's committed timeline) or governed by the refusal rule above. |
+| Disconnect (any read error or injected drop) with two windows present | S's task is aborted. The held events, both reservations and the refusal record are discarded. The resume reads the events from the server again. |
+| Credential rotation | Deferred while any event is held or any window exists, as in revision 4's follow-up. |
+
+### Locking
+
+Both capture transactions lock their own table sets in the global sorted
+`(schema, table)` order. The sets are disjoint, and shared metadata locks
+are compatible, so the two captures never wait for each other. A DDL
+spanning both sets (for example a multi-table `RENAME`) requests its
+exclusive locks in the same global order (probe 7). Every party then
+acquires in ascending order and holds only locks below the one it waits
+for, so no wait cycle can form. Lock-wait timeouts and deadlocks keep
+revision 4's bounds: at most three batched-capture attempts per window,
+then a fail-closed `mysql_capture_contention`. No path, including
+recovery from a failed or mismatched speculation, makes a per-table
+capture.
+
+### Scanner state if C fails
+
+S's scan is an ordinary request on the shared proof scanner. A scanner
+extension it caused may remain in the scanner's record when C fails. The
+record is source-cache state only: validated binlog facts (statements,
+identity, coverage) for the source's own lineage, independent of
+admission and checkpoints. It authorizes no table by itself. A later
+request still checks its own interval, server identity and digests, as
+every request does today. S's answers themselves are discarded with S.
+
+### Memory and bounds
+
+- Windows: at most two at a time.
+- Held events: within one window's `activation_window_events` and
+  `activation_window_bytes` (S's events are a subset), so with C's queue
+  at most two windows' worth of events.
+- Captures: one batched capture per window, at most three attempts. The
+  speculative capture is that capture; there is never a second capture
+  for the same window.
+- Scans: one shared scanner request per window.
+- Per-table captures: none from any window path.
+
+### Expected effect
+
+Measured on the series, the second window's capture and scan (40-60 ms)
+leave the serial path. Tables first touched during a large window's
+admission then wait for that admission plus their own window's decision
+and commit only. The slowest decile is expected to fall from about 260-330
+ms to about 200-270 ms, against a fastest decile of 101-200 ms. That is an
+estimate, and the full series decides.
+
+### Regressions and mutants
+
+- **First window succeeds while the second capture is in flight:** both
+  admitted in order; S's capture overlapped C's commit (trace).
+- **First window fails before commit:** S's capture aborted (a DDL on an
+  S table then proceeds at once), nothing of either window dispatched or
+  written, the checkpoint at C's boundary.
+- **First commit succeeds but its acknowledgement is lost:** read-back
+  resolves it before S decides; S's sequences follow C's original ones.
+- **Speculative capture fails before, and after, the first commit:** C is
+  admitted and dispatched; the failure surfaces only at S's head, with
+  its class.
+- **The same table appears again while reserved:** its held rows follow
+  C's outcome (admitted, or refused without a capture).
+- **Disconnect and cancellation with two windows present:** every held
+  event discarded, S's task aborted, every row delivered exactly once
+  after the resume.
+- **DDL spanning both table sets (live):** a multi-table `RENAME` of a C
+  table and an S table while both captures run. The source either admits
+  both windows or fails closed within three attempts, with no deadlock
+  and no per-table capture.
+- **Strict row and checkpoint order** across two windows.
+- **Bounds:** at most two windows, held events within one window's
+  limits, one capture and one scanner request per window, no per-table
+  capture.
+- **No speculative mutation:** no registry entry, activation record,
+  sequence or cache change before S decides, checked against the store
+  and the caches.
+- **Mutants:** S deciding before C's commit returns; a reservation
+  ignored (a C table joins S); a speculative cache write; a held row of a
+  refused table captured on its own; S's task not aborted when C fails;
+  a mismatched speculation repaired by a fresh capture instead of failing
+  closed.
+- Then the full final-binary series at 0, 64, 256 and 960 MiB. Every
+  repetition must meet the 2x decile bound, with no linear trend and no
+  material CPU regression, before mutants or the gate.
