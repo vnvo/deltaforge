@@ -385,7 +385,7 @@ pub(crate) async fn establish_at(
     // An activation window already decided this table (refused, or not
     // captured): its rows go on as without a lazy baseline. One it admitted
     // is proven by its committed baseline and never reaches here.
-    if let Some(outcome) = ctx.take_prepared(db, table, &e) {
+    if let Some(outcome) = ctx.take_prepared(db, table, &e, &e_cp) {
         let why = match outcome {
             PreparedOutcome::Refused(why) => why,
             PreparedOutcome::NoCapture => "no_capture",

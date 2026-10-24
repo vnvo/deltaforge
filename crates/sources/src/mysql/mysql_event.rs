@@ -55,10 +55,12 @@ pub(super) async fn read_next_event(
     }
     // What a window prefetched comes first, then the error that ended
     // the prefetch, then the stream.
-    if let Some((received, header, data)) = ctx.prefetched.pop_front() {
+    if let Some((received, seq, header, data)) = ctx.prefetched.pop_front() {
         ctx.last_received = received;
+        ctx.last_seq = seq;
         return Ok((header, data));
     }
+    ctx.last_seq = 0;
     let read = match ctx.prefetch_error.take() {
         Some(e) => Err(common::RetryOutcome::Failed(e)),
         None => {
@@ -1555,6 +1557,9 @@ pub(crate) mod tests {
             last_event_start: 0,
             lookahead: Default::default(),
             prefetched: Default::default(),
+            next_held_seq: 1,
+            last_seq: 0,
+            pending: None,
             prefetch_error: None,
             last_received: std::time::Instant::now(),
             prepared: Default::default(),

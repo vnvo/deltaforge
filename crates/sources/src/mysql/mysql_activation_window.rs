@@ -44,6 +44,11 @@ use super::mysql_binlog_scan::{
     trace_enabled, trace_proof,
 };
 use super::mysql_event::read_next_event;
+use super::mysql_window_speculation::{
+    Collector, Covers, Governs, Held, NextWindow, Pending, SpecInputs,
+    check_required, first_affecting, first_uncovered, reserved_rows_covered,
+    statement_before,
+};
 use super::{LoopControl, MySqlCheckpoint, RunCtx};
 use crate::durable_checkpoint::{
     WmPos, mysql_checkpoint_position, order_positions,
@@ -58,6 +63,8 @@ pub(crate) const CAPTURE_ATTEMPTS: u32 = 3;
 pub(crate) struct Prepared {
     /// The start of the table's interval: its rows' evaluation position.
     pub at: WmPos,
+    /// Which of the table's later rows the decision also covers.
+    pub covers: Covers,
     pub outcome: PreparedOutcome,
 }
 
@@ -83,11 +90,20 @@ pub(crate) struct WindowTrace {
     /// Events read from the stream during the admission, for the next
     /// window.
     pub prefetched: usize,
+    /// For a window resumed from its speculation: how many tables the
+    /// speculation captured (its required tables, and any it discards).
+    pub speculated: Option<usize>,
+    /// What became of the next window during the admission.
+    pub next: &'static str,
+    /// The next window's speculative candidates.
+    pub next_candidates: usize,
+    /// Whether the queue was cut before a row no decision covers.
+    pub cut: bool,
 }
 
 /// Transaction control: neither a schema change nor a statement that could
 /// be one.
-fn is_transaction_control(sql: &str) -> bool {
+pub(crate) fn is_transaction_control(sql: &str) -> bool {
     let s = sql.trim().trim_end_matches(';').trim();
     [
         "BEGIN",
@@ -125,8 +141,9 @@ fn rows_table(data: &EventData) -> Option<u64> {
 /// The stream's position while the window reads ahead: transaction
 /// boundaries with an exact running executed set, and the tables mapped so
 /// far. Mirrors what dispatching would record, without touching `ctx`.
-struct Ahead {
-    file: String,
+#[derive(Clone)]
+pub(crate) struct Ahead {
+    pub file: String,
     /// The executed set (GTID mode) at the last boundary.
     done: Option<GtidSet>,
     open_gtid: Option<String>,
@@ -135,7 +152,7 @@ struct Ahead {
     table_map: HashMap<u64, (String, String)>,
     /// A GTID that does not parse: the running set is unknown from here
     /// (dispatching that transaction fails closed).
-    broken: bool,
+    pub broken: bool,
 }
 
 impl Ahead {
@@ -160,7 +177,7 @@ impl Ahead {
 /// The tables of `data` (a rows event, or each one of a compressed
 /// transaction) that `ctx` would prove at their rows, with the table maps
 /// the event itself carries.
-fn touched(
+pub(crate) fn touched(
     ahead: &mut Ahead,
     header: &EventHeader,
     data: &EventData,
@@ -266,18 +283,36 @@ pub(super) async fn maybe_window(
     header: &EventHeader,
     data: &EventData,
 ) -> Result<Option<WindowTrace>, LoopControl> {
+    // A speculative window whose head passed without a window opening
+    // there is dropped unused (its task aborted).
+    if let Some(p) = &ctx.pending
+        && (ctx.last_seq == 0 || ctx.last_seq > p.head_seq)
+    {
+        ctx.pending = None;
+    }
+    let at_pending_head = ctx
+        .pending
+        .as_ref()
+        .is_some_and(|p| p.head_seq == ctx.last_seq);
+    let not_here = |ctx: &mut RunCtx| {
+        if at_pending_head {
+            ctx.pending = None;
+        }
+        Ok(None)
+    };
     if !ctx.lookahead.is_empty() || ctx.transaction_open_without_eval() {
-        return Ok(None);
+        return not_here(ctx);
     }
     let Some(a_head) = ctx.txn_eval_cp.clone() else {
-        return Ok(None);
+        return not_here(ctx);
     };
+    ctx.prune_prepared(&a_head);
     // The head event's tables, from the stream's own table map: no copy
     // of it unless a window opens (this runs for every rows event).
     let mut found = Vec::new();
     head_tables(&ctx.table_map, data, &a_head, &mut found);
     if found.is_empty() {
-        return Ok(None);
+        return not_here(ctx);
     }
     let mut batch: BTreeMap<(String, String), MySqlCheckpoint> =
         BTreeMap::new();
@@ -287,8 +322,19 @@ pub(super) async fn maybe_window(
         .await
         .map_err(LoopControl::Fail)?;
     if batch.is_empty() {
-        return Ok(None);
+        // Every speculated table is proven or governed: nothing is
+        // required, the speculation is discarded unused.
+        return not_here(ctx);
     }
+    let pending = if at_pending_head {
+        ctx.pending.take()
+    } else if ctx.pending.is_some() {
+        return Err(LoopControl::Fail(invariant(
+            "a window opened before the speculative window's head",
+        )));
+    } else {
+        None
+    };
     let mut ahead = Ahead {
         file: ctx.last_file.clone(),
         done: ctx.last_gtid.clone(),
@@ -309,28 +355,48 @@ pub(super) async fn maybe_window(
 
     // Read ahead, without advancing the position or dispatching. The
     // time bound counts from when the head event was received: events
-    // prefetched during the previous window's admission were received
-    // within it if their receipt is, and are taken without waiting.
+    // held during the previous window's admission were received within it
+    // if their receipt is, and are taken without waiting. A window resumed
+    // from its speculation reads exactly the held events it was collected
+    // from.
     let cfg = ctx.proofs.clone();
     let started = Instant::now();
     let deadline =
         ctx.last_received + Duration::from_millis(cfg.activation_window_ms);
     let mut queue: VecDeque<(EventHeader, EventData)> = VecDeque::new();
+    let mut receipts: Vec<(Instant, u64)> = Vec::new();
+    // Every queued row of a table, with its transaction's start.
+    let mut rows_at: Vec<(usize, (String, String), MySqlCheckpoint)> =
+        Vec::new();
     let mut bytes = 0u64;
     let closed_by = loop {
-        if full {
-            break "tables";
+        if let Some(p) = &pending {
+            if ctx.last_seq == p.end_seq {
+                break p.closed_by;
+            }
+            if !ctx.prefetched.front().is_some_and(|(_, seq, ..)| {
+                *seq > ctx.last_seq && *seq <= p.end_seq
+            }) {
+                return Err(LoopControl::Fail(invariant(
+                    "the speculative window's held events are not next",
+                )));
+            }
+        } else {
+            if full {
+                break "tables";
+            }
+            if queue.len() >= cfg.activation_window_events {
+                break "events";
+            }
+            if bytes >= cfg.activation_window_bytes {
+                break "bytes";
+            }
         }
-        if queue.len() >= cfg.activation_window_events {
-            break "events";
-        }
-        if bytes >= cfg.activation_window_bytes {
-            break "bytes";
-        }
-        let received_in_time = ctx
-            .prefetched
-            .front()
-            .is_some_and(|(received, ..)| *received <= deadline);
+        let received_in_time = pending.is_some()
+            || ctx
+                .prefetched
+                .front()
+                .is_some_and(|(received, ..)| *received <= deadline);
         let next = if received_in_time {
             read_next_event(stream, ctx).await
         } else {
@@ -367,35 +433,144 @@ pub(super) async fn maybe_window(
         if close.is_none() {
             let mut found = Vec::new();
             touched(&mut ahead, &h, &d, &mut found);
+            for (db, table, at) in &found {
+                rows_at.push((
+                    queue.len(),
+                    (db.clone(), table.clone()),
+                    at.clone(),
+                ));
+            }
             if !ahead.broken {
                 full = admit(ctx, &mut batch, &mut order, found)
                     .await
                     .map_err(LoopControl::Fail)?;
             }
         }
+        receipts.push((ctx.last_received, ctx.last_seq));
         queue.push_back((h, d));
         if let Some(why) = close {
+            if pending.as_ref().is_some_and(|p| ctx.last_seq != p.end_seq) {
+                return Err(LoopControl::Fail(invariant(
+                    "the speculative window closed elsewhere than its own reading",
+                )));
+            }
             break why;
         }
         if ahead.broken {
+            if pending.as_ref().is_some_and(|p| ctx.last_seq != p.end_seq) {
+                return Err(LoopControl::Fail(invariant(
+                    "the speculative window closed elsewhere than its own reading",
+                )));
+            }
             break "framing";
         }
     };
     let read = started.elapsed();
 
+    let scope = ctx
+        .registry_scope
+        .current()
+        .map_err(|e| LoopControl::Fail(e.into()))?;
+    let lineage = scope.lineage().lineage_hash.clone();
+    // The rule: the required set (this window's batch, from the unchanged
+    // functions) is a subset of the speculation, each table at exactly the
+    // same start; unused candidates are discarded. A difference is a
+    // defect, never repaired by a fresh capture.
+    let speculated = match &pending {
+        Some(p) => {
+            if p.lineage != lineage {
+                return Err(LoopControl::Fail(invariant(&format!(
+                    "the speculation was captured under lineage {}, the window \
+                     decides under {lineage}",
+                    p.lineage
+                ))));
+            }
+            check_required(&batch, &p.batch)
+                .map_err(|why| LoopControl::Fail(invariant(&why)))?;
+            Some(p.batch.len())
+        }
+        None => None,
+    };
+
     // The admission, with the stream read meanwhile: what arrives while it
     // captures, scans and commits is held (never dispatched or decoded
-    // past its framing) for the next window.
+    // past its framing), and the next window is collected from it and
+    // captured speculatively (nothing of `ctx` is held by that).
+    let server_uuid = ctx.expected_uuid().map_err(LoopControl::Fail)?;
+    let capture = CaptureScan {
+        dsn: ctx.dsn.clone(),
+        anchor: ctx.stream_anchor(&server_uuid, &lineage),
+        server_uuid,
+        lineage: lineage.clone(),
+        source_id: ctx.source_id.clone(),
+        lock_wait_secs: cfg.capture_lock_wait_secs,
+        scanner: std::sync::Arc::clone(&ctx.proof_scanner),
+    };
+    let mut collector = Collector::new(
+        ahead,
+        ctx.allow.clone(),
+        scope,
+        ctx.selection.proven_keys(),
+        batch.keys().cloned().collect(),
+        &cfg,
+        SpecInputs {
+            capture: capture.clone(),
+            lineage: lineage.clone(),
+        },
+    );
+    for (received, seq, h, d) in &ctx.prefetched {
+        collector.observe(*seq, *received, h, d);
+    }
     let mut prefetch = Prefetch::new(ctx, &cfg);
-    let admitted = prefetch
-        .during(stream, admit_window(ctx, &cfg, &a_head, batch, order))
-        .await;
+    let admission = async {
+        match pending {
+            Some(p) => admit_speculated(ctx, p, &lineage, &batch, order).await,
+            None => {
+                admit_window(ctx, &capture, &a_head, batch.clone(), order).await
+            }
+        }
+    };
+    let admitted = prefetch.during(stream, admission, &mut collector).await;
     let prefetched = prefetch.events.len();
+    ctx.next_held_seq = prefetch.next_seq;
     ctx.prefetched.extend(prefetch.events);
     if prefetch.error.is_some() {
         ctx.prefetch_error = prefetch.error;
     }
+    // A failed admission drops the collector: its task is aborted.
     let admitted = admitted?;
+
+    // How each decision governs the table's other held rows: the queue is
+    // cut before the first row no decision covers (a later window decides
+    // it), and a speculation that cannot hold an uncovered row of a
+    // reserved table is abandoned before it decides.
+    let decisions: HashMap<(String, String), (MySqlCheckpoint, Governs)> =
+        admitted
+            .governs
+            .iter()
+            .map(|(k, a, g)| (k.clone(), (a.clone(), g.clone())))
+            .collect();
+    let cut = first_uncovered(&rows_at, &decisions);
+    let candidates = collector.candidates();
+    let covered = reserved_rows_covered(&collector.reserved_rows, &decisions);
+    let (mut next, speculation) = collector.finish();
+    if cut.is_some() || !covered {
+        if next == NextWindow::Formed {
+            next = NextWindow::Abandoned;
+        }
+        drop(speculation);
+    } else {
+        ctx.pending = speculation;
+    }
+    if let Some(i) = cut {
+        let rest = queue.split_off(i);
+        let rest_receipts = receipts.split_off(i);
+        for ((h, d), (received, seq)) in
+            rest.into_iter().zip(rest_receipts).rev()
+        {
+            ctx.prefetched.push_front((received, seq, h, d));
+        }
+    }
     ctx.lookahead = queue;
     let trace = WindowTrace {
         tables: admitted.tables,
@@ -405,9 +580,25 @@ pub(super) async fn maybe_window(
         capture_attempts: admitted.attempts,
         work: admitted.work,
         prefetched,
+        speculated,
+        next: next.as_str(),
+        next_candidates: candidates,
+        cut: cut.is_some(),
     };
     observe_window(&ctx.source_id, &trace, read, &admitted);
     Ok(Some(trace))
+}
+
+/// An internal invariant violation of the speculative window: it fails the
+/// window closed.
+fn invariant(why: &str) -> SourceError {
+    SourceError::Schema {
+        details: format!(
+            "activation window invariant violated: {why}; nothing of the \
+             window was admitted or dispatched and the checkpoint stays before it"
+        )
+        .into(),
+    }
 }
 
 /// What reading the stream during an admission may hold: at most a
@@ -415,10 +606,11 @@ pub(super) async fn maybe_window(
 /// after a read error, which is kept and raised where the stream is read
 /// next.
 struct Prefetch {
-    events: VecDeque<(Instant, EventHeader, EventData)>,
+    events: VecDeque<Held>,
     error: Option<mysql_binlog_connector_rust::binlog_error::BinlogError>,
     events_left: usize,
     bytes_left: u64,
+    next_seq: u64,
 }
 
 impl Prefetch {
@@ -426,7 +618,7 @@ impl Prefetch {
         let held: u64 = ctx
             .prefetched
             .iter()
-            .map(|(_, h, _)| u64::from(h.event_length))
+            .map(|(_, _, h, _)| u64::from(h.event_length))
             .sum();
         let stopped = ctx.prefetch_error.is_some();
         Self {
@@ -439,31 +631,44 @@ impl Prefetch {
                     .saturating_sub(ctx.prefetched.len())
             },
             bytes_left: cfg.activation_window_bytes.saturating_sub(held),
+            next_seq: ctx.next_held_seq,
         }
     }
 
     /// Run `admission` to completion, reading the stream while it runs and
-    /// within bounds. A read in flight when it completes is cancelled,
-    /// losing nothing (the vendored channel keeps what it read).
+    /// within bounds, and feeding the next window's collector. A read in
+    /// flight when it completes is cancelled, losing nothing (the vendored
+    /// channel keeps what it read).
     async fn during<T>(
         &mut self,
         stream: &mut BinlogStream,
         admission: impl std::future::Future<Output = T>,
+        collector: &mut Collector,
     ) -> T {
         tokio::pin!(admission);
         loop {
-            if self.events_left == 0 || self.bytes_left == 0 {
-                return admission.await;
-            }
+            let reading = self.events_left > 0 && self.bytes_left > 0;
+            let deadline = collector.deadline();
+            let time_up = async move {
+                match deadline {
+                    Some(d) => tokio::time::sleep_until(d.into()).await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 biased;
                 done = &mut admission => return done,
-                read = stream.read() => match read {
+                _ = time_up => collector.time_up(),
+                read = stream.read(), if reading => match read {
                     Ok((h, d)) => {
+                        let received = Instant::now();
+                        let seq = self.next_seq;
+                        self.next_seq += 1;
+                        collector.observe(seq, received, &h, &d);
                         self.events_left -= 1;
                         self.bytes_left =
                             self.bytes_left.saturating_sub(u64::from(h.event_length));
-                        self.events.push_back((Instant::now(), h, d));
+                        self.events.push_back((received, seq, h, d));
                     }
                     Err(e) => {
                         self.error = Some(e);
@@ -475,7 +680,8 @@ impl Prefetch {
     }
 }
 
-/// A window's admission as done: how long each part took.
+/// A window's admission as done: how long each part took, and how each
+/// table's decision governs its other held rows.
 struct Admitted {
     tables: usize,
     attempts: u32,
@@ -485,112 +691,113 @@ struct Admitted {
     committed: Duration,
     capture: super::mysql_binlog_scan::CaptureTrace,
     batch: BatchStats,
+    governs: Vec<((String, String), MySqlCheckpoint, Governs)>,
 }
 
-/// One batched capture (retried in the same sorted order), one scanner
-/// request answering every table over its own `(A_i, B]`, and the atomic
-/// admission of all of them.
-async fn admit_window(
-    ctx: &mut RunCtx,
-    cfg: &deltaforge_config::MysqlProofCfg,
-    a_head: &MySqlCheckpoint,
-    batch: BTreeMap<(String, String), MySqlCheckpoint>,
-    order: Vec<(String, String)>,
-) -> Result<Admitted, LoopControl> {
-    let server_uuid = ctx.expected_uuid().map_err(LoopControl::Fail)?;
-    let lineage = ctx
-        .registry_scope
-        .current()
-        .map_err(|e| LoopControl::Fail(e.into()))?
-        .lineage()
-        .lineage_hash
-        .clone();
-    let source_id = ctx.source_id.clone();
+/// What one window's batched capture and shared scan need, owned (a
+/// speculative window's task holds no part of `RunCtx`).
+#[derive(Clone)]
+pub(crate) struct CaptureScan {
+    pub dsn: crate::credentials::ProtectedDsn,
+    pub server_uuid: String,
+    pub lineage: String,
+    pub source_id: String,
+    pub lock_wait_secs: u32,
+    pub scanner: std::sync::Arc<super::mysql_proof_scanner::ProofScanner>,
+    pub anchor: Option<super::mysql_binlog_scan::Anchor>,
+}
+
+/// A window's capture and every table's scan answer (in the sorted order
+/// of its tables).
+pub(crate) struct CapturedWindow {
+    pub cap: BatchCaptured,
+    pub answers: Vec<ScanReport>,
+    pub attempts: u32,
+    pub captured: Duration,
+    pub scanned: Duration,
+}
+
+/// One batched capture of the sorted `tables` (retried in the same order,
+/// at most [`CAPTURE_ATTEMPTS`] in all), then one scanner request answering
+/// every table over its own `(from_i, B]`. Failures keep their class.
+pub(crate) async fn capture_and_scan(
+    cs: &CaptureScan,
+    tables: &[(String, String)],
+    froms: &[MySqlCheckpoint],
+    head: &MySqlCheckpoint,
+) -> Result<CapturedWindow, SourceError> {
     let tag = ScanTag {
-        source_id: &source_id,
+        source_id: &cs.source_id,
         kind: ProofKind::Lazy,
     };
-
-    let tables: Vec<(String, String)> = batch.keys().cloned().collect();
     let mut attempts = 0;
     let t = Instant::now();
     let cap = loop {
         attempts += 1;
         match capture_batch(
-            ctx.dsn.expose(),
-            &server_uuid,
-            &lineage,
-            &tables,
-            cfg.capture_lock_wait_secs,
+            cs.dsn.expose(),
+            &cs.server_uuid,
+            &cs.lineage,
+            tables,
+            cs.lock_wait_secs,
             None,
         )
         .await
         {
             Ok(c) => break c,
             Err(BatchCaptureError::Failed(ProofError::OtherServer(found))) => {
-                return Err(LoopControl::Fail(SourceError::Lineage {
+                return Err(SourceError::Lineage {
                     details: format!(
                         "an activation capture reached another server ({found}), \
-                         expected {server_uuid}"
+                         expected {}",
+                        cs.server_uuid
                     )
                     .into(),
-                }));
+                });
             }
             Err(e) if attempts < CAPTURE_ATTEMPTS => {
-                warn!(source_id = %ctx.source_id, attempt = attempts, error = ?e, tables = tables.len(), "activation window: the batched capture failed; retrying");
+                warn!(source_id = %cs.source_id, attempt = attempts, error = ?e, tables = tables.len(), "activation window: the batched capture failed; retrying");
             }
             Err(e) => {
-                return Err(LoopControl::Fail(capture_failure(
-                    &ctx.source_id,
-                    &tables,
+                return Err(capture_failure(
+                    &cs.source_id,
+                    tables,
                     attempts,
-                    a_head,
+                    head,
                     e,
-                )));
+                ));
             }
         }
     };
     let captured = t.elapsed();
-
     let t = Instant::now();
-    let froms: Vec<MySqlCheckpoint> = batch
-        .values()
-        .map(|a| MySqlCheckpoint {
-            lineage: Some(lineage.clone()),
-            ..a.clone()
-        })
-        .collect();
-    let head = MySqlCheckpoint {
-        lineage: Some(lineage.clone()),
-        ..a_head.clone()
-    };
-    let anchor = ctx.stream_anchor(&server_uuid, &lineage);
     let answers = match super::mysql_proof_scanner::shared_intervals(
-        &ctx.proof_scanner,
-        ctx.dsn.expose(),
-        &source_id,
-        &server_uuid,
-        &lineage,
-        &froms,
+        &cs.scanner,
+        cs.dsn.expose(),
+        &cs.source_id,
+        &cs.server_uuid,
+        &cs.lineage,
+        froms,
         &cap.position,
-        anchor.as_ref(),
-        Some(&head),
+        cs.anchor.as_ref(),
+        Some(head),
         &tag,
     )
     .await
     {
         Ok(a) => a,
         Err(ProofError::OtherServer(found)) => {
-            return Err(LoopControl::Fail(SourceError::Lineage {
+            return Err(SourceError::Lineage {
                 details: format!(
                     "an activation scan reached another server ({found}), \
-                     expected {server_uuid}"
+                     expected {}",
+                    cs.server_uuid
                 )
                 .into(),
-            }));
+            });
         }
         Err(e) => {
-            return Err(LoopControl::Fail(SourceError::Schema {
+            return Err(SourceError::Schema {
                 details: format!(
                     "the activation window's shared proof scan of {} table(s) \
                      failed ({e}); no table of the window was admitted, \
@@ -598,35 +805,109 @@ async fn admit_window(
                     tables.len()
                 )
                 .into(),
-            }));
+            });
         }
     };
-    let scanned = t.elapsed();
+    Ok(CapturedWindow {
+        cap,
+        answers,
+        attempts,
+        captured,
+        scanned: t.elapsed(),
+    })
+}
 
-    let work = answers.first().map(|r| r.work).unwrap_or_default();
-    let mut proved: HashMap<(String, String), (MySqlCheckpoint, ScanReport)> =
-        batch
-            .into_iter()
-            .zip(answers)
-            .map(|((k, at), r)| (k, (at, r)))
-            .collect();
-    let tables_in_order: Vec<_> = order
-        .into_iter()
-        .filter_map(|k| proved.remove(&k).map(|(at, r)| (k, at, r)))
+/// A fresh window: its capture and scan, then the atomic admission of all
+/// its tables.
+async fn admit_window(
+    ctx: &mut RunCtx,
+    capture: &CaptureScan,
+    a_head: &MySqlCheckpoint,
+    batch: BTreeMap<(String, String), MySqlCheckpoint>,
+    order: Vec<(String, String)>,
+) -> Result<Admitted, LoopControl> {
+    let tables: Vec<(String, String)> = batch.keys().cloned().collect();
+    let froms: Vec<MySqlCheckpoint> = batch
+        .values()
+        .map(|a| MySqlCheckpoint {
+            lineage: Some(capture.lineage.clone()),
+            ..a.clone()
+        })
         .collect();
-    let t = Instant::now();
-    let batch = admit_batch(ctx, &lineage, &cap, tables_in_order)
+    let head = MySqlCheckpoint {
+        lineage: Some(capture.lineage.clone()),
+        ..a_head.clone()
+    };
+    let done = capture_and_scan(capture, &tables, &froms, &head)
         .await
         .map_err(LoopControl::Fail)?;
+    decide_and_commit(ctx, &capture.lineage, done, &batch, &tables, order).await
+}
+
+/// A speculated window: its capture and scan (awaited: a failure
+/// remembered by the task surfaces only now, in order), then the atomic
+/// admission of its required tables. Every answer is used only for the
+/// table and start it was obtained for.
+async fn admit_speculated(
+    ctx: &mut RunCtx,
+    mut pending: Pending,
+    lineage: &str,
+    required: &BTreeMap<(String, String), MySqlCheckpoint>,
+    order: Vec<(String, String)>,
+) -> Result<Admitted, LoopControl> {
+    let done = (&mut pending.task.0)
+        .await
+        .map_err(|e| {
+            LoopControl::Fail(SourceError::Other(anyhow::anyhow!(
+                "the speculative capture task ended: {e}"
+            )))
+        })?
+        .map_err(LoopControl::Fail)?;
+    let speculated: Vec<(String, String)> =
+        pending.batch.keys().cloned().collect();
+    decide_and_commit(ctx, lineage, done, required, &speculated, order).await
+}
+
+/// The decisions and the atomic commit of `required`'s tables, from a
+/// capture and answers obtained for `captured` (sorted; a superset).
+async fn decide_and_commit(
+    ctx: &mut RunCtx,
+    lineage: &str,
+    mut done: CapturedWindow,
+    required: &BTreeMap<(String, String), MySqlCheckpoint>,
+    captured: &[(String, String)],
+    order: Vec<(String, String)>,
+) -> Result<Admitted, LoopControl> {
+    let index: HashMap<&(String, String), usize> =
+        captured.iter().enumerate().map(|(i, k)| (k, i)).collect();
+    let work = done.answers.first().map(|r| r.work).unwrap_or_default();
+    let mut tables_in_order = Vec::with_capacity(required.len());
+    for k in order {
+        let (Some(at), Some(i)) = (required.get(&k), index.get(&k)) else {
+            return Err(LoopControl::Fail(invariant(&format!(
+                "table {}.{} has no capture or answer",
+                k.0, k.1
+            ))));
+        };
+        let report = done.answers[*i].clone();
+        tables_in_order.push((k, at.clone(), report));
+    }
+    let capture = std::mem::take(&mut done.cap.trace);
+    let t = Instant::now();
+    let (batch, governs) =
+        admit_batch(ctx, lineage, &done.cap, tables_in_order)
+            .await
+            .map_err(LoopControl::Fail)?;
     Ok(Admitted {
-        batch,
-        tables: tables.len(),
-        attempts,
+        tables: required.len(),
+        attempts: done.attempts,
         work,
-        captured,
-        scanned,
+        captured: done.captured,
+        scanned: done.scanned,
         committed: t.elapsed(),
-        capture: cap.trace,
+        capture,
+        batch,
+        governs,
     })
 }
 
@@ -638,7 +919,7 @@ const BATCH_STORAGE_RETRIES: usize = 3;
 /// One table's decision before the batch: refused (and why), or a
 /// candidate whose shape is registered and whose baseline is proposed.
 enum Decision {
-    Refused(&'static str),
+    Refused(&'static str, Covers),
     Candidate { binds: Option<String>, s: WmPos },
 }
 
@@ -655,7 +936,13 @@ async fn admit_batch(
     lineage: &str,
     cap: &BatchCaptured,
     tables: Vec<((String, String), MySqlCheckpoint, ScanReport)>,
-) -> Result<BatchStats, SourceError> {
+) -> Result<
+    (
+        BatchStats,
+        Vec<((String, String), MySqlCheckpoint, Governs)>,
+    ),
+    SourceError,
+> {
     use super::mysql_activation::{
         ACTIVATION_NS, BARRIER_NS, Kind, Record, Stored, baseline_capture_id,
         encode_record, table_stream,
@@ -690,20 +977,47 @@ async fn admit_batch(
     let (tables, gone): (Vec<_>, Vec<_>) = tables
         .into_iter()
         .partition(|((db, table), _, _)| cap.table(db, table).is_some());
-    for ((db, table), at, _) in gone {
+    // Its rows are covered up to the statement that dropped or renamed it.
+    // With no such statement in its proof answer the outcome is uncertain:
+    // the window fails closed, before anything is written.
+    let mut governs = Vec::with_capacity(tables.len() + gone.len());
+    let mut gone_until = Vec::with_capacity(gone.len());
+    for ((db, table), _, report) in &gone {
+        let Some(d) = first_affecting(&report.statements, |st| {
+            affects(st, db, table, lctn)
+        }) else {
+            return Err(SourceError::Schema {
+                details: format!(
+                    "table {db}.{table} did not exist at the activation window's \
+                     capture and nothing in its proof interval drops or renames \
+                     it: an uncertain outcome; nothing of the window was \
+                     admitted or dispatched and the checkpoint stays before it"
+                )
+                .into(),
+            });
+        };
+        gone_until.push(d.clone());
+    }
+    for (((db, table), at, _), d) in gone.into_iter().zip(gone_until) {
         warn!(source_id = %ctx.source_id, %db, %table, "no lazy baseline: the table did not exist at the window's capture");
         trace_proof(&tag, &db, &table, None, None, lctn, "no_capture");
         if let Some(e) =
             mysql_checkpoint_position(&at.file, at.pos, at.gtid_set.as_deref())
         {
             ctx.prepared.insert(
-                (db, table),
+                (db.clone(), table.clone()),
                 Prepared {
                     at: e,
+                    covers: Covers::UntilStatement(d.clone()),
                     outcome: PreparedOutcome::NoCapture,
                 },
             );
         }
+        governs.push((
+            (db, table),
+            at,
+            Governs::Refused(Covers::UntilStatement(d)),
+        ));
     }
     let scope = ctx.registry_scope.current()?;
     let keys: Vec<_> = tables
@@ -759,18 +1073,32 @@ async fn admit_batch(
             let decision = match barrier_to_bind(&t.records, &t.barriers, &e) {
                 Err(why) => {
                     info!(source_id = %ctx.source_id, %db, %table, why, "no lazy baseline");
-                    Decision::Refused("no_binding")
+                    Decision::Refused("no_binding", Covers::Transaction)
                 }
                 Ok(binds) => {
                     let s = pos(&tcap.position)?;
                     if !super::mysql_binlog_scan::covers(&tcap, &e, &s) {
-                        Decision::Refused("not_covered")
-                    } else if report
-                        .statements
-                        .iter()
-                        .any(|st| affects(st, db, table, lctn))
+                        // The capture does not contain the rows: the stream
+                        // and the capture disagree. Uncertain.
+                        discard(ctx);
+                        return Err(SourceError::Schema {
+                            details: format!(
+                                "the activation window's capture of {db}.{table} does \
+                                 not contain its rows' position: an uncertain \
+                                 outcome; nothing of the window was admitted or \
+                                 dispatched and the checkpoint stays before it"
+                            )
+                            .into(),
+                        });
+                    } else if let Some(d) =
+                        first_affecting(&report.statements, |st| {
+                            affects(st, db, table, lctn)
+                        })
                     {
-                        Decision::Refused("relevant_ddl")
+                        Decision::Refused(
+                            "relevant_ddl",
+                            Covers::UntilStatement(d.clone()),
+                        )
                     } else {
                         Decision::Candidate { binds, s }
                     }
@@ -794,7 +1122,7 @@ async fn admit_batch(
                     });
                     Some(reqs.len() - 1)
                 }
-                Decision::Refused(_) => None,
+                Decision::Refused(..) => None,
             });
             decisions.push(decision);
             timelines.push(t);
@@ -834,17 +1162,18 @@ async fn admit_batch(
             Option<(usize, Stored, super::mysql_selection::Timeline)>,
         > = Vec::with_capacity(tables.len());
         let mut reg_entry: Vec<Option<(usize, usize)>> = vec![None; regs.len()];
-        let mut outcomes: Vec<&'static str> = Vec::with_capacity(tables.len());
+        let mut outcomes: Vec<(&'static str, Covers)> =
+            Vec::with_capacity(tables.len());
         for (i, (((db, table), at, report), key)) in
             tables.iter().zip(&keys).enumerate()
         {
             let t = &timelines[i];
             let Decision::Candidate { binds, s } = &decisions[i] else {
-                let Decision::Refused(why) = decisions[i] else {
+                let Decision::Refused(why, covers) = &decisions[i] else {
                     unreachable!()
                 };
                 admitted.push(None);
-                outcomes.push(why);
+                outcomes.push((why, covers.clone()));
                 continue;
             };
             let reg = &regs[req_of[i].expect("a candidate's request")];
@@ -904,12 +1233,12 @@ async fn admit_batch(
                             .map_err(SourceError::Other)?,
                     });
                     admitted.push(Some((op, proposed, augmented)));
-                    outcomes.push("proven");
+                    outcomes.push(("proven", Covers::Transaction));
                 }
                 Err(why) => {
                     info!(source_id = %ctx.source_id, %db, %table, why, "no lazy baseline");
                     admitted.push(None);
-                    outcomes.push("not_decisive");
+                    outcomes.push(("not_decisive", Covers::Transaction));
                 }
             }
         }
@@ -962,12 +1291,18 @@ async fn admit_batch(
             tables.iter().zip(&keys).enumerate()
         {
             let tcap = cap.table(db, table);
+            let (why, covers) = outcomes[i].clone();
             match admitted[i].take() {
                 Some((op, _, mut augmented)) => {
                     augmented.table_head =
                         seqs[op].expect("a committed log write");
                     ctx.selection
                         .install_committed(key, std::sync::Arc::new(augmented));
+                    governs.push((
+                        (db.clone(), table.clone()),
+                        at.clone(),
+                        Governs::Admitted,
+                    ));
                 }
                 None => {
                     if let Ok(e) = pos(at) {
@@ -975,10 +1310,16 @@ async fn admit_batch(
                             (db.clone(), table.clone()),
                             Prepared {
                                 at: e,
-                                outcome: PreparedOutcome::Refused(outcomes[i]),
+                                covers: covers.clone(),
+                                outcome: PreparedOutcome::Refused(why),
                             },
                         );
                     }
+                    governs.push((
+                        (db.clone(), table.clone()),
+                        at.clone(),
+                        Governs::Refused(covers),
+                    ));
                 }
             }
             trace_proof(
@@ -988,10 +1329,10 @@ async fn admit_batch(
                 tcap.as_ref(),
                 Some(report),
                 lctn,
-                outcomes[i],
+                why,
             );
         }
-        return Ok(stats);
+        return Ok((stats, governs));
     }
 }
 
@@ -1065,6 +1406,11 @@ async fn admit(
         else {
             continue;
         };
+        // An earlier window's decision covers these rows: they go on as it
+        // decided, never captured again.
+        if ctx.take_prepared(&k.0, &k.1, &row, &at).is_some() {
+            continue;
+        }
         if !super::mysql_selection::unproven_at(ctx, &k.0, &k.1, &row).await? {
             continue;
         }
@@ -1090,17 +1436,49 @@ impl RunCtx {
         self.transaction_open() && self.txn_eval.is_none()
     }
 
-    /// The window-prepared proof of `db.table` for rows at `at`, consumed.
-    /// One prepared at another start is dropped.
+    /// The window's decision of `db.table`, if it covers rows whose
+    /// transaction starts at `at` (`boundary`): its decided transaction, or
+    /// every row before the statement that ends its coverage. Kept for
+    /// every row it covers; pruned once the stream is past them.
     pub(crate) fn take_prepared(
-        &mut self,
+        &self,
         db: &str,
         table: &str,
         at: &WmPos,
+        boundary: &MySqlCheckpoint,
     ) -> Option<PreparedOutcome> {
-        let p = self.prepared.remove(&(db.to_string(), table.to_string()))?;
-        matches!(order_positions(&p.at, at), CheckpointOrder::Equal)
-            .then_some(p.outcome)
+        let p = self.prepared.get(&(db.to_string(), table.to_string()))?;
+        let order = order_positions(&p.at, at);
+        let covered = match &p.covers {
+            Covers::Transaction => matches!(order, CheckpointOrder::Equal),
+            Covers::UntilStatement(d) => {
+                matches!(
+                    order,
+                    CheckpointOrder::Before | CheckpointOrder::Equal
+                ) && statement_before(d, boundary) == Some(false)
+            }
+        };
+        covered.then(|| p.outcome.clone())
+    }
+
+    /// Drop the decisions whose rows are all behind the transaction
+    /// starting at `head`.
+    pub(crate) fn prune_prepared(&mut self, head: &MySqlCheckpoint) {
+        let Some(h) = mysql_checkpoint_position(
+            &head.file,
+            head.pos,
+            head.gtid_set.as_deref(),
+        ) else {
+            return;
+        };
+        self.prepared.retain(|_, p| match &p.covers {
+            Covers::Transaction => {
+                !matches!(order_positions(&p.at, &h), CheckpointOrder::Before)
+            }
+            Covers::UntilStatement(d) => {
+                statement_before(d, head) != Some(true)
+            }
+        });
     }
 }
 
@@ -1151,6 +1529,10 @@ fn observe_window(
         "closed_by": t.closed_by,
         "capture_attempts": t.capture_attempts,
         "prefetched": t.prefetched,
+        "speculated": t.speculated,
+        "next": t.next,
+        "next_candidates": t.next_candidates,
+        "cut": t.cut,
         "extensions_committed": t.work.extensions_committed,
         "positioned_attempts": t.work.positioned_attempts,
         "unanchored_attempts": t.work.unanchored_attempts,
@@ -1321,7 +1703,13 @@ mod tests {
             ctx: &mut RunCtx,
             tables: &[&str],
             entries: Vec<((String, String), MySqlCheckpoint, ScanReport)>,
-        ) -> Result<BatchStats, SourceError> {
+        ) -> Result<
+            (
+                BatchStats,
+                Vec<((String, String), MySqlCheckpoint, Governs)>,
+            ),
+            SourceError,
+        > {
             let lineage = ctx
                 .registry_scope
                 .current()
@@ -1493,17 +1881,36 @@ mod tests {
                     table: "t3".into(),
                 }]),
             };
-            admit(
+            let (_, governs) = admit(
                 &mut ctx,
                 &["t1", "t3", "t4"],
                 vec![
                     entry("t1", 5),
-                    (("d".into(), "t3".into()), at(5), report(vec![relevant])),
+                    (
+                        ("d".into(), "t3".into()),
+                        at(5),
+                        report(vec![relevant.clone()]),
+                    ),
                     entry("t4", 4),
                 ],
             )
             .await
             .unwrap();
+            let governs: HashMap<_, _> =
+                governs.into_iter().map(|((_, t), _, g)| (t, g)).collect();
+            assert_eq!(governs["t1"], Governs::Admitted);
+            assert_eq!(
+                governs["t3"],
+                Governs::Refused(Covers::UntilStatement(
+                    relevant.event.clone()
+                )),
+                "a relevant DDL covers the rows before it"
+            );
+            assert_eq!(
+                governs["t4"],
+                Governs::Refused(Covers::Transaction),
+                "not decisive covers its own transaction only"
+            );
             assert_eq!(
                 seqs(&ctx, "t3").await,
                 (None, None),
@@ -1523,14 +1930,28 @@ mod tests {
                 1,
                 "no baseline beside the incomparable ddl"
             );
+            // Every covered row keeps its outcome; uncovered rows have none.
+            for k in [5, 9, 54] {
+                assert!(
+                    matches!(
+                        ctx.take_prepared("d", "t3", &wm(k), &at(k)),
+                        Some(PreparedOutcome::Refused("relevant_ddl"))
+                    ),
+                    "t3 rows at {k}, before the DDL at 55"
+                );
+            }
+            assert!(
+                ctx.take_prepared("d", "t3", &wm(55), &at(55)).is_none(),
+                "t3 rows after the DDL are not covered"
+            );
             assert!(matches!(
-                ctx.take_prepared("d", "t3", &wm(5)),
-                Some(PreparedOutcome::Refused("relevant_ddl"))
-            ));
-            assert!(matches!(
-                ctx.take_prepared("d", "t4", &wm(4)),
+                ctx.take_prepared("d", "t4", &wm(4), &at(4)),
                 Some(PreparedOutcome::Refused("not_decisive"))
             ));
+            assert!(
+                ctx.take_prepared("d", "t4", &wm(6), &at(6)).is_none(),
+                "t4's later transactions are not covered"
+            );
             assert!(
                 seqs(&ctx, "t1").await.1.is_some(),
                 "the other table is admitted"
@@ -1605,7 +2026,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let stats = admit(&mut ctx, &["t1"], vec![entry("t1", 5)])
+            let (stats, _) = admit(&mut ctx, &["t1"], vec![entry("t1", 5)])
                 .await
                 .unwrap();
             assert_eq!(

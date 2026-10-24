@@ -42,6 +42,7 @@ mod mysql_proof_scanner;
 mod mysql_selection;
 mod mysql_session;
 mod mysql_signature;
+mod mysql_window_speculation;
 use mysql_helpers::{checkpoint_lineage, prepare_client};
 
 pub mod mysql_decode;
@@ -336,11 +337,15 @@ pub(crate) struct RunCtx {
     /// Events read from the stream while a window was admitted, with when
     /// each was received; read before the stream is read again
     /// (`mysql_activation_window`).
-    prefetched: std::collections::VecDeque<(
-        std::time::Instant,
-        mysql_binlog_connector_rust::event::event_header::EventHeader,
-        mysql_binlog_connector_rust::event::event_data::EventData,
-    )>,
+    prefetched: std::collections::VecDeque<mysql_window_speculation::Held>,
+    /// The next held event's sequence number (from 1).
+    next_held_seq: u64,
+    /// The held sequence number of the event `read_next_event` last
+    /// returned (0: read from the stream).
+    last_seq: u64,
+    /// The speculative window, while its head is still ahead
+    /// (`mysql_window_speculation`).
+    pending: Option<mysql_window_speculation::Pending>,
     /// The read error that ended a prefetch: raised where the stream is
     /// read next, once `prefetched` is empty.
     prefetch_error:
@@ -352,8 +357,9 @@ pub(crate) struct RunCtx {
     prepared: HashMap<(String, String), mysql_activation_window::Prepared>,
     /// Schema-proof bounds.
     proofs: deltaforge_config::MysqlProofCfg,
-    /// The source's shared proof scanner (`mysql_proof_scanner`).
-    proof_scanner: mysql_proof_scanner::ProofScanner,
+    /// The source's shared proof scanner (`mysql_proof_scanner`), shared
+    /// with a speculative window's capture task.
+    proof_scanner: Arc<mysql_proof_scanner::ProofScanner>,
     /// Validated activation timelines and row-time selections.
     selection: mysql_selection::Caches,
     /// The current lineage's failover anchor (`Some(None)`: not entered by
@@ -1779,11 +1785,14 @@ impl MySqlSource {
             last_event_start: 0,
             lookahead: Default::default(),
             prefetched: Default::default(),
+            next_held_seq: 1,
+            last_seq: 0,
+            pending: None,
             prefetch_error: None,
             last_received: std::time::Instant::now(),
             prepared: Default::default(),
             proofs: self.proofs.clone(),
-            proof_scanner,
+            proof_scanner: Arc::new(proof_scanner),
             selection: mysql_selection::Caches::new(&self.pipeline, &self.id),
             failover: None,
             drift_checked: Default::default(),
@@ -1935,6 +1944,7 @@ impl MySqlSource {
                         && ctx.lookahead.is_empty()
                         && ctx.prefetched.is_empty()
                         && ctx.prefetch_error.is_none()
+                        && ctx.pending.is_none()
                     {
                         // A CloseUncertain/FailedClosed outcome returns an error from
                         // this block (gate 6); `loop_result?` re-propagates it before the
@@ -2002,9 +2012,6 @@ impl MySqlSource {
                 if let Some((header, data)) = ctx.lookahead.pop_front() {
                     advance_position(&mut ctx, &header);
                     dispatch_event(&mut ctx, &header, data).await?;
-                    if ctx.lookahead.is_empty() {
-                        ctx.prepared.clear();
-                    }
                     continue;
                 }
 
@@ -2608,6 +2615,8 @@ impl RunCtx {
         self.lookahead.clear();
         self.prefetched.clear();
         self.prefetch_error = None;
+        // A speculative window goes too: its task is aborted.
+        self.pending = None;
         self.prepared.clear();
         if !self.transaction_open() {
             return Ok(());

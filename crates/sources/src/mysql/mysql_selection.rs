@@ -180,6 +180,20 @@ impl Caches {
 
     /// Whether the table's last selection proved a version since its
     /// timeline last changed.
+    /// The backend keys of every table flagged proven, read without
+    /// touching recency (a speculative window's candidate filter).
+    pub(crate) fn proven_keys(&self) -> std::collections::HashSet<String> {
+        self.entries
+            .iter()
+            .filter_map(|(k, v)| match (k, v) {
+                (CacheKey::Timeline(key), Cached::Timeline(_, true)) => {
+                    Some(key.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(crate) fn is_proven(&mut self, key: &SchemaKey) -> bool {
         matches!(
             self.entries.peek(&CacheKey::Timeline(key.backend_key())),
