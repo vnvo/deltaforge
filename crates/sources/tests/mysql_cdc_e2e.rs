@@ -516,8 +516,8 @@ async fn mysql_cdc_basic_events() -> Result<()> {
     )
     .await?;
 
-    let registry = make_registry().await;
     let backend = make_storage_backend().await;
+    let registry = test_common::registry_on(&backend).await;
     let src = MySqlSource {
         id: "cdc-basic".into(),
         dsn: dsn.clone().into(),
