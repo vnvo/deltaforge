@@ -500,9 +500,21 @@ pub async fn commit_atomic(
     batch: &AtomicBatch,
     retries: usize,
 ) -> Result<CommitResult> {
+    commit_atomic_counted(be, batch, retries, &mut 0).await
+}
+
+/// [`commit_atomic`], adding to `applies` every `apply_batch` it makes
+/// (one when the first succeeds or conflicts).
+pub async fn commit_atomic_counted(
+    be: &dyn StorageBackend,
+    batch: &AtomicBatch,
+    retries: usize,
+    applies: &mut usize,
+) -> Result<CommitResult> {
     batch.validate()?;
     let mut attempt = 0;
     loop {
+        *applies += 1;
         let err = match be.apply_batch(batch).await {
             Ok(BatchOutcome::Committed { seqs }) => {
                 return Ok(CommitResult::Committed(seqs));

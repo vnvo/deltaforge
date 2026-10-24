@@ -484,6 +484,7 @@ struct Admitted {
     scanned: Duration,
     committed: Duration,
     capture: super::mysql_binlog_scan::CaptureTrace,
+    batch: BatchStats,
 }
 
 /// One batched capture (retried in the same sorted order), one scanner
@@ -614,10 +615,11 @@ async fn admit_window(
         .filter_map(|k| proved.remove(&k).map(|(at, r)| (k, at, r)))
         .collect();
     let t = Instant::now();
-    admit_batch(ctx, &lineage, &cap, tables_in_order)
+    let batch = admit_batch(ctx, &lineage, &cap, tables_in_order)
         .await
         .map_err(LoopControl::Fail)?;
     Ok(Admitted {
+        batch,
         tables: tables.len(),
         attempts,
         work,
@@ -653,7 +655,7 @@ async fn admit_batch(
     lineage: &str,
     cap: &BatchCaptured,
     tables: Vec<((String, String), MySqlCheckpoint, ScanReport)>,
-) -> Result<(), SourceError> {
+) -> Result<BatchStats, SourceError> {
     use super::mysql_activation::{
         ACTIVATION_NS, BARRIER_NS, Kind, Record, Stored, baseline_capture_id,
         encode_record, table_stream,
@@ -664,7 +666,7 @@ async fn admit_batch(
     };
     use storage::adapters::{RegistrationPlanning, RegistrationRequest};
     use storage::{
-        AtomicBatch, BatchOp, CommitResult, Precondition, commit_atomic,
+        AtomicBatch, BatchOp, CommitResult, Precondition, commit_atomic_counted,
     };
 
     // One store holds the registry and the activation records, or no
@@ -742,6 +744,7 @@ async fn admit_batch(
     super::mysql_failover_drift::check_window(ctx, &drift_tables).await?;
 
     let mut attempt = 0;
+    let mut stats = BatchStats::default();
     loop {
         attempt += 1;
         // Decide, as `establish_at` does, up to the registration.
@@ -914,10 +917,11 @@ async fn admit_batch(
             if batch.ops.is_empty() && batch.preconditions.is_empty() {
                 CommitResult::Committed(Vec::new())
             } else {
-                match commit_atomic(
+                match commit_atomic_counted(
                     ctx.registry_backend.as_ref(),
                     &batch,
                     BATCH_STORAGE_RETRIES,
+                    &mut stats.applies,
                 )
                 .await
                 {
@@ -941,6 +945,7 @@ async fn admit_batch(
                     )));
                 }
                 warn!(source_id = %ctx.source_id, attempt, why, "activation window: the batch conflicted; deciding again");
+                stats.conflicts += 1;
                 continue;
             }
         };
@@ -986,8 +991,16 @@ async fn admit_batch(
                 outcomes[i],
             );
         }
-        return Ok(());
+        return Ok(stats);
     }
+}
+
+/// How a window's atomic batch went: the conflicts that made it decide
+/// again, and every `apply_batch` call (one when nothing was retried).
+#[derive(Debug, Clone, Copy, Default)]
+struct BatchStats {
+    conflicts: usize,
+    applies: usize,
 }
 
 /// Why a window's batched capture finally failed, keeping its class:
@@ -1104,6 +1117,7 @@ fn observe_window(
         scanned,
         committed,
         capture,
+        batch,
         ..
     } = admitted;
     let source = [("source", source_id.to_string())];
@@ -1145,6 +1159,8 @@ fn observe_window(
         "capture_ms": captured.as_secs_f64() * 1e3,
         "scan_ms": scanned.as_secs_f64() * 1e3,
         "commit_ms": committed.as_secs_f64() * 1e3,
+        "batch_conflicts": batch.conflicts,
+        "batch_applies": batch.applies,
         "capture_connect_ms": capture.connect.as_secs_f64() * 1e3,
         "capture_lock_ms": capture.lock_wait.as_secs_f64() * 1e3,
         "capture_schema_ms": capture.schema.as_secs_f64() * 1e3,
@@ -1305,7 +1321,7 @@ mod tests {
             ctx: &mut RunCtx,
             tables: &[&str],
             entries: Vec<((String, String), MySqlCheckpoint, ScanReport)>,
-        ) -> Result<(), SourceError> {
+        ) -> Result<BatchStats, SourceError> {
             let lineage = ctx
                 .registry_scope
                 .current()
@@ -1589,9 +1605,14 @@ mod tests {
             )
             .await
             .unwrap();
-            admit(&mut ctx, &["t1"], vec![entry("t1", 5)])
+            let stats = admit(&mut ctx, &["t1"], vec![entry("t1", 5)])
                 .await
                 .unwrap();
+            assert_eq!(
+                (stats.conflicts, stats.applies),
+                (1, 2),
+                "one conflict, decided again and applied once more"
+            );
             let records = crate::mysql::mysql_activation::read_table(
                 &ctx.registry_backend,
                 ctx.schema.registry(),

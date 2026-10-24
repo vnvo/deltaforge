@@ -556,6 +556,9 @@ fn proof_trace(stdout: &Path) -> Value {
     };
     let (mut proofs, mut seeks) = (0u64, Vec::new());
     let mut outcomes: HashMap<String, u64> = HashMap::new();
+    // Each activation window: its size beside its phases and state-store
+    // commit, so the commit reads per table.
+    let mut windows = Vec::new();
     for line in text.lines() {
         let Some(i) = line.find("{\"record\"") else {
             continue;
@@ -571,6 +574,16 @@ fn proof_trace(stdout: &Path) -> Value {
                     .or_default() += 1;
             }
             Some("scan") => seeks.push(r["seek_ms"].as_f64().unwrap_or(0.0)),
+            Some("window") => windows.push(json!({
+                "tables": r["tables"], "events": r["events"],
+                "closed_by": r["closed_by"], "prefetched": r["prefetched"],
+                "read_ms": r["read_ms"], "capture_ms": r["capture_ms"],
+                "capture_lock_ms": r["capture_lock_ms"],
+                "capture_schema_ms": r["capture_schema_ms"],
+                "scan_ms": r["scan_ms"], "commit_ms": r["commit_ms"],
+                "batch_conflicts": r["batch_conflicts"],
+                "batch_applies": r["batch_applies"],
+            })),
             _ => {}
         }
     }
@@ -585,6 +598,7 @@ fn proof_trace(stdout: &Path) -> Value {
         "seek_total_ms": seeks.iter().sum::<f64>(),
         "seek_ms": quantiles(seeks.clone()),
         "seek_by_decile": deciles,
+        "windows": windows,
     })
 }
 
@@ -1154,7 +1168,7 @@ pub async fn run(
         "rss_peak_mib": rss_max as f64 / 1024.0,
         "allocations": allocs,
         "mysql_connections_max": conns_max,
-        "state_store_connections": match sys { Sys::Df(_) => json!("none (SQLite)"), Sys::Dbz(..) => json!("Kafka (offsets topic)") },
+        "state_store_connections": match sys { Sys::Df(_) if infra.state.is_some() => json!("PostgreSQL"), Sys::Df(_) => json!("none (SQLite)"), Sys::Dbz(..) => json!("Kafka (offsets topic)") },
         "mysql_cpu_s": db_cpu, "mysql": mysql_delta,
         "binlog_start": {"file": binlog_start.0, "offset": binlog_start.1},
         "binlog_end": {"file": binlog_end.0, "offset": binlog_end.1},
