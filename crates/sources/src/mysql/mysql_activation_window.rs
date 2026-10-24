@@ -38,8 +38,8 @@ use mysql_binlog_connector_rust::event::event_header::EventHeader;
 use tracing::{info, warn};
 
 use super::mysql_binlog_scan::{
-    BatchCaptureError, Captured, ProofError, ProofKind, ProofWork, ScanReport,
-    ScanTag, capture_batch, trace_enabled,
+    BatchCaptureError, Captured, MAX_BATCH_TABLES, ProofError, ProofKind,
+    ProofWork, ScanReport, ScanTag, capture_batch, trace_enabled,
 };
 use super::mysql_event::read_next_event;
 use super::{LoopControl, MySqlCheckpoint, RunCtx};
@@ -277,7 +277,7 @@ pub(super) async fn maybe_window(
     }
     let mut batch: BTreeMap<(String, String), MySqlCheckpoint> =
         BTreeMap::new();
-    admit(ctx, &mut batch, found)
+    let mut full = admit(ctx, &mut batch, found)
         .await
         .map_err(LoopControl::Fail)?;
     if batch.is_empty() {
@@ -309,6 +309,9 @@ pub(super) async fn maybe_window(
     let mut bytes = 0u64;
     let closed_by =
         loop {
+            if full {
+                break "tables";
+            }
             if queue.len() >= cfg.activation_window_events {
                 break "events";
             }
@@ -344,7 +347,7 @@ pub(super) async fn maybe_window(
                 let mut found = Vec::new();
                 touched(&mut ahead, &h, &d, &mut found);
                 if !ahead.broken {
-                    admit(ctx, &mut batch, found)
+                    full = admit(ctx, &mut batch, found)
                         .await
                         .map_err(LoopControl::Fail)?;
                 }
@@ -537,12 +540,16 @@ fn capture_failure(
 }
 
 /// Add each newly touched table that has no positional proof at its rows'
-/// start (and is in scope) to the batch, at its first start.
+/// start (and is in scope) to the batch, at its first start. Returns
+/// whether the batch is full ([`MAX_BATCH_TABLES`]): the window closes. A
+/// table that does not fit (one transaction touching more new tables than
+/// are left) stays out, counted and logged: its rows take the per-table
+/// proof when they are dispatched.
 async fn admit(
     ctx: &mut RunCtx,
     batch: &mut BTreeMap<(String, String), MySqlCheckpoint>,
     found: Vec<(String, String, MySqlCheckpoint)>,
-) -> Result<(), SourceError> {
+) -> Result<bool, SourceError> {
     for (db, table, at) in found {
         let k = (db, table);
         if batch.contains_key(&k) || !ctx.allow.matches(&k.0, &k.1) {
@@ -553,11 +560,21 @@ async fn admit(
         else {
             continue;
         };
-        if super::mysql_selection::unproven_at(ctx, &k.0, &k.1, &row).await? {
-            batch.insert(k, at);
+        if !super::mysql_selection::unproven_at(ctx, &k.0, &k.1, &row).await? {
+            continue;
         }
+        if batch.len() >= MAX_BATCH_TABLES {
+            warn!(source_id = %ctx.source_id, db = %k.0, table = %k.1, "activation window full: the table is proved on its own");
+            metrics::counter!(
+                "deltaforge_mysql_activation_window_overflow_total",
+                "source" => ctx.source_id.clone(),
+            )
+            .increment(1);
+            continue;
+        }
+        batch.insert(k, at);
     }
-    Ok(())
+    Ok(batch.len() >= MAX_BATCH_TABLES)
 }
 
 impl RunCtx {

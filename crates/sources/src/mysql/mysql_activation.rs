@@ -421,13 +421,28 @@ pub(crate) async fn append(
     capture_id: &str,
     record: &Record,
 ) -> Result<AppendStatus> {
+    append_outcome(backend, registry, key, ns, stream, capture_id, record)
+        .await
+        .map(|o| o.status)
+}
+
+/// [`append`], with the sequence the record is stored at.
+pub(crate) async fn append_outcome(
+    backend: &ArcStorageBackend,
+    registry: &DurableSchemaRegistry,
+    key: &SchemaKey,
+    ns: &str,
+    stream: &str,
+    capture_id: &str,
+    record: &Record,
+) -> Result<storage::LogAppendOutcome> {
     validate_version(registry, key, record).await?;
     let bytes = encode(record)?;
     match backend
         .log_append_if_absent(ns, stream, capture_id, &bytes)
         .await
     {
-        Ok(out) => Ok(out.status),
+        Ok(out) => Ok(out),
         Err(e)
             if matches!(
                 e.downcast_ref::<storage::LogError>(),
@@ -619,6 +634,15 @@ pub(crate) async fn read_stream(
     ns: &str,
     stream: &str,
 ) -> Result<Vec<Stored>> {
+    read_stream_head(backend, ns, stream).await.map(|(r, _)| r)
+}
+
+/// [`read_stream`], with the sequence of its last record (0 when empty).
+pub(crate) async fn read_stream_head(
+    backend: &ArcStorageBackend,
+    ns: &str,
+    stream: &str,
+) -> Result<(Vec<Stored>, u64)> {
     let mut out = Vec::new();
     let mut since = 0u64;
     loop {
@@ -660,7 +684,7 @@ pub(crate) async fn read_stream(
             out.push(Stored { capture_id, record });
         }
         if page.len() < READ_PAGE {
-            return Ok(out);
+            return Ok((out, since));
         }
     }
 }
@@ -671,12 +695,38 @@ pub(crate) async fn read_table(
     registry: &DurableSchemaRegistry,
     key: &SchemaKey,
 ) -> Result<Vec<Stored>> {
-    let records =
-        read_stream(backend, ACTIVATION_NS, &table_stream(key)).await?;
+    read_table_head(backend, registry, key)
+        .await
+        .map(|(r, _)| r)
+}
+
+/// [`read_table`], with the table stream's last sequence (0 when empty).
+pub(crate) async fn read_table_head(
+    backend: &ArcStorageBackend,
+    registry: &DurableSchemaRegistry,
+    key: &SchemaKey,
+) -> Result<(Vec<Stored>, u64)> {
+    let (records, head) =
+        read_stream_head(backend, ACTIVATION_NS, &table_stream(key)).await?;
     for r in &records {
         validate_version(registry, key, &r.record).await?;
     }
-    Ok(records)
+    Ok((records, head))
+}
+
+/// Whether the table stream holds exactly one record after `head`, the one
+/// stored at `seq`: nothing else was appended since it was read at `head`.
+pub(crate) async fn appended_alone(
+    backend: &ArcStorageBackend,
+    key: &SchemaKey,
+    head: u64,
+    seq: u64,
+) -> Result<bool> {
+    let after = backend
+        .log_read_meta_since(ACTIVATION_NS, &table_stream(key), head, 2)
+        .await
+        .context("read activation stream")?;
+    Ok(matches!(after.as_slice(), [one] if one.seq == seq))
 }
 
 /// Read the barriers that apply to `key` (its lineage and its database).

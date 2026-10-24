@@ -56,6 +56,9 @@ const CAPTURE_ATTEMPTS: u32 = 5;
 pub(crate) struct Timeline {
     pub records: Vec<Stored>,
     pub barriers: Vec<Stored>,
+    /// The sequence of the table stream's last record when it was read (0
+    /// when empty): an append's proof that nothing else was stored since.
+    pub table_head: u64,
 }
 
 impl Timeline {
@@ -196,6 +199,7 @@ impl Caches {
             Arc::new(Timeline {
                 records: Vec::new(),
                 barriers: Vec::new(),
+                table_head: 0,
             }),
         );
     }
@@ -220,6 +224,13 @@ impl Caches {
         for key in stale {
             self.entries.pop(&key);
         }
+    }
+
+    /// The record admitted into `timeline` was appended durably, and
+    /// nothing else since it was read: it is the table's timeline now.
+    fn install(&mut self, key: &SchemaKey, timeline: Arc<Timeline>) {
+        self.invalidate(key);
+        self.put_timeline(key.backend_key(), timeline);
     }
 
     /// A barrier (or anything lineage-wide) was appended.
@@ -567,14 +578,18 @@ async fn timeline(
         return Ok(t);
     }
     let registry = ctx.schema.registry();
-    let records =
-        mysql_activation::read_table(&ctx.registry_backend, registry, key)
+    let (records, table_head) =
+        mysql_activation::read_table_head(&ctx.registry_backend, registry, key)
             .await
             .map_err(timeline_error)?;
     let barriers = mysql_activation::read_barriers(&ctx.registry_backend, key)
         .await
         .map_err(timeline_error)?;
-    let t = Timeline { records, barriers };
+    let t = Timeline {
+        records,
+        barriers,
+        table_head,
+    };
     validate(registry, key, &t).await.map_err(timeline_error)?;
     let t = Arc::new(t);
     ctx.selection.put_timeline(k, t.clone());
@@ -729,6 +744,20 @@ pub(crate) async fn admit_decisive(
     proposed: Stored,
     row: &WmPos,
 ) -> Result<(), String> {
+    admit_decisive_timeline(registry, key, current, proposed, row)
+        .await
+        .map(drop)
+}
+
+/// [`admit_decisive`], returning the validated timeline with the proposed
+/// record added (the timeline once it is appended).
+pub(crate) async fn admit_decisive_timeline(
+    registry: &DurableSchemaRegistry,
+    key: &SchemaKey,
+    current: &Timeline,
+    proposed: Stored,
+    row: &WmPos,
+) -> Result<Timeline, String> {
     let version = match &proposed.record.kind {
         Kind::Observed { version, .. } | Kind::Baseline { version, .. } => {
             *version
@@ -738,6 +767,7 @@ pub(crate) async fn admit_decisive(
     let mut augmented = Timeline {
         records: current.records.clone(),
         barriers: current.barriers.clone(),
+        table_head: current.table_head,
     };
     augmented.records.push(proposed.clone());
     validate(registry, key, &augmented)
@@ -747,12 +777,75 @@ pub(crate) async fn admit_decisive(
         (Selection::Proven { version: v }, Some(decisive))
             if v == version && decisive == proposed.capture_id =>
         {
-            Ok(())
+            Ok(augmented)
         }
         (selection, _) => Err(format!(
             "the proposed record would not resolve selection at the rows ({selection:?})"
         )),
     }
+}
+
+/// Append the record [`admit_decisive_timeline`] admitted into `augmented`,
+/// and keep `caches` exact. The augmented timeline (already validated) is
+/// installed only when the record was newly stored and the table stream
+/// holds nothing else since `augmented` was read: then it is what a fresh
+/// read would return. A record already present, or a stream that changed
+/// meanwhile, discards the cached timeline (the next use reads it again).
+/// A failed write or check discards it too, and fails.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn append_admitted(
+    backend: &storage::ArcStorageBackend,
+    registry: &DurableSchemaRegistry,
+    caches: &mut Caches,
+    key: &SchemaKey,
+    capture_id: &str,
+    record: &super::mysql_activation::Record,
+    mut augmented: Timeline,
+) -> anyhow::Result<()> {
+    let stream = mysql_activation::table_stream(key);
+    let out = match mysql_activation::append_outcome(
+        backend,
+        registry,
+        key,
+        mysql_activation::ACTIVATION_NS,
+        &stream,
+        capture_id,
+        record,
+    )
+    .await
+    {
+        Ok(out) => out,
+        Err(e) => {
+            caches.invalidate(key);
+            return Err(e);
+        }
+    };
+    let alone = match out.status {
+        storage::AppendStatus::Inserted => {
+            match mysql_activation::appended_alone(
+                backend,
+                key,
+                augmented.table_head,
+                out.seq,
+            )
+            .await
+            {
+                Ok(alone) => alone,
+                Err(e) => {
+                    caches.invalidate(key);
+                    return Err(e);
+                }
+            }
+        }
+        storage::AppendStatus::AlreadyPresent => false,
+    };
+    if alone {
+        augmented.table_head = out.seq;
+        caches.install(key, Arc::new(augmented));
+    } else {
+        caches.invalidate(key);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -946,6 +1039,7 @@ mod tests {
             let timeline = Arc::new(Timeline {
                 records: Vec::new(),
                 barriers: Vec::new(),
+                table_head: 0,
             });
             let loaded = Arc::new(LoadedSchema::new(
                 MySqlTableSchema::new(Vec::new()),
@@ -992,6 +1086,7 @@ mod tests {
         let t = Arc::new(Timeline {
             records: Vec::new(),
             barriers: Vec::new(),
+            table_head: 0,
         });
         let loaded = Arc::new(LoadedSchema::new(
             MySqlTableSchema::new(Vec::new()),
@@ -1052,7 +1147,7 @@ mod tests {
     async fn the_candidate_digest_binds_versions_hashes_and_verdicts() {
         let backend: storage::ArcStorageBackend =
             Arc::new(storage::MemoryStorageBackend::new());
-        let reg = DurableSchemaRegistry::new(backend).await.unwrap();
+        let reg = DurableSchemaRegistry::new(backend.clone()).await.unwrap();
         let key = SchemaKey::new(
             "t",
             "s",
@@ -1128,6 +1223,7 @@ mod tests {
     /// One registered version (a single INT column `a`) and its FULL and
     /// MINIMAL TableMap signatures.
     struct Fixture {
+        backend: storage::ArcStorageBackend,
         reg: Arc<DurableSchemaRegistry>,
         key: SchemaKey,
         full: Signature,
@@ -1140,7 +1236,7 @@ mod tests {
         };
         let backend: storage::ArcStorageBackend =
             Arc::new(storage::MemoryStorageBackend::new());
-        let reg = DurableSchemaRegistry::new(backend).await.unwrap();
+        let reg = DurableSchemaRegistry::new(backend.clone()).await.unwrap();
         let key = SchemaKey::new(
             "t",
             "s",
@@ -1177,6 +1273,7 @@ mod tests {
         }));
         assert_eq!(compare(&schema, &full.table_map()), Verdict::Match);
         Fixture {
+            backend,
             reg,
             key,
             full,
@@ -1232,6 +1329,7 @@ mod tests {
         let t = Timeline {
             records,
             barriers: Vec::new(),
+            table_head: 0,
         };
         validate(&f.reg, &f.key, &t)
             .await
@@ -1349,7 +1447,11 @@ mod tests {
             )
         };
         let admit = |records: Vec<Stored>, barriers: Vec<Stored>, p: Stored| {
-            let current = Timeline { records, barriers };
+            let current = Timeline {
+                records,
+                barriers,
+                table_head: 0,
+            };
             let (f, row) = (&f, row.clone());
             async move { admit_decisive(&f.reg, &f.key, &current, p, &row).await }
         };
@@ -1415,6 +1517,7 @@ mod tests {
         let current = Timeline {
             records: vec![later],
             barriers: Vec::new(),
+            table_head: 0,
         };
         let err = admit_decisive(
             &f.reg,
@@ -1440,5 +1543,321 @@ mod tests {
         .await;
         let err = admit(vec![], vec![], invalid).await.unwrap_err();
         assert!(err.contains("not at or after the row"), "{err}");
+    }
+
+    mod admitted {
+        //! The admitted baseline's timeline installed in the cache equals what
+        //! a fresh read returns (the path that always re-read), in every case.
+        use super::*;
+        use crate::mysql::mysql_activation::{
+            ACTIVATION_NS, Record, append, baseline_capture_id, read_barriers,
+            read_table_head,
+        };
+
+        async fn fresh(f: &Fixture) -> Timeline {
+            let (records, table_head) =
+                read_table_head(&f.backend, &f.reg, &f.key).await.unwrap();
+            let barriers = read_barriers(&f.backend, &f.key).await.unwrap();
+            Timeline {
+                records,
+                barriers,
+                table_head,
+            }
+        }
+
+        /// What the next row sees: the cached timeline, or a fresh read.
+        async fn seen(f: &Fixture, caches: &mut Caches) -> Timeline {
+            match caches.timeline(&f.key.backend_key()) {
+                Some(t) => Timeline::clone(&t),
+                None => fresh(f).await,
+            }
+        }
+
+        fn same(a: &Timeline, b: &Timeline) -> bool {
+            a.records == b.records
+                && a.barriers == b.barriers
+                && a.table_head == b.table_head
+        }
+
+        /// The old path's outcome and the cache agree, at `row`.
+        async fn equivalent(f: &Fixture, caches: &mut Caches, row: &WmPos) {
+            let (cached, read) = (seen(f, caches).await, fresh(f).await);
+            assert!(same(&cached, &read), "{cached:?} != {read:?}");
+            assert_eq!(
+                select_decisive(&cached.all(), row),
+                select_decisive(&read.all(), row)
+            );
+        }
+
+        fn baseline(f: &Fixture, at: WmPos, digest: &str) -> Stored {
+            let record = Record::new(
+                at,
+                Kind::Baseline {
+                    version: 1,
+                    schema_hash: "h1".into(),
+                    to: gtid("1-20"),
+                    scan_digest: digest.into(),
+                    binds: None,
+                    classifier_version: CLASSIFIER_VERSION.into(),
+                },
+            );
+            let stream = table_stream(&f.key);
+            Stored {
+                capture_id: baseline_capture_id(
+                    &f.key.lineage_hash,
+                    &stream,
+                    &record,
+                )
+                .unwrap(),
+                record,
+            }
+        }
+
+        async fn store(f: &Fixture, s: &Stored) {
+            append(
+                &f.backend,
+                &f.reg,
+                &f.key,
+                ACTIVATION_NS,
+                &table_stream(&f.key),
+                &s.capture_id,
+                &s.record,
+            )
+            .await
+            .unwrap();
+        }
+
+        /// Admit `p` at `row` over the cached timeline and append it, as the
+        /// lazy baseline does.
+        async fn admit_and_append(
+            f: &Fixture,
+            caches: &mut Caches,
+            p: Stored,
+            row: &WmPos,
+        ) -> Result<(), String> {
+            let current = seen(f, caches).await;
+            caches.put_timeline(f.key.backend_key(), Arc::new(current.clone()));
+            let augmented = admit_decisive_timeline(
+                &f.reg,
+                &f.key,
+                &current,
+                p.clone(),
+                row,
+            )
+            .await?;
+            append_admitted(
+                &f.backend,
+                &f.reg,
+                caches,
+                &f.key,
+                &p.capture_id,
+                &p.record,
+                augmented,
+            )
+            .await
+            .map_err(|e| format!("{e:#}"))
+        }
+
+        #[tokio::test]
+        async fn accepted_baselines_install_the_fresh_timeline() {
+            let f = fixture().await;
+            let mut caches = Caches::with_budget_for_test(64);
+            admit_and_append(
+                &f,
+                &mut caches,
+                baseline(&f, gtid("1-5"), "a"),
+                &gtid("1-5"),
+            )
+            .await
+            .unwrap();
+            assert!(
+                caches.timeline(&f.key.backend_key()).is_some(),
+                "installed"
+            );
+            equivalent(&f, &mut caches, &gtid("1-5")).await;
+            // A later baseline, over a timeline with a record already.
+            admit_and_append(
+                &f,
+                &mut caches,
+                baseline(&f, gtid("1-9"), "b"),
+                &gtid("1-9"),
+            )
+            .await
+            .unwrap();
+            assert!(caches.timeline(&f.key.backend_key()).is_some());
+            equivalent(&f, &mut caches, &gtid("1-9")).await;
+            assert_eq!(fresh(&f).await.records.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn a_rejected_baseline_changes_nothing() {
+            let f = fixture().await;
+            let mut caches = Caches::with_budget_for_test(64);
+            store(
+                &f,
+                &Stored {
+                    capture_id: "d1".into(),
+                    record: Record::new(gtid("1-5"), Kind::Ddl),
+                },
+            )
+            .await;
+            let before = fresh(&f).await;
+            // Ambiguous with the ddl at the row: not decisive, not appended.
+            let err = admit_and_append(
+                &f,
+                &mut caches,
+                baseline(&f, gtid("1-5"), "a"),
+                &gtid("1-5"),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.contains("would not resolve"), "{err}");
+            assert!(same(&fresh(&f).await, &before));
+            equivalent(&f, &mut caches, &gtid("1-5")).await;
+        }
+
+        #[tokio::test]
+        async fn a_baseline_already_present_discards_the_cache() {
+            let f = fixture().await;
+            let mut caches = Caches::with_budget_for_test(64);
+            let b = baseline(&f, gtid("1-5"), "a");
+            store(&f, &b).await;
+            // The cache does not know it yet (a stale entry): appending it
+            // again stores nothing, and the cache is discarded.
+            caches.put_timeline(
+                f.key.backend_key(),
+                Arc::new(Timeline {
+                    records: Vec::new(),
+                    barriers: Vec::new(),
+                    table_head: 0,
+                }),
+            );
+            let current = Timeline::clone(
+                &caches.timeline(&f.key.backend_key()).unwrap(),
+            );
+            let augmented = admit_decisive_timeline(
+                &f.reg,
+                &f.key,
+                &current,
+                b.clone(),
+                &gtid("1-5"),
+            )
+            .await
+            .unwrap();
+            append_admitted(
+                &f.backend,
+                &f.reg,
+                &mut caches,
+                &f.key,
+                &b.capture_id,
+                &b.record,
+                augmented,
+            )
+            .await
+            .unwrap();
+            assert!(
+                caches.timeline(&f.key.backend_key()).is_none(),
+                "discarded"
+            );
+            equivalent(&f, &mut caches, &gtid("1-5")).await;
+            assert_eq!(fresh(&f).await.records.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_conflicting_baseline_fails_and_discards_the_cache() {
+            let f = fixture().await;
+            let mut caches = Caches::with_budget_for_test(64);
+            let b = baseline(&f, gtid("1-5"), "a");
+            // Other bytes under the same capture identity.
+            f.backend
+                .log_append_if_absent(
+                    ACTIVATION_NS,
+                    &table_stream(&f.key),
+                    &b.capture_id,
+                    b"other",
+                )
+                .await
+                .unwrap();
+            caches.put_timeline(
+                f.key.backend_key(),
+                Arc::new(Timeline {
+                    records: Vec::new(),
+                    barriers: Vec::new(),
+                    table_head: 0,
+                }),
+            );
+            let current = Timeline::clone(
+                &caches.timeline(&f.key.backend_key()).unwrap(),
+            );
+            let augmented = admit_decisive_timeline(
+                &f.reg,
+                &f.key,
+                &current,
+                b.clone(),
+                &gtid("1-5"),
+            )
+            .await
+            .unwrap();
+            let err = append_admitted(
+                &f.backend,
+                &f.reg,
+                &mut caches,
+                &f.key,
+                &b.capture_id,
+                &b.record,
+                augmented,
+            )
+            .await
+            .unwrap_err();
+            assert!(format!("{err:#}").contains("already exists"), "{err:#}");
+            assert!(
+                caches.timeline(&f.key.backend_key()).is_none(),
+                "discarded"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_stream_that_drifted_under_the_cache_is_read_again() {
+            let f = fixture().await;
+            let mut caches = Caches::with_budget_for_test(64);
+            let current = fresh(&f).await;
+            caches.put_timeline(f.key.backend_key(), Arc::new(current.clone()));
+            // Stored after the cache was read: the cache does not have it.
+            store(
+                &f,
+                &Stored {
+                    capture_id: "u1".into(),
+                    record: Record::new(gtid("1-3"), Kind::Unknown),
+                },
+            )
+            .await;
+            let b = baseline(&f, gtid("1-5"), "a");
+            let augmented = admit_decisive_timeline(
+                &f.reg,
+                &f.key,
+                &current,
+                b.clone(),
+                &gtid("1-5"),
+            )
+            .await
+            .unwrap();
+            append_admitted(
+                &f.backend,
+                &f.reg,
+                &mut caches,
+                &f.key,
+                &b.capture_id,
+                &b.record,
+                augmented,
+            )
+            .await
+            .unwrap();
+            assert!(
+                caches.timeline(&f.key.backend_key()).is_none(),
+                "not installed"
+            );
+            equivalent(&f, &mut caches, &gtid("1-5")).await;
+            assert_eq!(fresh(&f).await.records.len(), 2);
+        }
     }
 }

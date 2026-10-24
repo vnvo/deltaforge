@@ -477,10 +477,17 @@ pub(crate) async fn establish_at(
     }
     let checkpoint = serde_json::to_vec(&e_cp)
         .map_err(|err| SourceError::Other(err.into()))?;
-    let (version, schema_hash) = ctx
+    let (version, schema_hash) = match ctx
         .schema
         .register_captured(db, table, &cap.schema, &checkpoint)
-        .await?;
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.selection.invalidate(key);
+            return Err(e);
+        }
+    };
     let stream = table_stream(key);
     let record = Record::new(
         e.clone(),
@@ -499,7 +506,7 @@ pub(crate) async fn establish_at(
         capture_id: id.clone(),
         record: record.clone(),
     };
-    if let Err(why) = super::mysql_selection::admit_decisive(
+    let augmented = match super::mysql_selection::admit_decisive_timeline(
         ctx.schema.registry(),
         key,
         current,
@@ -508,30 +515,34 @@ pub(crate) async fn establish_at(
     )
     .await
     {
-        info!(source_id = %ctx.source_id, %db, %table, why, "no lazy baseline");
-        trace_proof(
-            &tag,
-            db,
-            table,
-            Some(&cap),
-            Some(&report),
-            lctn,
-            "not_decisive",
-        );
-        return Ok(false);
-    }
-    mysql_activation::append(
+        Ok(t) => t,
+        Err(why) => {
+            info!(source_id = %ctx.source_id, %db, %table, why, "no lazy baseline");
+            trace_proof(
+                &tag,
+                db,
+                table,
+                Some(&cap),
+                Some(&report),
+                lctn,
+                "not_decisive",
+            );
+            return Ok(false);
+        }
+    };
+    // Appended, then the validated timeline replaces the cached one (no
+    // second read and validation), or the cached one is discarded.
+    super::mysql_selection::append_admitted(
         &ctx.registry_backend,
         ctx.schema.registry(),
+        &mut ctx.selection,
         key,
-        mysql_activation::ACTIVATION_NS,
-        &stream,
         &id,
         &record,
+        augmented,
     )
     .await
     .map_err(|err| SourceError::Other(err.context("persist a baseline")))?;
-    ctx.selection.invalidate(key);
     info!(source_id = %ctx.source_id, %db, %table, version, scanned_events = report.events, "lazy baseline established");
     trace_proof(&tag, db, table, Some(&cap), Some(&report), lctn, "proven");
     Ok(true)

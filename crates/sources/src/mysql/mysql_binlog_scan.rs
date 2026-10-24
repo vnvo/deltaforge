@@ -1567,6 +1567,32 @@ pub(crate) enum BatchCaptureError {
     Failed(ProofError),
 }
 
+/// The most tables one batched capture takes (an activation window closes
+/// at it), and the most bytes of its lock request: one request a server
+/// accepts whatever its `max_allowed_packet` (at least 1 MiB) and limit of
+/// prepared-statement parameters.
+pub(crate) const MAX_BATCH_TABLES: usize = 2048;
+pub(crate) const MAX_LOCK_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// The lock statements of a batch, in its sorted order, as one request:
+/// one `SELECT 1 FROM t LIMIT 0` per table. `None` when the request would
+/// exceed its bounds.
+fn lock_request(tables: &[(&str, &str)]) -> Option<String> {
+    if tables.len() > MAX_BATCH_TABLES {
+        return None;
+    }
+    let mut sql = String::new();
+    for (db, table) in tables {
+        sql.push_str("SELECT 1 FROM ");
+        sql.push_str(&quoted(db, table));
+        sql.push_str(" LIMIT 0;");
+        if sql.len() > MAX_LOCK_REQUEST_BYTES {
+            return None;
+        }
+    }
+    Some(sql)
+}
+
 const ER_LOCK_WAIT_TIMEOUT: u16 = 1205;
 const ER_LOCK_DEADLOCK: u16 = 1213;
 const ER_NO_SUCH_TABLE: u16 = 1146;
@@ -1587,6 +1613,47 @@ fn batch_error(e: mysql_async::Error, what: &str) -> BatchCaptureError {
         }
         _ => ProofError::Capture(format!("{what}: {e}")),
     })
+}
+
+/// Take `tables`' metadata locks, in their order, in one request.
+async fn lock_all(
+    conn: &mut mysql_async::Conn,
+    tables: &[(&str, &str)],
+) -> Result<(), BatchCaptureError> {
+    if tables.is_empty() {
+        return Ok(());
+    }
+    let sql = lock_request(tables).ok_or_else(|| {
+        BatchCaptureError::Failed(ProofError::Capture(format!(
+            "the lock request for {} tables exceeds its bounds ({MAX_BATCH_TABLES} \
+             tables, {MAX_LOCK_REQUEST_BYTES} bytes)",
+            tables.len()
+        )))
+    })?;
+    let lock_failed = |e: mysql_async::Error| match server_code(&e) {
+        Some(code @ (ER_LOCK_WAIT_TIMEOUT | ER_LOCK_DEADLOCK)) => {
+            BatchCaptureError::Contention {
+                code,
+                why: format!("metadata locks: {e}"),
+            }
+        }
+        _ => batch_error(e, "metadata locks"),
+    };
+    // Exactly one result per statement, read in turn: a statement's error
+    // (its lock timeout or deadlock) surfaces as its result is read.
+    let mut result = conn.query_iter(sql).await.map_err(lock_failed)?;
+    for _ in 0..tables.len() {
+        result.for_each(|_| {}).await.map_err(lock_failed)?;
+    }
+    let extra = !result.is_empty();
+    result.drop_result().await.map_err(lock_failed)?;
+    if extra {
+        return Err(BatchCaptureError::Failed(ProofError::Capture(format!(
+            "the lock request returned more than its {} results",
+            tables.len()
+        ))));
+    }
+    Ok(())
 }
 
 /// One batched capture attempt (see [`BatchCaptured`]); `lock_wait_secs`
@@ -1636,38 +1703,57 @@ pub(crate) async fn capture_batch(
             conn.query_drop(&q).await.map_err(|e| batch_error(e, &q))?;
         }
         trace.connect = t0.elapsed();
-        // Every table's metadata lock, in sorted order (any other order can
-        // deadlock against a multi-table DDL), held until COMMIT.
+        // Which tables exist (one query): a dropped table has no shape and
+        // no lock. One dropped after this check fails the attempt (1146).
         let t = Instant::now();
-        let mut present = Vec::with_capacity(sorted.len());
         let mut missing = Vec::new();
-        for (db, table) in &sorted {
-            let lock = format!("SELECT 1 FROM {} LIMIT 0", quoted(db, table));
-            match conn.query_drop(&lock).await {
-                Ok(()) => {
-                    if present.is_empty()
-                        && let Some(hook) = after_first_lock
-                    {
-                        hook().await;
+        let present: Vec<(&str, &str)> = {
+            let pairs = vec!["(?, ?)"; sorted.len()].join(", ");
+            let params: Vec<mysql_async::Value> = sorted
+                .iter()
+                .flat_map(|(db, table)| [db.as_str().into(), table.as_str().into()])
+                .collect();
+            let existing: Vec<(String, String)> = if sorted.is_empty() {
+                Vec::new()
+            } else {
+                conn.exec(
+                    format!(
+                        "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
+                         WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({pairs})"
+                    ),
+                    params,
+                )
+                .await
+                .map_err(|e| batch_error(e, "table existence"))?
+            };
+            let existing: std::collections::HashSet<(String, String)> =
+                existing.into_iter().collect();
+            sorted
+                .iter()
+                .filter_map(|k| {
+                    if existing.contains(k) {
+                        Some((k.0.as_str(), k.1.as_str()))
+                    } else {
+                        missing.push(k.clone());
+                        None
                     }
-                    present.push((db.as_str(), table.as_str()))
-                }
-                Err(e) if server_code(&e) == Some(ER_NO_SUCH_TABLE) => {
-                    missing.push((db.clone(), table.clone()))
-                }
-                Err(e) => {
-                    return Err(match server_code(&e) {
-                        Some(
-                            code @ (ER_LOCK_WAIT_TIMEOUT | ER_LOCK_DEADLOCK),
-                        ) => BatchCaptureError::Contention {
-                            code,
-                            why: format!("{lock}: {e}"),
-                        },
-                        _ => batch_error(e, &lock),
-                    });
-                }
+                })
+                .collect()
+        };
+        // Every table's metadata lock, in sorted order (any other order can
+        // deadlock against a multi-table DDL), held until COMMIT: one
+        // request, every statement's result consumed, so a lock timeout or
+        // deadlock of any of them surfaces with its code. A request beyond
+        // its bounds fails the capture (never one round trip per table).
+        let rest = match (after_first_lock, present.split_first()) {
+            (Some(hook), Some((one, rest))) => {
+                lock_all(&mut conn, std::slice::from_ref(one)).await?;
+                hook().await;
+                rest
             }
-        }
+            _ => &present[..],
+        };
+        lock_all(&mut conn, rest).await?;
         trace.lock_wait = t.elapsed();
         let t = Instant::now();
         let from = read_position(&mut conn, gtid_mode, lineage_hash)
@@ -1965,6 +2051,36 @@ mod tests {
         ] {
             assert_ne!(base, other);
         }
+    }
+
+    /// One request: every table's lock statement, in the given order; a
+    /// request beyond its table or byte bound is refused, never split.
+    #[test]
+    fn the_lock_request_is_bounded() {
+        let names: Vec<(String, String)> =
+            (0..3).map(|i| ("d".to_string(), format!("t{i}"))).collect();
+        let tables: Vec<(&str, &str)> = names
+            .iter()
+            .map(|(d, t)| (d.as_str(), t.as_str()))
+            .collect();
+        assert_eq!(
+            lock_request(&tables).unwrap(),
+            "SELECT 1 FROM `d`.`t0` LIMIT 0;SELECT 1 FROM `d`.`t1` LIMIT 0;\
+             SELECT 1 FROM `d`.`t2` LIMIT 0;"
+        );
+        let many: Vec<(String, String)> = (0..=MAX_BATCH_TABLES)
+            .map(|i| ("d".to_string(), format!("t{i}")))
+            .collect();
+        let many: Vec<(&str, &str)> =
+            many.iter().map(|(d, t)| (d.as_str(), t.as_str())).collect();
+        assert!(lock_request(&many[..MAX_BATCH_TABLES]).is_some());
+        assert!(lock_request(&many).is_none(), "too many tables");
+        // 64-character names of 4-byte characters, all quoted: too many
+        // bytes well before the table bound.
+        let wide = "\u{1F600}".repeat(64);
+        let wide: Vec<(&str, &str)> =
+            vec![(wide.as_str(), wide.as_str()); MAX_BATCH_TABLES];
+        assert!(lock_request(&wide).is_none(), "too many bytes");
     }
 
     #[test]
@@ -3215,6 +3331,96 @@ mod tests {
                 task.await
                     .unwrap()
                     .expect("the rename waits, then succeeds");
+            }
+
+            /// A lock timeout fails the attempt as contention, and the attempt
+            /// holds no lock afterwards: a DDL on the batch's other table runs
+            /// at once.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn a_lock_timeout_is_contention_and_holds_nothing() {
+                let dsn = server(true).await;
+                let db = "batch_timeout";
+                sql(
+                    &dsn,
+                    &[
+                        &format!("CREATE DATABASE {db}"),
+                        &format!("CREATE TABLE {db}.a (id INT PRIMARY KEY)"),
+                        &format!("CREATE TABLE {db}.b (id INT PRIMARY KEY)"),
+                    ],
+                )
+                .await;
+                let mut locker =
+                    mysql_async::Conn::from_url(&dsn).await.unwrap();
+                locker
+                    .query_drop(format!("LOCK TABLES {db}.b WRITE"))
+                    .await
+                    .unwrap();
+                let tables = vec![
+                    (db.to_string(), "b".to_string()),
+                    (db.to_string(), "a".to_string()),
+                ];
+                let r = capture_batch(
+                    &dsn,
+                    &uuid(&dsn).await,
+                    LINEAGE,
+                    &tables,
+                    1,
+                    None,
+                )
+                .await;
+                assert!(
+                    matches!(
+                        r,
+                        Err(BatchCaptureError::Contention { code: 1205, .. })
+                    ),
+                    "{r:?}"
+                );
+                let mut ddl = mysql_async::Conn::from_url(&dsn).await.unwrap();
+                ddl.query_drop("SET SESSION lock_wait_timeout = 2")
+                    .await
+                    .unwrap();
+                ddl.query_drop(format!("ALTER TABLE {db}.a ADD COLUMN c INT"))
+                    .await
+                    .expect("no lock on a is left behind");
+                locker.query_drop("UNLOCK TABLES").await.unwrap();
+            }
+
+            /// A table that no longer exists has no shape: the batch captures
+            /// the others and names it missing.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn a_missing_table_does_not_fail_the_batch() {
+                let dsn = server(true).await;
+                let db = "batch_missing";
+                sql(
+                    &dsn,
+                    &[
+                        &format!("CREATE DATABASE {db}"),
+                        &format!("CREATE TABLE {db}.a (id INT PRIMARY KEY)"),
+                    ],
+                )
+                .await;
+                let tables = vec![
+                    (db.to_string(), "gone".to_string()),
+                    (db.to_string(), "a".to_string()),
+                ];
+                let cap = capture_batch(
+                    &dsn,
+                    &uuid(&dsn).await,
+                    LINEAGE,
+                    &tables,
+                    5,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(cap.table(db, "a").is_some());
+                assert!(cap.table(db, "gone").is_none());
+                assert_eq!(
+                    cap.missing,
+                    vec![(db.to_string(), "gone".to_string())]
+                );
             }
 
             /// A boundary after A, with a DDL in between, never proves:
