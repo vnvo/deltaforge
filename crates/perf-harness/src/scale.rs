@@ -583,6 +583,9 @@ fn proof_trace(stdout: &Path) -> Value {
                 "scan_ms": r["scan_ms"], "commit_ms": r["commit_ms"],
                 "batch_conflicts": r["batch_conflicts"],
                 "batch_applies": r["batch_applies"],
+                "capture_attempts": r["capture_attempts"],
+                "stream_openings": r["stream_openings"],
+                "extensions_committed": r["extensions_committed"],
             })),
             _ => {}
         }
