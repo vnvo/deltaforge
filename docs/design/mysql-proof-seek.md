@@ -1112,7 +1112,12 @@ more rows in the held events, which is rare.
 3. **S closes while C is still admitting.** S's tables are reserved and
    its capture and scan start in an owned task: one batched capture of
    its sorted tables (at most three attempts, revision 4), then one
-   shared scanner request over its tables' intervals. The task holds
+   shared scanner request over its tables' intervals, positioned at the
+   stream anchor of S's own head transaction (its GTID event's start and
+   the executed set before it, tracked from the held events exactly as
+   dispatching records it). The scanner positions only at an anchor taken
+   at exactly the request's start set; C's anchor would leave S's scan
+   unanchored, reading its file from the start. The task holds
    nothing of `RunCtx`. If C finishes before S closes, S is dropped
    unformed and its events stay held: when the stream reaches them, an
    ordinary window forms over them, with its time bound counted from

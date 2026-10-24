@@ -153,10 +153,15 @@ pub(crate) struct Ahead {
     /// A GTID that does not parse: the running set is unknown from here
     /// (dispatching that transaction fails closed).
     pub broken: bool,
+    /// The open transaction's stream anchor (its GTID event's start, with
+    /// the executed set before it), as dispatching records it
+    /// (`RunCtx::txn_anchor`).
+    pub txn_anchor: Option<super::mysql_binlog_scan::Anchor>,
 }
 
 impl Ahead {
     fn commit(&mut self, end_pos: u32) {
+        self.txn_anchor = None;
         if let (Some(done), Some(g)) =
             (self.done.as_mut(), self.open_gtid.take())
             && !done.insert(&g)
@@ -195,7 +200,23 @@ pub(crate) fn touched(
                 (tm.database_name.clone(), tm.table_name.clone()),
             );
         }
-        EventData::Gtid(g) => ahead.open_gtid = Some(g.gtid.clone()),
+        EventData::Gtid(g) => {
+            ahead.txn_anchor = ahead.done.as_ref().map(|set_before| {
+                super::mysql_binlog_scan::Anchor {
+                    server_uuid: String::new(),
+                    lineage: String::new(),
+                    file: ahead.file.clone(),
+                    offset: u64::from(
+                        header
+                            .next_event_position
+                            .saturating_sub(header.event_length),
+                    ),
+                    set_before: set_before.clone(),
+                    next_gtid: Some(g.gtid.clone()),
+                }
+            });
+            ahead.open_gtid = Some(g.gtid.clone());
+        }
         EventData::Xid(_) => ahead.commit(header.next_event_position),
         EventData::Query(q) if ends_transaction(&q.query) => {
             ahead.commit(header.next_event_position)
@@ -348,6 +369,7 @@ pub(super) async fn maybe_window(
             })
             .collect(),
         broken: false,
+        txn_anchor: ctx.txn_anchor.clone(),
     };
     // The head event's own table maps and boundaries (a compressed
     // transaction carries them).

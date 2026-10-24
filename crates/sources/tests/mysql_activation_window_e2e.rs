@@ -622,9 +622,11 @@ async fn tables_touched_during_an_admission_are_prefetched() {
     );
     assert_eq!(count(&windows[1], "tables"), n - 1, "{windows:?}");
     assert_eq!(windows[1]["closed_by"], "time", "{windows:?}");
-    // The second window was captured during the first's admission.
+    // The second window was captured during the first's admission, its
+    // scan positioned at its own head's stream anchor (never unanchored).
     assert_eq!(windows[0]["next"], "formed", "{windows:?}");
     assert_eq!(count(&windows[1], "speculated"), n - 1, "{windows:?}");
+    assert_eq!(count(&windows[1], "unanchored_attempts"), 0, "{windows:?}");
     let read_ms = windows[1]["read_ms"].as_f64().unwrap();
     assert!(
         read_ms < 25.0,

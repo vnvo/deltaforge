@@ -224,6 +224,7 @@ pub(crate) struct Collector {
     max_events: usize,
     max_bytes: u64,
     head: Option<(u64, Instant, MySqlCheckpoint)>,
+    head_anchor: Option<super::mysql_binlog_scan::Anchor>,
     batch: BTreeMap<(String, String), MySqlCheckpoint>,
     events: usize,
     bytes: u64,
@@ -258,6 +259,7 @@ impl Collector {
             max_events: cfg.activation_window_events,
             max_bytes: cfg.activation_window_bytes,
             head: None,
+            head_anchor: None,
             batch: BTreeMap::new(),
             events: 0,
             bytes: 0,
@@ -365,6 +367,9 @@ impl Collector {
             }
             if self.head.is_none() {
                 self.head = Some((seq, received, at.clone()));
+                // Its scan starts at its own head's stream anchor, as an
+                // ordinary window's does at dispatch.
+                self.head_anchor = self.ahead.txn_anchor.clone();
             }
             self.batch.insert(k, at);
         }
@@ -400,7 +405,14 @@ impl Collector {
         let Some(head) = head else {
             return;
         };
-        let capture = self.inputs.capture.clone();
+        let mut capture = self.inputs.capture.clone();
+        capture.anchor = self.head_anchor.clone().map(|a| {
+            super::mysql_binlog_scan::Anchor {
+                server_uuid: capture.server_uuid.clone(),
+                lineage: capture.lineage.clone(),
+                ..a
+            }
+        });
         self.task = Some(AbortOnDrop(tokio::spawn(async move {
             capture_and_scan(&capture, &tables, &froms, &head).await
         })));
