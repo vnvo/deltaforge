@@ -611,7 +611,7 @@ pub(crate) enum DriftVerdict {
     Marker {
         key: SchemaKey,
         previous: Option<SchemaRef>,
-        register: Option<MySqlTableSchema>,
+        register: Option<Box<MySqlTableSchema>>,
         outcome: Outcome,
     },
 }
@@ -716,7 +716,7 @@ pub(crate) async fn assess(
     Ok(DriftVerdict::Marker {
         key,
         previous: Some((previous.version, previous.hash.clone())),
-        register: Some(shape),
+        register: Some(Box::new(shape)),
         outcome: if drift {
             Outcome::Adapted
         } else {
@@ -748,7 +748,7 @@ pub(crate) async fn record(
                 .map_err(|e| SourceError::Other(e.into()))?;
             Some(
                 env.loader
-                    .register_captured(db, table, &shape, &checkpoint)
+                    .register_captured(db, table, shape.as_ref(), &checkpoint)
                     .await?,
             )
         }
