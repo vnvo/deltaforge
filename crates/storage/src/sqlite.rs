@@ -318,20 +318,23 @@ impl StorageBackend for SqliteStorageBackend {
                 out.push(match r {
                     BatchRead::KvGet { ns, key } => BatchReadResult::Kv(kv_live(&tx, ns, key)?),
                     BatchRead::LogLatest { ns, key } => BatchReadResult::Latest(
-                        tx.query_row(
+                        tx.prepare_cached(
                             "SELECT seq, val FROM df_log WHERE ns=?1 AND key=?2 \
                              ORDER BY seq DESC LIMIT 1",
-                            params![ns, key],
-                            |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)),
-                        )
+                        )?
+                        .query_row(params![ns, key], |r| {
+                            Ok((r.get::<_, i64>(0)? as u64, r.get(1)?))
+                        })
                         .optional()?,
                     ),
                     BatchRead::LogHead { ns, key } => BatchReadResult::Head(log_head(&tx, ns, key)?),
-                    BatchRead::LogLen { ns, key } => BatchReadResult::Len(tx.query_row(
-                        "SELECT COUNT(*) FROM df_log WHERE ns=?1 AND key=?2",
-                        params![ns, key],
-                        |r| r.get::<_, i64>(0),
-                    )? as u64),
+                    BatchRead::LogLen { ns, key } => BatchReadResult::Len(
+                        tx.prepare_cached(
+                            "SELECT COUNT(*) FROM df_log WHERE ns=?1 AND key=?2",
+                        )?
+                        .query_row(params![ns, key], |r| r.get::<_, i64>(0))?
+                            as u64,
+                    ),
                 });
             }
             tx.commit()?;
@@ -384,11 +387,10 @@ impl StorageBackend for SqliteStorageBackend {
                         value,
                     } => {
                         let exists: Option<i64> = tx
-                            .query_row(
+                            .prepare_cached(
                                 "SELECT seq FROM df_log WHERE ns=?1 AND key=?2 AND capture_id=?3",
-                                params![ns, key, capture_id],
-                                |r| r.get(0),
-                            )
+                            )?
+                            .query_row(params![ns, key, capture_id], |r| r.get(0))
                             .optional()?;
                         if exists.is_some() {
                             return Ok(BatchOutcome::Conflict {
@@ -1487,6 +1489,78 @@ mod tests {
 
         drop(be);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Cached statements carry nothing from one batch to the next: on the
+    /// one connection, committed, conflicting, failed-midway and ambiguous
+    /// (acknowledgement lost) batches alternate, each binding different
+    /// keys and values, and afterwards every stream and key holds exactly
+    /// what its own committed batch wrote (and the failed ones nothing).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cached_statements_carry_nothing_between_batches() {
+        use crate::{
+            AtomicBatch, BatchFault, BatchFaults, BatchOp, BatchOutcome,
+            BatchValue, CommitResult, Precondition, commit_atomic,
+        };
+        let b = SqliteStorageBackend::in_memory().unwrap();
+        let batch = |k: usize, tag: u8| AtomicBatch {
+            preconditions: vec![Precondition::LogHead {
+                ns: "n".into(),
+                key: format!("k{k}"),
+                seq: 0,
+            }],
+            ops: vec![
+                BatchOp::LogAppendIfAbsent {
+                    ns: "n".into(),
+                    key: format!("k{k}"),
+                    capture_id: format!("c{k}"),
+                    value: vec![tag; 3 + k % 7],
+                },
+                BatchOp::KvPut {
+                    ns: "kv".into(),
+                    key: format!("k{k}"),
+                    value: BatchValue::Bytes(vec![tag; 1 + k % 5]),
+                },
+            ],
+        };
+        for k in 0..20usize {
+            let tag = k as u8 + 1;
+            assert!(matches!(
+                b.apply_batch(&batch(k, tag)).await.unwrap(),
+                BatchOutcome::Committed { .. }
+            ));
+            assert!(matches!(
+                b.apply_batch(&batch(k, 0xEE)).await.unwrap(),
+                BatchOutcome::Conflict { .. }
+            ));
+            b.set_batch_fault(Some(BatchFault::AfterWrites(1)));
+            assert!(b.apply_batch(&batch(k + 100, 0xDD)).await.is_err());
+            b.set_batch_fault(Some(BatchFault::AfterCommit));
+            assert!(matches!(
+                commit_atomic(b.as_ref(), &batch(k + 200, 0xCC), 3)
+                    .await
+                    .unwrap(),
+                CommitResult::Committed(_)
+            ));
+        }
+        for k in 0..20usize {
+            let tag = k as u8 + 1;
+            let log = b.log_list("n", &format!("k{k}")).await.unwrap();
+            assert_eq!(log.len(), 1, "k{k}");
+            assert_eq!(log[0].1, vec![tag; 3 + k % 7], "k{k}");
+            assert_eq!(
+                b.kv_get("kv", &format!("k{k}")).await.unwrap(),
+                Some(vec![tag; 1 + k % 5]),
+                "k{k}"
+            );
+            let failed = format!("k{}", k + 100);
+            assert!(b.log_list("n", &failed).await.unwrap().is_empty());
+            assert_eq!(b.kv_get("kv", &failed).await.unwrap(), None);
+            let ambiguous = format!("k{}", k + 200);
+            let log = b.log_list("n", &ambiguous).await.unwrap();
+            assert_eq!(log.len(), 1, "{ambiguous}");
+            assert_eq!(log[0].1, vec![0xCC; 3 + (k + 200) % 7]);
+        }
     }
 
     /// The shared atomic-batch conformance suite.
