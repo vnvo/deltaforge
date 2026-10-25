@@ -1312,3 +1312,57 @@ async fn extra_speculative_candidates_are_discarded() {
     assert_eq!(count(&windows[1], "speculated"), 6, "{windows:?}");
     assert_eq!(count(&windows[1], "tables"), 1, "{windows:?}");
 }
+
+/// A statement held during an admission ends the speculation (the proven
+/// state may change before the next window's head): the next window then
+/// forms in the ordinary way over the held events, and its time bound
+/// still counts from its first event's receipt, so it closes at once
+/// instead of waiting a full bound again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn held_events_after_a_statement_form_an_ordinary_window_by_receipt() {
+    let (container, port) = start(true).await;
+    let mut c = conn(port).await;
+    tables(&mut c, 10).await;
+    let id = "spec-gave-up";
+    let r = run(port, id, MysqlProofCfg::default()).await;
+    r.handle.pause();
+    c.query_drop("INSERT INTO t0000 VALUES (1, 0)")
+        .await
+        .unwrap();
+    let mut locker = conn(port).await;
+    locker.query_drop("LOCK TABLES t0000 WRITE").await.unwrap();
+    r.handle.resume();
+    wait_for_waiter(port, "t0000").await;
+    c.query_drop("ALTER TABLE t0009 ADD COLUMN w INT")
+        .await
+        .unwrap();
+    c.query_drop(
+        "BEGIN; INSERT INTO t0001 VALUES (1, 1); INSERT INTO t0002 VALUES (1, 2); \
+         INSERT INTO t0003 VALUES (1, 3); INSERT INTO t0004 VALUES (1, 4); COMMIT",
+    )
+    .await
+    .unwrap();
+    sleep(Duration::from_millis(300)).await;
+    locker.query_drop("UNLOCK TABLES").await.unwrap();
+    r.delivered(5, Duration::from_secs(60)).await;
+    sleep(Duration::from_secs(1)).await;
+    let expected: Vec<(String, i64)> =
+        (0..5).map(|i| (format!("t{i:04}"), 1)).collect();
+    assert_eq!(
+        *r.order.lock().unwrap(),
+        expected,
+        "every row once, in order"
+    );
+    r.stop().await;
+    container.rm().await.ok();
+    let windows = records(id, "window");
+    assert_eq!(windows[0]["next"], "gave_up", "{windows:?}");
+    assert_eq!(count(&windows[1], "tables"), 4, "{windows:?}");
+    assert!(windows[1]["speculated"].is_null(), "{windows:?}");
+    let read_ms = windows[1]["read_ms"].as_f64().unwrap();
+    assert!(
+        read_ms < 25.0,
+        "the ordinary window over held events counts from receipt: {read_ms} ms"
+    );
+}
