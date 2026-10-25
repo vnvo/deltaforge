@@ -506,6 +506,15 @@ async fn capture_contention_fails_closed() {
         draft.evidence.text_of(EvidenceKey::ReasonClass),
         Some("lock_wait_timeout")
     );
+    // Exactly the bounded attempts, never a fourth.
+    assert!(
+        matches!(
+            draft.evidence.get(EvidenceKey::Attempts),
+            Some(deltaforge_core::incident::EvidenceValue::Count { value: 3 })
+        ),
+        "{:?}",
+        draft.evidence.get(EvidenceKey::Attempts)
+    );
     assert!(r.firsts.lock().unwrap().is_empty(), "nothing of the window");
     assert!(records(&r.id, "window").is_empty(), "no window completed");
     assert!(
