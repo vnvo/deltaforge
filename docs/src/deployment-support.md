@@ -118,7 +118,7 @@ Schema history written by earlier releases is kept but not used automatically: a
 
 ### MySQL
 
-- `REPLICATION REPLICA, REPLICATION CLIENT ON *.*` (always).
+- `REPLICATION SLAVE, REPLICATION CLIENT ON *.*` (always).
 - `SELECT, SHOW VIEW` on the captured database(s) for reads and introspection.
 - `RELOAD ON *.*` **only when an initial snapshot runs** (needed for the brief `FLUSH TABLES WITH READ LOCK` that anchors the snapshot). A CDC-only pipeline (`snapshot.mode = never`) does not need `RELOAD`.
 - Server settings enforced fail-closed at snapshot preflight: `gtid_mode = ON`, `enforce_gtid_consistency = ON`, `binlog_format = ROW`, and captured tables on InnoDB. `binlog_row_image = FULL` is recommended.

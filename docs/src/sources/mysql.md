@@ -38,7 +38,7 @@ Create a dedicated replication user with the required grants:
 CREATE USER 'deltaforge'@'%' IDENTIFIED WITH mysql_native_password BY 'your_password';
 
 -- Replication privileges (required)
-GRANT REPLICATION REPLICA, REPLICATION CLIENT ON *.* TO 'deltaforge'@'%';
+GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'deltaforge'@'%';
 
 -- Global RELOAD (required only when the initial snapshot runs; used for the
 -- brief FLUSH TABLES WITH READ LOCK that brackets the consistent anchor)
@@ -364,4 +364,4 @@ Verify grants for your user:
 SHOW GRANTS FOR 'deltaforge'@'%';
 ```
 
-Required grants include `REPLICATION REPLICA` and `REPLICATION CLIENT`.
+Required grants include `REPLICATION SLAVE` and `REPLICATION CLIENT`.
