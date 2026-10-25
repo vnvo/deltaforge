@@ -2,49 +2,65 @@
 //! classified statements (DDL, database and lineage barriers - never DML)
 //! of one contiguous covered interval `(lo, hi]` of the source's binlog.
 //!
-//! A proof asks for its interval `(A, B]`. When `(lo, hi]` covers it, the
-//! answer comes from the record; otherwise the record is extended by a
-//! physical scan of only the missing part - `(hi, B]` to the right, `(A, lo]`
-//! to the left - with the existing [`scan_interval`] (identity proven on its
-//! session, complete, exact, fail-closed). Each proof still applies its own
-//! `affects` and `covers` rules to the statements of its own interval, and
-//! its digest is the canonical [`scan_digest`] of `(A, B]` over them, so a
-//! table first seen at a position the record already covers costs no
-//! rescan of the history between them.
+//! A proof asks for its interval `(A, B]` (a batch: several `A_i` with one
+//! `B`). When `(lo, hi]` covers it, the answer comes from the record;
+//! otherwise the record is extended by a physical scan of only the missing
+//! part - `(hi, B]` to the right, `(A, lo]` to the left - with the existing
+//! scan (identity proven on its session, complete, exact, fail-closed). Each
+//! proof still applies its own `affects` and `covers` rules to the
+//! statements of its own interval, and its digest is the canonical
+//! [`scan_digest`] of `(A, B]` over them, so a table first seen at a
+//! position the record already covers costs no rescan of the history
+//! between them.
 //!
+//! Coalescing (`docs/design/mysql-proof-seek.md`, "Layer 2: the coalescing
+//! scanner"):
 //! - `A == B`: the canonical empty proof, no session; `B < A` or unordered
 //!   positions fail closed.
-//! - Requests are single-flight (one mutex). A request pins its `A` before
-//!   it waits, so pruning never removes what a queued request needs; the pin
-//!   is removed when the request ends or is dropped.
-//! - An extension's result is applied only once it completed exactly: a
-//!   cancelled one leaves the record as it was; a failed one (gap, purged
-//!   binlog, framing, limit, another server) clears the record.
+//! - A request pins its `A` before it waits, so pruning never removes what a
+//!   queued request needs; the pin is removed when the request ends or is
+//!   dropped.
+//! - Requests are served in rounds, one at a time, on the scanner's own
+//!   task. A round takes every request queued before it starts: one queued
+//!   while a round runs is served by exactly the next round. A round's
+//!   targets are fixed when it starts (the least `A` before `lo`, the
+//!   greatest `B` after `hi`), so it makes at most two extensions.
+//! - Each extension makes at most one positioned attempt (the right one at
+//!   the record's frontier anchor, the left one at the stream anchor of its
+//!   boundary) and at most one bounded unanchored attempt, only without an
+//!   anchor or after the positioned one was refused or failed. No third.
+//! - A round builds its extensions into a staging record; the record, its
+//!   frontier and the anchor cache change only when every extension
+//!   reached its target and the record's bounds hold. A failed or cancelled
+//!   round leaves them exactly as they were.
+//! - A waiter that is cancelled leaves; the round continues while any of
+//!   its waiters remains, and is dropped (its stream reset, nothing
+//!   committed) only when none does.
 //! - The record belongs to one server identity and lineage; another one
 //!   clears it.
-//! - Pruning (at each request) drops statements at or before the lowest of
-//!   the stream's boundary and every pin; a boundary past `hi` clears the
-//!   record (it restarts at the next request's `A`).
-//! - Retained state is bounded by statement count and encoded bytes;
-//!   exceeding either clears the record and fails the request closed.
+//! - Pruning (at each round) drops statements at or before the lowest of
+//!   the round's stream boundaries and every pin; a lowest point past `hi`
+//!   clears the record (it restarts at the next request's `A`).
 //!
 //! Operational semantics: the existing scan limits bound each physical
 //! extension (the work done); answering from the record re-reads no DML, so
 //! a request is no longer limited by the size of its whole logical interval.
 //! The record's own bounds limit retained state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use deltaforge_core::CheckpointOrder;
+use tokio::sync::oneshot;
 
 use super::MySqlCheckpoint;
 use super::mysql_activation::EventIdentity;
 use super::mysql_binlog_scan::{
-    ProofError, ScanLimits, ScanReport, ScanTag, ScanTrace, Statement,
-    encode_effect, encode_event, scan_digest, scan_interval, trace_enabled,
+    Anchor, ProofError, ProofKind, ProofWork, ScanLimits, ScanReport, ScanTag,
+    ScanTrace, Statement, encode_effect, encode_event, scan_digest,
+    scan_interval_at, trace_enabled,
 };
 use crate::durable_checkpoint::{
     WmPos, mysql_checkpoint_position, order_positions,
@@ -67,41 +83,48 @@ impl Default for RecordLimits {
     }
 }
 
-/// A physical scan of `(from, to]` (production: [`LiveSegments`]).
+/// Session anchors kept for later requests at the same boundary.
+const ANCHOR_CACHE: usize = 64;
+
+/// A physical scan of `(from, to]`, opened at `anchor` when one is given
+/// (production: [`LiveSegments`]).
 #[async_trait]
 pub(crate) trait Segments: Send + Sync {
     async fn scan(
         &self,
         from: &MySqlCheckpoint,
         to: &MySqlCheckpoint,
+        anchor: Option<&Anchor>,
         tag: &ScanTag<'_>,
     ) -> Result<ScanReport, ProofError>;
 }
 
 /// Physical scans on the source's verified server.
-pub(crate) struct LiveSegments<'a> {
-    pub dsn: &'a str,
+pub(crate) struct LiveSegments {
+    pub dsn: String,
     pub server_id: u64,
-    pub server_uuid: &'a str,
-    pub lineage_hash: &'a str,
+    pub server_uuid: String,
+    pub lineage_hash: String,
     pub limits: ScanLimits,
 }
 
 #[async_trait]
-impl Segments for LiveSegments<'_> {
+impl Segments for LiveSegments {
     async fn scan(
         &self,
         from: &MySqlCheckpoint,
         to: &MySqlCheckpoint,
+        anchor: Option<&Anchor>,
         tag: &ScanTag<'_>,
     ) -> Result<ScanReport, ProofError> {
-        scan_interval(
-            self.dsn,
+        scan_interval_at(
+            &self.dsn,
             self.server_id,
-            self.server_uuid,
-            self.lineage_hash,
+            &self.server_uuid,
+            &self.lineage_hash,
             from,
             to,
+            anchor,
             &self.limits,
             tag,
         )
@@ -115,20 +138,78 @@ struct Identity {
     lineage_hash: String,
 }
 
+impl Identity {
+    fn owns(&self, a: &Anchor) -> bool {
+        a.server_uuid.eq_ignore_ascii_case(&self.server_uuid)
+            && a.lineage == self.lineage_hash
+    }
+}
+
+#[derive(Clone)]
 struct Covered {
     identity: Identity,
     lo: MySqlCheckpoint,
     hi: MySqlCheckpoint,
     statements: Vec<Statement>,
     bytes: usize,
+    /// The boundary after `hi`'s last transaction, observed where the scan
+    /// that reached `hi` ended (GTID mode).
+    frontier: Option<Anchor>,
 }
+
+/// A queued request: one `(head, B]` with the stream anchor at `head`.
+struct Request {
+    identity: Identity,
+    head: MySqlCheckpoint,
+    a: WmPos,
+    to: MySqlCheckpoint,
+    b: WmPos,
+    boundary: Option<MySqlCheckpoint>,
+    anchor: Option<Anchor>,
+    segments: Arc<dyn Segments>,
+    source_id: String,
+    kind: ProofKind,
+}
+
+/// What a round gives each of its requests: the committed record (which
+/// covers the request) and the round's physical work.
+struct Served {
+    record: Arc<Covered>,
+    tally: Tally,
+}
+
+/// A round's physical work: its counters, the traces of the scans that
+/// completed, and the events and bytes they read.
+#[derive(Clone, Default)]
+struct Tally {
+    work: ProofWork,
+    traces: Vec<ScanTrace>,
+    events: u64,
+    bytes: u64,
+}
+
+type Reply = oneshot::Sender<Result<Served, ProofError>>;
+
+#[derive(Default)]
+struct Inner {
+    record: Option<Arc<Covered>>,
+    /// Session anchors observed by committed extensions, newest last.
+    anchors: VecDeque<Anchor>,
+    queue: Vec<(Request, Reply)>,
+    /// Whether the scanner's task is running rounds.
+    driving: bool,
+}
+
+type Pins = Arc<std::sync::Mutex<BTreeMap<u64, MySqlCheckpoint>>>;
 
 /// The shared proof scanner of one source.
 pub(crate) struct ProofScanner {
-    state: tokio::sync::Mutex<Option<Covered>>,
-    pins: Arc<std::sync::Mutex<BTreeMap<u64, MySqlCheckpoint>>>,
+    inner: Arc<std::sync::Mutex<Inner>>,
+    pins: Pins,
     next_pin: AtomicU64,
     limits: RecordLimits,
+    /// The bounds of each physical scan on the source's server.
+    scan_limits: ScanLimits,
 }
 
 impl Default for ProofScanner {
@@ -139,7 +220,7 @@ impl Default for ProofScanner {
 
 /// Removes its pin when the request ends or is dropped.
 struct Pin {
-    pins: Arc<std::sync::Mutex<BTreeMap<u64, MySqlCheckpoint>>>,
+    pins: Pins,
     id: u64,
 }
 
@@ -153,6 +234,14 @@ fn wm(p: &MySqlCheckpoint) -> Result<WmPos, ProofError> {
     mysql_checkpoint_position(&p.file, p.pos, p.gtid_set.as_deref()).ok_or_else(
         || ProofError::Positions(format!("unparseable position {p:?}")),
     )
+}
+
+/// The exact GTID set of a GTID-mode position.
+fn gtid_set_of(p: &WmPos) -> Option<GtidSet> {
+    match p {
+        WmPos::MysqlGtid { gtid_set } => GtidSet::parse(gtid_set),
+        _ => None,
+    }
 }
 
 fn entry_bytes(s: &Statement) -> usize {
@@ -179,14 +268,52 @@ fn at_or_before(s: &Statement, p: &WmPos) -> Option<bool> {
     }
 }
 
+/// The recorded statements of `(a, b]`.
+fn inside(
+    c: &Covered,
+    a: &WmPos,
+    b: &WmPos,
+) -> Result<Vec<Statement>, ProofError> {
+    let (lo, hi) = (wm(&c.lo)?, wm(&c.hi)?);
+    if !matches!(
+        order_positions(&lo, a),
+        CheckpointOrder::Before | CheckpointOrder::Equal
+    ) || !matches!(
+        order_positions(b, &hi),
+        CheckpointOrder::Before | CheckpointOrder::Equal
+    ) {
+        return Err(ProofError::Positions(
+            "the record does not cover the interval".into(),
+        ));
+    }
+    let unordered =
+        || ProofError::Positions("a recorded statement is unordered".into());
+    let mut out = Vec::new();
+    for s in &c.statements {
+        let after_a = !at_or_before(s, a).ok_or_else(unordered)?;
+        let within_b = at_or_before(s, b).ok_or_else(unordered)?;
+        if after_a && within_b {
+            out.push(s.clone());
+        }
+    }
+    Ok(out)
+}
+
 impl ProofScanner {
     pub(crate) fn new(limits: RecordLimits) -> Self {
         Self {
-            state: tokio::sync::Mutex::new(None),
+            inner: Default::default(),
             pins: Default::default(),
             next_pin: AtomicU64::new(1),
             limits,
+            scan_limits: ScanLimits::default(),
         }
+    }
+
+    /// With each physical scan bounded by `scan_limits`.
+    pub(crate) fn with_scan_limits(mut self, scan_limits: ScanLimits) -> Self {
+        self.scan_limits = scan_limits;
+        self
     }
 
     fn pin(&self, at: &MySqlCheckpoint) -> Pin {
@@ -198,23 +325,58 @@ impl ProofScanner {
         }
     }
 
-    /// The statements of `(from, to]` and its canonical digest. `boundary`:
-    /// the stream's last transaction boundary (pruning). `events`/`bytes`
-    /// report the physical work this request did (0 when answered from the
-    /// record).
+    /// The statements of `(from, to]` and its canonical digest (tests: the
+    /// source asks through [`shared_interval`]). `anchor`:
+    /// the stream anchor at `from`, when the caller observed one.
+    /// `boundary`: the stream's last transaction boundary (pruning).
+    /// `events`/`bytes` and `work` report the physical work of the round
+    /// that served this request (0 when answered from the record).
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn interval(
         &self,
-        segments: &dyn Segments,
+        segments: Arc<dyn Segments>,
         server_uuid: &str,
         lineage_hash: &str,
         from: &MySqlCheckpoint,
         to: &MySqlCheckpoint,
+        anchor: Option<&Anchor>,
         boundary: Option<&MySqlCheckpoint>,
         tag: &ScanTag<'_>,
     ) -> Result<ScanReport, ProofError> {
+        let mut answers = self
+            .intervals(
+                segments,
+                server_uuid,
+                lineage_hash,
+                std::slice::from_ref(from),
+                to,
+                anchor,
+                boundary,
+                tag,
+            )
+            .await?;
+        Ok(answers.pop().expect("one answer per start"))
+    }
+
+    /// A batch: the statements and digest of every `(from_i, to]`, from one
+    /// request on the least start (`anchor`: the stream anchor there). One
+    /// answer per start, in order, each its own canonical proof; one
+    /// failure fails them all.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn intervals(
+        &self,
+        segments: Arc<dyn Segments>,
+        server_uuid: &str,
+        lineage_hash: &str,
+        froms: &[MySqlCheckpoint],
+        to: &MySqlCheckpoint,
+        anchor: Option<&Anchor>,
+        boundary: Option<&MySqlCheckpoint>,
+        tag: &ScanTag<'_>,
+    ) -> Result<Vec<ScanReport>, ProofError> {
         let started = std::time::Instant::now();
-        for (name, p) in [("from", from), ("to", to)] {
+        for (name, p) in froms.iter().map(|f| ("from", f)).chain([("to", to)]) {
             if p.lineage.as_deref() != Some(lineage_hash) {
                 return Err(ProofError::Positions(format!(
                     "{name} position belongs to lineage {:?}, not {lineage_hash}",
@@ -222,260 +384,640 @@ impl ProofScanner {
                 )));
             }
         }
-        let (a, b) = (wm(from)?, wm(to)?);
-        match order_positions(&a, &b) {
-            CheckpointOrder::Equal => {
-                observe_request(tag, from, to, "empty", 0, 0, &[], None);
-                return Ok(answer(&a, &b, Vec::new(), 0, 0, started));
+        let b = wm(to)?;
+        // Each start: its position, and whether its interval is non-empty.
+        let mut starts = Vec::with_capacity(froms.len());
+        let mut head: Option<(usize, WmPos)> = None;
+        for (i, f) in froms.iter().enumerate() {
+            let a = wm(f)?;
+            let open = match order_positions(&a, &b) {
+                CheckpointOrder::Equal => false,
+                CheckpointOrder::Before => true,
+                other => {
+                    return Err(ProofError::Positions(format!(
+                        "from is not before to ({other:?})"
+                    )));
+                }
+            };
+            if open {
+                head = match head {
+                    None => Some((i, a.clone())),
+                    Some((j, h)) => match order_positions(&a, &h) {
+                        CheckpointOrder::Before => Some((i, a.clone())),
+                        CheckpointOrder::Equal | CheckpointOrder::After => {
+                            Some((j, h))
+                        }
+                        CheckpointOrder::Incomparable => {
+                            return Err(ProofError::Positions(
+                                "the batch's starts are unordered".into(),
+                            ));
+                        }
+                    },
+                };
             }
-            CheckpointOrder::Before => {}
-            other => {
-                return Err(ProofError::Positions(format!(
-                    "from is not before to ({other:?})"
-                )));
-            }
+            starts.push((a, open));
         }
-        // Pinned before waiting: pruning keeps everything after `A` while
-        // this request is queued or running.
-        let _pin = self.pin(from);
-        let mut state = self.state.lock().await;
+        let Some((h, a_head)) = head else {
+            for f in froms {
+                observe_request(tag, f, to, "empty", 0, 0, &[], None);
+            }
+            return Ok(starts
+                .iter()
+                .map(|(a, _)| answer(a, &b, Vec::new(), 0, 0, started))
+                .collect());
+        };
+        // Pinned before waiting: pruning keeps everything after the head
+        // while this request is queued or running.
+        let _pin = self.pin(&froms[h]);
         let identity = Identity {
             server_uuid: server_uuid.to_ascii_lowercase(),
             lineage_hash: lineage_hash.to_string(),
         };
-        if state.as_ref().is_some_and(|c| c.identity != identity) {
-            *state = None;
-        }
-        self.prune(&mut state, boundary);
-
-        let (mut events, mut bytes) = (0u64, 0u64);
-        let mut segments_run: Vec<ScanTrace> = Vec::new();
-        let result: Result<(), ProofError> = async {
-            let Some(c) = state.as_mut() else {
-                let r = segments.scan(from, to, tag).await?;
-                (events, bytes) = (r.events, r.bytes);
-                segments_run.push(r.trace.clone());
-                let size = r.statements.iter().map(entry_bytes).sum();
-                *state = Some(Covered {
-                    identity: identity.clone(),
-                    lo: from.clone(),
-                    hi: to.clone(),
-                    statements: r.statements,
-                    bytes: size,
-                });
-                return Ok(());
-            };
-            let (lo, hi) = (wm(&c.lo)?, wm(&c.hi)?);
-            match order_positions(&a, &lo) {
-                CheckpointOrder::Before => {
-                    let r = segments.scan(from, &c.lo.clone(), tag).await?;
-                    segments_run.push(r.trace.clone());
-                    events += r.events;
-                    bytes += r.bytes;
-                    c.bytes +=
-                        r.statements.iter().map(entry_bytes).sum::<usize>();
-                    let mut s = r.statements;
-                    s.append(&mut c.statements);
-                    c.statements = s;
-                    c.lo = from.clone();
-                }
-                CheckpointOrder::Equal | CheckpointOrder::After => {}
-                CheckpointOrder::Incomparable => {
-                    return Err(ProofError::Positions(
-                        "the start is unordered with the covered interval"
-                            .into(),
-                    ));
-                }
-            }
-            match order_positions(&b, &hi) {
-                CheckpointOrder::After => {
-                    let r = segments.scan(&c.hi.clone(), to, tag).await?;
-                    segments_run.push(r.trace.clone());
-                    events += r.events;
-                    bytes += r.bytes;
-                    c.bytes +=
-                        r.statements.iter().map(entry_bytes).sum::<usize>();
-                    c.statements.extend(r.statements);
-                    c.hi = to.clone();
-                }
-                CheckpointOrder::Before | CheckpointOrder::Equal => {}
-                CheckpointOrder::Incomparable => {
-                    return Err(ProofError::Positions(
-                        "the end is unordered with the covered interval".into(),
-                    ));
-                }
-            }
-            Ok(())
-        }
-        .await;
-        match result {
-            // Unordered positions refuse this request only.
-            Err(e @ ProofError::Positions(_)) => {
-                observe_request(
-                    tag,
-                    from,
-                    to,
-                    "failed",
-                    events,
-                    bytes,
-                    &segments_run,
-                    None,
-                );
-                return Err(e);
-            }
-            Err(e) => {
-                *state = None;
-                observe_request(
-                    tag,
-                    from,
-                    to,
-                    "failed",
-                    events,
-                    bytes,
-                    &segments_run,
-                    None,
-                );
-                return Err(e);
-            }
-            Ok(()) => {}
-        }
-        let c = state.as_ref().expect("covered after a successful request");
-        if c.statements.len() > self.limits.max_statements
-            || c.bytes > self.limits.max_bytes
-        {
-            let why = format!(
-                "proof record bound ({} statements, {} bytes)",
-                c.statements.len(),
-                c.bytes
-            );
-            *state = None;
-            observe_request(
-                tag,
-                from,
-                to,
-                "failed",
-                events,
-                bytes,
-                &segments_run,
-                None,
-            );
-            return Err(ProofError::Limit(why));
-        }
-        let mut inside = Vec::new();
-        for s in &c.statements {
-            let after_a = at_or_before(s, &a).ok_or_else(|| {
-                ProofError::Positions(
-                    "a recorded statement is unordered".into(),
-                )
-            })?;
-            let within_b = at_or_before(s, &b).ok_or_else(|| {
-                ProofError::Positions(
-                    "a recorded statement is unordered".into(),
-                )
-            })?;
-            if !after_a && within_b {
-                inside.push(s.clone());
-            }
-        }
-        let served = if segments_run.is_empty() {
-            "record"
-        } else {
-            "scanned"
+        let (reply, served) = oneshot::channel();
+        self.enqueue(
+            Request {
+                identity,
+                head: froms[h].clone(),
+                a: a_head,
+                to: to.clone(),
+                b: b.clone(),
+                boundary: boundary.cloned(),
+                anchor: anchor.cloned(),
+                segments,
+                source_id: tag.source_id.to_string(),
+                kind: tag.kind,
+            },
+            reply,
+        );
+        let served = match served.await {
+            Ok(r) => r,
+            Err(_) => Err(ProofError::Open("the proof scanner stopped".into())),
         };
-        observe_request(
-            tag,
-            from,
-            to,
-            served,
+        let served = match served {
+            Ok(s) => s,
+            Err(e) => {
+                for f in froms {
+                    observe_request(tag, f, to, "failed", 0, 0, &[], None);
+                }
+                return Err(e);
+            }
+        };
+        let c = &served.record;
+        let Tally {
+            work,
+            traces,
             events,
             bytes,
-            &segments_run,
-            Some((c.statements.len(), c.bytes)),
-        );
-        let mut report = answer(&a, &b, inside, events, bytes, started);
-        if let Some(last) = segments_run.pop() {
-            report.trace = last;
+        } = &served.tally;
+        let (events, bytes) = (*events, *bytes);
+        let mut answers = Vec::with_capacity(froms.len());
+        for (f, (a, open)) in froms.iter().zip(&starts) {
+            let statements = if *open { inside(c, a, &b)? } else { Vec::new() };
+            let how = match (open, traces.is_empty()) {
+                (false, _) => "empty",
+                (true, true) => "record",
+                (true, false) => "scanned",
+            };
+            observe_request(
+                tag,
+                f,
+                to,
+                how,
+                events,
+                bytes,
+                traces,
+                Some((c.statements.len(), c.bytes)),
+            );
+            let mut report = answer(a, &b, statements, events, bytes, started);
+            report.work = *work;
+            if let Some(last) = traces.last() {
+                report.trace = last.clone();
+            }
+            answers.push(report);
         }
-        Ok(report)
+        Ok(answers)
     }
 
-    /// Drop recorded statements at or before the lowest of `boundary` and
-    /// every pin; a lowest point past `hi` clears the record. Unordered
-    /// points prune nothing.
-    fn prune(
-        &self,
-        state: &mut Option<Covered>,
-        boundary: Option<&MySqlCheckpoint>,
-    ) {
-        let Some(c) = state.as_mut() else { return };
-        let mut points: Vec<(WmPos, MySqlCheckpoint)> = Vec::new();
-        for p in self.pins.lock().expect("pins").values().chain(boundary) {
-            match wm(p) {
-                Ok(w) => points.push((w, p.clone())),
-                Err(_) => return,
-            }
-        }
-        let Some((mut low, mut low_cp)) = points.first().cloned() else {
-            return;
-        };
-        for (p, cp) in &points[1..] {
-            match order_positions(p, &low) {
-                CheckpointOrder::Before => {
-                    (low, low_cp) = (p.clone(), cp.clone())
-                }
-                CheckpointOrder::Equal | CheckpointOrder::After => {}
-                CheckpointOrder::Incomparable => return,
-            }
-        }
-        let (Ok(lo), Ok(hi)) = (wm(&c.lo), wm(&c.hi)) else {
-            *state = None;
-            return;
-        };
-        match (order_positions(&low, &lo), order_positions(&low, &hi)) {
-            (CheckpointOrder::Before | CheckpointOrder::Equal, _) => {}
-            (_, CheckpointOrder::After) => *state = None,
-            (
-                CheckpointOrder::After,
-                CheckpointOrder::Before | CheckpointOrder::Equal,
-            ) => {
-                let mut keep = Vec::with_capacity(c.statements.len());
-                let mut unordered = false;
-                for s in c.statements.drain(..) {
-                    match at_or_before(&s, &low) {
-                        Some(true) => {}
-                        Some(false) => keep.push(s),
-                        None => unordered = true,
-                    }
-                }
-                if unordered {
-                    *state = None;
-                    return;
-                }
-                c.bytes = keep.iter().map(entry_bytes).sum();
-                c.statements = keep;
-                c.lo = MySqlCheckpoint {
-                    lineage: c.lo.lineage.clone(),
-                    ..low_cp
-                };
-            }
-            _ => *state = None,
+    /// Queue `req` for the next round, starting the scanner's task if no
+    /// round is running.
+    fn enqueue(&self, req: Request, reply: Reply) {
+        let mut g = self.inner.lock().expect("scanner");
+        g.queue.push((req, reply));
+        if !g.driving {
+            g.driving = true;
+            tokio::spawn(drive(
+                self.inner.clone(),
+                self.pins.clone(),
+                self.limits,
+            ));
         }
     }
 
     /// The retained record: (statements, bytes).
     #[cfg(test)]
     pub(crate) async fn retained(&self) -> Option<(usize, usize)> {
-        self.state
+        self.inner
             .lock()
-            .await
+            .expect("scanner")
+            .record
             .as_ref()
             .map(|c| (c.statements.len(), c.bytes))
+    }
+
+    /// The record's bounds and frontier, and the cached anchors.
+    #[cfg(test)]
+    fn snapshot(
+        &self,
+    ) -> Option<(
+        MySqlCheckpoint,
+        MySqlCheckpoint,
+        Option<Anchor>,
+        Vec<Anchor>,
+    )> {
+        let g = self.inner.lock().expect("scanner");
+        g.record.as_ref().map(|c| {
+            (
+                c.lo.clone(),
+                c.hi.clone(),
+                c.frontier.clone(),
+                g.anchors.iter().cloned().collect(),
+            )
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn pinned(&self) -> usize {
         self.pins.lock().expect("pins").len()
     }
+}
+
+/// Stops the scanner's task cleanly, also on a panic: later requests start
+/// a new one, and requests still queued are dropped (their waiters fail).
+struct Driving {
+    inner: Arc<std::sync::Mutex<Inner>>,
+    armed: bool,
+}
+
+impl Drop for Driving {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.queue.clear();
+        g.driving = false;
+    }
+}
+
+/// The scanner's task: rounds, one at a time, while requests are queued.
+async fn drive(
+    inner: Arc<std::sync::Mutex<Inner>>,
+    pins: Pins,
+    limits: RecordLimits,
+) {
+    let mut guard = Driving {
+        inner: inner.clone(),
+        armed: true,
+    };
+    loop {
+        let round: Vec<(Request, Reply)> = {
+            let mut g = inner.lock().expect("scanner");
+            let round: Vec<_> = std::mem::take(&mut g.queue)
+                .into_iter()
+                .filter(|(_, reply)| !reply.is_closed())
+                .collect();
+            if round.is_empty() {
+                // Under the lock that queues: a request queued after this
+                // starts a new task.
+                g.driving = false;
+                drop(g);
+                guard.armed = false;
+                return;
+            }
+            round
+        };
+        run_round(&inner, &pins, limits, round).await;
+    }
+}
+
+/// A round's extension: `(from, to]`, at `anchor` when one is known.
+struct Extension {
+    from: MySqlCheckpoint,
+    to: MySqlCheckpoint,
+    anchor: Option<Anchor>,
+}
+
+async fn run_round(
+    inner: &std::sync::Mutex<Inner>,
+    pins: &Pins,
+    limits: RecordLimits,
+    round: Vec<(Request, Reply)>,
+) {
+    // One identity per round: the first request's. A concurrent request of
+    // another identity fails closed.
+    let identity = round[0].0.identity.clone();
+    let (round, others): (Vec<_>, Vec<_>) =
+        round.into_iter().partition(|(r, _)| r.identity == identity);
+    for (_, reply) in others {
+        let _ = reply.send(Err(ProofError::OtherServer(
+            "a concurrent proof request of another server identity".into(),
+        )));
+    }
+
+    // Prune at the lowest pin and stream boundary, and fix the snapshot the
+    // round builds on.
+    let (record, cached) = {
+        let mut g = inner.lock().expect("scanner");
+        if g.record.as_ref().is_some_and(|c| c.identity != identity) {
+            g.record = None;
+        }
+        g.anchors.retain(|a| identity.owns(a));
+        let boundaries: Vec<MySqlCheckpoint> = round
+            .iter()
+            .filter_map(|(r, _)| r.boundary.clone())
+            .collect();
+        prune(&mut g.record, pins, &boundaries);
+        (g.record.clone(), g.anchors.clone())
+    };
+
+    // The targets: the least start before `lo`, the greatest end after
+    // `hi` (with no record: the least start and the greatest end). A
+    // request unordered with the record or the round is refused alone.
+    let (lo, hi) = match &record {
+        Some(c) => match (wm(&c.lo), wm(&c.hi)) {
+            (Ok(lo), Ok(hi)) => (Some(lo), Some(hi)),
+            _ => (None, None),
+        },
+        None => (None, None),
+    };
+    let record = record.filter(|_| lo.is_some());
+    let mut left: Option<(usize, WmPos)> = None;
+    let mut right: Option<(usize, WmPos)> = None;
+    let mut members: Vec<(Request, Reply)> = Vec::new();
+    for (r, reply) in round {
+        let before_lo = match &lo {
+            None => Ok(true),
+            Some(lo) => match order_positions(&r.a, lo) {
+                CheckpointOrder::Before => Ok(true),
+                CheckpointOrder::Equal | CheckpointOrder::After => Ok(false),
+                CheckpointOrder::Incomparable => {
+                    Err("the start is unordered with the covered interval")
+                }
+            },
+        };
+        let after_hi = match &hi {
+            None => Ok(true),
+            Some(hi) => match order_positions(&r.b, hi) {
+                CheckpointOrder::After => Ok(true),
+                CheckpointOrder::Before | CheckpointOrder::Equal => Ok(false),
+                CheckpointOrder::Incomparable => {
+                    Err("the end is unordered with the covered interval")
+                }
+            },
+        };
+        let i = members.len();
+        let new_left = match before_lo {
+            Ok(true) => match &left {
+                None => Ok(Some((i, r.a.clone()))),
+                Some((_, l)) => match order_positions(&r.a, l) {
+                    CheckpointOrder::Before => Ok(Some((i, r.a.clone()))),
+                    CheckpointOrder::Equal | CheckpointOrder::After => Ok(None),
+                    CheckpointOrder::Incomparable => {
+                        Err("the start is unordered with the round's")
+                    }
+                },
+            },
+            Ok(false) => Ok(None),
+            Err(e) => Err(e),
+        };
+        let new_right = match after_hi {
+            Ok(true) => match &right {
+                None => Ok(Some((i, r.b.clone()))),
+                Some((_, rt)) => match order_positions(&r.b, rt) {
+                    CheckpointOrder::After => Ok(Some((i, r.b.clone()))),
+                    CheckpointOrder::Equal | CheckpointOrder::Before => {
+                        Ok(None)
+                    }
+                    CheckpointOrder::Incomparable => {
+                        Err("the end is unordered with the round's")
+                    }
+                },
+            },
+            Ok(false) => Ok(None),
+            Err(e) => Err(e),
+        };
+        match (new_left, new_right) {
+            (Ok(l), Ok(rt)) => {
+                if l.is_some() {
+                    left = l;
+                }
+                if rt.is_some() {
+                    right = rt;
+                }
+                members.push((r, reply));
+            }
+            (Err(why), _) | (_, Err(why)) => {
+                let _ = reply.send(Err(ProofError::Positions(why.into())));
+            }
+        }
+    }
+    if members.is_empty() {
+        return;
+    }
+
+    // The stream anchor at a start: the request's own, else a cached
+    // session anchor; only one taken at exactly that set, of this identity.
+    let anchor_at = |i: usize| -> Option<Anchor> {
+        let r = &members[i].0;
+        let set = gtid_set_of(&r.a)?;
+        r.anchor
+            .iter()
+            .chain(cached.iter().rev())
+            .find(|a| identity.owns(a) && a.set_before == set)
+            .cloned()
+    };
+    let mut extensions: Vec<Extension> = Vec::new();
+    match &record {
+        None => {
+            let (l, _) = left.as_ref().expect("a start without a record");
+            let (rt, _) = right.as_ref().expect("an end without a record");
+            extensions.push(Extension {
+                from: members[*l].0.head.clone(),
+                to: members[*rt].0.to.clone(),
+                anchor: anchor_at(*l),
+            });
+        }
+        Some(c) => {
+            if let Some((l, _)) = &left {
+                extensions.push(Extension {
+                    from: members[*l].0.head.clone(),
+                    to: c.lo.clone(),
+                    anchor: anchor_at(*l),
+                });
+            }
+            if let Some((rt, _)) = &right {
+                let hi_set = hi.as_ref().and_then(gtid_set_of);
+                extensions.push(Extension {
+                    from: c.hi.clone(),
+                    to: members[*rt].0.to.clone(),
+                    anchor: c.frontier.clone().filter(|f| {
+                        identity.owns(f)
+                            && Some(&f.set_before) == hi_set.as_ref()
+                    }),
+                });
+            }
+        }
+    }
+    let segments = members[0].0.segments.clone();
+    let source_id = members[0].0.source_id.clone();
+    let kind = members[0].0.kind;
+    let (requests, mut replies): (Vec<Request>, Vec<Reply>) =
+        members.into_iter().unzip();
+    let left_first = record.is_some() && left.is_some();
+
+    let mut tally = Tally::default();
+    let built = {
+        let physical = async {
+            let tag = ScanTag {
+                source_id: &source_id,
+                kind,
+            };
+            let mut staging: Option<Covered> = record.as_deref().cloned();
+            let mut yielded: Vec<Anchor> = Vec::new();
+            for (n, ext) in extensions.iter().enumerate() {
+                let r =
+                    extend(segments.as_ref(), ext, &tag, &mut tally).await?;
+                yielded.extend(r.session_anchor.clone());
+                let size: usize = r.statements.iter().map(entry_bytes).sum();
+                match staging.as_mut() {
+                    None => {
+                        staging = Some(Covered {
+                            identity: identity.clone(),
+                            lo: ext.from.clone(),
+                            hi: ext.to.clone(),
+                            statements: r.statements,
+                            bytes: size,
+                            frontier: r.frontier,
+                        })
+                    }
+                    Some(c) if left_first && n == 0 => {
+                        let mut s = r.statements;
+                        s.append(&mut c.statements);
+                        c.statements = s;
+                        c.bytes += size;
+                        c.lo = ext.from.clone();
+                    }
+                    Some(c) => {
+                        c.statements.extend(r.statements);
+                        c.bytes += size;
+                        c.hi = ext.to.clone();
+                        c.frontier = r.frontier;
+                    }
+                }
+            }
+            let staging =
+                staging.expect("a round has a record or an extension");
+            if staging.statements.len() > limits.max_statements
+                || staging.bytes > limits.max_bytes
+            {
+                return Err(ProofError::Limit(format!(
+                    "proof record bound ({} statements, {} bytes)",
+                    staging.statements.len(),
+                    staging.bytes
+                )));
+            }
+            Ok((staging, yielded))
+        };
+        // The round runs while any waiter remains.
+        let gone = async {
+            for r in replies.iter_mut() {
+                r.closed().await;
+            }
+        };
+        tokio::select! {
+            built = physical => Some(built),
+            () = gone => None,
+        }
+    };
+    drop(requests);
+    let Some(built) = built else {
+        return;
+    };
+    match built {
+        Ok((staging, yielded)) => {
+            tally.work.extensions_committed = extensions.len() as u32;
+            let committed = Arc::new(staging);
+            {
+                let mut g = inner.lock().expect("scanner");
+                g.record = Some(committed.clone());
+                for a in yielded {
+                    g.anchors.retain(|c| c.set_before != a.set_before);
+                    g.anchors.push_back(a);
+                    while g.anchors.len() > ANCHOR_CACHE {
+                        g.anchors.pop_front();
+                    }
+                }
+            }
+            for reply in replies {
+                let _ = reply.send(Ok(Served {
+                    record: committed.clone(),
+                    tally: tally.clone(),
+                }));
+            }
+        }
+        Err(e) => {
+            observe_round_failure(&source_id, kind, &tally.work);
+            for reply in replies {
+                let _ = reply.send(Err(e.clone()));
+            }
+        }
+    }
+}
+
+/// Errors after which a positioned attempt is followed by one bounded
+/// unanchored attempt: the start was refused or the stream failed. An
+/// identity, ordering, limit or framing refusal is not retried.
+fn falls_back(e: &ProofError) -> bool {
+    matches!(
+        e,
+        ProofError::AnchorMismatch(_)
+            | ProofError::NotReached(_)
+            | ProofError::Open(_)
+            | ProofError::Read(_)
+            | ProofError::SeekLimit(_)
+    )
+}
+
+/// One extension: at most one positioned attempt, then at most one
+/// unanchored one. Never a third.
+async fn extend(
+    segments: &dyn Segments,
+    ext: &Extension,
+    tag: &ScanTag<'_>,
+    tally: &mut Tally,
+) -> Result<ScanReport, ProofError> {
+    let gtid = ext.from.gtid_set.is_some();
+    let mut reason = "no_anchor";
+    if let Some(a) = &ext.anchor {
+        tally.work.positioned_attempts += 1;
+        tally.work.stream_openings += 1;
+        match segments.scan(&ext.from, &ext.to, Some(a), tag).await {
+            Ok(r) => {
+                tally.record(&r);
+                return Ok(r);
+            }
+            Err(e) if falls_back(&e) => {
+                tracing::warn!(
+                    source_id = tag.source_id,
+                    kind = tag.kind.as_str(),
+                    error = %e,
+                    "proof scan: the anchored start was refused; one bounded unanchored scan follows"
+                );
+                reason = "refused_anchor";
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    tally.work.stream_openings += 1;
+    if gtid {
+        tally.work.unanchored_attempts += 1;
+        metrics::counter!(
+            "deltaforge_mysql_proof_unanchored_total",
+            "kind" => tag.kind.as_str(),
+            "reason" => reason,
+        )
+        .increment(1);
+    }
+    let r = segments.scan(&ext.from, &ext.to, None, tag).await?;
+    tally.record(&r);
+    Ok(r)
+}
+
+impl Tally {
+    fn record(&mut self, r: &ScanReport) {
+        self.traces.push(r.trace.clone());
+        self.events += r.events;
+        self.bytes += r.bytes;
+    }
+}
+
+/// Drop recorded statements at or before the lowest of `boundaries` and
+/// every pin; a lowest point past `hi` clears the record. Unordered points
+/// prune nothing.
+fn prune(
+    state: &mut Option<Arc<Covered>>,
+    pins: &Pins,
+    boundaries: &[MySqlCheckpoint],
+) {
+    let Some(current) = state.as_ref() else {
+        return;
+    };
+    let mut points: Vec<(WmPos, MySqlCheckpoint)> = Vec::new();
+    for p in pins.lock().expect("pins").values().chain(boundaries) {
+        match wm(p) {
+            Ok(w) => points.push((w, p.clone())),
+            Err(_) => return,
+        }
+    }
+    let Some((mut low, mut low_cp)) = points.first().cloned() else {
+        return;
+    };
+    for (p, cp) in &points[1..] {
+        match order_positions(p, &low) {
+            CheckpointOrder::Before => (low, low_cp) = (p.clone(), cp.clone()),
+            CheckpointOrder::Equal | CheckpointOrder::After => {}
+            CheckpointOrder::Incomparable => return,
+        }
+    }
+    let (Ok(lo), Ok(hi)) = (wm(&current.lo), wm(&current.hi)) else {
+        *state = None;
+        return;
+    };
+    match (order_positions(&low, &lo), order_positions(&low, &hi)) {
+        (CheckpointOrder::Before | CheckpointOrder::Equal, _) => {}
+        (_, CheckpointOrder::After) => *state = None,
+        (
+            CheckpointOrder::After,
+            CheckpointOrder::Before | CheckpointOrder::Equal,
+        ) => {
+            let mut keep = Vec::with_capacity(current.statements.len());
+            for s in &current.statements {
+                match at_or_before(s, &low) {
+                    Some(true) => {}
+                    Some(false) => keep.push(s.clone()),
+                    None => {
+                        *state = None;
+                        return;
+                    }
+                }
+            }
+            let mut c = Covered::clone(current);
+            c.bytes = keep.iter().map(entry_bytes).sum();
+            c.statements = keep;
+            c.lo = MySqlCheckpoint {
+                lineage: c.lo.lineage.clone(),
+                ..low_cp
+            };
+            *state = Some(Arc::new(c));
+        }
+        _ => *state = None,
+    }
+}
+
+/// A failed round's work, for its metrics; never fails.
+fn observe_round_failure(source_id: &str, kind: ProofKind, work: &ProofWork) {
+    metrics::counter!(
+        "deltaforge_mysql_proof_rounds_failed_total",
+        "source" => source_id.to_string(),
+        "kind" => kind.as_str(),
+    )
+    .increment(1);
+    tracing::debug!(
+        source_id,
+        kind = kind.as_str(),
+        ?work,
+        "proof round failed"
+    );
 }
 
 /// Bounded metrics of a request (source, kind, how it was served) and the
@@ -526,7 +1068,7 @@ fn observe_request(
 }
 
 /// A request on the source's shared scanner, with physical extensions on
-/// its verified server.
+/// its verified server. `anchor`: the stream anchor at `from`, if any.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn shared_interval(
     scanner: &ProofScanner,
@@ -536,25 +1078,58 @@ pub(crate) async fn shared_interval(
     lineage_hash: &str,
     from: &MySqlCheckpoint,
     to: &MySqlCheckpoint,
+    anchor: Option<&Anchor>,
     boundary: Option<&MySqlCheckpoint>,
     tag: &ScanTag<'_>,
 ) -> Result<ScanReport, ProofError> {
-    let segments = LiveSegments {
+    let mut answers = shared_intervals(
+        scanner,
         dsn,
+        source_id,
+        server_uuid,
+        lineage_hash,
+        std::slice::from_ref(from),
+        to,
+        anchor,
+        boundary,
+        tag,
+    )
+    .await?;
+    Ok(answers.pop().expect("one answer per start"))
+}
+
+/// A batch on the source's shared scanner: every `(from_i, to]`, from one
+/// request (see [`ProofScanner::intervals`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn shared_intervals(
+    scanner: &ProofScanner,
+    dsn: &str,
+    source_id: &str,
+    server_uuid: &str,
+    lineage_hash: &str,
+    froms: &[MySqlCheckpoint],
+    to: &MySqlCheckpoint,
+    anchor: Option<&Anchor>,
+    boundary: Option<&MySqlCheckpoint>,
+    tag: &ScanTag<'_>,
+) -> Result<Vec<ScanReport>, ProofError> {
+    let segments = Arc::new(LiveSegments {
+        dsn: dsn.to_string(),
         server_id: super::mysql_helpers::derive_server_id(&format!(
             "{source_id}/proofs"
         )),
-        server_uuid,
-        lineage_hash,
-        limits: ScanLimits::default(),
-    };
+        server_uuid: server_uuid.to_string(),
+        lineage_hash: lineage_hash.to_string(),
+        limits: scanner.scan_limits,
+    });
     scanner
-        .interval(
-            &segments,
+        .intervals(
+            segments,
             server_uuid,
             lineage_hash,
-            from,
+            froms,
             to,
+            anchor,
             boundary,
             tag,
         )
@@ -576,6 +1151,10 @@ fn answer(
         bytes,
         duration: started.elapsed(),
         trace: Default::default(),
+        frontier: None,
+        session_anchor: None,
+        positioned_at: None,
+        work: ProofWork::default(),
     }
 }
 
@@ -605,13 +1184,27 @@ mod tests {
 
     /// A synthetic binlog: transaction k (1..) ends at position k and holds
     /// the statements `ddl[k]` (possibly several).
+    /// An attempt: (from, to, the anchor's offset if positioned).
+    type Attempt = (u64, u64, Option<u64>);
+    /// Reached and release signals of a blocked scan.
+    type Block = Option<(Arc<Notify>, Arc<Notify>)>;
+
+    #[derive(Clone)]
     struct Synth {
         gtid: bool,
         ddl: BTreeMap<u64, Vec<DdlEffect>>,
         /// Physical segments scanned: (from, to) transaction numbers.
-        scanned: Mutex<Vec<(u64, u64)>>,
-        fail_next: Mutex<bool>,
-        block: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+        scanned: Arc<Mutex<Vec<(u64, u64)>>>,
+        /// Every attempt: (from, to, the anchor's offset if positioned).
+        attempts: Arc<Mutex<Vec<Attempt>>>,
+        fail_next: Arc<Mutex<bool>>,
+        /// Attempts from this transaction fail, while set.
+        fail_at: Arc<Mutex<Option<u64>>>,
+        /// Attempts at an anchor fail with this, while set.
+        refuse_anchors: Arc<Mutex<Option<ProofError>>>,
+        /// Attempts without an anchor fail with this, while set.
+        fail_unanchored: Arc<Mutex<Option<ProofError>>>,
+        block: Arc<Mutex<Block>>,
     }
 
     impl Synth {
@@ -620,8 +1213,30 @@ mod tests {
                 gtid,
                 ddl: BTreeMap::new(),
                 scanned: Default::default(),
-                fail_next: Mutex::new(false),
-                block: Mutex::new(None),
+                attempts: Default::default(),
+                fail_next: Default::default(),
+                fail_at: Default::default(),
+                refuse_anchors: Default::default(),
+                fail_unanchored: Default::default(),
+                block: Default::default(),
+            }
+        }
+
+        fn seg(&self) -> Arc<dyn Segments> {
+            Arc::new(self.clone())
+        }
+
+        /// The boundary after transaction `k`, as a scan observes it.
+        fn anchor(&self, k: u64, next: bool) -> Anchor {
+            let p = self.at(k);
+            Anchor {
+                server_uuid: U.into(),
+                lineage: L.into(),
+                file: p.file.clone(),
+                offset: p.pos,
+                set_before: GtidSet::parse(p.gtid_set.as_deref().unwrap())
+                    .unwrap(),
+                next_gtid: next.then(|| format!("{U}:{}", k + 1)),
             }
         }
 
@@ -660,6 +1275,9 @@ mod tests {
 
         fn statements(&self, from: u64, to: u64) -> Vec<Statement> {
             let mut out = Vec::new();
+            if from >= to {
+                return out;
+            }
             for (k, effects) in self.ddl.range(from + 1..=to) {
                 for (j, effect) in effects.iter().enumerate() {
                     let event = if self.gtid {
@@ -710,6 +1328,7 @@ mod tests {
             &self,
             from: &MySqlCheckpoint,
             to: &MySqlCheckpoint,
+            anchor: Option<&Anchor>,
             _tag: &ScanTag<'_>,
         ) -> Result<ScanReport, ProofError> {
             let block = self.block.lock().unwrap().clone();
@@ -717,10 +1336,27 @@ mod tests {
                 reached.notify_one();
                 release.notified().await;
             }
-            if std::mem::take(&mut *self.fail_next.lock().unwrap()) {
+            let (a, b) = (self.number(from), self.number(to));
+            self.attempts.lock().unwrap().push((
+                a,
+                b,
+                anchor.map(|x| x.offset),
+            ));
+            if std::mem::take(&mut *self.fail_next.lock().unwrap())
+                || *self.fail_at.lock().unwrap() == Some(a)
+            {
                 return Err(ProofError::Open("purged".into()));
             }
-            let (a, b) = (self.number(from), self.number(to));
+            if let Some(a) = anchor {
+                // An anchor is only ever one taken at the start.
+                assert_eq!(a.offset, from.pos, "an anchor of another boundary");
+                if let Some(e) = self.refuse_anchors.lock().unwrap().clone() {
+                    return Err(e);
+                }
+            } else if let Some(e) = self.fail_unanchored.lock().unwrap().clone()
+            {
+                return Err(e);
+            }
             self.scanned.lock().unwrap().push((a, b));
             Ok(ScanReport {
                 digest: String::new(),
@@ -729,6 +1365,10 @@ mod tests {
                 bytes: 100 * (b - a),
                 duration: Default::default(),
                 trace: Default::default(),
+                frontier: self.gtid.then(|| self.anchor(b, false)),
+                session_anchor: self.gtid.then(|| self.anchor(a, true)),
+                positioned_at: anchor.map(|x| (x.file.clone(), x.offset)),
+                work: Default::default(),
             })
         }
     }
@@ -741,8 +1381,17 @@ mod tests {
         boundary: Option<u64>,
     ) -> Result<ScanReport, ProofError> {
         let bd = boundary.map(|k| syn.at(k));
-        sc.interval(syn, U, L, &syn.at(a), &syn.at(b), bd.as_ref(), &TAG)
-            .await
+        sc.interval(
+            syn.seg(),
+            U,
+            L,
+            &syn.at(a),
+            &syn.at(b),
+            None,
+            bd.as_ref(),
+            &TAG,
+        )
+        .await
     }
 
     async fn same_as_direct(sc: &ProofScanner, syn: &Synth, a: u64, b: u64) {
@@ -776,10 +1425,12 @@ mod tests {
     async fn unordered_positions_fail_closed() {
         let (g, f) = (Synth::new(true), Synth::new(false));
         let sc = ProofScanner::default();
-        let r = sc.interval(&g, U, L, &g.at(1), &f.at(5), None, &TAG).await;
+        let r = sc
+            .interval(g.seg(), U, L, &g.at(1), &f.at(5), None, None, &TAG)
+            .await;
         assert!(matches!(r, Err(ProofError::Positions(_))), "{r:?}");
         let r = sc
-            .interval(&g, U, "other", &g.at(1), &g.at(5), None, &TAG)
+            .interval(g.seg(), U, "other", &g.at(1), &g.at(5), None, None, &TAG)
             .await;
         assert!(matches!(r, Err(ProofError::Positions(_))), "{r:?}");
     }
@@ -922,22 +1573,299 @@ mod tests {
         }
     }
 
-    /// A failed extension clears the record: the next request rescans from
-    /// its own start, and is right.
+    async fn ask_at(
+        sc: &ProofScanner,
+        syn: &Synth,
+        a: u64,
+        b: u64,
+        boundary: Option<u64>,
+        anchor: Option<&Anchor>,
+    ) -> Result<ScanReport, ProofError> {
+        let bd = boundary.map(|k| syn.at(k));
+        sc.interval(
+            syn.seg(),
+            U,
+            L,
+            &syn.at(a),
+            &syn.at(b),
+            anchor,
+            bd.as_ref(),
+            &TAG,
+        )
+        .await
+    }
+
+    fn work(
+        extensions_committed: u32,
+        positioned_attempts: u32,
+        unanchored_attempts: u32,
+        stream_openings: u32,
+    ) -> ProofWork {
+        ProofWork {
+            extensions_committed,
+            positioned_attempts,
+            unanchored_attempts,
+            stream_openings,
+        }
+    }
+
+    /// No partial scanner state: a round that fails - its right extension
+    /// after its left one succeeded, its left one, or every attempt - leaves
+    /// the record, its frontier and the anchor cache exactly as they were,
+    /// and the next request equals a direct scan.
     #[tokio::test]
-    async fn a_failed_extension_clears_the_record() {
+    async fn a_failed_round_changes_nothing() {
         for gtid in modes() {
-            let syn = Synth::new(gtid).with(8, vec![table("f")]);
+            let syn = Synth::new(gtid)
+                .with(8, vec![table("f")])
+                .with(25, vec![table("g")]);
             let sc = ProofScanner::default();
+            ask(&sc, &syn, 10, 20, Some(10)).await.unwrap();
+            let before = sc.snapshot();
+            let fail = |e: Option<ProofError>| {
+                *syn.refuse_anchors.lock().unwrap() = e.clone();
+                *syn.fail_unanchored.lock().unwrap() = e;
+            };
+            // The right extension fails after the left one succeeded.
+            *syn.fail_at.lock().unwrap() = Some(20);
+            let r = ask(&sc, &syn, 5, 30, Some(5)).await;
+            assert!(matches!(r, Err(ProofError::Open(_))), "{r:?}");
+            assert!(sc.snapshot() == before, "{gtid}: right failed");
+            *syn.fail_at.lock().unwrap() = None;
+            // The left extension fails.
+            *syn.fail_at.lock().unwrap() = Some(5);
+            assert!(ask(&sc, &syn, 5, 30, Some(5)).await.is_err());
+            assert!(sc.snapshot() == before, "{gtid}: left failed");
+            *syn.fail_at.lock().unwrap() = None;
+            // Every attempt fails: at most two per extension, and the round
+            // stops at its first failed extension.
+            // With a stream anchor (GTID mode), the positioned attempt and
+            // one unanchored attempt; never a third.
+            fail(Some(ProofError::Open("down".into())));
+            let tried = syn.attempts.lock().unwrap().len();
+            let anchor = gtid.then(|| syn.anchor(5, true));
+            assert!(
+                ask_at(&sc, &syn, 5, 30, Some(5), anchor.as_ref())
+                    .await
+                    .is_err()
+            );
+            let made = syn.attempts.lock().unwrap().len() - tried;
+            assert_eq!(made, if gtid { 2 } else { 1 }, "{gtid}");
+            assert!(sc.snapshot() == before, "{gtid}: all failed");
+            fail(None);
+            same_as_direct(&sc, &syn, 5, 30).await;
+        }
+    }
+
+    /// GTID mode, the normal path: the first request (no anchor) makes one
+    /// bounded unanchored attempt; every later extension to the right is
+    /// positioned at the record's frontier; a request at a boundary with a
+    /// stream anchor extends to the left from it.
+    #[tokio::test]
+    async fn extensions_are_positioned_at_their_anchors() {
+        let syn = Synth::new(true).with(15, vec![table("p")]);
+        let sc = ProofScanner::default();
+        let r = ask(&sc, &syn, 10, 20, Some(10)).await.unwrap();
+        assert_eq!(r.work, work(1, 0, 1, 1));
+        let r = ask(&sc, &syn, 12, 30, Some(12)).await.unwrap();
+        assert_eq!(r.work, work(1, 1, 0, 1));
+        assert_eq!(
+            syn.attempts.lock().unwrap().last(),
+            Some(&(20, 30, Some(syn.at(20).pos)))
+        );
+        // Left (with the stream anchor at 5) and right in one round.
+        let r = ask_at(&sc, &syn, 5, 40, Some(5), Some(&syn.anchor(5, true)))
+            .await
+            .unwrap();
+        assert_eq!(r.work, work(2, 2, 0, 2));
+        assert_eq!(r.statements, syn.direct(5, 40).0);
+        assert_eq!(r.digest, syn.direct(5, 40).1);
+        // Answered from the record: no work.
+        let r = ask(&sc, &syn, 6, 40, Some(5)).await.unwrap();
+        assert_eq!(r.work, ProofWork::default());
+    }
+
+    /// A refused anchor costs exactly one bounded unanchored attempt; with
+    /// both extensions' anchors refused, a round makes at most 2
+    /// positioned and 2 unanchored attempts and 4 stream openings, and its
+    /// answers equal direct scans.
+    #[tokio::test]
+    async fn refused_anchors_are_bounded_per_extension() {
+        let syn = Synth::new(true)
+            .with(15, vec![table("p")])
+            .with(3, vec![table("q")]);
+        let sc = ProofScanner::default();
+        ask(&sc, &syn, 10, 20, Some(10)).await.unwrap();
+        *syn.refuse_anchors.lock().unwrap() =
+            Some(ProofError::AnchorMismatch("refused".into()));
+        let r = ask(&sc, &syn, 12, 30, Some(12)).await.unwrap();
+        assert_eq!(r.work, work(1, 1, 1, 2));
+        assert_eq!(r.statements, syn.direct(12, 30).0);
+        let r = ask_at(&sc, &syn, 2, 40, Some(2), Some(&syn.anchor(2, true)))
+            .await
+            .unwrap();
+        assert_eq!(r.work, work(2, 2, 2, 4));
+        assert_eq!(r.digest, syn.direct(2, 40).1);
+        // A refusal that is not the start's (another server): no fallback.
+        *syn.refuse_anchors.lock().unwrap() =
+            Some(ProofError::OtherServer("x".into()));
+        let tried = syn.attempts.lock().unwrap().len();
+        let r = ask(&sc, &syn, 30, 50, Some(30)).await;
+        assert!(matches!(r, Err(ProofError::OtherServer(_))), "{r:?}");
+        assert_eq!(syn.attempts.lock().unwrap().len() - tried, 1);
+    }
+
+    /// The bounded alternative's yield: a session anchor at the boundary it
+    /// started from, which positions a later request at that boundary.
+    #[tokio::test]
+    async fn an_unanchored_scan_yields_a_session_anchor() {
+        let syn = Synth::new(true);
+        let sc = ProofScanner::default();
+        let r = ask(&sc, &syn, 40, 50, Some(40)).await.unwrap();
+        assert_eq!(r.work, work(1, 0, 1, 1));
+        // The stream moves on: the record is pruned to 45.
+        ask(&sc, &syn, 45, 60, Some(45)).await.unwrap();
+        // A request at 40 again (a snapshot baseline, say): positioned.
+        let r = ask(&sc, &syn, 40, 60, Some(40)).await.unwrap();
+        assert_eq!(r.work, work(1, 1, 0, 1));
+        assert_eq!(
+            syn.attempts.lock().unwrap().last(),
+            Some(&(40, 45, Some(syn.at(40).pos)))
+        );
+        // Only an anchor at exactly the start's set is used.
+        let r = ask(&sc, &syn, 41, 60, Some(41)).await.unwrap();
+        assert_eq!(r.work, ProofWork::default(), "covered");
+        let r = ask(&sc, &syn, 39, 60, Some(39)).await.unwrap();
+        assert_eq!(r.work, work(1, 0, 1, 1));
+    }
+
+    /// A request queued while a round runs is served by exactly the next
+    /// round, with every other request queued meanwhile: one extension to
+    /// their greatest end, one answer each, equal to direct scans.
+    #[tokio::test]
+    async fn a_request_queued_during_a_round_joins_exactly_the_next_round() {
+        for gtid in modes() {
+            let syn = Arc::new(
+                Synth::new(gtid)
+                    .with(7, vec![table("a")])
+                    .with(25, vec![table("b")])
+                    .with(35, vec![table("c")]),
+            );
+            let sc = Arc::new(ProofScanner::default());
+            let (reached, release) =
+                (Arc::new(Notify::new()), Arc::new(Notify::new()));
+            *syn.block.lock().unwrap() =
+                Some((reached.clone(), release.clone()));
+            let r0 = tokio::spawn({
+                let (sc, syn) = (sc.clone(), syn.clone());
+                async move { ask(&sc, &syn, 0, 10, Some(0)).await }
+            });
+            reached.notified().await;
+            *syn.block.lock().unwrap() = None;
+            let queued: Vec<_> = [(5, 30), (8, 40), (2, 20)]
+                .into_iter()
+                .map(|(a, b)| {
+                    let (sc, syn) = (sc.clone(), syn.clone());
+                    tokio::spawn(async move {
+                        (a, b, ask(&sc, &syn, a, b, Some(a)).await)
+                    })
+                })
+                .collect();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            release.notify_one();
+            r0.await.unwrap().unwrap();
+            let mut works = Vec::new();
+            for q in queued {
+                let (a, b, r) = q.await.unwrap();
+                let r = r.unwrap();
+                assert_eq!((r.statements, r.digest), syn.direct(a, b));
+                works.push(r.work);
+            }
+            assert_eq!(
+                *syn.scanned.lock().unwrap(),
+                vec![(0, 10), (10, 40)],
+                "{gtid}"
+            );
+            assert!(works.iter().all(|w| *w == works[0]), "{works:?}");
+            assert_eq!(works[0].extensions_committed, 1);
+        }
+    }
+
+    /// A batch (one window's tables, each from its own start): one request,
+    /// one extension, an answer per start identical to a direct scan.
+    #[tokio::test]
+    async fn a_batch_is_one_request_with_an_answer_per_start() {
+        for gtid in modes() {
+            let syn = Synth::new(gtid)
+                .with(2, vec![table("a")])
+                .with(5, vec![table("b")])
+                .with(9, vec![table("c")]);
+            let sc = ProofScanner::default();
+            let starts = [3, 1, 7, 9];
+            let froms: Vec<_> = starts.iter().map(|&k| syn.at(k)).collect();
+            let answers = sc
+                .intervals(
+                    syn.seg(),
+                    U,
+                    L,
+                    &froms,
+                    &syn.at(9),
+                    None,
+                    Some(&syn.at(1)),
+                    &TAG,
+                )
+                .await
+                .unwrap();
+            assert_eq!(answers.len(), starts.len());
+            for (k, r) in starts.iter().zip(&answers) {
+                assert_eq!(
+                    (r.statements.clone(), r.digest.clone()),
+                    syn.direct(*k, 9)
+                );
+            }
+            assert_eq!(*syn.scanned.lock().unwrap(), vec![(1, 9)]);
+            assert_eq!(sc.pinned(), 0);
+        }
+    }
+
+    /// Shared work survives a cancelled waiter: the round continues for the
+    /// waiter that remains, and commits.
+    #[tokio::test]
+    async fn a_round_continues_while_any_waiter_remains() {
+        for gtid in modes() {
+            let syn = Arc::new(Synth::new(gtid).with(15, vec![table("w")]));
+            let sc = Arc::new(ProofScanner::default());
             ask(&sc, &syn, 0, 10, Some(0)).await.unwrap();
-            *syn.fail_next.lock().unwrap() = true;
-            assert!(matches!(
-                ask(&sc, &syn, 5, 20, Some(5)).await,
-                Err(ProofError::Open(_))
-            ));
-            assert_eq!(sc.retained().await, None);
-            same_as_direct(&sc, &syn, 5, 20).await;
-            assert_eq!(syn.scanned.lock().unwrap().last(), Some(&(5, 20)));
+            let (reached, release) =
+                (Arc::new(Notify::new()), Arc::new(Notify::new()));
+            // Hold the scanner in a round, so the next two share a round.
+            *syn.block.lock().unwrap() =
+                Some((reached.clone(), release.clone()));
+            let hold = tokio::spawn({
+                let (sc, syn) = (sc.clone(), syn.clone());
+                async move { ask(&sc, &syn, 1, 11, Some(1)).await }
+            });
+            reached.notified().await;
+            let leaves = tokio::spawn({
+                let (sc, syn) = (sc.clone(), syn.clone());
+                async move { ask(&sc, &syn, 2, 20, Some(2)).await }
+            });
+            let stays = tokio::spawn({
+                let (sc, syn) = (sc.clone(), syn.clone());
+                async move { ask(&sc, &syn, 3, 20, Some(3)).await }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            release.notify_one();
+            hold.await.unwrap().unwrap();
+            // Their round is now blocked in its extension.
+            reached.notified().await;
+            leaves.abort();
+            let _ = leaves.await;
+            *syn.block.lock().unwrap() = None;
+            release.notify_one();
+            let r = stays.await.unwrap().unwrap();
+            assert_eq!((r.statements, r.digest), syn.direct(3, 20));
+            assert_eq!(sc.snapshot().unwrap().1, syn.at(20));
         }
     }
 
@@ -982,7 +1910,16 @@ mod tests {
         let sc = ProofScanner::default();
         // (1) Same offset (after 4), B holds transaction 5.
         let r = sc
-            .interval(&syn, U, L, &syn.at(4), &mixed(&syn, 5, 4), None, &TAG)
+            .interval(
+                syn.seg(),
+                U,
+                L,
+                &syn.at(4),
+                &mixed(&syn, 5, 4),
+                None,
+                None,
+                &TAG,
+            )
             .await
             .unwrap();
         assert_eq!(r.statements, syn.direct(4, 5).0);
@@ -990,7 +1927,16 @@ mod tests {
         assert_eq!(*syn.scanned.lock().unwrap(), vec![(4, 5)]);
         // (2) Same set, a later offset: empty, no scan.
         let r = sc
-            .interval(&syn, U, L, &syn.at(5), &mixed(&syn, 5, 9), None, &TAG)
+            .interval(
+                syn.seg(),
+                U,
+                L,
+                &syn.at(5),
+                &mixed(&syn, 5, 9),
+                None,
+                None,
+                &TAG,
+            )
             .await
             .unwrap();
         assert!(r.statements.is_empty());
@@ -1001,13 +1947,13 @@ mod tests {
             ..syn.at(9)
         };
         let r = sc
-            .interval(&syn, U, L, &syn.at(4), &other, None, &TAG)
+            .interval(syn.seg(), U, L, &syn.at(4), &other, None, None, &TAG)
             .await;
         assert!(matches!(r, Err(ProofError::Positions(_))), "{r:?}");
         // A GTID position against a file position: refused.
         let f = Synth::new(false);
         let r = sc
-            .interval(&syn, U, L, &syn.at(4), &f.at(9), None, &TAG)
+            .interval(syn.seg(), U, L, &syn.at(4), &f.at(9), None, None, &TAG)
             .await;
         assert!(matches!(r, Err(ProofError::Positions(_))), "{r:?}");
     }
@@ -1026,11 +1972,12 @@ mod tests {
         // set, so the statement at 10 stays recorded.
         let r = sc
             .interval(
-                &syn,
+                syn.seg(),
                 U,
                 L,
                 &mixed(&syn, 5, 35),
                 &syn.at(40),
+                None,
                 Some(&mixed(&syn, 5, 35)),
                 &TAG,
             )
@@ -1058,9 +2005,18 @@ mod tests {
         let sc = ProofScanner::default();
         ask(&sc, &syn, 0, 10, None).await.unwrap();
         let other = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-        sc.interval(&syn, other, L, &syn.at(0), &syn.at(10), None, &TAG)
-            .await
-            .unwrap();
+        sc.interval(
+            syn.seg(),
+            other,
+            L,
+            &syn.at(0),
+            &syn.at(10),
+            None,
+            None,
+            &TAG,
+        )
+        .await
+        .unwrap();
         assert_eq!(*syn.scanned.lock().unwrap(), vec![(0, 10), (0, 10)]);
     }
 

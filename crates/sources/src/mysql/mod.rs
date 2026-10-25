@@ -30,6 +30,7 @@ mod mysql_errors;
 pub use mysql_errors::{LoopControl, MySqlSourceError, MySqlSourceResult};
 
 mod mysql_activation;
+mod mysql_activation_window;
 mod mysql_baseline;
 mod mysql_binlog_scan;
 mod mysql_checkpoint_lineage;
@@ -41,6 +42,7 @@ mod mysql_proof_scanner;
 mod mysql_selection;
 mod mysql_session;
 mod mysql_signature;
+mod mysql_window_speculation;
 use mysql_helpers::{checkpoint_lineage, prepare_client};
 
 pub mod mysql_decode;
@@ -246,6 +248,8 @@ pub struct MySqlSource {
     /// The commit policy and sink cohort a snapshot generation freezes, set
     /// by the runner before the source runs.
     pub snapshot_cohort: crate::SnapshotCohortSlot,
+    /// Schema-proof bounds: the activation window and the binlog seek.
+    pub proofs: deltaforge_config::MysqlProofCfg,
 }
 
 pub(crate) const HEARTBEAT_INTERVAL_SECS: u64 = 15;
@@ -315,8 +319,53 @@ pub(crate) struct RunCtx {
     /// The same position as binlog coordinates (lineage left unset): where a
     /// lazy baseline's scan starts.
     txn_eval_cp: Option<MySqlCheckpoint>,
-    /// The source's shared proof scanner (`mysql_proof_scanner`).
-    proof_scanner: mysql_proof_scanner::ProofScanner,
+    /// GTID mode: the physical start of the current transaction (its GTID
+    /// event), the first transaction after `txn_eval_cp`, observed on this
+    /// stream (a stream anchor, `docs/design/mysql-proof-seek.md`). Its
+    /// identity is the run's verified lineage, filled in when it is used;
+    /// it lives only while its transaction is open.
+    txn_anchor: Option<mysql_binlog_scan::Anchor>,
+    /// Where the last positioned event started (`next_event_position -
+    /// event_length`).
+    last_event_start: u64,
+    /// Events an activation window read ahead, dispatched before the
+    /// stream is read again (`mysql_activation_window`).
+    lookahead: std::collections::VecDeque<(
+        mysql_binlog_connector_rust::event::event_header::EventHeader,
+        mysql_binlog_connector_rust::event::event_data::EventData,
+    )>,
+    /// Events read from the stream while a window was admitted, with when
+    /// each was received; read before the stream is read again
+    /// (`mysql_activation_window`).
+    prefetched: std::collections::VecDeque<mysql_window_speculation::Held>,
+    /// The next held event's sequence number (from 1).
+    next_held_seq: u64,
+    /// The held sequence number of the event `read_next_event` last
+    /// returned (0: read from the stream).
+    last_seq: u64,
+    /// The speculative window, while its head is still ahead
+    /// (`mysql_window_speculation`).
+    pending: Option<mysql_window_speculation::Pending>,
+    /// Windows committed so far (the proof trace's window numbers).
+    window_seq: u64,
+    /// While the proof trace is on: each table of the last committed window
+    /// whose first row is not yet handed on, with its window and admission
+    /// rank (measurement only; empty otherwise).
+    release_watch: HashMap<(String, String), (u64, usize)>,
+    /// The read error that ended a prefetch: raised where the stream is
+    /// read next, once `prefetched` is empty.
+    prefetch_error:
+        Option<mysql_binlog_connector_rust::binlog_error::BinlogError>,
+    /// When the event `read_next_event` last returned was received.
+    last_received: std::time::Instant,
+    /// Proofs an activation window prepared, by table, consumed by the lazy
+    /// baseline of the table's rows.
+    prepared: HashMap<(String, String), mysql_activation_window::Prepared>,
+    /// Schema-proof bounds.
+    proofs: deltaforge_config::MysqlProofCfg,
+    /// The source's shared proof scanner (`mysql_proof_scanner`), shared
+    /// with a speculative window's capture task.
+    proof_scanner: Arc<mysql_proof_scanner::ProofScanner>,
     /// Validated activation timelines and row-time selections.
     selection: mysql_selection::Caches,
     /// The current lineage's failover anchor (`Some(None)`: not entered by
@@ -1508,7 +1557,11 @@ impl MySqlSource {
         // The generation this start ran, if any.
         // One proof scanner for the whole run: the snapshot's drift checks
         // and baselines, then the stream's proofs.
-        let proof_scanner = mysql_proof_scanner::ProofScanner::default();
+        let proof_scanner = mysql_proof_scanner::ProofScanner::default()
+            .with_scan_limits(mysql_binlog_scan::ScanLimits {
+                max_seek: Duration::from_millis(self.proofs.max_seek_ms),
+                ..Default::default()
+            });
         let mut generation_run: Option<MyGenerationRun> = None;
         // The anchor a snapshot of this start, or the completed generation,
         // leaves the stream at.
@@ -1734,7 +1787,20 @@ impl MySqlSource {
             lower_case_table_names,
             txn_eval: None,
             txn_eval_cp: None,
-            proof_scanner,
+            txn_anchor: None,
+            last_event_start: 0,
+            lookahead: Default::default(),
+            prefetched: Default::default(),
+            next_held_seq: 1,
+            last_seq: 0,
+            pending: None,
+            window_seq: 0,
+            release_watch: Default::default(),
+            prefetch_error: None,
+            last_received: std::time::Instant::now(),
+            prepared: Default::default(),
+            proofs: self.proofs.clone(),
+            proof_scanner: Arc::new(proof_scanner),
             selection: mysql_selection::Caches::new(&self.pipeline, &self.id),
             failover: None,
             drift_checked: Default::default(),
@@ -1878,7 +1944,16 @@ impl MySqlSource {
                 // (between transactions, with an established GTID position).
                 if let Some(rt) = rotation.as_mut() {
                     rt.drive_preflight(&ctx);
-                    if ctx.current_gtid.is_none() && ctx.last_gtid.is_some() {
+                    // Never while a window's read-ahead or prefetch is
+                    // queued: a new stream would resume before those
+                    // events and send them again.
+                    if ctx.current_gtid.is_none()
+                        && ctx.last_gtid.is_some()
+                        && ctx.lookahead.is_empty()
+                        && ctx.prefetched.is_empty()
+                        && ctx.prefetch_error.is_none()
+                        && ctx.pending.is_none()
+                    {
                         // A CloseUncertain/FailedClosed outcome returns an error from
                         // this block (gate 6); `loop_result?` re-propagates it before the
                         // teardown checkpoint put, so the checkpoint never advances.
@@ -1932,27 +2007,57 @@ impl MySqlSource {
                     continue;
                 }
 
+                // An activation window's read-ahead, in order, before the
+                // stream is read again. A connection drop injected at an
+                // event boundary (test hook) applies here too: the queue
+                // goes with the stream, and the resume starts at the last
+                // proven boundary.
+                if !ctx.lookahead.is_empty() && crate::stream_probe::take_disconnect() {
+                    ctx.abandon_open_transaction().await?;
+                    lost = true;
+                    continue;
+                }
+                if let Some((header, data)) = ctx.lookahead.pop_front() {
+                    advance_position(&mut ctx, &header);
+                    mysql_activation_window::dispatch_watched(&mut ctx, &header, data).await?;
+                    continue;
+                }
+
                 debug!(source_id=%ctx.source_id, "reading the next event ..");
                 // Idle-source wakeup: race the read against rotation activity so a
                 // rotation applies even when no binlog events are flowing.
                 let control: Result<(), LoopControl> = match rotation.as_mut() {
                     Some(rt) => tokio::select! {
-                        r = read_next_event(&mut stream, &ctx) => match r {
-                            Ok((header, data)) => {
-                                advance_position(&mut ctx, &header);
-                                dispatch_event(&mut ctx, &header, data).await?;
-                                Ok(())
-                            }
+                        r = read_next_event(&mut stream, &mut ctx) => match r {
+                            Ok((header, data)) => match mysql_activation_window::maybe_window(
+                                &mut ctx, &mut stream, &header, &data,
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    advance_position(&mut ctx, &header);
+                                    mysql_activation_window::dispatch_watched(&mut ctx, &header, data).await?;
+                                    Ok(())
+                                }
+                                Err(ctrl) => Err(ctrl),
+                            },
                             Err(ctrl) => Err(ctrl),
                         },
                         _ = rt.wait_activity() => continue,
                     },
-                    None => match read_next_event(&mut stream, &ctx).await {
-                        Ok((header, data)) => {
-                            advance_position(&mut ctx, &header);
-                            dispatch_event(&mut ctx, &header, data).await?;
-                            Ok(())
-                        }
+                    None => match read_next_event(&mut stream, &mut ctx).await {
+                        Ok((header, data)) => match mysql_activation_window::maybe_window(
+                            &mut ctx, &mut stream, &header, &data,
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                advance_position(&mut ctx, &header);
+                                mysql_activation_window::dispatch_watched(&mut ctx, &header, data).await?;
+                                Ok(())
+                            }
+                            Err(ctrl) => Err(ctrl),
+                        },
                         Err(ctrl) => Err(ctrl),
                     },
                 };
@@ -2513,6 +2618,14 @@ impl RunCtx {
     pub(crate) async fn abandon_open_transaction(
         &mut self,
     ) -> SourceResult<()> {
+        // What a window read ahead (or prefetched) is past the position a
+        // resume starts from: never dispatched.
+        self.lookahead.clear();
+        self.prefetched.clear();
+        self.prefetch_error = None;
+        // A speculative window goes too: its task is aborted.
+        self.pending = None;
+        self.prepared.clear();
         if !self.transaction_open() {
             return Ok(());
         }
@@ -2536,6 +2649,7 @@ impl RunCtx {
                 .map_err(|e| SourceError::Other(e.into()))?;
         }
         self.in_explicit_txn = false;
+        self.txn_anchor = None;
         self.message_ordinal = 0;
         self.query_ordinal = 0;
         self.rows_ordinal = 0;
@@ -2557,6 +2671,7 @@ impl RunCtx {
     /// are evaluated at the current position.
     pub(crate) fn mark_transaction_boundary(&mut self) {
         self.rows_ordinal = 0;
+        self.txn_anchor = None;
         let gtid = self.gtid_text();
         self.txn_eval = crate::durable_checkpoint::mysql_checkpoint_position(
             &self.last_file,
@@ -2571,6 +2686,20 @@ impl RunCtx {
             snapshot_completed: None,
             snapshot_chain: None,
         });
+    }
+
+    /// The stream anchor at `txn_eval_cp`, of the verified identity
+    /// `server_uuid` and `lineage`: the open transaction's GTID event.
+    pub(crate) fn stream_anchor(
+        &self,
+        server_uuid: &str,
+        lineage: &str,
+    ) -> Option<mysql_binlog_scan::Anchor> {
+        self.txn_anchor.as_ref().map(|a| mysql_binlog_scan::Anchor {
+            server_uuid: server_uuid.to_string(),
+            lineage: lineage.to_string(),
+            ..a.clone()
+        })
     }
 
     /// The verified `server_uuid` (the published registry lineage) that every
@@ -2726,6 +2855,8 @@ fn advance_position(
 ) {
     if header.next_event_position != 0 {
         ctx.last_pos = u64::from(header.next_event_position);
+        ctx.last_event_start =
+            ctx.last_pos.saturating_sub(u64::from(header.event_length));
     }
 }
 

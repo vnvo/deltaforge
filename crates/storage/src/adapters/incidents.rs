@@ -349,7 +349,9 @@ pub fn verified_start_check(
         // A value the source could not decode (an operator fixes the data
         // or the schema, then restarts): the same rule.
         (
-            ReasonCode::SourceDecodeFailed | ReasonCode::PgMessageTooLarge,
+            ReasonCode::SourceDecodeFailed
+            | ReasonCode::PgMessageTooLarge
+            | ReasonCode::MysqlCaptureContention,
             Component::Source { .. },
         ) => Some(PIPELINE_RECOVERED),
         _ => None,

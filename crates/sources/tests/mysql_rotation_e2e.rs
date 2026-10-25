@@ -377,6 +377,7 @@ fn mysql_rotation_cfg(db: &str, port: u16, proj: &Projected) -> MysqlSrcCfg {
             apply_timeout_ms: 30_000,
         }),
         type_mapping: Default::default(),
+        proofs: Default::default(),
     }
 }
 
@@ -463,7 +464,7 @@ async fn start_rotation_harness(
         tables: vec![format!("{db}.orders")],
         tenant: "acme".to_string(),
         pipeline: "test".to_string(),
-        registry: make_registry().await,
+        registry: test_common::registry_on(&backend).await,
         registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         backend: Arc::clone(&backend),
         outbox_tables: AllowList::default(),
@@ -475,6 +476,7 @@ async fn start_rotation_harness(
         table_options: Default::default(),
         rotation,
         snapshot_cohort: Default::default(),
+        proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
     };
 

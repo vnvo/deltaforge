@@ -176,6 +176,7 @@ async fn run(port: u16, id: &str, db: &str, snapshot: SnapshotMode) -> Run {
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let (tx, rx) = test_common::acked_channel(&src, &ckpt, &src.id, 1024);

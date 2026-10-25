@@ -169,6 +169,11 @@ struct Args {
     /// longer, a capacity sweep runs its steps).
     #[arg(long, default_value_t = 120)]
     scale_seconds: u64,
+    /// Count the DeltaForge runner's user-space instructions and cycles
+    /// with `perf stat` for 30 s from 15 s into each scale run's load
+    /// (hybrid CPUs: the scaled per-core-type counts are summed).
+    #[arg(long)]
+    perf_counters: bool,
     /// After the last row arrives, watch the PostgreSQL slot's
     /// confirmed_flush_lsn to measure WAL-feedback staleness.
     #[arg(long)]
@@ -3301,6 +3306,7 @@ async fn main() -> Result<()> {
             RUNNER_LOG
                 .set("warn,deltaforge::proof_trace=info".into())
                 .ok();
+            scale::PERF_COUNTERS.set(args.perf_counters).ok();
             let plan = scale::Plan {
                 tables: args.scale_tables.clone(),
                 active: args.scale_active.clone(),

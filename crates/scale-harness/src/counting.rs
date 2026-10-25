@@ -192,6 +192,59 @@ impl CountingBackend {
 
 #[async_trait]
 impl StorageBackend for CountingBackend {
+    async fn read_batch(
+        &self,
+        reads: &[storage::BatchRead],
+    ) -> Result<Vec<storage::BatchReadResult>> {
+        for r in reads {
+            let (storage::BatchRead::KvGet { ns, key }
+            | storage::BatchRead::LogLatest { ns, key }
+            | storage::BatchRead::LogHead { ns, key }
+            | storage::BatchRead::LogLen { ns, key }) = r;
+            if !self.is_uncounted(ns, key) {
+                self.read("read_batch", ns, key);
+            }
+        }
+        self.inner.read_batch(reads).await
+    }
+    async fn apply_batch(
+        &self,
+        batch: &storage::AtomicBatch,
+    ) -> Result<storage::BatchOutcome> {
+        self.inner.apply_batch(batch).await
+    }
+    async fn log_read_streams(
+        &self,
+        streams: &[(String, String)],
+    ) -> Result<Vec<Vec<storage::LogEntryMeta>>> {
+        let out = self.inner.log_read_streams(streams).await?;
+        let (mut raw, mut norm, mut counted) = (0, 0, false);
+        for ((ns, key), entries) in streams.iter().zip(&out) {
+            if self.is_uncounted(ns, key) {
+                continue;
+            }
+            counted = true;
+            self.read("log_read_streams", ns, key);
+            let (r, n) =
+                self.records(entries.iter().map(|e| e.value.as_slice()));
+            raw += r;
+            norm += n;
+        }
+        if counted {
+            // One call, however many streams it reads.
+            self.count_n("log_read_streams", raw, norm, 0);
+        }
+        Ok(out)
+    }
+    async fn log_find_capture(
+        &self,
+        ns: &str,
+        key: &str,
+        capture_id: &str,
+    ) -> Result<Option<(u64, Vec<u8>)>> {
+        self.read("log_find_capture", ns, key);
+        self.inner.log_find_capture(ns, key, capture_id).await
+    }
     async fn kv_get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {
         if self.is_uncounted(ns, key) {
             return self.inner.kv_get(ns, key).await;

@@ -37,12 +37,14 @@
 // this allow is removed there.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use mysql_async::prelude::Queryable;
 use mysql_binlog_connector_rust::binlog_client::BinlogClient;
 use mysql_binlog_connector_rust::event::event_data::EventData;
 use mysql_binlog_connector_rust::event::event_header::EventHeader;
+use mysql_binlog_connector_rust::event::rotate_event::RotateEvent;
 use sha2::{Digest, Sha256};
 
 use super::MySqlCheckpoint;
@@ -67,6 +69,11 @@ pub(crate) struct ScanLimits {
     pub max_events: u64,
     pub max_bytes: u64,
     pub max_duration: Duration,
+    /// The longest wait from opening the stream to its first transaction.
+    /// A GTID-positioned stream (no anchor) seeks server-side through the
+    /// file's earlier events; past this bound the scan fails closed with
+    /// `SeekLimit` instead of paying an unbounded seek.
+    pub max_seek: Duration,
 }
 
 impl Default for ScanLimits {
@@ -75,8 +82,29 @@ impl Default for ScanLimits {
             max_events: 50_000_000,
             max_bytes: 64 * 1024 * 1024 * 1024,
             max_duration: Duration::from_secs(600),
+            max_seek: Duration::from_secs(10),
         }
     }
+}
+
+/// A physical start for a GTID-mode scan (`docs/design/mysql-proof-seek.md`,
+/// "Positioned GTID scanning"): in `file` of the server `server_uuid`
+/// (lineage `lineage`), the transaction starting at `offset` is the first
+/// one not in `set_before`, and `next_gtid` is its GTID when known.
+///
+/// An anchor is only ever taken from a binlog stream at a transaction
+/// boundary, never from a status read, and lives in memory only. It is a
+/// hint: the scan validates the events the server sends from it, and GTID
+/// accounting (`B ⊆ A ∪ seen`) still decides the proof, so a wrong anchor
+/// costs a refused scan, never an incomplete proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Anchor {
+    pub server_uuid: String,
+    pub lineage: String,
+    pub file: String,
+    pub offset: u64,
+    pub set_before: GtidSet,
+    pub next_gtid: Option<String>,
 }
 
 /// One classified statement found in the interval.
@@ -96,6 +124,34 @@ pub(crate) struct ScanReport {
     pub duration: Duration,
     pub digest: String,
     pub trace: ScanTrace,
+    /// GTID mode, once the end was reached: the boundary after the last
+    /// transaction of `to`, observed at the terminal event (a record
+    /// frontier, to extend the interval from).
+    pub frontier: Option<Anchor>,
+    /// GTID mode: the first transaction the stream sent, observed at its
+    /// GTID event, with the start set (a session anchor).
+    pub session_anchor: Option<Anchor>,
+    /// Whether the stream started at an anchor, and where its first GTID
+    /// was validated.
+    pub positioned_at: Option<(String, u64)>,
+    /// The shared scanner's physical work for the request this answers
+    /// (zero for a direct scan).
+    pub work: ProofWork,
+}
+
+/// The physical work of one scanner round (`docs/design/mysql-proof-seek.md`,
+/// "Exact bounds"), attributed to every request the round serves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ProofWork {
+    /// Extensions of the record the round committed (at most 2).
+    pub extensions_committed: u32,
+    /// Scans opened at an anchor (at most one per extension).
+    pub positioned_attempts: u32,
+    /// GTID-positioned scans without an anchor, under `max_seek` (at most
+    /// one per extension).
+    pub unanchored_attempts: u32,
+    /// Replication streams opened (at most 4).
+    pub stream_openings: u32,
 }
 
 /// Which proof a scan or capture serves (bounded: a metric label).
@@ -190,7 +246,7 @@ pub(crate) struct ScanDetail {
 }
 
 /// Why a scan or capture failed (always fail-closed).
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub(crate) enum ProofError {
     #[error("positions cannot be used: {0}")]
     Positions(String),
@@ -220,6 +276,16 @@ pub(crate) enum ProofError {
     Unstable(u32),
     #[error("schema capture failed: {0}")]
     Capture(String),
+    /// The stream opened at an anchor did not start as the anchor claims:
+    /// refused before any statement counted (the caller may fall back).
+    #[error("the anchored start was refused: {0}")]
+    AnchorMismatch(String),
+    /// A GTID-positioned stream did not reach its first transaction within
+    /// `max_seek`: the server's seek through the file's earlier events.
+    #[error(
+        "the binlog seek exceeded its bound ({0}); the interval is unproven"
+    )]
+    SeekLimit(String),
 }
 
 fn add_gtid(set: &mut GtidSet, gtid: &str) -> Result<(), ProofError> {
@@ -318,6 +384,236 @@ fn harmless_unparsed(event_type: u8) -> bool {
         | 37 // VIEW_CHANGE
         | 39 // PARTIAL_UPDATE_ROWS
     )
+}
+
+/// STOP_EVENT: the server stopped writing this file (a restart follows).
+const STOP_EVENT: u8 = 3;
+/// INCIDENT_EVENT.
+const INCIDENT_EVENT: u8 = 26;
+
+/// Where a stream opened at an anchor stands, before its first GTID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Chain {
+    /// Nothing yet: the server's artificial Rotate must name the anchor.
+    Opening,
+    /// At the anchor: the first real event must start at its offset.
+    AtAnchor,
+    /// A Stop at the anchor offset: only the file's Rotate may follow.
+    Stopped,
+    /// Rotated to the next file: its setup events, then its first GTID.
+    Rotated,
+    /// The first GTID was validated, at this file and offset.
+    Passed { file: String, offset: u64 },
+}
+
+/// The validation of a stream opened at an [`Anchor`]
+/// (`docs/design/mysql-proof-seek.md`, "Validation after opening a stream at
+/// an anchor"). Fed every event before the first GTID. It accepts only:
+/// - the server's artificial Rotate naming the anchor;
+/// - its Format_description;
+/// - then, starting exactly at the anchor offset, either the GTID event,
+///   or a rotation to the next file in sequence: the file's own Rotate, or
+///   a Stop and the server's artificial Rotate as it opens the next file.
+///   The next file's artificial Rotate and setup events follow, then its
+///   first GTID (or, for a file with no transactions, its own rotation).
+///
+/// The first GTID must not be in the anchor's `set_before`, and must be
+/// `next_gtid` when that is known. Anything transactional before it is
+/// refused. It changes nothing: the walk still sees every event.
+#[derive(Debug)]
+pub(crate) struct AnchorCheck {
+    anchor: Anchor,
+    /// The file the next positioned event belongs to.
+    file: String,
+    state: Chain,
+}
+
+impl AnchorCheck {
+    pub(crate) fn new(anchor: Anchor) -> Self {
+        Self {
+            file: anchor.file.clone(),
+            anchor,
+            state: Chain::Opening,
+        }
+    }
+
+    /// The file and offset of the first GTID, once validated: the
+    /// effective physical start.
+    pub(crate) fn passed(&self) -> Option<(&str, u64)> {
+        match &self.state {
+            Chain::Passed { file, offset } => Some((file, *offset)),
+            _ => None,
+        }
+    }
+
+    fn refuse(&self, why: String) -> ProofError {
+        ProofError::AnchorMismatch(format!(
+            "{why} (anchor {}:{}, state {:?})",
+            self.anchor.file, self.anchor.offset, self.state
+        ))
+    }
+
+    /// A rotation to the next file of the server's normal sequence.
+    fn rotate_to(&mut self, r: &RotateEvent) -> Result<(), ProofError> {
+        if !is_next_file(&self.file, &r.binlog_filename)
+            || r.binlog_position != 4
+        {
+            return Err(self.refuse(format!(
+                "a Rotate out of sequence, to {}:{}",
+                r.binlog_filename, r.binlog_position
+            )));
+        }
+        self.file = r.binlog_filename.clone();
+        self.state = Chain::Rotated;
+        Ok(())
+    }
+
+    /// Validate one event received before the first GTID.
+    pub(crate) fn check(
+        &mut self,
+        header: &EventHeader,
+        data: &EventData,
+    ) -> Result<(), ProofError> {
+        if self.passed().is_some() {
+            return Ok(());
+        }
+        let artificial = header.next_event_position == 0;
+        let start = u64::from(header.next_event_position)
+            .saturating_sub(u64::from(header.event_length));
+        let at_anchor =
+            |c: &Self| c.file == c.anchor.file && start == c.anchor.offset;
+        match (data, &self.state) {
+            (EventData::HeartBeat, _) => Ok(()),
+            (EventData::Rotate(r), Chain::Opening) if artificial => {
+                if r.binlog_filename == self.anchor.file
+                    && r.binlog_position == self.anchor.offset
+                {
+                    self.state = Chain::AtAnchor;
+                    Ok(())
+                } else {
+                    Err(self.refuse(format!(
+                        "the stream opened at {}:{}",
+                        r.binlog_filename, r.binlog_position
+                    )))
+                }
+            }
+            (_, Chain::Opening) => Err(self.refuse(
+                "the stream did not open with a Rotate to the anchor".into(),
+            )),
+            (
+                EventData::FormatDescription(_),
+                Chain::AtAnchor | Chain::Rotated,
+            ) => Ok(()),
+            (EventData::PreviousGtids(_), Chain::Rotated) => Ok(()),
+            (EventData::NotSupported, Chain::AtAnchor | Chain::Rotated)
+                if header.event_type == STOP_EVENT && !artificial =>
+            {
+                if self.state == Chain::Rotated || at_anchor(self) {
+                    self.state = Chain::Stopped;
+                    Ok(())
+                } else {
+                    Err(self.refuse(format!("a Stop at offset {start}")))
+                }
+            }
+            // The file's own Rotate, at the end of the anchor's file or of
+            // an empty file after it; or, after a Stop (a file the server
+            // stopped writing has no Rotate of its own), the server's
+            // artificial Rotate as it opens the next file.
+            (EventData::Rotate(r), Chain::AtAnchor | Chain::Rotated)
+                if !artificial =>
+            {
+                if self.state == Chain::AtAnchor && !at_anchor(self) {
+                    return Err(self.refuse(format!(
+                        "the file's Rotate at offset {start}"
+                    )));
+                }
+                self.rotate_to(r)
+            }
+            (EventData::Rotate(r), Chain::Stopped) if artificial => {
+                self.rotate_to(r)
+            }
+            // The server's artificial Rotate as it opens the file the chain
+            // just rotated to.
+            (EventData::Rotate(r), Chain::Rotated) if artificial => {
+                if r.binlog_filename == self.file && r.binlog_position == 4 {
+                    Ok(())
+                } else {
+                    Err(self.refuse(format!(
+                        "the server opened {}:{}",
+                        r.binlog_filename, r.binlog_position
+                    )))
+                }
+            }
+            (EventData::Gtid(g), Chain::AtAnchor | Chain::Rotated) => {
+                if self.state == Chain::AtAnchor && !at_anchor(self) {
+                    return Err(self.refuse(format!(
+                        "the first GTID {} starts at offset {start}",
+                        g.gtid
+                    )));
+                }
+                if self.anchor.set_before.contains(&g.gtid) {
+                    return Err(self.refuse(format!(
+                        "the first GTID {} is already in the anchor's set",
+                        g.gtid
+                    )));
+                }
+                if let Some(want) = &self.anchor.next_gtid
+                    && !want.eq_ignore_ascii_case(&g.gtid)
+                {
+                    return Err(self.refuse(format!(
+                        "the first GTID is {}, not {want}",
+                        g.gtid
+                    )));
+                }
+                self.state = Chain::Passed {
+                    file: self.file.clone(),
+                    offset: start,
+                };
+                Ok(())
+            }
+            (EventData::NotSupported, _)
+                if header.event_type == INCIDENT_EVENT =>
+            {
+                Err(ProofError::Incident)
+            }
+            (other, _) => Err(self.refuse(format!(
+                "a {} event before the first GTID",
+                event_kind(header, other)
+            ))),
+        }
+    }
+}
+
+/// `next` is the binlog file after `file`: same base name, index plus one.
+fn is_next_file(file: &str, next: &str) -> bool {
+    use crate::durable_checkpoint::binlog_file_parts;
+    match (binlog_file_parts(file), binlog_file_parts(next)) {
+        (Some((b1, i1)), Some((b2, i2))) => b1 == b2 && i2 == i1 + 1,
+        _ => false,
+    }
+}
+
+/// A short name for an event, for refusals.
+fn event_kind(header: &EventHeader, data: &EventData) -> String {
+    match data {
+        EventData::Query(q) => {
+            format!("query ({})", q.query.chars().take(40).collect::<String>())
+        }
+        EventData::TableMap(_) => "table map".into(),
+        EventData::WriteRows(_)
+        | EventData::UpdateRows(_)
+        | EventData::DeleteRows(_) => "rows".into(),
+        EventData::Xid(_) => "Xid".into(),
+        EventData::TransactionPayload(_) => "transaction payload".into(),
+        EventData::Rotate(_) => "Rotate".into(),
+        EventData::FormatDescription(_) => "Format_description".into(),
+        EventData::PreviousGtids(_) => "Previous_gtids".into(),
+        EventData::Gtid(_) => "GTID".into(),
+        EventData::NotSupported if header.event_type == ANONYMOUS_GTID => {
+            "anonymous GTID".into()
+        }
+        _ => format!("type {}", header.event_type),
+    }
 }
 
 struct Walk {
@@ -478,6 +774,36 @@ pub(crate) async fn scan_interval(
     limits: &ScanLimits,
     tag: &ScanTag<'_>,
 ) -> Result<ScanReport, ProofError> {
+    scan_interval_at(
+        dsn,
+        server_id,
+        server_uuid,
+        lineage_hash,
+        from,
+        to,
+        None,
+        limits,
+        tag,
+    )
+    .await
+}
+
+/// [`scan_interval`], opening a GTID-mode stream at `anchor` when one is
+/// given: an anchor taken at `from` (its set before is exactly `from`'s), of
+/// this server and lineage. Without one, the server seeks from the start of
+/// the file, bounded by `limits.max_seek`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn scan_interval_at(
+    dsn: &str,
+    server_id: u64,
+    server_uuid: &str,
+    lineage_hash: &str,
+    from: &MySqlCheckpoint,
+    to: &MySqlCheckpoint,
+    anchor: Option<&Anchor>,
+    limits: &ScanLimits,
+    tag: &ScanTag<'_>,
+) -> Result<ScanReport, ProofError> {
     let scan_id =
         NEXT_SCAN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let detail = trace_enabled();
@@ -492,6 +818,7 @@ pub(crate) async fn scan_interval(
         lineage_hash,
         from,
         to,
+        anchor,
         limits,
         detail,
         &mut trace,
@@ -574,6 +901,7 @@ async fn scan(
     lineage_hash: &str,
     from: &MySqlCheckpoint,
     to: &MySqlCheckpoint,
+    anchor: Option<&Anchor>,
     limits: &ScanLimits,
     detail: bool,
     trace: &mut ScanTrace,
@@ -601,6 +929,10 @@ async fn scan(
         bytes: 0,
         duration: started.elapsed(),
         trace: ScanTrace::default(),
+        frontier: None,
+        session_anchor: None,
+        positioned_at: None,
+        work: ProofWork::default(),
     };
     match order_positions(&pf, &pt) {
         CheckpointOrder::Equal => return Ok(empty(Vec::new())),
@@ -646,6 +978,41 @@ async fn scan(
     } else {
         GtidSet::new()
     };
+    // An anchor: the physical start of a GTID-mode stream. Only one taken at
+    // this request's A, of this server and lineage, is used; the stream it
+    // opens is validated before any statement counts (`AnchorCheck`).
+    let mut check = match anchor {
+        None => None,
+        Some(a) => {
+            if !gtid_mode {
+                return Err(ProofError::Positions(
+                    "an anchor for a file/position interval".into(),
+                ));
+            }
+            if !a.server_uuid.eq_ignore_ascii_case(server_uuid)
+                || a.lineage != lineage_hash
+            {
+                return Err(ProofError::OtherServer(format!(
+                    "an anchor of {} (lineage {})",
+                    a.server_uuid, a.lineage
+                )));
+            }
+            if a.set_before != done {
+                return Err(ProofError::Positions(format!(
+                    "an anchor after {} for an interval from {done}",
+                    a.set_before
+                )));
+            }
+            client.gtid_start = Some((
+                a.file.clone(),
+                u32::try_from(a.offset).map_err(|_| {
+                    ProofError::Positions("anchor offset out of range".into())
+                })?,
+            ));
+            Some(AnchorCheck::new(a.clone()))
+        }
+    };
+    let from_set = done.clone();
     // Trace only: the start set (to recognise a transaction decoded before
     // the start) and the source server's transactions in the interval.
     let start_set = (detail && gtid_mode).then(|| done.clone());
@@ -686,6 +1053,8 @@ async fn scan(
     let opened = Instant::now();
     trace.setup = opened - started;
     let mut first_at: Option<Instant> = None;
+    // The first transaction's GTID event: file, start offset and GTID.
+    let mut first_txn: Option<(String, u64, String)> = None;
     // The session's abortive close was armed right after it connected (see
     // `open_replication_session_abortive`): however this scan ends -
     // completion, error, timeout, or the future being cancelled or dropped -
@@ -694,15 +1063,54 @@ async fn scan(
     // thread ends. No connection is ever killed by id (ids can be reused).
     let walked: Result<(u64, u64), ProofError> = async {
         let (mut events, mut bytes) = (0u64, 0u64);
+        // The position of the last heartbeat at or past the end position:
+        // two in a row there, with the end not reached, is the live end.
+        let mut beat_at_end: Option<u64> = None;
         while !walk.reached {
-            let left = limits
+            let mut left = limits
                 .max_duration
                 .checked_sub(started.elapsed())
                 .ok_or_else(|| ProofError::Limit("time".into()))?;
-            let (header, data) = tokio::time::timeout(left, stream.read())
+            // In GTID mode, until the first transaction, the wait is also
+            // bounded by the seek bound (the server's seek through the
+            // file's earlier events, for a stream without an anchor).
+            let seeking = gtid_mode && first_txn.is_none();
+            if seeking {
+                let seek_left =
+                    limits.max_seek.checked_sub(opened.elapsed()).ok_or_else(
+                        || seek_limit(limits.max_seek),
+                    )?;
+                left = left.min(seek_left);
+            }
+            let (header, data) = match tokio::time::timeout(left, stream.read())
                 .await
-                .map_err(|_| ProofError::Limit("time".into()))?
-                .map_err(|e| ProofError::Read(e.to_string()))?;
+            {
+                Ok(r) => r.map_err(|e| ProofError::Read(e.to_string()))?,
+                Err(_) if seeking && opened.elapsed() >= limits.max_seek => {
+                    return Err(seek_limit(limits.max_seek));
+                }
+                Err(_) => return Err(ProofError::Limit("time".into())),
+            };
+            if let Some(c) = check.as_mut() {
+                c.check(&header, &data)?;
+            }
+            if gtid_mode && matches!(data, EventData::HeartBeat) {
+                let here = u64::from(header.next_event_position);
+                if at_or_past(&walk.file, here, to) {
+                    if beat_at_end == Some(here) {
+                        return Err(ProofError::NotReached(format!(
+                            "the stream is at its live end ({}:{here}) without \
+                             the end position",
+                            walk.file
+                        )));
+                    }
+                    beat_at_end = Some(here);
+                } else {
+                    beat_at_end = None;
+                }
+            } else if !matches!(data, EventData::HeartBeat) {
+                beat_at_end = None;
+            }
             if !matches!(data, EventData::HeartBeat) {
                 events += 1;
                 bytes += u64::from(header.event_length);
@@ -732,6 +1140,16 @@ async fn scan(
                 );
             }
             walk.event(&header, &data)?;
+            if let EventData::Gtid(g) = &data
+                && first_txn.is_none()
+            {
+                first_txn = Some((
+                    walk.file.clone(),
+                    u64::from(header.next_event_position)
+                        .saturating_sub(u64::from(header.event_length)),
+                    g.gtid.clone(),
+                ));
+            }
             if !protocol && trace.first.is_none() {
                 first_at = Some(Instant::now());
                 trace.first = Some(DecodedAt {
@@ -794,6 +1212,25 @@ async fn scan(
     }
     trace.detail = det;
     let (events, bytes) = walked?;
+    let anchor_at =
+        |file: String, offset: u64, set_before: GtidSet, next_gtid| Anchor {
+            server_uuid: server_uuid.to_string(),
+            lineage: lineage_hash.to_string(),
+            file,
+            offset,
+            set_before,
+            next_gtid,
+        };
+    // The boundary after the last transaction of `to` (at reach, `done` is
+    // exactly `to`: a GTID outside it is an overshoot).
+    let frontier = (gtid_mode && walk.reached)
+        .then(|| trace.terminal.clone())
+        .flatten()
+        .map(|t| anchor_at(t.file, t.end_pos, walk.done.clone(), None));
+    let session_anchor =
+        first_txn.filter(|_| gtid_mode).map(|(file, offset, gtid)| {
+            anchor_at(file, offset, from_set.clone(), Some(gtid))
+        });
     Ok(ScanReport {
         digest: scan_digest(&pf, &pt, &walk.statements),
         statements: walk.statements,
@@ -801,7 +1238,27 @@ async fn scan(
         bytes,
         duration: started.elapsed(),
         trace: ScanTrace::default(),
+        frontier,
+        session_anchor,
+        positioned_at: check
+            .as_ref()
+            .and_then(|c| c.passed())
+            .map(|(f, o)| (f.to_string(), o)),
+        work: ProofWork::default(),
     })
+}
+
+fn seek_limit(bound: Duration) -> ProofError {
+    ProofError::SeekLimit(format!("no transaction within {bound:?} of opening"))
+}
+
+/// Is the stream at `(file, pos)` at or past `to`'s binlog position?
+fn at_or_past(file: &str, pos: u64, to: &MySqlCheckpoint) -> bool {
+    use crate::durable_checkpoint::binlog_file_parts;
+    match (binlog_file_parts(file), binlog_file_parts(&to.file)) {
+        (Some((b, i)), Some((tb, ti))) if b == tb => (i, pos) >= (ti, to.pos),
+        _ => false,
+    }
 }
 
 /// Classify one decoded event (trace target only; never fails).
@@ -963,7 +1420,7 @@ async fn read_position(
 
 /// Bound on waiting for the table's metadata lock (a DDL in progress on the
 /// table): a capture that cannot lock fails, never reads unlocked.
-const LOCK_WAIT_SECS: u32 = 30;
+pub(crate) const LOCK_WAIT_SECS: u32 = 30;
 
 fn quoted(db: &str, table: &str) -> String {
     let q = |s: &str| format!("`{}`", s.replace('`', "``"));
@@ -1073,6 +1530,324 @@ pub(crate) async fn capture(
     })
 }
 
+/// Kills its connection on the server when dropped while armed (`id`
+/// non-zero), from a detached task, bounded in time.
+struct KillOnDrop {
+    dsn: String,
+    id: u32,
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if self.id == 0 {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (dsn, id) = (std::mem::take(&mut self.dsn), self.id);
+        rt.spawn(async move {
+            let kill = async {
+                let mut c =
+                    mysql_async::Conn::from_url(dsn.as_str()).await.ok()?;
+                c.query_drop(format!("KILL {id}")).await.ok();
+                c.disconnect().await.ok()
+            };
+            tokio::time::timeout(Duration::from_secs(10), kill)
+                .await
+                .ok();
+        });
+    }
+}
+
+/// The shapes of a window's tables read between two server positions in one
+/// transaction (`docs/design/mysql-proof-seek.md`, "Batched capture"): every
+/// table's metadata lock is taken first, in sorted `(schema, table)` order,
+/// and held across both position reads, so each table's shape is exactly
+/// what [`capture`] would read over `[from, position]`.
+#[derive(Debug, Clone)]
+pub(crate) struct BatchCaptured {
+    pub from: MySqlCheckpoint,
+    pub position: MySqlCheckpoint,
+    pub schemas: HashMap<(String, String), MySqlTableSchema>,
+    /// Tables that do not exist (dropped since their rows): no shape.
+    pub missing: Vec<(String, String)>,
+    pub trace: CaptureTrace,
+}
+
+impl BatchCaptured {
+    /// One table's capture, as [`capture`] returns it.
+    pub(crate) fn table(&self, db: &str, table: &str) -> Option<Captured> {
+        let schema = self.schemas.get(&(db.to_string(), table.to_string()))?;
+        Some(Captured {
+            from: self.from.clone(),
+            position: self.position.clone(),
+            schema: schema.clone(),
+            attempts: 1,
+            trace: self.trace.clone(),
+        })
+    }
+}
+
+/// Why a batched capture failed: a lock it could not take (a timeout or a
+/// deadlock: retried in the same sorted order) or anything else.
+#[derive(Debug)]
+pub(crate) enum BatchCaptureError {
+    Contention { code: u16, why: String },
+    Failed(ProofError),
+}
+
+/// The most tables one batched capture takes (an activation window closes
+/// at it), and the most bytes of its lock request: one request a server
+/// accepts whatever its `max_allowed_packet` (at least 1 MiB) and limit of
+/// prepared-statement parameters.
+pub(crate) const MAX_BATCH_TABLES: usize = 2048;
+pub(crate) const MAX_LOCK_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// The lock statements of a batch, in its sorted order, as one request:
+/// one `SELECT 1 FROM t LIMIT 0` per table. `None` when the request would
+/// exceed its bounds.
+fn lock_request(tables: &[(&str, &str)]) -> Option<String> {
+    if tables.len() > MAX_BATCH_TABLES {
+        return None;
+    }
+    let mut sql = String::new();
+    for (db, table) in tables {
+        sql.push_str("SELECT 1 FROM ");
+        sql.push_str(&quoted(db, table));
+        sql.push_str(" LIMIT 0;");
+        if sql.len() > MAX_LOCK_REQUEST_BYTES {
+            return None;
+        }
+    }
+    Some(sql)
+}
+
+const ER_LOCK_WAIT_TIMEOUT: u16 = 1205;
+const ER_LOCK_DEADLOCK: u16 = 1213;
+const ER_NO_SUCH_TABLE: u16 = 1146;
+
+fn server_code(e: &mysql_async::Error) -> Option<u16> {
+    match e {
+        mysql_async::Error::Server(s) => Some(s.code),
+        _ => None,
+    }
+}
+
+/// A failed statement of a batched capture: the connection (I/O or the
+/// driver) as `Open`, anything the server answered as `Capture`.
+fn batch_error(e: mysql_async::Error, what: &str) -> BatchCaptureError {
+    BatchCaptureError::Failed(match e {
+        mysql_async::Error::Io(_) | mysql_async::Error::Driver(_) => {
+            ProofError::Open(format!("{what}: {e}"))
+        }
+        _ => ProofError::Capture(format!("{what}: {e}")),
+    })
+}
+
+/// Take `tables`' metadata locks, in their order, in one request.
+async fn lock_all(
+    conn: &mut mysql_async::Conn,
+    tables: &[(&str, &str)],
+) -> Result<(), BatchCaptureError> {
+    if tables.is_empty() {
+        return Ok(());
+    }
+    let sql = lock_request(tables).ok_or_else(|| {
+        BatchCaptureError::Failed(ProofError::Capture(format!(
+            "the lock request for {} tables exceeds its bounds ({MAX_BATCH_TABLES} \
+             tables, {MAX_LOCK_REQUEST_BYTES} bytes)",
+            tables.len()
+        )))
+    })?;
+    let lock_failed = |e: mysql_async::Error| match server_code(&e) {
+        Some(code @ (ER_LOCK_WAIT_TIMEOUT | ER_LOCK_DEADLOCK)) => {
+            BatchCaptureError::Contention {
+                code,
+                why: format!("metadata locks: {e}"),
+            }
+        }
+        _ => batch_error(e, "metadata locks"),
+    };
+    // Exactly one result per statement, read in turn: a statement's error
+    // (its lock timeout or deadlock) surfaces as its result is read.
+    let mut result = conn.query_iter(sql).await.map_err(lock_failed)?;
+    for _ in 0..tables.len() {
+        result.for_each(|_| {}).await.map_err(lock_failed)?;
+    }
+    let extra = !result.is_empty();
+    result.drop_result().await.map_err(lock_failed)?;
+    if extra {
+        return Err(BatchCaptureError::Failed(ProofError::Capture(format!(
+            "the lock request returned more than its {} results",
+            tables.len()
+        ))));
+    }
+    Ok(())
+}
+
+/// One batched capture attempt (see [`BatchCaptured`]); `lock_wait_secs`
+/// bounds each table's lock wait. `after_first_lock` runs once the first
+/// table is locked (tests use it to race a multi-table DDL; production
+/// passes `None`).
+pub(crate) async fn capture_batch(
+    dsn: &str,
+    server_uuid: &str,
+    lineage_hash: &str,
+    tables: &[(String, String)],
+    lock_wait_secs: u32,
+    after_first_lock: Option<BetweenHook<'_>>,
+) -> Result<BatchCaptured, BatchCaptureError> {
+    let failed = |e: ProofError| BatchCaptureError::Failed(e);
+    let mut sorted: Vec<(String, String)> = tables.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    let pool = mysql_async::Pool::new(dsn);
+    let mut trace = CaptureTrace::default();
+    let t0 = Instant::now();
+    // A capture dropped mid-flight (its window failed, was abandoned or
+    // the run stopped) is killed on the server: its read-only transaction
+    // rolls back and its metadata locks are released at once, instead of
+    // when its query ends.
+    let mut guard = KillOnDrop {
+        dsn: dsn.to_string(),
+        id: 0,
+    };
+    let result = async {
+        let mut conn = pool
+            .get_conn()
+            .await
+            .map_err(|e| batch_error(e, "connect"))?;
+        guard.id = conn.id();
+        let mode: Option<String> = conn
+            .query_first("SELECT @@GLOBAL.gtid_mode")
+            .await
+            .map_err(|e| batch_error(e, "gtid_mode"))?;
+        let gtid_mode = mode.is_some_and(|m| m.eq_ignore_ascii_case("ON"));
+        // Identity first: nothing is locked or read on another server.
+        let live: Option<String> = conn
+            .query_first("SELECT @@GLOBAL.server_uuid")
+            .await
+            .map_err(|e| batch_error(e, "server_uuid"))?;
+        if !live
+            .as_deref()
+            .is_some_and(|l| server_uuid.eq_ignore_ascii_case(l.trim()))
+        {
+            return Err(failed(ProofError::OtherServer(format!("{live:?}"))));
+        }
+        for q in [
+            format!("SET SESSION lock_wait_timeout = {lock_wait_secs}"),
+            "START TRANSACTION READ ONLY".to_string(),
+        ] {
+            conn.query_drop(&q).await.map_err(|e| batch_error(e, &q))?;
+        }
+        trace.connect = t0.elapsed();
+        // Which tables exist (one query): a dropped table has no shape and
+        // no lock. One dropped after this check fails the attempt (1146).
+        let t = Instant::now();
+        let mut missing = Vec::new();
+        let present: Vec<(&str, &str)> = {
+            let pairs = vec!["(?, ?)"; sorted.len()].join(", ");
+            let params: Vec<mysql_async::Value> = sorted
+                .iter()
+                .flat_map(|(db, table)| [db.as_str().into(), table.as_str().into()])
+                .collect();
+            let existing: Vec<(String, String)> = if sorted.is_empty() {
+                Vec::new()
+            } else {
+                conn.exec(
+                    format!(
+                        "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
+                         WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({pairs})"
+                    ),
+                    params,
+                )
+                .await
+                .map_err(|e| batch_error(e, "table existence"))?
+            };
+            let existing: std::collections::HashSet<(String, String)> =
+                existing.into_iter().collect();
+            sorted
+                .iter()
+                .filter_map(|k| {
+                    if existing.contains(k) {
+                        Some((k.0.as_str(), k.1.as_str()))
+                    } else {
+                        missing.push(k.clone());
+                        None
+                    }
+                })
+                .collect()
+        };
+        // Every table's metadata lock, in sorted order (any other order can
+        // deadlock against a multi-table DDL), held until COMMIT: one
+        // request, every statement's result consumed, so a lock timeout or
+        // deadlock of any of them surfaces with its code. A request beyond
+        // its bounds fails the capture (never one round trip per table).
+        let rest = match (after_first_lock, present.split_first()) {
+            (Some(hook), Some((one, rest))) => {
+                lock_all(&mut conn, std::slice::from_ref(one)).await?;
+                hook().await;
+                rest
+            }
+            _ => &present[..],
+        };
+        lock_all(&mut conn, rest).await?;
+        trace.lock_wait = t.elapsed();
+        let t = Instant::now();
+        let from = read_position(&mut conn, gtid_mode, lineage_hash)
+            .await
+            .map_err(failed)?;
+        trace.positions = t.elapsed();
+        let t = Instant::now();
+        let schemas = super::mysql_schema_loader::fetch_table_schemas_on(
+            &mut conn, &present,
+        )
+        .await
+        .map_err(|e| failed(ProofError::Capture(e.to_string())))?;
+        trace.schema = t.elapsed();
+        for (db, table) in &present {
+            if !schemas.contains_key(&(db.to_string(), table.to_string())) {
+                missing.push((db.to_string(), table.to_string()));
+            }
+        }
+        let t = Instant::now();
+        let position = read_position(&mut conn, gtid_mode, lineage_hash)
+            .await
+            .map_err(failed)?;
+        trace.positions += t.elapsed();
+        match order_positions(
+            &wm(&from).map_err(failed)?,
+            &wm(&position).map_err(failed)?,
+        ) {
+            CheckpointOrder::Before | CheckpointOrder::Equal => {}
+            other => {
+                return Err(failed(ProofError::Positions(format!(
+                    "the server position went backwards during the capture ({other:?})"
+                ))));
+            }
+        }
+        conn.query_drop("COMMIT")
+            .await
+            .map_err(|e| batch_error(e, "COMMIT"))?;
+        conn.disconnect().await.ok();
+        Ok(BatchCaptured {
+            from,
+            position,
+            schemas,
+            missing,
+            trace: CaptureTrace::default(),
+        })
+    }
+    .await;
+    guard.id = 0;
+    pool.disconnect().await.ok();
+    result.map(|mut c| {
+        c.trace = trace;
+        c
+    })
+}
+
 /// Bounded capture metrics (lock wait and schema query apart). Never fails.
 pub(crate) fn observe_capture(tag: &ScanTag<'_>, cap: &Captured) {
     let labels = [
@@ -1174,6 +1949,8 @@ pub(crate) fn covers(cap: &Captured, start: &WmPos, end: &WmPos) -> bool {
 pub(crate) struct SharedProofs<'a> {
     pub scanner: &'a super::mysql_proof_scanner::ProofScanner,
     pub boundary: Option<&'a MySqlCheckpoint>,
+    /// The stream anchor at the interval's start, if one was observed.
+    pub anchor: Option<&'a Anchor>,
 }
 
 /// A capture whose own interval is proven: [`capture`], then a scan of
@@ -1212,6 +1989,7 @@ pub(crate) async fn capture_proven(
                     lineage_hash,
                     &cap.from,
                     &cap.position,
+                    sp.anchor,
                     sp.boundary,
                     tag,
                 )
@@ -1315,6 +2093,36 @@ mod tests {
         }
     }
 
+    /// One request: every table's lock statement, in the given order; a
+    /// request beyond its table or byte bound is refused, never split.
+    #[test]
+    fn the_lock_request_is_bounded() {
+        let names: Vec<(String, String)> =
+            (0..3).map(|i| ("d".to_string(), format!("t{i}"))).collect();
+        let tables: Vec<(&str, &str)> = names
+            .iter()
+            .map(|(d, t)| (d.as_str(), t.as_str()))
+            .collect();
+        assert_eq!(
+            lock_request(&tables).unwrap(),
+            "SELECT 1 FROM `d`.`t0` LIMIT 0;SELECT 1 FROM `d`.`t1` LIMIT 0;\
+             SELECT 1 FROM `d`.`t2` LIMIT 0;"
+        );
+        let many: Vec<(String, String)> = (0..=MAX_BATCH_TABLES)
+            .map(|i| ("d".to_string(), format!("t{i}")))
+            .collect();
+        let many: Vec<(&str, &str)> =
+            many.iter().map(|(d, t)| (d.as_str(), t.as_str())).collect();
+        assert!(lock_request(&many[..MAX_BATCH_TABLES]).is_some());
+        assert!(lock_request(&many).is_none(), "too many tables");
+        // 64-character names of 4-byte characters, all quoted: too many
+        // bytes well before the table bound.
+        let wide = "\u{1F600}".repeat(64);
+        let wide: Vec<(&str, &str)> =
+            vec![(wide.as_str(), wide.as_str()); MAX_BATCH_TABLES];
+        assert!(lock_request(&wide).is_none(), "too many bytes");
+    }
+
     #[test]
     fn gtid_sets_are_exact_not_ranges() {
         let mut s = GtidSet::parse(&format!("{U}:1-5")).unwrap();
@@ -1337,6 +2145,360 @@ mod tests {
             event_length: 0,
             next_event_position,
             event_flags: 0,
+        }
+    }
+
+    mod anchor_check {
+        use super::*;
+        use mysql_binlog_connector_rust::event::{
+            checksum_type::ChecksumType,
+            format_description_event::FormatDescriptionEvent,
+            gtid_event::GtidEvent, previous_gtids_event::PreviousGtidsEvent,
+            rotate_event::RotateEvent, xid_event::XidEvent,
+        };
+
+        const F1: &str = "binlog.000007";
+        const F2: &str = "binlog.000008";
+
+        fn anchor(file: &str, offset: u64, next_gtid: Option<u64>) -> Anchor {
+            Anchor {
+                server_uuid: U.into(),
+                lineage: "lin".into(),
+                file: file.into(),
+                offset,
+                set_before: GtidSet::parse(&format!("{U}:1-10")).unwrap(),
+                next_gtid: next_gtid.map(|n| format!("{U}:{n}")),
+            }
+        }
+
+        /// An event of `len` bytes starting at `start` (0, 0: artificial).
+        fn at(event_type: u8, start: u32, len: u32) -> EventHeader {
+            EventHeader {
+                event_length: len,
+                next_event_position: if start == 0 { 0 } else { start + len },
+                ..header(event_type, 0)
+            }
+        }
+
+        fn rotate(file: &str, pos: u64) -> EventData {
+            EventData::Rotate(RotateEvent {
+                binlog_filename: file.into(),
+                binlog_position: pos,
+            })
+        }
+
+        fn fde() -> EventData {
+            EventData::FormatDescription(FormatDescriptionEvent {
+                binlog_version: 4,
+                server_version: "8.4.0".into(),
+                create_timestamp: 0,
+                header_length: 19,
+                checksum_type: ChecksumType::None,
+            })
+        }
+
+        fn gtid(n: u64) -> EventData {
+            EventData::Gtid(GtidEvent {
+                flags: 0,
+                gtid: format!("{U}:{n}"),
+            })
+        }
+
+        /// Feed `events`; the result of the last one, and the check.
+        fn feed(
+            a: Anchor,
+            events: Vec<(EventHeader, EventData)>,
+        ) -> (Result<(), ProofError>, AnchorCheck) {
+            let mut c = AnchorCheck::new(a);
+            let mut last = Ok(());
+            for (h, d) in &events {
+                last = c.check(h, d);
+                if last.is_err() {
+                    break;
+                }
+            }
+            (last, c)
+        }
+
+        /// The server's opening: its artificial Rotate and Format_description.
+        fn opening(file: &str, offset: u64) -> Vec<(EventHeader, EventData)> {
+            vec![
+                (at(4, 0, 40), rotate(file, offset)),
+                (at(15, 0, 120), fde()),
+            ]
+        }
+
+        fn mismatch(r: Result<(), ProofError>) -> String {
+            match r {
+                Err(ProofError::AnchorMismatch(why)) => why,
+                other => panic!("expected AnchorMismatch, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_transaction_start_in_the_same_file_passes() {
+            let mut ev = opening(F1, 5000);
+            ev.push((at(27, 0, 20), EventData::HeartBeat));
+            ev.push((at(33, 5000, 79), gtid(11)));
+            let (r, c) = feed(anchor(F1, 5000, Some(11)), ev);
+            r.unwrap();
+            assert_eq!(c.passed(), Some((F1, 5000)));
+            // Later events are not checked again.
+            let mut c = c;
+            c.check(&at(16, 5200, 31), &EventData::Xid(XidEvent { xid: 1 }))
+                .unwrap();
+        }
+
+        /// A frontier at the end of a file: the file's Rotate starts at the
+        /// anchor offset, then the next file's setup events and its first
+        /// GTID, which becomes the effective coordinate.
+        #[test]
+        fn a_frontier_at_a_files_end_passes_the_rotation_chain() {
+            // The file's own Rotate at the anchor; or a Stop there and the
+            // server's artificial Rotate as it opens the next file.
+            let chain = |stop: bool| {
+                let mut ev = opening(F1, 9000);
+                if stop {
+                    ev.push((at(3, 9000, 23), EventData::NotSupported));
+                } else {
+                    ev.push((at(4, 9000, 44), rotate(F2, 4)));
+                }
+                ev.extend([
+                    (at(4, 0, 44), rotate(F2, 4)),
+                    (at(15, 4, 122), fde()),
+                    (
+                        at(35, 126, 71),
+                        EventData::PreviousGtids(PreviousGtidsEvent {
+                            gtid_set: format!("{U}:1-10"),
+                        }),
+                    ),
+                    (at(27, 0, 20), EventData::HeartBeat),
+                    (at(33, 197, 79), gtid(11)),
+                ]);
+                ev
+            };
+            for stop in [false, true] {
+                let (r, c) = feed(anchor(F1, 9000, None), chain(stop));
+                r.unwrap();
+                assert_eq!(c.passed(), Some((F2, 197)), "stop: {stop}");
+            }
+        }
+
+        #[test]
+        fn a_rotation_names_only_the_next_file() {
+            // After a Stop, only the server's opening of the next file.
+            let mut ev = opening(F1, 9000);
+            ev.extend([
+                (at(3, 9000, 23), EventData::NotSupported),
+                (at(4, 9023, 44), rotate(F2, 4)),
+            ]);
+            mismatch(feed(anchor(F1, 9000, None), ev).0);
+            let mut ev = opening(F1, 9000);
+            ev.extend([
+                (at(3, 9000, 23), EventData::NotSupported),
+                (at(4, 0, 44), rotate("binlog.000009", 4)),
+            ]);
+            assert!(
+                mismatch(feed(anchor(F1, 9000, None), ev).0)
+                    .contains("out of sequence")
+            );
+            // After a rotation, the server opens exactly that file.
+            for (file, pos) in [(F1, 4), (F2, 126), ("binlog.000009", 4)] {
+                let mut ev = opening(F1, 9000);
+                ev.extend([
+                    (at(4, 9000, 44), rotate(F2, 4)),
+                    (at(4, 0, 44), rotate(file, pos)),
+                ]);
+                assert!(
+                    mismatch(feed(anchor(F1, 9000, None), ev).0)
+                        .contains("opened"),
+                    "{file}:{pos}"
+                );
+            }
+        }
+
+        #[test]
+        fn files_without_transactions_chain_in_sequence() {
+            let mut ev = opening(F1, 9000);
+            ev.extend([
+                (at(4, 9000, 44), rotate(F2, 4)),
+                (at(4, 0, 44), rotate(F2, 4)),
+                (at(15, 4, 122), fde()),
+                (at(4, 126, 44), rotate("binlog.000009", 4)),
+                (at(4, 0, 44), rotate("binlog.000009", 4)),
+                (at(15, 4, 122), fde()),
+                (at(33, 126, 79), gtid(11)),
+            ]);
+            let (r, c) = feed(anchor(F1, 9000, None), ev);
+            r.unwrap();
+            assert_eq!(c.passed(), Some(("binlog.000009", 126)));
+        }
+
+        #[test]
+        fn an_opening_elsewhere_is_refused() {
+            for (file, pos) in [(F1, 5001), (F2, 5000)] {
+                let (r, _) = feed(anchor(F1, 5000, None), opening(file, pos));
+                assert!(mismatch(r).contains("opened at"));
+            }
+            // A real event before the server's artificial Rotate.
+            let (r, _) = feed(
+                anchor(F1, 5000, None),
+                vec![(at(33, 5000, 79), gtid(11))],
+            );
+            mismatch(r);
+        }
+
+        /// Probe 3: an offset inside a transaction streams its `BEGIN` (or
+        /// its rows) without a GTID. Nothing transactional may come first.
+        #[test]
+        fn a_transactional_event_before_the_first_gtid_is_refused() {
+            use mysql_binlog_connector_rust::event::{
+                table_map_event::TableMapEvent,
+                transaction_payload_event::TransactionPayloadEvent,
+                write_rows_event::WriteRowsEvent,
+            };
+            let firsts: Vec<(u8, EventData)> = vec![
+                (2, query("BEGIN")),
+                (2, query("ALTER TABLE t ADD c INT")),
+                (
+                    19,
+                    EventData::TableMap(TableMapEvent {
+                        table_id: 1,
+                        database_name: "d".into(),
+                        table_name: "t".into(),
+                        column_types: vec![],
+                        column_metas: vec![],
+                        null_bits: vec![],
+                        table_metadata: None,
+                    }),
+                ),
+                (
+                    30,
+                    EventData::WriteRows(WriteRowsEvent {
+                        table_id: 1,
+                        included_columns: vec![],
+                        rows: vec![],
+                    }),
+                ),
+                (16, EventData::Xid(XidEvent { xid: 1 })),
+                (
+                    40,
+                    EventData::TransactionPayload(TransactionPayloadEvent {
+                        uncompressed_size: 0,
+                        uncompressed_events: vec![],
+                    }),
+                ),
+                (ANONYMOUS_GTID, EventData::NotSupported),
+            ];
+            for (t, first) in firsts {
+                // At the anchor offset, and after a valid rotation.
+                let mut same = opening(F1, 5000);
+                same.push((at(t, 5000, 60), first.clone()));
+                let mut rotated = opening(F1, 9000);
+                rotated.extend([
+                    (at(4, 9000, 44), rotate(F2, 4)),
+                    (at(15, 4, 122), fde()),
+                    (at(t, 126, 60), first),
+                ]);
+                for (a, ev) in [
+                    (anchor(F1, 5000, None), same),
+                    (anchor(F1, 9000, None), rotated),
+                ] {
+                    let (r, c) = feed(a, ev);
+                    assert!(
+                        mismatch(r).contains("before the first GTID"),
+                        "event type {t}"
+                    );
+                    assert_eq!(c.passed(), None);
+                }
+            }
+        }
+
+        #[test]
+        fn a_first_event_elsewhere_than_the_anchor_is_refused() {
+            let mut ev = opening(F1, 5000);
+            ev.push((at(33, 5079, 79), gtid(11)));
+            assert!(
+                mismatch(feed(anchor(F1, 5000, None), ev).0)
+                    .contains("starts at")
+            );
+            let mut ev = opening(F1, 5000);
+            ev.push((at(4, 5100, 44), rotate(F2, 4)));
+            assert!(
+                mismatch(feed(anchor(F1, 5000, None), ev).0)
+                    .contains("Rotate at")
+            );
+            let mut ev = opening(F1, 5000);
+            ev.push((at(3, 5100, 23), EventData::NotSupported));
+            assert!(
+                mismatch(feed(anchor(F1, 5000, None), ev).0)
+                    .contains("Stop at")
+            );
+        }
+
+        #[test]
+        fn a_rotation_out_of_sequence_is_refused() {
+            for (file, pos) in [
+                ("binlog.000009", 4),
+                ("binlog.000006", 4),
+                (F1, 4),
+                (F2, 120),
+                ("other.000008", 4),
+            ] {
+                let mut ev = opening(F1, 9000);
+                ev.push((at(4, 9000, 44), rotate(file, pos)));
+                assert!(
+                    mismatch(feed(anchor(F1, 9000, None), ev).0)
+                        .contains("out of sequence"),
+                    "{file}:{pos}"
+                );
+            }
+        }
+
+        #[test]
+        fn setup_events_belong_only_to_a_new_file() {
+            let mut ev = opening(F1, 5000);
+            ev.push((
+                at(35, 5000, 71),
+                EventData::PreviousGtids(PreviousGtidsEvent {
+                    gtid_set: String::new(),
+                }),
+            ));
+            mismatch(feed(anchor(F1, 5000, None), ev).0);
+        }
+
+        #[test]
+        fn the_first_gtid_must_be_new_and_the_expected_one() {
+            let first = |n: u64, next: Option<u64>| {
+                let mut ev = opening(F1, 5000);
+                ev.push((at(33, 5000, 79), gtid(n)));
+                feed(anchor(F1, 5000, next), ev).0
+            };
+            assert!(mismatch(first(10, None)).contains("already in"));
+            assert!(mismatch(first(12, Some(11))).contains("not"));
+            first(12, None).unwrap();
+            first(11, Some(11)).unwrap();
+        }
+
+        #[test]
+        fn an_incident_is_refused_as_an_incident() {
+            let mut ev = opening(F1, 5000);
+            ev.push((at(INCIDENT_EVENT, 5000, 30), EventData::NotSupported));
+            assert!(matches!(
+                feed(anchor(F1, 5000, None), ev).0,
+                Err(ProofError::Incident)
+            ));
+        }
+
+        #[test]
+        fn the_live_end_is_at_or_past_the_end_position() {
+            let to = cp(F2, 500, None);
+            assert!(at_or_past(F2, 500, &to));
+            assert!(at_or_past(F2, 501, &to));
+            assert!(at_or_past("binlog.000009", 4, &to));
+            assert!(!at_or_past(F2, 499, &to));
+            assert!(!at_or_past(F1, 9000, &to));
+            assert!(!at_or_past("other.000009", 4, &to));
         }
     }
 
@@ -1971,6 +3133,474 @@ mod tests {
             traced(false, "trace_f").await;
         }
 
+        /// Positioned GTID scans (`docs/design/mysql-proof-seek.md`,
+        /// "Positioned GTID scanning"): a scan opened at an anchor answers
+        /// exactly as a GTID-positioned one, across rotations, and a wrong
+        /// anchor is refused promptly, never a proof that omits a DDL.
+        mod positioned {
+            use super::*;
+
+            async fn at(
+                dsn: &str,
+                from: &MySqlCheckpoint,
+                to: &MySqlCheckpoint,
+                anchor: Option<&Anchor>,
+            ) -> Result<ScanReport, ProofError> {
+                scan_interval_at(
+                    dsn,
+                    4_000_124,
+                    &uuid(dsn).await,
+                    LINEAGE,
+                    from,
+                    to,
+                    anchor,
+                    &ScanLimits {
+                        max_duration: Duration::from_secs(20),
+                        ..ScanLimits::default()
+                    },
+                    &TAG,
+                )
+                .await
+            }
+
+            fn set(p: &MySqlCheckpoint) -> GtidSet {
+                GtidSet::parse(p.gtid_set.as_deref().unwrap()).unwrap()
+            }
+
+            /// Positioned and GTID-positioned answers are statement- and
+            /// digest-identical: at the session anchor a scan yields, and at
+            /// the record frontier where it ended.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn positioned_scans_equal_gtid_positioned_scans() {
+                let dsn = server(true).await;
+                let db = "pos_same";
+                sql(&dsn, &[&format!("CREATE DATABASE {db}")]).await;
+                let a = position(&dsn).await;
+                sql(
+                    &dsn,
+                    &[
+                        &format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)"),
+                        &format!("INSERT INTO {db}.t VALUES (1)"),
+                        &format!("ALTER TABLE {db}.t ADD COLUMN v INT"),
+                    ],
+                )
+                .await;
+                let b = position(&dsn).await;
+                sql(
+                    &dsn,
+                    &[
+                        &format!("INSERT INTO {db}.t VALUES (2, 2)"),
+                        &format!("RENAME TABLE {db}.t TO {db}.u"),
+                    ],
+                )
+                .await;
+                let c = position(&dsn).await;
+
+                let plain = at(&dsn, &a, &b, None).await.unwrap();
+                assert_eq!(plain.positioned_at, None);
+                let session =
+                    plain.session_anchor.clone().expect("a session anchor");
+                assert_eq!(session.set_before, set(&a));
+                let frontier = plain.frontier.clone().expect("a frontier");
+                assert_eq!(frontier.set_before, set(&b));
+                assert_eq!(frontier.next_gtid, None);
+
+                let again = at(&dsn, &a, &b, Some(&session)).await.unwrap();
+                assert_eq!(again.digest, plain.digest);
+                assert_eq!(again.statements, plain.statements);
+                assert_eq!(
+                    again.positioned_at,
+                    Some((session.file.clone(), session.offset))
+                );
+                assert_eq!(again.frontier, plain.frontier);
+
+                let next = at(&dsn, &b, &c, Some(&frontier)).await.unwrap();
+                let direct = at(&dsn, &b, &c, None).await.unwrap();
+                assert_eq!(next.digest, direct.digest);
+                assert_eq!(affected(&next), [format!("{db}.t+{db}.u")]);
+                assert_eq!(
+                    next.positioned_at,
+                    Some((frontier.file.clone(), frontier.offset))
+                );
+            }
+
+            /// `hi` ends at a file's last transaction: the positioned scan
+            /// at its frontier passes the file's Rotate, the next file's
+            /// setup events (and an empty file's), and continues at the
+            /// next transaction's file and offset.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn a_frontier_at_a_files_end_crosses_the_rotation() {
+                let dsn = server(true).await;
+                for (db, flushes) in [("pos_rot1", 1), ("pos_rot2", 2)] {
+                    sql(&dsn, &[&format!("CREATE DATABASE {db}")]).await;
+                    let a = position(&dsn).await;
+                    sql(
+                        &dsn,
+                        &[&format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)")],
+                    )
+                    .await;
+                    let b = position(&dsn).await;
+                    for _ in 0..flushes {
+                        sql(&dsn, &["FLUSH BINARY LOGS"]).await;
+                    }
+                    sql(
+                        &dsn,
+                        &[&format!("ALTER TABLE {db}.t ADD COLUMN v INT")],
+                    )
+                    .await;
+                    let c = position(&dsn).await;
+                    assert_ne!(b.file, c.file);
+
+                    let head = at(&dsn, &a, &b, None).await.unwrap();
+                    let frontier = head.frontier.expect("a frontier");
+                    assert_eq!(
+                        (&frontier.file, frontier.offset),
+                        (&b.file, b.pos)
+                    );
+                    let next = at(&dsn, &b, &c, Some(&frontier)).await.unwrap();
+                    let direct = at(&dsn, &b, &c, None).await.unwrap();
+                    assert_eq!(next.digest, direct.digest, "{flushes} flushes");
+                    assert_eq!(affected(&next), [format!("{db}.t")]);
+                    let (file, offset) =
+                        next.positioned_at.expect("positioned");
+                    assert_eq!(file, c.file, "{flushes} flushes");
+                    assert!(offset > 4);
+                }
+            }
+
+            /// A frontier at the last transaction of a file the server
+            /// stopped writing: the chain is the file's Stop, then the
+            /// server's opening of the next file (a stopped file has no
+            /// Rotate of its own).
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn a_frontier_before_a_stop_crosses_the_restart() {
+                let (c, port) = start(true).await;
+                let dsn = dsn_of(port);
+                let db = "pos_stop";
+                sql(&dsn, &[&format!("CREATE DATABASE {db}")]).await;
+                let a = position(&dsn).await;
+                sql(
+                    &dsn,
+                    &[&format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)")],
+                )
+                .await;
+                let b = position(&dsn).await;
+                let frontier =
+                    at(&dsn, &a, &b, None).await.unwrap().frontier.unwrap();
+
+                c.stop_with_timeout(Some(60)).await.unwrap();
+                c.start().await.unwrap();
+                let port = c.get_host_port_ipv4(3306).await.unwrap();
+                let dsn = dsn_of(port);
+                for _ in 0..120 {
+                    if mysql_async::Conn::from_url(&dsn).await.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                sql(&dsn, &[&format!("ALTER TABLE {db}.t ADD COLUMN v INT")])
+                    .await;
+                let c2 = position(&dsn).await;
+                assert_ne!(b.file, c2.file);
+
+                let next = at(&dsn, &b, &c2, Some(&frontier)).await.unwrap();
+                let direct = at(&dsn, &b, &c2, None).await.unwrap();
+                assert_eq!(next.digest, direct.digest);
+                assert_eq!(affected(&next), [format!("{db}.t")]);
+                assert_eq!(next.positioned_at.unwrap().0, c2.file);
+            }
+
+            /// A batched capture locks its tables in sorted order, whatever
+            /// order it is given: a two-table RENAME taking the same locks
+            /// (MySQL locks a multi-table statement's tables in that order)
+            /// waits for it instead of deadlocking (probe 7: the reverse order
+            /// deadlocks, 1213).
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn a_batched_capture_locks_in_sorted_order() {
+                let dsn = server(true).await;
+                let db = "batch_order";
+                sql(
+                    &dsn,
+                    &[
+                        &format!("CREATE DATABASE {db}"),
+                        &format!("CREATE TABLE {db}.t010 (id INT PRIMARY KEY)"),
+                        &format!("CREATE TABLE {db}.t011 (id INT PRIMARY KEY)"),
+                    ],
+                )
+                .await;
+                let rename = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+                let (d, r) = (dsn.clone(), rename.clone());
+                let hook = move || -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+                let (d, r) = (d.clone(), r.clone());
+                Box::pin(async move {
+                    // The RENAME queues behind the first lock; give it time
+                    // to take what it can before the batch's second lock.
+                    let task = tokio::spawn(async move {
+                        let mut c = mysql_async::Conn::from_url(&d).await.unwrap();
+                        c.query_drop(format!(
+                            "RENAME TABLE {db}.t010 TO {db}.r010, {db}.t011 TO {db}.r011"
+                        ))
+                        .await
+                    });
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    *r.lock().await = Some(task);
+                })
+            };
+                let tables = vec![
+                    (db.to_string(), "t011".to_string()),
+                    (db.to_string(), "t010".to_string()),
+                ];
+                let cap = capture_batch(
+                    &dsn,
+                    &uuid(&dsn).await,
+                    LINEAGE,
+                    &tables,
+                    8,
+                    Some(&hook),
+                )
+                .await;
+                assert!(cap.is_ok(), "{cap:?}");
+                let cap = cap.unwrap();
+                assert_eq!(cap.schemas.len(), 2);
+                assert!(cap.missing.is_empty());
+                let task = rename.lock().await.take().expect("the rename ran");
+                task.await
+                    .unwrap()
+                    .expect("the rename waits, then succeeds");
+            }
+
+            /// A lock timeout fails the attempt as contention, and the attempt
+            /// holds no lock afterwards: a DDL on the batch's other table runs
+            /// at once.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn a_lock_timeout_is_contention_and_holds_nothing() {
+                let dsn = server(true).await;
+                let db = "batch_timeout";
+                sql(
+                    &dsn,
+                    &[
+                        &format!("CREATE DATABASE {db}"),
+                        &format!("CREATE TABLE {db}.a (id INT PRIMARY KEY)"),
+                        &format!("CREATE TABLE {db}.b (id INT PRIMARY KEY)"),
+                    ],
+                )
+                .await;
+                let mut locker =
+                    mysql_async::Conn::from_url(&dsn).await.unwrap();
+                locker
+                    .query_drop(format!("LOCK TABLES {db}.b WRITE"))
+                    .await
+                    .unwrap();
+                let tables = vec![
+                    (db.to_string(), "b".to_string()),
+                    (db.to_string(), "a".to_string()),
+                ];
+                let r = capture_batch(
+                    &dsn,
+                    &uuid(&dsn).await,
+                    LINEAGE,
+                    &tables,
+                    1,
+                    None,
+                )
+                .await;
+                assert!(
+                    matches!(
+                        r,
+                        Err(BatchCaptureError::Contention { code: 1205, .. })
+                    ),
+                    "{r:?}"
+                );
+                let mut ddl = mysql_async::Conn::from_url(&dsn).await.unwrap();
+                ddl.query_drop("SET SESSION lock_wait_timeout = 2")
+                    .await
+                    .unwrap();
+                ddl.query_drop(format!("ALTER TABLE {db}.a ADD COLUMN c INT"))
+                    .await
+                    .expect("no lock on a is left behind");
+                locker.query_drop("UNLOCK TABLES").await.unwrap();
+            }
+
+            /// A table that no longer exists has no shape: the batch captures
+            /// the others and names it missing.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn a_missing_table_does_not_fail_the_batch() {
+                let dsn = server(true).await;
+                let db = "batch_missing";
+                sql(
+                    &dsn,
+                    &[
+                        &format!("CREATE DATABASE {db}"),
+                        &format!("CREATE TABLE {db}.a (id INT PRIMARY KEY)"),
+                    ],
+                )
+                .await;
+                let tables = vec![
+                    (db.to_string(), "gone".to_string()),
+                    (db.to_string(), "a".to_string()),
+                ];
+                let cap = capture_batch(
+                    &dsn,
+                    &uuid(&dsn).await,
+                    LINEAGE,
+                    &tables,
+                    5,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(cap.table(db, "a").is_some());
+                assert!(cap.table(db, "gone").is_none());
+                assert_eq!(
+                    cap.missing,
+                    vec![(db.to_string(), "gone".to_string())]
+                );
+            }
+
+            /// A boundary after A, with a DDL in between, never proves:
+            /// refused at the first GTID when the next one is known, and
+            /// otherwise at the live end, within seconds.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn a_late_anchor_is_refused_promptly() {
+                let dsn = server(true).await;
+                let db = "pos_late";
+                sql(&dsn, &[&format!("CREATE DATABASE {db}")]).await;
+                let a = position(&dsn).await;
+                sql(
+                    &dsn,
+                    &[&format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)")],
+                )
+                .await;
+                let b = position(&dsn).await;
+                sql(
+                    &dsn,
+                    &[&format!("CREATE TABLE {db}.u (id INT PRIMARY KEY)")],
+                )
+                .await;
+                let c = position(&dsn).await;
+                let head = at(&dsn, &a, &b, None).await.unwrap();
+                let true_next = head.session_anchor.unwrap().next_gtid;
+                // B's frontier, claimed as a start at A.
+                let late = |next_gtid| Anchor {
+                    set_before: set(&a),
+                    next_gtid,
+                    ..head.frontier.clone().unwrap()
+                };
+
+                let err =
+                    at(&dsn, &a, &c, Some(&late(true_next))).await.unwrap_err();
+                assert!(
+                    matches!(err, ProofError::AnchorMismatch(_)),
+                    "{err:?}"
+                );
+
+                let started = Instant::now();
+                let err =
+                    at(&dsn, &a, &c, Some(&late(None))).await.unwrap_err();
+                assert!(matches!(err, ProofError::NotReached(_)), "{err:?}");
+                assert!(started.elapsed() < Duration::from_secs(10));
+
+                // The direct scan has the DDL the late start would omit.
+                let direct = at(&dsn, &a, &c, None).await.unwrap();
+                assert_eq!(
+                    affected(&direct),
+                    [format!("{db}.t"), format!("{db}.u")]
+                );
+            }
+
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn an_anchor_of_another_server_lineage_or_boundary_is_refused()
+             {
+                let dsn = server(true).await;
+                let db = "pos_foreign";
+                sql(&dsn, &[&format!("CREATE DATABASE {db}")]).await;
+                let a = position(&dsn).await;
+                sql(
+                    &dsn,
+                    &[&format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)")],
+                )
+                .await;
+                let b = position(&dsn).await;
+                let good = at(&dsn, &a, &b, None)
+                    .await
+                    .unwrap()
+                    .session_anchor
+                    .unwrap();
+                let other = Anchor {
+                    server_uuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+                    ..good.clone()
+                };
+                assert!(matches!(
+                    at(&dsn, &a, &b, Some(&other)).await,
+                    Err(ProofError::OtherServer(_))
+                ));
+                let lineage = Anchor {
+                    lineage: "ffff".into(),
+                    ..good.clone()
+                };
+                assert!(matches!(
+                    at(&dsn, &a, &b, Some(&lineage)).await,
+                    Err(ProofError::OtherServer(_))
+                ));
+                let boundary = Anchor {
+                    set_before: set(&b),
+                    ..good.clone()
+                };
+                assert!(matches!(
+                    at(&dsn, &a, &b, Some(&boundary)).await,
+                    Err(ProofError::Positions(_))
+                ));
+                // Inside an event: the server refuses the dump.
+                let inside = Anchor {
+                    offset: good.offset + 1,
+                    ..good.clone()
+                };
+                assert!(at(&dsn, &a, &b, Some(&inside)).await.is_err());
+                at(&dsn, &a, &b, Some(&good)).await.unwrap();
+            }
+
+            /// The bounded alternative: no transaction within `max_seek` of
+            /// opening is a typed refusal, not a wait for the time limit.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn the_seek_is_bounded() {
+                let dsn = server(true).await;
+                let db = "pos_seek";
+                sql(&dsn, &[&format!("CREATE DATABASE {db}")]).await;
+                let a = position(&dsn).await;
+                sql(
+                    &dsn,
+                    &[&format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)")],
+                )
+                .await;
+                let b = position(&dsn).await;
+                let r = scan_interval_at(
+                    &dsn,
+                    4_000_125,
+                    &uuid(&dsn).await,
+                    LINEAGE,
+                    &a,
+                    &b,
+                    None,
+                    &ScanLimits {
+                        max_seek: Duration::ZERO,
+                        ..ScanLimits::default()
+                    },
+                    &TAG,
+                )
+                .await;
+                assert!(matches!(r, Err(ProofError::SeekLimit(_))), "{r:?}");
+            }
+        }
+
         async fn scenario(gtid: bool, db: &str) {
             let dsn = server(gtid).await;
             sql(
@@ -2597,7 +4227,7 @@ mod tests {
         #[ignore = "requires docker"]
         async fn a_ddl_filling_a_gtid_gap_after_the_boundary_is_proved() {
             use super::super::super::mysql_proof_scanner::{
-                LiveSegments, ProofScanner,
+                LiveSegments, ProofScanner, Segments,
             };
             let dsn = server(true).await;
             let id = uuid(&dsn).await;
@@ -2671,15 +4301,24 @@ mod tests {
             );
             // Shared and direct agree on the gapped interval.
             let scanner = ProofScanner::default();
-            let segments = LiveSegments {
-                dsn: &dsn,
+            let segments: Arc<dyn Segments> = Arc::new(LiveSegments {
+                dsn: dsn.clone(),
                 server_id: 4_000_151,
-                server_uuid: &id,
-                lineage_hash: LINEAGE,
+                server_uuid: id.clone(),
+                lineage_hash: LINEAGE.into(),
                 limits: ScanLimits::default(),
-            };
+            });
             let shared = scanner
-                .interval(&segments, &id, LINEAGE, &a, &b, Some(&a), &TAG)
+                .interval(
+                    segments.clone(),
+                    &id,
+                    LINEAGE,
+                    &a,
+                    &b,
+                    None,
+                    Some(&a),
+                    &TAG,
+                )
                 .await
                 .unwrap();
             assert_eq!(shared.statements, direct.statements);
@@ -2701,7 +4340,7 @@ mod tests {
 
         async fn shared_equals_direct(gtid: bool, db: &str) {
             use super::super::super::mysql_proof_scanner::{
-                LiveSegments, ProofScanner,
+                LiveSegments, ProofScanner, Segments,
             };
             let dsn = server(gtid).await;
             let id = uuid(&dsn).await;
@@ -2728,23 +4367,24 @@ mod tests {
                 points.push(position(&dsn).await);
             }
             let scanner = ProofScanner::default();
-            let segments = LiveSegments {
-                dsn: &dsn,
+            let segments: Arc<dyn Segments> = Arc::new(LiveSegments {
+                dsn: dsn.clone(),
                 server_id: 4_000_150,
-                server_uuid: &id,
-                lineage_hash: LINEAGE,
+                server_uuid: id.clone(),
+                lineage_hash: LINEAGE.into(),
                 limits: ScanLimits::default(),
-            };
+            });
             let n = points.len();
             for i in 0..n {
                 for j in [i, (i + 3).min(n - 1), n - 1] {
                     let shared = scanner
                         .interval(
-                            &segments,
+                            segments.clone(),
                             &id,
                             LINEAGE,
                             &points[i],
                             &points[j],
+                            None,
                             Some(&points[i]),
                             &TAG,
                         )
@@ -2775,7 +4415,16 @@ mod tests {
             ] {
                 let small = ProofScanner::new(limits);
                 let r = small
-                    .interval(&segments, &id, LINEAGE, first, last, None, &TAG)
+                    .interval(
+                        segments.clone(),
+                        &id,
+                        LINEAGE,
+                        first,
+                        last,
+                        None,
+                        None,
+                        &TAG,
+                    )
                     .await;
                 assert!(matches!(r, Err(ProofError::Limit(_))), "{r:?}");
                 assert_eq!(small.retained().await, None);
@@ -2786,11 +4435,12 @@ mod tests {
             let fresh = ProofScanner::default();
             fresh
                 .interval(
-                    &segments,
+                    segments.clone(),
                     &id,
                     LINEAGE,
                     first,
                     &points[2],
+                    None,
                     Some(first),
                     &TAG,
                 )
@@ -2801,11 +4451,12 @@ mod tests {
             // holds the record and waits on the server; then it is dropped.
             // (A timeout could lose the race to fast local I/O.)
             let mut req = Box::pin(fresh.interval(
-                &segments,
+                segments.clone(),
                 &id,
                 LINEAGE,
                 first,
                 last,
+                None,
                 Some(first),
                 &TAG,
             ));
@@ -2825,11 +4476,12 @@ mod tests {
             assert_eq!(fresh.pinned(), 0);
             let r = fresh
                 .interval(
-                    &segments,
+                    segments.clone(),
                     &id,
                     LINEAGE,
                     first,
                     last,
+                    None,
                     Some(first),
                     &TAG,
                 )
@@ -2843,20 +4495,21 @@ mod tests {
                 lineage: Some(OTHER.into()),
                 ..p.clone()
             };
-            let other = LiveSegments {
-                dsn: &dsn,
+            let other: Arc<dyn Segments> = Arc::new(LiveSegments {
+                dsn: dsn.clone(),
                 server_id: 4_000_152,
-                server_uuid: &id,
-                lineage_hash: OTHER,
+                server_uuid: id.clone(),
+                lineage_hash: OTHER.into(),
                 limits: ScanLimits::default(),
-            };
+            });
             let r = fresh
                 .interval(
-                    &other,
+                    other,
                     &id,
                     OTHER,
                     &relabel(first),
                     &relabel(last),
+                    None,
                     None,
                     &TAG,
                 )
@@ -2893,17 +4546,18 @@ mod tests {
             );
             let shared = ProofScanner::default()
                 .interval(
-                    &LiveSegments {
-                        dsn: &dsn,
+                    Arc::new(LiveSegments {
+                        dsn: dsn.clone(),
                         server_id: 4_000_153,
-                        server_uuid: &id,
-                        lineage_hash: LINEAGE,
+                        server_uuid: id.clone(),
+                        lineage_hash: LINEAGE.into(),
                         limits: ScanLimits::default(),
-                    },
+                    }),
                     &id,
                     LINEAGE,
                     &a,
                     &b,
+                    None,
                     Some(&a),
                     &TAG,
                 )

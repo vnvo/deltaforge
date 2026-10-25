@@ -415,6 +415,7 @@ mod tests {
                         on_schema_drift: Default::default(),
                         rotation: None,
                         type_mapping: Default::default(),
+                        proofs: Default::default(),
                     }),
                     processors: vec![],
                     sinks: vec![],

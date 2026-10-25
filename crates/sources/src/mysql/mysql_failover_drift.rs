@@ -527,6 +527,7 @@ async fn shape_at_failover(
                 &anchor.current_lineage,
                 &from,
                 &cap.position,
+                None,
                 boundary,
                 &tag,
             )
@@ -597,6 +598,33 @@ pub(crate) async fn check(
     table: &str,
     event: FirstEvent<'_>,
 ) -> SourceResult<()> {
+    let verdict = assess(env, anchor, db, table, event).await?;
+    record(env, anchor, db, table, verdict).await
+}
+
+/// What a check concluded, before it writes anything.
+pub(crate) enum DriftVerdict {
+    /// The check completed earlier (its marker exists).
+    Completed,
+    /// The marker to write; `register`: the shape at the failover position
+    /// to register first (its version and hash are the marker's current).
+    Marker {
+        key: SchemaKey,
+        previous: Option<SchemaRef>,
+        register: Option<Box<MySqlTableSchema>>,
+        outcome: Outcome,
+    },
+}
+
+/// [`check`]'s reads and decision: everything up to its writes. A halt (or
+/// a hard stop) is its error; nothing is written either way.
+pub(crate) async fn assess(
+    env: &DriftEnv<'_>,
+    anchor: &FailoverAnchor,
+    db: &str,
+    table: &str,
+    event: FirstEvent<'_>,
+) -> SourceResult<DriftVerdict> {
     let key = env.scope.key(db, table);
     let previous_key = SchemaKey::new(
         &key.tenant,
@@ -606,7 +634,7 @@ pub(crate) async fn check(
         table,
     );
     if completed(env, &key, &previous_key, anchor).await? {
-        return Ok(());
+        return Ok(DriftVerdict::Completed);
     }
     let previous = env
         .loader
@@ -618,15 +646,12 @@ pub(crate) async fn check(
         })?;
     let Some(previous) = previous else {
         info!(source_id = env.source_id, %db, %table, "failover drift: no predecessor history (a new table)");
-        return write_marker(
-            env.backend,
-            &key,
-            anchor,
-            None,
-            None,
-            Outcome::NewTable,
-        )
-        .await;
+        return Ok(DriftVerdict::Marker {
+            key,
+            previous: None,
+            register: None,
+            outcome: Outcome::NewTable,
+        });
     };
     serde_json::from_value::<MySqlTableSchema>(previous.schema_json.clone())
         .map_err(|e| SourceError::Schema {
@@ -649,15 +674,12 @@ pub(crate) async fn check(
             ));
         }
         warn!(source_id = env.source_id, %db, %table, "failover drift unprovable: adapted");
-        return write_marker(
-            env.backend,
-            &key,
-            anchor,
-            Some((previous.version, previous.hash.clone())),
-            None,
-            Outcome::AdaptedUnprovable,
-        )
-        .await;
+        return Ok(DriftVerdict::Marker {
+            key,
+            previous: Some((previous.version, previous.hash.clone())),
+            register: None,
+            outcome: Outcome::AdaptedUnprovable,
+        });
     };
     let current_json = serde_json::to_value(&shape)
         .map_err(|e| SourceError::Other(e.into()))?;
@@ -688,28 +710,51 @@ pub(crate) async fn check(
             ),
         ));
     }
-    let checkpoint = serde_json::to_vec(&anchor.position)
-        .map_err(|e| SourceError::Other(e.into()))?;
-    let (current_version, current_hash) = env
-        .loader
-        .register_captured(db, table, &shape, &checkpoint)
-        .await?;
     if drift {
         warn!(source_id = env.source_id, %db, %table, changes = deltas.len(), "failover drift adapted");
     }
-    write_marker(
-        env.backend,
-        &key,
-        anchor,
-        Some((previous.version, previous.hash.clone())),
-        Some((current_version, current_hash)),
-        if drift {
+    Ok(DriftVerdict::Marker {
+        key,
+        previous: Some((previous.version, previous.hash.clone())),
+        register: Some(Box::new(shape)),
+        outcome: if drift {
             Outcome::Adapted
         } else {
             Outcome::Unchanged
         },
-    )
-    .await
+    })
+}
+
+/// [`check`]'s writes, for a verdict of [`assess`].
+pub(crate) async fn record(
+    env: &DriftEnv<'_>,
+    anchor: &FailoverAnchor,
+    db: &str,
+    table: &str,
+    verdict: DriftVerdict,
+) -> SourceResult<()> {
+    let DriftVerdict::Marker {
+        key,
+        previous,
+        register,
+        outcome,
+    } = verdict
+    else {
+        return Ok(());
+    };
+    let current = match register {
+        Some(shape) => {
+            let checkpoint = serde_json::to_vec(&anchor.position)
+                .map_err(|e| SourceError::Other(e.into()))?;
+            Some(
+                env.loader
+                    .register_captured(db, table, shape.as_ref(), &checkpoint)
+                    .await?,
+            )
+        }
+        None => None,
+    };
+    write_marker(env.backend, &key, anchor, previous, current, outcome).await
 }
 
 /// [`check`] from the stream, once per table and run: the anchor is loaded
@@ -756,6 +801,68 @@ pub(crate) async fn check_in_stream(
     ctx.drift_checked.insert(key);
     // The table passed its drift check: accepted.
     ctx.drift_resolver.accepted(&format!("{db}.{table}")).await;
+    Ok(())
+}
+
+/// [`check_in_stream`] for an activation window: assess every table first
+/// (any halt stops the window with nothing written), then record them all.
+pub(crate) async fn check_window(
+    ctx: &mut super::RunCtx,
+    tables: &[(String, String, WmPos, MySqlCheckpoint, Vec<Stored>)],
+) -> SourceResult<()> {
+    let scope = ctx.registry_scope.current()?;
+    let pending: Vec<_> = tables
+        .iter()
+        .filter(|(db, table, ..)| {
+            !ctx.drift_checked
+                .contains(&scope.key(db, table).backend_key())
+        })
+        .collect();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let anchor = match &ctx.failover {
+        Some(anchor) => anchor.clone(),
+        None => {
+            let anchor =
+                load_anchor(&ctx.registry_backend, &ctx.tenant, &ctx.source_id)
+                    .await
+                    .map_err(SourceError::Other)?
+                    .map(std::sync::Arc::new);
+            ctx.failover = Some(anchor.clone());
+            anchor
+        }
+    };
+    if let Some(anchor) = anchor {
+        let server_uuid = ctx.expected_uuid()?;
+        let env = DriftEnv {
+            backend: &ctx.registry_backend,
+            loader: &ctx.schema,
+            scope: &scope,
+            dsn: ctx.dsn.expose(),
+            server_uuid: &server_uuid,
+            source_id: &ctx.source_id,
+            halt: ctx.on_schema_drift == deltaforge_config::OnSchemaDrift::Halt,
+            lower_case_table_names: ctx.lower_case_table_names,
+            proofs: Some(&ctx.proof_scanner),
+        };
+        let mut verdicts = Vec::with_capacity(pending.len());
+        for (db, table, at, at_cp, timeline) in &pending {
+            let event = FirstEvent::Rows {
+                at,
+                at_cp,
+                timeline,
+            };
+            verdicts.push(assess(&env, &anchor, db, table, event).await?);
+        }
+        for ((db, table, ..), verdict) in pending.iter().zip(verdicts) {
+            record(&env, &anchor, db, table, verdict).await?;
+        }
+    }
+    for (db, table, ..) in pending {
+        ctx.drift_checked.insert(scope.key(db, table).backend_key());
+        ctx.drift_resolver.accepted(&format!("{db}.{table}")).await;
+    }
     Ok(())
 }
 

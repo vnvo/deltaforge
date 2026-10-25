@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use mysql_async::prelude::Queryable;
 use rdkafka::ClientConfig;
 use rdkafka::Message;
@@ -556,6 +556,9 @@ fn proof_trace(stdout: &Path) -> Value {
     };
     let (mut proofs, mut seeks) = (0u64, Vec::new());
     let mut outcomes: HashMap<String, u64> = HashMap::new();
+    // Each activation window: its size beside its phases and state-store
+    // commit, so the commit reads per table.
+    let mut windows = Vec::new();
     for line in text.lines() {
         let Some(i) = line.find("{\"record\"") else {
             continue;
@@ -571,6 +574,19 @@ fn proof_trace(stdout: &Path) -> Value {
                     .or_default() += 1;
             }
             Some("scan") => seeks.push(r["seek_ms"].as_f64().unwrap_or(0.0)),
+            Some("window") => windows.push(json!({
+                "tables": r["tables"], "events": r["events"],
+                "closed_by": r["closed_by"], "prefetched": r["prefetched"],
+                "read_ms": r["read_ms"], "capture_ms": r["capture_ms"],
+                "capture_lock_ms": r["capture_lock_ms"],
+                "capture_schema_ms": r["capture_schema_ms"],
+                "scan_ms": r["scan_ms"], "commit_ms": r["commit_ms"],
+                "batch_conflicts": r["batch_conflicts"],
+                "batch_applies": r["batch_applies"],
+                "capture_attempts": r["capture_attempts"],
+                "stream_openings": r["stream_openings"],
+                "extensions_committed": r["extensions_committed"],
+            })),
             _ => {}
         }
     }
@@ -585,6 +601,7 @@ fn proof_trace(stdout: &Path) -> Value {
         "seek_total_ms": seeks.iter().sum::<f64>(),
         "seek_ms": quantiles(seeks.clone()),
         "seek_by_decile": deciles,
+        "windows": windows,
     })
 }
 
@@ -744,6 +761,18 @@ pub async fn run(
     let duration = point.duration(base);
     let t_load = Instant::now();
     let load_end = t_load + duration;
+    let counters = match (sys, process.as_ref()) {
+        (Sys::Df(_), Some(p))
+            if PERF_COUNTERS.get().copied().unwrap_or(false) =>
+        {
+            let pid = p.pid();
+            Some(tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                perf_counters(pid, 30).await
+            }))
+        }
+        _ => None,
+    };
     let halt = Arc::new(AtomicBool::new(false));
     let mut writers = Vec::new();
     let mut queues = Vec::new();
@@ -917,6 +946,14 @@ pub async fn run(
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let cpu = sys_cpu(sys, process.as_ref()) - cpu0;
+    let perf = match counters {
+        Some(task) => match task.await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => json!({"error": format!("{e:#}")}),
+            Err(e) => json!({"error": e.to_string()}),
+        },
+        None => Value::Null,
+    };
     let df1 = df_counters().await;
     let (dbz1, history) = match sys {
         Sys::Dbz(c, _) => (
@@ -1151,10 +1188,11 @@ pub async fn run(
         "latency_catchup_ms": quantiles(catchup_lat),
         "catchup_s": catchup_s, "drain_s": drain_s,
         "cpu_s": cpu, "cpu_cores": cpu / (load_secs + drain_s.unwrap_or(0.0)),
+        "perf_counters": perf,
         "rss_peak_mib": rss_max as f64 / 1024.0,
         "allocations": allocs,
         "mysql_connections_max": conns_max,
-        "state_store_connections": match sys { Sys::Df(_) => json!("none (SQLite)"), Sys::Dbz(..) => json!("Kafka (offsets topic)") },
+        "state_store_connections": match sys { Sys::Df(_) if infra.state.is_some() => json!("PostgreSQL"), Sys::Df(_) => json!("none (SQLite)"), Sys::Dbz(..) => json!("Kafka (offsets topic)") },
         "mysql_cpu_s": db_cpu, "mysql": mysql_delta,
         "binlog_start": {"file": binlog_start.0, "offset": binlog_start.1},
         "binlog_end": {"file": binlog_end.0, "offset": binlog_end.1},
@@ -1606,5 +1644,91 @@ mod tests {
             t += Duration::from_millis(1);
         }
         assert!((n / 10.0 - 2_000.0).abs() < 1.0, "{n}");
+    }
+}
+
+/// Whether each DeltaForge scale run is counted with `perf stat`.
+pub static PERF_COUNTERS: std::sync::OnceLock<bool> =
+    std::sync::OnceLock::new();
+
+/// The process's user-space instructions and cycles over `secs`, from
+/// `perf stat -x,`. On a hybrid CPU perf reports each core type apart
+/// (`cpu_atom/instructions/u`, `cpu_core/instructions/u`), each already
+/// scaled for multiplexing: the process's total is their sum. A counter
+/// perf could not count fails the measurement instead of reading as zero.
+async fn perf_counters(pid: u32, secs: u64) -> Result<Value> {
+    let out = tokio::process::Command::new("perf")
+        .args(["stat", "-x", ",", "-e", "instructions:u,cycles:u", "-p"])
+        .arg(pid.to_string())
+        .args(["--", "sleep"])
+        .arg(secs.to_string())
+        .output()
+        .await
+        .context("run perf stat")?;
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+    parse_perf_csv(&text)
+}
+
+/// [`perf_counters`]' parse, apart for its tests.
+fn parse_perf_csv(text: &str) -> Result<Value> {
+    let (mut instructions, mut cycles) = (0f64, 0f64);
+    let mut parts = Vec::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split(',').collect();
+        if f.len() < 3 || line.starts_with('#') {
+            continue;
+        }
+        let event = f[2];
+        let base = event
+            .rsplit('/')
+            .find(|s| !s.is_empty() && *s != "u")
+            .unwrap_or(event)
+            .trim_end_matches(":u");
+        if base != "instructions" && base != "cycles" {
+            continue;
+        }
+        let value: f64 = f[0]
+            .parse()
+            .map_err(|_| anyhow!("perf could not count {event}: {:?}", f[0]))?;
+        let pct = f.get(4).and_then(|p| p.parse::<f64>().ok());
+        parts.push(json!({"event": event, "value": value, "running_pct": pct}));
+        if base == "instructions" {
+            instructions += value;
+        } else {
+            cycles += value;
+        }
+    }
+    if parts.is_empty() {
+        bail!("perf stat reported no counters: {text}");
+    }
+    Ok(json!({"instructions": instructions, "cycles": cycles, "parts": parts}))
+}
+
+#[cfg(test)]
+mod perf_tests {
+    use super::*;
+
+    /// A hybrid CPU's two scaled counts are summed; a plain CPU's one count
+    /// is taken as is; an uncounted event fails.
+    #[test]
+    fn hybrid_counters_are_summed() {
+        let hybrid = "9761736008,,cpu_atom/instructions/u,23078934514,76.87,,\n\
+                      13393446607,,cpu_core/instructions/u,6942384110,23.13,,\n\
+                      9115411318,,cpu_atom/cycles/u,23078934514,76.87,,\n\
+                      10763386464,,cpu_core/cycles/u,6942384110,23.13,,\n";
+        let v = parse_perf_csv(hybrid).unwrap();
+        assert_eq!(v["instructions"], 23155182615.0);
+        assert_eq!(v["cycles"], 19878797782.0);
+        let plain =
+            "1200,,instructions:u,100,100.00,,\n800,,cycles:u,100,100.00,,\n";
+        let v = parse_perf_csv(plain).unwrap();
+        assert_eq!(
+            (v["instructions"].as_f64(), v["cycles"].as_f64()),
+            (Some(1200.0), Some(800.0))
+        );
+        assert!(
+            parse_perf_csv("<not counted>,,cpu_core/instructions/u,0,0.00,,\n")
+                .is_err()
+        );
     }
 }

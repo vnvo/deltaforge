@@ -20,8 +20,11 @@
 #   a loom model.
 
 crate vendor/mysql-binlog-connector-rust warn
+patched vendor/mysql-binlog-connector-rust src/binlog_client.rs
 patched vendor/mysql-binlog-connector-rust src/binlog_stream.rs
 patched vendor/mysql-binlog-connector-rust src/column/column_value.rs
+patched vendor/mysql-binlog-connector-rust src/command/command_util.rs
+patched vendor/mysql-binlog-connector-rust src/command/dump_binlog_gtid_command.rs
 patched vendor/mysql-binlog-connector-rust src/event/table_map/default_charset.rs
 patched vendor/mysql-binlog-connector-rust src/event/table_map/table_metadata.rs
 patched vendor/mysql-binlog-connector-rust src/network/packet_channel.rs

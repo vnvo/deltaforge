@@ -12,6 +12,7 @@ runs the design cites.
 | `group-replication.sh <runner> <label>` | `group-replication-main-cd716061.log`, `group-replication-fixed-d254837d.log` | The same on a two-member multi-primary group. Runner digests are in `group-replication-runners.sha256`. |
 | `capture.sh` (probe 7) | `batched-capture-probe7.log` | The cost of batched captures, and their behavior with concurrent DDL and lock order. |
 | `frontier.sh` (probe 8) | `frontier-probe8.log` | Positioned starts at a compressed transaction and at a record frontier, and the live end. |
+| `lockstatement-probe9.rs` (probe 9) | `lockstatement-probe9.log` | One `UNION ALL` statement taking a window's metadata locks: acquisition order (textual, so client-sorted), lock type and duration, cleanup after 1146 and 1205, a RENAME spanning one or two captures, a DDL waiting for the commit, and cost against one statement per table. |
 
 `gaps.sh` and `group-replication.sh` use `receiver.py`, an HTTP sink
 target that appends each request body to a file.
@@ -21,3 +22,7 @@ a copy of the vendored `mysql-binlog-connector-rust`. The copy has one
 change: `DumpBinlogGtidCommand` also sends the client's `binlog_filename`
 and `binlog_position`, where the vendored code sends an empty name and
 position 4.
+
+`lockstatement-probe9.rs` is a Rust test: copy it into
+`crates/sources/tests/` and run it with
+`cargo test -p sources --test lockstatement-probe9 -- --ignored --nocapture`.

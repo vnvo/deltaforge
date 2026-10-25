@@ -415,6 +415,7 @@ pub async fn build_source(
                 table_options: c.table_options.clone(),
                 rotation,
                 snapshot_cohort: Default::default(),
+                proofs: c.proofs.clone(),
             }))
         }
     }

@@ -346,6 +346,16 @@ pub async fn make_registry() -> Arc<DurableSchemaRegistry> {
         .expect("registry")
 }
 
+/// A registry over `backend`: the one store the source keeps its schema
+/// registry and activation records in (as production builds it).
+pub async fn registry_on(
+    backend: &ArcStorageBackend,
+) -> Arc<DurableSchemaRegistry> {
+    DurableSchemaRegistry::new(Arc::clone(backend))
+        .await
+        .expect("registry")
+}
+
 pub async fn make_storage_backend() -> ArcStorageBackend {
     Arc::new(storage::MemoryStorageBackend::new()) as storage::ArcStorageBackend
 }

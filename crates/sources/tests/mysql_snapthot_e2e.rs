@@ -19,8 +19,7 @@ use tracing::info;
 
 mod test_common;
 use test_common::{
-    MYSQL_CDC_USER, MYSQL_CONTAINER, make_registry, mysql_cdc_dsn,
-    mysql_drop_db, mysql_setup,
+    MYSQL_CDC_USER, MYSQL_CONTAINER, mysql_cdc_dsn, mysql_drop_db, mysql_setup,
 };
 
 use crate::test_common::make_storage_backend;
@@ -46,21 +45,23 @@ async fn make_source(
     snapshot_cfg: SnapshotCfg,
 ) -> MySqlSource {
     let dsn = mysql_cdc_dsn(db).await;
+    let shared_store = make_storage_backend().await;
     MySqlSource {
         id: id.into(),
         dsn: dsn.into(),
         tables,
         tenant: "acme".into(),
         pipeline: "test".into(),
-        registry: make_registry().await,
+        registry: test_common::registry_on(&shared_store).await,
         registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         outbox_tables: AllowList::default(),
         snapshot_cfg,
-        backend: make_storage_backend().await,
+        backend: shared_store.clone(),
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }
@@ -674,7 +675,7 @@ async fn make_source_on(
         tables,
         tenant: "acme".into(),
         pipeline: "test".into(),
-        registry: make_registry().await,
+        registry: test_common::registry_on(&backend).await,
         registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         outbox_tables: AllowList::default(),
         snapshot_cfg,
@@ -683,6 +684,7 @@ async fn make_source_on(
         table_options,
         rotation: None,
         snapshot_cohort: Default::default(),
+        proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }

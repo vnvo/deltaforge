@@ -157,6 +157,7 @@ async fn open_session(
         server_id: client.server_id,
         gtid_enabled: client.gtid_enabled,
         gtid_set: client.gtid_set.clone(),
+        gtid_start: client.gtid_start.clone(),
         heartbeat_interval_secs: client.heartbeat_interval_secs,
         timeout_secs,
         keepalive_idle_secs: 0,

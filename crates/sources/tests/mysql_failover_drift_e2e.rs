@@ -23,6 +23,7 @@ use gate_ownership::GateOwned;
 use mysql_async::prelude::Queryable;
 use serde_json::Value;
 use sources::MySqlSource;
+use storage::adapters::test_util::FaultBackend;
 use storage::adapters::{LineageDescriptor, SchemaKey};
 use storage::{ArcStorageBackend, DurableSchemaRegistry, MemoryStorageBackend};
 use testcontainers::{
@@ -119,7 +120,11 @@ struct State {
 
 impl State {
     async fn new() -> Self {
-        let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        Self::on(Arc::new(MemoryStorageBackend::new())).await
+    }
+
+    /// Registry and activations in `backend` (one store, as in production).
+    async fn on(backend: ArcStorageBackend) -> Self {
         Self {
             registry: DurableSchemaRegistry::new(backend.clone())
                 .await
@@ -201,6 +206,7 @@ fn source(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }
@@ -674,4 +680,281 @@ async fn drift_is_proven_on_a_busy_server() {
             .expect("recorded");
         assert_eq!(m["outcome"], outcome, "{id}: {m}");
     }
+}
+
+/// Drift is checked for every table of an activation window at its close:
+/// a later table's drift stops the whole window. `orders` (unchanged on B)
+/// is touched first and `items` (a column added on B) after it, in one
+/// transaction, so both are in one window. Under halt the source stops on
+/// `items`, and nothing of `orders` becomes visible: no row, no schema
+/// version and no activation record under B's lineage.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn a_later_tables_drift_stops_the_whole_window() {
+    init_test_tracing();
+    let (a, b) = servers().await;
+    let db = "fd_window";
+    let sc = Scenario {
+        id: "fd_window",
+        db,
+        tables: vec![format!("{db}.orders"), format!("{db}.items")],
+    };
+    const ITEMS: &str = "CREATE TABLE items (id INT PRIMARY KEY, n INT)";
+    let st = State::new().await;
+    // Run 1 on A: both tables' schemas registered under A's lineage.
+    sql(
+        a,
+        &[
+            format!("DROP DATABASE IF EXISTS {db}"),
+            format!("CREATE DATABASE {db}"),
+            format!("USE {db}"),
+            ORDERS.to_string(),
+            ITEMS.to_string(),
+        ],
+    )
+    .await;
+    let src = source(&sc, a, &st, OnSchemaDrift::Adapt, SnapshotMode::Never);
+    let (items, _) = run(
+        src,
+        &st,
+        a,
+        &[
+            format!("INSERT INTO {db}.orders VALUES (1, 'on-a')"),
+            format!("INSERT INTO {db}.items VALUES (1, 1)"),
+        ],
+        Duration::from_secs(4),
+    )
+    .await;
+    assert_eq!(rows(&items).len(), 2, "run 1 on A");
+    // B: `items` drifted before the failover position, `orders` did not.
+    sql(
+        b,
+        &[
+            format!("DROP DATABASE IF EXISTS {db}"),
+            format!("CREATE DATABASE {db}"),
+            format!("USE {db}"),
+            ORDERS.to_string(),
+            ITEMS.to_string(),
+            "ALTER TABLE items ADD COLUMN extra INT".to_string(),
+        ],
+    )
+    .await;
+    let executed = query_one(a, "SELECT @@GLOBAL.gtid_executed").await;
+    sql(
+        b,
+        &[
+            "RESET BINARY LOGS AND GTIDS".to_string(),
+            format!("SET GLOBAL gtid_purged = '{executed}'"),
+        ],
+    )
+    .await;
+    let src = source(&sc, b, &st, OnSchemaDrift::Halt, SnapshotMode::Never);
+    let (items, ended) = run(
+        src,
+        &st,
+        b,
+        &[
+            "BEGIN".to_string(),
+            format!("INSERT INTO {db}.orders VALUES (2, 'on-b')"),
+            format!("INSERT INTO {db}.items VALUES (2, 2, 2)"),
+            "COMMIT".to_string(),
+        ],
+        Duration::from_secs(20),
+    )
+    .await;
+    halted(&ended, "schema drift since the failover");
+    assert!(rows(&items).is_empty(), "no row of the window: {items:?}");
+    assert!(
+        st.activation(b, sc.id, db, "orders").await.is_empty(),
+        "no activation record of the earlier table"
+    );
+    assert!(
+        st.marker(b, sc.id, db, "orders").await.is_none(),
+        "no drift outcome of the earlier table"
+    );
+    let uuid = query_one(b, "SELECT @@GLOBAL.server_uuid").await;
+    let hash = LineageDescriptor::mysql(&uuid).unwrap().lineage_hash();
+    let key = SchemaKey::new(TENANT, sc.id, &hash, db, "orders");
+    assert!(
+        st.registry.get_latest(&key).await.unwrap().is_none(),
+        "no schema version of the earlier table under B's lineage"
+    );
+}
+
+/// Drift outcomes are completed facts independent of the window that
+/// produced them: every table's check succeeds and its outcome commits
+/// (marker and live-shape registration), then the window's atomic batch
+/// fails. Nothing is admitted: no row, no activation record, the checkpoint
+/// does not move. The restart reuses exactly those outcomes (one marker per
+/// table, unchanged; no new schema version) and recomputes the whole
+/// window's admission.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn drift_outcomes_survive_a_failed_window_and_are_reused() {
+    init_test_tracing();
+    let (a, b) = servers().await;
+    let db = "fd_reuse";
+    let sc = Scenario {
+        id: "fd_reuse",
+        db,
+        tables: vec![format!("{db}.orders"), format!("{db}.items")],
+    };
+    const ITEMS: &str = "CREATE TABLE items (id INT PRIMARY KEY, n INT)";
+    let faults = Arc::new(FaultBackend::new());
+    let st = State::on(faults.clone()).await;
+    sql(
+        a,
+        &[
+            format!("DROP DATABASE IF EXISTS {db}"),
+            format!("CREATE DATABASE {db}"),
+            format!("USE {db}"),
+            ORDERS.to_string(),
+            ITEMS.to_string(),
+        ],
+    )
+    .await;
+    let src = source(&sc, a, &st, OnSchemaDrift::Adapt, SnapshotMode::Never);
+    let (items, _) = run(
+        src,
+        &st,
+        a,
+        &[
+            format!("INSERT INTO {db}.orders VALUES (1, 'on-a')"),
+            format!("INSERT INTO {db}.items VALUES (1, 1)"),
+        ],
+        Duration::from_secs(4),
+    )
+    .await;
+    assert_eq!(rows(&items).len(), 2, "run 1 on A");
+    // B: `items` drifted before the failover position, `orders` did not.
+    sql(
+        b,
+        &[
+            format!("DROP DATABASE IF EXISTS {db}"),
+            format!("CREATE DATABASE {db}"),
+            format!("USE {db}"),
+            ORDERS.to_string(),
+            ITEMS.to_string(),
+            "ALTER TABLE items ADD COLUMN extra INT".to_string(),
+        ],
+    )
+    .await;
+    let executed = query_one(a, "SELECT @@GLOBAL.gtid_executed").await;
+    sql(
+        b,
+        &[
+            "RESET BINARY LOGS AND GTIDS".to_string(),
+            format!("SET GLOBAL gtid_purged = '{executed}'"),
+        ],
+    )
+    .await;
+    let committed: sources::MySqlCheckpoint =
+        serde_json::from_slice(&st.ckpt.get_raw(sc.id).await.unwrap().unwrap())
+            .unwrap();
+    let uuid = query_one(b, "SELECT @@GLOBAL.server_uuid").await;
+    let hash = LineageDescriptor::mysql(&uuid).unwrap().lineage_hash();
+    let latest = |table: &'static str| {
+        let key = SchemaKey::new(TENANT, sc.id, &hash, db, table);
+        let registry = st.registry.clone();
+        async move {
+            registry
+                .get_latest(&key)
+                .await
+                .unwrap()
+                .map(|v| (v.version, v.hash))
+        }
+    };
+
+    // Run 2 on B: the window's atomic batch fails (every activation write
+    // does; drift outcomes are written outside it).
+    faults
+        .fail_writes_to
+        .lock()
+        .unwrap()
+        .push("schemas.v1.activation".into());
+    let src = source(&sc, b, &st, OnSchemaDrift::Adapt, SnapshotMode::Never);
+    let (items, _) = run(
+        src,
+        &st,
+        b,
+        &[
+            "BEGIN".to_string(),
+            format!("INSERT INTO {db}.orders VALUES (2, 'on-b')"),
+            format!("INSERT INTO {db}.items VALUES (2, 2, 2)"),
+            "COMMIT".to_string(),
+        ],
+        Duration::from_secs(15),
+    )
+    .await;
+    assert!(rows(&items).is_empty(), "no row admitted: {items:?}");
+    for table in ["orders", "items"] {
+        assert!(
+            st.activation(b, sc.id, db, table).await.is_empty(),
+            "no activation record of {table}"
+        );
+    }
+    let now: sources::MySqlCheckpoint =
+        serde_json::from_slice(&st.ckpt.get_raw(sc.id).await.unwrap().unwrap())
+            .unwrap();
+    assert_eq!(
+        (&now.file, now.pos, &now.gtid_set),
+        (&committed.file, committed.pos, &committed.gtid_set),
+        "the checkpoint does not move"
+    );
+    let markers = (
+        st.marker(b, sc.id, db, "orders")
+            .await
+            .expect("orders' outcome"),
+        st.marker(b, sc.id, db, "items")
+            .await
+            .expect("items' outcome"),
+    );
+    assert_eq!(markers.0["outcome"], "unchanged");
+    assert_eq!(markers.1["outcome"], "adapted");
+    let versions = (
+        latest("orders").await.expect("orders' live shape"),
+        latest("items").await.expect("items' live shape"),
+    );
+
+    // Run 3 on B, the store healthy: the outcomes are reused as they are,
+    // the window is admitted from scratch.
+    faults.fail_writes_to.lock().unwrap().clear();
+    let src = source(&sc, b, &st, OnSchemaDrift::Adapt, SnapshotMode::Never);
+    let (items, _) = run(src, &st, b, &[], Duration::from_secs(10)).await;
+    let got: Vec<_> = rows(&items)
+        .iter()
+        .map(|e| {
+            test_common::row_view(e.after.as_ref().unwrap())["id"]
+                .as_i64()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(got, vec![2, 2], "both rows of the window, once: {items:?}");
+    for (table, marker) in [("orders", &markers.0), ("items", &markers.1)] {
+        let uuid_key = SchemaKey::new(TENANT, sc.id, &hash, db, table);
+        let all = st
+            .backend
+            .log_list(MARKER_NS, &uuid_key.backend_key())
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 1, "one outcome of {table}");
+        assert_eq!(
+            &serde_json::from_slice::<Value>(&all[0].1).unwrap(),
+            marker,
+            "{table}'s outcome reused unchanged"
+        );
+        assert_eq!(
+            st.activation(b, sc.id, db, table).await.len(),
+            1,
+            "{table} admitted once"
+        );
+    }
+    assert_eq!(
+        (
+            latest("orders").await.unwrap(),
+            latest("items").await.unwrap()
+        ),
+        versions,
+        "no schema version registered again"
+    );
 }

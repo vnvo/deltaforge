@@ -27,6 +27,11 @@ pub struct FaultBackend {
     one_shot: AtomicBool,
     /// Every `kv_list` call: (namespace, prefix).
     pub kv_list_calls: std::sync::Mutex<Vec<(String, Option<String>)>>,
+    /// Every stream read: (namespace, key), one per `log_read_meta_since`
+    /// call and one per stream of each `log_read_streams` call; and how
+    /// many `log_read_streams` calls were made.
+    pub stream_reads: std::sync::Mutex<Vec<(String, String)>>,
+    pub batched_stream_reads: std::sync::atomic::AtomicU64,
     /// Every write to one of these namespaces fails while it is listed.
     pub fail_writes_to: std::sync::Mutex<Vec<String>>,
     /// `(namespace, n)`: allow `n` more writes to the namespace, fail the
@@ -73,6 +78,8 @@ impl FaultBackend {
             writes_left: std::sync::atomic::AtomicU64::new(u64::MAX),
             one_shot: AtomicBool::new(false),
             kv_list_calls: std::sync::Mutex::new(Vec::new()),
+            stream_reads: std::sync::Mutex::new(Vec::new()),
+            batched_stream_reads: std::sync::atomic::AtomicU64::new(0),
             fail_writes_to: std::sync::Mutex::new(Vec::new()),
             fail_after_writes_to: std::sync::Mutex::new(None),
             yield_after_slot_reads: AtomicBool::new(false),
@@ -125,6 +132,53 @@ impl FaultBackend {
 
 #[async_trait::async_trait]
 impl StorageBackend for FaultBackend {
+    async fn read_batch(
+        &self,
+        reads: &[crate::BatchRead],
+    ) -> Result<Vec<crate::BatchReadResult>> {
+        self.inner.read_batch(reads).await
+    }
+    /// `fail_log_read_meta` fails the whole read: nothing partial is
+    /// returned.
+    async fn log_read_streams(
+        &self,
+        streams: &[(String, String)],
+    ) -> Result<Vec<Vec<LogEntryMeta>>> {
+        self.batched_stream_reads.fetch_add(1, Ordering::SeqCst);
+        self.stream_reads
+            .lock()
+            .unwrap()
+            .extend(streams.iter().cloned());
+        anyhow::ensure!(
+            !self.fail_log_read_meta.load(Ordering::SeqCst),
+            "injected stream read failure"
+        );
+        self.inner.log_read_streams(streams).await
+    }
+    /// A write fault in any op's namespace fails the whole batch before it
+    /// reaches the store: an atomic batch writes all or nothing.
+    async fn apply_batch(
+        &self,
+        batch: &crate::AtomicBatch,
+    ) -> Result<crate::BatchOutcome> {
+        for op in &batch.ops {
+            let ns = match op {
+                crate::BatchOp::LogAppendIfAbsent { ns, .. }
+                | crate::BatchOp::KvPut { ns, .. }
+                | crate::BatchOp::KvMaxSeq { ns, .. } => ns,
+            };
+            self.write(ns)?;
+        }
+        self.inner.apply_batch(batch).await
+    }
+    async fn log_find_capture(
+        &self,
+        ns: &str,
+        key: &str,
+        capture_id: &str,
+    ) -> Result<Option<(u64, Vec<u8>)>> {
+        self.inner.log_find_capture(ns, key, capture_id).await
+    }
     async fn kv_get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {
         anyhow::ensure!(
             !self.fail_kv_get.load(Ordering::SeqCst),
@@ -242,6 +296,10 @@ impl StorageBackend for FaultBackend {
         since: u64,
         limit: usize,
     ) -> Result<Vec<LogEntryMeta>> {
+        self.stream_reads
+            .lock()
+            .unwrap()
+            .push((ns.to_string(), key.to_string()));
         anyhow::ensure!(
             !self.fail_log_read_meta.load(Ordering::SeqCst),
             "injected log_read_meta_since failure"

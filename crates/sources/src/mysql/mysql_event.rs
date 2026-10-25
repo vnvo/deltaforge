@@ -47,16 +47,32 @@ async fn send_event(
 
 pub(super) async fn read_next_event(
     stream: &mut BinlogStream,
-    ctx: &RunCtx,
+    ctx: &mut RunCtx,
 ) -> Result<(EventHeader, EventData), LoopControl> {
     // Test hook: the connection "dropped" right here.
     if crate::stream_probe::take_disconnect() {
         return Err(LoopControl::Reconnect);
     }
-    match watchdog(stream.read(), ctx.inactivity, &ctx.cancel, "binlog_read")
-        .await
-    {
-        Ok(event) => Ok(event),
+    // What a window prefetched comes first, then the error that ended
+    // the prefetch, then the stream.
+    if let Some((received, seq, header, data)) = ctx.prefetched.pop_front() {
+        ctx.last_received = received;
+        ctx.last_seq = seq;
+        return Ok((header, data));
+    }
+    ctx.last_seq = 0;
+    let read = match ctx.prefetch_error.take() {
+        Some(e) => Err(common::RetryOutcome::Failed(e)),
+        None => {
+            watchdog(stream.read(), ctx.inactivity, &ctx.cancel, "binlog_read")
+                .await
+        }
+    };
+    match read {
+        Ok(event) => {
+            ctx.last_received = std::time::Instant::now();
+            Ok(event)
+        }
         Err(outcome) => {
             // The server purged the binlog the resume position needs: the
             // position is gone (an operator incident, not a retry).
@@ -675,6 +691,19 @@ async fn handle_gtid(
             "binlog framing error: malformed GTID {gtid_str:?}"
         )));
     }
+    // The stream anchor: this GTID event's start is the first transaction
+    // after the executed set (every earlier one was received, or skipped by
+    // the server as in its start set).
+    ctx.txn_anchor = ctx.last_gtid.as_ref().map(|set_before| {
+        super::mysql_binlog_scan::Anchor {
+            server_uuid: String::new(),
+            lineage: String::new(),
+            file: ctx.last_file.clone(),
+            offset: ctx.last_event_start,
+            set_before: set_before.clone(),
+            next_gtid: Some(gtid_str.clone()),
+        }
+    });
     ctx.current_gtid = Some(gtid_str.clone());
     ctx.in_explicit_txn = false;
     // New transaction boundary: reset the DDL message ordinal and the
@@ -1022,6 +1051,43 @@ async fn emit_ddl_event(
     Ok(())
 }
 
+/// How a QueryEvent bears on its transaction. One rule for the dispatcher
+/// ([`handle_query`]) and for the activation window's read-ahead, which
+/// tracks transaction boundaries without dispatching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QueryBoundary {
+    /// `BEGIN`: an explicit transaction opens.
+    Opens,
+    /// The statement ends its transaction: `COMMIT`/`ROLLBACK`, a DDL (as
+    /// the server executed it, executable comments included) or an account
+    /// statement (implicitly committed), or any statement outside an
+    /// explicit transaction (its own autocommit transaction).
+    Completes,
+    /// A control statement inside an explicit transaction (`SAVEPOINT`,
+    /// `SET`, ...): part of it, closed later.
+    Continues,
+}
+
+pub(super) fn query_boundary(
+    sql: &str,
+    in_explicit_txn: bool,
+    server_version: Option<u32>,
+) -> QueryBoundary {
+    let sql_upper = sql.to_uppercase();
+    if sql_upper == "BEGIN" {
+        return QueryBoundary::Opens;
+    }
+    if sql_upper == "COMMIT"
+        || sql_upper == "ROLLBACK"
+        || credential_ddl_operation(sql, server_version).is_some()
+        || super::mysql_ddl_attribution::is_ddl_statement(sql, server_version)
+        || !in_explicit_txn
+    {
+        return QueryBoundary::Completes;
+    }
+    QueryBoundary::Continues
+}
+
 async fn handle_query(
     ctx: &mut RunCtx,
     header: &EventHeader,
@@ -1030,13 +1096,18 @@ async fn handle_query(
     // Every QueryEvent counts, as the binlog scanner numbers them.
     ctx.query_ordinal += 1;
     let sql_upper = q.query.to_uppercase();
+    let boundary = query_boundary(
+        &q.query,
+        ctx.in_explicit_txn,
+        ctx.binlog_server_version,
+    );
 
     // BEGIN opens an explicit, multi-event transaction (row events + Xid, or an
     // explicit COMMIT/ROLLBACK). The transaction was already opened on the
     // coordinator by its GTID event; here we only record that we are inside an
     // explicit block so a later control statement is not mistaken for a
     // standalone autocommit transaction.
-    if sql_upper == "BEGIN" {
+    if boundary == QueryBoundary::Opens {
         ctx.in_explicit_txn = true;
         return Ok(());
     }
@@ -1112,7 +1183,7 @@ async fn handle_query(
     }
 
     // Any other QueryEvent.
-    if ctx.in_explicit_txn {
+    if boundary == QueryBoundary::Continues {
         // A control/ignored statement inside an explicit transaction (e.g.
         // SAVEPOINT, SET) - part of that transaction, which is closed later by its
         // Xid or COMMIT/ROLLBACK. Do not close here.
@@ -1392,7 +1463,7 @@ fn source_event_labels(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::failover::reconciler::SchemaReconciler;
     use crate::mysql::mysql_schema_loader::MySqlSchemaLoader;
@@ -1440,7 +1511,7 @@ mod tests {
         .flatten()
     }
 
-    fn make_runctx(tx: mpsc::Sender<SourceItem>) -> RunCtx {
+    pub(crate) fn make_runctx(tx: mpsc::Sender<SourceItem>) -> RunCtx {
         // A static test schema: `id BIGINT`, `sku VARCHAR(255)` (utf8mb4).
         let mut sku = crate::mysql::MySqlColumn::new(
             "sku",
@@ -1524,6 +1595,19 @@ mod tests {
             lower_case_table_names: 0,
             txn_eval: None,
             txn_eval_cp: None,
+            txn_anchor: None,
+            last_event_start: 0,
+            lookahead: Default::default(),
+            prefetched: Default::default(),
+            next_held_seq: 1,
+            last_seq: 0,
+            pending: None,
+            window_seq: 0,
+            release_watch: Default::default(),
+            prefetch_error: None,
+            last_received: std::time::Instant::now(),
+            prepared: Default::default(),
+            proofs: Default::default(),
             proof_scanner: Default::default(),
             selection: Default::default(),
             failover: None,
@@ -2111,6 +2195,30 @@ mod tests {
     // =========================================================================
     // QueryEvent helpers
     // =========================================================================
+
+    /// The one transaction-boundary rule for queries.
+    #[test]
+    fn query_boundaries_follow_dispatch() {
+        use super::{QueryBoundary as B, query_boundary};
+        let v = Some(80409);
+        assert_eq!(query_boundary("BEGIN", false, v), B::Opens);
+        assert_eq!(query_boundary("COMMIT", true, v), B::Completes);
+        assert_eq!(query_boundary("ROLLBACK", true, v), B::Completes);
+        for ddl in [
+            "ALTER TABLE t ADD c INT",
+            "/*!50700 ALTER TABLE t ADD c INT */",
+            "CREATE TABLE t (a INT)",
+        ] {
+            assert_eq!(query_boundary(ddl, true, v), B::Completes, "{ddl}");
+        }
+        assert_eq!(query_boundary("SAVEPOINT s", true, v), B::Continues);
+        assert_eq!(query_boundary("SET @x = 1", true, v), B::Continues);
+        assert_eq!(query_boundary("FLUSH PRIVILEGES", false, v), B::Completes);
+        assert_eq!(
+            query_boundary("ALTER USER 'u' IDENTIFIED BY 'x'", true, v),
+            B::Completes
+        );
+    }
 
     fn query_event(sql: &str) -> QueryEvent {
         QueryEvent {
@@ -3247,6 +3355,52 @@ mod tests {
         // At a boundary nothing is abandoned.
         ctx.abandon_open_transaction().await.unwrap();
         assert!(rx.try_recv().is_err());
+    }
+
+    /// GTID mode: a transaction's GTID event is its stream anchor - its
+    /// start offset, the executed set before it and its GTID - and only
+    /// while it is open; file/position mode has none.
+    #[tokio::test]
+    async fn a_gtid_event_is_the_open_transactions_stream_anchor() {
+        let (tx, _rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        ctx.current_gtid = None;
+        ctx.in_explicit_txn = false;
+        let before =
+            GtidSet::parse("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-4").unwrap();
+        ctx.last_gtid = Some(before.clone());
+        ctx.last_file = "binlog.000003".into();
+        ctx.last_event_start = 1200;
+        let gtid = "3e11fa47-71ca-11e1-9e33-c80aa9429562:5";
+        handle_gtid(
+            &mut ctx,
+            GtidEvent {
+                flags: 0,
+                gtid: gtid.into(),
+            },
+        )
+        .await
+        .unwrap();
+        let a = ctx.stream_anchor("u", "l").expect("an anchor");
+        assert_eq!((a.server_uuid.as_str(), a.lineage.as_str()), ("u", "l"));
+        assert_eq!((a.file.as_str(), a.offset), ("binlog.000003", 1200));
+        assert_eq!(a.set_before, before);
+        assert_eq!(a.next_gtid.as_deref(), Some(gtid));
+        ctx.mark_transaction_boundary();
+        assert!(ctx.stream_anchor("u", "l").is_none());
+
+        ctx.current_gtid = None;
+        ctx.last_gtid = None;
+        handle_gtid(
+            &mut ctx,
+            GtidEvent {
+                flags: 0,
+                gtid: gtid.into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(ctx.stream_anchor("u", "l").is_none());
     }
 
     #[tokio::test]

@@ -1,0 +1,71 @@
+running 1 test
+setup: 2056 tables in 5.586046082s
+server Some("8.4.9"), max_allowed_packet Some(67108864)
+== A. coverage and cost
+N=1 rep 0: union 8.229845ms (38 bytes), held 1 SHARED_READ/TRANSACTION/GRANTED=true, after COMMIT 0; per-table statements 371.757µs (1 results)
+N=1 rep 1: union 248.427µs (38 bytes), held 1 SHARED_READ/TRANSACTION/GRANTED=true, after COMMIT 0; per-table statements 322.087µs (1 results)
+N=1 rep 2: union 194.107µs (38 bytes), held 1 SHARED_READ/TRANSACTION/GRANTED=true, after COMMIT 0; per-table statements 250.986µs (1 results)
+N=10 rep 0: union 2.752835ms (479 bytes), held 10 SHARED_READ/TRANSACTION/GRANTED=true, after COMMIT 0; per-table statements 833.987µs (10 results)
+N=10 rep 1: union 708.112µs (479 bytes), held 10 SHARED_READ/TRANSACTION/GRANTED=true, after COMMIT 0; per-table statements 800.711µs (10 results)
+N=10 rep 2: union 507.757µs (479 bytes), held 10 SHARED_READ/TRANSACTION/GRANTED=true, after COMMIT 0; per-table statements 1.11661ms (10 results)
+N=200 rep 0: union 44.776797ms (9789 bytes), held 200 SHARED_READ/TRANSACTION/GRANTED=true, after COMMIT 0; per-table statements 28.933213ms (200 results)
+N=200 rep 1: union 19.872295ms (9789 bytes), held 200 SHARED_READ/TRANSACTION/GRANTED=true, after COMMIT 0; per-table statements 26.513753ms (200 results)
+N=200 rep 2: union 25.431645ms (9789 bytes), held 200 SHARED_READ/TRANSACTION/GRANTED=true, after COMMIT 0; per-table statements 30.605986ms (200 results)
+N=2048 rep 0: union 701.883124ms (100341 bytes), held 2048 SHARED_READ/TRANSACTION/GRANTED=true, after COMMIT 0; per-table statements 293.598757ms (2048 results)
+N=2048 rep 1: union 636.466402ms (100341 bytes), held 2048 SHARED_READ/TRANSACTION/GRANTED=true, after COMMIT 0; per-table statements 283.541326ms (2048 results)
+N=2048 rep 2: union 647.550483ms (100341 bytes), held 2048 SHARED_READ/TRANSACTION/GRANTED=true, after COMMIT 0; per-table statements 271.268996ms (2048 results)
+== B. acquisition order
+N=10 sorted rep 0: waiting on t0005, holding 5 below and 0 above t0005; then Ok(()), holding 10
+N=10 sorted rep 1: waiting on t0005, holding 5 below and 0 above t0005; then Ok(()), holding 10
+N=10 sorted rep 2: waiting on t0005, holding 5 below and 0 above t0005; then Ok(()), holding 10
+N=10 reversed rep 0: waiting on t0005, holding 0 below and 4 above t0005; then Ok(()), holding 10
+N=10 reversed rep 1: waiting on t0005, holding 0 below and 4 above t0005; then Ok(()), holding 10
+N=10 reversed rep 2: waiting on t0005, holding 0 below and 4 above t0005; then Ok(()), holding 10
+N=200 sorted rep 0: waiting on t0100, holding 100 below and 0 above t0100; then Ok(()), holding 200
+N=200 sorted rep 1: waiting on t0100, holding 100 below and 0 above t0100; then Ok(()), holding 200
+N=200 sorted rep 2: waiting on t0100, holding 100 below and 0 above t0100; then Ok(()), holding 200
+N=200 reversed rep 0: waiting on t0100, holding 0 below and 99 above t0100; then Ok(()), holding 200
+N=200 reversed rep 1: waiting on t0100, holding 0 below and 99 above t0100; then Ok(()), holding 200
+N=200 reversed rep 2: waiting on t0100, holding 0 below and 99 above t0100; then Ok(()), holding 200
+N=2048 sorted rep 0: waiting on t1024, holding 1024 below and 0 above t1024; then Ok(()), holding 2048
+N=2048 sorted rep 1: waiting on t1024, holding 1024 below and 0 above t1024; then Ok(()), holding 2048
+N=2048 sorted rep 2: waiting on t1024, holding 1024 below and 0 above t1024; then Ok(()), holding 2048
+N=2048 reversed rep 0: waiting on t1024, holding 0 below and 1023 above t1024; then Ok(()), holding 2048
+N=2048 reversed rep 1: waiting on t1024, holding 0 below and 1023 above t1024; then Ok(()), holding 2048
+N=2048 reversed rep 2: waiting on t1024, holding 0 below and 1023 above t1024; then Ok(()), holding 2048
+== C. RENAME spanning one capture's set
+sorted rep 0: capture Ok(()); RENAME Ok(())
+sorted rep 1: capture Ok(()); RENAME Ok(())
+sorted rep 2: capture Ok(()); RENAME Ok(())
+sorted rep 3: capture Ok(()); RENAME Ok(())
+sorted rep 4: capture Ok(()); RENAME Ok(())
+reversed rep 0: capture Err("Server error: `ERROR 42S02 (1146): Table 'p9.t0150' doesn't exist'"); RENAME Ok(())
+reversed rep 1: capture Err("Server error: `ERROR 42S02 (1146): Table 'p9.t0150' doesn't exist'"); RENAME Ok(())
+reversed rep 2: capture Err("Server error: `ERROR 42S02 (1146): Table 'p9.t0150' doesn't exist'"); RENAME Ok(())
+reversed rep 3: capture Err("Server error: `ERROR 42S02 (1146): Table 'p9.t0150' doesn't exist'"); RENAME Ok(())
+reversed rep 4: capture Err("Server error: `ERROR 42S02 (1146): Table 'p9.t0150' doesn't exist'"); RENAME Ok(())
+== D. two captures and a RENAME spanning both
+rep 0: captures Ok(()) Ok(()); RENAME Ok(())
+rep 1: captures Ok(()) Ok(()); RENAME Ok(())
+rep 2: captures Ok(()) Ok(()); RENAME Ok(())
+rep 3: captures Ok(()) Ok(()); RENAME Ok(())
+rep 4: captures Ok(()) Ok(()); RENAME Ok(())
+rep 5: captures Ok(()) Ok(()); RENAME Ok(())
+rep 6: captures Ok(()) Ok(()); RENAME Ok(())
+rep 7: captures Ok(()) Ok(()); RENAME Ok(())
+rep 8: captures Ok(()) Ok(()); RENAME Ok(())
+rep 9: captures Ok(()) Ok(()); RENAME Ok(())
+== E. missing table
+missing t9999: Err("Server error: `ERROR 42S02 (1146): Table 'p9.t9999' doesn't exist'"); holding after the error: 0
+== F. timeout and deadlock cleanup
+timeout: Err("Server error: `ERROR HY000 (1205): Lock wait timeout exceeded; try restarting transaction'"); holding after the error: 0
+unsorted against RENAME: capture Err("Server error: `ERROR 42S02 (1146): Table 'p9.t0150' doesn't exist'"), holding 0 after; RENAME Ok(())
+== G. DDL waits for the capture's commit
+ALTER waiting on ["t0050"] (EXCLUSIVE,EXCLUSIVE,SHARED_UPGRADABLE), still waiting after 1 s: true; capture committed at 1.02647591s, ALTER done at 1.062398828s: Ok(())
+== H. size and limits
+2048 references (100341 bytes): Ok(()) in 677.378037ms, holding 2048
+8192 references (401397 bytes): Ok(()) in 3.875615806s, holding 2048
+32768 references (1605621 bytes): Ok(()) in 99.716521779s, holding 2048
+2048 64-character names: 221173 bytes (21% of the 1 MiB request bound)
+test probe9_single_lock_statement ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 134.36s

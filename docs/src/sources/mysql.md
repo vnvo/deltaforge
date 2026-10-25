@@ -61,6 +61,7 @@ Set `spec.source.type` to `mysql` and provide a config object:
 | `id` | string | Yes | Unique identifier used for checkpoints, server_id derivation, and metrics |
 | `dsn` | string | Yes | MySQL connection string with replication privileges |
 | `tables` | array | Yes | Table patterns to capture. The key is required, but an empty list `[]` captures all user tables. |
+| `proofs` | object | No | Bounds of the schema proofs: see [Schema proof bounds](#schema-proof-bounds). |
 
 ### Table Patterns
 
@@ -90,6 +91,34 @@ source:
     tables:
       - shop.orders
       - shop.order_items
+```
+
+### Schema proof bounds
+
+`proofs` bounds the work that proves the schema version of a table's first
+rows (see [Rows are decoded with the definition in effect when they were
+written](#rows-are-decoded-with-the-definition-in-effect-when-they-were-written)).
+Every field is optional. A value outside its range is refused when the
+configuration is loaded:
+
+| Field | Default | Range | Description |
+|-------|---------|-------|-------------|
+| `activation_window_ms` | `50` | 1 to 1,000 | How long after its first event was received an activation window reads ahead to batch the first rows of newly active tables. The window holds the stream's dispatch meanwhile. |
+| `activation_window_events` | `10000` | 1 to 100,000 | At most this many events buffered by a window. |
+| `activation_window_bytes` | `16777216` | 65,536 to 268,435,456 | At most this many bytes of events buffered by a window. |
+| `capture_lock_wait_secs` | `30` | 1 to 300 | How long a window's capture waits for each table's metadata lock, on each of its three attempts. |
+| `max_seek_ms` | `10000` | 100 to 600,000 | A proof scan with no known start offset fails closed when the server sends no transaction within this bound. |
+
+```yaml
+source:
+  type: mysql
+  config:
+    id: orders-mysql
+    dsn: ${MYSQL_DSN}
+    tables: ["shop.*"]
+    proofs:
+      activation_window_ms: 50
+      max_seek_ms: 10000
 ```
 
 ## Resume Behavior
@@ -303,6 +332,48 @@ When no version can be proven, the source **stops** with a schema error naming t
 - two DDLs of one table both happen before the source reads the first, with rows written between them (the definition between the two was never captured; with `binlog_row_metadata = FULL` those rows proceed only if that definition was already recorded and is the single exact match).
 
 Re-snapshot is the immediate remediation that always works.
+
+**Many newly active tables at once.** When rows of a table without proof
+arrive, the source first reads ahead (an activation window, at most
+`proofs.activation_window_ms`, without advancing its position or emitting
+anything) and collects every other table whose first rows follow. A
+statement that can change a schema, or an idle stream, closes the window
+early. One read-only transaction then captures all of these tables: it
+locks their metadata in sorted order, which avoids deadlocking against a
+multi-table DDL, and reads every definition between the same two binlog
+positions. Meanwhile the source keeps reading the stream, holding what
+arrives for the next window without emitting it, so tables first touched
+during an admission are not held for a second full window. The next
+window's capture and proof scan also start while the current window is
+still being admitted. It is decided and written only after the current
+window commits, in stream order: tables it captured that turn out to be
+proven already are dropped, and any table it should have captured but did
+not stops the source (an internal error, never repaired by guessing). At
+most two windows exist at a time. One binlog
+scan proves them all, and each table is admitted or
+refused exactly as it would be on its own. The admitted tables' schema
+versions and proofs are then written in one state-store transaction: all of
+them or none. A failover drift check runs for every table of the window
+first, so a drift incident stops the whole window with nothing of it
+written. If the store cannot commit the window (after a few retries of the
+whole transaction), the source stops; it never falls back to admitting the
+tables one by one. If the locks are not granted
+within `proofs.capture_lock_wait_secs` on three attempts, the source stops
+with a `mysql_capture_contention` incident: nothing of the window is
+emitted, the checkpoint stays before it, and a restart retries once the
+schema change holding the lock is done. There is no fallback to one
+capture per table.
+
+**Proof scans start where their interval starts.** A proof scan normally
+opens the binlog at a position the source observed in its own stream,
+either the transaction of the rows or the end of the last scan, and checks
+the first events the server sends before trusting it. Without such a
+position, for example a snapshot baseline, the server seeks from the start
+of the binlog file. That seek is bounded by `proofs.max_seek_ms`: a seek
+that exceeds it stops the proof rather than wait, and the position the scan
+then observes positions the next proof at the same boundary. GTID
+membership still decides what a proof contains, so the start position
+never changes a proof, only how long it takes.
 
 **Recommended:** set `binlog_row_metadata = FULL` on the server. It removes the first two cases whenever the row's definition is still recorded, at a small cost in binlog size.
 

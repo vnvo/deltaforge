@@ -31,6 +31,14 @@ pub struct BinlogClient {
     /// GTID set in format "uuid:1-100,uuid2:1-200"
     /// Only used when gtid_enabled is true
     pub gtid_set: String,
+    /// GTID mode only (DeltaForge patch): the binlog file and offset at which
+    /// the server starts the dump, sent with `gtid_set`. The server still
+    /// skips the transactions in `gtid_set`. `None` (the default) sends no
+    /// file name and offset 4, so the server picks the first file not covered
+    /// by `gtid_set` and reads it from its start, as before. The position
+    /// must be a transaction boundary the caller has observed in a stream
+    /// and validates when the dump opens.
+    pub gtid_start: Option<(String, u32)>,
     /// Heartbeat interval in seconds
     /// Server will send a heartbeat event if no binlog events are received within this interval
     /// If heartbeat_interval_secs=0, server won't send heartbeat events

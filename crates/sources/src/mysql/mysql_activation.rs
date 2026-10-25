@@ -27,6 +27,7 @@ use anyhow::{Context, Result};
 use deltaforge_core::CheckpointOrder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
 use storage::adapters::SchemaKey;
 use storage::{AppendStatus, ArcStorageBackend, DurableSchemaRegistry};
 
@@ -401,7 +402,7 @@ pub(crate) fn full_capture_id(
 /// The timeline contradicts itself: the same identity with different bytes,
 /// an unsupported or corrupt record, or an `observed` version that does not
 /// exist in the table's history.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[error("schema activation timeline: {0}")]
 pub(crate) struct TimelineError(pub String);
 
@@ -421,13 +422,28 @@ pub(crate) async fn append(
     capture_id: &str,
     record: &Record,
 ) -> Result<AppendStatus> {
+    append_outcome(backend, registry, key, ns, stream, capture_id, record)
+        .await
+        .map(|o| o.status)
+}
+
+/// [`append`], with the sequence the record is stored at.
+pub(crate) async fn append_outcome(
+    backend: &ArcStorageBackend,
+    registry: &DurableSchemaRegistry,
+    key: &SchemaKey,
+    ns: &str,
+    stream: &str,
+    capture_id: &str,
+    record: &Record,
+) -> Result<storage::LogAppendOutcome> {
     validate_version(registry, key, record).await?;
     let bytes = encode(record)?;
     match backend
         .log_append_if_absent(ns, stream, capture_id, &bytes)
         .await
     {
-        Ok(out) => Ok(out.status),
+        Ok(out) => Ok(out),
         Err(e)
             if matches!(
                 e.downcast_ref::<storage::LogError>(),
@@ -619,6 +635,15 @@ pub(crate) async fn read_stream(
     ns: &str,
     stream: &str,
 ) -> Result<Vec<Stored>> {
+    read_stream_head(backend, ns, stream).await.map(|(r, _)| r)
+}
+
+/// [`read_stream`], with the sequence of its last record (0 when empty).
+pub(crate) async fn read_stream_head(
+    backend: &ArcStorageBackend,
+    ns: &str,
+    stream: &str,
+) -> Result<(Vec<Stored>, u64)> {
     let mut out = Vec::new();
     let mut since = 0u64;
     loop {
@@ -626,43 +651,150 @@ pub(crate) async fn read_stream(
             .log_read_meta_since(ns, stream, since, READ_PAGE)
             .await
             .context("read activation stream")?;
-        for e in &page {
-            since = e.seq;
-            let capture_id = e.capture_id.clone().ok_or_else(|| {
+        let (records, head) = decode_stream(stream, &page)?;
+        out.extend(records);
+        if !page.is_empty() {
+            since = head;
+        }
+        if page.len() < READ_PAGE {
+            return Ok((out, since));
+        }
+    }
+}
+
+/// A stream's entries as records, with its last sequence (0 when empty):
+/// every entry must carry a capture identity and decode as a record of
+/// this build's format.
+fn decode_stream(
+    stream: &str,
+    entries: &[storage::LogEntryMeta],
+) -> std::result::Result<(Vec<Stored>, u64), TimelineError> {
+    let mut out = Vec::with_capacity(entries.len());
+    let mut head = 0u64;
+    for e in entries {
+        head = e.seq;
+        let capture_id = e.capture_id.clone().ok_or_else(|| {
+            TimelineError(format!(
+                "record {} in {stream} has no capture identity",
+                e.seq
+            ))
+        })?;
+        let record: Record =
+            serde_json::from_slice(&e.value).map_err(|err| {
                 TimelineError(format!(
-                    "record {} in {stream} has no capture identity",
+                    "corrupt record {} in {stream}: {err}",
                     e.seq
                 ))
             })?;
-            let record: Record =
-                serde_json::from_slice(&e.value).map_err(|err| {
-                    TimelineError(format!(
-                        "corrupt record {} in {stream}: {err}",
-                        e.seq
-                    ))
-                })?;
-            if record.format_version != FORMAT_VERSION {
-                let why = if record.format_version < FORMAT_VERSION {
-                    "; it was written before exact GTID sets, so its \
-                     boundaries may claim transactions the server had not \
-                     executed. Configure the source under a new source id \
-                     to start it again with a snapshot"
-                } else {
-                    ""
-                };
-                return Err(TimelineError(format!(
-                    "record {} in {stream} has format_version {} (this \
-                     build reads {FORMAT_VERSION}){why}",
-                    e.seq, record.format_version
-                ))
-                .into());
-            }
-            out.push(Stored { capture_id, record });
+        if record.format_version != FORMAT_VERSION {
+            let why = if record.format_version < FORMAT_VERSION {
+                "; it was written before exact GTID sets, so its \
+                 boundaries may claim transactions the server had not \
+                 executed. Configure the source under a new source id \
+                 to start it again with a snapshot"
+            } else {
+                ""
+            };
+            return Err(TimelineError(format!(
+                "record {} in {stream} has format_version {} (this \
+                 build reads {FORMAT_VERSION}){why}",
+                e.seq, record.format_version
+            )));
         }
-        if page.len() < READ_PAGE {
-            return Ok(out);
+        out.push(Stored { capture_id, record });
+    }
+    Ok((out, head))
+}
+
+/// The most tables, and encoded stream-key bytes, one batched timeline read
+/// takes (the activation window's own bounds).
+pub(crate) const TIMELINE_READ_MAX_TABLES: usize =
+    super::mysql_binlog_scan::MAX_BATCH_TABLES;
+pub(crate) const TIMELINE_READ_MAX_KEY_BYTES: usize = 1 << 20;
+
+/// One table's timeline parts as [`read_table_head`] and
+/// [`read_barriers_head`] return them: its records and stream head, the
+/// barriers that apply (lineage, then database), and their heads.
+pub(crate) type TimelineParts =
+    (Vec<Stored>, u64, Vec<Stored>, Vec<(String, u64)>);
+
+/// The timeline parts of `keys` (deduplicated, in canonical order), all
+/// from one store snapshot: each table stream and each shared barrier
+/// stream read exactly once (`log_read_streams`), decoded exactly as the
+/// per-table reads decode them. Per table: its parts, or the error its own
+/// read would have failed with (a version its records name is validated
+/// the same way). A read failure, or a request beyond the bounds, is an
+/// error with nothing usable.
+pub(crate) async fn read_timelines(
+    backend: &ArcStorageBackend,
+    registry: &DurableSchemaRegistry,
+    keys: &[SchemaKey],
+) -> Result<BTreeMap<String, Result<TimelineParts>>> {
+    let mut tables: BTreeMap<String, &SchemaKey> = BTreeMap::new();
+    for k in keys {
+        tables.insert(k.backend_key(), k);
+    }
+    anyhow::ensure!(
+        tables.len() <= TIMELINE_READ_MAX_TABLES,
+        "a batched timeline read of {} tables exceeds its bound of {TIMELINE_READ_MAX_TABLES}",
+        tables.len()
+    );
+    let mut barriers: BTreeMap<String, ()> = BTreeMap::new();
+    for k in tables.values() {
+        for b in barrier_streams(k) {
+            barriers.insert(b, ());
         }
     }
+    let mut streams: Vec<(String, String)> = tables
+        .values()
+        .map(|k| (ACTIVATION_NS.to_string(), table_stream(k)))
+        .collect();
+    streams
+        .extend(barriers.keys().map(|b| (BARRIER_NS.to_string(), b.clone())));
+    let key_bytes: usize = streams.iter().map(|(n, k)| n.len() + k.len()).sum();
+    anyhow::ensure!(
+        key_bytes <= TIMELINE_READ_MAX_KEY_BYTES,
+        "a batched timeline read of {key_bytes} key bytes exceeds its bound of \
+         {TIMELINE_READ_MAX_KEY_BYTES}"
+    );
+    let read = backend
+        .log_read_streams(&streams)
+        .await
+        .context("read activation streams")?;
+    let mut by_stream: HashMap<
+        String,
+        std::result::Result<(Vec<Stored>, u64), TimelineError>,
+    > = HashMap::with_capacity(streams.len());
+    for ((_, stream), entries) in streams.iter().zip(&read) {
+        by_stream.insert(stream.clone(), decode_stream(stream, entries));
+    }
+    let mut out = BTreeMap::new();
+    for (bk, key) in tables {
+        let parts = async {
+            let (records, head) = match &by_stream[&table_stream(key)] {
+                Ok(r) => r.clone(),
+                Err(e) => return Err(e.clone().into()),
+            };
+            for r in &records {
+                validate_version(registry, key, &r.record).await?;
+            }
+            let mut all = Vec::new();
+            let mut heads = Vec::new();
+            for b in barrier_streams(key) {
+                match &by_stream[&b] {
+                    Ok((records, head)) => {
+                        all.extend(records.iter().cloned());
+                        heads.push((b, *head));
+                    }
+                    Err(e) => return Err(e.clone().into()),
+                }
+            }
+            Ok((records, head, all, heads))
+        }
+        .await;
+        out.insert(bk, parts);
+    }
+    Ok(out)
 }
 
 /// Read a table's records and validate every version they name.
@@ -671,12 +803,67 @@ pub(crate) async fn read_table(
     registry: &DurableSchemaRegistry,
     key: &SchemaKey,
 ) -> Result<Vec<Stored>> {
-    let records =
-        read_stream(backend, ACTIVATION_NS, &table_stream(key)).await?;
+    read_table_head(backend, registry, key)
+        .await
+        .map(|(r, _)| r)
+}
+
+/// [`read_table`], with the table stream's last sequence (0 when empty).
+pub(crate) async fn read_table_head(
+    backend: &ArcStorageBackend,
+    registry: &DurableSchemaRegistry,
+    key: &SchemaKey,
+) -> Result<(Vec<Stored>, u64)> {
+    let (records, head) =
+        read_stream_head(backend, ACTIVATION_NS, &table_stream(key)).await?;
     for r in &records {
         validate_version(registry, key, &r.record).await?;
     }
-    Ok(records)
+    Ok((records, head))
+}
+
+/// Whether the table stream holds exactly one record after `head`, the one
+/// stored at `seq`: nothing else was appended since it was read at `head`.
+pub(crate) async fn appended_alone(
+    backend: &ArcStorageBackend,
+    key: &SchemaKey,
+    head: u64,
+    seq: u64,
+) -> Result<bool> {
+    let after = backend
+        .log_read_meta_since(ACTIVATION_NS, &table_stream(key), head, 2)
+        .await
+        .context("read activation stream")?;
+    Ok(matches!(after.as_slice(), [one] if one.seq == seq))
+}
+
+/// The barrier streams that apply to `key`: its lineage's, its database's.
+pub(crate) fn barrier_streams(key: &SchemaKey) -> [String; 2] {
+    [
+        barrier_stream(key, &BarrierScope::Lineage),
+        barrier_stream(key, &BarrierScope::Database { db: key.db.clone() }),
+    ]
+}
+
+/// [`read_barriers`], with each barrier stream's last sequence.
+pub(crate) async fn read_barriers_head(
+    backend: &ArcStorageBackend,
+    key: &SchemaKey,
+) -> Result<(Vec<Stored>, Vec<(String, u64)>)> {
+    let mut out = Vec::new();
+    let mut heads = Vec::new();
+    for stream in barrier_streams(key) {
+        let (records, head) =
+            read_stream_head(backend, BARRIER_NS, &stream).await?;
+        out.extend(records);
+        heads.push((stream, head));
+    }
+    Ok((out, heads))
+}
+
+/// The bytes a record is stored as.
+pub(crate) fn encode_record(record: &Record) -> Result<Vec<u8>> {
+    encode(record)
 }
 
 /// Read the barriers that apply to `key` (its lineage and its database).
@@ -742,12 +929,21 @@ pub(crate) fn select_decisive(
     records: &[Stored],
     row: &WmPos,
 ) -> (Selection, Option<String>) {
+    select_decisive_in(records.iter(), row)
+}
+
+/// [`select_decisive`] over records given by reference (a timeline's own
+/// records and barriers, without copying them).
+pub(crate) fn select_decisive_in<'a>(
+    records: impl IntoIterator<Item = &'a Stored>,
+    row: &WmPos,
+) -> (Selection, Option<String>) {
     let (selection, decisive) = select_inner(records, row);
     (selection, decisive.map(|d| d.capture_id.clone()))
 }
 
 fn select_inner<'a>(
-    records: &'a [Stored],
+    records: impl IntoIterator<Item = &'a Stored>,
     row: &WmPos,
 ) -> (Selection, Option<&'a Stored>) {
     let mut applicable: Vec<&Stored> = Vec::new();

@@ -28,6 +28,7 @@ use super::mysql_activation::{
     self, Kind, Record, Selection, Stored, baseline_capture_id, select,
     table_stream,
 };
+use super::mysql_activation_window::PreparedOutcome;
 use super::mysql_binlog_scan::{
     CLASSIFIER_VERSION, ProofError, ProofKind, ScanReport, ScanTag, Statement,
     capture, covers, observe_capture, trace_proof,
@@ -78,7 +79,7 @@ pub(crate) fn affects(
 /// discontinuity barrier) for the baseline to bind. `Err` when the position
 /// is shared with anything a baseline cannot supersede: several barriers, or
 /// a table record.
-fn barrier_to_bind(
+pub(crate) fn barrier_to_bind(
     table: &[Stored],
     barriers: &[Stored],
     r0: &WmPos,
@@ -230,6 +231,7 @@ pub(crate) async fn establish(
         &lineage,
         &r0_cp,
         &s_cp,
+        None,
         Some(&r0_cp),
         &tag,
     )
@@ -380,6 +382,17 @@ pub(crate) async fn establish_at(
             return Ok(false);
         }
     };
+    // An activation window already decided this table (refused, or not
+    // captured): its rows go on as without a lazy baseline. One it admitted
+    // is proven by its committed baseline and never reaches here.
+    if let Some(outcome) = ctx.take_prepared(db, table, &e, &e_cp) {
+        let why = match outcome {
+            PreparedOutcome::Refused(why) => why,
+            PreparedOutcome::NoCapture => "no_capture",
+        };
+        info!(source_id = %ctx.source_id, %db, %table, why, "no lazy baseline (decided by the activation window)");
+        return Ok(false);
+    }
     let cap = match capture(
         ctx.dsn.expose(),
         &server_uuid,
@@ -416,7 +429,7 @@ pub(crate) async fn establish_at(
         trace_proof(&tag, db, table, Some(&cap), None, lctn, "not_covered");
         return Ok(false);
     }
-    let report = match super::mysql_proof_scanner::shared_interval(
+    let scanned = super::mysql_proof_scanner::shared_interval(
         &ctx.proof_scanner,
         ctx.dsn.expose(),
         &source_id,
@@ -424,11 +437,12 @@ pub(crate) async fn establish_at(
         &lineage,
         &e_cp,
         &s_cp,
+        ctx.stream_anchor(&server_uuid, &lineage).as_ref(),
         Some(&e_cp),
         &tag,
     )
-    .await
-    {
+    .await;
+    let report = match scanned {
         Ok(report) => report,
         Err(ProofError::OtherServer(found)) => {
             return Err(other_server(&server_uuid, &found));
@@ -458,10 +472,17 @@ pub(crate) async fn establish_at(
     }
     let checkpoint = serde_json::to_vec(&e_cp)
         .map_err(|err| SourceError::Other(err.into()))?;
-    let (version, schema_hash) = ctx
+    let (version, schema_hash) = match ctx
         .schema
         .register_captured(db, table, &cap.schema, &checkpoint)
-        .await?;
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.selection.invalidate(key);
+            return Err(e);
+        }
+    };
     let stream = table_stream(key);
     let record = Record::new(
         e.clone(),
@@ -480,7 +501,7 @@ pub(crate) async fn establish_at(
         capture_id: id.clone(),
         record: record.clone(),
     };
-    if let Err(why) = super::mysql_selection::admit_decisive(
+    let augmented = match super::mysql_selection::admit_decisive_timeline(
         ctx.schema.registry(),
         key,
         current,
@@ -489,30 +510,34 @@ pub(crate) async fn establish_at(
     )
     .await
     {
-        info!(source_id = %ctx.source_id, %db, %table, why, "no lazy baseline");
-        trace_proof(
-            &tag,
-            db,
-            table,
-            Some(&cap),
-            Some(&report),
-            lctn,
-            "not_decisive",
-        );
-        return Ok(false);
-    }
-    mysql_activation::append(
+        Ok(t) => t,
+        Err(why) => {
+            info!(source_id = %ctx.source_id, %db, %table, why, "no lazy baseline");
+            trace_proof(
+                &tag,
+                db,
+                table,
+                Some(&cap),
+                Some(&report),
+                lctn,
+                "not_decisive",
+            );
+            return Ok(false);
+        }
+    };
+    // Appended, then the validated timeline replaces the cached one (no
+    // second read and validation), or the cached one is discarded.
+    super::mysql_selection::append_admitted(
         &ctx.registry_backend,
         ctx.schema.registry(),
+        &mut ctx.selection,
         key,
-        mysql_activation::ACTIVATION_NS,
-        &stream,
         &id,
         &record,
+        augmented,
     )
     .await
     .map_err(|err| SourceError::Other(err.context("persist a baseline")))?;
-    ctx.selection.invalidate(key);
     info!(source_id = %ctx.source_id, %db, %table, version, scanned_events = report.events, "lazy baseline established");
     trace_proof(&tag, db, table, Some(&cap), Some(&report), lctn, "proven");
     Ok(true)
@@ -770,6 +795,7 @@ mod tests {
                 table_options: Default::default(),
                 rotation: None,
                 snapshot_cohort: Default::default(),
+                proofs: Default::default(),
                 type_mapping: deltaforge_core::TypeMapping::V2,
             };
             // One required sink; its barriers commit through the runner's

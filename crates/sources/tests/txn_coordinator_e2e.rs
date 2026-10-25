@@ -286,21 +286,23 @@ async fn mysql_source(
     dsn: &str,
     db: &str,
 ) -> sources::mysql::MySqlSource {
+    let shared_store = test_common::make_storage_backend().await;
     sources::mysql::MySqlSource {
         id: id.into(),
         dsn: dsn.to_string().into(),
         tables: vec![format!("{db}.orders")],
         tenant: "acme".into(),
         pipeline: "acc".into(),
-        registry: test_common::make_registry().await,
+        registry: test_common::registry_on(&shared_store).await,
         registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         outbox_tables: AllowList::default(),
         snapshot_cfg: deltaforge_config::SnapshotCfg::default(),
-        backend: test_common::make_storage_backend().await,
+        backend: shared_store.clone(),
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }

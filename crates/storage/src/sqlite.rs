@@ -18,9 +18,38 @@ use tokio::task::JoinHandle;
 use tracing::{error, info};
 
 use crate::{
-    AppendStatus, LogAppendOutcome, LogEntryMeta, LogError, LogStreamMeta,
-    LogTruncateOutcome, LogTruncateRequest, StorageBackend, content_digest,
+    AppendStatus, AtomicBatch, BatchFault, BatchFaults, BatchOp, BatchOutcome,
+    BatchRead, BatchReadResult, BatchValue, LogAppendOutcome, LogEntryMeta,
+    LogError, LogStreamMeta, LogTruncateOutcome, LogTruncateRequest,
+    Precondition, StorageBackend, content_digest, max_seq_value, render_seq,
 };
+
+/// A key's live value (an expired one reads as absent).
+fn kv_live(
+    conn: &Connection,
+    ns: &str,
+    key: &str,
+) -> rusqlite::Result<Option<Vec<u8>>> {
+    let row: Option<(Vec<u8>, Option<i64>)> = conn
+        .prepare_cached(
+            "SELECT val, expires_at FROM df_kv WHERE ns=?1 AND key=?2",
+        )?
+        .query_row(params![ns, key], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let now = now_secs();
+    Ok(row.and_then(|(v, exp)| (!exp.is_some_and(|e| e <= now)).then_some(v)))
+}
+
+/// A stream's last sequence (0 when empty).
+fn log_head(conn: &Connection, ns: &str, key: &str) -> rusqlite::Result<u64> {
+    let seq: Option<i64> = conn
+        .prepare_cached(
+            "SELECT seq FROM df_log WHERE ns=?1 AND key=?2 ORDER BY seq DESC LIMIT 1",
+        )?
+        .query_row(params![ns, key], |r| r.get(0))
+        .optional()?;
+    Ok(seq.map_or(0, |s| s as u64))
+}
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -66,12 +95,12 @@ fn ensure_log_meta(
     ns: &str,
     key: &str,
 ) -> rusqlite::Result<()> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT OR IGNORE INTO df_log_meta(ns, key, min_valid_from_seq, head_seq)
          VALUES(?1, ?2, 0,
                 COALESCE((SELECT MAX(seq) FROM df_log WHERE ns=?1 AND key=?2), 0))",
-        params![ns, key],
-    )?;
+    )?
+    .execute(params![ns, key])?;
     Ok(())
 }
 
@@ -82,6 +111,14 @@ pub struct SqliteStorageBackend {
     /// delete + horizon update but BEFORE committing, to prove neither is durable
     /// unless the transaction commits. Always false in production (one atomic load).
     fail_truncate_after_delete: Arc<std::sync::atomic::AtomicBool>,
+    /// Test-only fault point of `apply_batch` (one shot).
+    batch_fault: Arc<Mutex<Option<BatchFault>>>,
+}
+
+impl BatchFaults for SqliteStorageBackend {
+    fn set_batch_fault(&self, fault: Option<BatchFault>) {
+        *self.batch_fault.lock().expect("batch fault") = fault;
+    }
 }
 
 impl std::fmt::Debug for SqliteStorageBackend {
@@ -207,6 +244,7 @@ impl SqliteStorageBackend {
             fail_truncate_after_delete: Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             ),
+            batch_fault: Arc::new(Mutex::new(None)),
         }))
     }
 
@@ -267,6 +305,226 @@ macro_rules! db {
 
 #[async_trait]
 impl StorageBackend for SqliteStorageBackend {
+    async fn read_batch(
+        &self,
+        reads: &[BatchRead],
+    ) -> Result<Vec<BatchReadResult>> {
+        let reads = reads.to_vec();
+        db!(self, move |conn: &Connection| {
+            // One snapshot: every read inside one transaction.
+            let tx = conn.unchecked_transaction()?;
+            let mut out = Vec::with_capacity(reads.len());
+            for r in &reads {
+                out.push(match r {
+                    BatchRead::KvGet { ns, key } => BatchReadResult::Kv(kv_live(&tx, ns, key)?),
+                    BatchRead::LogLatest { ns, key } => BatchReadResult::Latest(
+                        tx.prepare_cached(
+                            "SELECT seq, val FROM df_log WHERE ns=?1 AND key=?2 \
+                             ORDER BY seq DESC LIMIT 1",
+                        )?
+                        .query_row(params![ns, key], |r| {
+                            Ok((r.get::<_, i64>(0)? as u64, r.get(1)?))
+                        })
+                        .optional()?,
+                    ),
+                    BatchRead::LogHead { ns, key } => BatchReadResult::Head(log_head(&tx, ns, key)?),
+                    BatchRead::LogLen { ns, key } => BatchReadResult::Len(
+                        tx.prepare_cached(
+                            "SELECT COUNT(*) FROM df_log WHERE ns=?1 AND key=?2",
+                        )?
+                        .query_row(params![ns, key], |r| r.get::<_, i64>(0))?
+                            as u64,
+                    ),
+                });
+            }
+            tx.commit()?;
+            Ok(out)
+        })
+    }
+
+    async fn log_read_streams(
+        &self,
+        streams: &[(String, String)],
+    ) -> Result<Vec<Vec<LogEntryMeta>>> {
+        let streams = streams.to_vec();
+        db!(self, move |conn: &Connection| {
+            // One snapshot: every stream inside one read transaction, with
+            // one prepared statement.
+            let tx = conn.unchecked_transaction()?;
+            let mut out = Vec::with_capacity(streams.len());
+            {
+                let mut stmt = tx.prepare_cached(
+                    "SELECT seq, COALESCE(ts_ms, ts*1000), capture_id, content_hash, val
+                     FROM df_log WHERE ns=?1 AND key=?2 ORDER BY seq ASC",
+                )?;
+                for (ns, key) in &streams {
+                    let rows = stmt.query_map(params![ns, key], |r| {
+                        Ok(LogEntryMeta {
+                            seq: r.get::<_, i64>(0)? as u64,
+                            stored_at_ms: r.get(1)?,
+                            capture_id: r.get(2)?,
+                            content_hash: r.get(3)?,
+                            value: r.get(4)?,
+                        })
+                    })?;
+                    out.push(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+                }
+            }
+            tx.commit()?;
+            Ok(out)
+        })
+    }
+
+    async fn apply_batch(&self, batch: &AtomicBatch) -> Result<BatchOutcome> {
+        batch.validate()?;
+        let batch = batch.clone();
+        let fault = self.batch_fault.lock().expect("batch fault").take();
+        if fault == Some(BatchFault::BeforeTransaction) {
+            anyhow::bail!("injected failure before the transaction");
+        }
+        db!(self, move |conn: &Connection| {
+            // One writer transaction on the one connection: preconditions,
+            // then every write; contiguous sequences; nothing visible before
+            // the commit, and nothing at all unless it commits.
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            for (i, p) in batch.preconditions.iter().enumerate() {
+                let holds = match p {
+                    Precondition::LogHead { ns, key, seq } => {
+                        log_head(&tx, ns, key)? == *seq
+                    }
+                    Precondition::KvIs { ns, key, value } => {
+                        kv_live(&tx, ns, key)? == *value
+                    }
+                };
+                if !holds {
+                    return Ok(BatchOutcome::Conflict {
+                        why: format!(
+                            "precondition {i} no longer holds ({p:?})"
+                        ),
+                    });
+                }
+            }
+            let mut seqs: Vec<Option<u64>> = vec![None; batch.ops.len()];
+            for (i, op) in batch.ops.iter().enumerate() {
+                if fault == Some(BatchFault::AfterWrites(i)) {
+                    anyhow::bail!("injected failure after {i} staged writes");
+                }
+                match op {
+                    BatchOp::LogAppendIfAbsent {
+                        ns,
+                        key,
+                        capture_id,
+                        value,
+                    } => {
+                        let exists: Option<i64> = tx
+                            .prepare_cached(
+                                "SELECT seq FROM df_log WHERE ns=?1 AND key=?2 AND capture_id=?3",
+                            )?
+                            .query_row(params![ns, key, capture_id], |r| r.get(0))
+                            .optional()?;
+                        if exists.is_some() {
+                            return Ok(BatchOutcome::Conflict {
+                                why: format!(
+                                    "{capture_id} already exists in {key}"
+                                ),
+                            });
+                        }
+                        ensure_log_meta(&tx, ns, key)?;
+                        tx.prepare_cached(
+                            "INSERT INTO df_log(ns, key, val, ts, ts_ms, capture_id, content_hash)
+                             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                            )?
+                            .execute(
+                            params![
+                                ns,
+                                key,
+                                value,
+                                now_secs(),
+                                now_ms(),
+                                capture_id,
+                                content_digest(value)
+                            ],
+                        )?;
+                        let seq = tx.last_insert_rowid() as u64;
+                        tx.prepare_cached(
+                            "UPDATE df_log_meta SET head_seq=MAX(head_seq, ?3) WHERE ns=?1 AND key=?2",
+                            )?
+                            .execute(
+                            params![ns, key, seq as i64],
+                        )?;
+                        seqs[i] = Some(seq);
+                    }
+                    BatchOp::KvPut { ns, key, value } => {
+                        let bytes = match value {
+                            BatchValue::Bytes(b) => b.clone(),
+                            BatchValue::SeqTemplate { template, of } => {
+                                render_seq(
+                                    template,
+                                    seqs[*of].expect("validated"),
+                                )
+                            }
+                        };
+                        tx.prepare_cached(
+                            "INSERT INTO df_kv(ns, key, val, updated_at, expires_at)
+                             VALUES(?1, ?2, ?3, ?4, NULL)
+                             ON CONFLICT(ns, key) DO UPDATE SET
+                               val=excluded.val, updated_at=excluded.updated_at, expires_at=NULL",
+                            )?
+                            .execute(
+                            params![ns, key, bytes, now_secs()],
+                        )?;
+                    }
+                    BatchOp::KvMaxSeq { ns, key, of } => {
+                        let current = kv_live(&tx, ns, key)?;
+                        let bytes = max_seq_value(
+                            current.as_deref(),
+                            seqs[*of].expect("validated"),
+                        )?;
+                        tx.prepare_cached(
+                            "INSERT INTO df_kv(ns, key, val, updated_at, expires_at)
+                             VALUES(?1, ?2, ?3, ?4, NULL)
+                             ON CONFLICT(ns, key) DO UPDATE SET
+                               val=excluded.val, updated_at=excluded.updated_at, expires_at=NULL",
+                            )?
+                            .execute(
+                            params![ns, key, bytes, now_secs()],
+                        )?;
+                    }
+                }
+            }
+            if fault == Some(BatchFault::AfterWrites(batch.ops.len())) {
+                anyhow::bail!("injected failure after every write was staged");
+            }
+            tx.commit()?;
+            if fault == Some(BatchFault::AfterCommit) {
+                anyhow::bail!("injected failure after the commit");
+            }
+            Ok(BatchOutcome::Committed { seqs })
+        })
+    }
+
+    async fn log_find_capture(
+        &self,
+        ns: &str,
+        key: &str,
+        capture_id: &str,
+    ) -> Result<Option<(u64, Vec<u8>)>> {
+        let (ns, key, capture_id) =
+            (ns.to_string(), key.to_string(), capture_id.to_string());
+        db!(self, move |conn: &Connection| {
+            Ok(conn
+                .query_row(
+                    "SELECT seq, val FROM df_log WHERE ns=?1 AND key=?2 AND capture_id=?3",
+                    params![ns, key, capture_id],
+                    |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)),
+                )
+                .optional()?)
+        })
+    }
+
     async fn kv_get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {
         let ns = ns.to_string();
         let key = key.to_string();
@@ -1264,5 +1522,84 @@ mod tests {
 
         drop(be);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Cached statements carry nothing from one batch to the next: on the
+    /// one connection, committed, conflicting, failed-midway and ambiguous
+    /// (acknowledgement lost) batches alternate, each binding different
+    /// keys and values, and afterwards every stream and key holds exactly
+    /// what its own committed batch wrote (and the failed ones nothing).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cached_statements_carry_nothing_between_batches() {
+        use crate::{
+            AtomicBatch, BatchFault, BatchFaults, BatchOp, BatchOutcome,
+            BatchValue, CommitResult, Precondition, commit_atomic,
+        };
+        let b = SqliteStorageBackend::in_memory().unwrap();
+        let batch = |k: usize, tag: u8| AtomicBatch {
+            preconditions: vec![Precondition::LogHead {
+                ns: "n".into(),
+                key: format!("k{k}"),
+                seq: 0,
+            }],
+            ops: vec![
+                BatchOp::LogAppendIfAbsent {
+                    ns: "n".into(),
+                    key: format!("k{k}"),
+                    capture_id: format!("c{k}"),
+                    value: vec![tag; 3 + k % 7],
+                },
+                BatchOp::KvPut {
+                    ns: "kv".into(),
+                    key: format!("k{k}"),
+                    value: BatchValue::Bytes(vec![tag; 1 + k % 5]),
+                },
+            ],
+        };
+        for k in 0..20usize {
+            let tag = k as u8 + 1;
+            assert!(matches!(
+                b.apply_batch(&batch(k, tag)).await.unwrap(),
+                BatchOutcome::Committed { .. }
+            ));
+            assert!(matches!(
+                b.apply_batch(&batch(k, 0xEE)).await.unwrap(),
+                BatchOutcome::Conflict { .. }
+            ));
+            b.set_batch_fault(Some(BatchFault::AfterWrites(1)));
+            assert!(b.apply_batch(&batch(k + 100, 0xDD)).await.is_err());
+            b.set_batch_fault(Some(BatchFault::AfterCommit));
+            assert!(matches!(
+                commit_atomic(b.as_ref(), &batch(k + 200, 0xCC), 3)
+                    .await
+                    .unwrap(),
+                CommitResult::Committed(_)
+            ));
+        }
+        for k in 0..20usize {
+            let tag = k as u8 + 1;
+            let log = b.log_list("n", &format!("k{k}")).await.unwrap();
+            assert_eq!(log.len(), 1, "k{k}");
+            assert_eq!(log[0].1, vec![tag; 3 + k % 7], "k{k}");
+            assert_eq!(
+                b.kv_get("kv", &format!("k{k}")).await.unwrap(),
+                Some(vec![tag; 1 + k % 5]),
+                "k{k}"
+            );
+            let failed = format!("k{}", k + 100);
+            assert!(b.log_list("n", &failed).await.unwrap().is_empty());
+            assert_eq!(b.kv_get("kv", &failed).await.unwrap(), None);
+            let ambiguous = format!("k{}", k + 200);
+            let log = b.log_list("n", &ambiguous).await.unwrap();
+            assert_eq!(log.len(), 1, "{ambiguous}");
+            assert_eq!(log[0].1, vec![0xCC; 3 + (k + 200) % 7]);
+        }
+    }
+
+    /// The shared atomic-batch conformance suite.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn atomic_batch_conformance() {
+        let b = SqliteStorageBackend::in_memory().unwrap();
+        crate::atomic_batch_suite::all(b.clone(), b.as_ref(), "batch").await;
     }
 }

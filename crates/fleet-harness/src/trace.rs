@@ -41,12 +41,36 @@ pub fn mark(source: &TraceSource, now: DateTime<Utc>) -> Mark {
 /// The proof-trace record in one log line: the JSON message itself (plain
 /// text logs) or inside a JSON log line's `fields.message` / `message`.
 pub fn record(line: &str) -> Option<Value> {
-    let is_record = |v: &Value| {
-        matches!(
-            v.get("record").and_then(Value::as_str),
-            Some("scan" | "request" | "proof")
-        )
-    };
+    any_record(line).filter(|v| kind(v) == Kind::Proof)
+}
+
+/// The proof records, which the run's proof summary counts.
+const PROOF_RECORDS: [&str; 3] = ["scan", "request", "proof"];
+/// The activation window's measurement records: well-formed trace records
+/// that no proof summary counts.
+const MEASUREMENT_RECORDS: [&str; 3] = ["window", "release", "batch"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Proof,
+    Measurement,
+    Unknown,
+}
+
+fn kind(v: &Value) -> Kind {
+    match v.get("record").and_then(Value::as_str) {
+        Some(r) if PROOF_RECORDS.contains(&r) => Kind::Proof,
+        Some(r) if MEASUREMENT_RECORDS.contains(&r) => Kind::Measurement,
+        _ => Kind::Unknown,
+    }
+}
+
+/// The trace record a line carries, of any type (a JSON object with a
+/// string `record` field), whether the line is the record itself, a JSON
+/// log line whose message is the record, or text around it.
+fn any_record(line: &str) -> Option<Value> {
+    let is_record =
+        |v: &Value| v.get("record").and_then(Value::as_str).is_some();
     if let Ok(v) = serde_json::from_str::<Value>(line.trim()) {
         for msg in [&v["fields"]["message"], &v["message"]] {
             if let Some(m) = msg.as_str()
@@ -125,13 +149,18 @@ pub struct Collected {
     pub errors: Vec<String>,
 }
 
-/// The records in `text`, and how many lines claim to carry one but do
-/// not parse.
+/// The proof records in `text`, and how many lines claim to carry a record
+/// but do not parse, or carry one of an unknown type. Measurement records
+/// are recognized and left out.
 fn parse(text: &str) -> (Vec<Value>, u64) {
     let (mut records, mut malformed) = (Vec::new(), 0);
     for line in text.lines() {
-        match record(line) {
-            Some(r) => records.push(r),
+        match any_record(line) {
+            Some(r) => match kind(&r) {
+                Kind::Proof => records.push(r),
+                Kind::Measurement => {}
+                Kind::Unknown => malformed += 1,
+            },
             None if claims_record(line) => malformed += 1,
             None => {}
         }
@@ -322,6 +351,34 @@ mod tests {
         ] {
             assert!(record(other).is_none(), "{other}");
         }
+    }
+
+    /// Every accepted type parses: the proof records are kept, the
+    /// measurement records recognized and left out of the summary; an
+    /// unknown type is malformed, not ignored.
+    #[test]
+    fn record_types_are_explicit() {
+        let text = [
+            r#"{"record":"scan","scan_id":1}"#,
+            r#"INFO deltaforge::proof_trace: {"record":"request","served":"scanned"}"#,
+            r#"{"record":"proof","outcome":"proven"}"#,
+            r#"{"record":"window","tables":3}"#,
+            r#"{"record":"release","window":1,"rank":0}"#,
+            r#"{"record":"batch","seq":1,"tables":[]}"#,
+            r#"{"record":"mystery","n":1}"#,
+        ]
+        .join("\n");
+        let (records, malformed) = parse(&text);
+        let kinds: Vec<&str> = records
+            .iter()
+            .map(|r| r["record"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["scan", "request", "proof"]);
+        assert_eq!(malformed, 1, "the unknown type");
+        for line in text.split('\n').skip(3).take(3) {
+            assert!(record(line).is_none(), "{line} is not a proof record");
+        }
+        assert!(record(r#"{"record":"scan","scan_id":9}"#).is_some());
     }
 
     #[test]

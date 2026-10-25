@@ -242,7 +242,7 @@ async fn make_mysql_source(
         tables: vec![format!("{db}.orders")],
         tenant: "acme".into(),
         pipeline: "test".into(),
-        registry: make_registry().await,
+        registry: test_common::registry_on(&backend).await,
         registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         backend,
         outbox_tables: AllowList::default(),
@@ -251,6 +251,7 @@ async fn make_mysql_source(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }
@@ -553,8 +554,8 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
     let (_c_a, port_a) = start_mysql().await;
     mysql_create_schema(port_a, DB).await;
 
-    let registry = make_registry().await;
     let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+    let registry = test_common::registry_on(&backend).await;
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
 
     // run 1: schema (id, sku) registered from A
@@ -575,6 +576,7 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
             table_options: Default::default(),
             rotation: None,
             snapshot_cohort: Default::default(),
+            proofs: Default::default(),
             type_mapping: deltaforge_core::TypeMapping::V2,
         };
         let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
@@ -632,6 +634,7 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
             table_options: Default::default(),
             rotation: None,
             snapshot_cohort: Default::default(),
+            proofs: Default::default(),
             type_mapping: deltaforge_core::TypeMapping::V2,
         };
         let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
@@ -695,8 +698,8 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
     let (_c_a, port_a) = start_mysql().await;
     mysql_create_schema(port_a, DB).await;
 
-    let registry = make_registry().await;
     let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+    let registry = test_common::registry_on(&backend).await;
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
 
     // run 1: register A's schema (id, sku)
@@ -717,6 +720,7 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
             table_options: Default::default(),
             rotation: None,
             snapshot_cohort: Default::default(),
+            proofs: Default::default(),
             type_mapping: deltaforge_core::TypeMapping::V2,
         };
         let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
@@ -771,6 +775,7 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
             table_options: Default::default(),
             rotation: None,
             snapshot_cohort: Default::default(),
+            proofs: Default::default(),
             type_mapping: deltaforge_core::TypeMapping::V2,
         };
         let (tx, _rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
@@ -842,12 +847,15 @@ async fn mysql_failover_schema_drift_halt_no_drift_continues() -> Result<()> {
         handle.join().await.ok();
     }
 
-    // B: identical schema, GTID purged to simulate promoted replica
+    // B: identical schema, as a promoted replica: its binlog holds
+    // nothing before the failover position (A's executed set purged), so
+    // the table's shape there is provable.
     let (_c_b, port_b) = start_mysql().await;
     mysql_create_schema(port_b, DB).await;
     {
         let pool = mysql_root_pool(port_b).await;
         let mut conn = pool.get_conn().await?;
+        conn.query_drop("RESET BINARY LOGS AND GTIDS").await?;
         conn.query_drop(format!(
             "SET GLOBAL gtid_purged='{}'",
             mysql_gtid_executed(port_a).await
@@ -863,7 +871,7 @@ async fn mysql_failover_schema_drift_halt_no_drift_continues() -> Result<()> {
             tables: vec![format!("{DB}.orders")],
             tenant: "acme".into(),
             pipeline: "test".into(),
-            registry: make_registry().await,
+            registry: test_common::registry_on(&backend).await,
             registry_scope:
                 sources::registry_scope::SharedRegistryScope::default(),
             backend: Arc::clone(&backend),
@@ -873,6 +881,7 @@ async fn mysql_failover_schema_drift_halt_no_drift_continues() -> Result<()> {
             table_options: Default::default(),
             rotation: None,
             snapshot_cohort: Default::default(),
+            proofs: Default::default(),
             type_mapping: deltaforge_core::TypeMapping::V2,
         };
         let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);

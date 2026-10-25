@@ -128,21 +128,23 @@ async fn make_source(
     tables: Vec<String>,
     outbox_tables: AllowList,
 ) -> MySqlSource {
+    let shared_store = make_storage_backend().await;
     MySqlSource {
         id: id.into(),
         dsn: dsn.to_string().into(),
         tables,
         tenant: "acme".into(),
         pipeline: "test".to_string(),
-        registry: make_registry().await,
+        registry: test_common::registry_on(&shared_store).await,
         registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         outbox_tables,
         snapshot_cfg: SnapshotCfg::default(),
-        backend: make_storage_backend().await,
+        backend: shared_store.clone(),
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
     }
 }
@@ -514,8 +516,8 @@ async fn mysql_cdc_basic_events() -> Result<()> {
     )
     .await?;
 
-    let registry = make_registry().await;
     let backend = make_storage_backend().await;
+    let registry = test_common::registry_on(&backend).await;
     let src = MySqlSource {
         id: "cdc-basic".into(),
         dsn: dsn.clone().into(),
@@ -531,6 +533,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let (mut rx, handle) = start_source(src).await?;
@@ -664,11 +667,12 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
         registry_scope: scope.clone(),
         outbox_tables: AllowList::default(),
         snapshot_cfg: SnapshotCfg::default(),
-        backend: make_storage_backend().await,
+        backend: registry.backend().clone(),
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let (mut rx, handle) = start_source(src).await?;
@@ -2003,24 +2007,26 @@ async fn startup_fails_closed_without_sink_checkpoints() -> Result<()> {
     let mut conn = pool.get_conn().await?;
     conn.query_drop(format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)"))
         .await?;
+    let shared_store = make_storage_backend().await;
     let src = MySqlSource {
         id: "init-closed".into(),
         dsn: dsn.into(),
         tables: vec![format!("{db}.t")],
         tenant: "acme".into(),
         pipeline: "test".to_string(),
-        registry: make_registry().await,
+        registry: test_common::registry_on(&shared_store).await,
         registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         outbox_tables: AllowList::default(),
         snapshot_cfg: SnapshotCfg {
             mode: deltaforge_config::SnapshotMode::Never,
             ..Default::default()
         },
-        backend: make_storage_backend().await,
+        backend: shared_store.clone(),
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let ckpt = test_common::unwritable_sink_checkpoints(

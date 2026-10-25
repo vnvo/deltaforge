@@ -20,7 +20,6 @@ use storage::{ArcStorageBackend, MemoryStorageBackend};
 use tokio::time::timeout;
 
 mod test_common;
-use test_common::make_registry;
 
 #[tokio::test]
 async fn unverified_lineage_prevents_stream_opening() {
@@ -33,7 +32,7 @@ async fn unverified_lineage_prevents_stream_opening() {
         tables: vec!["db.t".into()],
         tenant: "acme".into(),
         pipeline: "test".into(),
-        registry: make_registry().await,
+        registry: test_common::registry_on(&backend).await,
         registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         backend,
         outbox_tables: AllowList::default(),
@@ -42,6 +41,7 @@ async fn unverified_lineage_prevents_stream_opening() {
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
+        proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
     };
 
