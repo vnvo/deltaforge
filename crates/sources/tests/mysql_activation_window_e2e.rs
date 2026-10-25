@@ -1381,7 +1381,9 @@ async fn ddl_closes_a_window_during_admission(gtid: bool, ddl: &str, id: &str) {
     let store = Store::memory();
     let r = run_on(port, id, MysqlProofCfg::default(), &store).await;
     r.handle.pause();
-    c.query_drop("INSERT INTO t0000 VALUES (1, 0)").await.unwrap();
+    c.query_drop("INSERT INTO t0000 VALUES (1, 0)")
+        .await
+        .unwrap();
     c.query_drop(ddl).await.unwrap();
     let mut locker = conn(port).await;
     locker.query_drop("LOCK TABLES t0000 WRITE").await.unwrap();
@@ -1409,7 +1411,11 @@ async fn ddl_closes_a_window_during_admission(gtid: bool, ddl: &str, id: &str) {
     assert!(!r.handle.join.is_finished(), "the source keeps running");
     let expected: Vec<(String, i64)> =
         (0..5).map(|i| (format!("t{i:04}"), 1)).collect();
-    assert_eq!(*r.order.lock().unwrap(), expected, "every row once, in order");
+    assert_eq!(
+        *r.order.lock().unwrap(),
+        expected,
+        "every row once, in order"
+    );
     r.stop().await;
     let cp: sources::MySqlCheckpoint = serde_json::from_slice(
         &store.ckpt.get_raw(id).await.unwrap().expect("a checkpoint"),
