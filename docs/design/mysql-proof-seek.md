@@ -1312,3 +1312,42 @@ duplicates), count the store calls (one call, 33 streams, none twice, for
 30 tables in two databases), keep a malformed record's classification, use
 nothing from a failed read, refuse 2,049 tables, and catch a change after
 the read at commit.
+
+## Acceptance
+
+Accepted on `26a3b893` (results:
+`crates/perf-harness/results/2026-10-proof-seek-fix.md`). Activation p99
+for 200 first-touched tables is 177-370 ms at every offset from 0 to 960
+MiB, against about 3 s to 54 s before; positioned seek is flat at
+0.24-0.60 ms per scan; no row was missing, duplicated or reordered; the
+instruction count is at parity (median ratio 1.028, 95% upper bound 1.078).
+
+Three acceptance measurements were withdrawn as invalid, with their runs
+kept as failed:
+
+- **The activation-decile ratio (2x)** compared large shared windows with
+  late single-table ones, so making the late ones slower would have passed
+  it. Replaced by a window-level trend (Theil-Sen over per-window medians
+  against their size bucket, at most +25 ms) and by latency reported per
+  window size.
+- **Within-window delivery spread (50 ms)** measured the downstream batch
+  cycle: the arrival bursts are 37.7-42.9 ms apart and coincide with
+  delivery batches (40.1-42.8 ms apart), after the window's commit.
+- **Within-window release skew (5 ms)** measured stream position: a
+  window's held events are released one at a time in binary-log order, and
+  a later-admitted table's first row comes later in the log.
+
+They are replaced by the ordered-drain contract, met in the diagnostic: rows
+in strict binary-log order, no release stall above 5 ms (longest 3.31 ms),
+held events drained at least 10x the offered rate (at least 12.8x), the
+held queue drained completely, with the per-event release cost (2.6-39.1
+us) and the deepest queue (1,420 events) reported.
+
+Adaptive window close and parallel schema reads were measured and not
+adopted (see the results). The proof trace carries per-window commit times,
+per-table release times and per-batch delivery records for this kind of
+measurement; they cost nothing while the trace is off.
+
+Source-database impact at fleet scale (metadata-lock duration, MySQL CPU,
+connections, DDL delay, overload backoff) is a separate fleet-qualification
+requirement.
