@@ -99,6 +99,10 @@ pub(crate) struct WindowTrace {
     pub next_candidates: usize,
     /// Whether the queue was cut before a row no decision covers.
     pub cut: bool,
+    /// The window's number, and when its admission committed (unix
+    /// microseconds; measurement only).
+    pub window_seq: u64,
+    pub commit_unix_us: u128,
 }
 
 /// Transaction control: neither a schema change nor a statement that could
@@ -563,6 +567,8 @@ pub(super) async fn maybe_window(
     }
     let mut prefetch = Prefetch::new(ctx, &cfg);
     let cancel = ctx.cancel.clone();
+    // Measurement only: the admission order, to trace each table's release.
+    let admitted_order = trace_enabled().then(|| order.clone());
     let admission = async {
         match pending {
             Some(p) => admit_speculated(ctx, p, &lineage, &batch, order).await,
@@ -586,6 +592,14 @@ pub(super) async fn maybe_window(
         return Err(LoopControl::Stop);
     };
     let admitted = admitted?;
+    let commit_unix_us = unix_us();
+    ctx.window_seq += 1;
+    if let Some(order) = admitted_order {
+        ctx.release_watch.clear();
+        for (rank, k) in order.into_iter().enumerate() {
+            ctx.release_watch.insert(k, (ctx.window_seq, rank));
+        }
+    }
 
     // How each decision governs the table's other held rows: the queue is
     // cut before the first row no decision covers (a later window decides
@@ -631,9 +645,52 @@ pub(super) async fn maybe_window(
         next: next.as_str(),
         next_candidates: candidates,
         cut: cut.is_some(),
+        window_seq: ctx.window_seq,
+        commit_unix_us,
     };
     observe_window(&ctx.source_id, &trace, read, &admitted);
     Ok(Some(trace))
+}
+
+fn unix_us() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros())
+}
+
+/// [`dispatch_event`](super::mysql_event::dispatch_event), and while the
+/// proof trace is on, a `release` record when a table of the last committed
+/// window has its first row handed on (measurement only: nothing else
+/// changes, and nothing is looked up while no window table is awaited).
+pub(super) async fn dispatch_watched(
+    ctx: &mut RunCtx,
+    header: &EventHeader,
+    data: EventData,
+) -> deltaforge_core::SourceResult<()> {
+    let watched = if ctx.release_watch.is_empty() {
+        None
+    } else {
+        rows_table(&data)
+            .and_then(|id| ctx.table_map.get(&id))
+            .map(|tm| (tm.database_name.clone(), tm.table_name.clone()))
+            .filter(|k| ctx.release_watch.contains_key(k))
+    };
+    super::mysql_event::dispatch_event(ctx, header, data).await?;
+    if let Some(k) = watched
+        && let Some((window, rank)) = ctx.release_watch.remove(&k)
+    {
+        let record = serde_json::json!({
+            "record": "release",
+            "source": ctx.source_id,
+            "window": window,
+            "rank": rank,
+            "db": k.0,
+            "table": k.1,
+            "unix_us": unix_us(),
+        });
+        tracing::info!(target: "deltaforge::proof_trace", "{record}");
+    }
+    Ok(())
 }
 
 /// An internal invariant violation of the speculative window: it fails the
@@ -1583,6 +1640,8 @@ fn observe_window(
         "next": t.next,
         "next_candidates": t.next_candidates,
         "cut": t.cut,
+        "window_seq": t.window_seq,
+        "commit_unix_us": t.commit_unix_us,
         "extensions_committed": t.work.extensions_committed,
         "positioned_attempts": t.work.positioned_attempts,
         "unanchored_attempts": t.work.unanchored_attempts,

@@ -627,6 +627,16 @@ async fn tables_touched_during_an_admission_are_prefetched() {
     assert_eq!(windows[0]["next"], "formed", "{windows:?}");
     assert_eq!(count(&windows[1], "speculated"), n - 1, "{windows:?}");
     assert_eq!(count(&windows[1], "unanchored_attempts"), 0, "{windows:?}");
+    // Measurement records: each table's first row released once, with its
+    // window and admission rank.
+    let releases = records("prefetch", "release");
+    assert_eq!(releases.len() as u64, n, "{releases:?}");
+    let second: Vec<u64> = releases
+        .iter()
+        .filter(|r| r["window"] == windows[1]["window_seq"])
+        .map(|r| count(r, "rank"))
+        .collect();
+    assert_eq!(second, (0..n - 1).collect::<Vec<_>>(), "{releases:?}");
     let read_ms = windows[1]["read_ms"].as_f64().unwrap();
     assert!(
         read_ms < 25.0,

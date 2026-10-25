@@ -1560,6 +1560,8 @@ pub(crate) mod tests {
             next_held_seq: 1,
             last_seq: 0,
             pending: None,
+            window_seq: 0,
+            release_watch: Default::default(),
             prefetch_error: None,
             last_received: std::time::Instant::now(),
             prepared: Default::default(),

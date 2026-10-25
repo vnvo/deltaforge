@@ -2513,7 +2513,38 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
             }
         });
 
+        // Measurement only (the proof trace): each batch's tables, in the
+        // order their first event appears, and when its delivery started
+        // and ended.
+        let traced = tracing::enabled!(
+            target: "deltaforge::proof_trace",
+            tracing::Level::INFO
+        )
+        .then(|| {
+            let mut seen = std::collections::HashSet::new();
+            let tables: Vec<String> = frozen
+                .events
+                .iter()
+                .map(|e| format!("{}.{}", e.source.db, e.source.table))
+                .filter(|t| seen.insert(t.clone()))
+                .collect();
+            (tables, trace_unix_us())
+        });
         let raw_outcomes = futures::future::join_all(sink_futs).await;
+        if let Some((tables, start_unix_us)) = traced {
+            static BATCH_SEQ: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let record = serde_json::json!({
+                "record": "batch",
+                "pipeline": pipeline_name_str,
+                "seq": BATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+                "events": frozen.events.len(),
+                "tables": tables,
+                "start_unix_us": start_unix_us,
+                "end_unix_us": trace_unix_us(),
+            });
+            tracing::info!(target: "deltaforge::proof_trace", "{record}");
+        }
 
         let mut required_acks = 0usize;
         let mut total_acks = 0usize;
@@ -10077,4 +10108,11 @@ mod generation_flow_tests {
             policy(&CommitPolicy::Required, &s).digest
         );
     }
+}
+
+/// Unix microseconds (the proof trace's measurement records).
+fn trace_unix_us() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros())
 }

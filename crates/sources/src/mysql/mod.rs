@@ -346,6 +346,12 @@ pub(crate) struct RunCtx {
     /// The speculative window, while its head is still ahead
     /// (`mysql_window_speculation`).
     pending: Option<mysql_window_speculation::Pending>,
+    /// Windows committed so far (the proof trace's window numbers).
+    window_seq: u64,
+    /// While the proof trace is on: each table of the last committed window
+    /// whose first row is not yet handed on, with its window and admission
+    /// rank (measurement only; empty otherwise).
+    release_watch: HashMap<(String, String), (u64, usize)>,
     /// The read error that ended a prefetch: raised where the stream is
     /// read next, once `prefetched` is empty.
     prefetch_error:
@@ -1788,6 +1794,8 @@ impl MySqlSource {
             next_held_seq: 1,
             last_seq: 0,
             pending: None,
+            window_seq: 0,
+            release_watch: Default::default(),
             prefetch_error: None,
             last_received: std::time::Instant::now(),
             prepared: Default::default(),
@@ -2011,7 +2019,7 @@ impl MySqlSource {
                 }
                 if let Some((header, data)) = ctx.lookahead.pop_front() {
                     advance_position(&mut ctx, &header);
-                    dispatch_event(&mut ctx, &header, data).await?;
+                    mysql_activation_window::dispatch_watched(&mut ctx, &header, data).await?;
                     continue;
                 }
 
@@ -2028,7 +2036,7 @@ impl MySqlSource {
                             {
                                 Ok(_) => {
                                     advance_position(&mut ctx, &header);
-                                    dispatch_event(&mut ctx, &header, data).await?;
+                                    mysql_activation_window::dispatch_watched(&mut ctx, &header, data).await?;
                                     Ok(())
                                 }
                                 Err(ctrl) => Err(ctrl),
@@ -2045,7 +2053,7 @@ impl MySqlSource {
                         {
                             Ok(_) => {
                                 advance_position(&mut ctx, &header);
-                                dispatch_event(&mut ctx, &header, data).await?;
+                                mysql_activation_window::dispatch_watched(&mut ctx, &header, data).await?;
                                 Ok(())
                             }
                             Err(ctrl) => Err(ctrl),
