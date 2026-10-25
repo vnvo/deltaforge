@@ -128,11 +128,6 @@ pub(crate) fn is_transaction_control(sql: &str) -> bool {
     })
 }
 
-fn ends_transaction(sql: &str) -> bool {
-    let s = sql.trim().trim_end_matches(';').trim();
-    s.eq_ignore_ascii_case("COMMIT") || s.eq_ignore_ascii_case("ROLLBACK")
-}
-
 fn rows_table(data: &EventData) -> Option<u64> {
     match data {
         EventData::WriteRows(e) => Some(e.table_id),
@@ -161,11 +156,17 @@ pub(crate) struct Ahead {
     /// the executed set before it), as dispatching records it
     /// (`RunCtx::txn_anchor`).
     pub txn_anchor: Option<super::mysql_binlog_scan::Anchor>,
+    /// Inside an explicit transaction (after `BEGIN`), and the server
+    /// version: what decides whether a statement ends its transaction, as
+    /// dispatching decides it (`RunCtx::in_explicit_txn`).
+    explicit: bool,
+    server_version: Option<u32>,
 }
 
 impl Ahead {
     fn commit(&mut self, end_pos: u32) {
         self.txn_anchor = None;
+        self.explicit = false;
         if let (Some(done), Some(g)) =
             (self.done.as_mut(), self.open_gtid.take())
             && !done.insert(&g)
@@ -222,8 +223,22 @@ pub(crate) fn touched(
             ahead.open_gtid = Some(g.gtid.clone());
         }
         EventData::Xid(_) => ahead.commit(header.next_event_position),
-        EventData::Query(q) if ends_transaction(&q.query) => {
-            ahead.commit(header.next_event_position)
+        // The dispatcher's own rule: a DDL completes its implicit
+        // transaction before the next event's start is assigned.
+        EventData::Query(q) => {
+            match super::mysql_event::query_boundary(
+                &q.query,
+                ahead.explicit,
+                ahead.server_version,
+            ) {
+                super::mysql_event::QueryBoundary::Opens => {
+                    ahead.explicit = true
+                }
+                super::mysql_event::QueryBoundary::Completes => {
+                    ahead.commit(header.next_event_position)
+                }
+                super::mysql_event::QueryBoundary::Continues => {}
+            }
         }
         d => {
             if let Some(id) = rows_table(d)
@@ -384,6 +399,8 @@ pub(super) async fn maybe_window(
             .collect(),
         broken: false,
         txn_anchor: ctx.txn_anchor.clone(),
+        explicit: ctx.in_explicit_txn,
+        server_version: ctx.binlog_server_version,
     };
     // The head event's own table maps and boundaries (a compressed
     // transaction carries them).
@@ -466,9 +483,11 @@ pub(super) async fn maybe_window(
             }
             _ => None,
         };
+        // Every event passes through the tracker exactly once, the closing
+        // one included (a closing DDL completes its transaction there).
+        let mut found = Vec::new();
+        touched(&mut ahead, &h, &d, &mut found);
         if close.is_none() {
-            let mut found = Vec::new();
-            touched(&mut ahead, &h, &d, &mut found);
             for (db, table, at) in &found {
                 rows_at.push((
                     queue.len(),
@@ -2497,6 +2516,87 @@ mod tests {
         assert!(e.draft().is_none());
     }
 
+    /// The read-ahead tracker ends transactions where the dispatcher does:
+    /// a DDL (plain or in an executable comment) completes its implicit
+    /// transaction, so the next transaction starts after it; a control
+    /// statement inside an explicit transaction does not.
+    #[test]
+    fn the_tracker_ends_a_ddls_transaction_as_dispatch_does() {
+        use mysql_binlog_connector_rust::event::{
+            gtid_event::GtidEvent, query_event::QueryEvent,
+        };
+        const U: &str = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+        let header = |end: u32| EventHeader {
+            timestamp: 0,
+            event_type: 0,
+            server_id: 1,
+            event_length: 50,
+            next_event_position: end,
+            event_flags: 0,
+        };
+        let gtid = |n: u64| {
+            EventData::Gtid(GtidEvent {
+                flags: 0,
+                gtid: format!("{U}:{n}"),
+            })
+        };
+        let query = |sql: &str| {
+            EventData::Query(QueryEvent {
+                thread_id: 1,
+                exec_time: 0,
+                error_code: 0,
+                schema: "d".into(),
+                query: sql.into(),
+            })
+        };
+        for ddl in [
+            "ALTER TABLE t ADD COLUMN w INT",
+            "/*!50700 ALTER TABLE t ADD COLUMN w INT */",
+        ] {
+            let mut ahead = Ahead {
+                file: "mysql-bin.000001".into(),
+                done: GtidSet::parse(&format!("{U}:1-4")),
+                open_gtid: None,
+                boundary: MySqlCheckpoint {
+                    file: "mysql-bin.000001".into(),
+                    pos: 100,
+                    gtid_set: Some(format!("{U}:1-4")),
+                    lineage: None,
+                    snapshot_completed: None,
+                    snapshot_chain: None,
+                },
+                table_map: HashMap::new(),
+                broken: false,
+                txn_anchor: None,
+                explicit: false,
+                server_version: Some(80409),
+            };
+            let mut found = Vec::new();
+            touched(&mut ahead, &header(150), &gtid(5), &mut found);
+            touched(&mut ahead, &header(300), &query(ddl), &mut found);
+            assert_eq!(ahead.boundary.pos, 300, "{ddl}");
+            assert_eq!(
+                ahead.boundary.gtid_set.as_deref(),
+                Some(format!("{U}:1-5").as_str()),
+                "{ddl}"
+            );
+            // An explicit transaction: a SAVEPOINT continues it, its COMMIT
+            // ends it.
+            touched(&mut ahead, &header(350), &gtid(6), &mut found);
+            touched(&mut ahead, &header(400), &query("BEGIN"), &mut found);
+            touched(
+                &mut ahead,
+                &header(450),
+                &query("SAVEPOINT s"),
+                &mut found,
+            );
+            assert_eq!(ahead.boundary.pos, 300, "{ddl}: still inside");
+            touched(&mut ahead, &header(500), &query("COMMIT"), &mut found);
+            assert_eq!(ahead.boundary.pos, 500, "{ddl}");
+            assert!(found.is_empty());
+        }
+    }
+
     #[test]
     fn transaction_control_never_closes_a_window() {
         for sql in ["BEGIN", "begin", "COMMIT", "ROLLBACK;", " XA START 'x'"] {
@@ -2514,7 +2614,5 @@ mod tests {
         ] {
             assert!(!is_transaction_control(sql), "{sql}");
         }
-        assert!(ends_transaction("commit"));
-        assert!(!ends_transaction("BEGIN"));
     }
 }

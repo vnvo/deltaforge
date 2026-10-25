@@ -1366,3 +1366,94 @@ async fn held_events_after_a_statement_form_an_ordinary_window_by_receipt() {
         "the ordinary window over held events counts from receipt: {read_ms} ms"
     );
 }
+
+/// A DDL closes the current window, and new tables' rows arrive while it is
+/// admitted (its capture held by a lock): the DDL completes its implicit
+/// transaction in the read-ahead exactly as dispatch completes it, so the
+/// speculative window captures from the transaction after the DDL and its
+/// recomputed tables match. Every row arrives once, in order, the source
+/// keeps running (no invariant incident) and the checkpoint reaches the
+/// server's position after the last insert.
+async fn ddl_closes_a_window_during_admission(gtid: bool, ddl: &str, id: &str) {
+    let (container, port) = start(gtid).await;
+    let mut c = conn(port).await;
+    tables(&mut c, 10).await;
+    let store = Store::memory();
+    let r = run_on(port, id, MysqlProofCfg::default(), &store).await;
+    r.handle.pause();
+    c.query_drop("INSERT INTO t0000 VALUES (1, 0)").await.unwrap();
+    c.query_drop(ddl).await.unwrap();
+    let mut locker = conn(port).await;
+    locker.query_drop("LOCK TABLES t0000 WRITE").await.unwrap();
+    r.handle.resume();
+    wait_for_waiter(port, "t0000").await;
+    c.query_drop(
+        "BEGIN; INSERT INTO t0001 VALUES (1, 1); INSERT INTO t0002 VALUES (1, 2); \
+         INSERT INTO t0003 VALUES (1, 3); INSERT INTO t0004 VALUES (1, 4); COMMIT",
+    )
+    .await
+    .unwrap();
+    let (file, pos): (String, u64) = c
+        .query_first("SHOW BINARY LOG STATUS")
+        .await
+        .unwrap()
+        .map(|row: mysql_async::Row| {
+            let mut row = row;
+            (row.take(0).unwrap(), row.take(1).unwrap())
+        })
+        .unwrap();
+    sleep(Duration::from_millis(300)).await;
+    locker.query_drop("UNLOCK TABLES").await.unwrap();
+    r.delivered(5, Duration::from_secs(60)).await;
+    sleep(Duration::from_secs(2)).await;
+    assert!(!r.handle.join.is_finished(), "the source keeps running");
+    let expected: Vec<(String, i64)> =
+        (0..5).map(|i| (format!("t{i:04}"), 1)).collect();
+    assert_eq!(*r.order.lock().unwrap(), expected, "every row once, in order");
+    r.stop().await;
+    let cp: sources::MySqlCheckpoint = serde_json::from_slice(
+        &store.ckpt.get_raw(id).await.unwrap().expect("a checkpoint"),
+    )
+    .unwrap();
+    assert_eq!(cp.file, file, "{cp:?}");
+    assert!(cp.pos >= pos, "the checkpoint {cp:?} reaches {file}:{pos}");
+    container.rm().await.ok();
+    let windows = records(id, "window");
+    assert_eq!(windows[0]["closed_by"], "statement", "{windows:?}");
+    assert_eq!(windows[0]["next"], "formed", "{windows:?}");
+    assert_eq!(count(&windows[1], "tables"), 4, "{windows:?}");
+    assert_eq!(count(&windows[1], "speculated"), 4, "{windows:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn a_ddl_closing_a_window_starts_the_next_after_it_gtid() {
+    ddl_closes_a_window_during_admission(
+        true,
+        "ALTER TABLE t0009 ADD COLUMN w INT",
+        "ddl-close-gtid",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn a_ddl_closing_a_window_starts_the_next_after_it_file_position() {
+    ddl_closes_a_window_during_admission(
+        false,
+        "ALTER TABLE t0009 ADD COLUMN w INT",
+        "ddl-close-filepos",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn an_executable_comment_ddl_closing_a_window_starts_the_next_after_it() {
+    ddl_closes_a_window_during_admission(
+        true,
+        "/*!50700 ALTER TABLE t0009 ADD COLUMN w INT */",
+        "ddl-close-comment",
+    )
+    .await;
+}

@@ -1051,6 +1051,43 @@ async fn emit_ddl_event(
     Ok(())
 }
 
+/// How a QueryEvent bears on its transaction. One rule for the dispatcher
+/// ([`handle_query`]) and for the activation window's read-ahead, which
+/// tracks transaction boundaries without dispatching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QueryBoundary {
+    /// `BEGIN`: an explicit transaction opens.
+    Opens,
+    /// The statement ends its transaction: `COMMIT`/`ROLLBACK`, a DDL (as
+    /// the server executed it, executable comments included) or an account
+    /// statement (implicitly committed), or any statement outside an
+    /// explicit transaction (its own autocommit transaction).
+    Completes,
+    /// A control statement inside an explicit transaction (`SAVEPOINT`,
+    /// `SET`, ...): part of it, closed later.
+    Continues,
+}
+
+pub(super) fn query_boundary(
+    sql: &str,
+    in_explicit_txn: bool,
+    server_version: Option<u32>,
+) -> QueryBoundary {
+    let sql_upper = sql.to_uppercase();
+    if sql_upper == "BEGIN" {
+        return QueryBoundary::Opens;
+    }
+    if sql_upper == "COMMIT"
+        || sql_upper == "ROLLBACK"
+        || credential_ddl_operation(sql, server_version).is_some()
+        || super::mysql_ddl_attribution::is_ddl_statement(sql, server_version)
+        || !in_explicit_txn
+    {
+        return QueryBoundary::Completes;
+    }
+    QueryBoundary::Continues
+}
+
 async fn handle_query(
     ctx: &mut RunCtx,
     header: &EventHeader,
@@ -1059,13 +1096,18 @@ async fn handle_query(
     // Every QueryEvent counts, as the binlog scanner numbers them.
     ctx.query_ordinal += 1;
     let sql_upper = q.query.to_uppercase();
+    let boundary = query_boundary(
+        &q.query,
+        ctx.in_explicit_txn,
+        ctx.binlog_server_version,
+    );
 
     // BEGIN opens an explicit, multi-event transaction (row events + Xid, or an
     // explicit COMMIT/ROLLBACK). The transaction was already opened on the
     // coordinator by its GTID event; here we only record that we are inside an
     // explicit block so a later control statement is not mistaken for a
     // standalone autocommit transaction.
-    if sql_upper == "BEGIN" {
+    if boundary == QueryBoundary::Opens {
         ctx.in_explicit_txn = true;
         return Ok(());
     }
@@ -1141,7 +1183,7 @@ async fn handle_query(
     }
 
     // Any other QueryEvent.
-    if ctx.in_explicit_txn {
+    if boundary == QueryBoundary::Continues {
         // A control/ignored statement inside an explicit transaction (e.g.
         // SAVEPOINT, SET) - part of that transaction, which is closed later by its
         // Xid or COMMIT/ROLLBACK. Do not close here.
@@ -2153,6 +2195,30 @@ pub(crate) mod tests {
     // =========================================================================
     // QueryEvent helpers
     // =========================================================================
+
+    /// The one transaction-boundary rule for queries.
+    #[test]
+    fn query_boundaries_follow_dispatch() {
+        use super::{QueryBoundary as B, query_boundary};
+        let v = Some(80409);
+        assert_eq!(query_boundary("BEGIN", false, v), B::Opens);
+        assert_eq!(query_boundary("COMMIT", true, v), B::Completes);
+        assert_eq!(query_boundary("ROLLBACK", true, v), B::Completes);
+        for ddl in [
+            "ALTER TABLE t ADD c INT",
+            "/*!50700 ALTER TABLE t ADD c INT */",
+            "CREATE TABLE t (a INT)",
+        ] {
+            assert_eq!(query_boundary(ddl, true, v), B::Completes, "{ddl}");
+        }
+        assert_eq!(query_boundary("SAVEPOINT s", true, v), B::Continues);
+        assert_eq!(query_boundary("SET @x = 1", true, v), B::Continues);
+        assert_eq!(query_boundary("FLUSH PRIVILEGES", false, v), B::Completes);
+        assert_eq!(
+            query_boundary("ALTER USER 'u' IDENTIFIED BY 'x'", true, v),
+            B::Completes
+        );
+    }
 
     fn query_event(sql: &str) -> QueryEvent {
         QueryEvent {
