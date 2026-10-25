@@ -34,8 +34,9 @@ If `binlog_row_image` is not `FULL`, DeltaForge will warn at startup and before-
 Create a dedicated replication user with the required grants:
 
 ```sql
--- Create user with mysql_native_password (required by binlog connector)
-CREATE USER 'deltaforge'@'%' IDENTIFIED WITH mysql_native_password BY 'your_password';
+-- Create the user with the server's default authentication plugin
+-- (caching_sha2_password on MySQL 8.x)
+CREATE USER 'deltaforge'@'%' IDENTIFIED BY 'your_password';
 
 -- Replication privileges (required)
 GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'deltaforge'@'%';
@@ -407,9 +408,9 @@ Each captured row change produces an event with:
 
 ### Connection Issues
 
-If you see authentication errors mentioning `mysql_native_password`:
+DeltaForge authenticates with the server's default plugin (`caching_sha2_password` on MySQL 8.x); no particular plugin is required. MySQL 8.4 disables `mysql_native_password` by default, so a user created `IDENTIFIED WITH mysql_native_password` fails to log in with an error mentioning that plugin. Move the user to the server's default plugin:
 ```sql
-ALTER USER 'deltaforge'@'%' IDENTIFIED WITH mysql_native_password BY 'password';
+ALTER USER 'deltaforge'@'%' IDENTIFIED BY 'password';
 ```
 
 ### Missing Before-Images

@@ -235,17 +235,9 @@ async fn connect_binlog(
 
             if error_msg.contains("mysql_native_password") {
                 error!("MySQL auth issue hints:");
-                error!(
-                    "  1) CREATE USER 'df'@'%' IDENTIFIED WITH mysql_native_password BY 'dfpw';"
-                );
-                error!(
-                    "  2) GRANT REPLICATION REPLICA, REPLICATION CLIENT ON *.* TO 'df'@'%';"
-                );
-                error!(
-                    "  3) GRANT SELECT, SHOW VIEW ON {}.* TO 'df'@'%';",
-                    default_db_for_hints
-                );
-                error!("  4) FLUSH PRIVILEGES;");
+                for hint in auth_hints(default_db_for_hints) {
+                    error!("{hint}");
+                }
             } else if error_msg.contains("Access denied") {
                 error!(
                     "Access denied - check username/password and privileges"
@@ -460,11 +452,7 @@ pub(super) async fn resolve_binlog_tail(
                 diagnostics
                     .push("OK: User has replication privileges".to_string());
             } else {
-                diagnostics.push(
-                    "FAIL: User lacks REPLICATION REPLICA privilege"
-                        .to_string(),
-                );
-                diagnostics.push("   Fix: GRANT REPLICATION REPLICA, REPLICATION CLIENT ON *.* TO user;".to_string());
+                diagnostics.extend(missing_replication_grant());
             }
             debug!("user grants: {:?}", grants);
         }
@@ -498,13 +486,36 @@ pub(super) async fn resolve_binlog_tail(
     }
 
     Err(MySqlSourceError::BinlogConnect(
-        "Failed to resolve binlog position. Common fixes:\n\
-         1) Enable binary logging: --log-bin --binlog-format=ROW\n\
-         2) Grant privileges: GRANT REPLICATION REPLICA, REPLICATION CLIENT ON *.* TO ...;\n\
-         3) Ensure user exists: CREATE USER '..'@'%' IDENTIFIED BY 'password';"
-            .to_string(),
+        BINLOG_POSITION_FIXES.to_string(),
     ))
 }
+
+/// The account a binlog connection needs, as hints. The user takes the
+/// server's default authentication plugin (`caching_sha2_password` on
+/// MySQL 8.4, where `mysql_native_password` is disabled by default).
+fn auth_hints(db: &str) -> Vec<String> {
+    vec![
+        "  1) CREATE USER 'df'@'%' IDENTIFIED BY 'dfpw';  (or ALTER USER ... IDENTIFIED BY ... to move an existing user to the server's default plugin)".to_string(),
+        "  2) GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'df'@'%';".to_string(),
+        format!("  3) GRANT SELECT, SHOW VIEW ON {db}.* TO 'df'@'%';"),
+        "  4) FLUSH PRIVILEGES;".to_string(),
+    ]
+}
+
+/// The diagnostics for a user without the replication privilege.
+fn missing_replication_grant() -> [String; 2] {
+    [
+        "FAIL: User lacks the REPLICATION SLAVE privilege".to_string(),
+        "   Fix: GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO user;"
+            .to_string(),
+    ]
+}
+
+/// The error when the binlog position cannot be resolved.
+const BINLOG_POSITION_FIXES: &str = "Failed to resolve binlog position. Common fixes:\n\
+     1) Enable binary logging: --log-bin --binlog-format=ROW\n\
+     2) Grant privileges: GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO ...;\n\
+     3) Ensure user exists: CREATE USER '..'@'%' IDENTIFIED BY 'password';";
 
 /// Shorten SQL for logs
 pub(crate) fn short_sql(s: &str, max: usize) -> String {
@@ -584,4 +595,40 @@ pub(crate) fn make_checkpoint_meta(
         Vec::new()
     });
     CheckpointMeta::from_vec(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The account remediation MySQL 8.4 accepts: `REPLICATION SLAVE` (8.4
+    /// rejects `REPLICATION REPLICA` with a syntax error) and a user on the
+    /// server's default authentication plugin (8.4 disables
+    /// `mysql_native_password`).
+    #[test]
+    fn account_remediation_is_valid_on_mysql_8_4() {
+        assert_eq!(
+            auth_hints("shop"),
+            [
+                "  1) CREATE USER 'df'@'%' IDENTIFIED BY 'dfpw';  (or ALTER USER ... IDENTIFIED BY ... to move an existing user to the server's default plugin)",
+                "  2) GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'df'@'%';",
+                "  3) GRANT SELECT, SHOW VIEW ON shop.* TO 'df'@'%';",
+                "  4) FLUSH PRIVILEGES;",
+            ]
+        );
+        assert_eq!(
+            missing_replication_grant(),
+            [
+                "FAIL: User lacks the REPLICATION SLAVE privilege",
+                "   Fix: GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO user;",
+            ]
+        );
+        assert_eq!(
+            BINLOG_POSITION_FIXES,
+            "Failed to resolve binlog position. Common fixes:\n\
+             1) Enable binary logging: --log-bin --binlog-format=ROW\n\
+             2) Grant privileges: GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO ...;\n\
+             3) Ensure user exists: CREATE USER '..'@'%' IDENTIFIED BY 'password';"
+        );
+    }
 }
