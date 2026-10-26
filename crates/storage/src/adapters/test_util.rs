@@ -165,7 +165,8 @@ impl StorageBackend for FaultBackend {
             let ns = match op {
                 crate::BatchOp::LogAppendIfAbsent { ns, .. }
                 | crate::BatchOp::KvPut { ns, .. }
-                | crate::BatchOp::KvMaxSeq { ns, .. } => ns,
+                | crate::BatchOp::KvMaxSeq { ns, .. }
+                | crate::BatchOp::KvMax { ns, .. } => ns,
             };
             self.write(ns)?;
         }

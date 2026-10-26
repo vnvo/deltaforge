@@ -477,12 +477,18 @@ impl StorageBackend for SqliteStorageBackend {
                             params![ns, key, bytes, now_secs()],
                         )?;
                     }
-                    BatchOp::KvMaxSeq { ns, key, of } => {
+                    BatchOp::KvMaxSeq { .. } | BatchOp::KvMax { .. } => {
+                        let (ns, key, n) = match op {
+                            BatchOp::KvMaxSeq { ns, key, of } => {
+                                (ns, key, seqs[*of].expect("validated"))
+                            }
+                            BatchOp::KvMax { ns, key, value } => {
+                                (ns, key, *value)
+                            }
+                            _ => unreachable!(),
+                        };
                         let current = kv_live(&tx, ns, key)?;
-                        let bytes = max_seq_value(
-                            current.as_deref(),
-                            seqs[*of].expect("validated"),
-                        )?;
+                        let bytes = max_seq_value(current.as_deref(), n)?;
                         tx.prepare_cached(
                             "INSERT INTO df_kv(ns, key, val, updated_at, expires_at)
                              VALUES(?1, ?2, ?3, ?4, NULL)
@@ -570,6 +576,10 @@ impl StorageBackend for SqliteStorageBackend {
         value: &[u8],
         ttl_secs: u64,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !crate::is_guarded_namespace(ns),
+            "a key in guarded namespace {ns} cannot carry a TTL"
+        );
         let ns = ns.to_string();
         let key = key.to_string();
         let value = value.to_vec();
