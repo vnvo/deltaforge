@@ -241,20 +241,20 @@ async fn pg_log_head(
         .map_or(0, |r| r.get::<_, i64>(0) as u64))
 }
 
+const KV_PUT_SQL: &str =
+    "INSERT INTO df_kv(ns, key, val, updated_at, expires_at)
+     VALUES($1, $2, $3, $4, NULL)
+     ON CONFLICT(ns, key) DO UPDATE SET
+       val=EXCLUDED.val, updated_at=EXCLUDED.updated_at, expires_at=NULL";
+
 async fn pg_kv_put(
     tx: &deadpool_postgres::tokio_postgres::Transaction<'_>,
     ns: &str,
     key: &str,
     value: &[u8],
 ) -> Result<()> {
-    tx.execute(
-        "INSERT INTO df_kv(ns, key, val, updated_at, expires_at)
-         VALUES($1, $2, $3, $4, NULL)
-         ON CONFLICT(ns, key) DO UPDATE SET
-           val=EXCLUDED.val, updated_at=EXCLUDED.updated_at, expires_at=NULL",
-        &[&ns, &key, &value, &now_secs()],
-    )
-    .await?;
+    tx.execute(KV_PUT_SQL, &[&ns, &key, &value, &now_secs()])
+        .await?;
     Ok(())
 }
 
@@ -495,14 +495,18 @@ impl StorageBackend for PostgresStorageBackend {
 
     async fn kv_put(&self, ns: &str, key: &str, value: &[u8]) -> Result<()> {
         let mut c = client!(self);
-        // A guarded key is written under the store lock (see
-        // `is_guarded_namespace`).
-        let tx = c.transaction().await?;
         if crate::is_guarded_namespace(ns) {
+            // A guarded key is written under the store lock (see
+            // `is_guarded_namespace`).
+            let tx = c.transaction().await?;
             tx.execute(LOCK_LOG_SQL, &[&LOG_ALLOCATION_LOCK]).await?;
+            pg_kv_put(&tx, ns, key, value).await?;
+            tx.commit().await?;
+        } else {
+            // Any other key: one auto-committed statement.
+            c.execute(KV_PUT_SQL, &[&ns, &key, &value, &now_secs()])
+                .await?;
         }
-        pg_kv_put(&tx, ns, key, value).await?;
-        tx.commit().await?;
         Ok(())
     }
 
@@ -531,15 +535,19 @@ impl StorageBackend for PostgresStorageBackend {
     }
 
     async fn kv_delete(&self, ns: &str, key: &str) -> Result<bool> {
+        const DELETE: &str = "DELETE FROM df_kv WHERE ns=$1 AND key=$2";
         let mut c = client!(self);
-        let tx = c.transaction().await?;
-        if crate::is_guarded_namespace(ns) {
+        let n = if crate::is_guarded_namespace(ns) {
+            // Under the store lock, like every guarded write.
+            let tx = c.transaction().await?;
             tx.execute(LOCK_LOG_SQL, &[&LOG_ALLOCATION_LOCK]).await?;
-        }
-        let n = tx
-            .execute("DELETE FROM df_kv WHERE ns=$1 AND key=$2", &[&ns, &key])
-            .await?;
-        tx.commit().await?;
+            let n = tx.execute(DELETE, &[&ns, &key]).await?;
+            tx.commit().await?;
+            n
+        } else {
+            // Any other key: one auto-committed statement.
+            c.execute(DELETE, &[&ns, &key]).await?
+        };
         Ok(n > 0)
     }
 
@@ -1342,6 +1350,105 @@ mod tests {
         assert_eq!(
             be.kv_get(ns, &key).await.unwrap().as_deref(),
             Some(&b"v2"[..])
+        );
+    }
+
+    /// Which writers take the store lock: while another session holds it,
+    /// writes of unguarded keys finish (one auto-committed statement, no
+    /// lock), and guarded kv writes, deletes and log truncation wait until it
+    /// is released, then complete correctly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires a live PostgreSQL (DELTAFORGE_IT_PG_DSN)"]
+    async fn pg_guarded_writers_wait_for_the_store_lock_and_others_do_not() {
+        use deadpool_postgres::tokio_postgres;
+        use std::time::Duration;
+        let dsn = std::env::var("DELTAFORGE_IT_PG_DSN")
+            .expect("DELTAFORGE_IT_PG_DSN must be set to run this test");
+        let be = PostgresStorageBackend::connect(&dsn).await.unwrap();
+        let run = now_ms();
+        let (free_ns, guarded_ns) =
+            (format!("it{run}_free"), "schemas.v1.index");
+        let (gkey, stream_ns) =
+            (format!("it{run}_g"), format!("schemas.v1.it{run}_trunc"));
+        be.kv_put(&free_ns, "gone", b"x").await.unwrap();
+        be.kv_put(guarded_ns, &gkey, b"x").await.unwrap();
+        for i in 0..3 {
+            be.log_append(&stream_ns, "s", format!("e{i}").as_bytes())
+                .await
+                .unwrap();
+        }
+        let (admin, conn) = tokio_postgres::connect(&dsn, NoTls).await.unwrap();
+        tokio::spawn(conn);
+        admin.batch_execute("BEGIN").await.unwrap();
+        admin
+            .execute(LOCK_LOG_SQL, &[&LOG_ALLOCATION_LOCK])
+            .await
+            .unwrap();
+
+        // Unguarded keys never wait for the lock.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            be.kv_put(&free_ns, "k", b"v").await.unwrap();
+            assert!(be.kv_delete(&free_ns, "gone").await.unwrap());
+        })
+        .await
+        .expect("an unguarded write waited for the store lock");
+
+        // Guarded writers wait while the lock is held.
+        let put = {
+            let (be, gkey) = (be.clone(), gkey.clone());
+            tokio::spawn(
+                async move { be.kv_put(guarded_ns, &gkey, b"y").await },
+            )
+        };
+        let delete = {
+            let (be, gkey) = (be.clone(), gkey.clone());
+            tokio::spawn(async move {
+                be.kv_delete(guarded_ns, &format!("{gkey}_other")).await
+            })
+        };
+        let truncate = {
+            let (be, stream_ns) = (be.clone(), stream_ns.clone());
+            tokio::spawn(async move {
+                be.log_truncate(
+                    &stream_ns,
+                    "s",
+                    LogTruncateRequest {
+                        older_than_ms: None,
+                        pin_seq: u64::MAX,
+                        max_entries: Some(1),
+                        max_bytes: None,
+                    },
+                )
+                .await
+            })
+        };
+        lock_waiters(&admin, 3).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !put.is_finished(),
+            "a guarded kv_put ran without the store lock"
+        );
+        assert!(
+            !delete.is_finished(),
+            "a guarded kv_delete ran without the store lock"
+        );
+        assert!(
+            !truncate.is_finished(),
+            "log_truncate ran without the store lock"
+        );
+
+        admin.batch_execute("COMMIT").await.unwrap();
+        put.await.unwrap().unwrap();
+        assert!(!delete.await.unwrap().unwrap());
+        let out = truncate.await.unwrap().unwrap();
+        assert_eq!(out.removed, 2, "{out:?}");
+        assert_eq!(
+            be.kv_get(guarded_ns, &gkey).await.unwrap().as_deref(),
+            Some(&b"y"[..])
+        );
+        assert_eq!(
+            be.kv_get(&free_ns, "k").await.unwrap().as_deref(),
+            Some(&b"v"[..])
         );
     }
 
