@@ -241,20 +241,20 @@ async fn pg_log_head(
         .map_or(0, |r| r.get::<_, i64>(0) as u64))
 }
 
+const KV_PUT_SQL: &str =
+    "INSERT INTO df_kv(ns, key, val, updated_at, expires_at)
+     VALUES($1, $2, $3, $4, NULL)
+     ON CONFLICT(ns, key) DO UPDATE SET
+       val=EXCLUDED.val, updated_at=EXCLUDED.updated_at, expires_at=NULL";
+
 async fn pg_kv_put(
     tx: &deadpool_postgres::tokio_postgres::Transaction<'_>,
     ns: &str,
     key: &str,
     value: &[u8],
 ) -> Result<()> {
-    tx.execute(
-        "INSERT INTO df_kv(ns, key, val, updated_at, expires_at)
-         VALUES($1, $2, $3, $4, NULL)
-         ON CONFLICT(ns, key) DO UPDATE SET
-           val=EXCLUDED.val, updated_at=EXCLUDED.updated_at, expires_at=NULL",
-        &[&ns, &key, &value, &now_secs()],
-    )
-    .await?;
+    tx.execute(KV_PUT_SQL, &[&ns, &key, &value, &now_secs()])
+        .await?;
     Ok(())
 }
 
@@ -357,16 +357,15 @@ impl StorageBackend for PostgresStorageBackend {
             anyhow::bail!("injected failure before the transaction");
         }
         let mut c = client!(self);
-        // Serializable: a concurrent change to anything the preconditions
-        // read aborts this transaction (an error the caller resolves by
-        // read-back). Dropped without a commit, it rolls back.
-        let tx = c
-            .build_transaction()
-            .isolation_level(
-                deadpool_postgres::tokio_postgres::IsolationLevel::Serializable,
-            )
-            .start()
-            .await?;
+        // The store lock first, then every read. Read committed: each
+        // statement after the lock sees every transaction committed before
+        // the lock was granted, and every writer of guarded data holds the
+        // same lock until it commits, so a precondition that holds when read
+        // holds until this commit. (A repeatable-read or serializable
+        // snapshot would be taken by the lock statement itself, before the
+        // wait, and miss writers that committed meanwhile.) Dropped without
+        // a commit, the transaction rolls back.
+        let tx = c.transaction().await?;
         tx.execute(LOCK_LOG_SQL, &[&LOG_ALLOCATION_LOCK]).await?;
         let now = now_secs();
         for (i, p) in batch.preconditions.iter().enumerate() {
@@ -439,6 +438,11 @@ impl StorageBackend for PostgresStorageBackend {
                     )?;
                     pg_kv_put(&tx, ns, key, &bytes).await?;
                 }
+                BatchOp::KvMax { ns, key, value } => {
+                    let current = pg_kv_live(&tx, ns, key, now).await?;
+                    let bytes = max_seq_value(current.as_deref(), *value)?;
+                    pg_kv_put(&tx, ns, key, &bytes).await?;
+                }
             }
         }
         if fault == Some(BatchFault::AfterWrites(batch.ops.len())) {
@@ -490,15 +494,19 @@ impl StorageBackend for PostgresStorageBackend {
     }
 
     async fn kv_put(&self, ns: &str, key: &str, value: &[u8]) -> Result<()> {
-        let c = client!(self);
-        c.execute(
-            "INSERT INTO df_kv(ns, key, val, updated_at, expires_at)
-             VALUES($1, $2, $3, $4, NULL)
-             ON CONFLICT(ns, key) DO UPDATE SET
-               val=EXCLUDED.val, updated_at=EXCLUDED.updated_at, expires_at=NULL",
-            &[&ns, &key, &value, &now_secs()],
-        )
-        .await?;
+        let mut c = client!(self);
+        if crate::is_guarded_namespace(ns) {
+            // A guarded key is written under the store lock (see
+            // `is_guarded_namespace`).
+            let tx = c.transaction().await?;
+            tx.execute(LOCK_LOG_SQL, &[&LOG_ALLOCATION_LOCK]).await?;
+            pg_kv_put(&tx, ns, key, value).await?;
+            tx.commit().await?;
+        } else {
+            // Any other key: one auto-committed statement.
+            c.execute(KV_PUT_SQL, &[&ns, &key, &value, &now_secs()])
+                .await?;
+        }
         Ok(())
     }
 
@@ -509,6 +517,10 @@ impl StorageBackend for PostgresStorageBackend {
         value: &[u8],
         ttl_secs: u64,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !crate::is_guarded_namespace(ns),
+            "a key in guarded namespace {ns} cannot carry a TTL"
+        );
         let c = client!(self);
         let expires_at = now_secs() + ttl_secs as i64;
         c.execute(
@@ -523,10 +535,19 @@ impl StorageBackend for PostgresStorageBackend {
     }
 
     async fn kv_delete(&self, ns: &str, key: &str) -> Result<bool> {
-        let c = client!(self);
-        let n = c
-            .execute("DELETE FROM df_kv WHERE ns=$1 AND key=$2", &[&ns, &key])
-            .await?;
+        const DELETE: &str = "DELETE FROM df_kv WHERE ns=$1 AND key=$2";
+        let mut c = client!(self);
+        let n = if crate::is_guarded_namespace(ns) {
+            // Under the store lock, like every guarded write.
+            let tx = c.transaction().await?;
+            tx.execute(LOCK_LOG_SQL, &[&LOG_ALLOCATION_LOCK]).await?;
+            let n = tx.execute(DELETE, &[&ns, &key]).await?;
+            tx.commit().await?;
+            n
+        } else {
+            // Any other key: one auto-committed statement.
+            c.execute(DELETE, &[&ns, &key]).await?
+        };
         Ok(n > 0)
     }
 
@@ -735,6 +756,8 @@ impl StorageBackend for PostgresStorageBackend {
     ) -> Result<LogTruncateOutcome> {
         let mut c = client!(self);
         let tx = c.transaction().await?;
+        // A writer of df_log and df_log_meta: under the store lock.
+        tx.execute(LOCK_LOG_SQL, &[&LOG_ALLOCATION_LOCK]).await?;
         tx.execute(ENSURE_LOG_META_SQL, &[&ns, &key]).await?;
         let rows = tx
             .query(
@@ -842,13 +865,16 @@ impl StorageBackend for PostgresStorageBackend {
     ) -> Result<LogStreamMeta> {
         let mut c = client!(self);
         let tx = c.transaction().await?;
-        tx.execute(ENSURE_LOG_META_SQL, &[&ns, &key]).await?;
-        let meta_row = tx
-            .query_one(
-                "SELECT min_valid_from_seq, head_seq FROM df_log_meta WHERE ns=$1 AND key=$2",
-                &[&ns, &key],
-            )
-            .await?;
+        const META: &str = "SELECT min_valid_from_seq, head_seq FROM df_log_meta WHERE ns=$1 AND key=$2";
+        // The meta row is created (a write) only under the store lock.
+        let meta_row = match tx.query_opt(META, &[&ns, &key]).await? {
+            Some(row) => row,
+            None => {
+                tx.execute(LOCK_LOG_SQL, &[&LOG_ALLOCATION_LOCK]).await?;
+                tx.execute(ENSURE_LOG_META_SQL, &[&ns, &key]).await?;
+                tx.query_one(META, &[&ns, &key]).await?
+            }
+        };
         let mvfs: i64 = meta_row.get(0);
         let head: i64 = meta_row.get(1);
         let stat_row = tx
@@ -1174,6 +1200,384 @@ mod tests {
         suite::empty_vs_truncated(be.clone(), &format!("it{base}_empty")).await;
         suite::concurrent_appends(be.clone(), &format!("it{base}_conc")).await;
         suite::ns_max_seq_scoped(be.clone(), &format!("it{base}_nsmax")).await;
+    }
+
+    /// Waits until `n` sessions wait for the log-allocation lock.
+    async fn lock_waiters(
+        admin: &deadpool_postgres::tokio_postgres::Client,
+        n: i64,
+    ) {
+        for _ in 0..500 {
+            let row = admin
+                .query_one(
+                    "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted",
+                    &[],
+                )
+                .await
+                .unwrap();
+            if row.get::<_, i64>(0) >= n {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{n} lock waiters never appeared");
+    }
+
+    /// A batch's preconditions are read after it holds the store lock: a
+    /// writer that committed while the batch waited for the lock is seen,
+    /// and the batch reports a conflict instead of committing on a stale
+    /// read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires a live PostgreSQL (DELTAFORGE_IT_PG_DSN)"]
+    async fn pg_batch_preconditions_see_a_writer_that_committed_while_the_batch_waited()
+     {
+        use deadpool_postgres::tokio_postgres;
+        let dsn = std::env::var("DELTAFORGE_IT_PG_DSN")
+            .expect("DELTAFORGE_IT_PG_DSN must be set to run this test");
+        let be = PostgresStorageBackend::connect(&dsn).await.unwrap();
+        let ns = format!("schemas.v1.it{}_stale", now_ms());
+        let (admin, conn) = tokio_postgres::connect(&dsn, NoTls).await.unwrap();
+        tokio::spawn(conn);
+        admin.batch_execute("BEGIN").await.unwrap();
+        admin
+            .execute(LOCK_LOG_SQL, &[&LOG_ALLOCATION_LOCK])
+            .await
+            .unwrap();
+
+        // A writer queues for the lock first, then a batch that requires the
+        // writer's stream to be still empty.
+        let writer = {
+            let (be, ns) = (be.clone(), ns.clone());
+            tokio::spawn(async move {
+                be.log_append_if_absent(&ns, "s", "w1", b"w").await
+            })
+        };
+        lock_waiters(&admin, 1).await;
+        let batch = AtomicBatch {
+            preconditions: vec![Precondition::LogHead {
+                ns: ns.clone(),
+                key: "s".into(),
+                seq: 0,
+            }],
+            ops: vec![BatchOp::LogAppendIfAbsent {
+                ns: ns.clone(),
+                key: "other".into(),
+                capture_id: "a1".into(),
+                value: b"a".to_vec(),
+            }],
+        };
+        let applied = {
+            let be = be.clone();
+            tokio::spawn(async move { be.apply_batch(&batch).await })
+        };
+        lock_waiters(&admin, 2).await;
+        admin.batch_execute("COMMIT").await.unwrap();
+
+        writer.await.unwrap().unwrap();
+        let outcome = applied.await.unwrap().unwrap();
+        assert!(
+            matches!(outcome, BatchOutcome::Conflict { .. }),
+            "the stream was written before the batch held the lock: {outcome:?}"
+        );
+    }
+
+    /// A write to a guarded key cannot commit between a batch's precondition
+    /// read and its commit: it waits for the store lock the batch holds, so a
+    /// batch that commits on `KvIs` committed before the key changed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires a live PostgreSQL (DELTAFORGE_IT_PG_DSN)"]
+    async fn pg_guarded_kv_writes_serialize_with_batches() {
+        use deadpool_postgres::tokio_postgres;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dsn = std::env::var("DELTAFORGE_IT_PG_DSN")
+            .expect("DELTAFORGE_IT_PG_DSN must be set to run this test");
+        let be = PostgresStorageBackend::connect(&dsn).await.unwrap();
+        let key = format!("it{}_guarded", now_ms());
+        let ns = "schemas.v1.index";
+        be.kv_put(ns, &key, b"v1").await.unwrap();
+        let (admin, conn) = tokio_postgres::connect(&dsn, NoTls).await.unwrap();
+        tokio::spawn(conn);
+        admin.batch_execute("BEGIN").await.unwrap();
+        admin
+            .execute(LOCK_LOG_SQL, &[&LOG_ALLOCATION_LOCK])
+            .await
+            .unwrap();
+
+        // The batch waits for the lock first, then the key is rewritten.
+        let done = Arc::new(AtomicUsize::new(0));
+        let batch = AtomicBatch {
+            preconditions: vec![Precondition::KvIs {
+                ns: ns.into(),
+                key: key.clone(),
+                value: Some(b"v1".to_vec()),
+            }],
+            ops: vec![BatchOp::LogAppendIfAbsent {
+                ns: format!("schemas.v1.{key}"),
+                key: "s".into(),
+                capture_id: "a1".into(),
+                value: b"a".to_vec(),
+            }],
+        };
+        let applied = {
+            let (be, done) = (be.clone(), done.clone());
+            tokio::spawn(async move {
+                let r = be.apply_batch(&batch).await;
+                (r, done.fetch_add(1, Ordering::SeqCst))
+            })
+        };
+        lock_waiters(&admin, 1).await;
+        let writer = {
+            let (be, done, key) = (be.clone(), done.clone(), key.clone());
+            tokio::spawn(async move {
+                let r = be.kv_put(ns, &key, b"v2").await;
+                (r, done.fetch_add(1, Ordering::SeqCst))
+            })
+        };
+        // Long enough for a writer that ignores the lock to commit.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        admin.batch_execute("COMMIT").await.unwrap();
+
+        let (written, writer_rank) = writer.await.unwrap();
+        written.unwrap();
+        let (outcome, batch_rank) = applied.await.unwrap();
+        let outcome = outcome.unwrap();
+        if matches!(outcome, BatchOutcome::Committed { .. }) {
+            assert!(
+                batch_rank < writer_rank,
+                "the batch committed on v1 after the key became v2"
+            );
+        }
+        assert_eq!(
+            be.kv_get(ns, &key).await.unwrap().as_deref(),
+            Some(&b"v2"[..])
+        );
+    }
+
+    /// Which writers take the store lock: while another session holds it,
+    /// writes of unguarded keys finish (one auto-committed statement, no
+    /// lock), and guarded kv writes, deletes and log truncation wait until it
+    /// is released, then complete correctly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires a live PostgreSQL (DELTAFORGE_IT_PG_DSN)"]
+    async fn pg_guarded_writers_wait_for_the_store_lock_and_others_do_not() {
+        use deadpool_postgres::tokio_postgres;
+        use std::time::Duration;
+        let dsn = std::env::var("DELTAFORGE_IT_PG_DSN")
+            .expect("DELTAFORGE_IT_PG_DSN must be set to run this test");
+        let be = PostgresStorageBackend::connect(&dsn).await.unwrap();
+        let run = now_ms();
+        let (free_ns, guarded_ns) =
+            (format!("it{run}_free"), "schemas.v1.index");
+        let (gkey, stream_ns) =
+            (format!("it{run}_g"), format!("schemas.v1.it{run}_trunc"));
+        be.kv_put(&free_ns, "gone", b"x").await.unwrap();
+        be.kv_put(guarded_ns, &gkey, b"x").await.unwrap();
+        for i in 0..3 {
+            be.log_append(&stream_ns, "s", format!("e{i}").as_bytes())
+                .await
+                .unwrap();
+        }
+        let (admin, conn) = tokio_postgres::connect(&dsn, NoTls).await.unwrap();
+        tokio::spawn(conn);
+        admin.batch_execute("BEGIN").await.unwrap();
+        admin
+            .execute(LOCK_LOG_SQL, &[&LOG_ALLOCATION_LOCK])
+            .await
+            .unwrap();
+
+        // Unguarded keys never wait for the lock.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            be.kv_put(&free_ns, "k", b"v").await.unwrap();
+            assert!(be.kv_delete(&free_ns, "gone").await.unwrap());
+        })
+        .await
+        .expect("an unguarded write waited for the store lock");
+
+        // Guarded writers wait while the lock is held.
+        let put = {
+            let (be, gkey) = (be.clone(), gkey.clone());
+            tokio::spawn(
+                async move { be.kv_put(guarded_ns, &gkey, b"y").await },
+            )
+        };
+        let delete = {
+            let (be, gkey) = (be.clone(), gkey.clone());
+            tokio::spawn(async move {
+                be.kv_delete(guarded_ns, &format!("{gkey}_other")).await
+            })
+        };
+        let truncate = {
+            let (be, stream_ns) = (be.clone(), stream_ns.clone());
+            tokio::spawn(async move {
+                be.log_truncate(
+                    &stream_ns,
+                    "s",
+                    LogTruncateRequest {
+                        older_than_ms: None,
+                        pin_seq: u64::MAX,
+                        max_entries: Some(1),
+                        max_bytes: None,
+                    },
+                )
+                .await
+            })
+        };
+        lock_waiters(&admin, 3).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !put.is_finished(),
+            "a guarded kv_put ran without the store lock"
+        );
+        assert!(
+            !delete.is_finished(),
+            "a guarded kv_delete ran without the store lock"
+        );
+        assert!(
+            !truncate.is_finished(),
+            "log_truncate ran without the store lock"
+        );
+
+        admin.batch_execute("COMMIT").await.unwrap();
+        put.await.unwrap().unwrap();
+        assert!(!delete.await.unwrap().unwrap());
+        let out = truncate.await.unwrap().unwrap();
+        assert_eq!(out.removed, 2, "{out:?}");
+        assert_eq!(
+            be.kv_get(guarded_ns, &gkey).await.unwrap().as_deref(),
+            Some(&b"y"[..])
+        );
+        assert_eq!(
+            be.kv_get(&free_ns, "k").await.unwrap().as_deref(),
+            Some(&b"v"[..])
+        );
+    }
+
+    /// The store lock serializes guarded writes of every source sharing the
+    /// store. Qualification at 1, 8 and 32 concurrent sources, each
+    /// committing batches on its own stream plus the shared sequence
+    /// high-water: no source starves, unrelated sources never conflict, and
+    /// sequences stay unique and increase per source; the high-water ends at
+    /// the largest sequence. The measured latency and throughput are printed
+    /// (`--nocapture`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "requires a live PostgreSQL (DELTAFORGE_IT_PG_DSN)"]
+    async fn pg_store_lock_qualification_across_sources() {
+        use deadpool_postgres::tokio_postgres;
+        use std::time::{Duration, Instant};
+        let dsn = std::env::var("DELTAFORGE_IT_PG_DSN")
+            .expect("DELTAFORGE_IT_PG_DSN must be set to run this test");
+        let be = PostgresStorageBackend::connect(&dsn).await.unwrap();
+        let (admin, conn) = tokio_postgres::connect(&dsn, NoTls).await.unwrap();
+        tokio::spawn(conn);
+        let run = now_ms();
+        for sources in [1usize, 8, 32] {
+            let ns = format!("schemas.v1.it{run}_q{sources}");
+            let hw_ns = "schemas.v1.index";
+            let hw_key = format!("it{run}_q{sources}_hw");
+            let until = Instant::now() + Duration::from_secs(3);
+            let mut tasks = Vec::new();
+            for src in 0..sources {
+                let (be, ns, hw_key) = (be.clone(), ns.clone(), hw_key.clone());
+                tasks.push(tokio::spawn(async move {
+                    let (mut head, mut seqs, mut lat) =
+                        (0u64, Vec::new(), Vec::new());
+                    let mut conflicts = 0usize;
+                    while Instant::now() < until {
+                        let n = seqs.len();
+                        let batch = AtomicBatch {
+                            preconditions: vec![Precondition::LogHead {
+                                ns: ns.clone(),
+                                key: format!("s{src}"),
+                                seq: head,
+                            }],
+                            ops: vec![
+                                BatchOp::LogAppendIfAbsent {
+                                    ns: ns.clone(),
+                                    key: format!("s{src}"),
+                                    capture_id: format!("c{n}"),
+                                    value: vec![b'x'; 256],
+                                },
+                                BatchOp::KvMaxSeq {
+                                    ns: hw_ns.into(),
+                                    key: hw_key.clone(),
+                                    of: 0,
+                                },
+                            ],
+                        };
+                        let t = Instant::now();
+                        match be.apply_batch(&batch).await.unwrap() {
+                            BatchOutcome::Committed { seqs: s } => {
+                                head = s[0].unwrap();
+                                seqs.push(head);
+                            }
+                            BatchOutcome::Conflict { .. } => conflicts += 1,
+                        }
+                        lat.push(t.elapsed());
+                    }
+                    (seqs, lat, conflicts)
+                }));
+            }
+            // Sample the sessions waiting for the lock while the sources run.
+            let mut waiters = Vec::new();
+            while Instant::now() < until {
+                let row = admin
+                    .query_one(
+                        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted",
+                        &[],
+                    )
+                    .await
+                    .unwrap();
+                waiters.push(row.get::<_, i64>(0));
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let (mut all_seqs, mut lat, mut conflicts) =
+                (Vec::new(), Vec::new(), 0);
+            for t in tasks {
+                let (seqs, l, c) = t.await.unwrap();
+                assert!(
+                    !seqs.is_empty(),
+                    "a source starved at {sources} sources"
+                );
+                assert!(
+                    seqs.windows(2).all(|w| w[0] < w[1]),
+                    "one source's sequences went back"
+                );
+                all_seqs.extend(seqs);
+                lat.extend(l);
+                conflicts += c;
+            }
+            assert_eq!(conflicts, 0, "unrelated sources conflicted");
+            let total = all_seqs.len();
+            all_seqs.sort_unstable();
+            all_seqs.dedup();
+            assert_eq!(all_seqs.len(), total, "a sequence was committed twice");
+            let hw: u64 = serde_json::from_slice(
+                &be.kv_get(hw_ns, &hw_key).await.unwrap().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                hw,
+                *all_seqs.last().unwrap(),
+                "the high-water is not the largest sequence"
+            );
+            lat.sort_unstable();
+            let q = |p: f64| lat[((lat.len() - 1) as f64 * p) as usize];
+            let max = *lat.last().unwrap();
+            assert!(
+                max < Duration::from_secs(2),
+                "a batch waited {max:?} at {sources} sources"
+            );
+            waiters.sort_unstable();
+            eprintln!(
+                "store lock, {sources} sources: {total} batches in 3 s ({:.0}/s), latency p50 {:?} p99 {:?} max {:?}, lock waiters p50 {} max {}",
+                total as f64 / 3.0,
+                q(0.5),
+                q(0.99),
+                max,
+                waiters[waiters.len() / 2],
+                waiters.last().unwrap()
+            );
+        }
     }
 
     /// The shared atomic-batch conformance suite against a live PostgreSQL

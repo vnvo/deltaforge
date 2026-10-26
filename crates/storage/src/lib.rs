@@ -389,6 +389,25 @@ pub enum BatchOp {
     /// The key becomes the larger of its current number (JSON) and the
     /// sequence of log write `of`.
     KvMaxSeq { ns: String, key: String, of: usize },
+    /// The key becomes the larger of its current number (JSON) and `value`.
+    KvMax { ns: String, key: String, value: u64 },
+}
+
+/// The namespaces whose data batch preconditions read and whose writers
+/// serialize on the store's write lock: the schema registry's, the source
+/// lineage records and every activation, barrier and failover stream
+/// (`schemas`, `schemas.v1` and `schemas.v1.*`, `schema_lineage`).
+///
+/// On PostgreSQL every writer of these namespaces holds the store lock for
+/// its whole transaction, and a batch takes it before it reads anything, so
+/// a precondition that holds when read holds until the batch commits.
+/// Guarded keys never carry a TTL (the expiry sweep does not take the
+/// lock).
+pub fn is_guarded_namespace(ns: &str) -> bool {
+    ns == "schemas"
+        || ns == "schemas.v1"
+        || ns.starts_with("schemas.v1.")
+        || ns == "schema_lineage"
 }
 
 /// Writes decided from reads, committed atomically:
@@ -474,6 +493,7 @@ impl AtomicBatch {
                     *of
                 }
                 BatchOp::KvMaxSeq { of, .. } => *of,
+                BatchOp::KvMax { .. } => continue,
             };
             anyhow::ensure!(
                 of < i
@@ -654,6 +674,19 @@ async fn read_back(
                     .transpose()?
                     .unwrap_or(0);
                 if n < seqs[*of].expect("validated") {
+                    return Ok(ReadBack::Partial(format!(
+                        "{key} is below its write"
+                    )));
+                }
+            }
+            BatchOp::KvMax { ns, key, value } => {
+                let stored = be.kv_get(ns, key).await?;
+                let n = stored
+                    .as_deref()
+                    .map(serde_json::from_slice::<u64>)
+                    .transpose()?
+                    .unwrap_or(0);
+                if n < *value {
                     return Ok(ReadBack::Partial(format!(
                         "{key} is below its write"
                     )));
@@ -1815,11 +1848,52 @@ pub(crate) mod atomic_batch_suite {
     }
 
     /// The whole suite.
+    /// `KvMax` raises a number and never lowers it, inside a batch and
+    /// alone.
+    pub async fn kv_max_never_lowers(be: Arc<dyn StorageBackend>, ns: &str) {
+        let max = |value: u64| AtomicBatch {
+            preconditions: Vec::new(),
+            ops: vec![BatchOp::KvMax {
+                ns: ns.into(),
+                key: "hw".into(),
+                value,
+            }],
+        };
+        let read = || async {
+            serde_json::from_slice::<u64>(
+                &be.kv_get(ns, "hw").await.unwrap().unwrap(),
+            )
+            .unwrap()
+        };
+        for (value, expect) in [(7, 7), (3, 7), (12, 12), (12, 12)] {
+            let out = commit_atomic(be.as_ref(), &max(value), 3).await.unwrap();
+            assert!(matches!(out, CommitResult::Committed(_)), "{out:?}");
+            assert_eq!(read().await, expect, "after KvMax {value}");
+        }
+    }
+
+    /// A key in a guarded namespace never carries a TTL.
+    pub async fn guarded_keys_refuse_a_ttl(be: Arc<dyn StorageBackend>) {
+        for ns in [
+            "schemas",
+            "schemas.v1",
+            "schemas.v1.index",
+            "schema_lineage",
+        ] {
+            assert!(
+                be.kv_put_with_ttl(ns, "k", b"v", 60).await.is_err(),
+                "{ns} accepted a TTL"
+            );
+        }
+    }
+
     pub async fn all(
         be: Arc<dyn StorageBackend>,
         faults: &dyn BatchFaults,
         ns: &str,
     ) {
+        kv_max_never_lowers(be.clone(), &format!("{ns}_max")).await;
+        guarded_keys_refuse_a_ttl(be.clone()).await;
         commits_atomically(be.clone(), &format!("{ns}_ok")).await;
         conflicts_write_nothing(be.clone(), &format!("{ns}_conf")).await;
         failures_leave_nothing(be.clone(), faults, &format!("{ns}_fail")).await;

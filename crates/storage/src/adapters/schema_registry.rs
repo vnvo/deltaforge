@@ -1665,13 +1665,27 @@ impl DurableSchemaRegistry {
         if seq <= self.sequence.load(Ordering::SeqCst) {
             return Ok(());
         }
-        self.backend
-            .kv_put(INDEX_NS, HW_KEY, &serde_json::to_vec(&seq)?)
+        // A monotonic max in one atomic batch (under the store lock on
+        // PostgreSQL), never an overwrite: another registry, or a batch not
+        // yet admitted here, may already have stored a higher value.
+        let batch = crate::AtomicBatch {
+            preconditions: Vec::new(),
+            ops: vec![crate::BatchOp::KvMax {
+                ns: INDEX_NS.into(),
+                key: HW_KEY.into(),
+                value: seq,
+            }],
+        };
+        match crate::commit_atomic(self.backend.as_ref(), &batch, 3)
             .await
-            .context(
-                "schema registry: failed to persist sequence high-water",
-            )?;
-        self.sequence.store(seq, Ordering::SeqCst);
+            .context("schema registry: failed to persist sequence high-water")?
+        {
+            crate::CommitResult::Committed(_) => {}
+            crate::CommitResult::Conflict(why) => anyhow::bail!(
+                "schema registry: high-water batch conflicted: {why}"
+            ),
+        }
+        self.sequence.fetch_max(seq, Ordering::SeqCst);
         Ok(())
     }
 
@@ -1876,6 +1890,37 @@ mod tests {
     use crate::adapters::source_lineage;
     use crate::adapters::test_util::FaultBackend;
     use serde_json::json;
+
+    /// Every namespace the registry and the lineage records write is
+    /// guarded.
+    #[test]
+    fn registry_namespaces_are_guarded() {
+        for ns in [V1_NS, LEGACY_NS, INDEX_NS, MIGRATION_NS, source_lineage::NS]
+        {
+            assert!(crate::is_guarded_namespace(ns), "{ns}");
+        }
+        for ns in ["schemasx", "schemas_v1", "checkpoints", "dlq", "failover"] {
+            assert!(!crate::is_guarded_namespace(ns), "{ns}");
+        }
+    }
+
+    /// The durable sequence high-water never decreases: a registry whose
+    /// in-process mirror lags (another registry, or a batch not yet
+    /// admitted) cannot overwrite a higher value with a lower one.
+    #[tokio::test]
+    async fn the_sequence_high_water_never_decreases() {
+        let (_f, b) = backend();
+        let lagging = reg(&b).await;
+        b.kv_put(INDEX_NS, HW_KEY, &serde_json::to_vec(&100u64).unwrap())
+            .await
+            .unwrap();
+        lagging.bump_hw(50).await.unwrap();
+        let hw: u64 = serde_json::from_slice(
+            &b.kv_get(INDEX_NS, HW_KEY).await.unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(hw, 100, "the high-water went back from 100 to {hw}");
+    }
 
     fn skey(source: &str, lineage: &str, table: &str) -> SchemaKey {
         SchemaKey::new("t", source, lineage, "db", table)
@@ -2666,6 +2711,49 @@ mod tests {
                     })
                     .collect()),
                 CommitResult::Conflict(why) => Err(why),
+            }
+        }
+
+        /// Every namespace a planned registration reads in its
+        /// preconditions or writes is guarded, so its writers and the batch
+        /// serialize on the store lock (first registrations, new shapes and
+        /// a second lineage of the same source).
+        #[tokio::test]
+        async fn planned_registrations_touch_only_guarded_namespaces() {
+            let (_f, b) = backend();
+            let r = reg(&b).await;
+            let a = skey("src", "lin-a", "t1");
+            plan_and_commit(&r, &b, &[req(&a, "h1")]).await.unwrap();
+            let reqs = [
+                req(&a, "h2"),
+                req(&skey("src", "lin-a", "t2"), "h1"),
+                req(&skey("src", "lin-b", "t1"), "h1"),
+            ];
+            let RegistrationPlanning::Planned {
+                preconditions,
+                registrations,
+            } = r.plan_registrations(&reqs, Utc::now()).await.unwrap()
+            else {
+                panic!("needs repair");
+            };
+            for p in &preconditions {
+                let ns = match p {
+                    crate::Precondition::LogHead { ns, .. }
+                    | crate::Precondition::KvIs { ns, .. } => ns,
+                };
+                assert!(
+                    crate::is_guarded_namespace(ns),
+                    "precondition on {ns}"
+                );
+            }
+            for op in registrations.iter().flat_map(|p| &p.ops) {
+                let ns = match op {
+                    crate::BatchOp::LogAppendIfAbsent { ns, .. }
+                    | crate::BatchOp::KvPut { ns, .. }
+                    | crate::BatchOp::KvMaxSeq { ns, .. }
+                    | crate::BatchOp::KvMax { ns, .. } => ns,
+                };
+                assert!(crate::is_guarded_namespace(ns), "write to {ns}");
             }
         }
 

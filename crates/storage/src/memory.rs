@@ -295,7 +295,14 @@ impl StorageBackend for MemoryStorageBackend {
                     };
                     staged_kv.push(((ns.clone(), key.clone()), bytes));
                 }
-                BatchOp::KvMaxSeq { ns, key, of } => {
+                BatchOp::KvMaxSeq { .. } | BatchOp::KvMax { .. } => {
+                    let (ns, key, n) = match op {
+                        BatchOp::KvMaxSeq { ns, key, of } => {
+                            (ns, key, seqs[*of].expect("validated"))
+                        }
+                        BatchOp::KvMax { ns, key, value } => (ns, key, *value),
+                        _ => unreachable!(),
+                    };
                     let k = (ns.clone(), key.clone());
                     let current = staged_kv
                         .iter()
@@ -303,13 +310,7 @@ impl StorageBackend for MemoryStorageBackend {
                         .find(|(sk, _)| sk == &k)
                         .map(|(_, v)| v.clone())
                         .or_else(|| kv_value(&kv, ns, key));
-                    staged_kv.push((
-                        k,
-                        max_seq_value(
-                            current.as_deref(),
-                            seqs[*of].expect("validated"),
-                        )?,
-                    ));
+                    staged_kv.push((k, max_seq_value(current.as_deref(), n)?));
                 }
             }
         }
@@ -391,6 +392,10 @@ impl StorageBackend for MemoryStorageBackend {
         value: &[u8],
         ttl_secs: u64,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !crate::is_guarded_namespace(ns),
+            "a key in guarded namespace {ns} cannot carry a TTL"
+        );
         let mut store = self.kv.write().await;
         store.0.insert(
             (ns.to_string(), key.to_string()),

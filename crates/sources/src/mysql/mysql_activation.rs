@@ -1068,6 +1068,21 @@ mod tests {
     use std::sync::Arc;
     use storage::MemoryStorageBackend;
 
+    /// Every activation, barrier and failover stream is in a guarded
+    /// namespace: their writers and the window's batch serialize on the
+    /// store lock.
+    #[test]
+    fn activation_namespaces_are_guarded() {
+        for ns in [
+            super::ACTIVATION_NS,
+            super::BARRIER_NS,
+            crate::mysql::mysql_failover_drift::ANCHOR_NS,
+            crate::mysql::mysql_failover_drift::MARKER_NS,
+        ] {
+            assert!(storage::is_guarded_namespace(ns), "{ns}");
+        }
+    }
+
     const U: &str = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
     const V: &str = "4f2a0b1c-71ca-11e1-9e33-c80aa9429562";
     const L: &str = "0123456789abcdef0123456789abcdef";
