@@ -1,13 +1,22 @@
 # MySQL mass invalidation: bounded control-plane work per window
 
-Status: design for review, not implemented. Revision 3, 2026-10-26.
+Status: design for review, not implemented. Revision 4, 2026-10-26.
 - **Revision 2** applied the review of revision 1 and added findings about
   existing code.
 - **Revision 3** applies the review of revision 2: a durable batch identity,
   the global lock's scope, bulk-append details, the connection budget under
   idle pools, cache and item limits, snapshot compatibility, a dedicated
-  statement-count lane and the order of work. The rulings are in
-  "Decisions".
+  statement-count lane and the order of work.
+- **Revision 4** applies the review of revision 3:
+  - the commit marker stores the batch's outcome, which decides an ambiguous
+    commit;
+  - memory is bounded from capture to commit;
+  - an oversized timeline fails closed;
+  - size errors are classified by the caller;
+  - existing state over the new item limit stays readable;
+  - the order of work is final.
+
+The rulings are in "Decisions".
 
 ## Problem
 
@@ -138,19 +147,29 @@ fixed.
     rc.1.
 - **Chunk caps:** fixed constants: 4,096 items and a 4 MiB target payload,
   plus a hard, fail-closed limit on one encoded item.
-- **Order of work:**
-  1. Findings 1 and 2 together, in one small store-correctness PR with a
-     separate failing regression for each. No writer is left on the old
-     protocol in between, and the PR contains no bulk execution or batching.
-  2. Cancellation failure (finding 3), its own correctness PR.
-  3. Stale DSN on rotation (finding 4), its own small correctness PR.
-  4. The mass-invalidation batching, afterward.
+- **Order of work:** findings 1 and 2 first, in one store-correctness PR
+  (the final order is in "Order of work").
 - **Ambiguous commits:** a durable commit identity per batch.
 - **The global lock:** qualified with a multi-source measurement, its
   trade-off documented, and no per-source scalability claimed.
 - **Statement counts:** measured in a dedicated PostgreSQL lane in the gate
   manifest. The shared PostgreSQL service is not changed.
 - **Stage 2:** held.
+
+### Review of revision 3
+
+- **Commit identity:** its own correctness PR, immediately after the store
+  protocol PR. The marker stores the committed outcome, and later kv equality
+  never decides it.
+- **Capture bound:** lands with cancellation, as one guarantee.
+- **Memory:** bounded from capture through commit, with one deterministic
+  prefix.
+- **Oversized timelines:** fail closed (`mysql_timeline_too_large`) for rc.1;
+  compaction or streaming selection is follow-up work.
+- **`state_item_too_large`:** classified by the caller that knows the
+  relation.
+- **Legacy items over `M`:** stay readable.
+- **The dedicated `pg_stat_statements` lane:** approved.
 
 ## Where the work is done today
 
@@ -326,29 +345,36 @@ fixed.
 **Chunking and size limits.**
 - **Caps,** fixed constants: a group is split into chunks of at most `I` =
   4,096 items, with a target payload of `C` = 4 MiB.
-- **Item limit:** one encoded state item (a kv value or a log entry) may not
-  exceed `M` = 16 MiB.
-  - The store has no existing record limit to reuse (searched: only
-    PostgreSQL's source `max_message_bytes`, an unrelated replication
+- **Item limit for writes:** one newly written state item (a kv value or a
+  log entry) may not exceed `M` = 16 MiB.
+  - The store has no existing record limit to reuse (searched: only the
+    PostgreSQL source's `max_message_bytes`, an unrelated replication
     setting).
-  - An item over `M` fails closed before any statement, with a classified
-    incident `state_item_too_large` (HaltedSafe, operator action). It names
-    the table and the size.
+  - The store refuses an item over `M` before any statement with a generic
+    error `StateItemTooLarge { size, key_digest }`, where `key_digest` is a
+    SHA-256 of namespace and key. It names no table, because the store does
+    not know one.
+  - The caller that knows the relation classifies it. The window, baseline
+    and drift paths raise the incident `state_item_too_large` (HaltedSafe,
+    operator action) with `db.table`, the size and the digest.
   - `M` is validated by a test that builds the largest MySQL 8.4 table
     definition the server accepts (4,096 columns, maximal comments, defaults
     and ENUM lists) and asserts that its encoded registration is at most
     `M`/2.
-  - A chunk therefore carries at most `C` + `M` of payload, so the largest
-    PostgreSQL message is below 20 MiB plus statement text.
-- **Batch byte budget:** a batch's total encoded payload may not exceed `W` =
-  64 MiB, which bounds memory.
-  - When a window's planned batch would exceed `W`, the window admits the
-    longest prefix of its tables in first-touch order whose payload fits. A
-    table under `M` always fits on its own.
-  - The rest get no decision. The window's existing cut returns their held
-    rows to the stream, and a later window decides them. Nothing fails.
-  - That cut is the mechanism `first_uncovered` already applies to rows no
-    decision covers.
+  - A write chunk therefore carries at most `C` + `M` of payload, so the
+    largest PostgreSQL message is below 20 MiB plus statement text.
+- **Existing items larger than `M` stay readable.** The limit applies only to
+  new writes, never to reads, so state written before the limit is never made
+  unreadable.
+  - A read of a legacy item over `M` is counted
+    (`deltaforge_state_oversized_reads_total`) and logged once with its key
+    digest and size.
+  - Section "Bounded memory" accounts for it as one item: the working bound is
+    `W` + max(`M`, the largest legacy item read) + fixed overhead.
+  - The upgrade notes give a read-only query an operator can run before
+    upgrading to find any item over `M` (`max(octet_length(val))` per
+    namespace).
+
 - **Order:** chunks keep request order, and results are reassembled by
   ordinal.
 - **Atomicity:** all chunks run in the same transaction. A partial
@@ -357,6 +383,71 @@ fixed.
 - **Tests:** failure injection after every statement (an extension of
   `BatchFault`) asserts that nothing is visible from another connection, and
   that read-back reports none.
+
+**Bounded memory from capture to commit.**
+
+The batch budget `W` = 64 MiB bounds every step that accumulates per-table
+data, not only the final encoded batch. Working memory for one window is at
+most `W` + one maximum-size item + fixed overhead. The maximum-size item is
+`M`, or a larger legacy item while it is being read.
+
+- **One deterministic prefix:**
+  - every accumulating step consumes its input incrementally, in the window's
+    first-touch order of tables;
+  - accounting is in estimated encoded bytes;
+  - accumulation stops at the longest prefix of tables whose total fits in
+    `W`;
+  - the first step to stop sets the prefix, and every later step works only
+    on that prefix.
+- **Schema capture** (`capture_batch`):
+  - the reads are ordered by the window's table rank, joining a `VALUES
+    ROW(rank, schema, table)` constructor and ordering by rank and ordinal
+    position;
+  - the column read, by far the largest, is streamed row by row
+    (`mysql_async` result streaming);
+  - when the next table's rows would exceed `W`, the capture stops consuming
+    and the remaining rows are discarded without being kept;
+  - the existence, primary-key, prefix and metadata reads run only for the
+    prefix tables. They are small per table, and they are accounted the same
+    way;
+  - a single table over `M` is refused (`state_item_too_large`) as soon as
+    its accumulated rows exceed `M`.
+  - The metadata locks still cover every window table in sorted order, so
+    lock order is unchanged. Locks of the suffix tables are released with the
+    capture transaction, like everything else.
+- **Store reads** (`read_batch`, `load_timelines`):
+  - each array statement returns rows ordered by request ordinal and is
+    consumed as a row stream (`tokio-postgres` `query_raw`), so a result set
+    is never materialized whole;
+  - consumption stops at the prefix; rows beyond it are discarded by the
+    driver as they arrive, without being retained;
+  - no statement is split for memory reasons, so the statement bound is
+    unchanged;
+  - SQLite steps its statements row by row with the same accounting.
+- **Registration planning:** `plan_registrations` plans tables one at a time
+  in rank order, and stops at the prefix. Entries are encoded once and moved
+  into the batch, not copied.
+- **The suffix leaves no trace:**
+  - suffix tables are dropped before any decision, cache mutation or write;
+  - they get no decision, so the window's existing cut (`first_uncovered`)
+    returns their held rows to the stream;
+  - nothing of theirs was recorded, so the next window starts as if they had
+    never been planned.
+- **Binary-log order is preserved:**
+  - the prefix is in first-touch order, so the window's first held row
+    belongs to an admitted table;
+  - the cut falls before the first row whose table is undecided;
+  - rows of admitted tables after the cut return to the stream with it, in
+    order, and are dispatched later under their committed decision. Nothing
+    is reordered.
+- **No starvation:**
+  - the rank-0 table (the window's first-touched table) is always admitted,
+    because one table is at most `M` and `M` < `W`;
+  - each window therefore admits at least one table and dispatches at least
+    its first row, so the stream always advances;
+  - a large-but-valid table cut from one window is the first-touched table of
+    the window that starts at the cut, so it is admitted there;
+  - a table can be cut at most once in a row.
 
 **Bulk append, sequences and capture ids.**
 - **Validation, before any statement:**
@@ -411,35 +502,56 @@ fixed.
   existing loops.
 
 **Durable batch commit identity (fixes finding 6).**
-- **The marker:** each logical batch gets a 128-bit random identity and a
-  digest of its canonical encoding, both fixed before its first attempt and
-  reused by every re-apply.
-  - Its last write, inside the same transaction, inserts the marker into a
-    new table `df_batch_commit(batch_id PRIMARY KEY, digest, committed_at)`.
-  - SQLite gets the same table. The in-memory store keeps a map.
-- **Read-back on an ambiguous response:**
-  - **Marker present with a matching digest:** committed. The associated
-    data is then read back through two array statements (capture ids against
-    `df_log`, keys against `df_kv`, across all chunks) to return the stored
-    sequences.
-  - **Marker absent:** not committed; re-apply.
-  - **Atomicity violation:** a marker with a different digest, or a matching
-    marker whose associated data is partial or different.
+- **Identity:** each logical batch gets a 128-bit random identity and a
+  digest of its canonical request encoding. Both are fixed before its first
+  attempt and reused by every re-apply.
+- **The marker holds the outcome.** The batch's last write, inside the same
+  transaction, inserts one row into a new table `df_batch_commit`:
+  - `batch_id` (primary key);
+  - `digest`: the canonical request digest;
+  - `result`: the encoded `BatchOutcome` the caller needs, which is every
+    op ordinal's status (`Inserted`, `AlreadyPresent`, `Applied`) and its
+    assigned sequence, if any, in ordinal order;
+  - `committed_at`.
+  - SQLite gets the same table; the in-memory store keeps a map with the same
+    fields.
+- **Resolution on an ambiguous response:**
+  - **Matching id and digest:** committed. The stored result is returned.
+  - **No marker:** not committed; re-apply.
+  - **Same id, different digest:** `BatchIdentityConflict`, a classified
+    error that is never retried.
+  - **Never consulted:** later kv equality. Other legitimate writers may
+    have changed kv values since the batch committed.
+  - **Diagnostic only:** immutable log captures may be checked and logged on
+    a mismatch, but they never decide the outcome.
+- **Strict result-size bound:**
+  - a batch may hold at most 16,384 ops; `AtomicBatch::validate` refuses
+    more before any statement;
+  - each op's result encodes as one status byte plus a sequence varint (at
+    most 10 bytes), so a result is at most 16,384 × 11 bytes plus a header,
+    under 192 KiB;
+  - the marker's `result` column is checked against a 256 KiB limit before
+    the insert, so an encoding bug fails the batch instead of storing an
+    oversized marker;
+  - a 2,048-table window needs at most 6N + 1 = 12,289 ops, within the limit.
+- **Retention:**
+  - a commit call has a hard deadline of 5 minutes, covering all its attempts
+    and its resolution;
+  - markers are kept 24 h;
+  - a sweep deletes markers older than 24 h, hourly, under the store lock;
+  - a test asserts that the deadline is enforced and far below the retention.
 - **Item idempotency:** log capture ids stay the guard against duplicate
   items. They are not the authority on whether the batch committed.
-- **Retention:**
-  - markers are needed only while their commit call resolves an ambiguous
-    outcome, which is bounded by its retries (3 storage retries with
-    backoff, seconds);
-  - a sweep under the store lock deletes markers older than 24 h, hourly;
-  - a test asserts that a commit call's resolution never outlives the
-    retention: the call has a hard deadline far below 24 h.
-- **Tests:** injected ambiguity after commit across multiple chunks:
-  - marker present with complete data;
-  - marker absent;
-  - marker with a wrong digest;
-  - marker present with partial data, simulated by deleting one item before
-    read-back.
+- **Tests:**
+  - injected ambiguity after commit across multiple chunks, with the marker
+    present, absent and with a wrong digest;
+  - **a valid later writer:** after an ambiguous commit, another valid
+    transaction changes one of the batch's kv values (for example the
+    high-water, or a registry key) before resolution. Resolution must still
+    report the original batch as committed, with its stored sequences;
+  - an oversized result refused before the insert;
+  - 16,385 ops refused by validation;
+  - the sweep deletes only expired markers and holds the store lock.
 
 **SQLite and memory.** Both keep their loops: SQLite costs 5-20 µs per
 statement in process, and the diagnosis shows no SQLite round-trip defect.
@@ -463,9 +575,9 @@ They get the same validation, modes, mapping and read-back rules.
 - **Formula:** with `I` = 4,096 and `C` = 4 MiB, greedy packing gives each
   group at most `ceil(n/I) + ceil(B/C)` chunks. Here `B` is the group's
   payload, and the batch's total payload is at most `W` = 64 MiB.
-- **Reads:** chunked by items. Their results count toward `W`: a read phase
-  whose results would exceed `W` cuts the window to a prefix of tables, as
-  the write side does.
+- **Reads:** chunked by items and streamed. Their results count toward `W`
+  through the prefix rule in "Bounded memory", and streaming adds no
+  statements.
 - **Statements per window:**
   - phase-1 read transaction: 2 + Σ chunks;
   - phase-2 read transaction, if any: 2 + Σ chunks;
@@ -681,22 +793,35 @@ They get the same validation, modes, mapping and read-back rules.
   - the defaults are validated by measuring resident memory against the
     estimate (jemalloc) for timelines of 1, 100 and 10,000 records per
     table.
-- **Per-timeline hard limit:** 64 MiB of estimated bytes and 100,000
-  records.
-  - A timeline over either limit is never admitted to the cache. It is served
-    from the store on each use: correct but slower.
-  - It is counted (`deltaforge_mysql_timeline_uncached_total`) and logged
-    once per table, the way the schema registry treats an entry larger than
-    its budget (`oversized_uncached`).
-  - Shared barrier streams have the same limit, and over it they are not
-    cached either.
-- **No single item exceeds the budget:** an admitted timeline is at most
-  64 MiB, a quarter of the 256 MiB budget.
+- **Per-timeline hard limit, fail closed for rc.1:** 64 MiB of estimated
+  bytes and 100,000 records per timeline. This covers the table's stream plus
+  its shared barrier streams, each accounted once.
+  - A timeline is loaded as a row stream with its size accounted as it
+    arrives. The load stops at the limit, so at most the limit plus one
+    record is ever held.
+  - A timeline over the limit raises `mysql_timeline_too_large` (HaltedSafe,
+    operator action), naming the table and the stream's key digest. The
+    source stops before dispatching that table's row.
+  - It is never served "uncached": that would still materialize or evaluate
+    the whole timeline and break the memory bound.
+  - **Follow-up, not part of this work:** timeline compaction, or a streaming
+    selector that never materializes a whole timeline, to replace the
+    fail-closed limit after rc.1.
+  - **Upgrade notes:** a read-only query counts records and bytes per
+    activation and barrier stream, so an operator can find a stream over the
+    limit before upgrading.
+- **The cache bound, stated exactly:**
+  - the cache holds at most 256 MiB of estimated bytes;
+  - transiently, one timeline load in flight adds at most 64 MiB plus one
+    record, because it stops at the limit;
+  - so the peak is at most 256 MiB + 64 MiB + one record, never an unbounded
+    oversized timeline.
   - Admission evicts least-recently-used entries until the new entry fits,
     before inserting it.
-  - A test admits a timeline just under and just over the per-timeline limit
-    into a full cache, and asserts that the estimated total never exceeds
-    256 MiB at any point, including transiently.
+  - A test loads timelines just under and just over the limit into a full
+    cache. It asserts that the cache's estimated total never exceeds 256 MiB,
+    and that the over-limit load raises the incident after holding at most
+    the limit plus one record.
 - **Barrier-cache mutation test:** a mutant removes the cache update from
   `record_barrier`, or from each of its two callers (`record_stream_start`
   and DDL handling). Each must be killed by a test that appends a barrier
@@ -758,10 +883,33 @@ They get the same validation, modes, mapping and read-back rules.
    - ordinal mapping of collapsed duplicates across chunks;
    - existing ids in each mode;
    - existing and new ids interleaved, with deterministic results;
-   - rollback after the sequence reservation, then a re-apply.
-5. **Commit identity:** marker present and complete, absent, wrong digest,
-   present with partial data; markers swept after retention.
-6. **Size limits:**
+   - **rollback after the sequence reservation:** batch A reserves a block
+     with `setval` and rolls back. Another batch B commits, then A is retried.
+     Every committed sequence is unique and increases in commit order, and
+     A's gap is never reused.
+5. **Commit identity:**
+   - marker present (the stored result returned), absent (re-apply), and
+     with a wrong digest (`BatchIdentityConflict`);
+   - **a valid later writer** changes one of the batch's kv values after the
+     ambiguous commit, and resolution still reports the batch committed with
+     its stored sequences;
+   - result-size limit and op-count limit;
+   - commit-call deadline;
+   - the sweep under the store lock.
+6. **Size limits and memory:**
+   - `StateItemTooLarge` carries the size and key digest, and each caller
+     classifies `state_item_too_large` with its relation;
+   - a legacy item over `M` is still read, counted and accounted;
+   - working memory stays within `W` + one maximum item + overhead (measured
+     with jemalloc) for windows of 2,048 tables with large schemas, through
+     capture, reads, planning and commit;
+   - **the deterministic prefix cut, interleaved:** held rows of admitted and
+     deferred tables interleave in binary-log order. Admitted tables commit;
+     every row is delivered once, in binary-log order; deferred tables are
+     admitted by the following windows, with nothing recorded for them before
+     their own window;
+   - **no starvation:** a valid table near `M` that is cut from a full window
+     is admitted by the next window as its rank-0 table;
    - an item at and over `M`;
    - the maximal MySQL 8.4 table definition fits under `M`/2;
    - a window over `W` admits its fitting prefix, and the rest is decided by
@@ -777,12 +925,16 @@ They get the same validation, modes, mapping and read-back rules.
    - MySQL `Connections` growth and peak `Threads_connected` bounded by `P`,
      `G`, `L` and the replication bounds, independent of table count;
    - cancellation with every pool full and `L` captures holding locks;
-   - idle retention and eviction under pressure;
+   - idle retention and eviction under pressure: **many sources with idle
+     pools fill the runner budget; a new capture request evicts idle
+     connections at once and acquires within its timeout; no class starves**;
    - per-class timeouts and saturation metrics;
    - draining on rotation and failover.
 9. **Caches:**
    - every invalidation path (section 6);
-   - per-timeline limits and the budget never exceeded;
+   - the fail-closed timeline limit (`mysql_timeline_too_large` after holding
+     at most the limit plus one record);
+   - the cache total never above 256 MiB;
    - memory validation of the defaults.
 10. **Findings 1-6:** each first gets a failing regression of its own.
 11. **Mutants:**
@@ -791,6 +943,10 @@ They get the same validation, modes, mapping and read-back rules.
     - duplicate capture ids accepted with different bytes;
     - `KvMaxSeq` as a sum;
     - read-back ignoring the marker;
+    - resolution falling back to kv equality;
+    - the prefix not in first-touch order;
+    - a suffix table recorded before its own window;
+    - a timeline served past its limit;
     - chunk order reversed;
     - the cancellation reserve removed;
     - `L` above `R`;
@@ -813,30 +969,31 @@ They get the same validation, modes, mapping and read-back rules.
 
 Each step is its own PR, with focused validation and one full gate.
 
-1. **Store correctness (findings 1 and 2), one PR:**
-   - the lock-first protocol for every guarded writer at once;
+1. **Store correctness (findings 1 and 2):**
+   - the lock-first protocol for every guarded writer at once, so no writer
+     follows the old protocol in between;
    - a separate failing regression for each finding;
    - the multi-source qualification;
    - no bulk execution, no batching.
-2. **Cancellation (finding 3):** bounded, awaited, logged kills; a guard on
-   every capture path; the reserve and the lock-holding bound `L`.
-3. **Stale DSN on rotation (finding 4):** a failing regression first, then
+2. **Durable batch commit identity (finding 6):**
+   - the marker table, which stores the outcome;
+   - resolution from the stored result;
+   - the result-size bound, retention and the sweep;
+   - the later-writer regression.
+3. **Cancellation and the capture bound (finding 3):**
+   - bounded, awaited, logged kills;
+   - a guard on every capture path;
+   - the four reserved kill permits and the runner-wide bound of four
+     lock-holding captures, together.
+4. **Stale DSN on rotation (finding 4):** a failing regression first, then
    the fix.
-4. **Mass-invalidation batching:**
-   - the commit identity (finding 6);
-   - set-based execution and chunking;
-   - size limits;
+5. **Mass-invalidation batching:**
+   - set-based execution, chunking and the dedicated statement-count lane;
+   - size limits and bounded memory;
    - failover and snapshot through batched admission;
    - the connection budget;
-   - batched histories and cache bounds (finding 5).
+   - batched histories, cache bounds and the fail-closed timeline limit
+     (finding 5).
 
    It may be split into smaller PRs along those lines, each with its tests.
    Then the diagnosis rerun on both stores (acceptance), then stage 2.
-
-## Open questions
-
-1. **The commit identity's placement:** it also hardens today's read-back
-   (finding 6). It is proposed at the start of step 4. Alternatively it could
-   be its own small correctness PR right after step 1.
-2. **Placement of `L` and `R`:** proposed in step 2, so that cancellation and
-   its capacity land together.
