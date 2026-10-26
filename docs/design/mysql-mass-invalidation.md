@@ -1,8 +1,13 @@
 # MySQL mass invalidation: bounded control-plane work per window
 
-Status: design for review, not implemented. Revision 2, 2026-10-26.
-Revision 2 applies the review of revision 1 (rulings in "Decisions") and adds
-the findings about existing code that the review's questions uncovered.
+Status: design for review, not implemented. Revision 3, 2026-10-26.
+- **Revision 2** applied the review of revision 1 and added findings about
+  existing code.
+- **Revision 3** applies the review of revision 2: a durable batch identity,
+  the global lock's scope, bulk-append details, the connection budget under
+  idle pools, cache and item limits, snapshot compatibility, a dedicated
+  statement-count lane and the order of work. The rulings are in
+  "Decisions".
 
 ## Problem
 
@@ -95,8 +100,17 @@ fixed.
      lineage began, plus every lineage and database barrier.
    - The lineage barrier vector is copied into every cached table's timeline.
      Nothing compacts these streams.
+6. **Ambiguous-commit read-back proves item equality, not this
+   transaction's commit.**
+   - `read_back` declares a batch committed when every log op is found with
+     identical bytes and every kv op holds its value.
+   - A later, independent writer could produce the same values, so equality
+     does not prove that this transaction committed.
+   - Section 1 adds a durable commit identity per batch.
 
-## Decisions (review of revision 1)
+## Decisions
+
+### Review of revision 1
 
 - **Connections:**
   - a per-source control-plane pool: default 4, valid 2-16;
@@ -112,6 +126,31 @@ fixed.
   memory.
 - **Pre-activation:** deferred until after this work, the diagnosis rerun
   and stage 2. It is then evaluated as a latency or readiness policy.
+
+### Review of revision 2
+
+- **Cancellation:**
+  - four reserved cancellation permits for rc.1;
+  - a runner-wide maximum of four concurrent lock-holding captures, matching
+    the reserve;
+  - explicit, bounded cancellation stays mandatory. Dropping the socket can
+    become an optimization only after the probe, never a replacement for
+    rc.1.
+- **Chunk caps:** fixed constants: 4,096 items and a 4 MiB target payload,
+  plus a hard, fail-closed limit on one encoded item.
+- **Order of work:**
+  1. Findings 1 and 2 together, in one small store-correctness PR with a
+     separate failing regression for each. No writer is left on the old
+     protocol in between, and the PR contains no bulk execution or batching.
+  2. Cancellation failure (finding 3), its own correctness PR.
+  3. Stale DSN on rotation (finding 4), its own small correctness PR.
+  4. The mass-invalidation batching, afterward.
+- **Ambiguous commits:** a durable commit identity per batch.
+- **The global lock:** qualified with a multi-source measurement, its
+  trade-off documented, and no per-source scalability claimed.
+- **Statement counts:** measured in a dedicated PostgreSQL lane in the gate
+  manifest. The shared PostgreSQL service is not changed.
+- **Stage 2:** held.
 
 ## Where the work is done today
 
@@ -239,6 +278,34 @@ fixed.
   competing commit invalidated must yield `Conflict`, never a commit. The same
   tests run on SQLite (one connection, `BEGIN IMMEDIATE`) and in memory.
 
+**The lock's scope: one lock per store, a documented trade-off.**
+- **Why one lock:**
+  - `df_log.seq` is one sequence for the whole store, so schema sequences are
+    globally monotonic across every source that shares it.
+  - The schema-sequence high-water is one key shared by every source in a
+    runner.
+  - Both need one serialization point for sequence allocation and the
+    high-water. Today's log appends already take this one lock; the change
+    extends it to the guarded kv writes and to the batch's reads.
+- **The cost:** guarded writes of unrelated sources serialize on one lock, so
+  the store's guarded write throughput is one critical section at a time. No
+  per-source scalability is claimed.
+- **Qualified in the store-correctness PR**, before batching, on PostgreSQL:
+  - concurrent batches for unrelated sources;
+  - lock wait (p50, p99, maximum) and batches per second at 1, 8 and 32
+    concurrent sources;
+  - no starvation: every waiter acquires within a bound derived from the
+    measured critical section, asserted in the test;
+  - schema sequences strictly increasing in commit order across sources.
+- **If the measurement shows the lock as a bottleneck,** two alternatives are
+  recorded for a later decision, neither part of this work:
+  - per-source lock keys for per-source data, with only sequence allocation
+    and the high-water under the global lock;
+  - sequence blocks pre-allocated per source.
+- **Batching reduces the lock's hold time:** today's critical section is
+  about 30 statements per table. With batching it is bounded by the window
+  limits.
+
 **Set-based execution.**
 - **Unchanged interfaces:** `read_batch` and `apply_batch` keep their
   signatures: items in, results in request order out.
@@ -256,10 +323,32 @@ fixed.
     - one meta upsert and one head update per chunk;
     - `KvMaxSeq` once per batch, with the batch's maximum.
 
-**Chunking.**
-- **Caps:** a group is split into chunks of at most `I` items and at most
-  `C` encoded parameter bytes; an item larger than `C` forms its own chunk.
-  Proposed: `I` = 4,096 and `C` = 4 MiB.
+**Chunking and size limits.**
+- **Caps,** fixed constants: a group is split into chunks of at most `I` =
+  4,096 items, with a target payload of `C` = 4 MiB.
+- **Item limit:** one encoded state item (a kv value or a log entry) may not
+  exceed `M` = 16 MiB.
+  - The store has no existing record limit to reuse (searched: only
+    PostgreSQL's source `max_message_bytes`, an unrelated replication
+    setting).
+  - An item over `M` fails closed before any statement, with a classified
+    incident `state_item_too_large` (HaltedSafe, operator action). It names
+    the table and the size.
+  - `M` is validated by a test that builds the largest MySQL 8.4 table
+    definition the server accepts (4,096 columns, maximal comments, defaults
+    and ENUM lists) and asserts that its encoded registration is at most
+    `M`/2.
+  - A chunk therefore carries at most `C` + `M` of payload, so the largest
+    PostgreSQL message is below 20 MiB plus statement text.
+- **Batch byte budget:** a batch's total encoded payload may not exceed `W` =
+  64 MiB, which bounds memory.
+  - When a window's planned batch would exceed `W`, the window admits the
+    longest prefix of its tables in first-touch order whose payload fits. A
+    table under `M` always fits on its own.
+  - The rest get no decision. The window's existing cut returns their held
+    rows to the stream, and a later window decides them. Nothing fails.
+  - That cut is the mechanism `first_uncovered` already applies to rows no
+    decision covers.
 - **Order:** chunks keep request order, and results are reassembled by
   ordinal.
 - **Atomicity:** all chunks run in the same transaction. A partial
@@ -297,19 +386,60 @@ fixed.
 - **Result:** every input ordinal maps to exactly one `(seq, Inserted |
   AlreadyPresent)`. A rolled-back batch leaves a gap in the sequence, as
   today.
+- **Duplicates across chunks:** duplicates are collapsed over the whole
+  request before chunking, so a collapsed duplicate never reaches a chunk.
+  - A whole-request map from each ordinal to its canonical ordinal is kept,
+    and results are reassembled through it.
+  - Duplicates whose first and later occurrences would have fallen into
+    different chunks therefore map to one result.
+- **Interleaved existing and new ids:**
+  - existing ids (`AbsentOrIdentical`) map to their stored sequences;
+  - new ids take `base + rank`, ranked among new entries only, in request
+    order;
+  - the outcome is a pure function of the request and the store's state under
+    the lock, so it is deterministic.
+- **Rollback after reservation:**
+  - `setval` is not transactional, so a batch that rolls back after reserving
+    leaves its block as a gap;
+  - a re-apply reserves a new block, so its sequences differ from the failed
+    attempt;
+  - nothing may use a sequence before its batch is confirmed (caches are
+    installed only from confirmed commits, as today);
+  - after an ambiguous outcome, the sequences come from the store, through the
+    commit identity below, never from the attempt's reservation.
 - **SQLite and memory:** same validation and mapping; inserts in their
   existing loops.
 
-**Ambiguous-commit read-back.**
-- **Lookups:** two array statements per chunk group, capture ids against
-  `df_log` and keys against `df_kv`, across all chunks.
-- **Rules:**
-  - all ops found with identical bytes: committed, with the stored
-    sequences;
-  - none found: re-apply;
-  - some found: `AtomicityViolation`.
-- **Tests:** injected ambiguity after commit, with all, none and partial
-  results across multiple chunks.
+**Durable batch commit identity (fixes finding 6).**
+- **The marker:** each logical batch gets a 128-bit random identity and a
+  digest of its canonical encoding, both fixed before its first attempt and
+  reused by every re-apply.
+  - Its last write, inside the same transaction, inserts the marker into a
+    new table `df_batch_commit(batch_id PRIMARY KEY, digest, committed_at)`.
+  - SQLite gets the same table. The in-memory store keeps a map.
+- **Read-back on an ambiguous response:**
+  - **Marker present with a matching digest:** committed. The associated
+    data is then read back through two array statements (capture ids against
+    `df_log`, keys against `df_kv`, across all chunks) to return the stored
+    sequences.
+  - **Marker absent:** not committed; re-apply.
+  - **Atomicity violation:** a marker with a different digest, or a matching
+    marker whose associated data is partial or different.
+- **Item idempotency:** log capture ids stay the guard against duplicate
+  items. They are not the authority on whether the batch committed.
+- **Retention:**
+  - markers are needed only while their commit call resolves an ambiguous
+    outcome, which is bounded by its retries (3 storage retries with
+    backoff, seconds);
+  - a sweep under the store lock deletes markers older than 24 h, hourly;
+  - a test asserts that a commit call's resolution never outlives the
+    retention: the call has a hard deadline far below 24 h.
+- **Tests:** injected ambiguity after commit across multiple chunks:
+  - marker present with complete data;
+  - marker absent;
+  - marker with a wrong digest;
+  - marker present with partial data, simulated by deleting one item before
+    read-back.
 
 **SQLite and memory.** Both keep their loops: SQLite costs 5-20 µs per
 statement in process, and the diagnosis shows no SQLite round-trip defect.
@@ -331,23 +461,28 @@ They get the same validation, modes, mapping and read-back rules.
   | `KvMaxSeq` | 1 |
 
 - **Formula:** with `I` = 4,096 and `C` = 4 MiB, greedy packing gives each
-  group at most `ceil(n/I) + ceil(B/C)` chunks, and never more than `n`.
+  group at most `ceil(n/I) + ceil(B/C)` chunks. Here `B` is the group's
+  payload, and the batch's total payload is at most `W` = 64 MiB.
+- **Reads:** chunked by items. Their results count toward `W`: a read phase
+  whose results would exceed `W` cuts the window to a prefix of tables, as
+  the write side does.
 - **Statements per window:**
   - phase-1 read transaction: 2 + Σ chunks;
   - phase-2 read transaction, if any: 2 + Σ chunks;
-  - write transaction: begin, lock, capture-id check, sequence reservation,
-    `KvMaxSeq` (2) and commit, plus Σ chunks over the precondition, `KvPut`,
-    insert and meta groups.
+  - write transaction: 8 fixed statements (begin, lock, capture-id check,
+    sequence reservation, `KvMaxSeq` read and write, commit marker, commit),
+    plus Σ chunks over the precondition, `KvPut`, insert and meta groups.
 
 | Case | Registrations | Read statements | Write statements | Total |
 |---|---|---|---|---|
-| Measured narrow tables (1.5 KB entry, k = 0, D ≤ 2,048) | 3 MiB of entries | 7 | 18-19 | about 26 |
-| 100-column tables (about 30 KB entry) | about 60 MiB | 7 | about 33 | about 40 |
-| Bound for any schema size (every item its own chunk) | any | at most (2 + 7N) + (2 + (2 + k)N) | at most 7 + (4 + k)N + D + 1 + 4N (`KvIs`) + 4N (`KvPut`) + 2N (inserts) + 4N (meta upsert and update) | bounded by the window's 2,048 tables |
+| Measured narrow tables (1.5 KB entry, k = 0, D ≤ 2,048, all new) | 3 MiB of entries | 7 | 19-20 | about 27 |
+| 100-column tables (about 30 KB entry, all new) | about 60 MiB | 7 | about 34 | about 41 |
+| Exact worst case, any schema size (k = 0, D ≤ 2,048, payload ≤ `W`) | ≤ 64 MiB | phase 1: 2 + 2 + 1 + 1 + 1 = 7; phase 2: 2 + 1 = 3 | 8 + 3 (`LogHead`, 10,241 items) + 2 (`KvIs`) + 2 (`KvPut`) + 1 (inserts) + 2 (meta) + 17 (byte splits: `ceil(64 MiB / 4 MiB)` + 1) = 35 | **45** |
 
-  The worst row is reached only when every item exceeds `C`. In every case
-  the count is bounded by the window limits (2,048 tables, the configured
-  window bytes and events), not by the number of tables invalidated.
+- **The worst case** with k other lineages adds `ceil(kN/I)` to the
+  precondition and phase-2 groups: 1 each at k = 1, 2 at k = 2, 4 at k = 4.
+- **What the bound depends on:** the window limits (2,048 tables, `W`, `I`,
+  `C`, `M`), not the number of tables invalidated.
 
 ### 2. Batch construction
 
@@ -395,6 +530,35 @@ They get the same validation, modes, mapping and read-back rules.
   batch per page.
 - **Unchanged:** copy and owner checks.
 
+**Compatibility across versions and restarts.**
+- **Restart safety rests on selection, not on capture ids.** `establish`
+  skips every table whose records and barriers already select `Proven` at R0
+  (`mysql_baseline.rs`, the candidate loop). That holds whichever path wrote
+  the baseline and whatever its S, `scan_digest` or `capture_id`. A baseline
+  written by the old per-table path therefore stops the batched path from
+  writing a second one, and the reverse holds too.
+- **The candidate loop's reads:** two serial store reads per table today.
+  They become one `load_timelines` call per page (section 6).
+- **Required tests:**
+  - **Restart halfway through a generation:** pages 1-2 established, the
+    process killed, the generation resumed. Pages 1-2 write nothing, and
+    pages 3 onward are established once.
+  - **Mixed versions:** pages established by the old per-table binary, then
+    the generation resumed by the batched binary. Each table has exactly one
+    baseline, sequences are unique, and rows select the same versions as an
+    all-old or all-new run.
+  - **Retry after an ambiguous page commit:** the commit identity resolves
+    it. Committed means no rewrite; absent means a re-apply that writes each
+    table once.
+  - **DDL between pages:** a DDL on a page-3 table after page 2 commits puts
+    the statement inside page 3's scan (R0, S3]. That table gets no baseline,
+    as today ("no baseline: affects"), and the other tables are unaffected.
+  - **Idempotency:** re-running a completed generation's establish step
+    writes nothing.
+- **Acceptability:** a different S, `scan_digest` or `capture_id` from the
+  per-table path is acceptable only because these tests show mixed-version
+  restarts stay correct and idempotent.
+
 ### 5. MySQL control-plane connections
 
 **Limits.**
@@ -406,27 +570,50 @@ They get the same validation, modes, mapping and read-back rules.
   - position queries.
 - **Per runner:** a budget of `G` permits (default 32, validated).
   - A permit is acquired before a control-plane connection opens and released
-    when it closes; idle pooled connections expire after a short TTL, which
-    returns their permits.
-  - Every control-plane connection holds a permit, including cancellation
-    connections.
-- **Not covered:** replication sessions (the scanner's dump streams) and
-  snapshot-copy workers keep their own bounds. Their counts are reported with
-  the control-plane count in each source's total connections.
+    when it closes. Every control-plane connection holds a permit, including
+    cancellation connections.
+  - `R` = 4 of them are reserved for cancellation (below), so ordinary
+    control-plane use draws on `G - R` = 28.
+- **Lock-holding captures:** at most `L` = 4 concurrent lock-holding captures
+  per runner (a semaphore acquired before a capture's lock statements and
+  released at its commit or kill).
+  - `L` = `R` guarantees a reserved cancellation permit for every capture that
+    can need one.
+  - A capture waiting for this semaphore holds no locks. Its wait counts
+    toward its `capture_lock_wait_secs` bound.
+- **Idle connections:**
+  - at most one idle control-plane connection is retained per source, through
+    the pool's idle limit; others close when returned;
+  - under budget pressure (a permit request that would wait), idle
+    connections across the runner are evicted at once to free permits;
+  - each idle connection also expires after a short TTL (10 s).
+- **Saturation:**
+  - every permit acquisition has its class's timeout (below);
+  - waits and timeouts are exported as metrics (`deltaforge_mysql_control_permit_wait_seconds`, `deltaforge_mysql_control_permit_timeouts_total` by class);
+  - a capture that times out on the budget raises `mysql_control_plane_saturated`
+    (AutoRetry), separate from lock contention.
+- **Total source connections:** control-plane, replication, cancellation and
+  snapshot-copy connections are reported together per source, and each kind
+  separately. Replication and snapshot-copy keep their own bounds (the
+  window's two stream openings, `max_parallel_tables`), outside `G`.
 
 **Cancellation.**
-- **Reserve:** `R` of the runner's `G` permits (default 4) are reserved for
-  cancellation. A `KILL` connection never waits on any source's pool, so
-  lock-holding sessions occupying a pool cannot block their own cancellation.
+- **Reserve:** `R` = 4 of the runner's `G` permits are reserved for
+  cancellation, matching `L` = 4 lock-holding captures. A `KILL` connection
+  never waits on any source's pool or the ordinary budget, so lock-holding
+  sessions occupying a pool cannot block their own cancellation.
 - **Bounded and visible:** the kill is awaited with a bound (10 s), logged
   and counted when it fails. That fixes finding 3. `lock_wait_timeout` stays
   the server-side backstop.
 - **Every capture path** gets the guard, including any remaining single-table
   capture.
-- **A probe decides whether the reserve can shrink to zero:** does closing
-  the client socket release (a) a session waiting for a metadata lock and
-  (b) a session holding one? Only if both are released promptly does the
-  design rely on dropping the connection, with the probe's evidence recorded.
+- **The probe** (does closing the client socket release (a) a session
+  waiting for a metadata lock and (b) a session holding one?) is recorded as
+  evidence only.
+  - For rc.1 the reserve stays at 4, and explicit, bounded `KILL` stays
+    mandatory.
+  - Dropping the socket may later become an optimization alongside the kill,
+    never a replacement.
 
 **Fairness and timeouts.**
 - **Classes and timeouts:**
@@ -494,6 +681,26 @@ They get the same validation, modes, mapping and read-back rules.
   - the defaults are validated by measuring resident memory against the
     estimate (jemalloc) for timelines of 1, 100 and 10,000 records per
     table.
+- **Per-timeline hard limit:** 64 MiB of estimated bytes and 100,000
+  records.
+  - A timeline over either limit is never admitted to the cache. It is served
+    from the store on each use: correct but slower.
+  - It is counted (`deltaforge_mysql_timeline_uncached_total`) and logged
+    once per table, the way the schema registry treats an entry larger than
+    its budget (`oversized_uncached`).
+  - Shared barrier streams have the same limit, and over it they are not
+    cached either.
+- **No single item exceeds the budget:** an admitted timeline is at most
+  64 MiB, a quarter of the 256 MiB budget.
+  - Admission evicts least-recently-used entries until the new entry fits,
+    before inserting it.
+  - A test admits a timeline just under and just over the per-timeline limit
+    into a full cache, and asserts that the estimated total never exceeds
+    256 MiB at any point, including transiently.
+- **Barrier-cache mutation test:** a mutant removes the cache update from
+  `record_barrier`, or from each of its two callers (`record_stream_start`
+  and DDL handling). Each must be killed by a test that appends a barrier
+  and then asserts that a cached table's selection changes accordingly.
 
 ### Head-of-line delay after the change
 
@@ -507,7 +714,7 @@ They get the same validation, modes, mapping and read-back rules.
 - **Projection, to be validated by stage 2:** a 40,000-table cold start runs
   about 20 windows of 2,048 tables, giving:
   - about 40 s of schema reads;
-  - about 20 × 26 store statements for narrow tables;
+  - about 20 × 27 store statements for narrow tables;
   - pool-bounded connections.
 
 ## Invariants
@@ -527,44 +734,67 @@ They get the same validation, modes, mapping and read-back rules.
 ## Validation
 
 1. **Statement counts:** measured with `pg_stat_statements` on a live
-   PostgreSQL, not with a wrapper. The gate's PostgreSQL container gains
-   `shared_preload_libraries=pg_stat_statements`; tests reset the counters
-   and assert calls per window for 1, 64 and 2,048 tables against the bound
-   above. This is a test-infrastructure change to `scripts/gate.sh`.
+   PostgreSQL, not with a wrapper.
+   - A dedicated lane starts its own PostgreSQL container with
+     `shared_preload_libraries=pg_stat_statements`. It is listed in the gate
+     manifest (`scripts/gate-suites.txt`) as its own suite.
+   - The shared PostgreSQL service and the other suites are unchanged.
+   - Tests reset the counters and assert calls per window for 1, 64 and 2,048
+     tables against the bound above, separating the test's own queries by
+     role.
 2. **Concurrency:**
    - overlapping batches;
    - batches against every guarded single-key writer;
    - sequence order under concurrent batches;
-   - the high-water staying monotonic.
-3. **Failure injection** after every chunked statement: nothing visible, and
-   read-back reports none.
+   - the high-water staying monotonic;
+   - the multi-source qualification (1, 8 and 32 sources: lock wait,
+     throughput, no starvation, strictly increasing global sequences).
+3. **Failure injection** after every chunked statement: nothing visible from
+   another connection; the commit marker absent; read-back reports not
+   committed.
 4. **Bulk append:**
-   - duplicate capture ids within a request, identical and different;
+   - duplicate capture ids, identical and different, within a chunk and
+     spanning chunks;
+   - ordinal mapping of collapsed duplicates across chunks;
    - existing ids in each mode;
-   - ordinal mapping across chunks.
-5. **Read-back:** all, none and partial across chunks.
-6. **Snapshot equivalence:**
-   - the old and new paths write identical bytes and sequences with fixed
-     positions;
-   - equal under live timing except `to`, `scan_digest` and `capture_id`.
-7. **Connections:**
+   - existing and new ids interleaved, with deterministic results;
+   - rollback after the sequence reservation, then a re-apply.
+5. **Commit identity:** marker present and complete, absent, wrong digest,
+   present with partial data; markers swept after retention.
+6. **Size limits:**
+   - an item at and over `M`;
+   - the maximal MySQL 8.4 table definition fits under `M`/2;
+   - a window over `W` admits its fitting prefix, and the rest is decided by
+     the next window.
+7. **Snapshot compatibility:**
+   - restart halfway;
+   - old pages followed by new pages;
+   - retry after an ambiguous page commit;
+   - DDL between pages;
+   - idempotent re-run;
+   - fixed-position byte equivalence.
+8. **Connections:**
    - MySQL `Connections` growth and peak `Threads_connected` bounded by `P`,
-     `G` and the replication bounds, independent of table count;
-   - cancellation under a full pool;
-   - fairness and timeouts per class;
+     `G`, `L` and the replication bounds, independent of table count;
+   - cancellation with every pool full and `L` captures holding locks;
+   - idle retention and eviction under pressure;
+   - per-class timeouts and saturation metrics;
    - draining on rotation and failover.
-8. **Cache invalidation** tests as in section 6; memory validation of the
-   cache defaults.
-9. **Findings 1-5:** each first gets a failing test.
-10. **Mutants:**
+9. **Caches:**
+   - every invalidation path (section 6);
+   - per-timeline limits and the budget never exceeded;
+   - memory validation of the defaults.
+10. **Findings 1-6:** each first gets a failing regression of its own.
+11. **Mutants:**
     - preconditions read before the lock;
     - one guarded writer without the lock;
     - duplicate capture ids accepted with different bytes;
     - `KvMaxSeq` as a sum;
-    - read-back reduced to the first chunk;
+    - read-back ignoring the marker;
     - chunk order reversed;
     - the cancellation reserve removed;
-    - a barrier append without cache invalidation.
+    - `L` above `R`;
+    - each barrier append path without its cache update.
 
 ## Acceptance (diagnosis rerun on both stores)
 
@@ -579,12 +809,34 @@ They get the same validation, modes, mapping and read-back rules.
   where ordering is identical.
 - Then stage 2 (10,000 and 40,000 tables).
 
+## Order of work
+
+Each step is its own PR, with focused validation and one full gate.
+
+1. **Store correctness (findings 1 and 2), one PR:**
+   - the lock-first protocol for every guarded writer at once;
+   - a separate failing regression for each finding;
+   - the multi-source qualification;
+   - no bulk execution, no batching.
+2. **Cancellation (finding 3):** bounded, awaited, logged kills; a guard on
+   every capture path; the reserve and the lock-holding bound `L`.
+3. **Stale DSN on rotation (finding 4):** a failing regression first, then
+   the fix.
+4. **Mass-invalidation batching:**
+   - the commit identity (finding 6);
+   - set-based execution and chunking;
+   - size limits;
+   - failover and snapshot through batched admission;
+   - the connection budget;
+   - batched histories and cache bounds (finding 5).
+
+   It may be split into smaller PRs along those lines, each with its tests.
+   Then the diagnosis rerun on both stores (acceptance), then stage 2.
+
 ## Open questions
 
-1. **Cancellation reserve:** whether `R` = 4 of 32, or the probe's evidence,
-   should decide its final size.
-2. **Chunk caps:** whether `I` = 4,096 and `C` = 4 MiB should be configurable
-   or fixed constants (proposed: fixed, tested at their edges).
-3. **Order of work:** findings 1 and 2 touch the store protocol every source
-   uses. Proposed: fix them first, each with its failing test, as their own
-   PR, before the batching work builds on the new protocol.
+1. **The commit identity's placement:** it also hardens today's read-back
+   (finding 6). It is proposed at the start of step 4. Alternatively it could
+   be its own small correctness PR right after step 1.
+2. **Placement of `L` and `R`:** proposed in step 2, so that cancellation and
+   its capacity land together.
