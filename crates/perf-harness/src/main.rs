@@ -169,6 +169,11 @@ struct Args {
     /// longer, a capacity sweep runs its steps).
     #[arg(long, default_value_t = 120)]
     scale_seconds: u64,
+    /// Scaling study: run only these points of the grid (ids as in
+    /// `scale-summary.md`, e.g. `t100-a20-burst-o0`); every id must be a
+    /// point of the grid.
+    #[arg(long, value_delimiter = ',')]
+    scale_points: Vec<String>,
     /// Count the DeltaForge runner's user-space instructions and cycles
     /// with `perf stat` for 30 s from 15 s into each scale run's load
     /// (hybrid CPUs: the scaled per-core-type counts are summed).
@@ -3322,6 +3327,7 @@ async fn main() -> Result<()> {
                 seconds: args.scale_seconds,
                 warmup: args.warmup,
                 catchup: args.scale_catchup,
+                only: args.scale_points.clone(),
             };
             scale::study(
                 &plan,
@@ -3761,6 +3767,34 @@ async fn measure(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scale_points_parse_as_a_comma_separated_list() {
+        use clap::Parser;
+        let a = super::Args::try_parse_from([
+            "canonical-perf",
+            "--out",
+            "o",
+            "--scale-tables",
+            "100,1000",
+            "--scale-points",
+            "t100-a1-steady-o0,t1000-a50-steady-o0",
+        ])
+        .unwrap();
+        assert_eq!(
+            a.scale_points,
+            ["t100-a1-steady-o0", "t1000-a50-steady-o0"]
+        );
+        let none = super::Args::try_parse_from([
+            "canonical-perf",
+            "--out",
+            "o",
+            "--scale-tables",
+            "100",
+        ])
+        .unwrap();
+        assert!(none.scale_points.is_empty());
+    }
+
     #[test]
     fn a_routed_row_must_be_kept_and_on_its_topic() {
         let r = super::Route {
