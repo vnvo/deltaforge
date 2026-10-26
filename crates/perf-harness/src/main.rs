@@ -169,6 +169,11 @@ struct Args {
     /// longer, a capacity sweep runs its steps).
     #[arg(long, default_value_t = 120)]
     scale_seconds: u64,
+    /// Scaling study: run only these points of the grid (ids as in
+    /// `scale-summary.md`, e.g. `t100-a20-burst-o0`); every id must be a
+    /// point of the grid.
+    #[arg(long, value_delimiter = ',')]
+    scale_points: Vec<String>,
     /// Count the DeltaForge runner's user-space instructions and cycles
     /// with `perf stat` for 30 s from 15 s into each scale run's load
     /// (hybrid CPUs: the scaled per-core-type counts are summed).
@@ -3322,6 +3327,7 @@ async fn main() -> Result<()> {
                 seconds: args.scale_seconds,
                 warmup: args.warmup,
                 catchup: args.scale_catchup,
+                only: args.scale_points.clone(),
             };
             scale::study(
                 &plan,

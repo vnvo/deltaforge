@@ -1335,6 +1335,8 @@ pub struct Plan {
     pub warmup: bool,
     /// The catch-up phase (a stop and resume during the load).
     pub catchup: bool,
+    /// When not empty, only the grid's points with these ids run.
+    pub only: Vec<String>,
 }
 
 impl Plan {
@@ -1347,14 +1349,17 @@ impl Plan {
                     continue;
                 }
                 for &binlog_mib in &self.binlog_mib {
-                    v.push(Point {
+                    let p = Point {
                         tables,
                         active,
                         workload,
                         rotate: self.rotate,
                         binlog_mib,
                         pad: self.pad,
-                    });
+                    };
+                    if self.only.is_empty() || self.only.contains(&p.id()) {
+                        v.push(p);
+                    }
                 }
             }
         }
@@ -1414,7 +1419,19 @@ pub async fn study(
     let base = Duration::from_secs(plan.seconds);
     let mut seq = 0u64;
     let mut outcome = Ok(());
+    let all: Vec<String> = plan
+        .tables
+        .iter()
+        .flat_map(|&t| plan.points(t))
+        .map(|p| p.id())
+        .collect();
+    if let Some(missing) = plan.only.iter().find(|id| !all.contains(id)) {
+        bail!("--scale-points: {missing} is not a point of the grid");
+    }
     'tables: for &tables in &plan.tables {
+        if plan.points(tables).is_empty() {
+            continue;
+        }
         let secs = fixture(infra, tables).await?;
         writeln!(fixtures, "{}", json!({"tables": tables, "build_s": secs}))?;
         eprintln!("fixture of {tables} tables built in {secs:.0} s");
@@ -1612,6 +1629,30 @@ fn summary(out: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_point_list_selects_exactly_its_points() {
+        let plan = |only: &[&str]| Plan {
+            tables: vec![100, 1000],
+            active: vec![1, 20, 50, 100],
+            workloads: vec![Workload::Steady, Workload::Burst],
+            rotate: false,
+            binlog_mib: vec![0],
+            pad: Pad::Large,
+            reps: 5,
+            seconds: 120,
+            warmup: true,
+            catchup: true,
+            only: only.iter().map(|s| s.to_string()).collect(),
+        };
+        let ids = |p: &Plan, t| -> Vec<String> {
+            p.points(t).iter().map(|p| p.id()).collect()
+        };
+        assert_eq!(ids(&plan(&[]), 1000).len(), 8);
+        let p = plan(&["t100-a20-burst-o0", "t1000-a1-burst-o0"]);
+        assert_eq!(ids(&p, 100), ["t100-a20-burst-o0"]);
+        assert_eq!(ids(&p, 1000), ["t1000-a1-burst-o0"]);
+    }
 
     #[test]
     fn a_rotating_run_activates_half_the_inactive_tables() {

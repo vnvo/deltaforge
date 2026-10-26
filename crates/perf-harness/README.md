@@ -169,6 +169,8 @@ Options:
   `--scale-binlog-pad small|large` what pads the file up to them.
 - `--scale-catchup false` drops the catch-up phase.
 - `--scale-seconds` sets the load's length.
+- `--scale-points` runs only the listed points of the grid (ids as in
+  `scale-summary.md`); an id outside the grid is refused.
 
 The load-generation settings apply equally to both systems and are not
 production recommendations: 64 writer connections, and a source that does
