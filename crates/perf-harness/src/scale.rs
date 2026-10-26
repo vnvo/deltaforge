@@ -1323,6 +1323,7 @@ fn floors() -> (f64, f64) {
 }
 
 /// The study's plan, from the command line.
+#[derive(Clone)]
 pub struct Plan {
     pub tables: Vec<usize>,
     pub active: Vec<u32>,
@@ -1340,6 +1341,30 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// Refuse a point list that names a point outside the grid, or one
+    /// point twice. Selected points always run in the grid's order.
+    pub fn check_points(&self) -> Result<()> {
+        let grid = Plan {
+            only: Vec::new(),
+            ..self.clone()
+        };
+        let all: Vec<String> = grid
+            .tables
+            .iter()
+            .flat_map(|&t| grid.points(t))
+            .map(|p| p.id())
+            .collect();
+        for (i, id) in self.only.iter().enumerate() {
+            if !all.contains(id) {
+                bail!("--scale-points: {id} is not a point of the grid");
+            }
+            if self.only[..i].contains(id) {
+                bail!("--scale-points: {id} is listed twice");
+            }
+        }
+        Ok(())
+    }
+
     fn points(&self, tables: usize) -> Vec<Point> {
         let mut v = Vec::new();
         for &workload in &self.workloads {
@@ -1419,15 +1444,7 @@ pub async fn study(
     let base = Duration::from_secs(plan.seconds);
     let mut seq = 0u64;
     let mut outcome = Ok(());
-    let all: Vec<String> = plan
-        .tables
-        .iter()
-        .flat_map(|&t| plan.points(t))
-        .map(|p| p.id())
-        .collect();
-    if let Some(missing) = plan.only.iter().find(|id| !all.contains(id)) {
-        bail!("--scale-points: {missing} is not a point of the grid");
-    }
+    plan.check_points()?;
     'tables: for &tables in &plan.tables {
         if plan.points(tables).is_empty() {
             continue;
@@ -1652,6 +1669,32 @@ mod tests {
         let p = plan(&["t100-a20-burst-o0", "t1000-a1-burst-o0"]);
         assert_eq!(ids(&p, 100), ["t100-a20-burst-o0"]);
         assert_eq!(ids(&p, 1000), ["t1000-a1-burst-o0"]);
+        assert!(p.check_points().is_ok());
+
+        // The grid's order, whatever the list's order.
+        let listed = [
+            "t100-a50-burst-o0",
+            "t100-a1-steady-o0",
+            "t100-a20-burst-o0",
+        ];
+        let mut reversed = listed;
+        reversed.reverse();
+        assert_eq!(ids(&plan(&listed), 100), ids(&plan(&reversed), 100));
+        assert_eq!(
+            ids(&plan(&listed), 100),
+            [
+                "t100-a1-steady-o0",
+                "t100-a20-burst-o0",
+                "t100-a50-burst-o0"
+            ]
+        );
+
+        let unknown = plan(&["t100-a20-burst-o0", "t100-a30-burst-o0"]);
+        let e = unknown.check_points().unwrap_err().to_string();
+        assert!(e.contains("t100-a30-burst-o0 is not a point"), "{e}");
+        let twice = plan(&["t100-a20-burst-o0", "t100-a20-burst-o0"]);
+        let e = twice.check_points().unwrap_err().to_string();
+        assert!(e.contains("listed twice"), "{e}");
     }
 
     #[test]

@@ -3768,6 +3768,34 @@ async fn measure(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn scale_points_parse_as_a_comma_separated_list() {
+        use clap::Parser;
+        let a = super::Args::try_parse_from([
+            "canonical-perf",
+            "--out",
+            "o",
+            "--scale-tables",
+            "100,1000",
+            "--scale-points",
+            "t100-a1-steady-o0,t1000-a50-steady-o0",
+        ])
+        .unwrap();
+        assert_eq!(
+            a.scale_points,
+            ["t100-a1-steady-o0", "t1000-a50-steady-o0"]
+        );
+        let none = super::Args::try_parse_from([
+            "canonical-perf",
+            "--out",
+            "o",
+            "--scale-tables",
+            "100",
+        ])
+        .unwrap();
+        assert!(none.scale_points.is_empty());
+    }
+
+    #[test]
     fn a_routed_row_must_be_kept_and_on_its_topic() {
         let r = super::Route {
             topics: ["t.a".into(), "t.b".into()],

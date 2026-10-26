@@ -170,7 +170,17 @@ Options:
 - `--scale-catchup false` drops the catch-up phase.
 - `--scale-seconds` sets the load's length.
 - `--scale-points` runs only the listed points of the grid (ids as in
-  `scale-summary.md`); an id outside the grid is refused.
+  `scale-summary.md`). An id outside the grid, or one listed twice, is
+  refused. The points run in the grid's order, whatever the list's order.
+  It is how a point is re-run with more repetitions in one invocation. The
+  stage-1 expansion to five repetitions was:
+
+  ```bash
+  canonical-perf --binary df=<runner> --binary dbz=debezium --debezium-profile tuned \
+      --out target/perf/scale-stage1x --reps 5 --scale-tables 100,1000 \
+      --scale-active 1,20,50,100 --scale-workload steady,burst --scale-binlog-mib 0 \
+      --scale-points t100-a1-steady-o0,t100-a20-burst-o0,t100-a50-burst-o0,t100-a50-steady-o0,t100-a100-burst-o0,t1000-a1-burst-o0,t1000-a50-steady-o0,t1000-a100-steady-o0
+  ```
 
 The load-generation settings apply equally to both systems and are not
 production recommendations: 64 writer connections, and a source that does
