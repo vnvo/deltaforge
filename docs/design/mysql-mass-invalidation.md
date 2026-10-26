@@ -1,12 +1,16 @@
 # MySQL mass invalidation: bounded control-plane work per window
 
-Status: design for review, not implemented. Revision 4, 2026-10-26.
+Status: design for review, not implemented. Revision 4.1, 2026-10-26.
 - **Revision 2** applied the review of revision 1 and added findings about
   existing code.
 - **Revision 3** applies the review of revision 2: a durable batch identity,
   the global lock's scope, bulk-append details, the connection budget under
   idle pools, cache and item limits, snapshot compatibility, a dedicated
   statement-count lane and the order of work.
+- **Revision 4.1** corrects revision 4:
+  - a per-table aggregate limit completes the no-starvation proof;
+  - a read-item cap makes the statement bound exact (54 per plan);
+  - the marker sweep is chunked and budgeted.
 - **Revision 4** applies the review of revision 3:
   - the commit marker stores the batch's outcome, which decides an ambiguous
     commit;
@@ -170,6 +174,21 @@ fixed.
   relation.
 - **Legacy items over `M`:** stay readable.
 - **The dedicated `pg_stat_statements` lane:** approved.
+
+### Review of revision 4
+
+- **Per-table aggregate limit:** 64 MiB from capture through commit; a table
+  over it fails closed with `mysql_table_state_too_large`. Prefix selection
+  uses complete per-table contributions, and the no-starvation argument rests
+  on it.
+- **Read items:** 16,384 per plan, beside the 16,384 write ops. A single
+  table over the cap fails closed with `mysql_table_registry_too_large`. The
+  exact bound is recomputed: 54 statements per atomic plan.
+- **The marker sweep:** chunked (1,024 per lock acquisition), budgeted,
+  measured, and harmless when it falls behind.
+- **Approval:** with these corrections, PR #177 is approved to merge once the
+  docs checks and CI pass at the updated head. Implementation follows the
+  recorded order.
 
 ## Where the work is done today
 
@@ -369,8 +388,11 @@ fixed.
   - A read of a legacy item over `M` is counted
     (`deltaforge_state_oversized_reads_total`) and logged once with its key
     digest and size.
-  - Section "Bounded memory" accounts for it as one item: the working bound is
-    `W` + max(`M`, the largest legacy item read) + fixed overhead.
+  - It counts inside its table's aggregate (section "Bounded memory"). A
+    legacy item that alone pushes its table over `T` = 64 MiB makes that
+    table fail closed with `mysql_table_state_too_large`, naming the size and
+    key digest, rather than breaking the memory bound. That is the explicit
+    refusal, and the upgrade query below finds such items beforehand.
   - The upgrade notes give a read-only query an operator can run before
     upgrading to find any item over `M` (`max(octet_length(val))` per
     namespace).
@@ -387,16 +409,41 @@ fixed.
 **Bounded memory from capture to commit.**
 
 The batch budget `W` = 64 MiB bounds every step that accumulates per-table
-data, not only the final encoded batch. Working memory for one window is at
-most `W` + one maximum-size item + fixed overhead. The maximum-size item is
-`M`, or a larger legacy item while it is being read.
+data, not only the final encoded batch.
+
+- **Per-table aggregate limit:** a table's aggregate contribution may not
+  exceed `T` = 64 MiB.
+  - The aggregate is everything accumulated for that table from capture
+    through commit: its captured schema, the existing versions and lineages
+    read for it, its timeline and history reads, its registration and index
+    entries, its activation record and its share of the commit outcome.
+  - A table over `T` fails closed with `mysql_table_state_too_large`
+    (HaltedSafe, operator action), naming the table and its aggregate size.
+    It is never cut and retried.
+- **Per-plan caps** (fixed constants):
+  - **Read items, 16,384:** every requested read item of an atomic plan,
+    meaning plan reads of both phases, precondition checks and capture-id
+    existence checks;
+  - **Read-key payload, 4 MiB:** the parameter payload of those reads;
+  - **Write ops, 16,384;**
+  - **Encoded payload, `W`:** includes the write parameters' keys.
+  - A single table whose read items exceed 16,384 (for example through
+    thousands of lineages) fails closed with `mysql_table_registry_too_large`
+    (HaltedSafe, operator action). A single table's write ops are at most 7,
+    so the write-op cap can never be exceeded by one table.
+- **Working memory** for one window is at most `W` + one per-table aggregate
+  (`T`, the table being accumulated when the prefix closes) + fixed overhead.
+  A legacy item larger than `M` counts inside its table's aggregate and is
+  bounded by `T` like everything else.
 
 - **One deterministic prefix:**
   - every accumulating step consumes its input incrementally, in the window's
     first-touch order of tables;
-  - accounting is in estimated encoded bytes;
-  - accumulation stops at the longest prefix of tables whose total fits in
-    `W`;
+  - accounting is per table: each table's complete aggregate contribution,
+    its read items, its read-key payload and its write ops;
+  - accumulation stops at the longest prefix of tables whose totals fit every
+    per-plan cap (`W`, 16,384 read items, 4 MiB of read keys, 16,384 write
+    ops);
   - the first step to stop sets the prefix, and every later step works only
     on that prefix.
 - **Schema capture** (`capture_batch`):
@@ -441,13 +488,20 @@ most `W` + one maximum-size item + fixed overhead. The maximum-size item is
     order, and are dispatched later under their committed decision. Nothing
     is reordered.
 - **No starvation:**
-  - the rank-0 table (the window's first-touched table) is always admitted,
-    because one table is at most `M` and `M` < `W`;
-  - each window therefore admits at least one table and dispatches at least
-    its first row, so the stream always advances;
-  - a large-but-valid table cut from one window is the first-touched table of
-    the window that starts at the cut, so it is admitted there;
-  - a table can be cut at most once in a row.
+  - **every valid table fits alone:** a valid table's aggregate is at most
+    `T` = `W`, and its read items, read keys and write ops are within the
+    per-plan caps; otherwise it is invalid and halts;
+  - **every valid rank-0 table is admitted:** the prefix starts with the
+    window's first-touched table, which fits;
+  - **every non-empty window admits at least one table** and dispatches at
+    least its first row, so the stream advances;
+  - **a deferred valid table progresses:** cut from one window, it is the
+    first-touched table, rank 0, of the window that starts at the cut, so it
+    is admitted there; a valid table is cut at most once in a row;
+  - **an invalid table halts explicitly:** a table over `T` or over the
+    read-item cap raises `mysql_table_state_too_large` or
+    `mysql_table_registry_too_large` when it is accumulated as rank 0, or
+    earlier. It never loops through cuts.
 
 **Bulk append, sequences and capture ids.**
 - **Validation, before any statement:**
@@ -533,13 +587,32 @@ most `W` + one maximum-size item + fixed overhead. The maximum-size item is
   - the marker's `result` column is checked against a 256 KiB limit before
     the insert, so an encoding bug fails the batch instead of storing an
     oversized marker;
-  - a 2,048-table window needs at most 6N + 1 = 12,289 ops, within the limit.
+  - the 16,384-op limit is the same plan-wide write-op cap the prefix rule
+    enforces, so a plan's result always fits.
 - **Retention:**
   - a commit call has a hard deadline of 5 minutes, covering all its attempts
     and its resolution;
   - markers are kept 24 h;
-  - a sweep deletes markers older than 24 h, hourly, under the store lock;
   - a test asserts that the deadline is enforced and far below the retention.
+- **The sweep never monopolizes the store lock:**
+  - **chunks:** each chunk is its own short transaction: take the store lock,
+    delete at most 1,024 markers older than 24 h (oldest first, by
+    `committed_at` through an index), commit. Committing releases the lock,
+    so other writers interleave between chunks.
+  - **budget:** a sweep runs at most 64 chunks or 1 s of wall time,
+    whichever comes first, then yields until the next hourly run. That is at
+    most 65,536 markers per run.
+  - **metrics:**
+    - `deltaforge_store_batch_markers_backlog`, the expired markers left
+      after a run, from the chunk that came back short;
+    - `deltaforge_store_batch_markers_deleted_total`;
+    - `deltaforge_store_batch_marker_sweep_seconds`;
+    - the lock hold per chunk, as part of the existing lock-wait
+      measurement.
+  - **falling behind has no effect on correctness:** a marker is consulted
+    only by its own batch id within that call's 5-minute deadline, so an
+    expired marker is never read. A backlog only costs storage, and the
+    backlog metric makes it visible.
 - **Item idempotency:** log capture ids stay the guard against duplicate
   items. They are not the authority on whether the batch committed.
 - **Tests:**
@@ -557,44 +630,76 @@ most `W` + one maximum-size item + fixed overhead. The maximum-size item is
 statement in process, and the diagnosis shows no SQLite round-trip defect.
 They get the same validation, modes, mapping and read-back rules.
 
-**Exact worst-case statement bound for a 2,048-table window.**
-- **Assumptions:** all N = 2,048 tables are new; k other lineages; D distinct
-  databases.
-- **Item counts:**
+**Exact statement bound per atomic plan.**
 
-  | Group | Items |
-  |---|---|
-  | Read phase 1 | 3N `KvGet`, 2N `LogLatest`, N `LogHead`, N `LogLen` |
-  | Read phase 2 (existing versions only) | at most 2N `KvGet` and kN `LogLatest` |
-  | `LogHead` preconditions | (4 + k)N + D + 1: legacy, main, side and the table's activation stream per table, plus the barrier heads deduplicated (one lineage, D databases) |
-  | `KvIs` preconditions | 4N |
-  | `KvPut` | 4N |
-  | Log appends | 2N, for 2N streams |
-  | `KvMaxSeq` | 1 |
+**Caps the bound rests on** (fixed constants, section "Bounded memory"):
+- 16,384 read items per plan: plan reads of both phases, precondition checks
+  and capture-id existence checks;
+- 4 MiB of read-key payload;
+- 16,384 write ops, `KvMaxSeq` included;
+- `W` = 64 MiB of encoded write payload, keys included;
+- `I` = 4,096 items and `C` = 4 MiB per statement.
 
-- **Formula:** with `I` = 4,096 and `C` = 4 MiB, greedy packing gives each
-  group at most `ceil(n/I) + ceil(B/C)` chunks. Here `B` is the group's
-  payload, and the batch's total payload is at most `W` = 64 MiB.
-- **Reads:** chunked by items and streamed. Their results count toward `W`
-  through the prefix rule in "Bounded memory", and streaming adds no
-  statements.
-- **Statements per window:**
-  - phase-1 read transaction: 2 + Σ chunks;
-  - phase-2 read transaction, if any: 2 + Σ chunks;
-  - write transaction: 8 fixed statements (begin, lock, capture-id check,
-    sequence reservation, `KvMaxSeq` read and write, commit marker, commit),
-    plus Σ chunks over the precondition, `KvPut`, insert and meta groups.
+**Packing rule:**
+- a group's current chunk closes when it holds `I` items, or once its
+  payload has reached `C` (an item is added first, then the check);
+- so every chunk closed by bytes carries at least `C`;
+- and a non-empty group of `n` items and `B` bytes produces at most
+  `floor(n / I) + floor(B / C) + 1` chunks;
+- a chunk's payload stays below `C` + `M`.
 
-| Case | Registrations | Read statements | Write statements | Total |
+**Read side: 9 groups.**
+- **The groups:**
+  - phase 1: `KvGet`, `LogLatest`, `LogHead`, `LogLen`;
+  - phase 2: `KvGet`, `LogLatest`;
+  - write transaction: `LogHead` and `KvIs` preconditions, and the
+    capture-id check.
+- **Item-closed chunks:** with Σ n ≤ 16,384, Σ floor(n / 4,096) ≤ 4.
+- **Byte-closed chunks:** with Σ B ≤ 4 MiB, Σ floor(B / 4 MiB) ≤ 1.
+- **Final chunks:** at most 9, one per non-empty group.
+- **At most 14 read chunks.**
+
+**Write side: 4 groups** (`KvPut`, inserts, meta upsert, meta head update).
+- **Item-closed chunks:**
+  - inserts number at most 16,383 (`KvMaxSeq` takes one op), and each meta
+    group has at most one item per insert;
+  - Σ floor(n / 4,096) is greatest with every op an insert: 3 + 3 + 3 = 9.
+    Any split with `KvPut` gives at most 9.
+- **Byte-closed chunks:** with Σ B ≤ 64 MiB, Σ floor(B / 4 MiB) ≤ 16.
+- **Final chunks:** at most 4.
+- **At most 29 write chunks.**
+
+**Fixed statements: 11.**
+- 2 read transactions × 2 (begin, commit);
+- the write transaction's begin, lock, sequence reservation, `KvMaxSeq` read
+  and write, commit marker and commit.
+
+**Exact bound: 11 + 14 + 29 = 54 statements per atomic plan,** whatever the
+table count, schema sizes, lineages or databases. This corrects revision 3's
+"45", which assumed one lineage and no read cap.
+
+**What the caps mean for real windows.** A new narrow table needs about 18
+read items:
+- 7 plan reads;
+- 8 precondition checks;
+- 2 capture-id checks;
+- at most one shared barrier head.
+
+So one plan admits up to 910 new narrow tables, and a larger window commits
+its first 910 and cuts the rest to the next window.
+
+| Case | Tables per plan | Read statements | Write statements | Total per plan |
 |---|---|---|---|---|
-| Measured narrow tables (1.5 KB entry, k = 0, D ≤ 2,048, all new) | 3 MiB of entries | 7 | 19-20 | about 27 |
-| 100-column tables (about 30 KB entry, all new) | about 60 MiB | 7 | about 34 | about 41 |
-| Exact worst case, any schema size (k = 0, D ≤ 2,048, payload ≤ `W`) | ≤ 64 MiB | phase 1: 2 + 2 + 1 + 1 + 1 = 7; phase 2: 2 + 1 = 3 | 8 + 3 (`LogHead`, 10,241 items) + 2 (`KvIs`) + 2 (`KvPut`) + 1 (inserts) + 2 (meta) + 17 (byte splits: `ceil(64 MiB / 4 MiB)` + 1) = 35 | **45** |
+| Measured narrow tables (1.5 KB entry, k = 0, all new) | up to 910 | 6 | 14 | about 20 |
+| 100-column tables (about 30 KB entry, all new) | up to 910 (about 28 MiB) | 6 | about 20 | about 26 |
+| Any tables, any sizes | prefix fitting every cap | at most 18 | at most 36 | at most **54** |
 
-- **The worst case** with k other lineages adds `ceil(kN/I)` to the
-  precondition and phase-2 groups: 1 each at k = 1, 2 at k = 2, 4 at k = 4.
-- **What the bound depends on:** the window limits (2,048 tables, `W`, `I`,
-  `C`, `M`), not the number of tables invalidated.
+A 2,048-table narrow window therefore takes three plans: about 60 statements.
+Today it takes about 30 statements per table, about 61,000.
+
+- **What the bound depends on:** the fixed caps, not the number of tables
+  invalidated. More tables mean more plans of at most 54 statements each,
+  one per window, and each plan admits at least one table.
 
 ### 2. Batch construction
 
@@ -833,13 +938,14 @@ They get the same validation, modes, mapping and read-back rules.
   - one batched capture: MySQL schema work, about 1 ms per table on the
     server;
   - one shared scan;
-  - a store statement count bounded by the window limits.
+  - at most 54 store statements per atomic plan.
 - Rows still wait for their window in order. The remaining per-table share is
   MySQL's own schema reads.
-- **Projection, to be validated by stage 2:** a 40,000-table cold start runs
-  about 20 windows of 2,048 tables, giving:
+- **Projection, to be validated by stage 2:** a 40,000-table cold start of
+  narrow tables runs about 44 plans of up to 910 tables, giving:
   - about 40 s of schema reads;
-  - about 20 × 27 store statements for narrow tables;
+  - about 44 × 20, roughly 900, store statements in all, against about 1.2
+    million today;
   - pool-bounded connections.
 
 ## Invariants
@@ -895,7 +1001,11 @@ They get the same validation, modes, mapping and read-back rules.
      its stored sequences;
    - result-size limit and op-count limit;
    - commit-call deadline;
-   - the sweep under the store lock.
+   - **the sweep:** expired markers only; at most 1,024 per lock acquisition;
+     the lock released between chunks (a concurrent writer acquires between
+     two chunks); the per-run budget enforced with a large backlog; the
+     backlog metric reported; and resolution unaffected while a backlog
+     exists.
 6. **Size limits and memory:**
    - `StateItemTooLarge` carries the size and key digest, and each caller
      classifies `state_item_too_large` with its relation;
@@ -908,8 +1018,15 @@ They get the same validation, modes, mapping and read-back rules.
      every row is delivered once, in binary-log order; deferred tables are
      admitted by the following windows, with nothing recorded for them before
      their own window;
-   - **no starvation:** a valid table near `M` that is cut from a full window
-     is admitted by the next window as its rank-0 table;
+   - **no starvation:** a valid table whose aggregate is near `T` and that is
+     cut from a full window is admitted by the next window as its rank-0
+     table;
+   - **invalid tables halt:** a table over `T` raises
+     `mysql_table_state_too_large`, and one over 16,384 read items raises
+     `mysql_table_registry_too_large`, as rank 0. Neither is cut repeatedly;
+   - **statement counts:** a plan constructed at every cap at once (16,384
+     read items, 16,384 write ops, 64 MiB payload) executes at most 54
+     statements in the dedicated `pg_stat_statements` lane;
    - an item at and over `M`;
    - the maximal MySQL 8.4 table definition fits under `M`/2;
    - a window over `W` admits its fitting prefix, and the rest is decided by
@@ -947,6 +1064,9 @@ They get the same validation, modes, mapping and read-back rules.
     - the prefix not in first-touch order;
     - a suffix table recorded before its own window;
     - a timeline served past its limit;
+    - prefix selection using one item instead of the table's aggregate;
+    - the read-item cap ignored;
+    - sweep chunks larger than 1,024, or several chunks under one lock;
     - chunk order reversed;
     - the cancellation reserve removed;
     - `L` above `R`;
