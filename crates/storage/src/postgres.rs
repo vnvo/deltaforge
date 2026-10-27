@@ -93,6 +93,10 @@ const MIGRATIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS df_kv_checkpoints_key_c ON df_kv ((key COLLATE \"C\"))
         WHERE ns = 'checkpoints'",
     "CREATE INDEX IF NOT EXISTS df_slot_ns_key_c ON df_slot (ns, (key COLLATE \"C\"))",
+    "CREATE TABLE IF NOT EXISTS df_batch_commit (
+        batch_id TEXT PRIMARY KEY, digest BYTEA NOT NULL,
+        result BYTEA NOT NULL, committed_at BIGINT NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS df_batch_commit_at ON df_batch_commit(committed_at)",
 ];
 
 // Prefix listings compare keys byte-wise (`COLLATE "C"`), whatever the database
@@ -139,6 +143,18 @@ pub struct PostgresStorageBackend {
     batch_fault: std::sync::Mutex<Option<BatchFault>>,
 }
 
+impl PostgresStorageBackend {
+    /// A backend over `pool` for the background commit-marker sweep (no
+    /// TTL task of its own).
+    fn marker_sweeper(pool: Pool) -> Self {
+        Self {
+            pool,
+            _sweep_handle: tokio::spawn(async {}),
+            batch_fault: std::sync::Mutex::new(None),
+        }
+    }
+}
+
 impl BatchFaults for PostgresStorageBackend {
     fn set_batch_fault(&self, fault: Option<BatchFault>) {
         *self.batch_fault.lock().expect("batch fault") = fault;
@@ -174,8 +190,21 @@ impl PostgresStorageBackend {
                 .map_err(|e| anyhow!("schema migration: {e}\nSQL: {stmt}"))?;
         }
 
-        // TTL sweep every 60s
+        // TTL sweep every 60s; commit-marker sweep every hour.
         let sweep_pool = pool.clone();
+        let marker_pool = pool.clone();
+        tokio::spawn(async move {
+            let be = PostgresStorageBackend::marker_sweeper(marker_pool);
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                if let Err(e) = crate::sweep_batch_markers(&be, now_ms()).await
+                {
+                    error!("commit-marker sweep error: {e:#}");
+                }
+            }
+        });
         let sweep_handle = tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_secs(60));
@@ -443,6 +472,18 @@ impl StorageBackend for PostgresStorageBackend {
                     let bytes = max_seq_value(current.as_deref(), *value)?;
                     pg_kv_put(&tx, ns, key, &bytes).await?;
                 }
+                BatchOp::CommitMarker { batch_id, digest } => {
+                    let result = crate::encode_batch_result(
+                        &batch.ops[..i],
+                        &seqs[..i],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO df_batch_commit(batch_id, digest, result, committed_at)
+                         VALUES($1, $2, $3, $4)",
+                        &[batch_id, digest, &result, &now_ms()],
+                    )
+                    .await?;
+                }
             }
         }
         if fault == Some(BatchFault::AfterWrites(batch.ops.len())) {
@@ -453,6 +494,51 @@ impl StorageBackend for PostgresStorageBackend {
             anyhow::bail!("injected failure after the commit");
         }
         Ok(BatchOutcome::Committed { seqs })
+    }
+
+    async fn batch_commit_get(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<crate::BatchCommitRecord>> {
+        // Under the store lock: a batch that wrote this marker holds the lock
+        // until its commit or rollback has ended, so the answer is final.
+        let mut c = client!(self);
+        let tx = c.transaction().await?;
+        tx.execute(LOCK_LOG_SQL, &[&LOG_ALLOCATION_LOCK]).await?;
+        let row = tx
+            .query_opt(
+                "SELECT digest, result, committed_at FROM df_batch_commit WHERE batch_id=$1",
+                &[&batch_id],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(row.map(|r| crate::BatchCommitRecord {
+            digest: r.get(0),
+            result: r.get(1),
+            committed_at_ms: r.get(2),
+        }))
+    }
+
+    async fn batch_commit_sweep(
+        &self,
+        before_ms: i64,
+        limit: usize,
+    ) -> Result<usize> {
+        // One chunk, one transaction: the store lock is released between
+        // chunks.
+        let mut c = client!(self);
+        let tx = c.transaction().await?;
+        tx.execute(LOCK_LOG_SQL, &[&LOG_ALLOCATION_LOCK]).await?;
+        let n = tx
+            .execute(
+                "DELETE FROM df_batch_commit WHERE batch_id IN (
+                   SELECT batch_id FROM df_batch_commit WHERE committed_at < $1
+                   ORDER BY committed_at LIMIT $2)",
+                &[&before_ms, &(limit as i64)],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(n as usize)
     }
 
     async fn log_find_capture(

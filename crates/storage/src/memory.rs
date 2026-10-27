@@ -112,6 +112,10 @@ pub struct MemoryStorageBackend {
     queue_id: AtomicU64,
     /// Test-only fault point of `apply_batch` (one shot).
     batch_fault: std::sync::Mutex<Option<BatchFault>>,
+    /// Commit markers by batch id.
+    commits: std::sync::Mutex<
+        std::collections::HashMap<String, crate::BatchCommitRecord>,
+    >,
 }
 
 impl BatchFaults for MemoryStorageBackend {
@@ -247,6 +251,8 @@ impl StorageBackend for MemoryStorageBackend {
         let mut next = base;
         let mut staged_logs: Vec<(NsKey, MemLogEntry)> = Vec::new();
         let mut staged_kv: Vec<(NsKey, Vec<u8>)> = Vec::new();
+        let mut staged_marker: Option<(String, crate::BatchCommitRecord)> =
+            None;
         for (i, op) in batch.ops.iter().enumerate() {
             if fault == Some(BatchFault::AfterWrites(i)) {
                 anyhow::bail!("injected failure after {i} staged writes");
@@ -312,12 +318,34 @@ impl StorageBackend for MemoryStorageBackend {
                         .or_else(|| kv_value(&kv, ns, key));
                     staged_kv.push((k, max_seq_value(current.as_deref(), n)?));
                 }
+                BatchOp::CommitMarker { batch_id, digest } => {
+                    let result = crate::encode_batch_result(
+                        &batch.ops[..i],
+                        &seqs[..i],
+                    )?;
+                    staged_marker = Some((
+                        batch_id.clone(),
+                        crate::BatchCommitRecord {
+                            digest: digest.clone(),
+                            result,
+                            committed_at_ms: now_ms(),
+                        },
+                    ));
+                }
             }
         }
         if fault == Some(BatchFault::AfterWrites(batch.ops.len())) {
             anyhow::bail!("injected failure after every write was staged");
         }
         // Commit.
+        if let Some((id, marker)) = staged_marker {
+            let mut commits = self.commits.lock().expect("commits");
+            anyhow::ensure!(
+                !commits.contains_key(&id),
+                "commit marker {id} already exists"
+            );
+            commits.insert(id, marker);
+        }
         for (k, e) in staged_logs {
             let seq = e.seq;
             log.ensure_meta(&k);
@@ -340,6 +368,32 @@ impl StorageBackend for MemoryStorageBackend {
             anyhow::bail!("injected failure after the commit");
         }
         Ok(BatchOutcome::Committed { seqs })
+    }
+
+    async fn batch_commit_get(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<crate::BatchCommitRecord>> {
+        Ok(self.commits.lock().expect("commits").get(batch_id).cloned())
+    }
+
+    async fn batch_commit_sweep(
+        &self,
+        before_ms: i64,
+        limit: usize,
+    ) -> Result<usize> {
+        let mut commits = self.commits.lock().expect("commits");
+        let mut old: Vec<(i64, String)> = commits
+            .iter()
+            .filter(|(_, m)| m.committed_at_ms < before_ms)
+            .map(|(id, m)| (m.committed_at_ms, id.clone()))
+            .collect();
+        old.sort();
+        old.truncate(limit);
+        for (_, id) in &old {
+            commits.remove(id);
+        }
+        Ok(old.len())
     }
 
     async fn log_find_capture(

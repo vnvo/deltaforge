@@ -285,6 +285,30 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// The commit marker of batch `batch_id` ([`BatchOp::CommitMarker`]), if
+    /// that batch committed. Read only after every transaction that could
+    /// still write it has ended (on PostgreSQL, under the store lock). The
+    /// default refuses, like [`StorageBackend::apply_batch`].
+    async fn batch_commit_get(
+        &self,
+        _batch_id: &str,
+    ) -> Result<Option<BatchCommitRecord>> {
+        Err(anyhow::anyhow!(
+            "this storage backend does not support atomic batches"
+        ))
+    }
+
+    /// Delete at most `limit` commit markers committed before `before_ms`,
+    /// oldest first, in one transaction (one store-lock acquisition where
+    /// there is a lock); returns how many. The default has none to delete.
+    async fn batch_commit_sweep(
+        &self,
+        _before_ms: i64,
+        _limit: usize,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
     /// The entry stored under `capture_id` in `(ns, key)`, if any.
     async fn log_find_capture(
         &self,
@@ -391,6 +415,231 @@ pub enum BatchOp {
     KvMaxSeq { ns: String, key: String, of: usize },
     /// The key becomes the larger of its current number (JSON) and `value`.
     KvMax { ns: String, key: String, value: u64 },
+    /// The batch's durable commit identity, written by [`commit_atomic`] as
+    /// the transaction's last write: `batch_id`, the request `digest` and
+    /// the encoded outcome of every earlier op ([`encode_batch_result`]).
+    /// Resolving an ambiguous outcome reads only this marker.
+    CommitMarker { batch_id: String, digest: Vec<u8> },
+}
+
+/// The most ops one atomic batch may hold, its commit marker excluded.
+pub const MAX_BATCH_OPS: usize = 16_384;
+/// The largest encoded outcome a commit marker may store.
+pub const MAX_BATCH_RESULT_BYTES: usize = 256 * 1024;
+/// How long one [`commit_atomic`] call may take: every attempt and the
+/// resolution of an ambiguous outcome included.
+pub const COMMIT_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(300);
+/// How long a commit marker is kept: far longer than [`COMMIT_DEADLINE`],
+/// the only time it is read.
+pub const BATCH_MARKER_RETENTION_MS: i64 = 24 * 3600 * 1000;
+/// Markers deleted per transaction (one store-lock acquisition).
+pub const BATCH_MARKER_SWEEP_CHUNK: usize = 1024;
+/// Chunks per sweep run, at most.
+pub const BATCH_MARKER_SWEEP_MAX_CHUNKS: usize = 64;
+/// Wall time per sweep run, at most.
+pub const BATCH_MARKER_SWEEP_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(1);
+
+/// A stored commit marker (see [`BatchOp::CommitMarker`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchCommitRecord {
+    pub digest: Vec<u8>,
+    pub result: Vec<u8>,
+    pub committed_at_ms: i64,
+}
+
+/// A commit marker exists under this batch id with another request digest:
+/// two different batches claimed one identity. Never retried.
+#[derive(Debug, thiserror::Error)]
+#[error("batch identity conflict: marker {0} records another request")]
+pub struct BatchIdentityConflict(pub String);
+
+/// The canonical digest of a batch request (its preconditions and ops, a
+/// commit marker excluded), the identity a marker is checked against.
+pub fn batch_digest(batch: &AtomicBatch) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    fn put(h: &mut Sha256, b: &[u8]) {
+        h.update((b.len() as u64).to_be_bytes());
+        h.update(b);
+    }
+    let mut h = Sha256::new();
+    h.update(b"deltaforge.batch.v1");
+    for p in &batch.preconditions {
+        match p {
+            Precondition::LogHead { ns, key, seq } => {
+                put(&mut h, b"LogHead");
+                put(&mut h, ns.as_bytes());
+                put(&mut h, key.as_bytes());
+                put(&mut h, &seq.to_be_bytes());
+            }
+            Precondition::KvIs { ns, key, value } => {
+                put(&mut h, b"KvIs");
+                put(&mut h, ns.as_bytes());
+                put(&mut h, key.as_bytes());
+                match value {
+                    Some(v) => {
+                        put(&mut h, b"some");
+                        put(&mut h, v);
+                    }
+                    None => put(&mut h, b"none"),
+                }
+            }
+        }
+    }
+    for op in &batch.ops {
+        match op {
+            BatchOp::LogAppendIfAbsent {
+                ns,
+                key,
+                capture_id,
+                value,
+            } => {
+                put(&mut h, b"LogAppendIfAbsent");
+                put(&mut h, ns.as_bytes());
+                put(&mut h, key.as_bytes());
+                put(&mut h, capture_id.as_bytes());
+                put(&mut h, value);
+            }
+            BatchOp::KvPut { ns, key, value } => {
+                put(&mut h, b"KvPut");
+                put(&mut h, ns.as_bytes());
+                put(&mut h, key.as_bytes());
+                match value {
+                    BatchValue::Bytes(b) => {
+                        put(&mut h, b"bytes");
+                        put(&mut h, b);
+                    }
+                    BatchValue::SeqTemplate { template, of } => {
+                        put(&mut h, b"template");
+                        put(&mut h, template);
+                        put(&mut h, &(*of as u64).to_be_bytes());
+                    }
+                }
+            }
+            BatchOp::KvMaxSeq { ns, key, of } => {
+                put(&mut h, b"KvMaxSeq");
+                put(&mut h, ns.as_bytes());
+                put(&mut h, key.as_bytes());
+                put(&mut h, &(*of as u64).to_be_bytes());
+            }
+            BatchOp::KvMax { ns, key, value } => {
+                put(&mut h, b"KvMax");
+                put(&mut h, ns.as_bytes());
+                put(&mut h, key.as_bytes());
+                put(&mut h, &value.to_be_bytes());
+            }
+            BatchOp::CommitMarker { .. } => {}
+        }
+    }
+    h.finalize().to_vec()
+}
+
+const RESULT_FORMAT: u8 = 1;
+const STATUS_LOG_INSERTED: u8 = 1;
+const STATUS_KV_APPLIED: u8 = 2;
+
+fn put_varint(out: &mut Vec<u8>, mut n: u64) {
+    loop {
+        let b = (n & 0x7f) as u8;
+        n >>= 7;
+        if n == 0 {
+            out.push(b);
+            return;
+        }
+        out.push(b | 0x80);
+    }
+}
+
+fn get_varint(b: &[u8], at: &mut usize) -> Result<u64> {
+    let mut n = 0u64;
+    for shift in (0..64).step_by(7) {
+        let byte = *b
+            .get(*at)
+            .ok_or_else(|| anyhow::anyhow!("batch result: truncated"))?;
+        *at += 1;
+        n |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(n);
+        }
+    }
+    anyhow::bail!("batch result: a varint is too long")
+}
+
+/// The outcome a commit marker stores: a format byte, the op count, then
+/// per op its status (a log write inserted at a sequence, or a kv write
+/// applied) and its sequence. At most [`MAX_BATCH_RESULT_BYTES`]; a batch of
+/// [`MAX_BATCH_OPS`] ops encodes in at most 16,384 x 11 bytes plus a header.
+pub fn encode_batch_result(
+    ops: &[BatchOp],
+    seqs: &[Option<u64>],
+) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        ops.len() == seqs.len(),
+        "batch result: ops and outcomes differ in number"
+    );
+    let mut out = vec![RESULT_FORMAT];
+    put_varint(&mut out, ops.len() as u64);
+    for (op, seq) in ops.iter().zip(seqs) {
+        match (op, seq) {
+            (BatchOp::LogAppendIfAbsent { .. }, Some(s)) => {
+                out.push(STATUS_LOG_INSERTED);
+                put_varint(&mut out, *s);
+            }
+            (BatchOp::LogAppendIfAbsent { .. }, None) => {
+                anyhow::bail!("batch result: a log write has no sequence")
+            }
+            (BatchOp::CommitMarker { .. }, _) => {
+                anyhow::bail!("batch result: a marker is not an outcome")
+            }
+            _ => out.push(STATUS_KV_APPLIED),
+        }
+    }
+    check_result_size(&out)?;
+    Ok(out)
+}
+
+fn check_result_size(result: &[u8]) -> Result<()> {
+    anyhow::ensure!(
+        result.len() <= MAX_BATCH_RESULT_BYTES,
+        "batch result of {} bytes exceeds the {MAX_BATCH_RESULT_BYTES}-byte limit",
+        result.len()
+    );
+    Ok(())
+}
+
+/// The sequences a marker's `result` records for a batch of `n` ops.
+pub fn decode_batch_result(
+    result: &[u8],
+    n: usize,
+) -> Result<Vec<Option<u64>>> {
+    check_result_size(result)?;
+    anyhow::ensure!(
+        result.first() == Some(&RESULT_FORMAT),
+        "batch result: unknown format"
+    );
+    let mut at = 1;
+    let count = get_varint(result, &mut at)? as usize;
+    anyhow::ensure!(
+        count == n,
+        "batch result records {count} ops, the batch has {n}"
+    );
+    let mut seqs = Vec::with_capacity(n);
+    for _ in 0..n {
+        match result.get(at).copied() {
+            Some(STATUS_LOG_INSERTED) => {
+                at += 1;
+                seqs.push(Some(get_varint(result, &mut at)?));
+            }
+            Some(STATUS_KV_APPLIED) => {
+                at += 1;
+                seqs.push(None);
+            }
+            other => anyhow::bail!("batch result: unknown status {other:?}"),
+        }
+    }
+    anyhow::ensure!(at == result.len(), "batch result: trailing bytes");
+    Ok(seqs)
 }
 
 /// The namespaces whose data batch preconditions read and whose writers
@@ -433,8 +682,8 @@ pub enum BatchOutcome {
     Conflict { why: String },
 }
 
-/// A batch whose read-back finds only part of it, or different bytes: the
-/// store did not behave atomically.
+/// A commit marker whose stored outcome does not fit its batch: the store
+/// did not behave atomically.
 #[derive(Debug, thiserror::Error)]
 #[error("atomic batch violated: {0}")]
 pub struct AtomicityViolation(pub String);
@@ -474,8 +723,22 @@ impl AtomicBatch {
     /// exactly once.
     pub fn validate(&self) -> Result<()> {
         let sentinel = SEQ_SENTINEL.to_string();
+        let marked =
+            matches!(self.ops.last(), Some(BatchOp::CommitMarker { .. }));
+        let ops = self.ops.len() - usize::from(marked);
+        anyhow::ensure!(
+            ops <= MAX_BATCH_OPS,
+            "a batch of {ops} ops exceeds the {MAX_BATCH_OPS}-op limit"
+        );
         for (i, op) in self.ops.iter().enumerate() {
             let of = match op {
+                BatchOp::CommitMarker { .. } => {
+                    anyhow::ensure!(
+                        i + 1 == self.ops.len(),
+                        "batch op {i}: a commit marker must be the last op"
+                    );
+                    continue;
+                }
                 BatchOp::LogAppendIfAbsent { .. } => continue,
                 BatchOp::KvPut {
                     value: BatchValue::Bytes(_),
@@ -536,13 +799,21 @@ pub enum CommitResult {
     Conflict(String),
 }
 
-/// Commit `batch`, resolving ambiguous outcomes. An `apply_batch` error may
-/// or may not have committed, so every log write's identity is read back:
-/// none stored, the same batch is applied again (at most `retries` more
-/// times); all stored with exactly the intended bytes, the earlier commit
-/// succeeded and its stored sequences are returned (templated KV values
-/// checked against them, no new allocation); anything else is an
-/// [`AtomicityViolation`].
+/// Commit `batch`, resolving ambiguous outcomes from its durable commit
+/// identity. The batch gets a random id and its request digest
+/// ([`batch_digest`]) once, and every attempt writes them, with the outcome
+/// of every op, as its last write ([`BatchOp::CommitMarker`]). After an
+/// `apply_batch` error, only the marker decides:
+///
+/// - a marker with the same digest: the batch committed, and its stored
+///   sequences are returned (later writers may since have changed its kv
+///   values; that never matters);
+/// - no marker: it did not commit, and it is applied again (at most
+///   `retries` more times);
+/// - a marker with another digest: [`BatchIdentityConflict`], never retried;
+/// - a stored outcome that does not fit the batch: [`AtomicityViolation`].
+///
+/// The whole call, every attempt included, ends within [`COMMIT_DEADLINE`].
 pub async fn commit_atomic(
     be: &dyn StorageBackend,
     batch: &AtomicBatch,
@@ -559,12 +830,65 @@ pub async fn commit_atomic_counted(
     retries: usize,
     applies: &mut usize,
 ) -> Result<CommitResult> {
+    commit_atomic_within(be, batch, retries, applies, COMMIT_DEADLINE).await
+}
+
+/// [`commit_atomic_counted`] with an explicit deadline (tests).
+pub(crate) async fn commit_atomic_within(
+    be: &dyn StorageBackend,
+    batch: &AtomicBatch,
+    retries: usize,
+    applies: &mut usize,
+    deadline: std::time::Duration,
+) -> Result<CommitResult> {
     batch.validate()?;
+    anyhow::ensure!(
+        !batch
+            .ops
+            .iter()
+            .any(|o| matches!(o, BatchOp::CommitMarker { .. })),
+        "a batch's commit marker is added by commit_atomic only"
+    );
+    // One identity for every attempt of this logical batch.
+    let batch_id = uuid::Uuid::new_v4().simple().to_string();
+    let digest = batch_digest(batch);
+    let mut marked = batch.clone();
+    marked.ops.push(BatchOp::CommitMarker {
+        batch_id: batch_id.clone(),
+        digest: digest.clone(),
+    });
+    let attempts = commit_attempts(
+        be,
+        &marked,
+        batch.ops.len(),
+        &batch_id,
+        &digest,
+        retries,
+        applies,
+    );
+    match tokio::time::timeout(deadline, attempts).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "atomic batch {batch_id}: the {deadline:?} commit deadline passed; outcome unknown"
+        )),
+    }
+}
+
+async fn commit_attempts(
+    be: &dyn StorageBackend,
+    marked: &AtomicBatch,
+    n: usize,
+    batch_id: &str,
+    digest: &[u8],
+    retries: usize,
+    applies: &mut usize,
+) -> Result<CommitResult> {
     let mut attempt = 0;
     loop {
         *applies += 1;
-        let err = match be.apply_batch(batch).await {
-            Ok(BatchOutcome::Committed { seqs }) => {
+        let err = match be.apply_batch(marked).await {
+            Ok(BatchOutcome::Committed { mut seqs }) => {
+                seqs.truncate(n);
                 return Ok(CommitResult::Committed(seqs));
             }
             Ok(BatchOutcome::Conflict { why }) => {
@@ -573,129 +897,105 @@ pub async fn commit_atomic_counted(
             Err(e) => e,
         };
         attempt += 1;
-        // The read-back itself may fail transiently: retried, never skipped.
+        // Only the marker decides; its lookup may fail transiently and is
+        // retried, never skipped.
         let mut reads = 0;
         let found = loop {
-            match read_back(be, batch).await {
+            match be.batch_commit_get(batch_id).await {
                 Ok(found) => break found,
                 Err(e) if reads < retries => {
                     reads += 1;
-                    tracing::warn!(error = %e, "atomic batch: read-back failed; retrying it");
+                    tracing::warn!(error = %e, "atomic batch: marker lookup failed; retrying it");
                 }
                 Err(e) => {
                     return Err(e.context(format!(
-                        "atomic batch: outcome unknown after the error {err:#}"
+                        "atomic batch {batch_id}: outcome unknown after the error {err:#}"
                     )));
                 }
             }
         };
         match found {
-            ReadBack::None if attempt <= retries => {
+            Some(marker) if marker.digest == digest => {
+                return match decode_batch_result(&marker.result, n) {
+                    Ok(seqs) => Ok(CommitResult::Committed(seqs)),
+                    Err(e) => Err(AtomicityViolation(format!(
+                        "marker {batch_id}: {e:#}"
+                    ))
+                    .into()),
+                };
+            }
+            Some(_) => {
+                return Err(BatchIdentityConflict(batch_id.into()).into());
+            }
+            None if attempt <= retries => {
                 tracing::warn!(error = %err, attempt, "atomic batch: not committed; applying it again");
             }
-            ReadBack::None => {
+            None => {
                 return Err(err.context(format!(
                     "atomic batch: not committed after {attempt} attempts"
                 )));
             }
-            ReadBack::All(seqs) => return Ok(CommitResult::Committed(seqs)),
-            ReadBack::Partial(why) => {
-                return Err(AtomicityViolation(why).into());
-            }
         }
     }
 }
 
-enum ReadBack {
-    None,
-    All(Vec<Option<u64>>),
-    Partial(String),
+/// One marker sweep run's result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkerSweep {
+    pub deleted: usize,
+    pub chunks: usize,
+    /// Expired markers remained when the run's budget ended.
+    pub backlog: bool,
 }
 
-async fn read_back(
+/// Delete commit markers older than [`BATCH_MARKER_RETENTION_MS`]: chunks
+/// of at most [`BATCH_MARKER_SWEEP_CHUNK`], each its own transaction (one
+/// store-lock acquisition), at most [`BATCH_MARKER_SWEEP_MAX_CHUNKS`] chunks
+/// or [`BATCH_MARKER_SWEEP_BUDGET`] per run. Falling behind is harmless: a
+/// marker is read only by its own commit call, within its deadline.
+pub async fn sweep_batch_markers(
     be: &dyn StorageBackend,
-    batch: &AtomicBatch,
-) -> Result<ReadBack> {
-    let mut seqs = vec![None; batch.ops.len()];
-    let (mut present, mut absent) = (0usize, 0usize);
-    for (i, op) in batch.ops.iter().enumerate() {
-        if let BatchOp::LogAppendIfAbsent {
-            ns,
-            key,
-            capture_id,
-            value,
-        } = op
-        {
-            match be.log_find_capture(ns, key, capture_id).await? {
-                Some((seq, stored)) if &stored == value => {
-                    seqs[i] = Some(seq);
-                    present += 1;
-                }
-                Some(_) => {
-                    return Ok(ReadBack::Partial(format!(
-                        "{capture_id} in {key} holds other bytes"
-                    )));
-                }
-                None => absent += 1,
-            }
+    now_ms: i64,
+) -> Result<MarkerSweep> {
+    sweep_batch_markers_within(
+        be,
+        now_ms - BATCH_MARKER_RETENTION_MS,
+        BATCH_MARKER_SWEEP_MAX_CHUNKS,
+        BATCH_MARKER_SWEEP_BUDGET,
+    )
+    .await
+}
+
+pub(crate) async fn sweep_batch_markers_within(
+    be: &dyn StorageBackend,
+    before_ms: i64,
+    max_chunks: usize,
+    budget: std::time::Duration,
+) -> Result<MarkerSweep> {
+    let started = std::time::Instant::now();
+    let mut run = MarkerSweep {
+        deleted: 0,
+        chunks: 0,
+        backlog: false,
+    };
+    while run.chunks < max_chunks && started.elapsed() < budget {
+        let n = be
+            .batch_commit_sweep(before_ms, BATCH_MARKER_SWEEP_CHUNK)
+            .await?;
+        run.chunks += 1;
+        run.deleted += n;
+        run.backlog = n == BATCH_MARKER_SWEEP_CHUNK;
+        if !run.backlog {
+            break;
         }
     }
-    if present == 0 {
-        return Ok(ReadBack::None);
-    }
-    if absent > 0 {
-        return Ok(ReadBack::Partial(format!(
-            "{present} of {} log writes are stored",
-            present + absent
-        )));
-    }
-    // Every log write is stored: its KV writes must be too.
-    for op in &batch.ops {
-        match op {
-            BatchOp::KvPut { ns, key, value } => {
-                let want = match value {
-                    BatchValue::Bytes(b) => b.clone(),
-                    BatchValue::SeqTemplate { template, of } => {
-                        render_seq(template, seqs[*of].expect("validated"))
-                    }
-                };
-                if be.kv_get(ns, key).await?.as_deref() != Some(want.as_slice())
-                {
-                    return Ok(ReadBack::Partial(format!(
-                        "{key} does not hold its write"
-                    )));
-                }
-            }
-            BatchOp::KvMaxSeq { ns, key, of } => {
-                let stored = be.kv_get(ns, key).await?;
-                let n = stored
-                    .as_deref()
-                    .map(serde_json::from_slice::<u64>)
-                    .transpose()?
-                    .unwrap_or(0);
-                if n < seqs[*of].expect("validated") {
-                    return Ok(ReadBack::Partial(format!(
-                        "{key} is below its write"
-                    )));
-                }
-            }
-            BatchOp::KvMax { ns, key, value } => {
-                let stored = be.kv_get(ns, key).await?;
-                let n = stored
-                    .as_deref()
-                    .map(serde_json::from_slice::<u64>)
-                    .transpose()?
-                    .unwrap_or(0);
-                if n < *value {
-                    return Ok(ReadBack::Partial(format!(
-                        "{key} is below its write"
-                    )));
-                }
-            }
-            BatchOp::LogAppendIfAbsent { .. } => {}
-        }
-    }
-    Ok(ReadBack::All(seqs))
+    metrics::counter!("deltaforge_store_batch_markers_deleted_total")
+        .increment(run.deleted as u64);
+    metrics::gauge!("deltaforge_store_batch_markers_backlog")
+        .set(if run.backlog { 1.0 } else { 0.0 });
+    metrics::histogram!("deltaforge_store_batch_marker_sweep_seconds")
+        .record(started.elapsed().as_secs_f64());
+    Ok(run)
 }
 
 /// Test-only fault points of `apply_batch` (each backend honors them).
@@ -1263,6 +1563,60 @@ pub(crate) mod kv_list_contract_suite {
 /// Shared contract suite for the keyset-paginated `slot_list` primitive, run against
 /// every backend (Memory, SQLite in-crate; PostgreSQL env-gated).
 #[cfg(test)]
+mod batch_commit_identity_tests {
+    use super::*;
+    use crate::adapters::test_util::FaultBackend;
+
+    /// A batch whose acknowledgement was lost committed; another valid
+    /// writer then changed one of its keys before the outcome was resolved.
+    /// The batch is still reported committed, with its own sequences: later
+    /// key values never decide whether a transaction committed.
+    #[tokio::test]
+    async fn a_lost_acknowledgement_resolves_as_committed_after_a_later_write()
+    {
+        let mem = Arc::new(MemoryStorageBackend::new());
+        let fb = FaultBackend::wrap(mem.clone());
+        let batch = AtomicBatch {
+            preconditions: Vec::new(),
+            ops: vec![
+                BatchOp::LogAppendIfAbsent {
+                    ns: "schemas.v1".into(),
+                    key: "s".into(),
+                    capture_id: "c1".into(),
+                    value: b"entry".to_vec(),
+                },
+                BatchOp::KvPut {
+                    ns: "schemas.v1.index".into(),
+                    key: "k".into(),
+                    value: BatchValue::Bytes(b"batch".to_vec()),
+                },
+            ],
+        };
+        mem.set_batch_fault(Some(BatchFault::AfterCommit));
+        *fb.write_after_batch_error.lock().unwrap() =
+            Some(("schemas.v1.index".into(), "k".into(), b"later".to_vec()));
+        let out = commit_atomic(&fb, &batch, 3).await.unwrap();
+        let committed_seq = mem
+            .log_find_capture("schemas.v1", "s", "c1")
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
+        assert_eq!(
+            out,
+            CommitResult::Committed(vec![Some(committed_seq), None])
+        );
+        assert_eq!(
+            mem.kv_get("schemas.v1.index", "k")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(&b"later"[..])
+        );
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod slot_list_contract_suite {
     use super::*;
 
@@ -1775,9 +2129,24 @@ pub(crate) mod atomic_batch_suite {
         assert_eq!(be.log_stream_meta(ns, "ack/a").await.unwrap().len, 1);
     }
 
-    /// Only part of a batch stored is an atomicity violation, never a
-    /// success and never a retry.
-    pub async fn partial_read_back_is_a_violation(
+    /// A failure before the commit leaves no marker: the same batch is
+    /// applied again and commits once.
+    pub async fn an_absent_marker_reapplies(
+        be: Arc<dyn StorageBackend>,
+        faults: &dyn BatchFaults,
+        ns: &str,
+    ) {
+        let mut batch = sample(ns, "r");
+        batch.preconditions.clear();
+        faults.set_batch_fault(Some(BatchFault::AfterWrites(1)));
+        let out = commit_atomic(be.as_ref(), &batch, 3).await.unwrap();
+        assert!(matches!(out, CommitResult::Committed(_)), "{out:?}");
+        assert_eq!(be.log_stream_meta(ns, "r/a").await.unwrap().len, 1);
+    }
+
+    /// With no marker, an existing item under the batch's capture id does
+    /// not make the batch committed: it is applied again and conflicts.
+    pub async fn an_existing_item_without_a_marker_conflicts(
         be: Arc<dyn StorageBackend>,
         faults: &dyn BatchFaults,
         ns: &str,
@@ -1788,23 +2157,172 @@ pub(crate) mod atomic_batch_suite {
         let mut batch = sample(ns, "p");
         batch.preconditions.clear();
         faults.set_batch_fault(Some(BatchFault::BeforeTransaction));
-        let err = commit_atomic(be.as_ref(), &batch, 3).await.unwrap_err();
+        let out = commit_atomic(be.as_ref(), &batch, 3).await.unwrap();
+        assert!(matches!(out, CommitResult::Conflict(_)), "{out:?}");
+    }
+
+    /// A marker under the batch's id with another request digest is an
+    /// identity conflict, never a success and never a retry.
+    pub async fn a_marker_with_another_digest_is_an_identity_conflict(
+        be: Arc<dyn StorageBackend>,
+        faults: &dyn BatchFaults,
+        ns: &str,
+    ) {
+        let mut first = sample(ns, "d");
+        first.preconditions.clear();
+        first.ops.push(BatchOp::CommitMarker {
+            batch_id: format!("{ns}-shared"),
+            digest: batch_digest(&first),
+        });
+        assert!(matches!(
+            be.apply_batch(&first).await.unwrap(),
+            BatchOutcome::Committed { .. }
+        ));
+        let mut second = sample(ns, "e");
+        second.preconditions.clear();
+        let digest = batch_digest(&second);
+        let n = second.ops.len();
+        second.ops.push(BatchOp::CommitMarker {
+            batch_id: format!("{ns}-shared"),
+            digest: digest.clone(),
+        });
+        faults.set_batch_fault(Some(BatchFault::BeforeTransaction));
+        let err = commit_attempts(
+            be.as_ref(),
+            &second,
+            n,
+            &format!("{ns}-shared"),
+            &digest,
+            3,
+            &mut 0,
+        )
+        .await
+        .unwrap_err();
         assert!(
-            err.downcast_ref::<AtomicityViolation>().is_some(),
+            err.downcast_ref::<BatchIdentityConflict>().is_some(),
             "{err:#}"
         );
-        // Other bytes under an intended identity: also a violation.
-        be.log_append_if_absent(ns, "q/a", "reg/1/h", b"other")
+    }
+
+    /// The stored outcome is exactly what the commit returned: every log
+    /// write's sequence and every kv write as applied.
+    pub async fn the_stored_outcome_is_the_commit_result(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
+        let mut batch = sample(ns, "o");
+        batch.preconditions.clear();
+        let n = batch.ops.len();
+        let digest = batch_digest(&batch);
+        batch.ops.push(BatchOp::CommitMarker {
+            batch_id: format!("{ns}-o"),
+            digest: digest.clone(),
+        });
+        let BatchOutcome::Committed { mut seqs } =
+            be.apply_batch(&batch).await.unwrap()
+        else {
+            panic!("did not commit");
+        };
+        seqs.truncate(n);
+        let marker = be
+            .batch_commit_get(&format!("{ns}-o"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(marker.digest, digest);
+        assert_eq!(decode_batch_result(&marker.result, n).unwrap(), seqs);
+        assert!(
+            seqs.iter().any(|s| s.is_some())
+                && seqs.iter().any(|s| s.is_none())
+        );
+    }
+
+    /// The sweep deletes only expired markers, at most one chunk per call,
+    /// within its chunk budget, and reports a backlog it left.
+    pub async fn the_sweep_is_chunked_and_bounded(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
+        let marker = |id: String| AtomicBatch {
+            preconditions: Vec::new(),
+            ops: vec![
+                BatchOp::KvMax {
+                    ns: format!("{ns}.m"),
+                    key: "k".into(),
+                    value: 1,
+                },
+                BatchOp::CommitMarker {
+                    batch_id: id,
+                    digest: vec![0; 32],
+                },
+            ],
+        };
+        // Markers are store-wide: clear those of earlier cases (and of
+        // earlier runs on a shared database) so only this case's count.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        sweep_batch_markers_within(
+            be.as_ref(),
+            now_ms_for_tests(),
+            usize::MAX,
+            std::time::Duration::from_secs(600),
+        )
+        .await
+        .unwrap();
+        for i in 0..2_500 {
+            be.apply_batch(&marker(format!("{ns}-old-{i}")))
+                .await
+                .unwrap();
+        }
+        // Everything written so far is older than this cutoff.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let cutoff = now_ms_for_tests();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        be.apply_batch(&marker(format!("{ns}-fresh")))
             .await
             .unwrap();
-        let mut batch = sample(ns, "q");
-        batch.preconditions.clear();
-        faults.set_batch_fault(Some(BatchFault::BeforeTransaction));
-        let err = commit_atomic(be.as_ref(), &batch, 3).await.unwrap_err();
-        assert!(
-            err.downcast_ref::<AtomicityViolation>().is_some(),
-            "{err:#}"
+        let two = sweep_batch_markers_within(
+            be.as_ref(),
+            cutoff,
+            2,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (two.deleted, two.chunks, two.backlog),
+            (2 * BATCH_MARKER_SWEEP_CHUNK, 2, true)
         );
+        let rest = sweep_batch_markers_within(
+            be.as_ref(),
+            cutoff,
+            64,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (rest.deleted, rest.chunks, rest.backlog),
+            (2_500 - 2 * BATCH_MARKER_SWEEP_CHUNK, 1, false)
+        );
+        assert!(
+            be.batch_commit_get(&format!("{ns}-old-0"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            be.batch_commit_get(&format!("{ns}-fresh"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    fn now_ms_for_tests() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
     }
 
     /// Concurrent batches each take one contiguous range; the ranges are
@@ -1903,12 +2421,27 @@ pub(crate) mod atomic_batch_suite {
             &format!("{ns}_ack"),
         )
         .await;
-        partial_read_back_is_a_violation(
+        an_absent_marker_reapplies(be.clone(), faults, &format!("{ns}_absent"))
+            .await;
+        an_existing_item_without_a_marker_conflicts(
             be.clone(),
             faults,
             &format!("{ns}_part"),
         )
         .await;
+        a_marker_with_another_digest_is_an_identity_conflict(
+            be.clone(),
+            faults,
+            &format!("{ns}_digest"),
+        )
+        .await;
+        the_stored_outcome_is_the_commit_result(
+            be.clone(),
+            &format!("{ns}_outcome"),
+        )
+        .await;
+        the_sweep_is_chunked_and_bounded(be.clone(), &format!("{ns}_sweep"))
+            .await;
         concurrent_batches_take_disjoint_ranges(
             be.clone(),
             &format!("{ns}_conc"),

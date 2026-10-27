@@ -44,6 +44,11 @@ pub struct FaultBackend {
     /// result in hand and waits for `.1`, so a test can run other work
     /// between a task's listing and its next step.
     pub pause_after_slot_list: std::sync::Mutex<Option<SlotListPause>>,
+    /// One-shot: when the next `apply_batch` fails, this `(ns, key, value)`
+    /// is written to the inner store before the error is returned (another
+    /// valid writer acting between an ambiguous commit and its resolution).
+    pub write_after_batch_error:
+        std::sync::Mutex<Option<(String, String, Vec<u8>)>>,
 }
 
 /// See [`FaultBackend::pause_after_slot_list`]: (namespace, reached,
@@ -84,6 +89,7 @@ impl FaultBackend {
             fail_after_writes_to: std::sync::Mutex::new(None),
             yield_after_slot_reads: AtomicBool::new(false),
             pause_after_slot_list: std::sync::Mutex::new(None),
+            write_after_batch_error: std::sync::Mutex::new(None),
         }
     }
 
@@ -167,10 +173,33 @@ impl StorageBackend for FaultBackend {
                 | crate::BatchOp::KvPut { ns, .. }
                 | crate::BatchOp::KvMaxSeq { ns, .. }
                 | crate::BatchOp::KvMax { ns, .. } => ns,
+                // The marker is the batch's own record, not a namespace
+                // write.
+                crate::BatchOp::CommitMarker { .. } => continue,
             };
             self.write(ns)?;
         }
-        self.inner.apply_batch(batch).await
+        let out = self.inner.apply_batch(batch).await;
+        if out.is_err() {
+            let later = self.write_after_batch_error.lock().unwrap().take();
+            if let Some((ns, key, value)) = later {
+                self.inner.kv_put(&ns, &key, &value).await?;
+            }
+        }
+        out
+    }
+    async fn batch_commit_get(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<crate::BatchCommitRecord>> {
+        self.inner.batch_commit_get(batch_id).await
+    }
+    async fn batch_commit_sweep(
+        &self,
+        before_ms: i64,
+        limit: usize,
+    ) -> Result<usize> {
+        self.inner.batch_commit_sweep(before_ms, limit).await
     }
     async fn log_find_capture(
         &self,

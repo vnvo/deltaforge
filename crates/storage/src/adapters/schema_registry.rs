@@ -2752,6 +2752,11 @@ mod tests {
                     | crate::BatchOp::KvPut { ns, .. }
                     | crate::BatchOp::KvMaxSeq { ns, .. }
                     | crate::BatchOp::KvMax { ns, .. } => ns,
+                    crate::BatchOp::CommitMarker { .. } => {
+                        panic!(
+                            "a planned registration carries no commit marker"
+                        )
+                    }
                 };
                 assert!(crate::is_guarded_namespace(ns), "write to {ns}");
             }
