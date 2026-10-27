@@ -1446,6 +1446,9 @@ const KILL_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) struct CaptureSlots {
     holding: tokio::sync::Semaphore,
     kills: tokio::sync::Semaphore,
+    /// Test-only: every cancellation waits this long before it connects
+    /// (0 in production), so a test can observe what happens meanwhile.
+    kill_delay_ms: std::sync::atomic::AtomicU64,
 }
 
 impl CaptureSlots {
@@ -1453,6 +1456,7 @@ impl CaptureSlots {
         Self {
             holding: tokio::sync::Semaphore::const_new(holding),
             kills: tokio::sync::Semaphore::const_new(kills),
+            kill_delay_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -1641,6 +1645,13 @@ impl Drop for KillOnDrop {
             // per slot), never on a pool or the captures' slots.
             let _slot = permit;
             let _reserve = slots.kills.acquire().await;
+            #[cfg(test)]
+            {
+                let delay = slots
+                    .kill_delay_ms
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
             let kill = async {
                 let mut c = mysql_async::Conn::from_url(dsn.as_str())
                     .await
@@ -3723,9 +3734,17 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 let failures = kill_failures();
+                slots.kill_delay_ms.store(1000, Ordering::SeqCst);
                 for t in &tasks {
                     t.abort();
                 }
+                // While the kills are delayed, no slot comes back.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert_eq!(
+                    slots.holding.available_permits(),
+                    0,
+                    "a slot came back before its session was killed"
+                );
                 // Every slot comes back only after its session was killed.
                 let deadline = Instant::now() + Duration::from_secs(15);
                 while slots.holding.available_permits() < 4 {
