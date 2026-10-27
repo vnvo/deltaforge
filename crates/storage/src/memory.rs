@@ -112,6 +112,14 @@ pub struct MemoryStorageBackend {
     queue_id: AtomicU64,
     /// Test-only fault point of `apply_batch` (one shot).
     batch_fault: std::sync::Mutex<Option<BatchFault>>,
+    /// Test-only: when set, `apply_batch` checks, the moment it publishes a
+    /// commit marker and while it still holds the locks, that the batch's
+    /// logs, kv writes and global sequence are already visible, and records
+    /// the verdict.
+    #[cfg(test)]
+    verify_on_marker: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    marker_verdicts: std::sync::Mutex<Vec<bool>>,
     /// Commit markers by batch id.
     commits: std::sync::Mutex<
         std::collections::HashMap<String, crate::BatchCommitRecord>,
@@ -337,16 +345,17 @@ impl StorageBackend for MemoryStorageBackend {
         if fault == Some(BatchFault::AfterWrites(batch.ops.len())) {
             anyhow::bail!("injected failure after every write was staged");
         }
-        // Commit.
-        if let Some((id, marker)) = staged_marker {
-            let mut commits = self.commits.lock().expect("commits");
+        // Commit: the batch's state first and its marker last, all under
+        // the log and kv locks, so a visible marker always means the whole
+        // batch is visible. A duplicate marker id is refused before anything
+        // is applied.
+        if let Some((id, _)) = &staged_marker {
             anyhow::ensure!(
-                !commits.contains_key(&id),
+                !self.commits.lock().expect("commits").contains_key(id),
                 "commit marker {id} already exists"
             );
-            commits.insert(id, marker);
         }
-        for (k, e) in staged_logs {
+        for (k, e) in staged_logs.iter().cloned() {
             let seq = e.seq;
             log.ensure_meta(&k);
             log.entries.entry(k.clone()).or_default().push(e);
@@ -354,7 +363,7 @@ impl StorageBackend for MemoryStorageBackend {
                 m.head_seq = m.head_seq.max(seq);
             }
         }
-        for (k, v) in staged_kv {
+        for (k, v) in staged_kv.iter().cloned() {
             kv.0.insert(
                 k,
                 KvEntry {
@@ -364,6 +373,21 @@ impl StorageBackend for MemoryStorageBackend {
             );
         }
         self.global_seq.store(next, Ordering::SeqCst);
+        if let Some((id, marker)) = staged_marker {
+            self.commits.lock().expect("commits").insert(id, marker);
+            #[cfg(test)]
+            if self.verify_on_marker.load(Ordering::SeqCst) {
+                let visible = staged_logs.iter().all(|(k, e)| {
+                    log.entries
+                        .get(k)
+                        .is_some_and(|v| v.iter().any(|x| x.seq == e.seq))
+                }) && staged_kv
+                    .iter()
+                    .all(|(k, v)| kv.0.get(k).is_some_and(|x| &x.value == v))
+                    && self.global_seq.load(Ordering::SeqCst) == next;
+                self.marker_verdicts.lock().unwrap().push(visible);
+            }
+        }
         if fault == Some(BatchFault::AfterCommit) {
             anyhow::bail!("injected failure after the commit");
         }
@@ -969,6 +993,43 @@ impl StorageBackend for MemoryStorageBackend {
 
 #[cfg(test)]
 mod tests {
+    /// The commit marker is the batch's last visible write: when it becomes
+    /// visible, every staged log entry, kv write and the global sequence are
+    /// already visible.
+    #[tokio::test]
+    async fn the_commit_marker_is_published_after_the_batch_state() {
+        use crate::{AtomicBatch, BatchOp, BatchValue, StorageBackend};
+        let be = super::MemoryStorageBackend::new();
+        be.verify_on_marker
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let batch = AtomicBatch {
+            preconditions: Vec::new(),
+            ops: vec![
+                BatchOp::LogAppendIfAbsent {
+                    ns: "schemas.v1".into(),
+                    key: "s".into(),
+                    capture_id: "c1".into(),
+                    value: b"e".to_vec(),
+                },
+                BatchOp::KvPut {
+                    ns: "schemas.v1.index".into(),
+                    key: "k".into(),
+                    value: BatchValue::Bytes(b"v".to_vec()),
+                },
+                BatchOp::CommitMarker {
+                    batch_id: "b1".into(),
+                    digest: vec![1],
+                },
+            ],
+        };
+        be.apply_batch(&batch).await.unwrap();
+        assert_eq!(
+            *be.marker_verdicts.lock().unwrap(),
+            [true],
+            "the marker was visible before the batch's state"
+        );
+    }
+
     use super::*;
     use std::sync::Arc;
 
