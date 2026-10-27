@@ -157,6 +157,67 @@ pub async fn preflight(
     Ok(())
 }
 
+/// How long a replacement stream may take to deliver its first event.
+pub(crate) const CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Stage-B confirmation: a replacement stream proves the server accepted its
+/// dump by delivering its first decoded event within `bound`. Connecting is
+/// not enough: a server refuses the dump of a user without the replication
+/// privilege only on the stream's first read. A read error (that refusal, a
+/// protocol error, a decode failure) or the bound passing refuses the
+/// replacement, with no credential in the reason. The event is returned,
+/// to be handed on exactly once ([`hand_on`]).
+pub(crate) async fn confirm_first_event<F>(
+    first: F,
+    bound: Duration,
+) -> Result<
+    (
+        mysql_binlog_connector_rust::event::event_header::EventHeader,
+        mysql_binlog_connector_rust::event::event_data::EventData,
+    ),
+    RotationReject,
+>
+where
+    F: std::future::Future<
+            Output = Result<
+                (
+                    mysql_binlog_connector_rust::event::event_header::EventHeader,
+                    mysql_binlog_connector_rust::event::event_data::EventData,
+                ),
+                mysql_binlog_connector_rust::binlog_error::BinlogError,
+            >,
+        >,
+{
+    match tokio::time::timeout(bound, first).await {
+        Ok(Ok(event)) => Ok(event),
+        Ok(Err(_)) | Err(_) => Err(RotationReject::ReplacementOpenFailed),
+    }
+}
+
+/// Hand the confirmed replacement's first event to the run loop: it is
+/// read next, exactly once, through the normal path (position tracking,
+/// then dispatch). Rotation applies only with nothing queued, so it is the
+/// queue's only event.
+pub(crate) fn hand_on(
+    prefetched: &mut std::collections::VecDeque<
+        super::mysql_window_speculation::Held,
+    >,
+    next_held_seq: &mut u64,
+    (header, data): (
+        mysql_binlog_connector_rust::event::event_header::EventHeader,
+        mysql_binlog_connector_rust::event::event_data::EventData,
+    ),
+) {
+    debug_assert!(prefetched.is_empty(), "rotation applied with events queued");
+    prefetched.push_front((
+        std::time::Instant::now(),
+        *next_held_seq,
+        header,
+        data,
+    ));
+    *next_held_seq += 1;
+}
+
 /// Open a binlog stream for `dsn` resuming from the exact frozen accumulated GTID
 /// set, via the production connect path (same server_id, heartbeat/timeout,
 /// retry policy and session identity verification as startup/reconnect). A
@@ -314,6 +375,9 @@ impl MySqlRotationRuntime {
         // out afterwards.
         let holder = Arc::new(Mutex::new(Some(stream)));
         let replaced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The confirmed replacement's first event, handed on only once the
+        // rotation is applied.
+        let confirmed = Arc::new(Mutex::new(None));
         // Both the replacement and a recovery session must prove they are the
         // verified server before their dump command.
         let expected = ctx.expected_uuid()?;
@@ -376,6 +440,7 @@ impl MySqlRotationRuntime {
         // open_new: replacement stream from the frozen GTID set with the new creds.
         let open_new = {
             let replaced = Arc::clone(&replaced);
+            let confirmed = Arc::clone(&confirmed);
             let expected = expected.clone();
             let holder = Arc::clone(&holder);
             let new_dsn = new_dsn.clone();
@@ -384,7 +449,7 @@ impl MySqlRotationRuntime {
             let cancel = cancel.clone();
             let frozen = frozen_gtid.clone();
             move || async move {
-                let s = open_binlog(
+                let mut s = open_binlog(
                     new_dsn.expose(),
                     &expected,
                     &source_id,
@@ -394,6 +459,20 @@ impl MySqlRotationRuntime {
                     &cancel,
                 )
                 .await?;
+                // The candidate must deliver its first event before it can
+                // replace anything; refused, it is closed and the old
+                // credentials recover the stream.
+                let first = match confirm_first_event(s.read(), CONFIRM_TIMEOUT)
+                    .await
+                {
+                    Ok(first) => first,
+                    Err(reject) => {
+                        s.close().await.ok();
+                        drop(s);
+                        return Err(reject);
+                    }
+                };
+                *confirmed.lock().await = Some(first);
                 *holder.lock().await = Some(s);
                 replaced.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok::<(), RotationReject>(())
@@ -443,6 +522,9 @@ impl MySqlRotationRuntime {
             // the run (stream, captures, scans, schema reads, kills) takes
             // it. Replaced only here, once the new stream is applied.
             ctx.dsn.replace(candidate.dsn.clone());
+            if let Some(first) = confirmed.lock().await.take() {
+                hand_on(&mut ctx.prefetched, &mut ctx.next_held_seq, first);
+            }
         }
 
         // Take the resulting stream back out (Applied: new; Kept: old/recovered).
@@ -456,5 +538,87 @@ impl MySqlRotationRuntime {
 
     pub(crate) async fn shutdown(self) {
         self.mgr.shutdown().await
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    fn first_event() -> (
+        mysql_binlog_connector_rust::event::event_header::EventHeader,
+        mysql_binlog_connector_rust::event::event_data::EventData,
+    ) {
+        (
+            mysql_binlog_connector_rust::event::event_header::EventHeader {
+                timestamp: 0,
+                event_type: 4,
+                server_id: 1,
+                event_length: 44,
+                next_event_position: 0,
+                event_flags: 0x20,
+            },
+            mysql_binlog_connector_rust::event::event_data::EventData::NotSupported,
+        )
+    }
+
+    /// A replacement's first decoded event confirms it, and is returned
+    /// intact to be handed on.
+    #[tokio::test]
+    async fn a_first_event_confirms_the_replacement() {
+        let (header, _) = super::confirm_first_event(
+            async { Ok(first_event()) },
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!((header.event_type, header.event_length), (4, 44));
+    }
+
+    /// An authorization refusal, a protocol error or a first event that does
+    /// not decode refuses the replacement, with no credential in the reason.
+    #[tokio::test]
+    async fn a_refused_or_malformed_first_event_refuses_the_replacement() {
+        use mysql_binlog_connector_rust::binlog_error::BinlogError;
+        for err in [
+            BinlogError::ConnectError(
+                "Access denied; you need (at least one of) the REPLICATION SLAVE privilege(s)".into(),
+            ),
+            BinlogError::UnexpectedData("malformed first event".into()),
+        ] {
+            let r = super::confirm_first_event(
+                async move { Err(err) },
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+            assert!(
+                matches!(r, Err(crate::rotation::RotationReject::ReplacementOpenFailed)),
+                "{r:?}"
+            );
+        }
+    }
+
+    /// A replacement that never delivers an event is refused at the bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_replacement_is_refused_at_the_bound() {
+        let r = super::confirm_first_event(
+            std::future::pending(),
+            super::CONFIRM_TIMEOUT,
+        )
+        .await;
+        assert!(matches!(
+            r,
+            Err(crate::rotation::RotationReject::ReplacementOpenFailed)
+        ));
+    }
+
+    /// The confirmed first event is queued exactly once, as the next held
+    /// event, for the run loop to read through its normal path.
+    #[test]
+    fn the_confirmed_event_is_handed_on_once() {
+        let mut queue = std::collections::VecDeque::new();
+        let mut next = 7;
+        super::hand_on(&mut queue, &mut next, first_event());
+        assert_eq!(queue.len(), 1);
+        let (_, seq, header, _) = queue.pop_front().unwrap();
+        assert_eq!((seq, next, header.event_type), (7, 8, 4));
     }
 }
