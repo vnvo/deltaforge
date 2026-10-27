@@ -1449,6 +1449,10 @@ pub(crate) struct CaptureSlots {
     /// Test-only: every cancellation waits this long before it connects
     /// (0 in production), so a test can observe what happens meanwhile.
     kill_delay_ms: std::sync::atomic::AtomicU64,
+    /// Test-only: every cancellation fails before it connects.
+    fail_kills: std::sync::atomic::AtomicBool,
+    /// Slots retired after an unresolved cancellation (see `kill_failed`).
+    retired: std::sync::atomic::AtomicU64,
 }
 
 impl CaptureSlots {
@@ -1457,7 +1461,15 @@ impl CaptureSlots {
             holding: tokio::sync::Semaphore::const_new(holding),
             kills: tokio::sync::Semaphore::const_new(kills),
             kill_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            fail_kills: std::sync::atomic::AtomicBool::new(false),
+            retired: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Slots retired for the life of the process: their sessions may still
+    /// hold metadata locks.
+    pub(crate) fn retired(&self) -> u64 {
+        self.retired.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -1635,15 +1647,13 @@ impl Drop for KillOnDrop {
         let (dsn, id, slots) =
             (std::mem::take(&mut self.dsn), self.id, self.slots);
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
-            kill_failed(id, "no runtime to run the kill on");
+            kill_failed(slots, permit, id, "no runtime to run the kill on");
             return;
         };
         rt.spawn(async move {
-            // The slot is released only once the session is gone or the
-            // bounded attempt failed: the bound counts every session that
-            // may still hold locks. The kill draws on its own reserve (one
-            // per slot), never on a pool or the captures' slots.
-            let _slot = permit;
+            // The kill draws on its own reserve (one per slot), never on a
+            // pool or the captures' slots. Its slot returns only once the
+            // session is known to be gone.
             let _reserve = slots.kills.acquire().await;
             #[cfg(test)]
             {
@@ -1653,6 +1663,10 @@ impl Drop for KillOnDrop {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
             let kill = async {
+                #[cfg(test)]
+                if slots.fail_kills.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err("injected kill failure".to_string());
+                }
                 let mut c = mysql_async::Conn::from_url(dsn.as_str())
                     .await
                     .map_err(|e| format!("connect: {e}"))?;
@@ -1667,9 +1681,12 @@ impl Drop for KillOnDrop {
                 killed
             };
             match tokio::time::timeout(KILL_TIMEOUT, kill).await {
-                Ok(Ok(())) => {}
-                Ok(Err(why)) => kill_failed(id, &why),
+                // The session is gone: its slot returns.
+                Ok(Ok(())) => drop(permit),
+                Ok(Err(why)) => kill_failed(slots, permit, id, &why),
                 Err(_) => kill_failed(
+                    slots,
+                    permit,
                     id,
                     &format!("timed out after {KILL_TIMEOUT:?}"),
                 ),
@@ -1678,17 +1695,32 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// A cancellation failed: counted, logged and exported. The session's
-/// locks last until the server notices the closed connection or its lock
-/// wait ends.
-fn kill_failed(id: u32, why: &str) {
+/// A cancellation did not resolve: the session may still hold metadata
+/// locks, so its slot is retired for the life of the process (capacity
+/// degrades safely until a restart; the bound is never exceeded). Counted,
+/// logged and exported.
+fn kill_failed(
+    slots: &'static CaptureSlots,
+    permit: Option<tokio::sync::SemaphorePermit<'static>>,
+    id: u32,
+    why: &str,
+) {
+    if let Some(p) = permit {
+        p.forget();
+        let retired = slots
+            .retired
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        metrics::gauge!("deltaforge_mysql_capture_slots_retired")
+            .set(retired as f64);
+    }
     KILL_FAILURES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     metrics::counter!("deltaforge_mysql_capture_kill_failures_total")
         .increment(1);
     tracing::warn!(
         session = id,
         why,
-        "a dropped capture's session could not be killed"
+        "a dropped capture's session could not be killed; its slot is retired until restart"
     );
 }
 
@@ -3771,6 +3803,132 @@ mod tests {
                 assert_eq!(kill_failures(), failures, "a cancellation failed");
                 sql(&dsn, &[&format!("ALTER TABLE {db}.t0 ADD COLUMN v INT")])
                     .await;
+            }
+
+            /// A cancellation that does not resolve retires its slot: the
+            /// session may still hold its locks, so the slot never returns,
+            /// further captures get only the remaining capacity, and a
+            /// successful cancellation still returns its own slot.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn an_unresolved_cancellation_retires_its_slot() {
+                let dsn = server(true).await;
+                let db = "cancel_fail";
+                sql(&dsn, &[&format!("CREATE DATABASE {db}")]).await;
+                for t in ["a", "b", "c"] {
+                    sql(
+                        &dsn,
+                        &[&format!(
+                            "CREATE TABLE {db}.{t} (id INT PRIMARY KEY)"
+                        )],
+                    )
+                    .await;
+                }
+                let slots: &'static CaptureSlots =
+                    Box::leak(Box::new(CaptureSlots::new(2, 2)));
+                let u = uuid(&dsn).await;
+                let held = |table: &'static str, inside: Arc<AtomicU32>| {
+                    let (d, u) = (dsn.clone(), u.clone());
+                    tokio::spawn(async move {
+                        let hook = move || -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+                            let inside = inside.clone();
+                            Box::pin(async move {
+                                inside.fetch_add(1, Ordering::SeqCst);
+                                std::future::pending::<()>().await;
+                            })
+                        };
+                        let tables = vec![(db.to_string(), table.to_string())];
+                        capture_batch_with(
+                            slots,
+                            &d,
+                            &u,
+                            LINEAGE,
+                            &tables,
+                            8,
+                            Some(&hook),
+                        )
+                        .await
+                    })
+                };
+                let until = |inside: Arc<AtomicU32>| async move {
+                    let deadline = Instant::now() + Duration::from_secs(20);
+                    while inside.load(Ordering::SeqCst) == 0 {
+                        assert!(
+                            Instant::now() < deadline,
+                            "the capture never held its lock"
+                        );
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                };
+
+                // A holds a real metadata lock, and its kill fails.
+                let a_inside = Arc::new(AtomicU32::new(0));
+                let a = held("a", a_inside.clone());
+                until(a_inside).await;
+                let mut c = mysql_async::Conn::from_url(&dsn).await.unwrap();
+                let locked: Vec<String> = c
+                    .exec(
+                        "SELECT OBJECT_NAME FROM performance_schema.metadata_locks WHERE OBJECT_SCHEMA = ? AND OBJECT_NAME = 'a'",
+                        (db,),
+                    )
+                    .await
+                    .unwrap();
+                assert!(!locked.is_empty(), "the capture held no lock");
+                slots.fail_kills.store(true, Ordering::SeqCst);
+                let failures = kill_failures();
+                a.abort();
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while kill_failures() == failures {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the failed kill was not counted"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert_eq!(
+                    slots.retired(),
+                    1,
+                    "the failed kill's slot is retired"
+                );
+                assert_eq!(
+                    slots.holding.available_permits(),
+                    1,
+                    "the failed kill's slot came back"
+                );
+
+                // The remaining capacity is one: B takes it, C cannot.
+                slots.fail_kills.store(false, Ordering::SeqCst);
+                let b_inside = Arc::new(AtomicU32::new(0));
+                let b = held("b", b_inside.clone());
+                until(b_inside).await;
+                let tables = vec![(db.to_string(), "c".to_string())];
+                let third = capture_batch_with(
+                    slots, &dsn, &u, LINEAGE, &tables, 1, None,
+                )
+                .await;
+                assert!(
+                    matches!(third, Err(BatchCaptureError::Contention { .. })),
+                    "a capture exceeded the remaining capacity"
+                );
+
+                // A successful cancellation still returns its slot.
+                b.abort();
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while slots.holding.available_permits() < 1 {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the successful kill's slot never came back"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert_eq!(slots.holding.available_permits(), 1);
+                assert_eq!(slots.retired(), 1);
+                assert_eq!(
+                    kill_failures(),
+                    failures + 1,
+                    "only the failed kill is counted"
+                );
             }
 
             /// A batched capture locks its tables in sorted order, whatever
