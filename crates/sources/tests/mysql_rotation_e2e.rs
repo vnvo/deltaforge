@@ -1108,7 +1108,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCapture {
     }
 }
 
-/// Sessions running a statement on `{db}.{table}`.
+/// The source's sessions waiting for `{db}.{table}`'s metadata lock.
 async fn sessions_on(
     root_dsn: &str,
     db: &str,
@@ -1118,12 +1118,30 @@ async fn sessions_on(
     let ids: Vec<u64> = c
         .exec(
             "SELECT ID FROM information_schema.PROCESSLIST \
-             WHERE INFO LIKE ? AND COMMAND <> 'Killed' AND ID <> CONNECTION_ID()",
-            (format!("%`{db}`.`{table}`%"),),
+             WHERE USER = ? AND STATE = 'Waiting for table metadata lock' \
+             AND INFO LIKE ? AND ID <> CONNECTION_ID()",
+            (MYSQL_CDC_USER, format!("%`{db}`.`{table}`%")),
         )
         .await?;
     c.disconnect().await.ok();
     Ok(ids)
+}
+
+/// End every session of the CDC user (a revocation that also terminates
+/// what was authenticated with the old credentials).
+async fn end_cdc_sessions(root_dsn: &str) -> Result<usize> {
+    let mut c = mysql_async::Conn::from_url(root_dsn).await?;
+    let ids: Vec<u64> = c
+        .exec(
+            "SELECT ID FROM information_schema.PROCESSLIST WHERE USER = ?",
+            (MYSQL_CDC_USER,),
+        )
+        .await?;
+    for id in &ids {
+        c.query_drop(format!("KILL {id}")).await.ok();
+    }
+    c.disconnect().await.ok();
+    Ok(ids.len())
 }
 
 /// After a rotation the old password stops working at once (`ALTER USER`),
@@ -1171,6 +1189,16 @@ async fn mysql_rotation_reaches_every_new_connection_and_never_logs_credentials(
         &h.root_dsn,
         dump_before,
         Duration::from_secs(40),
+    )
+    .await?;
+    // Revocation also ends every session opened with the old credentials:
+    // each pool must open new connections from here on.
+    let ended = end_cdc_sessions(&h.root_dsn).await?;
+    assert!(ended >= 1, "no source session to end");
+    let dump_after = wait_for_dump_thread_change(
+        &h.root_dsn,
+        dump_after,
+        Duration::from_secs(60),
     )
     .await?;
 
