@@ -1041,7 +1041,7 @@ async fn full_fallback(
     // affecting the table, and only then registered through the normal
     // registry path (never derived from the TableMap).
     let cap = match capture_proven(
-        ctx.dsn.expose(),
+        &ctx.dsn,
         super::mysql_helpers::derive_server_id(&format!(
             "{}/capture",
             ctx.source_id

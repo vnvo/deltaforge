@@ -319,7 +319,7 @@ impl MySqlRotationRuntime {
         let expected = ctx.expected_uuid()?;
         let frozen_gtid = ctx.gtid_text().unwrap_or_default();
         let new_dsn = candidate.dsn.clone();
-        let old_dsn = ctx.dsn.clone();
+        let old_dsn = ctx.dsn.current();
         let source_id = self.mgr.source_id().to_string();
         let backend = Arc::clone(&self.backend);
         let server_id = self.server_id;
@@ -439,8 +439,10 @@ impl MySqlRotationRuntime {
         if let ApplyStep::Applied =
             self.mgr.finish_apply(generation, outcome)?
         {
-            ctx.dsn = candidate.dsn.clone();
-            ctx.schema.set_dsn(candidate.dsn.clone());
+            // The run's one authoritative DSN: every later connection of
+            // the run (stream, captures, scans, schema reads, kills) takes
+            // it. Replaced only here, once the new stream is applied.
+            ctx.dsn.replace(candidate.dsn.clone());
         }
 
         // Take the resulting stream back out (Applied: new; Kept: old/recovered).

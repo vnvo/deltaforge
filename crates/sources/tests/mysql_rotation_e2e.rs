@@ -1108,25 +1108,6 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCapture {
     }
 }
 
-/// The source's sessions waiting for `{db}.{table}`'s metadata lock.
-async fn sessions_on(
-    root_dsn: &str,
-    db: &str,
-    table: &str,
-) -> Result<Vec<u64>> {
-    let mut c = mysql_async::Conn::from_url(root_dsn).await?;
-    let ids: Vec<u64> = c
-        .exec(
-            "SELECT ID FROM information_schema.PROCESSLIST \
-             WHERE USER = ? AND STATE = 'Waiting for table metadata lock' \
-             AND INFO LIKE ? AND ID <> CONNECTION_ID()",
-            (MYSQL_CDC_USER, format!("%`{db}`.`{table}`%")),
-        )
-        .await?;
-    c.disconnect().await.ok();
-    Ok(ids)
-}
-
 /// End every session of the CDC user (a revocation that also terminates
 /// what was authenticated with the old credentials).
 async fn end_cdc_sessions(root_dsn: &str) -> Result<usize> {
@@ -1147,9 +1128,10 @@ async fn end_cdc_sessions(root_dsn: &str) -> Result<usize> {
 /// After a rotation the old password stops working at once (`ALTER USER`),
 /// so any connection still made with it fails. Every kind the source opens
 /// afterwards must use the new credentials: the replication stream, a
-/// capture and its proof for a table first seen after the rotation, a
-/// reconnect, and the kill of a cancelled capture. Neither password ever
-/// appears in a log line or in the run's result.
+/// capture and its proof for a table first seen after the rotation, and a
+/// reconnect. Neither password ever appears in a log line or in the run's
+/// result. (Cancellation connections are tested below the pipeline, in
+/// `mysql_binlog_scan`.)
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires docker"]
 async fn mysql_rotation_reaches_every_new_connection_and_never_logs_credentials()
@@ -1256,51 +1238,9 @@ async fn mysql_rotation_reaches_every_new_connection_and_never_logs_credentials(
         "no event after the reconnect"
     );
 
-    // Cancellation on the new credentials: a capture blocked on a held lock
-    // is dropped when the source stops, and its session is killed.
-    root.query_drop(format!(
-        "CREATE TABLE {}.blocked (id INT PRIMARY KEY)",
-        h.db
-    ))
-    .await?;
-    root.query_drop(format!("LOCK TABLES {}.blocked WRITE", h.db))
-        .await?;
-    root.query_drop(format!("INSERT INTO {}.blocked VALUES (1)", h.db))
-        .await?;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let waiting = loop {
-        let s = sessions_on(&h.root_dsn, &h.db, "blocked").await?;
-        if !s.is_empty() {
-            break s;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "no capture queued for the held lock"
-        );
-        sleep(Duration::from_millis(100)).await;
-    };
     let db = h.db.clone();
-    let root_dsn = h.root_dsn.clone();
     h.handle.stop();
     let result = h.handle.join().await;
-    // A kill is immediate; a session no kill reaches outlasts 5 s (the
-    // server notices the dropped client only later).
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !sessions_on(&root_dsn, &db, "blocked").await?.is_empty() {
-        if Instant::now() >= deadline {
-            let mut c = mysql_async::Conn::from_url(&root_dsn).await?;
-            let rows: Vec<(u64, String, String, Option<String>, Option<String>, u64)> = c
-                .query("SELECT ID, USER, COMMAND, STATE, LEFT(INFO, 160), TIME FROM information_schema.PROCESSLIST WHERE USER <> 'event_scheduler'")
-                .await?;
-            eprintln!("[rotation-every] processlist at failure: {rows:#?}");
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the cancelled capture's session {waiting:?} was not killed with the new credentials"
-        );
-        sleep(Duration::from_millis(100)).await;
-    }
-    root.query_drop("UNLOCK TABLES").await?;
     root.disconnect().await.ok();
 
     // No credential in any log line or in the run's result.

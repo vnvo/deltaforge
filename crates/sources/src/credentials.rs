@@ -73,6 +73,61 @@ impl std::fmt::Debug for ProtectedDsn {
     }
 }
 
+/// One run's authoritative DSN. Every connection factory of the run
+/// (replication and reconnect, capture and proof scans, schema-loader
+/// reads, cancellation) takes [`SharedDsn::current`] immediately before it
+/// connects; a credential rotation replaces it, atomically, only once the
+/// new credentials are validated and applied. Clones share the one value.
+#[derive(Clone)]
+pub struct SharedDsn(Arc<std::sync::RwLock<ProtectedDsn>>);
+
+impl SharedDsn {
+    pub fn new(dsn: ProtectedDsn) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(dsn)))
+    }
+
+    /// The DSN now: a cheap snapshot. The lock is never held across I/O.
+    pub fn current(&self) -> ProtectedDsn {
+        self.0.read().expect("dsn lock").clone()
+    }
+
+    /// Replace the DSN for every later connection of the run (a validated
+    /// rotation only).
+    pub fn replace(&self, dsn: ProtectedDsn) {
+        *self.0.write().expect("dsn lock") = dsn;
+    }
+}
+
+impl From<ProtectedDsn> for SharedDsn {
+    fn from(dsn: ProtectedDsn) -> Self {
+        SharedDsn::new(dsn)
+    }
+}
+
+impl From<String> for SharedDsn {
+    fn from(dsn: String) -> Self {
+        SharedDsn::new(dsn.into())
+    }
+}
+
+impl From<&str> for SharedDsn {
+    fn from(dsn: &str) -> Self {
+        SharedDsn::new(dsn.into())
+    }
+}
+
+impl From<&String> for SharedDsn {
+    fn from(dsn: &String) -> Self {
+        SharedDsn::new(dsn.into())
+    }
+}
+
+impl std::fmt::Debug for SharedDsn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedDsn(REDACTED)")
+    }
+}
+
 /// Typed, redacted credential-resolution error. Never carries DSN content, a
 /// resolved value, or provider free text (the wrapped [`SecretError`] is itself
 /// redacted to a safe reference).
@@ -348,5 +403,21 @@ fn base_dsn_has_credentials(base: &str) -> bool {
             .unwrap_or(false)
     } else {
         DsnComponents::from_keyvalue(base, 0, "", "").has_credentials()
+    }
+}
+
+#[cfg(test)]
+mod shared_dsn_tests {
+    /// Clones share one DSN: a replacement is seen by every holder, and
+    /// a snapshot taken before it keeps its value. Never printed.
+    #[test]
+    fn a_shared_dsn_is_replaced_for_every_holder() {
+        let shared = super::SharedDsn::from("mysql://u:old@h/");
+        let other = shared.clone();
+        let before = other.current();
+        shared.replace("mysql://u:new@h/".into());
+        assert_eq!(other.current().expose(), "mysql://u:new@h/");
+        assert_eq!(before.expose(), "mysql://u:old@h/");
+        assert_eq!(format!("{shared:?}"), "SharedDsn(REDACTED)");
     }
 }

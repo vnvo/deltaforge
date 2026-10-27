@@ -124,7 +124,7 @@ pub(crate) struct DriftEnv<'a> {
     pub backend: &'a ArcStorageBackend,
     pub loader: &'a MySqlSchemaLoader,
     pub scope: &'a RegistryScope,
-    pub dsn: &'a str,
+    pub dsn: &'a crate::credentials::SharedDsn,
     pub server_uuid: &'a str,
     pub source_id: &'a str,
     pub halt: bool,
@@ -521,7 +521,7 @@ async fn shape_at_failover(
                 matches!(event, FirstEvent::Rows { .. }).then_some(&from);
             super::mysql_proof_scanner::shared_interval(
                 proofs,
-                env.dsn,
+                env.dsn.current().expose(),
                 env.source_id,
                 env.server_uuid,
                 &anchor.current_lineage,
@@ -535,7 +535,7 @@ async fn shape_at_failover(
         }
         _ => {
             scan_interval(
-                env.dsn,
+                env.dsn.current().expose(),
                 super::mysql_helpers::derive_server_id(&format!(
                     "{}/failover-drift",
                     env.source_id
@@ -789,7 +789,7 @@ pub(crate) async fn check_in_stream(
             backend: &ctx.registry_backend,
             loader: &ctx.schema,
             scope: &scope,
-            dsn: ctx.dsn.expose(),
+            dsn: &ctx.dsn,
             server_uuid: &server_uuid,
             source_id: &ctx.source_id,
             halt: ctx.on_schema_drift == deltaforge_config::OnSchemaDrift::Halt,
@@ -839,7 +839,7 @@ pub(crate) async fn check_window(
             backend: &ctx.registry_backend,
             loader: &ctx.schema,
             scope: &scope,
-            dsn: ctx.dsn.expose(),
+            dsn: &ctx.dsn,
             server_uuid: &server_uuid,
             source_id: &ctx.source_id,
             halt: ctx.on_schema_drift == deltaforge_config::OnSchemaDrift::Halt,
@@ -968,7 +968,7 @@ mod tests {
             backend: &backend,
             loader: &loader,
             scope: &scope,
-            dsn: "",
+            dsn: &crate::credentials::SharedDsn::from(""),
             server_uuid: B,
             source_id: "s",
             halt: true,
@@ -1088,7 +1088,7 @@ mod tests {
                     backend: &backend,
                     loader,
                     scope,
-                    dsn: "",
+                    dsn: &crate::credentials::SharedDsn::from(""),
                     server_uuid: B,
                     source_id: "s",
                     halt: true,

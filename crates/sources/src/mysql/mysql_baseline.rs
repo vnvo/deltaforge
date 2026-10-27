@@ -178,15 +178,8 @@ pub(crate) async fn establish(
     // 1. A capture of each table's shape, bound to its interval by step 2.
     let mut captured = Vec::new();
     for c in candidates {
-        match capture(
-            ctx.dsn.expose(),
-            &server_uuid,
-            &lineage,
-            &c.db,
-            &c.table,
-            None,
-        )
-        .await
+        match capture(&ctx.dsn, &server_uuid, &lineage, &c.db, &c.table, None)
+            .await
         {
             Ok(cap) => {
                 observe_capture(&tag, &cap);
@@ -225,7 +218,7 @@ pub(crate) async fn establish(
     // 2. One complete scan of (R0, S].
     let report: ScanReport = match super::mysql_proof_scanner::shared_interval(
         &ctx.proof_scanner,
-        ctx.dsn.expose(),
+        ctx.dsn.current().expose(),
         &ctx.source_id,
         &server_uuid,
         &lineage,
@@ -393,15 +386,8 @@ pub(crate) async fn establish_at(
         info!(source_id = %ctx.source_id, %db, %table, why, "no lazy baseline (decided by the activation window)");
         return Ok(false);
     }
-    let cap = match capture(
-        ctx.dsn.expose(),
-        &server_uuid,
-        &lineage,
-        db,
-        table,
-        None,
-    )
-    .await
+    let cap = match capture(&ctx.dsn, &server_uuid, &lineage, db, table, None)
+        .await
     {
         Ok(cap) => {
             observe_capture(&tag, &cap);
@@ -431,7 +417,7 @@ pub(crate) async fn establish_at(
     }
     let scanned = super::mysql_proof_scanner::shared_interval(
         &ctx.proof_scanner,
-        ctx.dsn.expose(),
+        ctx.dsn.current().expose(),
         &source_id,
         &server_uuid,
         &lineage,

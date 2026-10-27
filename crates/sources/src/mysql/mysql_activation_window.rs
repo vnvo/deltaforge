@@ -824,7 +824,7 @@ struct Admitted {
 /// speculative window's task holds no part of `RunCtx`).
 #[derive(Clone)]
 pub(crate) struct CaptureScan {
-    pub dsn: crate::credentials::ProtectedDsn,
+    pub dsn: crate::credentials::SharedDsn,
     pub server_uuid: String,
     pub lineage: String,
     pub source_id: String,
@@ -861,7 +861,7 @@ pub(crate) async fn capture_and_scan(
     let cap = loop {
         attempts += 1;
         match capture_batch(
-            cs.dsn.expose(),
+            &cs.dsn,
             &cs.server_uuid,
             &cs.lineage,
             tables,
@@ -899,7 +899,7 @@ pub(crate) async fn capture_and_scan(
     let t = Instant::now();
     let answers = match super::mysql_proof_scanner::shared_intervals(
         &cs.scanner,
-        cs.dsn.expose(),
+        cs.dsn.current().expose(),
         &cs.source_id,
         &cs.server_uuid,
         &cs.lineage,
