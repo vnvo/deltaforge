@@ -3733,8 +3733,22 @@ mod tests {
                         Instant::now() < deadline,
                         "a cancellation did not complete"
                     );
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
+                // A slot is back only once its session is gone: no metadata
+                // lock of these captures remains at that moment.
+                let mut c = mysql_async::Conn::from_url(&dsn).await.unwrap();
+                let held: Vec<String> = c
+                    .exec(
+                        "SELECT OBJECT_NAME FROM performance_schema.metadata_locks WHERE OBJECT_SCHEMA = ?",
+                        (db,),
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    held.is_empty(),
+                    "slots came back while locks remained: {held:?}"
+                );
                 assert_eq!(kill_failures(), failures, "a cancellation failed");
                 sql(&dsn, &[&format!("ALTER TABLE {db}.t0 ADD COLUMN v INT")])
                     .await;
