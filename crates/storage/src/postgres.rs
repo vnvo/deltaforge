@@ -93,6 +93,10 @@ const MIGRATIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS df_kv_checkpoints_key_c ON df_kv ((key COLLATE \"C\"))
         WHERE ns = 'checkpoints'",
     "CREATE INDEX IF NOT EXISTS df_slot_ns_key_c ON df_slot (ns, (key COLLATE \"C\"))",
+    "CREATE TABLE IF NOT EXISTS df_batch_commit (
+        batch_id TEXT PRIMARY KEY, digest BYTEA NOT NULL,
+        result BYTEA NOT NULL, committed_at BIGINT NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS df_batch_commit_at ON df_batch_commit(committed_at)",
 ];
 
 // Prefix listings compare keys byte-wise (`COLLATE "C"`), whatever the database
@@ -139,6 +143,18 @@ pub struct PostgresStorageBackend {
     batch_fault: std::sync::Mutex<Option<BatchFault>>,
 }
 
+impl PostgresStorageBackend {
+    /// A backend over `pool` for the background commit-marker sweep (no
+    /// TTL task of its own).
+    fn marker_sweeper(pool: Pool) -> Self {
+        Self {
+            pool,
+            _sweep_handle: tokio::spawn(async {}),
+            batch_fault: std::sync::Mutex::new(None),
+        }
+    }
+}
+
 impl BatchFaults for PostgresStorageBackend {
     fn set_batch_fault(&self, fault: Option<BatchFault>) {
         *self.batch_fault.lock().expect("batch fault") = fault;
@@ -174,8 +190,21 @@ impl PostgresStorageBackend {
                 .map_err(|e| anyhow!("schema migration: {e}\nSQL: {stmt}"))?;
         }
 
-        // TTL sweep every 60s
+        // TTL sweep every 60s; commit-marker sweep every hour.
         let sweep_pool = pool.clone();
+        let marker_pool = pool.clone();
+        tokio::spawn(async move {
+            let be = PostgresStorageBackend::marker_sweeper(marker_pool);
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                if let Err(e) = crate::sweep_batch_markers(&be, now_ms()).await
+                {
+                    error!("commit-marker sweep error: {e:#}");
+                }
+            }
+        });
         let sweep_handle = tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_secs(60));
@@ -443,6 +472,18 @@ impl StorageBackend for PostgresStorageBackend {
                     let bytes = max_seq_value(current.as_deref(), *value)?;
                     pg_kv_put(&tx, ns, key, &bytes).await?;
                 }
+                BatchOp::CommitMarker { batch_id, digest } => {
+                    let result = crate::encode_batch_result(
+                        &batch.ops[..i],
+                        &seqs[..i],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO df_batch_commit(batch_id, digest, result, committed_at)
+                         VALUES($1, $2, $3, $4)",
+                        &[batch_id, digest, &result, &now_ms()],
+                    )
+                    .await?;
+                }
             }
         }
         if fault == Some(BatchFault::AfterWrites(batch.ops.len())) {
@@ -453,6 +494,51 @@ impl StorageBackend for PostgresStorageBackend {
             anyhow::bail!("injected failure after the commit");
         }
         Ok(BatchOutcome::Committed { seqs })
+    }
+
+    async fn batch_commit_get(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<crate::BatchCommitRecord>> {
+        // Under the store lock: a batch that wrote this marker holds the lock
+        // until its commit or rollback has ended, so the answer is final.
+        let mut c = client!(self);
+        let tx = c.transaction().await?;
+        tx.execute(LOCK_LOG_SQL, &[&LOG_ALLOCATION_LOCK]).await?;
+        let row = tx
+            .query_opt(
+                "SELECT digest, result, committed_at FROM df_batch_commit WHERE batch_id=$1",
+                &[&batch_id],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(row.map(|r| crate::BatchCommitRecord {
+            digest: r.get(0),
+            result: r.get(1),
+            committed_at_ms: r.get(2),
+        }))
+    }
+
+    async fn batch_commit_sweep(
+        &self,
+        before_ms: i64,
+        limit: usize,
+    ) -> Result<usize> {
+        // One chunk, one transaction: the store lock is released between
+        // chunks.
+        let mut c = client!(self);
+        let tx = c.transaction().await?;
+        tx.execute(LOCK_LOG_SQL, &[&LOG_ALLOCATION_LOCK]).await?;
+        let n = tx
+            .execute(
+                "DELETE FROM df_batch_commit WHERE batch_id IN (
+                   SELECT batch_id FROM df_batch_commit WHERE committed_at < $1
+                   ORDER BY committed_at LIMIT $2)",
+                &[&before_ms, &(limit as i64)],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(n as usize)
     }
 
     async fn log_find_capture(
@@ -1449,6 +1535,148 @@ mod tests {
         assert_eq!(
             be.kv_get(&free_ns, "k").await.unwrap().as_deref(),
             Some(&b"v"[..])
+        );
+    }
+
+    /// The commit-marker lookup waits for the store lock (an in-flight
+    /// batch holding it cannot still be committing when the answer comes),
+    /// and the sweep releases the lock between chunks: a guarded writer
+    /// queued behind the sweep runs before the sweep's next chunk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires a live PostgreSQL (DELTAFORGE_IT_PG_DSN)"]
+    async fn pg_marker_lookup_and_sweep_follow_the_store_lock() {
+        use deadpool_postgres::tokio_postgres;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        let dsn = std::env::var("DELTAFORGE_IT_PG_DSN")
+            .expect("DELTAFORGE_IT_PG_DSN must be set to run this test");
+        let be = PostgresStorageBackend::connect(&dsn).await.unwrap();
+        let run = now_ms();
+        // Clear older markers, then 3 chunks' worth of expired ones.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        crate::sweep_batch_markers_within(
+            be.as_ref(),
+            now_ms(),
+            usize::MAX,
+            Duration::from_secs(600),
+        )
+        .await
+        .unwrap();
+        let (admin, conn) = tokio_postgres::connect(&dsn, NoTls).await.unwrap();
+        tokio::spawn(conn);
+        admin
+            .execute(
+                "INSERT INTO df_batch_commit(batch_id, digest, result, committed_at)
+                 SELECT 'it' || $1::text || '-' || g, decode('00', 'hex'), decode('01', 'hex'), $2
+                 FROM generate_series(1, 3000) g",
+                &[&run.to_string(), &(run - 1)],
+            )
+            .await
+            .unwrap();
+
+        admin.batch_execute("BEGIN").await.unwrap();
+        admin
+            .execute(LOCK_LOG_SQL, &[&LOG_ALLOCATION_LOCK])
+            .await
+            .unwrap();
+        let lookup = {
+            let be = be.clone();
+            let id = format!("it{run}-1");
+            tokio::spawn(async move { be.batch_commit_get(&id).await })
+        };
+        lock_waiters(&admin, 1).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !lookup.is_finished(),
+            "the marker lookup ran without the store lock"
+        );
+
+        // The sweep queues next, then a guarded writer behind it.
+        let order = Arc::new(AtomicUsize::new(0));
+        let sweep = {
+            let (be, order) = (be.clone(), order.clone());
+            tokio::spawn(async move {
+                let r = crate::sweep_batch_markers_within(
+                    be.as_ref(),
+                    run,
+                    64,
+                    Duration::from_secs(60),
+                )
+                .await;
+                (r, order.fetch_add(1, Ordering::SeqCst))
+            })
+        };
+        lock_waiters(&admin, 2).await;
+        let writer = {
+            let (be, order) = (be.clone(), order.clone());
+            tokio::spawn(async move {
+                let r = be
+                    .kv_put(
+                        "schemas.v1.index",
+                        &format!("it{run}_sweepw"),
+                        b"v",
+                    )
+                    .await;
+                (r, order.fetch_add(1, Ordering::SeqCst))
+            })
+        };
+        lock_waiters(&admin, 3).await;
+        admin.batch_execute("COMMIT").await.unwrap();
+
+        assert!(lookup.await.unwrap().unwrap().is_some());
+        let (written, writer_rank) = writer.await.unwrap();
+        written.unwrap();
+        let (swept, sweep_rank) = sweep.await.unwrap();
+        let swept = swept.unwrap();
+        assert_eq!(swept.deleted, 3000);
+        assert_eq!(swept.chunks, 3);
+        assert!(
+            writer_rank < sweep_rank,
+            "the sweep held the store lock across chunks"
+        );
+    }
+
+    /// The later-writer regression against PostgreSQL: a lost acknowledgement
+    /// resolves as committed from the marker although a valid writer changed
+    /// one of the batch's keys before the resolution.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires a live PostgreSQL (DELTAFORGE_IT_PG_DSN)"]
+    async fn pg_a_lost_acknowledgement_resolves_from_the_marker() {
+        let dsn = std::env::var("DELTAFORGE_IT_PG_DSN")
+            .expect("DELTAFORGE_IT_PG_DSN must be set to run this test");
+        let pg = PostgresStorageBackend::connect(&dsn).await.unwrap();
+        let fb = crate::adapters::test_util::FaultBackend::wrap(pg.clone());
+        let ns = format!("schemas.v1.it{}_ack", now_ms());
+        let batch = AtomicBatch {
+            preconditions: Vec::new(),
+            ops: vec![
+                BatchOp::LogAppendIfAbsent {
+                    ns: ns.clone(),
+                    key: "s".into(),
+                    capture_id: "c1".into(),
+                    value: b"entry".to_vec(),
+                },
+                BatchOp::KvPut {
+                    ns: ns.clone(),
+                    key: "k".into(),
+                    value: crate::BatchValue::Bytes(b"batch".to_vec()),
+                },
+            ],
+        };
+        pg.set_batch_fault(Some(BatchFault::AfterCommit));
+        *fb.write_after_batch_error.lock().unwrap() =
+            Some((ns.clone(), "k".into(), b"later".to_vec()));
+        let out = crate::commit_atomic(&fb, &batch, 3).await.unwrap();
+        let seq = pg
+            .log_find_capture(&ns, "s", "c1")
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
+        assert_eq!(out, crate::CommitResult::Committed(vec![Some(seq), None]));
+        assert_eq!(
+            pg.kv_get(&ns, "k").await.unwrap().as_deref(),
+            Some(&b"later"[..])
         );
     }
 

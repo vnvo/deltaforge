@@ -115,6 +115,21 @@ pub struct SqliteStorageBackend {
     batch_fault: Arc<Mutex<Option<BatchFault>>>,
 }
 
+impl SqliteStorageBackend {
+    /// A backend over `conn` for the background commit-marker sweep (no
+    /// TTL task of its own).
+    fn marker_sweeper(conn: Arc<Mutex<Connection>>) -> Self {
+        Self {
+            conn,
+            _sweep_handle: tokio::spawn(async {}),
+            fail_truncate_after_delete: Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
+            batch_fault: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
 impl BatchFaults for SqliteStorageBackend {
     fn set_batch_fault(&self, fault: Option<BatchFault>) {
         *self.batch_fault.lock().expect("batch fault") = fault;
@@ -185,6 +200,14 @@ CREATE TABLE IF NOT EXISTS df_queue (
     ts   INTEGER NOT NULL DEFAULT (unixepoch())
 );
 CREATE INDEX IF NOT EXISTS df_queue_ns_key_id ON df_queue(ns, key, id);
+
+CREATE TABLE IF NOT EXISTS df_batch_commit (
+    batch_id     TEXT    PRIMARY KEY,
+    digest       BLOB    NOT NULL,
+    result       BLOB    NOT NULL,
+    committed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS df_batch_commit_at ON df_batch_commit(committed_at);
 "#;
 
 impl SqliteStorageBackend {
@@ -214,6 +237,21 @@ impl SqliteStorageBackend {
         )?;
 
         let conn = Arc::new(Mutex::new(conn));
+
+        // Commit-marker sweep every hour, in chunks on the one connection.
+        let marker_conn = Arc::clone(&conn);
+        tokio::spawn(async move {
+            let be = SqliteStorageBackend::marker_sweeper(marker_conn);
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                if let Err(e) = crate::sweep_batch_markers(&be, now_ms()).await
+                {
+                    error!("commit-marker sweep error: {e:#}");
+                }
+            }
+        });
 
         // TTL sweep every 60s
         let sweep_conn = Arc::clone(&conn);
@@ -499,6 +537,17 @@ impl StorageBackend for SqliteStorageBackend {
                             params![ns, key, bytes, now_secs()],
                         )?;
                     }
+                    BatchOp::CommitMarker { batch_id, digest } => {
+                        let result = crate::encode_batch_result(
+                            &batch.ops[..i],
+                            &seqs[..i],
+                        )?;
+                        tx.prepare_cached(
+                            "INSERT INTO df_batch_commit(batch_id, digest, result, committed_at)
+                             VALUES(?1, ?2, ?3, ?4)",
+                        )?
+                        .execute(params![batch_id, digest, result, now_ms()])?;
+                    }
                 }
             }
             if fault == Some(BatchFault::AfterWrites(batch.ops.len())) {
@@ -509,6 +558,45 @@ impl StorageBackend for SqliteStorageBackend {
                 anyhow::bail!("injected failure after the commit");
             }
             Ok(BatchOutcome::Committed { seqs })
+        })
+    }
+
+    async fn batch_commit_get(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<crate::BatchCommitRecord>> {
+        // The one connection serializes this read after any batch that
+        // could still write the marker.
+        let batch_id = batch_id.to_string();
+        db!(self, move |conn: &Connection| {
+            Ok(conn
+                .query_row(
+                    "SELECT digest, result, committed_at FROM df_batch_commit WHERE batch_id=?1",
+                    params![batch_id],
+                    |r| {
+                        Ok(crate::BatchCommitRecord {
+                            digest: r.get(0)?,
+                            result: r.get(1)?,
+                            committed_at_ms: r.get(2)?,
+                        })
+                    },
+                )
+                .optional()?)
+        })
+    }
+
+    async fn batch_commit_sweep(
+        &self,
+        before_ms: i64,
+        limit: usize,
+    ) -> Result<usize> {
+        db!(self, move |conn: &Connection| {
+            Ok(conn.execute(
+                "DELETE FROM df_batch_commit WHERE batch_id IN (
+                   SELECT batch_id FROM df_batch_commit WHERE committed_at < ?1
+                   ORDER BY committed_at LIMIT ?2)",
+                params![before_ms, limit as i64],
+            )?)
         })
     }
 

@@ -213,6 +213,19 @@ impl StorageBackend for CountingBackend {
     ) -> Result<storage::BatchOutcome> {
         self.inner.apply_batch(batch).await
     }
+    async fn batch_commit_get(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<storage::BatchCommitRecord>> {
+        self.inner.batch_commit_get(batch_id).await
+    }
+    async fn batch_commit_sweep(
+        &self,
+        before_ms: i64,
+        limit: usize,
+    ) -> Result<usize> {
+        self.inner.batch_commit_sweep(before_ms, limit).await
+    }
     async fn log_read_streams(
         &self,
         streams: &[(String, String)],
