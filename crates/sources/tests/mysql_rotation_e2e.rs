@@ -1283,7 +1283,9 @@ async fn mysql_rotation_reaches_every_new_connection_and_never_logs_credentials(
     let root_dsn = h.root_dsn.clone();
     h.handle.stop();
     let result = h.handle.join().await;
-    let deadline = Instant::now() + Duration::from_secs(8);
+    // A kill is immediate; a session no kill reaches outlasts 5 s (the
+    // server notices the dropped client only later).
+    let deadline = Instant::now() + Duration::from_secs(3);
     while !sessions_on(&root_dsn, &db, "blocked").await?.is_empty() {
         if Instant::now() >= deadline {
             let mut c = mysql_async::Conn::from_url(&root_dsn).await?;
