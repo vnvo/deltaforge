@@ -49,6 +49,8 @@ pub struct FaultBackend {
     /// valid writer acting between an ambiguous commit and its resolution).
     pub write_after_batch_error:
         std::sync::Mutex<Option<(String, String, Vec<u8>)>>,
+    /// Every `apply_batch` waits forever (a store that stopped answering).
+    pub stall_batches: AtomicBool,
 }
 
 /// See [`FaultBackend::pause_after_slot_list`]: (namespace, reached,
@@ -90,6 +92,7 @@ impl FaultBackend {
             yield_after_slot_reads: AtomicBool::new(false),
             pause_after_slot_list: std::sync::Mutex::new(None),
             write_after_batch_error: std::sync::Mutex::new(None),
+            stall_batches: AtomicBool::new(false),
         }
     }
 
@@ -178,6 +181,9 @@ impl StorageBackend for FaultBackend {
                 crate::BatchOp::CommitMarker { .. } => continue,
             };
             self.write(ns)?;
+        }
+        if self.stall_batches.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
         }
         let out = self.inner.apply_batch(batch).await;
         if out.is_err() {

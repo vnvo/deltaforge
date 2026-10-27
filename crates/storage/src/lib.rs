@@ -1614,6 +1614,99 @@ mod batch_commit_identity_tests {
             Some(&b"later"[..])
         );
     }
+
+    fn kv_ops(n: usize) -> AtomicBatch {
+        AtomicBatch {
+            preconditions: Vec::new(),
+            ops: (0..n)
+                .map(|i| BatchOp::KvPut {
+                    ns: "ns".into(),
+                    key: format!("k{i}"),
+                    value: BatchValue::Bytes(vec![1]),
+                })
+                .collect(),
+        }
+    }
+
+    /// At most `MAX_BATCH_OPS` ops; the commit marker is not counted and
+    /// must be last.
+    #[test]
+    fn a_batch_holds_at_most_the_op_limit() {
+        assert!(kv_ops(MAX_BATCH_OPS).validate().is_ok());
+        let mut marked = kv_ops(MAX_BATCH_OPS);
+        marked.ops.push(BatchOp::CommitMarker {
+            batch_id: "b".into(),
+            digest: vec![],
+        });
+        assert!(marked.validate().is_ok());
+        let err = kv_ops(MAX_BATCH_OPS + 1).validate().unwrap_err();
+        assert!(format!("{err:#}").contains("16384-op limit"), "{err:#}");
+        let mut early = kv_ops(2);
+        early.ops.insert(
+            0,
+            BatchOp::CommitMarker {
+                batch_id: "b".into(),
+                digest: vec![],
+            },
+        );
+        assert!(early.validate().is_err());
+    }
+
+    /// The largest batch's outcome encodes well within the result limit, and
+    /// a result over the limit is refused when encoded and when decoded.
+    #[test]
+    fn a_stored_outcome_is_bounded() {
+        let ops: Vec<BatchOp> = (0..MAX_BATCH_OPS)
+            .map(|i| BatchOp::LogAppendIfAbsent {
+                ns: "ns".into(),
+                key: "s".into(),
+                capture_id: format!("c{i}"),
+                value: vec![],
+            })
+            .collect();
+        let seqs: Vec<Option<u64>> =
+            (0..MAX_BATCH_OPS).map(|_| Some(u64::MAX)).collect();
+        let result = encode_batch_result(&ops, &seqs).unwrap();
+        assert!(result.len() <= MAX_BATCH_OPS * 11 + 4, "{}", result.len());
+        assert!(result.len() < MAX_BATCH_RESULT_BYTES);
+        assert_eq!(decode_batch_result(&result, MAX_BATCH_OPS).unwrap(), seqs);
+        assert!(
+            check_result_size(&vec![0; MAX_BATCH_RESULT_BYTES + 1]).is_err()
+        );
+        assert!(
+            decode_batch_result(
+                &vec![RESULT_FORMAT; MAX_BATCH_RESULT_BYTES + 1],
+                1
+            )
+            .is_err()
+        );
+    }
+
+    /// A store that stops answering cannot hold a commit call past its
+    /// deadline; the deadline is far shorter than the marker retention.
+    #[tokio::test]
+    async fn a_commit_call_ends_at_its_deadline() {
+        let fb = FaultBackend::new();
+        fb.stall_batches
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let err = commit_atomic_within(
+            &fb,
+            &kv_ops(1),
+            3,
+            &mut 0,
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("commit deadline"), "{err:#}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(COMMIT_DEADLINE, std::time::Duration::from_secs(300));
+        assert!(
+            BATCH_MARKER_RETENTION_MS
+                >= 100 * COMMIT_DEADLINE.as_millis() as i64
+        );
+    }
 }
 
 #[cfg(test)]
