@@ -804,16 +804,12 @@ pub(crate) fn proof_start(
     anchor: &FailoverAnchor,
     event: &FirstEvent<'_>,
 ) -> Option<MySqlCheckpoint> {
-    let Some(f_cp) = anchor.position.clone() else {
-        return None;
-    };
-    let Some(f) = mysql_checkpoint_position(
+    let f_cp = anchor.position.clone()?;
+    let f = mysql_checkpoint_position(
         &f_cp.file,
         f_cp.pos,
         f_cp.gtid_set.as_deref(),
-    ) else {
-        return None;
-    };
+    )?;
     let from = match event {
         FirstEvent::Ddl => return None,
         FirstEvent::Snapshot => f_cp.clone(),
@@ -1727,7 +1723,7 @@ mod tests {
             let registry =
                 DurableSchemaRegistry::new(backend.clone()).await.unwrap();
             for (t, schema) in previous {
-                let k = SchemaKey::new("t", "s", &hash(PREV), db, t);
+                let k = SchemaKey::new("t", "s", hash(PREV), db, t);
                 registry
                     .register_version(
                         &k,
