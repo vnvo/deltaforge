@@ -875,11 +875,11 @@ async fn a_stop_cancels_the_waiting_window_and_speculative_captures() {
         assert!(!store.registered(port, id, &t).await, "{t} registered");
     }
     assert!(records(id, "window").is_empty(), "no window completed");
-    // The stop's checkpoint, if any, is before either window.
-    if let Some(raw) = store.ckpt.get_raw(id).await.unwrap() {
-        let cp: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-        assert_eq!(cp["gtid_set"].as_str(), Some(before.trim()), "{cp}");
-    }
+    // An ordinary stop: its checkpoint is written, before either window.
+    let raw = store.ckpt.get_raw(id).await.unwrap();
+    let raw = raw.expect("the stop writes its checkpoint");
+    let cp: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(cp["gtid_set"].as_str(), Some(before.trim()), "{cp}");
     first.query_drop("UNLOCK TABLES").await.unwrap();
     second.query_drop("UNLOCK TABLES").await.unwrap();
     r.drain.abort();

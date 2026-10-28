@@ -610,7 +610,15 @@ pub(super) async fn maybe_window(
     let Some(admitted) = admitted else {
         return Err(LoopControl::Stop);
     };
-    let admitted = admitted?;
+    let admitted = match admitted {
+        // A stop that cancelled the window's capture (or the speculated
+        // one) first: nothing of the window was dispatched and the stream
+        // position is still before it, so the run stops as on any stop.
+        Err(LoopControl::Fail(SourceError::Cancelled)) => {
+            return Err(LoopControl::Stop);
+        }
+        other => other?,
+    };
     let commit_unix_us = unix_us();
     ctx.window_seq += 1;
     if let Some(order) = admitted_order {
