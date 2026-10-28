@@ -340,7 +340,7 @@ pub(super) async fn maybe_window(
         let keys: Vec<_> = ctx
             .pending
             .as_ref()
-            .map(|p| p.batch.keys().map(|(db, t)| scope.key(db, t)).collect())
+            .map(|p| p.order.iter().map(|(db, t)| scope.key(db, t)).collect())
             .unwrap_or_default();
         super::mysql_selection::load_timelines(ctx, &keys).await;
     }
@@ -2006,7 +2006,7 @@ mod tests {
             use super::*;
             use crate::mysql::mysql_activation::{
                 BARRIER_NS, BarrierScope, barrier_stream, read_barriers_head,
-                read_timelines,
+                read_timelines, read_timelines_within, table_stream,
             };
             use storage::StorageBackend as _;
             use storage::adapters::test_util::FaultBackend;
@@ -2079,6 +2079,100 @@ mod tests {
             /// reads give, duplicates requested included; each table stream
             /// and each shared barrier stream is read exactly once, in one
             /// call.
+            /// Within a budget: the barriers, then the tables in the
+            /// order asked while their streams fit whole; the rest are left
+            /// out (read when reached), and nothing is usable when the
+            /// barriers alone do not fit.
+            #[tokio::test]
+            async fn a_budgeted_timeline_read_stops_in_the_order_asked() {
+                let ctx =
+                    ctx_on(std::sync::Arc::new(FaultBackend::new())).await;
+                let keys = fixture(&ctx).await;
+                let mut asked = keys.clone();
+                asked.reverse();
+                let all = read_timelines(
+                    &ctx.registry_backend,
+                    ctx.schema.registry(),
+                    &asked,
+                )
+                .await
+                .unwrap();
+                // The bytes of the barriers and of each asked table's stream.
+                let streams: Vec<(String, String)> = asked
+                    .iter()
+                    .map(|k| (ACTIVATION_NS.to_string(), table_stream(k)))
+                    .collect();
+                let per_table = ctx
+                    .registry_backend
+                    .log_read_streams(&streams)
+                    .await
+                    .unwrap();
+                let mut barrier_streams: Vec<(String, String)> = Vec::new();
+                for k in &asked {
+                    for b in crate::mysql::mysql_activation::barrier_streams(k)
+                    {
+                        let s = (BARRIER_NS.to_string(), b);
+                        if !barrier_streams.contains(&s) {
+                            barrier_streams.push(s);
+                        }
+                    }
+                }
+                let barrier_bytes: u64 = ctx
+                    .registry_backend
+                    .log_read_streams(&barrier_streams)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .flatten()
+                    .map(storage::log_entry_bytes)
+                    .sum();
+                let bytes = |n: usize| -> u64 {
+                    barrier_bytes
+                        + per_table[..n]
+                            .iter()
+                            .flatten()
+                            .map(storage::log_entry_bytes)
+                            .sum::<u64>()
+                };
+                for n in [1, 7, asked.len()] {
+                    let got = read_timelines_within(
+                        &ctx.registry_backend,
+                        ctx.schema.registry(),
+                        &asked,
+                        bytes(n),
+                    )
+                    .await
+                    .unwrap();
+                    // An empty stream after the last that fits still fits.
+                    let fits: Vec<String> = asked
+                        .iter()
+                        .enumerate()
+                        .take_while(|(i, _)| bytes(i + 1) <= bytes(n))
+                        .map(|(_, k)| k.backend_key())
+                        .collect();
+                    let mut keys: Vec<String> = got.keys().cloned().collect();
+                    keys.sort();
+                    let mut want = fits.clone();
+                    want.sort();
+                    assert_eq!(keys, want, "budget for {n} tables");
+                    for k in &fits {
+                        assert_eq!(
+                            got[k].as_ref().unwrap().0.len(),
+                            all[k].as_ref().unwrap().0.len()
+                        );
+                    }
+                }
+                let none = read_timelines_within(
+                    &ctx.registry_backend,
+                    ctx.schema.registry(),
+                    &asked,
+                    0,
+                )
+                .await
+                .unwrap();
+                assert!(barrier_bytes == 0 || none.is_empty());
+            }
+
             #[tokio::test]
             async fn the_batch_equals_the_per_table_reads_reading_each_stream_once()
              {
@@ -2108,18 +2202,22 @@ mod tests {
                 let unique: std::collections::BTreeSet<_> =
                     reads.iter().collect();
                 assert_eq!(unique.len(), reads.len(), "no stream read twice");
-                let mut sorted = reads.clone();
-                sorted.sort();
-                let (tables, barriers): (Vec<_>, Vec<_>) =
-                    reads.iter().partition(|(ns, _)| ns == ACTIVATION_NS);
-                assert!(
-                    tables.windows(2).all(|w| w[0] <= w[1]),
-                    "canonical order"
-                );
+                // The shared barriers first (canonical order), then each
+                // table once, in the order asked.
+                let (barriers, tables) = reads.split_at(3);
+                assert!(barriers.iter().all(|(ns, _)| ns == BARRIER_NS));
                 assert!(
                     barriers.windows(2).all(|w| w[0] <= w[1]),
                     "canonical order"
                 );
+                let mut want: Vec<(String, String)> = Vec::new();
+                for k in &asked {
+                    let s = (ACTIVATION_NS.to_string(), table_stream(k));
+                    if !want.contains(&s) {
+                        want.push(s);
+                    }
+                }
+                assert_eq!(tables, &want[..], "the order asked");
                 assert_eq!(got.len(), 30);
                 for k in &keys {
                     let (records, head, barriers, heads) =

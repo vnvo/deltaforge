@@ -415,7 +415,7 @@ async fn a_burst_is_batched_file_position() {
 /// it are one batch, those touched after it are proven after it (the
 /// changed table by its DDL's forward proof), all delivered.
 /// Wide tables (`n` of them): each schema is about 8 KB, so a table's
-/// window cost is about 30 KB.
+/// window cost is about 46 KB.
 async fn wide_tables(c: &mut mysql_async::Conn, n: usize) {
     // MySQL's longest column comment is 1,024 characters.
     let comment = "x".repeat(1000);
@@ -462,7 +462,7 @@ async fn a_window_over_its_caps_admits_its_prefix_and_defers_the_rest() {
     let (container, port) = start(true).await;
     let mut c = conn(port).await;
     wide_tables(&mut c, 5).await;
-    let _caps = WindowCaps::set(70_000, 16_384, 70_000);
+    let _caps = WindowCaps::set(110_000, 16_384, 110_000);
     let id = "prefix";
     let store = Store::memory();
     let r = run_on(port, id, MysqlProofCfg::default(), &store).await;

@@ -277,6 +277,31 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
         Ok(out)
     }
 
+    /// [`log_read_streams`](Self::log_read_streams) within `budget` bytes
+    /// ([`log_entry_bytes`]): the leading streams, in request order, whose
+    /// entries fit together, the first one always. Nothing past the first
+    /// stream that does not fit is kept; the result answers that many
+    /// requests. The default reads everything first and is for test doubles
+    /// only; every production backend stops reading at the budget.
+    async fn log_read_streams_within(
+        &self,
+        streams: &[(String, String)],
+        budget: u64,
+    ) -> Result<Vec<Vec<LogEntryMeta>>> {
+        let all = self.log_read_streams(streams).await?;
+        let mut total = 0u64;
+        let mut out = Vec::with_capacity(all.len());
+        for (i, entries) in all.into_iter().enumerate() {
+            let bytes: u64 = entries.iter().map(log_entry_bytes).sum();
+            if i > 0 && total + bytes > budget {
+                break;
+            }
+            total += bytes;
+            out.push(entries);
+        }
+        Ok(out)
+    }
+
     /// Apply `batch` atomically (see [`AtomicBatch`]). The default refuses:
     /// a backend that cannot commit atomically never pretends to.
     async fn apply_batch(&self, _batch: &AtomicBatch) -> Result<BatchOutcome> {
@@ -543,6 +568,39 @@ pub(crate) fn note_read(ns: &str, key: &str, size: usize) {
             limit = MAX_STATE_ITEM_BYTES,
             "a state item over the write limit was read (written before the limit)"
         );
+    }
+}
+
+/// A log entry's size as read: its value, its identifiers and a fixed
+/// overhead.
+pub fn log_entry_bytes(e: &LogEntryMeta) -> u64 {
+    (e.value.len()
+        + e.capture_id.as_ref().map_or(0, String::len)
+        + e.content_hash.as_ref().map_or(0, String::len)) as u64
+        + 32
+}
+
+/// Accumulates [`log_entry_bytes`] of stream reads within a budget: a
+/// stream fits while the total does (the first stream always).
+pub(crate) struct StreamBudget {
+    budget: u64,
+    total: u64,
+}
+
+impl StreamBudget {
+    pub(crate) fn new(budget: u64) -> Self {
+        Self { budget, total: 0 }
+    }
+
+    /// Count an entry of stream `i`; `false`: it does not fit, and the read
+    /// stops before stream `i`.
+    pub(crate) fn take(&mut self, i: usize, e: &LogEntryMeta) -> bool {
+        let bytes = log_entry_bytes(e);
+        if i > 0 && self.total + bytes > self.budget {
+            return false;
+        }
+        self.total += bytes;
+        true
     }
 }
 
@@ -2696,6 +2754,8 @@ pub(crate) mod atomic_batch_suite {
             .await;
         large_groups_keep_request_order(be.clone(), &format!("{ns}_big")).await;
         oversized_items_are_refused(be.clone(), &format!("{ns}_m")).await;
+        stream_reads_stop_at_their_budget(be.clone(), &format!("{ns}_within"))
+            .await;
         oversized_legacy_items_stay_readable(
             be.clone(),
             &format!("{ns}_legacy"),
@@ -3019,6 +3079,41 @@ pub(crate) mod atomic_batch_suite {
             "{} {before}",
             oversized_reads()
         );
+    }
+
+    /// A budgeted stream read answers the leading streams, in request
+    /// order, whose entries fit the budget together: exactly as the full
+    /// read answers them, the first one always, and none past the first that
+    /// does not fit (an empty stream fits).
+    pub async fn stream_reads_stop_at_their_budget(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
+        for (key, n) in [("a", 3), ("c", 3), ("d", 1)] {
+            for i in 0..n {
+                be.log_append(ns, key, &vec![i as u8; 1000]).await.unwrap();
+            }
+        }
+        let streams: Vec<(String, String)> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|k| (ns.to_string(), k.to_string()))
+            .collect();
+        let full = be.log_read_streams(&streams).await.unwrap();
+        let a_bytes: u64 = full[0].iter().map(log_entry_bytes).sum();
+        let c_bytes: u64 = full[2].iter().map(log_entry_bytes).sum();
+        for (budget, answered) in [
+            (0, 2),
+            (a_bytes, 2),
+            (a_bytes + c_bytes - 1, 2),
+            (a_bytes + c_bytes, 3),
+            (u64::MAX, 4),
+        ] {
+            let got =
+                be.log_read_streams_within(&streams, budget).await.unwrap();
+            assert_eq!(got.len(), answered, "budget {budget}");
+            assert_eq!(&got[..], &full[..answered], "budget {budget}");
+        }
+        assert!(be.log_read_streams_within(&[], 0).await.unwrap().is_empty());
     }
 
     /// Every stream as paged out one by one.

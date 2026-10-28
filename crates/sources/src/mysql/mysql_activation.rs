@@ -730,9 +730,27 @@ pub(crate) async fn read_timelines(
     registry: &DurableSchemaRegistry,
     keys: &[SchemaKey],
 ) -> Result<BTreeMap<String, Result<TimelineParts>>> {
-    let mut tables: BTreeMap<String, &SchemaKey> = BTreeMap::new();
+    read_timelines_within(backend, registry, keys, u64::MAX).await
+}
+
+/// [`read_timelines`] within `budget` bytes of entries: the shared barrier
+/// streams first, then each table's stream in `keys`' order (the window's
+/// first-touch order); a table whose stream is not read whole within the
+/// budget is left out (read when it is reached), and so is every table
+/// when the barriers alone do not fit.
+pub(crate) async fn read_timelines_within(
+    backend: &ArcStorageBackend,
+    registry: &DurableSchemaRegistry,
+    keys: &[SchemaKey],
+    budget: u64,
+) -> Result<BTreeMap<String, Result<TimelineParts>>> {
+    // In `keys`' order, each table once.
+    let mut tables: Vec<(String, &SchemaKey)> = Vec::new();
     for k in keys {
-        tables.insert(k.backend_key(), k);
+        let bk = k.backend_key();
+        if !tables.iter().any(|(b, _)| *b == bk) {
+            tables.push((bk, k));
+        }
     }
     anyhow::ensure!(
         tables.len() <= TIMELINE_READ_MAX_TABLES,
@@ -740,17 +758,20 @@ pub(crate) async fn read_timelines(
         tables.len()
     );
     let mut barriers: BTreeMap<String, ()> = BTreeMap::new();
-    for k in tables.values() {
+    for (_, k) in &tables {
         for b in barrier_streams(k) {
             barriers.insert(b, ());
         }
     }
-    let mut streams: Vec<(String, String)> = tables
-        .values()
-        .map(|k| (ACTIVATION_NS.to_string(), table_stream(k)))
+    let mut streams: Vec<(String, String)> = barriers
+        .keys()
+        .map(|b| (BARRIER_NS.to_string(), b.clone()))
         .collect();
-    streams
-        .extend(barriers.keys().map(|b| (BARRIER_NS.to_string(), b.clone())));
+    streams.extend(
+        tables
+            .iter()
+            .map(|(_, k)| (ACTIVATION_NS.to_string(), table_stream(k))),
+    );
     let key_bytes: usize = streams.iter().map(|(n, k)| n.len() + k.len()).sum();
     anyhow::ensure!(
         key_bytes <= TIMELINE_READ_MAX_KEY_BYTES,
@@ -758,9 +779,13 @@ pub(crate) async fn read_timelines(
          {TIMELINE_READ_MAX_KEY_BYTES}"
     );
     let read = backend
-        .log_read_streams(&streams)
+        .log_read_streams_within(&streams, budget)
         .await
         .context("read activation streams")?;
+    // Barriers not read whole: nothing is usable.
+    if read.len() < barriers.len() {
+        return Ok(BTreeMap::new());
+    }
     let mut by_stream: HashMap<
         String,
         std::result::Result<(Vec<Stored>, u64), TimelineError>,
@@ -770,6 +795,10 @@ pub(crate) async fn read_timelines(
     }
     let mut out = BTreeMap::new();
     for (bk, key) in tables {
+        // A table past the budget: not read.
+        if !by_stream.contains_key(&table_stream(key)) {
+            continue;
+        }
         let parts = async {
             let (records, head) = match &by_stream[&table_stream(key)] {
                 Ok(r) => r.clone(),

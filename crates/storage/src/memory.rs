@@ -185,6 +185,40 @@ impl StorageBackend for MemoryStorageBackend {
         Ok(out)
     }
 
+    async fn log_read_streams_within(
+        &self,
+        streams: &[(String, String)],
+        budget: u64,
+    ) -> Result<Vec<Vec<LogEntryMeta>>> {
+        let store = self.log.read().await;
+        let mut within = crate::StreamBudget::new(budget);
+        let mut out: Vec<Vec<LogEntryMeta>> = Vec::new();
+        'streams: for (i, (ns, key)) in streams.iter().enumerate() {
+            let mut entries = Vec::new();
+            for e in store
+                .entries
+                .get(&(ns.clone(), key.clone()))
+                .into_iter()
+                .flatten()
+            {
+                let m = LogEntryMeta {
+                    seq: e.seq,
+                    stored_at_ms: e.ts_ms,
+                    capture_id: e.capture_id.clone(),
+                    content_hash: e.content_hash.clone(),
+                    value: e.value.clone(),
+                };
+                if !within.take(i, &m) {
+                    break 'streams;
+                }
+                entries.push(m);
+            }
+            out.push(entries);
+        }
+        crate::note_stream_reads(&streams[..out.len()], &out);
+        Ok(out)
+    }
+
     async fn read_batch(
         &self,
         reads: &[BatchRead],

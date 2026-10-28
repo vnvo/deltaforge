@@ -569,6 +569,68 @@ impl StorageBackend for PostgresStorageBackend {
         Ok(out)
     }
 
+    async fn log_read_streams_within(
+        &self,
+        streams: &[(String, String)],
+        budget: u64,
+    ) -> Result<Vec<Vec<LogEntryMeta>>> {
+        use futures::TryStreamExt as _;
+        let mut out: Vec<Vec<LogEntryMeta>> = Vec::new();
+        if streams.is_empty() {
+            return Ok(out);
+        }
+        let (nss, keys): (Vec<&str>, Vec<&str>) = streams
+            .iter()
+            .map(|(n, k)| (n.as_str(), k.as_str()))
+            .unzip();
+        let c = client!(self);
+        // One statement, consumed as a row stream in request order: the
+        // rows past the budget are discarded as they arrive, never kept.
+        let params: [&(
+             dyn deadpool_postgres::tokio_postgres::types::ToSql + Sync
+         ); 2] = [&nss, &keys];
+        let rows = c
+            .query_raw(
+                "SELECT r.i, l.seq, COALESCE(l.ts_ms, l.ts*1000), l.capture_id,
+                        l.content_hash, l.val
+                 FROM unnest($1::text[], $2::text[]) WITH ORDINALITY AS r(ns, key, i)
+                 JOIN df_log l ON l.ns = r.ns AND l.key = r.key
+                 ORDER BY r.i, l.seq",
+                params,
+            )
+            .await?;
+        futures::pin_mut!(rows);
+        let mut within = crate::StreamBudget::new(budget);
+        let mut stopped = false;
+        while let Some(r) = rows.try_next().await? {
+            let i = r.get::<_, i64>(0) as usize - 1;
+            let m = LogEntryMeta {
+                seq: r.get::<_, i64>(1) as u64,
+                stored_at_ms: r.get(2),
+                capture_id: r.get(3),
+                content_hash: r.get(4),
+                value: r.get(5),
+            };
+            if !within.take(i, &m) {
+                // Every stream before `i` is whole (an empty one has no
+                // rows); `i` and the rest are not answered.
+                out.truncate(i);
+                out.resize_with(i, Vec::new);
+                stopped = true;
+                break;
+            }
+            while out.len() <= i {
+                out.push(Vec::new());
+            }
+            out[i].push(m);
+        }
+        if !stopped {
+            out.resize_with(streams.len(), Vec::new);
+        }
+        crate::note_stream_reads(&streams[..out.len()], &out);
+        Ok(out)
+    }
+
     async fn apply_batch(&self, batch: &AtomicBatch) -> Result<BatchOutcome> {
         batch.validate()?;
         let fault = self.batch_fault.lock().expect("batch fault").take();

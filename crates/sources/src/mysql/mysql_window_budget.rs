@@ -160,9 +160,10 @@ const TABLE_WRITE_OPS: u64 = 7;
 
 /// One table's complete cost, from its encoded captured schema, its
 /// timeline and the source's other lineages (`key_bytes`: its registry key).
-/// The schema is held three times (as captured, as its registration's
-/// request and as its encoded entry); every record and barrier of its
-/// timeline counts with its encoding.
+/// The schema is held five times (as captured, as its registration's
+/// request and as its encoded entry, and its registry's latest main and
+/// side versions, read for its planning, are counted at its size); every
+/// record and barrier of its timeline counts with its encoding.
 pub(crate) fn table_cost(
     schema_bytes: u64,
     timeline: &super::mysql_selection::Timeline,
@@ -182,7 +183,7 @@ pub(crate) fn table_cost(
     let read_items =
         7 + 8 + other_lineages + 8 + other_lineages + barrier_heads + 2;
     Ok(Cost {
-        bytes: 3 * schema_bytes + timeline_bytes + TABLE_WRITE_OVERHEAD,
+        bytes: 5 * schema_bytes + timeline_bytes + TABLE_WRITE_OVERHEAD,
         read_items,
         read_key_bytes: read_items * (key_bytes + 64),
         write_ops: TABLE_WRITE_OPS,
