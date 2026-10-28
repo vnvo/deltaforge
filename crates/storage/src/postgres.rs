@@ -522,10 +522,12 @@ impl StorageBackend for PostgresStorageBackend {
             out[k] = Some(BatchReadResult::Len(v));
         }
         tx.commit().await?;
-        Ok(out
+        let out: Vec<BatchReadResult> = out
             .into_iter()
             .map(|r| r.expect("every read answered"))
-            .collect())
+            .collect();
+        crate::note_batch_reads(reads, &out);
+        Ok(out)
     }
 
     async fn log_read_streams(
@@ -563,6 +565,7 @@ impl StorageBackend for PostgresStorageBackend {
                 value: r.get(5),
             });
         }
+        crate::note_stream_reads(streams, &out);
         Ok(out)
     }
 
@@ -912,6 +915,7 @@ impl StorageBackend for PostgresStorageBackend {
     }
 
     async fn kv_put(&self, ns: &str, key: &str, value: &[u8]) -> Result<()> {
+        crate::check_guarded_write(ns, key, value.len())?;
         let mut c = client!(self);
         if crate::is_guarded_namespace(ns) {
             // A guarded key is written under the store lock (see
@@ -935,6 +939,7 @@ impl StorageBackend for PostgresStorageBackend {
         value: &[u8],
         ttl_secs: u64,
     ) -> Result<()> {
+        crate::check_guarded_write(ns, key, value.len())?;
         anyhow::ensure!(
             !crate::is_guarded_namespace(ns),
             "a key in guarded namespace {ns} cannot carry a TTL"
@@ -1016,6 +1021,7 @@ impl StorageBackend for PostgresStorageBackend {
         key: &str,
         value: &[u8],
     ) -> Result<u64> {
+        crate::check_guarded_write(ns, key, value.len())?;
         let mut c = client!(self);
         let tx = c.transaction().await?;
         tx.execute(LOCK_LOG_SQL, &[&LOG_ALLOCATION_LOCK]).await?;
@@ -1106,6 +1112,7 @@ impl StorageBackend for PostgresStorageBackend {
         capture_id: &str,
         value: &[u8],
     ) -> Result<LogAppendOutcome> {
+        crate::check_guarded_write(ns, key, value.len())?;
         let digest = content_digest(value);
         let mut c = client!(self);
         let tx = c.transaction().await?;

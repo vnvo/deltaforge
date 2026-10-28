@@ -376,6 +376,7 @@ impl StorageBackend for SqliteStorageBackend {
                 });
             }
             tx.commit()?;
+            crate::note_batch_reads(&reads, &out);
             Ok(out)
         })
     }
@@ -409,6 +410,7 @@ impl StorageBackend for SqliteStorageBackend {
                 }
             }
             tx.commit()?;
+            crate::note_stream_reads(&streams, &out);
             Ok(out)
         })
     }
@@ -642,6 +644,7 @@ impl StorageBackend for SqliteStorageBackend {
     }
 
     async fn kv_put(&self, ns: &str, key: &str, value: &[u8]) -> Result<()> {
+        crate::check_guarded_write(ns, key, value.len())?;
         let ns = ns.to_string();
         let key = key.to_string();
         let value = value.to_vec();
@@ -664,6 +667,7 @@ impl StorageBackend for SqliteStorageBackend {
         value: &[u8],
         ttl_secs: u64,
     ) -> Result<()> {
+        crate::check_guarded_write(ns, key, value.len())?;
         anyhow::ensure!(
             !crate::is_guarded_namespace(ns),
             "a key in guarded namespace {ns} cannot carry a TTL"
@@ -743,6 +747,7 @@ impl StorageBackend for SqliteStorageBackend {
         key: &str,
         value: &[u8],
     ) -> Result<u64> {
+        crate::check_guarded_write(ns, key, value.len())?;
         let ns = ns.to_string();
         let key = key.to_string();
         let value = value.to_vec();
@@ -825,6 +830,7 @@ impl StorageBackend for SqliteStorageBackend {
         capture_id: &str,
         value: &[u8],
     ) -> Result<LogAppendOutcome> {
+        crate::check_guarded_write(ns, key, value.len())?;
         let ns = ns.to_string();
         let key = key.to_string();
         let capture_id = capture_id.to_string();

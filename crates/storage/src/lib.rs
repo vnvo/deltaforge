@@ -455,6 +455,127 @@ pub struct BatchCommitRecord {
 #[error("batch identity conflict: marker {0} records another request")]
 pub struct BatchIdentityConflict(pub String);
 
+/// The most bytes one newly written state item (a kv value or a log entry)
+/// may hold: every batch item, and every single write to a guarded
+/// namespace (`docs/design/mysql-mass-invalidation.md`, "Chunking and size
+/// limits"). Reads are never limited: an item written before the limit
+/// stays readable, counted ([`oversized_reads`]).
+pub const MAX_STATE_ITEM_BYTES: usize = 16 * 1024 * 1024;
+
+/// A write refused before any statement: one item over
+/// [`MAX_STATE_ITEM_BYTES`]. It names no table (the store knows none); the
+/// caller that knows the relation classifies it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "a state item of {size} bytes exceeds the {MAX_STATE_ITEM_BYTES}-byte limit (key digest {key_digest})"
+)]
+pub struct StateItemTooLarge {
+    pub size: usize,
+    /// SHA-256 of the item's namespace and key, hex.
+    pub key_digest: String,
+}
+
+/// The SHA-256 (hex) of a state item's namespace and key.
+pub fn state_key_digest(ns: &str, key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(ns.as_bytes());
+    h.update([0u8]);
+    h.update(key.as_bytes());
+    hex::encode(h.finalize())
+}
+
+/// Refuse a new item of `size` bytes over the limit.
+pub fn check_state_item(
+    ns: &str,
+    key: &str,
+    size: usize,
+) -> std::result::Result<(), StateItemTooLarge> {
+    if size > MAX_STATE_ITEM_BYTES {
+        return Err(StateItemTooLarge {
+            size,
+            key_digest: state_key_digest(ns, key),
+        });
+    }
+    Ok(())
+}
+
+/// A single write's limit: guarded namespaces only (the registry and
+/// activation state a window, baseline or drift writes).
+pub(crate) fn check_guarded_write(
+    ns: &str,
+    key: &str,
+    size: usize,
+) -> Result<()> {
+    if is_guarded_namespace(ns) {
+        check_state_item(ns, key, size)?;
+    }
+    Ok(())
+}
+
+static OVERSIZED_READS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Reads of items over [`MAX_STATE_ITEM_BYTES`] since the process started.
+pub fn oversized_reads() -> u64 {
+    OVERSIZED_READS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Count a read item over the limit (written before the limit existed),
+/// logged once per item with its size and key digest.
+pub(crate) fn note_read(ns: &str, key: &str, size: usize) {
+    if size <= MAX_STATE_ITEM_BYTES {
+        return;
+    }
+    OVERSIZED_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    metrics::counter!("deltaforge_state_oversized_reads_total").increment(1);
+    static LOGGED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    let digest = state_key_digest(ns, key);
+    let mut logged = LOGGED.lock().expect("oversized reads");
+    if logged
+        .get_or_insert_with(Default::default)
+        .insert(digest.clone())
+    {
+        tracing::warn!(
+            size,
+            key_digest = %digest,
+            limit = MAX_STATE_ITEM_BYTES,
+            "a state item over the write limit was read (written before the limit)"
+        );
+    }
+}
+
+/// Count the oversized items among a batched read's results.
+pub(crate) fn note_batch_reads(reads: &[BatchRead], got: &[BatchReadResult]) {
+    for (r, g) in reads.iter().zip(got) {
+        let (BatchRead::KvGet { ns, key } | BatchRead::LogLatest { ns, key }) =
+            r
+        else {
+            continue;
+        };
+        match g {
+            BatchReadResult::Kv(Some(v))
+            | BatchReadResult::Latest(Some((_, v))) => {
+                note_read(ns, key, v.len())
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Count the oversized entries among stream reads.
+pub(crate) fn note_stream_reads(
+    streams: &[(String, String)],
+    got: &[Vec<LogEntryMeta>],
+) {
+    for ((ns, key), entries) in streams.iter().zip(got) {
+        for e in entries {
+            note_read(ns, key, e.value.len());
+        }
+    }
+}
+
 /// The canonical digest of a batch request (its preconditions and ops, a
 /// commit marker excluded), the identity a marker is checked against.
 pub fn batch_digest(batch: &AtomicBatch) -> Vec<u8> {
@@ -730,6 +851,28 @@ impl AtomicBatch {
             ops <= MAX_BATCH_OPS,
             "a batch of {ops} ops exceeds the {MAX_BATCH_OPS}-op limit"
         );
+        for op in &self.ops {
+            // A rendered template is never longer than its sentinel form.
+            let item = match op {
+                BatchOp::LogAppendIfAbsent { ns, key, value, .. } => {
+                    Some((ns, key, value.len()))
+                }
+                BatchOp::KvPut { ns, key, value } => Some((
+                    ns,
+                    key,
+                    match value {
+                        BatchValue::Bytes(b) => b.len(),
+                        BatchValue::SeqTemplate { template, .. } => {
+                            template.len()
+                        }
+                    },
+                )),
+                _ => None,
+            };
+            if let Some((ns, key, size)) = item {
+                check_state_item(ns, key, size)?;
+            }
+        }
         for (i, op) in self.ops.iter().enumerate() {
             let of = match op {
                 BatchOp::CommitMarker { .. } => {
@@ -2552,6 +2695,12 @@ pub(crate) mod atomic_batch_suite {
         an_expired_value_reads_as_absent(be.clone(), &format!("{ns}_ttl"))
             .await;
         large_groups_keep_request_order(be.clone(), &format!("{ns}_big")).await;
+        oversized_items_are_refused(be.clone(), &format!("{ns}_m")).await;
+        oversized_legacy_items_stay_readable(
+            be.clone(),
+            &format!("{ns}_legacy"),
+        )
+        .await;
     }
 
     /// A max sees the batch's own earlier writes of its key, and repeated
@@ -2785,6 +2934,91 @@ pub(crate) mod atomic_batch_suite {
         let big = be.log_list(ns, "big").await.unwrap();
         assert_eq!(big.len(), 3);
         assert!(big.iter().all(|(_, v)| v.len() == 2 * 1024 * 1024));
+    }
+
+    /// A newly written state item may not exceed `MAX_STATE_ITEM_BYTES`: a
+    /// batch item over it is refused before any statement with its size and
+    /// key digest, and nothing is written; one at the limit commits. A
+    /// single write to a guarded namespace is refused the same way.
+    pub async fn oversized_items_are_refused(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
+        let at = vec![7u8; MAX_STATE_ITEM_BYTES];
+        let over = vec![7u8; MAX_STATE_ITEM_BYTES + 1];
+        let batch = |log_value: &[u8], kv_value: &[u8]| AtomicBatch {
+            preconditions: vec![],
+            ops: vec![
+                log(ns, "s", "e", log_value),
+                BatchOp::KvPut {
+                    ns: ns.into(),
+                    key: "k".into(),
+                    value: BatchValue::Bytes(kv_value.to_vec()),
+                },
+            ],
+        };
+        for (log_value, kv_value, key) in [(&over, &at, "s"), (&at, &over, "k")]
+        {
+            let err = be
+                .apply_batch(&batch(log_value, kv_value))
+                .await
+                .unwrap_err();
+            let too = err
+                .downcast_ref::<StateItemTooLarge>()
+                .unwrap_or_else(|| panic!("{err:#}"));
+            assert_eq!(too.size, MAX_STATE_ITEM_BYTES + 1);
+            assert_eq!(too.key_digest, state_key_digest(ns, key));
+            assert!(be.log_list(ns, "s").await.unwrap().is_empty());
+            assert_eq!(be.kv_get(ns, "k").await.unwrap(), None);
+        }
+        committed(be.apply_batch(&batch(&at, &at)).await.unwrap());
+        let guarded = "schemas.v1.oversize";
+        let err = be.kv_put(guarded, ns, &over).await.unwrap_err();
+        assert!(err.downcast_ref::<StateItemTooLarge>().is_some(), "{err:#}");
+        let err = be.log_append(guarded, ns, &over).await.unwrap_err();
+        assert!(err.downcast_ref::<StateItemTooLarge>().is_some(), "{err:#}");
+    }
+
+    /// An item over the limit written before it existed (an unguarded one
+    /// here) stays readable through batched and stream reads, and each such
+    /// read is counted.
+    pub async fn oversized_legacy_items_stay_readable(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
+        let over = vec![3u8; MAX_STATE_ITEM_BYTES + 10];
+        be.kv_put(ns, "legacy", &over).await.unwrap();
+        be.log_append(ns, "legacy", &over).await.unwrap();
+        let before = oversized_reads();
+        let got = be
+            .read_batch(&[
+                BatchRead::KvGet {
+                    ns: ns.into(),
+                    key: "legacy".into(),
+                },
+                BatchRead::LogLatest {
+                    ns: ns.into(),
+                    key: "legacy".into(),
+                },
+            ])
+            .await
+            .unwrap();
+        assert!(
+            matches!(&got[0], BatchReadResult::Kv(Some(v)) if v.len() == over.len())
+        );
+        assert!(
+            matches!(&got[1], BatchReadResult::Latest(Some((_, v))) if v.len() == over.len())
+        );
+        let streams = be
+            .log_read_streams(&[(ns.into(), "legacy".into())])
+            .await
+            .unwrap();
+        assert_eq!(streams[0][0].value.len(), over.len());
+        assert!(
+            oversized_reads() >= before + 3,
+            "{} {before}",
+            oversized_reads()
+        );
     }
 
     /// Every stream as paged out one by one.
