@@ -131,8 +131,16 @@ pub(crate) async fn prove(
     // 1. Captures, bound to their intervals by step 3.
     let mut captured = Vec::new();
     for p in open {
-        match capture(&ctx.dsn, &server_uuid, &lineage, &p.db, &p.table, None)
-            .await
+        // A stop ends the proof (`?`): nothing is decided.
+        match capture(
+            &ctx.capture,
+            &server_uuid,
+            &lineage,
+            &p.db,
+            &p.table,
+            None,
+        )
+        .await?
         {
             Ok(cap) => {
                 observe_capture(&tag, &cap);

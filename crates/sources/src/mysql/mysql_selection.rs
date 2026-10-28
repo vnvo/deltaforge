@@ -1040,8 +1040,9 @@ async fn full_fallback(
     // The live shape, captured with its own interval proven free of anything
     // affecting the table, and only then registered through the normal
     // registry path (never derived from the TableMap).
+    // A stop ends the selection (`?`): nothing is decided.
     let cap = match capture_proven(
-        &ctx.dsn,
+        &ctx.capture,
         super::mysql_helpers::derive_server_id(&format!(
             "{}/capture",
             ctx.source_id
@@ -1066,7 +1067,7 @@ async fn full_fallback(
             anchor: None,
         }),
     )
-    .await
+    .await?
     {
         Ok(cap) => cap,
         Err(ProofError::OtherServer(found)) => {

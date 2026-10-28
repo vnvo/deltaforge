@@ -124,7 +124,8 @@ pub(crate) struct DriftEnv<'a> {
     pub backend: &'a ArcStorageBackend,
     pub loader: &'a MySqlSchemaLoader,
     pub scope: &'a RegistryScope,
-    pub dsn: &'a crate::credentials::SharedDsn,
+    /// The run's capture context (its DSN and stop).
+    pub capture: &'a super::mysql_binlog_scan::CaptureCtx,
     pub server_uuid: &'a str,
     pub source_id: &'a str,
     pub halt: bool,
@@ -464,15 +465,16 @@ async fn shape_at_failover(
         kind: ProofKind::FailoverDrift,
     };
     let lctn = env.lower_case_table_names;
+    // A stop ends the check (`?`): nothing is decided.
     let cap = match capture(
-        env.dsn,
+        env.capture,
         env.server_uuid,
         &anchor.current_lineage,
         db,
         table,
         None,
     )
-    .await
+    .await?
     {
         Ok(cap) => {
             observe_capture(&tag, &cap);
@@ -521,7 +523,7 @@ async fn shape_at_failover(
                 matches!(event, FirstEvent::Rows { .. }).then_some(&from);
             super::mysql_proof_scanner::shared_interval(
                 proofs,
-                env.dsn.current().expose(),
+                env.capture.dsn().current().expose(),
                 env.source_id,
                 env.server_uuid,
                 &anchor.current_lineage,
@@ -535,7 +537,7 @@ async fn shape_at_failover(
         }
         _ => {
             scan_interval(
-                env.dsn.current().expose(),
+                env.capture.dsn().current().expose(),
                 super::mysql_helpers::derive_server_id(&format!(
                     "{}/failover-drift",
                     env.source_id
@@ -789,7 +791,7 @@ pub(crate) async fn check_in_stream(
             backend: &ctx.registry_backend,
             loader: &ctx.schema,
             scope: &scope,
-            dsn: &ctx.dsn,
+            capture: &ctx.capture,
             server_uuid: &server_uuid,
             source_id: &ctx.source_id,
             halt: ctx.on_schema_drift == deltaforge_config::OnSchemaDrift::Halt,
@@ -839,7 +841,7 @@ pub(crate) async fn check_window(
             backend: &ctx.registry_backend,
             loader: &ctx.schema,
             scope: &scope,
-            dsn: &ctx.dsn,
+            capture: &ctx.capture,
             server_uuid: &server_uuid,
             source_id: &ctx.source_id,
             halt: ctx.on_schema_drift == deltaforge_config::OnSchemaDrift::Halt,
@@ -968,7 +970,7 @@ mod tests {
             backend: &backend,
             loader: &loader,
             scope: &scope,
-            dsn: &crate::credentials::SharedDsn::from(""),
+            capture: &super::super::mysql_binlog_scan::CaptureCtx::detached(""),
             server_uuid: B,
             source_id: "s",
             halt: true,
@@ -1088,7 +1090,10 @@ mod tests {
                     backend: &backend,
                     loader,
                     scope,
-                    dsn: &crate::credentials::SharedDsn::from(""),
+                    capture:
+                        &super::super::mysql_binlog_scan::CaptureCtx::detached(
+                            "",
+                        ),
                     server_uuid: B,
                     source_id: "s",
                     halt: true,

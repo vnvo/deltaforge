@@ -1561,6 +1561,9 @@ pub(crate) mod tests {
             ),
             tenant: "test-tenant".to_string(),
             dsn: "mysql://fake".to_string().into(),
+            capture: crate::mysql::mysql_binlog_scan::CaptureCtx::detached(
+                "mysql://fake",
+            ),
             host: "localhost".to_string(),
             default_db: "test".to_string(),
             server_id: 1,
