@@ -2402,7 +2402,15 @@ pub(crate) mod tests {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
-            let production = match text.find("\n#[cfg(test)]\nmod ") {
+            // The test module, however visible it is.
+            let production = match [
+                "\n#[cfg(test)]\nmod tests",
+                "\n#[cfg(test)]\npub(crate) mod tests",
+            ]
+            .iter()
+            .filter_map(|m| text.find(m))
+            .min()
+            {
                 Some(i) => &text[..i],
                 None => &text[..],
             };
@@ -2454,8 +2462,14 @@ pub(crate) mod tests {
         // Every production capture, by path: what it passes as its context.
         let calls = [
             ("mysql_forward_proof.rs", "capture(&ctx.capture,", 1),
+            // The lazy baseline, and the per-table snapshot path (kept as the
+            // batched one's test reference).
             ("mysql_baseline.rs", "capture(&ctx.capture,", 2),
+            // Snapshot baselines, one batched capture per chunk.
+            ("mysql_baseline.rs", "capture_batch(&ctx.capture,", 1),
+            // The per-table drift check, and snapshot-time drift per chunk.
             ("mysql_failover_drift.rs", "capture(env.capture,", 1),
+            ("mysql_failover_drift.rs", "capture_batch(env.capture,", 1),
             ("mysql_selection.rs", "capture_proven(&ctx.capture,", 1),
             (
                 "mysql_activation_window.rs",
@@ -2511,7 +2525,7 @@ pub(crate) mod tests {
             );
             total += n;
         }
-        assert_eq!(total, 9);
+        assert_eq!(total, 11);
         // The window's captures (also speculative ones) and the snapshot's
         // and stream's drift checks carry the run's context.
         let window = &sources
