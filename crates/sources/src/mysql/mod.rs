@@ -262,6 +262,8 @@ pub(crate) struct RunCtx {
     table_metrics: Arc<deltaforge_core::table_metrics::TableMetrics>,
     tenant: String,
     dsn: crate::credentials::SharedDsn,
+    /// The run's capture context: the same DSN and the run's stop.
+    capture: mysql_binlog_scan::CaptureCtx,
     #[allow(dead_code)]
     host: String,
     default_db: String,
@@ -1410,6 +1412,12 @@ impl MySqlSource {
         // The run's one authoritative DSN, shared by every connection
         // factory of the run (see `SharedDsn`).
         let run_dsn = crate::credentials::SharedDsn::new(self.dsn.clone());
+        // The run's one capture context (that DSN and the run's stop),
+        // shared by every schema capture of the run.
+        let captures = mysql_binlog_scan::CaptureCtx::for_run(
+            run_dsn.clone(),
+            cancel.clone(),
+        );
         // Verify the source lineage ONCE, before any snapshot, stream, or RunCtx.
         // Fail closed if it cannot be established: a swallowed error here would
         // proceed to snapshot/stream with no durable-watermark identity, leaving
@@ -1605,8 +1613,7 @@ impl MySqlSource {
                             backend: &self.backend,
                             loader: &snap_schema_loader,
                             scope: &drift_scope,
-                            dsn: &run_dsn,
-                            cancel: &cancel,
+                            capture: &captures,
                             server_uuid: &server_uuid,
                             source_id: &self.id,
                             halt: self.on_schema_drift
@@ -1759,6 +1766,7 @@ impl MySqlSource {
             ),
             tenant: self.tenant.clone(),
             dsn: run_dsn,
+            capture: captures,
             host,
             default_db,
             server_id,

@@ -561,14 +561,13 @@ pub(super) async fn maybe_window(
     // captured speculatively (nothing of `ctx` is held by that).
     let server_uuid = ctx.expected_uuid().map_err(LoopControl::Fail)?;
     let capture = CaptureScan {
-        dsn: ctx.dsn.clone(),
+        capture: ctx.capture.clone(),
         anchor: ctx.stream_anchor(&server_uuid, &lineage),
         server_uuid,
         lineage: lineage.clone(),
         source_id: ctx.source_id.clone(),
         lock_wait_secs: cfg.capture_lock_wait_secs,
         scanner: std::sync::Arc::clone(&ctx.proof_scanner),
-        cancel: ctx.cancel.clone(),
     };
     let mut collector = Collector::new(
         ahead,
@@ -825,15 +824,14 @@ struct Admitted {
 /// speculative window's task holds no part of `RunCtx`).
 #[derive(Clone)]
 pub(crate) struct CaptureScan {
-    pub dsn: crate::credentials::SharedDsn,
+    /// The run's capture context: its DSN and stop (an in-flight capture,
+    /// also a speculative one, is cancelled).
+    pub capture: super::mysql_binlog_scan::CaptureCtx,
     pub server_uuid: String,
     pub lineage: String,
     pub source_id: String,
     pub lock_wait_secs: u32,
     pub scanner: std::sync::Arc<super::mysql_proof_scanner::ProofScanner>,
-    /// The run's stop: an in-flight capture (also a speculative one) is
-    /// cancelled.
-    pub cancel: tokio_util::sync::CancellationToken,
     pub anchor: Option<super::mysql_binlog_scan::Anchor>,
 }
 
@@ -864,22 +862,19 @@ pub(crate) async fn capture_and_scan(
     let t = Instant::now();
     let cap = loop {
         attempts += 1;
+        // A stop ends the window (`?`), never retried: nothing of it was
+        // dispatched.
         match capture_batch(
-            &cs.dsn,
+            &cs.capture,
             &cs.server_uuid,
             &cs.lineage,
             tables,
             cs.lock_wait_secs,
             None,
-            &cs.cancel,
         )
-        .await
+        .await?
         {
             Ok(c) => break c,
-            // A stop: never retried; nothing of the window was dispatched.
-            Err(BatchCaptureError::Failed(ProofError::Cancelled)) => {
-                return Err(SourceError::Cancelled);
-            }
             Err(BatchCaptureError::Failed(ProofError::OtherServer(found))) => {
                 return Err(SourceError::Lineage {
                     details: format!(
@@ -908,7 +903,7 @@ pub(crate) async fn capture_and_scan(
     let t = Instant::now();
     let answers = match super::mysql_proof_scanner::shared_intervals(
         &cs.scanner,
-        cs.dsn.current().expose(),
+        cs.capture.dsn().current().expose(),
         &cs.source_id,
         &cs.server_uuid,
         &cs.lineage,

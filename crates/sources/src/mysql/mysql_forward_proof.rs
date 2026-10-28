@@ -131,23 +131,21 @@ pub(crate) async fn prove(
     // 1. Captures, bound to their intervals by step 3.
     let mut captured = Vec::new();
     for p in open {
+        // A stop ends the proof (`?`): nothing is decided.
         match capture(
-            &ctx.dsn,
+            &ctx.capture,
             &server_uuid,
             &lineage,
             &p.db,
             &p.table,
             None,
-            &ctx.cancel,
         )
-        .await
+        .await?
         {
             Ok(cap) => {
                 observe_capture(&tag, &cap);
                 captured.push((p, cap))
             }
-            // A stop: nothing is decided; the run ends without advancing.
-            Err(ProofError::Cancelled) => return Err(SourceError::Cancelled),
             Err(ProofError::OtherServer(found)) => {
                 return Err(other_server(&server_uuid, &found));
             }

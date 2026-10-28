@@ -287,10 +287,64 @@ pub(crate) enum ProofError {
         "the binlog seek exceeded its bound ({0}); the interval is unproven"
     )]
     SeekLimit(String),
-    /// The run stopped while the capture was in flight: its session is
-    /// killed (as for any dropped capture) and nothing was decided.
-    #[error("the capture was cancelled: the source is stopping")]
-    Cancelled,
+}
+
+/// The run stopped while a capture was in flight: its session is killed
+/// (as for any dropped capture) and nothing was decided. Never a
+/// [`ProofError`]: a capture's outcome is `Result<Result<_, ProofError>,
+/// Cancelled>`, so no caller can take a stop for a failed capture (a
+/// fallback, a retry, an admission going on); `?` ends the caller as
+/// [`SourceError::Cancelled`](deltaforge_core::SourceError::Cancelled).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Cancelled;
+
+impl From<Cancelled> for deltaforge_core::SourceError {
+    fn from(_: Cancelled) -> Self {
+        deltaforge_core::SourceError::Cancelled
+    }
+}
+
+/// A run's schema-capture context: its one authoritative DSN and its stop.
+/// Built once per run ([`CaptureCtx::for_run`]) and shared by every
+/// capture of the run (forward proofs, snapshot and lazy baselines,
+/// failover drift, FULL fallback, activation windows), the only way to
+/// start a capture: none can use another DSN or miss the run's stop.
+#[derive(Clone)]
+pub(crate) struct CaptureCtx {
+    dsn: crate::credentials::SharedDsn,
+    cancel: CancellationToken,
+}
+
+impl CaptureCtx {
+    /// The run's context. Called once, where the run starts.
+    pub(crate) fn for_run(
+        dsn: crate::credentials::SharedDsn,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self { dsn, cancel }
+    }
+
+    /// The run's authoritative DSN.
+    pub(crate) fn dsn(&self) -> &crate::credentials::SharedDsn {
+        &self.dsn
+    }
+
+    /// A context of its own (tests), stopped with [`CaptureCtx::stop`].
+    #[cfg(test)]
+    pub(crate) fn detached(
+        dsn: impl Into<crate::credentials::SharedDsn>,
+    ) -> Self {
+        Self {
+            dsn: dsn.into(),
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    /// Stop the context's run (tests).
+    #[cfg(test)]
+    pub(crate) fn stop(&self) {
+        self.cancel.cancel();
+    }
 }
 
 fn add_gtid(set: &mut GtidSet, gtid: &str) -> Result<(), ProofError> {
@@ -1494,39 +1548,36 @@ pub(crate) fn kill_failures() -> u64 {
 /// Read `db.table`'s shape between two positions (module docs). Never
 /// requires the server to be quiet: the positions may differ.
 pub(crate) async fn capture(
-    dsn: &crate::credentials::SharedDsn,
+    cx: &CaptureCtx,
     server_uuid: &str,
     lineage_hash: &str,
     db: &str,
     table: &str,
     between: Option<BetweenHook<'_>>,
-    cancel: &CancellationToken,
-) -> Result<Captured, ProofError> {
+) -> Result<Result<Captured, ProofError>, Cancelled> {
     capture_with(
         &CAPTURE_SLOTS,
-        dsn,
+        cx,
         server_uuid,
         lineage_hash,
         db,
         table,
         between,
-        cancel,
     )
     .await
 }
 
 /// [`capture`] under the given capture slots.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn capture_with(
     slots: &'static CaptureSlots,
-    dsn: &crate::credentials::SharedDsn,
+    cx: &CaptureCtx,
     server_uuid: &str,
     lineage_hash: &str,
     db: &str,
     table: &str,
     between: Option<BetweenHook<'_>>,
-    cancel: &CancellationToken,
-) -> Result<Captured, ProofError> {
+) -> Result<Result<Captured, ProofError>, Cancelled> {
+    let dsn = &cx.dsn;
     let pool = mysql_async::Pool::new(dsn.current().expose());
     let mut trace = CaptureTrace::default();
     let t0 = Instant::now();
@@ -1640,16 +1691,16 @@ pub(crate) async fn capture_with(
         biased;
         // A stop: the capture is dropped where it stands and its armed
         // guard kills its session (a lock wait ends at once).
-        _ = cancel.cancelled() => return Err(ProofError::Cancelled),
+        _ = cx.cancel.cancelled() => return Err(Cancelled),
         r = body => r,
     };
     guard.id = 0;
     guard.permit = None;
     pool.disconnect().await.ok();
-    result.map(|mut c| {
+    Ok(result.map(|mut c| {
         c.trace = trace;
         c
-    })
+    }))
 }
 
 /// Kills its connection on the server when dropped while armed (`id`
@@ -1879,39 +1930,36 @@ async fn lock_all(
 /// table is locked (tests use it to race a multi-table DDL; production
 /// passes `None`).
 pub(crate) async fn capture_batch(
-    dsn: &crate::credentials::SharedDsn,
+    cx: &CaptureCtx,
     server_uuid: &str,
     lineage_hash: &str,
     tables: &[(String, String)],
     lock_wait_secs: u32,
     after_first_lock: Option<BetweenHook<'_>>,
-    cancel: &CancellationToken,
-) -> Result<BatchCaptured, BatchCaptureError> {
+) -> Result<Result<BatchCaptured, BatchCaptureError>, Cancelled> {
     capture_batch_with(
         &CAPTURE_SLOTS,
-        dsn,
+        cx,
         server_uuid,
         lineage_hash,
         tables,
         lock_wait_secs,
         after_first_lock,
-        cancel,
     )
     .await
 }
 
 /// [`capture_batch`] under the given capture slots.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn capture_batch_with(
     slots: &'static CaptureSlots,
-    dsn: &crate::credentials::SharedDsn,
+    cx: &CaptureCtx,
     server_uuid: &str,
     lineage_hash: &str,
     tables: &[(String, String)],
     lock_wait_secs: u32,
     after_first_lock: Option<BetweenHook<'_>>,
-    cancel: &CancellationToken,
-) -> Result<BatchCaptured, BatchCaptureError> {
+) -> Result<Result<BatchCaptured, BatchCaptureError>, Cancelled> {
+    let dsn = &cx.dsn;
     let failed = |e: ProofError| BatchCaptureError::Failed(e);
     let mut sorted: Vec<(String, String)> = tables.to_vec();
     sorted.sort();
@@ -2077,18 +2125,16 @@ pub(crate) async fn capture_batch_with(
     let result = tokio::select! {
         biased;
         // A stop: as in `capture_with`.
-        _ = cancel.cancelled() => {
-            return Err(BatchCaptureError::Failed(ProofError::Cancelled));
-        }
+        _ = cx.cancel.cancelled() => return Err(Cancelled),
         r = body => r,
     };
     guard.id = 0;
     guard.permit = None;
     pool.disconnect().await.ok();
-    result.map(|mut c| {
+    Ok(result.map(|mut c| {
         c.trace = trace;
         c
-    })
+    }))
 }
 
 /// Bounded capture metrics (lock wait and schema query apart). Never fails.
@@ -2204,7 +2250,7 @@ pub(crate) struct SharedProofs<'a> {
 /// (retention, unknown events, limits, another server) fails closed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn capture_proven(
-    dsn: &crate::credentials::SharedDsn,
+    cx: &CaptureCtx,
     scan_server_id: u64,
     server_uuid: &str,
     lineage_hash: &str,
@@ -2216,86 +2262,243 @@ pub(crate) async fn capture_proven(
     between: Option<BetweenHook<'_>>,
     tag: &ScanTag<'_>,
     shared: Option<SharedProofs<'_>>,
-    cancel: &CancellationToken,
-) -> Result<Captured, ProofError> {
-    let mut retries = Vec::new();
-    for attempt in 1..=attempts.max(1) {
-        let mut cap =
-            capture(dsn, server_uuid, lineage_hash, db, table, between, cancel)
-                .await?;
-        cap.attempts = attempt;
-        let report = match &shared {
-            Some(sp) => {
-                super::mysql_proof_scanner::shared_interval(
-                    sp.scanner,
-                    dsn.current().expose(),
-                    tag.source_id,
-                    server_uuid,
-                    lineage_hash,
-                    &cap.from,
-                    &cap.position,
-                    sp.anchor,
-                    sp.boundary,
-                    tag,
-                )
-                .await?
-            }
-            None => {
-                scan_interval(
-                    dsn.current().expose(),
-                    scan_server_id,
-                    server_uuid,
-                    lineage_hash,
-                    &cap.from,
-                    &cap.position,
-                    limits,
-                    tag,
-                )
-                .await?
-            }
-        };
-        let relevant = report.statements.iter().any(|st| {
-            super::mysql_baseline::affects(
-                st,
-                db,
-                table,
-                lower_case_table_names,
-            )
-        });
-        cap.trace.retries = retries.clone();
-        observe_capture(tag, &cap);
-        if !relevant {
-            trace_proof(
-                tag,
-                db,
-                table,
-                Some(&cap),
-                Some(&report),
-                lower_case_table_names,
-                "proven",
-            );
-            return Ok(cap);
-        }
-        retries.push("relevant statement in the capture interval".into());
-        tokio::time::sleep(Duration::from_millis(20 * u64::from(attempt)))
-            .await;
+) -> Result<Result<Captured, ProofError>, Cancelled> {
+    /// How an attempt ends early: a stop, or a proof failure.
+    enum Ended {
+        Stopped,
+        Failed(ProofError),
     }
-    trace_proof(
-        tag,
-        db,
-        table,
-        None,
-        None,
-        lower_case_table_names,
-        "unstable",
-    );
-    Err(ProofError::Unstable(attempts.max(1)))
+    impl From<ProofError> for Ended {
+        fn from(e: ProofError) -> Self {
+            Ended::Failed(e)
+        }
+    }
+    let dsn = cx.dsn();
+    let proven = async {
+        let mut retries = Vec::new();
+        for attempt in 1..=attempts.max(1) {
+            let mut cap =
+                capture(cx, server_uuid, lineage_hash, db, table, between)
+                    .await
+                    .map_err(|Cancelled| Ended::Stopped)??;
+            cap.attempts = attempt;
+            let report = match &shared {
+                Some(sp) => {
+                    super::mysql_proof_scanner::shared_interval(
+                        sp.scanner,
+                        dsn.current().expose(),
+                        tag.source_id,
+                        server_uuid,
+                        lineage_hash,
+                        &cap.from,
+                        &cap.position,
+                        sp.anchor,
+                        sp.boundary,
+                        tag,
+                    )
+                    .await?
+                }
+                None => {
+                    scan_interval(
+                        dsn.current().expose(),
+                        scan_server_id,
+                        server_uuid,
+                        lineage_hash,
+                        &cap.from,
+                        &cap.position,
+                        limits,
+                        tag,
+                    )
+                    .await?
+                }
+            };
+            let relevant = report.statements.iter().any(|st| {
+                super::mysql_baseline::affects(
+                    st,
+                    db,
+                    table,
+                    lower_case_table_names,
+                )
+            });
+            cap.trace.retries = retries.clone();
+            observe_capture(tag, &cap);
+            if !relevant {
+                trace_proof(
+                    tag,
+                    db,
+                    table,
+                    Some(&cap),
+                    Some(&report),
+                    lower_case_table_names,
+                    "proven",
+                );
+                return Ok(cap);
+            }
+            retries.push("relevant statement in the capture interval".into());
+            tokio::time::sleep(Duration::from_millis(20 * u64::from(attempt)))
+                .await;
+        }
+        trace_proof(
+            tag,
+            db,
+            table,
+            None,
+            None,
+            lower_case_table_names,
+            "unstable",
+        );
+        Err(Ended::Failed(ProofError::Unstable(attempts.max(1))))
+    };
+    match proven.await {
+        Ok(cap) => Ok(Ok(cap)),
+        Err(Ended::Failed(e)) => Ok(Err(e)),
+        Err(Ended::Stopped) => Err(Cancelled),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::mysql_ddl_attribution::TableName;
     use super::*;
+
+    /// The production text of each MySQL source file (before its test
+    /// module): (file, text, text with whitespace removed).
+    fn production_sources() -> Vec<(String, String, String)> {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/mysql");
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let production = match text.find("\n#[cfg(test)]\nmod ") {
+                Some(i) => &text[..i],
+                None => &text[..],
+            };
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            out.push((
+                name,
+                production.to_string(),
+                production.split_whitespace().collect(),
+            ));
+        }
+        out
+    }
+
+    /// Every schema capture of a run shares the one context the run
+    /// builds: the capture APIs take only a `CaptureCtx`, production code
+    /// builds exactly one (from the run's DSN and its own stop token), and
+    /// each capture path passes the run's context on (forward proofs,
+    /// snapshot and lazy baselines, failover drift, FULL fallback and
+    /// activation windows). A capture with another token would outlast a
+    /// stop by its whole lock wait.
+    #[test]
+    fn every_capture_path_shares_the_runs_capture_context() {
+        let sources = production_sources();
+        let built: Vec<&str> = sources
+            .iter()
+            .flat_map(|(f, _, t)| {
+                std::iter::repeat_n(
+                    f.as_str(),
+                    t.matches("CaptureCtx::for_run(").count(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            built,
+            ["mod.rs"],
+            "where the run's capture context is built"
+        );
+        let run = &sources.iter().find(|(f, _, _)| f == "mod.rs").unwrap().2;
+        assert!(
+            run.contains(
+                "letcaptures=mysql_binlog_scan::CaptureCtx::for_run(run_dsn.clone(),cancel.clone(),);"
+            ),
+            "the run's context is built from the run's DSN and stop"
+        );
+        assert!(
+            run.contains("asyncfnrun_inner(&self,tx:mpsc::Sender<SourceItem>,chkpt_store:Arc<dynCheckpointStore>,cancel:CancellationToken,"),
+            "`cancel` is the run's stop token"
+        );
+        // Every production capture, by path: what it passes as its context.
+        let calls = [
+            ("mysql_forward_proof.rs", "capture(&ctx.capture,", 1),
+            ("mysql_baseline.rs", "capture(&ctx.capture,", 2),
+            ("mysql_failover_drift.rs", "capture(env.capture,", 1),
+            ("mysql_selection.rs", "capture_proven(&ctx.capture,", 1),
+            (
+                "mysql_activation_window.rs",
+                "capture_batch(&cs.capture,",
+                1,
+            ),
+        ];
+        for (file, call, n) in calls {
+            let text = &sources.iter().find(|(f, _, _)| f == file).unwrap().2;
+            assert_eq!(text.matches(call).count(), n, "{file}: {call}");
+        }
+        // Capture calls in `t`: not a definition, a path or another name's
+        // suffix (`observe_capture(`).
+        let entry = |t: &str| {
+            let names = [
+                "capture(",
+                "capture_with(",
+                "capture_batch(",
+                "capture_batch_with(",
+                "capture_proven(",
+            ];
+            names
+                .iter()
+                .map(|c| {
+                    t.match_indices(c)
+                        .filter(|(i, _)| {
+                            let before = &t[..*i];
+                            let joined =
+                                before.chars().last().is_some_and(|c| {
+                                    c.is_alphanumeric() || c == '_'
+                                });
+                            !before.ends_with("fn ")
+                                && !before.ends_with("::")
+                                && !joined
+                        })
+                        .count()
+                })
+                .sum::<usize>()
+        };
+        let mut total = 0;
+        for (file, raw, _) in &sources {
+            let n = entry(raw);
+            let known: usize = calls
+                .iter()
+                .filter(|(f, _, _)| f == file)
+                .map(|(_, _, n)| n)
+                .sum();
+            let inner = if file == "mysql_binlog_scan.rs" { 3 } else { 0 };
+            assert_eq!(
+                n,
+                known + inner,
+                "{file}: a capture call outside the listed paths"
+            );
+            total += n;
+        }
+        assert_eq!(total, 9);
+        // The window's captures (also speculative ones) and the snapshot's
+        // and stream's drift checks carry the run's context.
+        let window = &sources
+            .iter()
+            .find(|(f, _, _)| f == "mysql_activation_window.rs")
+            .unwrap()
+            .2;
+        assert!(window.contains("capture:ctx.capture.clone(),"));
+        assert_eq!(run.matches("capture:&captures,").count(), 1);
+        assert_eq!(run.matches("capture:captures,").count(), 1);
+        let drift = &sources
+            .iter()
+            .find(|(f, _, _)| f == "mysql_failover_drift.rs")
+            .unwrap()
+            .2;
+        assert_eq!(drift.matches("capture:&ctx.capture,").count(), 2);
+    }
 
     /// A cancellation that cannot reach the server is counted (and
     /// logged), never silent (finding 3).
@@ -3628,15 +3831,15 @@ mod tests {
                 let task = tokio::spawn(async move {
                     capture_with(
                         slots,
-                        &crate::credentials::SharedDsn::from(d.as_str()),
+                        &CaptureCtx::detached(d.as_str()),
                         &u,
                         LINEAGE,
                         db,
                         "t",
                         None,
-                        &tokio_util::sync::CancellationToken::new(),
                     )
                     .await
+                    .expect("not cancelled")
                 });
                 let deadline = Instant::now() + Duration::from_secs(20);
                 while waiting_capture(&dsn, db, "t").await.is_empty() {
@@ -3658,19 +3861,19 @@ mod tests {
                 holder.query_drop("UNLOCK TABLES").await.unwrap();
             }
 
-            /// A capture started with `token` on `db.t` (single, or the
-            /// batched form with a 300 s lock wait); `hold` pauses it, once
-            /// locked, until it is dropped.
+            /// A capture under `cx` on `db.t` (single, or the batched form
+            /// with a 300 s lock wait); `hold` pauses it, once locked, until
+            /// it is dropped. A failed capture is its error's text.
             fn cancellable(
                 slots: &'static CaptureSlots,
-                dsn: &str,
+                cx: CaptureCtx,
                 u: &str,
                 db: &'static str,
                 batched: bool,
                 hold: Option<Arc<AtomicU32>>,
-                token: tokio_util::sync::CancellationToken,
-            ) -> tokio::task::JoinHandle<Result<(), ProofError>> {
-                let (d, u) = (dsn.to_string(), u.to_string());
+            ) -> tokio::task::JoinHandle<Result<Result<(), String>, Cancelled>>
+            {
+                let u = u.to_string();
                 tokio::spawn(async move {
                     let hook = move || -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
                         let hold = hold.clone();
@@ -3681,39 +3884,31 @@ mod tests {
                             }
                         })
                     };
-                    let shared =
-                        crate::credentials::SharedDsn::from(d.as_str());
                     if batched {
                         let tables = vec![(db.to_string(), "t".to_string())];
                         capture_batch_with(
                             slots,
-                            &shared,
+                            &cx,
                             &u,
                             LINEAGE,
                             &tables,
                             300,
                             Some(&hook),
-                            &token,
                         )
                         .await
-                        .map(|_| ())
-                        .map_err(|e| match e {
-                            BatchCaptureError::Failed(e) => e,
-                            other => ProofError::Capture(format!("{other:?}")),
-                        })
+                        .map(|r| r.map(|_| ()).map_err(|e| format!("{e:?}")))
                     } else {
                         capture_with(
                             slots,
-                            &shared,
+                            &cx,
                             &u,
                             LINEAGE,
                             db,
                             "t",
                             Some(&hook),
-                            &token,
                         )
                         .await
-                        .map(|_| ())
+                        .map(|r| r.map(|_| ()).map_err(|e| format!("{e:?}")))
                     }
                 })
             }
@@ -3761,16 +3956,15 @@ mod tests {
                         .unwrap();
                     let slots: &'static CaptureSlots =
                         Box::leak(Box::new(CaptureSlots::new(4, 4)));
-                    let token = tokio_util::sync::CancellationToken::new();
+                    let cx = CaptureCtx::detached(dsn.as_str());
                     let failures = kill_failures();
                     let task = cancellable(
                         slots,
-                        &dsn,
+                        cx.clone(),
                         &uuid(&dsn).await,
                         db,
                         batched,
                         None,
-                        token.clone(),
                     );
                     let deadline = Instant::now() + Duration::from_secs(20);
                     while waiting_capture(&dsn, db, "t").await.is_empty() {
@@ -3781,15 +3975,12 @@ mod tests {
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                     let t = Instant::now();
-                    token.cancel();
+                    cx.stop();
                     let r = tokio::time::timeout(Duration::from_secs(2), task)
                         .await
                         .expect("the cancelled capture returns at once")
                         .unwrap();
-                    assert!(
-                        matches!(r, Err(ProofError::Cancelled)),
-                        "{db}: {r:?}"
-                    );
+                    assert!(matches!(r, Err(Cancelled)), "{db}: {r:?}");
                     assert!(
                         t.elapsed() < Duration::from_secs(1),
                         "{db}: {:?}",
@@ -3843,16 +4034,15 @@ mod tests {
                     .await;
                     let slots: &'static CaptureSlots =
                         Box::leak(Box::new(CaptureSlots::new(4, 4)));
-                    let token = tokio_util::sync::CancellationToken::new();
+                    let cx = CaptureCtx::detached(dsn.as_str());
                     let inside = Arc::new(AtomicU32::new(0));
                     let task = cancellable(
                         slots,
-                        &dsn,
+                        cx.clone(),
                         &uuid(&dsn).await,
                         db,
                         batched,
                         Some(inside.clone()),
-                        token.clone(),
                     );
                     let deadline = Instant::now() + Duration::from_secs(20);
                     while inside.load(Ordering::SeqCst) == 0 {
@@ -3896,15 +4086,12 @@ mod tests {
                         );
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
-                    token.cancel();
+                    cx.stop();
                     let r = tokio::time::timeout(Duration::from_secs(2), task)
                         .await
                         .expect("the cancelled capture returns at once")
                         .unwrap();
-                    assert!(
-                        matches!(r, Err(ProofError::Cancelled)),
-                        "{db}: {r:?}"
-                    );
+                    assert!(matches!(r, Err(Cancelled)), "{db}: {r:?}");
                     tokio::time::timeout(Duration::from_secs(3), ddl)
                         .await
                         .expect("the queued DDL proceeds")
@@ -3940,16 +4127,15 @@ mod tests {
                 let slots: &'static CaptureSlots =
                     Box::leak(Box::new(CaptureSlots::new(2, 2)));
                 slots.fail_kills.store(true, Ordering::SeqCst);
-                let token = tokio_util::sync::CancellationToken::new();
+                let cx = CaptureCtx::detached(dsn.as_str());
                 let inside = Arc::new(AtomicU32::new(0));
                 let task = cancellable(
                     slots,
-                    &dsn,
+                    cx.clone(),
                     &uuid(&dsn).await,
                     db,
                     false,
                     Some(inside.clone()),
-                    token.clone(),
                 );
                 let deadline = Instant::now() + Duration::from_secs(20);
                 while inside.load(Ordering::SeqCst) == 0 {
@@ -3957,12 +4143,12 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 let failures = kill_failures();
-                token.cancel();
+                cx.stop();
                 let r = tokio::time::timeout(Duration::from_secs(2), task)
                     .await
                     .expect("the cancelled capture returns at once")
                     .unwrap();
-                assert!(matches!(r, Err(ProofError::Cancelled)), "{r:?}");
+                assert!(matches!(r, Err(Cancelled)), "{r:?}");
                 let deadline = Instant::now() + Duration::from_secs(15);
                 while kill_failures() == failures {
                     assert!(
@@ -4018,7 +4204,7 @@ mod tests {
                                 release.acquire().await.unwrap().forget();
                             })
                         };
-                        capture_with(slots, &crate::credentials::SharedDsn::from(d.as_str()), &u, LINEAGE, db, &format!("t{i}"), Some(&hook), &tokio_util::sync::CancellationToken::new()).await
+                        capture_with(slots, &CaptureCtx::detached(d.as_str()), &u, LINEAGE, db, &format!("t{i}"), Some(&hook)).await.expect("not cancelled")
                     }));
                 }
                 tokio::time::sleep(Duration::from_secs(3)).await;
@@ -4065,15 +4251,15 @@ mod tests {
                         let tables = vec![(db.to_string(), "a".to_string())];
                         capture_batch_with(
                             slots,
-                            &crate::credentials::SharedDsn::from(d.as_str()),
+                            &CaptureCtx::detached(d.as_str()),
                             &u,
                             LINEAGE,
                             &tables,
                             8,
                             Some(&hook),
-                            &tokio_util::sync::CancellationToken::new(),
                         )
                         .await
+                        .expect("not cancelled")
                     })
                 };
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -4081,15 +4267,15 @@ mod tests {
                 let tables = vec![(db.to_string(), "b".to_string())];
                 let waited = capture_batch_with(
                     slots,
-                    &crate::credentials::SharedDsn::from(dsn.as_str()),
+                    &CaptureCtx::detached(dsn.as_str()),
                     &u,
                     LINEAGE,
                     &tables,
                     1,
                     None,
-                    &tokio_util::sync::CancellationToken::new(),
                 )
-                .await;
+                .await
+                .expect("not cancelled");
                 assert!(
                     matches!(waited, Err(BatchCaptureError::Contention { .. })),
                     "a capture ran with every slot held"
@@ -4134,7 +4320,7 @@ mod tests {
                             })
                         };
                         let tables = vec![(db.to_string(), format!("t{i}"))];
-                        capture_batch_with(slots, &crate::credentials::SharedDsn::from(d.as_str()), &u, LINEAGE, &tables, 8, Some(&hook), &tokio_util::sync::CancellationToken::new()).await
+                        capture_batch_with(slots, &CaptureCtx::detached(d.as_str()), &u, LINEAGE, &tables, 8, Some(&hook)).await.expect("not cancelled")
                     }));
                 }
                 let deadline = Instant::now() + Duration::from_secs(20);
@@ -4220,15 +4406,15 @@ mod tests {
                         let tables = vec![(db.to_string(), table.to_string())];
                         capture_batch_with(
                             slots,
-                            &crate::credentials::SharedDsn::from(d.as_str()),
+                            &CaptureCtx::detached(d.as_str()),
                             &u,
                             LINEAGE,
                             &tables,
                             8,
                             Some(&hook),
-                            &tokio_util::sync::CancellationToken::new(),
                         )
                         .await
+                        .expect("not cancelled")
                     })
                 };
                 let until = |inside: Arc<AtomicU32>| async move {
@@ -4286,15 +4472,15 @@ mod tests {
                 let tables = vec![(db.to_string(), "c".to_string())];
                 let third = capture_batch_with(
                     slots,
-                    &crate::credentials::SharedDsn::from(dsn.as_str()),
+                    &CaptureCtx::detached(dsn.as_str()),
                     &u,
                     LINEAGE,
                     &tables,
                     1,
                     None,
-                    &tokio_util::sync::CancellationToken::new(),
                 )
-                .await;
+                .await
+                .expect("not cancelled");
                 assert!(
                     matches!(third, Err(BatchCaptureError::Contention { .. })),
                     "a capture exceeded the remaining capacity"
@@ -4356,20 +4542,15 @@ mod tests {
                     Box::leak(Box::new(CaptureSlots::new(4, 4)));
                 let u = uuid(&dsn).await;
                 let task = {
-                    let shared = shared.clone();
+                    // The capture's context shares the DSN the test replaces.
+                    let cx = CaptureCtx::detached(shared.clone());
                     tokio::spawn(async move {
                         let tables = vec![(db.to_string(), "t".to_string())];
                         capture_batch_with(
-                            slots,
-                            &shared,
-                            &u,
-                            LINEAGE,
-                            &tables,
-                            30,
-                            None,
-                            &tokio_util::sync::CancellationToken::new(),
+                            slots, &cx, &u, LINEAGE, &tables, 30, None,
                         )
                         .await
+                        .expect("not cancelled")
                     })
                 };
                 let waiting = |dsn: String| async move {
@@ -4460,15 +4641,15 @@ mod tests {
                     (db.to_string(), "t010".to_string()),
                 ];
                 let cap = capture_batch(
-                    &crate::credentials::SharedDsn::from(dsn.as_str()),
+                    &CaptureCtx::detached(dsn.as_str()),
                     &uuid(&dsn).await,
                     LINEAGE,
                     &tables,
                     8,
                     Some(&hook),
-                    &tokio_util::sync::CancellationToken::new(),
                 )
-                .await;
+                .await
+                .expect("not cancelled");
                 assert!(cap.is_ok(), "{cap:?}");
                 let cap = cap.unwrap();
                 assert_eq!(cap.schemas.len(), 2);
@@ -4507,15 +4688,15 @@ mod tests {
                     (db.to_string(), "a".to_string()),
                 ];
                 let r = capture_batch(
-                    &crate::credentials::SharedDsn::from(dsn.as_str()),
+                    &CaptureCtx::detached(dsn.as_str()),
                     &uuid(&dsn).await,
                     LINEAGE,
                     &tables,
                     1,
                     None,
-                    &tokio_util::sync::CancellationToken::new(),
                 )
-                .await;
+                .await
+                .expect("not cancelled");
                 assert!(
                     matches!(
                         r,
@@ -4553,15 +4734,15 @@ mod tests {
                     (db.to_string(), "a".to_string()),
                 ];
                 let cap = capture_batch(
-                    &crate::credentials::SharedDsn::from(dsn.as_str()),
+                    &CaptureCtx::detached(dsn.as_str()),
                     &uuid(&dsn).await,
                     LINEAGE,
                     &tables,
                     5,
                     None,
-                    &tokio_util::sync::CancellationToken::new(),
                 )
                 .await
+                .expect("not cancelled")
                 .unwrap();
                 assert!(cap.table(db, "a").is_some());
                 assert!(cap.table(db, "gone").is_none());
@@ -5308,7 +5489,7 @@ mod tests {
                 move || a()
             });
             capture_proven(
-                &crate::credentials::SharedDsn::from(dsn),
+                &CaptureCtx::detached(dsn),
                 4_000_140,
                 &uuid(dsn).await,
                 LINEAGE,
@@ -5320,9 +5501,9 @@ mod tests {
                 hook.as_ref().map(|h| h as BetweenHook<'_>),
                 &TAG,
                 None,
-                &tokio_util::sync::CancellationToken::new(),
             )
             .await
+            .expect("not cancelled")
         }
 
         /// The shared proof scanner equals direct scans on a real server:
@@ -5851,15 +6032,15 @@ mod tests {
                     move || w()
                 };
                 let c = capture(
-                    &crate::credentials::SharedDsn::from(dsn.as_str()),
+                    &CaptureCtx::detached(dsn.as_str()),
                     &uuid(&dsn).await,
                     LINEAGE,
                     db,
                     "t",
                     Some(&hook),
-                    &tokio_util::sync::CancellationToken::new(),
                 )
                 .await
+                .expect("not cancelled")
                 .unwrap();
                 assert!(strictly_before(&c.from, &c.position));
                 assert!(busy.finish().await > 0);
@@ -6112,7 +6293,7 @@ mod tests {
                 move || w()
             };
             let r = capture_proven(
-                &crate::credentials::SharedDsn::from(dsn.as_str()),
+                &CaptureCtx::detached(dsn.as_str()),
                 4_000_141,
                 &uuid(&dsn).await,
                 LINEAGE,
@@ -6127,32 +6308,32 @@ mod tests {
                 Some(&hook),
                 &TAG,
                 None,
-                &tokio_util::sync::CancellationToken::new(),
             )
-            .await;
+            .await
+            .expect("not cancelled");
             assert!(matches!(r, Err(ProofError::Limit(_))), "{r:?}");
 
             let r = capture(
-                &crate::credentials::SharedDsn::from(dsn.as_str()),
+                &CaptureCtx::detached(dsn.as_str()),
                 "00000000-1111-2222-3333-444444444444",
                 LINEAGE,
                 "cap_fail",
                 "t",
                 None,
-                &tokio_util::sync::CancellationToken::new(),
             )
-            .await;
+            .await
+            .expect("not cancelled");
             assert!(matches!(r, Err(ProofError::OtherServer(_))), "{r:?}");
             let r = capture(
-                &crate::credentials::SharedDsn::from(dsn.as_str()),
+                &CaptureCtx::detached(dsn.as_str()),
                 &uuid(&dsn).await,
                 LINEAGE,
                 "cap_fail",
                 "missing",
                 None,
-                &tokio_util::sync::CancellationToken::new(),
             )
-            .await;
+            .await
+            .expect("not cancelled");
             assert!(matches!(r, Err(ProofError::Capture(_))), "{r:?}");
         }
 
@@ -6240,15 +6421,15 @@ mod tests {
                         >
                 };
                 let c = capture(
-                    &crate::credentials::SharedDsn::from(dsn.as_str()),
+                    &CaptureCtx::detached(dsn.as_str()),
                     &uuid(&dsn).await,
                     LINEAGE,
                     db,
                     "t",
                     Some(&hook),
-                    &tokio_util::sync::CancellationToken::new(),
                 )
                 .await
+                .expect("not cancelled")
                 .unwrap();
                 assert_eq!(columns(&c), ["id", "name"]);
                 let task = alter.lock().unwrap().take().unwrap();
@@ -6333,15 +6514,15 @@ mod tests {
                 move || w()
             };
             let c = capture(
-                &crate::credentials::SharedDsn::from(dsn.as_str()),
+                &CaptureCtx::detached(dsn.as_str()),
                 &uuid(&dsn).await,
                 LINEAGE,
                 "cap_cover",
                 "t",
                 Some(&hook),
-                &tokio_util::sync::CancellationToken::new(),
             )
             .await
+            .expect("not cancelled")
             .unwrap();
             let (a, b) = (wm(&c.from).unwrap(), wm(&c.position).unwrap());
             assert!(covers(&c, &before, &b));
