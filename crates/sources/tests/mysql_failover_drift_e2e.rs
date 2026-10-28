@@ -957,11 +957,28 @@ async fn a_failed_window_writes_no_drift_outcome_and_the_restart_records_once()
     let at: Option<sources::MySqlCheckpoint> =
         serde_json::from_slice(registered.checkpoint.as_deref().unwrap())
             .unwrap();
+    // The anchor records F as a GTID position (no file, no offset); the
+    // window's E is a position on B, with B's file and offset, even where
+    // the two GTID sets agree.
     assert_eq!(
-        at.map(|c| c.gtid_set),
-        Some(committed.gtid_set.clone()),
+        at.map(|c| (c.file, c.pos, c.gtid_set)),
+        Some((String::new(), 0, committed.gtid_set.clone())),
         "items' registration carries F"
     );
+    // Each marker names exactly its table's registration.
+    for table in ["orders", "items"] {
+        let key = SchemaKey::new(TENANT, sc.id, &hash, db, table);
+        let marker = st.marker(b, sc.id, db, table).await.unwrap();
+        let latest = st.registry.get_latest(&key).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                marker["current_schema_version"].as_i64(),
+                marker["current_schema_hash"].as_str()
+            ),
+            (Some(latest.version as i64), Some(latest.hash.as_str())),
+            "{table}'s marker names its registration"
+        );
+    }
 }
 
 /// A window batch whose acknowledgement is lost after it committed
