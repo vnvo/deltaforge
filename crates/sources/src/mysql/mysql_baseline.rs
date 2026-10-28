@@ -22,6 +22,7 @@
 //! unproven at R0.
 
 use deltaforge_core::{CheckpointOrder, SourceError, SourceResult};
+use schema_registry::SourceSchema as _;
 use tracing::{info, warn};
 
 use super::mysql_activation::{
@@ -104,11 +105,586 @@ struct Candidate {
     binds: Option<String>,
 }
 
+/// Test only: [`establish`] takes the per-table path ([`establish_per_table`],
+/// the one before batched admission), so its stored outcome can be compared.
+#[cfg(test)]
+pub(crate) static PER_TABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test hooks of the batched [`establish`].
+#[cfg(test)]
+pub(crate) mod hooks {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    /// Run `establish` again at the same R0 right after it; what the
+    /// replay wrote lands in `REPLAYED`.
+    pub static REPLAY: AtomicBool = AtomicBool::new(false);
+    pub static REPLAYED: AtomicUsize = AtomicUsize::new(usize::MAX);
+    /// Fail the run after this many chunks committed (0: never).
+    pub static FAIL_AFTER_CHUNKS: AtomicUsize = AtomicUsize::new(0);
+    /// Chunks committed or decided.
+    pub static CHUNKS: AtomicUsize = AtomicUsize::new(0);
+    /// Run once just before a chunk's commit.
+    pub static BEFORE_COMMIT: Mutex<Option<Box<dyn FnOnce() + Send>>> =
+        Mutex::new(None);
+}
+
 /// Establish baselines at the stream's start position (the snapshot anchor:
 /// called only after a snapshot, for the tables it copied) for every table
-/// not already proven there. Storage failures are fatal; an uncertain
-/// or failed proof only leaves the table unproven (logged).
+/// not already proven there, through batched admission
+/// (`docs/design/mysql-mass-invalidation.md`, section 4): the candidates,
+/// in discovery order, in chunks of at most `MAX_BATCH_TABLES`, each with
+/// one capture of all its tables, its own end S, one scan of (R0, S] and
+/// one atomic commit of its registrations and baselines. A chunk the
+/// window limits cut short continues with its untouched suffix. The
+/// per-table decisions are unchanged: an uncertain or failed proof only
+/// leaves the table unproven (logged); storage failures are fatal.
 pub(crate) async fn establish(
+    ctx: &RunCtx,
+    tracked: &[(String, String)],
+) -> SourceResult<usize> {
+    #[cfg(test)]
+    if PER_TABLE.load(std::sync::atomic::Ordering::SeqCst) {
+        return establish_per_table(ctx, tracked).await;
+    }
+    let scope = ctx.registry_scope.current()?;
+    let lineage = scope.lineage().lineage_hash.clone();
+    let r0_cp = MySqlCheckpoint {
+        file: ctx.last_file.clone(),
+        pos: ctx.last_pos,
+        gtid_set: ctx.gtid_text(),
+        lineage: Some(lineage.clone()),
+        snapshot_completed: None,
+        snapshot_chain: None,
+    };
+    let Some(r0) = mysql_checkpoint_position(
+        &r0_cp.file,
+        r0_cp.pos,
+        r0_cp.gtid_set.as_deref(),
+    ) else {
+        warn!(source_id = %ctx.source_id, "unparseable start position: no baselines");
+        return Ok(0);
+    };
+    let candidates = candidates(ctx, tracked, &r0).await?;
+    let mut written = 0;
+    let mut at = 0;
+    while at < candidates.len() {
+        let end = (at + super::mysql_binlog_scan::MAX_BATCH_TABLES)
+            .min(candidates.len());
+        let chunk =
+            establish_chunk(ctx, &candidates[at..end], &r0, &r0_cp).await?;
+        written += chunk.written;
+        at += chunk.consumed.max(1);
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering::SeqCst;
+            let n = hooks::CHUNKS.fetch_add(1, SeqCst) + 1;
+            if hooks::FAIL_AFTER_CHUNKS.load(SeqCst) == n {
+                return Err(SourceError::Other(anyhow::anyhow!(
+                    "injected failure after {n} chunk(s)"
+                )));
+            }
+        }
+    }
+    #[cfg(test)]
+    if hooks::REPLAY.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        let again = Box::pin(establish(ctx, tracked)).await?;
+        hooks::REPLAYED.store(again, std::sync::atomic::Ordering::SeqCst);
+    }
+    if written > 0 {
+        info!(source_id = %ctx.source_id, baselines = written, "activation baselines established");
+    }
+    Ok(written)
+}
+
+/// Each tracked table not proven at R0, in the given (discovery) order,
+/// with its timeline (records, barriers and their heads) and the barrier it
+/// binds.
+async fn candidates(
+    ctx: &RunCtx,
+    tracked: &[(String, String)],
+    r0: &WmPos,
+) -> SourceResult<Vec<(Candidate, Timeline)>> {
+    let scope = ctx.registry_scope.current()?;
+    let storage = |e: anyhow::Error| {
+        SourceError::Other(e.context("read the activation timeline"))
+    };
+    let mut out = Vec::new();
+    for (db, table) in tracked {
+        let key = scope.key(db, table);
+        let (records, table_head) = mysql_activation::read_table_head(
+            &ctx.registry_backend,
+            ctx.schema.registry(),
+            &key,
+        )
+        .await
+        .map_err(storage)?;
+        let (barriers, barrier_heads) =
+            mysql_activation::read_barriers_head(&ctx.registry_backend, &key)
+                .await
+                .map_err(storage)?;
+        let all: Vec<Stored> =
+            records.iter().chain(barriers.iter()).cloned().collect();
+        if matches!(select(&all, r0), Selection::Proven { .. }) {
+            continue;
+        }
+        match barrier_to_bind(&records, &barriers, r0) {
+            Ok(binds) => out.push((
+                Candidate {
+                    db: db.clone(),
+                    table: table.clone(),
+                    binds,
+                },
+                Timeline {
+                    records,
+                    barriers,
+                    table_head,
+                    barrier_heads,
+                },
+            )),
+            Err(why) => {
+                warn!(source_id = %ctx.source_id, %db, %table, why, "no baseline");
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// What one chunk did: the leading candidates it decided (at least one),
+/// and the baselines it wrote.
+struct ChunkDone {
+    consumed: usize,
+    written: usize,
+}
+
+/// One chunk: one batched capture in discovery order, S its end, one scan
+/// of (R0, S], then the decisions of its prefix (`mysql_window_budget`)
+/// and one atomic commit of their registrations (checkpoint R0) and
+/// baselines. Tables past the prefix are untouched, decided by the next
+/// chunk.
+async fn establish_chunk(
+    ctx: &RunCtx,
+    chunk: &[(Candidate, Timeline)],
+    r0: &WmPos,
+    r0_cp: &MySqlCheckpoint,
+) -> SourceResult<ChunkDone> {
+    use super::mysql_binlog_scan::{BatchCaptureError, capture_batch};
+    use super::mysql_window_budget::{Caps, Prefix, table_cost};
+    use storage::adapters::{RegistrationPlanning, RegistrationRequest};
+    use storage::{
+        AtomicBatch, BatchOp, CommitResult, Precondition, commit_atomic_counted,
+    };
+
+    let scope = ctx.registry_scope.current()?;
+    let lineage = scope.lineage().lineage_hash.clone();
+    let server_uuid = ctx.expected_uuid()?;
+    let source_id = ctx.source_id.clone();
+    let tag = ScanTag {
+        source_id: &source_id,
+        kind: ProofKind::Snapshot,
+    };
+    let lctn = ctx.lower_case_table_names;
+    let skip_all = |why: &'static str| {
+        for (c, _) in chunk {
+            trace_proof(&tag, &c.db, &c.table, None, None, lctn, why);
+        }
+        Ok(ChunkDone {
+            consumed: chunk.len(),
+            written: 0,
+        })
+    };
+    let tables: Vec<(String, String)> = chunk
+        .iter()
+        .map(|(c, _)| (c.db.clone(), c.table.clone()))
+        .collect();
+
+    // 1. One capture of every table, in discovery order. A stop ends the
+    // baselines (`?`); another server is never a "no baseline".
+    let cap = match capture_batch(
+        &ctx.capture,
+        &server_uuid,
+        &lineage,
+        &tables,
+        ctx.proofs.capture_lock_wait_secs,
+        None,
+    )
+    .await?
+    {
+        Ok(cap) => cap,
+        Err(BatchCaptureError::Failed(ProofError::OtherServer(found))) => {
+            return Err(other_server(&server_uuid, &found));
+        }
+        Err(e) => {
+            warn!(source_id = %ctx.source_id, error = ?e, tables = chunk.len(), "no baselines: the chunk's capture failed");
+            return skip_all("no_capture");
+        }
+    };
+    // The capture's own budget: the chunk ends at its first unread table,
+    // which leads the next chunk; unread as the first, its own rows exceed
+    // the item limit.
+    let mut limit = chunk
+        .iter()
+        .position(|(c, _)| {
+            cap.deferred.contains(&(c.db.clone(), c.table.clone()))
+        })
+        .unwrap_or(chunk.len());
+    if limit == 0 {
+        let (c, _) = &chunk[0];
+        let too = storage::StateItemTooLarge {
+            size: cap.oversized.unwrap_or_default() as usize,
+            key_digest: storage::state_key_digest(
+                storage::adapters::schema_registry::V1_NS,
+                &scope.key(&c.db, &c.table).backend_key(),
+            ),
+        };
+        return Err(crate::incident_drafts::state_item_too_large(
+            &ctx.source_id,
+            &c.db,
+            &c.table,
+            &too,
+            r0_cp,
+        ));
+    }
+    // The window limits: the longest prefix whose complete costs fit.
+    let mut prefix = Prefix::new(Caps::current());
+    for (i, (c, t)) in chunk[..limit].iter().enumerate() {
+        let key = scope.key(&c.db, &c.table);
+        let cost = match cap.schemas.get(&(c.db.clone(), c.table.clone())) {
+            None => Default::default(),
+            Some(schema) => table_cost(
+                serde_json::to_vec(schema)
+                    .map_err(|e| SourceError::Other(e.into()))?
+                    .len() as u64,
+                t,
+                0,
+                key.backend_key().len() as u64,
+            )
+            .map_err(SourceError::Other)?,
+        };
+        match prefix.offer(cost) {
+            Ok(true) => {}
+            Ok(false) => {
+                limit = i;
+                break;
+            }
+            Err(invalid) => {
+                return Err(crate::incident_drafts::mysql_table_too_large(
+                    &ctx.source_id,
+                    &c.db,
+                    &c.table,
+                    &invalid,
+                    r0_cp,
+                ));
+            }
+        }
+    }
+    let chunk = &chunk[..limit.max(1)];
+    let s_cp = cap.position.clone();
+    let Some(s) = mysql_checkpoint_position(
+        &s_cp.file,
+        s_cp.pos,
+        s_cp.gtid_set.as_deref(),
+    ) else {
+        return skip_all("no_capture");
+    };
+
+    // 2. One complete scan of (R0, S].
+    let report: ScanReport = match super::mysql_proof_scanner::shared_interval(
+        &ctx.proof_scanner,
+        ctx.dsn.current().expose(),
+        &ctx.source_id,
+        &server_uuid,
+        &lineage,
+        r0_cp,
+        &s_cp,
+        None,
+        Some(r0_cp),
+        &tag,
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(ProofError::OtherServer(found)) => {
+            return Err(other_server(&server_uuid, &found));
+        }
+        Err(e) => {
+            warn!(source_id = %ctx.source_id, error = ?e, "no baselines: the interval scan failed");
+            for (c, _) in chunk {
+                let tcap = cap.table(&c.db, &c.table);
+                trace_proof(
+                    &tag,
+                    &c.db,
+                    &c.table,
+                    tcap.as_ref(),
+                    None,
+                    lctn,
+                    "scan_failed",
+                );
+            }
+            return Ok(ChunkDone {
+                consumed: chunk.len(),
+                written: 0,
+            });
+        }
+    };
+
+    // 3. Each table's decision, exactly as one at a time: no capture, not
+    // covered or a relevant statement leaves it unproven, with nothing
+    // registered or recorded.
+    let checkpoint =
+        serde_json::to_vec(r0_cp).map_err(|e| SourceError::Other(e.into()))?;
+    let mut proven: Vec<(&Candidate, super::mysql_binlog_scan::Captured)> =
+        Vec::new();
+    for (c, _) in chunk {
+        let Some(tcap) = cap.table(&c.db, &c.table) else {
+            warn!(source_id = %ctx.source_id, db = %c.db, table = %c.table, "no baseline: no capture");
+            trace_proof(&tag, &c.db, &c.table, None, None, lctn, "no_capture");
+            continue;
+        };
+        observe_capture(&tag, &tcap);
+        if !covers(&tcap, r0, &s) {
+            warn!(source_id = %ctx.source_id, db = %c.db, table = %c.table, "no baseline: the scan does not cover the capture interval");
+            trace_proof(
+                &tag,
+                &c.db,
+                &c.table,
+                Some(&tcap),
+                Some(&report),
+                lctn,
+                "not_covered",
+            );
+            continue;
+        }
+        if report
+            .statements
+            .iter()
+            .any(|st| affects(st, &c.db, &c.table, lctn))
+        {
+            info!(source_id = %ctx.source_id, db = %c.db, table = %c.table, "no baseline: a DDL or barrier in the scanned interval");
+            trace_proof(
+                &tag,
+                &c.db,
+                &c.table,
+                Some(&tcap),
+                Some(&report),
+                lctn,
+                "relevant_ddl",
+            );
+            continue;
+        }
+        proven.push((c, tcap));
+    }
+    if proven.is_empty() {
+        return Ok(ChunkDone {
+            consumed: chunk.len(),
+            written: 0,
+        });
+    }
+
+    // 4. One atomic commit of the registrations and baselines.
+    let registry = ctx.schema.registry();
+    if !std::sync::Arc::ptr_eq(registry.backend(), &ctx.registry_backend) {
+        return Err(SourceError::Other(anyhow::anyhow!(
+            "snapshot baselines need the schema registry and the activation \
+             records in one state store"
+        )));
+    }
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let reqs: Vec<RegistrationRequest> = proven
+            .iter()
+            .map(|(c, tcap)| RegistrationRequest {
+                key: scope.key(&c.db, &c.table),
+                hash: tcap.schema.fingerprint().to_string(),
+                schema_json: serde_json::to_value(&tcap.schema)
+                    .expect("a schema serializes"),
+                checkpoint: Some(checkpoint.clone()),
+            })
+            .collect();
+        let (pre, regs) = match registry
+            .plan_registrations(&reqs, chrono::Utc::now())
+            .await
+            .map_err(|e| {
+                SourceError::Other(
+                    e.context("plan the baselines' registrations"),
+                )
+            })? {
+            RegistrationPlanning::Planned {
+                preconditions,
+                registrations,
+            } => (preconditions, registrations),
+            RegistrationPlanning::NeedsRepair(broken) => {
+                for k in &broken {
+                    registry.repair_key(k).await.map_err(SourceError::Other)?;
+                }
+                if attempt > BATCH_RETRIES {
+                    return Err(SourceError::Other(anyhow::anyhow!(
+                        "the snapshot baselines' registrations still need repair \
+                         after {attempt} attempts"
+                    )));
+                }
+                continue;
+            }
+        };
+        let mut batch = AtomicBatch {
+            preconditions: pre,
+            ops: Vec::new(),
+        };
+        let mut entries = Vec::with_capacity(regs.len());
+        let mut op_table = Vec::new();
+        for (i, ((c, _), reg)) in proven.iter().zip(&regs).enumerate() {
+            let base = batch.push_group(reg.ops.clone());
+            entries.push(reg.entry_op.map(|e| base + e));
+            let key = scope.key(&c.db, &c.table);
+            let stream = table_stream(&key);
+            let t = chunk
+                .iter()
+                .find(|(k, _)| k.db == c.db && k.table == c.table)
+                .map(|(_, t)| t)
+                .expect("a chunk table");
+            let (table_head, barrier_heads) = if attempt == 1 {
+                (t.table_head, t.barrier_heads.clone())
+            } else {
+                let (_, head) = mysql_activation::read_table_head(
+                    &ctx.registry_backend,
+                    registry,
+                    &key,
+                )
+                .await
+                .map_err(SourceError::Other)?;
+                let (_, heads) = mysql_activation::read_barriers_head(
+                    &ctx.registry_backend,
+                    &key,
+                )
+                .await
+                .map_err(SourceError::Other)?;
+                (head, heads)
+            };
+            batch.preconditions.push(Precondition::LogHead {
+                ns: mysql_activation::ACTIVATION_NS.into(),
+                key: stream.clone(),
+                seq: table_head,
+            });
+            for (b, head) in barrier_heads {
+                batch.preconditions.push(Precondition::LogHead {
+                    ns: mysql_activation::BARRIER_NS.into(),
+                    key: b,
+                    seq: head,
+                });
+            }
+            let record = Record::new(
+                r0.clone(),
+                Kind::Baseline {
+                    version: reg.version,
+                    schema_hash: reg.hash.clone(),
+                    to: s.clone(),
+                    scan_digest: report.digest.clone(),
+                    binds: c.binds.clone(),
+                    classifier_version: CLASSIFIER_VERSION.to_string(),
+                },
+            );
+            let id = baseline_capture_id(&lineage, &stream, &record)
+                .map_err(SourceError::Other)?;
+            // Idempotent, as one append at a time was.
+            batch.ops.push(BatchOp::LogAppendIdempotent {
+                ns: mysql_activation::ACTIVATION_NS.into(),
+                key: stream,
+                capture_id: id,
+                value: mysql_activation::encode_record(&record)
+                    .map_err(SourceError::Other)?,
+            });
+            op_table.resize(batch.ops.len(), i);
+        }
+        #[cfg(test)]
+        if let Some(hook) = hooks::BEFORE_COMMIT.lock().unwrap().take() {
+            hook();
+        }
+        let mut applies = 0;
+        let seqs = match commit_atomic_counted(
+            ctx.registry_backend.as_ref(),
+            &batch,
+            BATCH_RETRIES,
+            &mut applies,
+        )
+        .await
+        {
+            Ok(CommitResult::Committed(seqs)) => seqs,
+            Ok(CommitResult::Conflict(why)) => {
+                if attempt > BATCH_RETRIES {
+                    return Err(SourceError::Other(anyhow::anyhow!(
+                        "the snapshot baselines conflicted {attempt} times (last: \
+                         {why}); nothing of the chunk was written"
+                    )));
+                }
+                warn!(source_id = %ctx.source_id, attempt, why, "snapshot baselines: the batch conflicted; deciding again");
+                continue;
+            }
+            Err(e) => {
+                if let Some(too) = e.chain().find_map(|c| {
+                    c.downcast_ref::<storage::StateItemTooLarge>()
+                }) && let Some(i) =
+                    batch.ops.iter().zip(&op_table).find_map(|(op, i)| {
+                        let (BatchOp::LogAppendIfAbsent { ns, key, .. }
+                        | BatchOp::LogAppendIdempotent { ns, key, .. }
+                        | BatchOp::KvPut { ns, key, .. }) = op
+                        else {
+                            return None;
+                        };
+                        (storage::state_key_digest(ns, key) == too.key_digest)
+                            .then_some(*i)
+                    })
+                {
+                    let c = proven[i].0;
+                    return Err(crate::incident_drafts::state_item_too_large(
+                        &ctx.source_id,
+                        &c.db,
+                        &c.table,
+                        too,
+                        r0_cp,
+                    ));
+                }
+                return Err(SourceError::Other(
+                    e.context("commit the snapshot baselines"),
+                ));
+            }
+        };
+        // Committed: the registry's cache learns it, and only now.
+        for (reg, entry) in regs.iter().zip(&entries) {
+            if let Some(op) = entry {
+                registry.admit_committed(
+                    reg,
+                    seqs[*op].expect("a committed log write"),
+                );
+            }
+        }
+        for (c, tcap) in &proven {
+            trace_proof(
+                &tag,
+                &c.db,
+                &c.table,
+                Some(tcap),
+                Some(&report),
+                lctn,
+                "proven",
+            );
+        }
+        return Ok(ChunkDone {
+            consumed: chunk.len(),
+            written: proven.len(),
+        });
+    }
+}
+
+/// Conflicting re-reads, or retries of a batch whose outcome a storage
+/// error left unknown, before the chunk fails closed.
+const BATCH_RETRIES: usize = 3;
+
+/// The per-table path [`establish`] replaced: a capture, registration and
+/// append per table (the reference its stored outcome is compared with).
+#[cfg(test)]
+async fn establish_per_table(
     ctx: &RunCtx,
     tracked: &[(String, String)],
 ) -> SourceResult<usize> {
@@ -1126,6 +1702,290 @@ mod tests {
             let err = format!("{:#}", res.expect_err("fails closed"));
             assert!(err.contains("is unreadable"), "{err}");
             assert!(rows.is_empty(), "{rows:?}");
+        }
+
+        /// The test hooks back at rest.
+        fn reset_hooks() {
+            use std::sync::atomic::Ordering::SeqCst;
+            super::super::PER_TABLE.store(false, SeqCst);
+            super::super::hooks::REPLAY.store(false, SeqCst);
+            super::super::hooks::REPLAYED.store(usize::MAX, SeqCst);
+            super::super::hooks::FAIL_AFTER_CHUNKS.store(0, SeqCst);
+            super::super::hooks::CHUNKS.store(0, SeqCst);
+            *super::super::hooks::BEFORE_COMMIT.lock().unwrap() = None;
+            crate::stream_probe::set_window_caps(None);
+        }
+
+        /// One baseline per table, each at the anchor and binding its
+        /// barrier; returns the baselines.
+        async fn one_baseline_each(
+            st: &State,
+            db: &str,
+            tables: &[&str],
+        ) -> Vec<Stored> {
+            let mut out = Vec::new();
+            for t in tables {
+                let (table, barriers) = timeline(st, db, t).await;
+                let base = baselines(&table);
+                assert_eq!(base.len(), 1, "{t}: {table:?}");
+                let anchor = barriers.last().expect("the anchor barrier");
+                assert_eq!(
+                    order_positions(
+                        &anchor.record.position,
+                        &base[0].record.position
+                    ),
+                    CheckpointOrder::Equal,
+                    "{t}"
+                );
+                assert!(matches!(
+                    &base[0].record.kind,
+                    Kind::Baseline { binds: Some(b), .. } if *b == anchor.capture_id
+                ));
+                out.push(base[0].clone());
+            }
+            out
+        }
+
+        /// The batched path stores what the per-table path stored, at the
+        /// same anchor (a quiet server between the runs): the same
+        /// registrations (version, hash, schema, checkpoint, sequence) and
+        /// the same baselines but for the timing-derived fields (S, the
+        /// scan digest, the derived capture identity).
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn batched_baselines_store_what_the_per_table_path_stored() {
+            reset_hooks();
+            let port = server(true).await;
+            let db = "base_eq";
+            let tables = ["a", "b", "c"];
+            prepare(port, db, &tables).await;
+            for t in &tables {
+                sql(port, &[format!("INSERT INTO {db}.{t} VALUES (1, 1)")])
+                    .await;
+            }
+            let names: Vec<String> =
+                tables.iter().map(|t| format!("{db}.{t}")).collect();
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let old = state().await;
+            super::super::PER_TABLE
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let (_, res) =
+                run(&old, port, db, &names, SnapshotMode::Initial, &[]).await;
+            res.unwrap();
+            super::super::PER_TABLE
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            let new = state().await;
+            let (_, res) =
+                run(&new, port, db, &names, SnapshotMode::Initial, &[]).await;
+            res.unwrap();
+            let a = one_baseline_each(&old, db, &tables).await;
+            let b = one_baseline_each(&new, db, &tables).await;
+            for (i, t) in tables.iter().enumerate() {
+                let ka = old.scope.current().unwrap().key(db, t);
+                let kb = new.scope.current().unwrap().key(db, t);
+                let ra = old.registry.get_latest(&ka).await.unwrap().unwrap();
+                let rb = new.registry.get_latest(&kb).await.unwrap().unwrap();
+                assert_eq!(
+                    (
+                        ra.version,
+                        &ra.hash,
+                        &ra.schema_json,
+                        &ra.checkpoint,
+                        ra.sequence
+                    ),
+                    (
+                        rb.version,
+                        &rb.hash,
+                        &rb.schema_json,
+                        &rb.checkpoint,
+                        rb.sequence
+                    ),
+                    "{t}: registration"
+                );
+                assert_eq!(
+                    order_positions(
+                        &a[i].record.position,
+                        &b[i].record.position
+                    ),
+                    CheckpointOrder::Equal,
+                    "{t}: the same anchor"
+                );
+                let strip = |k: &Kind| match k {
+                    Kind::Baseline {
+                        version,
+                        schema_hash,
+                        classifier_version,
+                        ..
+                    } => (
+                        *version,
+                        schema_hash.clone(),
+                        classifier_version.clone(),
+                    ),
+                    other => panic!("{other:?}"),
+                };
+                assert_eq!(
+                    strip(&a[i].record.kind),
+                    strip(&b[i].record.kind),
+                    "{t}"
+                );
+                assert_eq!(
+                    a[i].record.format_version,
+                    b[i].record.format_version
+                );
+            }
+        }
+
+        /// Establish replayed at the same anchor writes nothing: every table
+        /// is proven there already.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn establish_replayed_at_the_same_anchor_writes_nothing() {
+            reset_hooks();
+            let port = server(true).await;
+            let db = "base_replay";
+            let tables = ["a", "b"];
+            prepare(port, db, &tables).await;
+            let st = state().await;
+            super::super::hooks::REPLAY
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let names = [format!("{db}.a"), format!("{db}.b")];
+            let (_, res) = run(
+                &st,
+                port,
+                db,
+                &[&names[0], &names[1]],
+                SnapshotMode::Initial,
+                &[],
+            )
+            .await;
+            res.unwrap();
+            assert_eq!(
+                super::super::hooks::REPLAYED
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the replay wrote nothing"
+            );
+            one_baseline_each(&st, db, &tables).await;
+            reset_hooks();
+        }
+
+        /// A generation interrupted after its first chunk committed (small
+        /// caps make one table a chunk) is replaced: the next run
+        /// establishes every table exactly once at the new anchor R0', each
+        /// binding R0''s barrier; a baseline of the old generation at R0 does
+        /// not prove the table at R0'.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn an_interrupted_generation_is_replaced_and_proves_each_table_once()
+         {
+            reset_hooks();
+            let port = server(true).await;
+            let db = "base_interrupt";
+            let tables = ["a", "b", "c"];
+            prepare(port, db, &tables).await;
+            let names: Vec<String> =
+                tables.iter().map(|t| format!("{db}.{t}")).collect();
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let st = state().await;
+            // One table per chunk.
+            crate::stream_probe::set_window_caps(Some((1, 16_384, 1 << 30)));
+            super::super::hooks::FAIL_AFTER_CHUNKS
+                .store(1, std::sync::atomic::Ordering::SeqCst);
+            let (_, res) =
+                run(&st, port, db, &names, SnapshotMode::Initial, &[]).await;
+            assert!(res.is_err(), "the injected failure ends the run");
+            let (first, _) = timeline(&st, db, "a").await;
+            assert_eq!(baselines(&first).len(), 1, "the first chunk committed");
+            let (second, _) = timeline(&st, db, "b").await;
+            assert!(baselines(&second).is_empty(), "the second never ran");
+            reset_hooks();
+            crate::stream_probe::set_window_caps(Some((1, 16_384, 1 << 30)));
+            sql(port, &[format!("INSERT INTO {db}.a VALUES (9, 9)")]).await;
+            let (_, res) =
+                run(&st, port, db, &names, SnapshotMode::Initial, &[]).await;
+            crate::stream_probe::set_window_caps(None);
+            res.unwrap();
+            for t in &tables {
+                let (table, barriers) = timeline(&st, db, t).await;
+                let anchor = barriers.last().unwrap();
+                let at_new: Vec<_> = baselines(&table)
+                    .into_iter()
+                    .filter(|b| {
+                        order_positions(
+                            &anchor.record.position,
+                            &b.record.position,
+                        ) == CheckpointOrder::Equal
+                    })
+                    .collect();
+                assert_eq!(
+                    at_new.len(),
+                    1,
+                    "{t}: one baseline at R0': {table:?}"
+                );
+                assert!(matches!(
+                    &at_new[0].record.kind,
+                    Kind::Baseline { binds: Some(b), .. } if *b == anchor.capture_id
+                ));
+            }
+            // The old generation's baseline of `a` is at R0, before R0'.
+            let (a, _) = timeline(&st, db, "a").await;
+            assert_eq!(baselines(&a).len(), 2, "{a:?}");
+        }
+
+        /// A chunk whose commit acknowledgement is lost resolves through its
+        /// durable marker: one registration and one baseline per table.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn an_ambiguous_chunk_commit_resolves_through_its_marker() {
+            reset_hooks();
+            let port = server(true).await;
+            let db = "base_ack";
+            let tables = ["a", "b"];
+            prepare(port, db, &tables).await;
+            let mem = Arc::new(MemoryStorageBackend::new());
+            let backend: ArcStorageBackend = mem.clone();
+            let st = State {
+                registry: DurableSchemaRegistry::new(backend.clone())
+                    .await
+                    .unwrap(),
+                ckpt: Arc::new(MemCheckpointStore::new().unwrap()),
+                scope: crate::registry_scope::SharedRegistryScope::default(),
+                backend,
+            };
+            *super::super::hooks::BEFORE_COMMIT.lock().unwrap() =
+                Some(Box::new(move || {
+                    use storage::BatchFaults as _;
+                    mem.set_batch_fault(Some(storage::BatchFault::AfterCommit));
+                }));
+            let names = [format!("{db}.a"), format!("{db}.b")];
+            let (_, res) = run(
+                &st,
+                port,
+                db,
+                &[&names[0], &names[1]],
+                SnapshotMode::Initial,
+                &[],
+            )
+            .await;
+            res.unwrap();
+            assert!(
+                super::super::hooks::BEFORE_COMMIT.lock().unwrap().is_none(),
+                "the commit ran"
+            );
+            one_baseline_each(&st, db, &tables).await;
+            for t in &tables {
+                let key = st.scope.current().unwrap().key(db, t);
+                assert_eq!(
+                    st.registry
+                        .get_latest(&key)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .version,
+                    1
+                );
+            }
+            reset_hooks();
         }
 
         /// A snapshot proves every table it copied at its anchor (they are
