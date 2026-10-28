@@ -340,7 +340,7 @@ pub(super) async fn maybe_window(
         let keys: Vec<_> = ctx
             .pending
             .as_ref()
-            .map(|p| p.batch.keys().map(|(db, t)| scope.key(db, t)).collect())
+            .map(|p| p.order.iter().map(|(db, t)| scope.key(db, t)).collect())
             .unwrap_or_default();
         super::mysql_selection::load_timelines(ctx, &keys).await;
     }
@@ -964,12 +964,14 @@ async fn admit_window(
     batch: BTreeMap<(String, String), MySqlCheckpoint>,
     order: Vec<(String, String)>,
 ) -> Result<Admitted, LoopControl> {
-    let tables: Vec<(String, String)> = batch.keys().cloned().collect();
-    let froms: Vec<MySqlCheckpoint> = batch
-        .values()
-        .map(|a| MySqlCheckpoint {
+    // First-touch order: the capture reads schemas in it and stops at the
+    // budget (`mysql_window_budget`).
+    let tables: Vec<(String, String)> = order.clone();
+    let froms: Vec<MySqlCheckpoint> = tables
+        .iter()
+        .map(|k| MySqlCheckpoint {
             lineage: Some(capture.lineage.clone()),
-            ..a.clone()
+            ..batch[k].clone()
         })
         .collect();
     let head = MySqlCheckpoint {
@@ -1001,8 +1003,7 @@ async fn admit_speculated(
             )))
         })?
         .map_err(LoopControl::Fail)?;
-    let speculated: Vec<(String, String)> =
-        pending.batch.keys().cloned().collect();
+    let speculated: Vec<(String, String)> = pending.order.clone();
     decide_and_commit(ctx, lineage, done, required, &speculated, order).await
 }
 
@@ -1036,8 +1037,12 @@ async fn decide_and_commit(
         admit_batch(ctx, lineage, &done.cap, tables_in_order)
             .await
             .map_err(LoopControl::Fail)?;
+    let decided = governs
+        .iter()
+        .filter(|(_, _, g)| *g != Governs::Deferred)
+        .count();
     Ok(Admitted {
-        tables: required.len(),
+        tables: decided,
         attempts: done.attempts,
         work,
         captured: done.captured,
@@ -1111,6 +1116,93 @@ async fn admit_batch(
         kind: ProofKind::Lazy,
     };
     let lctn = ctx.lower_case_table_names;
+    let scope = ctx.registry_scope.current()?;
+    // The window's prefix (`mysql_window_budget`): its tables in first-touch
+    // order, each with its complete cost, up to the first that would take
+    // the plan over a cap. The rest are deferred: nothing of them is
+    // decided, recorded or written, and their rows go back to the stream
+    // for the next window, whose first table one of them is.
+    let mut tables = tables;
+    let deferred = {
+        use super::mysql_window_budget::{Caps, Prefix, table_cost};
+        let other_lineages = storage::adapters::source_lineage::load(
+            &ctx.registry_backend,
+            &ctx.tenant,
+            &ctx.source_id,
+        )
+        .await
+        .map_err(SourceError::Other)?
+        .map_or(0, |r| r.prior_lineage_hashes.len() as u64);
+        let mut prefix = Prefix::new(Caps::current());
+        let mut cut = tables.len();
+        for (i, ((db, table), at, _)) in tables.iter().enumerate() {
+            // Past the capture's budget: unread, so the prefix ends here. The
+            // window's first table is unread only when its own rows exceed
+            // the store's item limit.
+            if cap.deferred.contains(&(db.clone(), table.clone())) {
+                if i == 0 {
+                    let key = scope.key(db, table);
+                    let too = storage::StateItemTooLarge {
+                        size: cap.oversized.unwrap_or_default() as usize,
+                        key_digest: storage::state_key_digest(
+                            storage::adapters::schema_registry::V1_NS,
+                            &key.backend_key(),
+                        ),
+                    };
+                    return Err(crate::incident_drafts::state_item_too_large(
+                        &ctx.source_id,
+                        db,
+                        table,
+                        &too,
+                        at,
+                    ));
+                }
+                cut = i;
+                break;
+            }
+            // A table gone before the capture holds nothing.
+            let cost = match cap.schemas.get(&(db.clone(), table.clone())) {
+                None => Default::default(),
+                Some(schema) => {
+                    let key = scope.key(db, table);
+                    let t = timeline(ctx, &key).await?;
+                    table_cost(
+                        serde_json::to_vec(schema)
+                            .map_err(|e| SourceError::Other(e.into()))?
+                            .len() as u64,
+                        &t,
+                        other_lineages,
+                        key.backend_key().len() as u64,
+                    )
+                    .map_err(SourceError::Other)?
+                }
+            };
+            match prefix.offer(cost) {
+                Ok(true) => {}
+                Ok(false) => {
+                    cut = i;
+                    break;
+                }
+                Err(invalid) => {
+                    return Err(crate::incident_drafts::mysql_table_too_large(
+                        &ctx.source_id,
+                        db,
+                        table,
+                        &invalid,
+                        at,
+                    ));
+                }
+            }
+        }
+        tables.split_off(cut)
+    };
+    if !deferred.is_empty() {
+        metrics::counter!(
+            "deltaforge_mysql_activation_window_deferred_total",
+            "source" => ctx.source_id.clone(),
+        )
+        .increment(deferred.len() as u64);
+    }
     // A table gone before the capture has no shape: nothing to decide.
     let (tables, gone): (Vec<_>, Vec<_>) = tables
         .into_iter()
@@ -1157,7 +1249,6 @@ async fn admit_batch(
             Governs::Refused(Covers::UntilStatement(d)),
         ));
     }
-    let scope = ctx.registry_scope.current()?;
     let keys: Vec<_> = tables
         .iter()
         .map(|((db, table), _, _)| scope.key(db, table))
@@ -1302,6 +1393,8 @@ async fn admit_batch(
         let mut reg_entry: Vec<Option<(usize, usize)>> = vec![None; regs.len()];
         let mut outcomes: Vec<(&'static str, Covers)> =
             Vec::with_capacity(tables.len());
+        // Each table's ops, to name the table of an item the store refuses.
+        let mut op_table: Vec<usize> = Vec::new();
         for (i, (((db, table), at, report), key)) in
             tables.iter().zip(&keys).enumerate()
         {
@@ -1372,11 +1465,13 @@ async fn admit_batch(
                     });
                     admitted.push(Some((op, proposed, augmented)));
                     outcomes.push(("proven", Covers::Transaction));
+                    op_table.resize(batch.ops.len(), i);
                 }
                 Err(why) => {
                     info!(source_id = %ctx.source_id, %db, %table, why, "no lazy baseline");
                     admitted.push(None);
                     outcomes.push(("not_decisive", Covers::Transaction));
+                    op_table.resize(batch.ops.len(), i);
                 }
             }
         }
@@ -1395,6 +1490,24 @@ async fn admit_batch(
                     Ok(c) => c,
                     Err(e) => {
                         discard(ctx);
+                        // An item over the store's limit: the table it
+                        // belongs to, classified.
+                        if let Some(too) = e.chain().find_map(|c| {
+                            c.downcast_ref::<storage::StateItemTooLarge>()
+                        }) && let Some(i) =
+                            refused_table(&batch, &op_table, &too.key_digest)
+                        {
+                            let ((db, table), at, _) = &tables[i];
+                            return Err(
+                                crate::incident_drafts::state_item_too_large(
+                                    &ctx.source_id,
+                                    db,
+                                    table,
+                                    too,
+                                    at,
+                                ),
+                            );
+                        }
                         return Err(SourceError::Other(e.context(
                             "commit the activation window's admissions",
                         )));
@@ -1470,8 +1583,33 @@ async fn admit_batch(
                 why,
             );
         }
+        for ((db, table), at, _) in &deferred {
+            trace_proof(&tag, db, table, None, None, lctn, "deferred");
+            governs.push((
+                (db.clone(), table.clone()),
+                at.clone(),
+                Governs::Deferred,
+            ));
+        }
         return Ok((stats, governs));
     }
+}
+
+/// The table (index into the window's decided tables) whose op writes the
+/// item with `key_digest`.
+fn refused_table(
+    batch: &storage::AtomicBatch,
+    op_table: &[usize],
+    key_digest: &str,
+) -> Option<usize> {
+    batch.ops.iter().zip(op_table).find_map(|(op, i)| {
+        let (storage::BatchOp::LogAppendIfAbsent { ns, key, .. }
+        | storage::BatchOp::KvPut { ns, key, .. }) = op
+        else {
+            return None;
+        };
+        (storage::state_key_digest(ns, key) == key_digest).then_some(*i)
+    })
 }
 
 /// How a window's atomic batch went: the conflicts that made it decide
@@ -1787,6 +1925,8 @@ mod tests {
                     })
                     .collect(),
                 missing: Vec::new(),
+                deferred: Vec::new(),
+                oversized: None,
                 trace: Default::default(),
             }
         }
@@ -1866,7 +2006,7 @@ mod tests {
             use super::*;
             use crate::mysql::mysql_activation::{
                 BARRIER_NS, BarrierScope, barrier_stream, read_barriers_head,
-                read_timelines,
+                read_timelines, read_timelines_within, table_stream,
             };
             use storage::StorageBackend as _;
             use storage::adapters::test_util::FaultBackend;
@@ -1939,6 +2079,153 @@ mod tests {
             /// reads give, duplicates requested included; each table stream
             /// and each shared barrier stream is read exactly once, in one
             /// call.
+            /// Within a budget: the barriers, then the tables in the
+            /// order asked while their streams fit whole; the rest are left
+            /// out (read when reached), and nothing is usable when the
+            /// barriers alone do not fit.
+            #[tokio::test]
+            async fn a_budgeted_timeline_read_stops_in_the_order_asked() {
+                let ctx =
+                    ctx_on(std::sync::Arc::new(FaultBackend::new())).await;
+                let keys = fixture(&ctx).await;
+                let mut asked = keys.clone();
+                asked.reverse();
+                let all = read_timelines(
+                    &ctx.registry_backend,
+                    ctx.schema.registry(),
+                    &asked,
+                )
+                .await
+                .unwrap();
+                // The bytes of the barriers and of each asked table's stream.
+                let streams: Vec<(String, String)> = asked
+                    .iter()
+                    .map(|k| (ACTIVATION_NS.to_string(), table_stream(k)))
+                    .collect();
+                let per_table = ctx
+                    .registry_backend
+                    .log_read_streams(&streams)
+                    .await
+                    .unwrap();
+                let mut barrier_streams: Vec<(String, String)> = Vec::new();
+                for k in &asked {
+                    for b in crate::mysql::mysql_activation::barrier_streams(k)
+                    {
+                        let s = (BARRIER_NS.to_string(), b);
+                        if !barrier_streams.contains(&s) {
+                            barrier_streams.push(s);
+                        }
+                    }
+                }
+                let barrier_bytes: u64 = ctx
+                    .registry_backend
+                    .log_read_streams(&barrier_streams)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .flatten()
+                    .map(storage::log_entry_bytes)
+                    .sum();
+                let bytes = |n: usize| -> u64 {
+                    barrier_bytes
+                        + per_table[..n]
+                            .iter()
+                            .flatten()
+                            .map(storage::log_entry_bytes)
+                            .sum::<u64>()
+                };
+                for n in [1, 7, asked.len()] {
+                    let got = read_timelines_within(
+                        &ctx.registry_backend,
+                        ctx.schema.registry(),
+                        &asked,
+                        bytes(n),
+                    )
+                    .await
+                    .unwrap();
+                    // An empty stream after the last that fits still fits.
+                    let fits: Vec<String> = asked
+                        .iter()
+                        .enumerate()
+                        .take_while(|(i, _)| bytes(i + 1) <= bytes(n))
+                        .map(|(_, k)| k.backend_key())
+                        .collect();
+                    let mut keys: Vec<String> = got.keys().cloned().collect();
+                    keys.sort();
+                    let mut want = fits.clone();
+                    want.sort();
+                    assert_eq!(keys, want, "budget for {n} tables");
+                    for k in &fits {
+                        assert_eq!(
+                            got[k].as_ref().unwrap().0.len(),
+                            all[k].as_ref().unwrap().0.len()
+                        );
+                    }
+                }
+                let none = read_timelines_within(
+                    &ctx.registry_backend,
+                    ctx.schema.registry(),
+                    &asked,
+                    0,
+                )
+                .await
+                .unwrap();
+                assert!(barrier_bytes == 0 || none.is_empty());
+            }
+
+            /// The prefetch at a speculative window's head reads within
+            /// the plan budget, in the order given: under a budget that
+            /// takes only the barriers and the first tables, only those are
+            /// cached; the rest are read when reached.
+            #[tokio::test]
+            #[ignore = "sets the process-wide window caps: run serially (gate lane)"]
+            async fn the_timeline_prefetch_stops_at_the_plan_budget() {
+                let ctx =
+                    ctx_on(std::sync::Arc::new(FaultBackend::new())).await;
+                let keys = fixture(&ctx).await;
+                let mut asked = keys.clone();
+                asked.reverse();
+                let mut ctx = ctx;
+                // A budget that takes the barriers and about a third of the
+                // table streams (the fixture's streams are a few records).
+                let all: u64 = ctx
+                    .registry_backend
+                    .log_read_streams(
+                        &asked
+                            .iter()
+                            .map(|k| {
+                                (ACTIVATION_NS.to_string(), table_stream(k))
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .await
+                    .unwrap()
+                    .iter()
+                    .flatten()
+                    .map(storage::log_entry_bytes)
+                    .sum();
+                crate::stream_probe::set_window_caps(Some((
+                    all / 3 + 4096,
+                    16_384,
+                    1 << 30,
+                )));
+                crate::mysql::mysql_selection::load_timelines(&mut ctx, &asked)
+                    .await;
+                crate::stream_probe::set_window_caps(None);
+                let cached: Vec<bool> = asked
+                    .iter()
+                    .map(|k| ctx.selection.timeline(&k.backend_key()).is_some())
+                    .collect();
+                assert!(cached[0], "the first table is read");
+                assert!(
+                    !cached[cached.len() - 1],
+                    "the last is left: {cached:?}"
+                );
+                // A prefix: no table cached after one left out.
+                let first_out = cached.iter().position(|c| !c).unwrap();
+                assert!(cached[first_out..].iter().all(|c| !c), "{cached:?}");
+            }
+
             #[tokio::test]
             async fn the_batch_equals_the_per_table_reads_reading_each_stream_once()
              {
@@ -1968,18 +2255,22 @@ mod tests {
                 let unique: std::collections::BTreeSet<_> =
                     reads.iter().collect();
                 assert_eq!(unique.len(), reads.len(), "no stream read twice");
-                let mut sorted = reads.clone();
-                sorted.sort();
-                let (tables, barriers): (Vec<_>, Vec<_>) =
-                    reads.iter().partition(|(ns, _)| ns == ACTIVATION_NS);
-                assert!(
-                    tables.windows(2).all(|w| w[0] <= w[1]),
-                    "canonical order"
-                );
+                // The shared barriers first (canonical order), then each
+                // table once, in the order asked.
+                let (barriers, tables) = reads.split_at(3);
+                assert!(barriers.iter().all(|(ns, _)| ns == BARRIER_NS));
                 assert!(
                     barriers.windows(2).all(|w| w[0] <= w[1]),
                     "canonical order"
                 );
+                let mut want: Vec<(String, String)> = Vec::new();
+                for k in &asked {
+                    let s = (ACTIVATION_NS.to_string(), table_stream(k));
+                    if !want.contains(&s) {
+                        want.push(s);
+                    }
+                }
+                assert_eq!(tables, &want[..], "the order asked");
                 assert_eq!(got.len(), 30);
                 for k in &keys {
                     let (records, head, barriers, heads) =

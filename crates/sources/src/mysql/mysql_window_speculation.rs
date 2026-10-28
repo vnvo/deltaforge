@@ -62,6 +62,10 @@ pub(crate) enum Governs {
     /// Refused, or not captured: the rows it covers go on without a lazy
     /// baseline, never captured on their own.
     Refused(Covers),
+    /// Cut from the window's prefix by its limits (`mysql_window_budget`):
+    /// nothing of it was decided or recorded, so it covers none of its rows;
+    /// they go back to the stream for a later window.
+    Deferred,
 }
 
 /// Whether `statement` precedes the transaction starting at `boundary`
@@ -107,6 +111,7 @@ pub(crate) fn covers_row(
         Governs::Refused(Covers::UntilStatement(d)) => {
             statement_before(d, row) == Some(false)
         }
+        Governs::Deferred => false,
     }
 }
 
@@ -170,6 +175,8 @@ pub(crate) struct Pending {
     pub closed_by: &'static str,
     pub lineage: String,
     pub batch: BTreeMap<(String, String), MySqlCheckpoint>,
+    /// The batch's tables in first-touch order: the capture's rank order.
+    pub order: Vec<(String, String)>,
     pub task: AbortOnDrop<Result<CapturedWindow, SourceError>>,
 }
 
@@ -226,6 +233,8 @@ pub(crate) struct Collector {
     head: Option<(u64, Instant, MySqlCheckpoint)>,
     head_anchor: Option<super::mysql_binlog_scan::Anchor>,
     batch: BTreeMap<(String, String), MySqlCheckpoint>,
+    /// The batch's tables in first-touch order.
+    order: Vec<(String, String)>,
     events: usize,
     bytes: u64,
     end_seq: u64,
@@ -261,6 +270,7 @@ impl Collector {
             head: None,
             head_anchor: None,
             batch: BTreeMap::new(),
+            order: Vec::new(),
             events: 0,
             bytes: 0,
             end_seq: 0,
@@ -371,7 +381,9 @@ impl Collector {
                 // ordinary window's does at dispatch.
                 self.head_anchor = self.ahead.txn_anchor.clone();
             }
-            self.batch.insert(k, at);
+            if self.batch.insert(k.clone(), at).is_none() {
+                self.order.push(k);
+            }
         }
         if self.head.is_some() {
             self.end_seq = seq;
@@ -388,14 +400,13 @@ impl Collector {
     /// Close the window and start its capture and scan.
     fn close(&mut self, why: &'static str) {
         self.closed = Some(why);
-        let tables: Vec<(String, String)> =
-            self.batch.keys().cloned().collect();
-        let froms: Vec<MySqlCheckpoint> = self
-            .batch
-            .values()
-            .map(|a| MySqlCheckpoint {
+        // First-touch order: the capture's rank order.
+        let tables: Vec<(String, String)> = self.order.clone();
+        let froms: Vec<MySqlCheckpoint> = tables
+            .iter()
+            .map(|k| MySqlCheckpoint {
                 lineage: Some(self.inputs.lineage.clone()),
-                ..a.clone()
+                ..self.batch[k].clone()
             })
             .collect();
         let head = self.head.as_ref().map(|(_, _, h)| MySqlCheckpoint {
@@ -433,6 +444,7 @@ impl Collector {
                     closed_by,
                     lineage: self.inputs.lineage.clone(),
                     batch: self.batch,
+                    order: self.order,
                     task,
                 }),
             ),
@@ -630,6 +642,29 @@ mod tests {
         );
         assert_eq!(first_uncovered(&rows, &decisions), Some(6));
         assert_eq!(first_uncovered(&rows[..6], &decisions), None);
+    }
+
+    /// A table cut from the window's prefix (deferred) covers none of its
+    /// rows: the queue is cut at its first one, before any later row
+    /// (admitted tables' included), and a reserved row of it is uncovered.
+    #[test]
+    fn a_deferred_table_cuts_at_its_first_row() {
+        let a = cp(&format!("{U}:1-3"));
+        let later = cp(&format!("{U}:1-4"));
+        let rows = vec![
+            (0, key("adm"), a.clone()),
+            (1, key("adm"), a.clone()),
+            (2, key("def"), a.clone()),
+            (3, key("adm"), later.clone()),
+            (4, key("def"), later.clone()),
+        ];
+        let decisions = HashMap::from([
+            (key("adm"), (a.clone(), Governs::Admitted)),
+            (key("def"), (a.clone(), Governs::Deferred)),
+        ]);
+        assert_eq!(first_uncovered(&rows, &decisions), Some(2));
+        assert!(!covers_row(&Governs::Deferred, &a, &a));
+        assert!(!reserved_rows_covered(&[(key("def"), later)], &decisions));
     }
 
     #[test]

@@ -694,10 +694,13 @@ pub(crate) async fn load_timelines(ctx: &mut RunCtx, keys: &[SchemaKey]) {
         return;
     }
     let registry = ctx.schema.registry();
-    let Ok(read) = mysql_activation::read_timelines(
+    // Within the plan budget, in the given order: a table left out is read
+    // when it is reached.
+    let Ok(read) = mysql_activation::read_timelines_within(
         &ctx.registry_backend,
         registry,
         &missing,
+        super::mysql_window_budget::Caps::current().plan.bytes,
     )
     .await
     else {

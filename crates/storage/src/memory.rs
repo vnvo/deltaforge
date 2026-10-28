@@ -160,7 +160,7 @@ impl StorageBackend for MemoryStorageBackend {
     ) -> Result<Vec<Vec<LogEntryMeta>>> {
         // One snapshot: the log held for every stream.
         let store = self.log.read().await;
-        Ok(streams
+        let out: Vec<Vec<LogEntryMeta>> = streams
             .iter()
             .map(|(ns, key)| {
                 store
@@ -180,7 +180,43 @@ impl StorageBackend for MemoryStorageBackend {
                     })
                     .unwrap_or_default()
             })
-            .collect())
+            .collect();
+        crate::note_stream_reads(streams, &out);
+        Ok(out)
+    }
+
+    async fn log_read_streams_within(
+        &self,
+        streams: &[(String, String)],
+        budget: u64,
+    ) -> Result<Vec<Vec<LogEntryMeta>>> {
+        let store = self.log.read().await;
+        let mut within = crate::StreamBudget::new(budget);
+        let mut out: Vec<Vec<LogEntryMeta>> = Vec::new();
+        'streams: for (i, (ns, key)) in streams.iter().enumerate() {
+            let mut entries = Vec::new();
+            for e in store
+                .entries
+                .get(&(ns.clone(), key.clone()))
+                .into_iter()
+                .flatten()
+            {
+                let m = LogEntryMeta {
+                    seq: e.seq,
+                    stored_at_ms: e.ts_ms,
+                    capture_id: e.capture_id.clone(),
+                    content_hash: e.content_hash.clone(),
+                    value: e.value.clone(),
+                };
+                if !within.take(i, &m) {
+                    break 'streams;
+                }
+                entries.push(m);
+            }
+            out.push(entries);
+        }
+        crate::note_stream_reads(&streams[..out.len()], &out);
+        Ok(out)
     }
 
     async fn read_batch(
@@ -190,7 +226,7 @@ impl StorageBackend for MemoryStorageBackend {
         // One snapshot: both stores held for the whole batch.
         let log = self.log.read().await;
         let kv = self.kv.read().await;
-        Ok(reads
+        let out: Vec<BatchReadResult> = reads
             .iter()
             .map(|r| match r {
                 BatchRead::KvGet { ns, key } => BatchReadResult::Kv(
@@ -216,7 +252,9 @@ impl StorageBackend for MemoryStorageBackend {
                         .map_or(0, |v| v.len() as u64),
                 ),
             })
-            .collect())
+            .collect();
+        crate::note_batch_reads(reads, &out);
+        Ok(out)
     }
 
     async fn apply_batch(&self, batch: &AtomicBatch) -> Result<BatchOutcome> {
@@ -452,6 +490,7 @@ impl StorageBackend for MemoryStorageBackend {
     }
 
     async fn kv_put(&self, ns: &str, key: &str, value: &[u8]) -> Result<()> {
+        crate::check_guarded_write(ns, key, value.len())?;
         let mut store = self.kv.write().await;
         store.0.insert(
             (ns.to_string(), key.to_string()),
@@ -470,6 +509,7 @@ impl StorageBackend for MemoryStorageBackend {
         value: &[u8],
         ttl_secs: u64,
     ) -> Result<()> {
+        crate::check_guarded_write(ns, key, value.len())?;
         anyhow::ensure!(
             !crate::is_guarded_namespace(ns),
             "a key in guarded namespace {ns} cannot carry a TTL"
@@ -519,6 +559,7 @@ impl StorageBackend for MemoryStorageBackend {
         key: &str,
         value: &[u8],
     ) -> Result<u64> {
+        crate::check_guarded_write(ns, key, value.len())?;
         // Allocated under the log lock: entries are stored in sequence order.
         let mut store = self.log.write().await;
         let seq = self.next_seq();
@@ -605,6 +646,7 @@ impl StorageBackend for MemoryStorageBackend {
         capture_id: &str,
         value: &[u8],
     ) -> Result<LogAppendOutcome> {
+        crate::check_guarded_write(ns, key, value.len())?;
         let mut store = self.log.write().await;
         let k = (ns.to_string(), key.to_string());
         store.ensure_meta(&k);

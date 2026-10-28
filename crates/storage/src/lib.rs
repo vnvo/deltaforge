@@ -277,6 +277,31 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
         Ok(out)
     }
 
+    /// [`log_read_streams`](Self::log_read_streams) within `budget` bytes
+    /// ([`log_entry_bytes`]): the leading streams, in request order, whose
+    /// entries fit together, the first one always. Nothing past the first
+    /// stream that does not fit is kept; the result answers that many
+    /// requests. The default reads everything first and is for test doubles
+    /// only; every production backend stops reading at the budget.
+    async fn log_read_streams_within(
+        &self,
+        streams: &[(String, String)],
+        budget: u64,
+    ) -> Result<Vec<Vec<LogEntryMeta>>> {
+        let all = self.log_read_streams(streams).await?;
+        let mut total = 0u64;
+        let mut out = Vec::with_capacity(all.len());
+        for (i, entries) in all.into_iter().enumerate() {
+            let bytes: u64 = entries.iter().map(log_entry_bytes).sum();
+            if i > 0 && total + bytes > budget {
+                break;
+            }
+            total += bytes;
+            out.push(entries);
+        }
+        Ok(out)
+    }
+
     /// Apply `batch` atomically (see [`AtomicBatch`]). The default refuses:
     /// a backend that cannot commit atomically never pretends to.
     async fn apply_batch(&self, _batch: &AtomicBatch) -> Result<BatchOutcome> {
@@ -454,6 +479,160 @@ pub struct BatchCommitRecord {
 #[derive(Debug, thiserror::Error)]
 #[error("batch identity conflict: marker {0} records another request")]
 pub struct BatchIdentityConflict(pub String);
+
+/// The most bytes one newly written state item (a kv value or a log entry)
+/// may hold: every batch item, and every single write to a guarded
+/// namespace (`docs/design/mysql-mass-invalidation.md`, "Chunking and size
+/// limits"). Reads are never limited: an item written before the limit
+/// stays readable, counted ([`oversized_reads`]).
+pub const MAX_STATE_ITEM_BYTES: usize = 16 * 1024 * 1024;
+
+/// A write refused before any statement: one item over
+/// [`MAX_STATE_ITEM_BYTES`]. It names no table (the store knows none); the
+/// caller that knows the relation classifies it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "a state item of {size} bytes exceeds the {MAX_STATE_ITEM_BYTES}-byte limit (key digest {key_digest})"
+)]
+pub struct StateItemTooLarge {
+    pub size: usize,
+    /// SHA-256 of the item's namespace and key, hex.
+    pub key_digest: String,
+}
+
+/// The SHA-256 (hex) of a state item's namespace and key.
+pub fn state_key_digest(ns: &str, key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(ns.as_bytes());
+    h.update([0u8]);
+    h.update(key.as_bytes());
+    hex::encode(h.finalize())
+}
+
+/// Refuse a new item of `size` bytes over the limit.
+pub fn check_state_item(
+    ns: &str,
+    key: &str,
+    size: usize,
+) -> std::result::Result<(), StateItemTooLarge> {
+    if size > MAX_STATE_ITEM_BYTES {
+        return Err(StateItemTooLarge {
+            size,
+            key_digest: state_key_digest(ns, key),
+        });
+    }
+    Ok(())
+}
+
+/// A single write's limit: guarded namespaces only (the registry and
+/// activation state a window, baseline or drift writes).
+pub(crate) fn check_guarded_write(
+    ns: &str,
+    key: &str,
+    size: usize,
+) -> Result<()> {
+    if is_guarded_namespace(ns) {
+        check_state_item(ns, key, size)?;
+    }
+    Ok(())
+}
+
+static OVERSIZED_READS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Reads of items over [`MAX_STATE_ITEM_BYTES`] since the process started.
+pub fn oversized_reads() -> u64 {
+    OVERSIZED_READS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Count a read item over the limit (written before the limit existed),
+/// logged once per item with its size and key digest.
+pub(crate) fn note_read(ns: &str, key: &str, size: usize) {
+    if size <= MAX_STATE_ITEM_BYTES {
+        return;
+    }
+    OVERSIZED_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    metrics::counter!("deltaforge_state_oversized_reads_total").increment(1);
+    static LOGGED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    let digest = state_key_digest(ns, key);
+    let mut logged = LOGGED.lock().expect("oversized reads");
+    if logged
+        .get_or_insert_with(Default::default)
+        .insert(digest.clone())
+    {
+        tracing::warn!(
+            size,
+            key_digest = %digest,
+            limit = MAX_STATE_ITEM_BYTES,
+            "a state item over the write limit was read (written before the limit)"
+        );
+    }
+}
+
+/// A log entry's size as read: its value, its identifiers and a fixed
+/// overhead.
+pub fn log_entry_bytes(e: &LogEntryMeta) -> u64 {
+    (e.value.len()
+        + e.capture_id.as_ref().map_or(0, String::len)
+        + e.content_hash.as_ref().map_or(0, String::len)) as u64
+        + 32
+}
+
+/// Accumulates [`log_entry_bytes`] of stream reads within a budget: a
+/// stream fits while the total does (the first stream always).
+pub(crate) struct StreamBudget {
+    budget: u64,
+    total: u64,
+}
+
+impl StreamBudget {
+    pub(crate) fn new(budget: u64) -> Self {
+        Self { budget, total: 0 }
+    }
+
+    /// Count an entry of stream `i`; `false`: it does not fit, and the read
+    /// stops before stream `i`.
+    pub(crate) fn take(&mut self, i: usize, e: &LogEntryMeta) -> bool {
+        let bytes = log_entry_bytes(e);
+        if i > 0 && self.total + bytes > self.budget {
+            return false;
+        }
+        self.total += bytes;
+        true
+    }
+}
+
+/// Count the oversized items among a batched read's results.
+pub(crate) fn note_batch_reads(reads: &[BatchRead], got: &[BatchReadResult]) {
+    for (r, g) in reads.iter().zip(got) {
+        let (BatchRead::KvGet { ns, key } | BatchRead::LogLatest { ns, key }) =
+            r
+        else {
+            continue;
+        };
+        match g {
+            BatchReadResult::Kv(Some(v))
+            | BatchReadResult::Latest(Some((_, v))) => {
+                note_read(ns, key, v.len())
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Count the oversized entries among stream reads.
+pub(crate) fn note_stream_reads(
+    streams: &[(String, String)],
+    got: &[Vec<LogEntryMeta>],
+) {
+    for ((ns, key), entries) in streams.iter().zip(got) {
+        for e in entries {
+            note_read(ns, key, e.value.len());
+        }
+    }
+}
 
 /// The canonical digest of a batch request (its preconditions and ops, a
 /// commit marker excluded), the identity a marker is checked against.
@@ -730,6 +909,28 @@ impl AtomicBatch {
             ops <= MAX_BATCH_OPS,
             "a batch of {ops} ops exceeds the {MAX_BATCH_OPS}-op limit"
         );
+        for op in &self.ops {
+            // A rendered template is never longer than its sentinel form.
+            let item = match op {
+                BatchOp::LogAppendIfAbsent { ns, key, value, .. } => {
+                    Some((ns, key, value.len()))
+                }
+                BatchOp::KvPut { ns, key, value } => Some((
+                    ns,
+                    key,
+                    match value {
+                        BatchValue::Bytes(b) => b.len(),
+                        BatchValue::SeqTemplate { template, .. } => {
+                            template.len()
+                        }
+                    },
+                )),
+                _ => None,
+            };
+            if let Some((ns, key, size)) = item {
+                check_state_item(ns, key, size)?;
+            }
+        }
         for (i, op) in self.ops.iter().enumerate() {
             let of = match op {
                 BatchOp::CommitMarker { .. } => {
@@ -2552,6 +2753,14 @@ pub(crate) mod atomic_batch_suite {
         an_expired_value_reads_as_absent(be.clone(), &format!("{ns}_ttl"))
             .await;
         large_groups_keep_request_order(be.clone(), &format!("{ns}_big")).await;
+        oversized_items_are_refused(be.clone(), &format!("{ns}_m")).await;
+        stream_reads_stop_at_their_budget(be.clone(), &format!("{ns}_within"))
+            .await;
+        oversized_legacy_items_stay_readable(
+            be.clone(),
+            &format!("{ns}_legacy"),
+        )
+        .await;
     }
 
     /// A max sees the batch's own earlier writes of its key, and repeated
@@ -2785,6 +2994,126 @@ pub(crate) mod atomic_batch_suite {
         let big = be.log_list(ns, "big").await.unwrap();
         assert_eq!(big.len(), 3);
         assert!(big.iter().all(|(_, v)| v.len() == 2 * 1024 * 1024));
+    }
+
+    /// A newly written state item may not exceed `MAX_STATE_ITEM_BYTES`: a
+    /// batch item over it is refused before any statement with its size and
+    /// key digest, and nothing is written; one at the limit commits. A
+    /// single write to a guarded namespace is refused the same way.
+    pub async fn oversized_items_are_refused(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
+        let at = vec![7u8; MAX_STATE_ITEM_BYTES];
+        let over = vec![7u8; MAX_STATE_ITEM_BYTES + 1];
+        let batch = |log_value: &[u8], kv_value: &[u8]| AtomicBatch {
+            preconditions: vec![],
+            ops: vec![
+                log(ns, "s", "e", log_value),
+                BatchOp::KvPut {
+                    ns: ns.into(),
+                    key: "k".into(),
+                    value: BatchValue::Bytes(kv_value.to_vec()),
+                },
+            ],
+        };
+        for (log_value, kv_value, key) in [(&over, &at, "s"), (&at, &over, "k")]
+        {
+            let err = be
+                .apply_batch(&batch(log_value, kv_value))
+                .await
+                .unwrap_err();
+            let too = err
+                .downcast_ref::<StateItemTooLarge>()
+                .unwrap_or_else(|| panic!("{err:#}"));
+            assert_eq!(too.size, MAX_STATE_ITEM_BYTES + 1);
+            assert_eq!(too.key_digest, state_key_digest(ns, key));
+            assert!(be.log_list(ns, "s").await.unwrap().is_empty());
+            assert_eq!(be.kv_get(ns, "k").await.unwrap(), None);
+        }
+        committed(be.apply_batch(&batch(&at, &at)).await.unwrap());
+        let guarded = "schemas.v1.oversize";
+        let err = be.kv_put(guarded, ns, &over).await.unwrap_err();
+        assert!(err.downcast_ref::<StateItemTooLarge>().is_some(), "{err:#}");
+        let err = be.log_append(guarded, ns, &over).await.unwrap_err();
+        assert!(err.downcast_ref::<StateItemTooLarge>().is_some(), "{err:#}");
+    }
+
+    /// An item over the limit written before it existed (an unguarded one
+    /// here) stays readable through batched and stream reads, and each such
+    /// read is counted.
+    pub async fn oversized_legacy_items_stay_readable(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
+        let over = vec![3u8; MAX_STATE_ITEM_BYTES + 10];
+        be.kv_put(ns, "legacy", &over).await.unwrap();
+        be.log_append(ns, "legacy", &over).await.unwrap();
+        let before = oversized_reads();
+        let got = be
+            .read_batch(&[
+                BatchRead::KvGet {
+                    ns: ns.into(),
+                    key: "legacy".into(),
+                },
+                BatchRead::LogLatest {
+                    ns: ns.into(),
+                    key: "legacy".into(),
+                },
+            ])
+            .await
+            .unwrap();
+        assert!(
+            matches!(&got[0], BatchReadResult::Kv(Some(v)) if v.len() == over.len())
+        );
+        assert!(
+            matches!(&got[1], BatchReadResult::Latest(Some((_, v))) if v.len() == over.len())
+        );
+        let streams = be
+            .log_read_streams(&[(ns.into(), "legacy".into())])
+            .await
+            .unwrap();
+        assert_eq!(streams[0][0].value.len(), over.len());
+        assert!(
+            oversized_reads() >= before + 3,
+            "{} {before}",
+            oversized_reads()
+        );
+    }
+
+    /// A budgeted stream read answers the leading streams, in request
+    /// order, whose entries fit the budget together: exactly as the full
+    /// read answers them, the first one always, and none past the first that
+    /// does not fit (an empty stream fits).
+    pub async fn stream_reads_stop_at_their_budget(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
+        for (key, n) in [("a", 3), ("c", 3), ("d", 1)] {
+            for i in 0..n {
+                be.log_append(ns, key, &vec![i as u8; 1000]).await.unwrap();
+            }
+        }
+        let streams: Vec<(String, String)> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|k| (ns.to_string(), k.to_string()))
+            .collect();
+        let full = be.log_read_streams(&streams).await.unwrap();
+        let a_bytes: u64 = full[0].iter().map(log_entry_bytes).sum();
+        let c_bytes: u64 = full[2].iter().map(log_entry_bytes).sum();
+        for (budget, answered) in [
+            (0, 2),
+            (a_bytes, 2),
+            (a_bytes + c_bytes - 1, 2),
+            (a_bytes + c_bytes, 3),
+            (u64::MAX, 4),
+        ] {
+            let got =
+                be.log_read_streams_within(&streams, budget).await.unwrap();
+            assert_eq!(got.len(), answered, "budget {budget}");
+            assert_eq!(&got[..], &full[..answered], "budget {budget}");
+        }
+        assert!(be.log_read_streams_within(&[], 0).await.unwrap().is_empty());
     }
 
     /// Every stream as paged out one by one.

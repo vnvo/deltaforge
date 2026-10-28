@@ -1015,22 +1015,77 @@ pub(crate) async fn fetch_table_schemas_on(
     conn: &mut mysql_async::Conn,
     tables: &[(&str, &str)],
 ) -> SourceResult<HashMap<(String, String), MySqlTableSchema>> {
+    Ok(fetch_table_schemas_within(conn, tables, u64::MAX, u64::MAX)
+        .await?
+        .schemas)
+}
+
+/// The schemas [`fetch_table_schemas_within`] read: the first `kept`
+/// tables, in rank order (one with no columns does not exist), and the
+/// rest left unread.
+#[derive(Debug)]
+pub(crate) struct SchemasWithin {
+    pub schemas: HashMap<(String, String), MySqlTableSchema>,
+    /// Tables `[0, kept)` were read whole; `[kept, ..)` were not read.
+    pub kept: usize,
+    /// The bytes the table at `kept` had reached when it went over
+    /// `item_limit`, if that is why the read stopped.
+    pub oversized: Option<u64>,
+}
+
+/// One column row's size as read (its values' bytes).
+fn row_bytes(row: &Row) -> u64 {
+    (0..row.len())
+        .map(|i| match row.as_ref(i) {
+            Some(mysql_async::Value::Bytes(b)) => b.len() as u64,
+            _ => 8,
+        })
+        .sum::<u64>()
+        + 16
+}
+
+/// [`fetch_table_schemas_on`] for `tables` in rank order, within a budget
+/// (`docs/design/mysql-mass-invalidation.md`, "Schema capture"): the
+/// column rows, by far the largest read, are consumed one at a time in rank
+/// order. A table is kept once it is whole and the kept tables' rows fit
+/// `budget` (the first table always fits); the read stops at the first
+/// table that does not, or at a table whose own rows exceed `item_limit`,
+/// and the rest of the rows are discarded unkept. The other reads cover the
+/// kept tables only.
+pub(crate) async fn fetch_table_schemas_within(
+    conn: &mut mysql_async::Conn,
+    tables: &[(&str, &str)],
+    budget: u64,
+    item_limit: u64,
+) -> SourceResult<SchemasWithin> {
     let mut schemas = HashMap::new();
     if tables.is_empty() {
-        return Ok(schemas);
+        return Ok(SchemasWithin {
+            schemas,
+            kept: 0,
+            oversized: None,
+        });
     }
-    let pairs = vec!["(?, ?)"; tables.len()].join(", ");
-    let params: Vec<mysql_async::Value> = tables
+    let all_pairs = vec!["(?, ?)"; tables.len()].join(", ");
+    let ranks = vec!["?"; tables.len()].join(", ");
+    // A database name never holds a `.`, so `db.table` names one table.
+    let mut col_params: Vec<mysql_async::Value> = tables
         .iter()
-        .flat_map(|(db, table)| [(*db).into(), (*table).into()])
+        .map(|(db, table)| format!("{db}.{table}").into())
         .collect();
+    col_params.extend(
+        tables
+            .iter()
+            .flat_map(|(db, table)| [(*db).into(), (*table).into()]),
+    );
 
-    // Fetch columns
-    let col_rows: Vec<Row> = conn
-        .exec(
+    // Fetch columns, in rank order, one row at a time.
+    let mut rows = conn
+        .exec_iter(
             format!(
                 r#"
             SELECT
+                FIELD(CONCAT(TABLE_SCHEMA, '.', TABLE_NAME), {ranks}) AS RK,
                 TABLE_SCHEMA,
                 TABLE_NAME,
                 COLUMN_NAME,
@@ -1049,20 +1104,55 @@ pub(crate) async fn fetch_table_schemas_on(
                 (SELECT co.ID FROM INFORMATION_SCHEMA.COLLATIONS co
                  WHERE co.COLLATION_NAME = c.COLLATION_NAME) AS COLLATION_ID
             FROM INFORMATION_SCHEMA.COLUMNS c
-            WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({pairs})
-            ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
+            WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({all_pairs})
+            ORDER BY RK, ORDINAL_POSITION
             "#
             ),
-            params.clone(),
+            col_params,
         )
         .await
         .map_err(query_error)?;
-
-    for mut row in col_rows {
+    // The table being read: its rank, key, schema so far and bytes.
+    let mut current: Option<(usize, (String, String), MySqlTableSchema, u64)> =
+        None;
+    let mut total = 0u64;
+    let mut stop: Option<(usize, Option<u64>)> = None;
+    while let Some(mut row) = rows.next().await.map_err(query_error)? {
+        let rank = row.take::<i64, _>("RK").unwrap().max(1) as usize - 1;
+        let bytes = row_bytes(&row);
         let key: (String, String) = (
             row.take("TABLE_SCHEMA").unwrap(),
             row.take("TABLE_NAME").unwrap(),
         );
+        if current.as_ref().is_some_and(|c| c.0 != rank)
+            && let Some((_, k, schema, b)) = current.take()
+        {
+            total += b;
+            schemas.insert(k, schema);
+        }
+        let entry = current.get_or_insert_with(|| {
+            (
+                rank,
+                key,
+                MySqlTableSchema {
+                    columns: Vec::new(),
+                    primary_key: Vec::new(),
+                    engine: None,
+                    charset: None,
+                    collation: None,
+                },
+                0,
+            )
+        });
+        entry.3 += bytes;
+        if entry.3 > item_limit {
+            stop = Some((rank, Some(entry.3)));
+            break;
+        }
+        if !schemas.is_empty() && total + entry.3 > budget {
+            stop = Some((rank, None));
+            break;
+        }
         let column = MySqlColumn {
             name: row.take("COLUMN_NAME").unwrap(),
             column_type: row.take("COLUMN_TYPE").unwrap(),
@@ -1091,18 +1181,32 @@ pub(crate) async fn fetch_table_schemas_on(
                 .unwrap(),
             primary_key_prefix: None,
         };
-        schemas
-            .entry(key)
-            .or_insert_with(|| MySqlTableSchema {
-                columns: Vec::new(),
-                primary_key: Vec::new(),
-                engine: None,
-                charset: None,
-                collation: None,
-            })
-            .columns
-            .push(column);
+        entry.2.columns.push(column);
     }
+    // The rows past the stop are read off the connection, never kept.
+    rows.drop_result().await.map_err(query_error)?;
+    let (kept, oversized) = match stop {
+        Some((rank, oversized)) => (rank, oversized),
+        None => {
+            if let Some((_, k, schema, _)) = current.take() {
+                schemas.insert(k, schema);
+            }
+            (tables.len(), None)
+        }
+    };
+    let tables = &tables[..kept];
+    if tables.is_empty() {
+        return Ok(SchemasWithin {
+            schemas,
+            kept,
+            oversized,
+        });
+    }
+    let pairs = vec!["(?, ?)"; tables.len()].join(", ");
+    let params: Vec<mysql_async::Value> = tables
+        .iter()
+        .flat_map(|(db, table)| [(*db).into(), (*table).into()])
+        .collect();
 
     #[cfg(test)]
     read_hook::after(tables, 1).await;
@@ -1194,7 +1298,11 @@ pub(crate) async fn fetch_table_schemas_on(
         }
     }
 
-    Ok(schemas)
+    Ok(SchemasWithin {
+        schemas,
+        kept,
+        oversized,
+    })
 }
 
 /// Test-only: an action run between the schema read's queries (after query

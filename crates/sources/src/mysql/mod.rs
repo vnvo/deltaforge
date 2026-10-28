@@ -42,6 +42,7 @@ mod mysql_proof_scanner;
 mod mysql_selection;
 mod mysql_session;
 mod mysql_signature;
+mod mysql_window_budget;
 mod mysql_window_speculation;
 use mysql_helpers::{checkpoint_lineage, prepare_client};
 
@@ -50,6 +51,7 @@ pub mod mysql_jsonb;
 
 mod mysql_schema_loader;
 pub use mysql_schema_loader::{LoadedSchema, MySqlSchemaLoader};
+pub(crate) use mysql_window_budget::Invalid as WindowInvalid;
 
 pub mod mysql_rotation;
 

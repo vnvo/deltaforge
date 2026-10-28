@@ -56,6 +56,9 @@ storage = { path = "../storage", features = ["testing"] }
 ctor = "0.6"
 metrics-util = "0.19"
 testcontainers = "0.25"
+# The window memory test measures its peak allocation with jemalloc.
+tikv-jemallocator = "0.6"
+tikv-jemalloc-sys = { version = "0.6", features = ["stats"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = [
     "env-filter",

@@ -414,6 +414,163 @@ async fn a_burst_is_batched_file_position() {
 /// A schema change closes the window before it: the tables touched before
 /// it are one batch, those touched after it are proven after it (the
 /// changed table by its DDL's forward proof), all delivered.
+/// Wide tables (`n` of them): each schema is about 8 KB, so a table's
+/// window cost is about 46 KB.
+async fn wide_tables(c: &mut mysql_async::Conn, n: usize) {
+    // MySQL's longest column comment is 1,024 characters.
+    let comment = "x".repeat(1000);
+    let extra: String = (1..=6)
+        .map(|k| format!(", c{k} INT COMMENT '{comment}'"))
+        .collect();
+    for i in 0..n {
+        c.query_drop(format!(
+            "CREATE TABLE t{i:04} (id INT PRIMARY KEY COMMENT '{comment}', \
+             v INT NOT NULL COMMENT '{comment}'{extra})"
+        ))
+        .await
+        .unwrap();
+    }
+}
+
+/// Test caps for the duration of a test, cleared on drop.
+struct WindowCaps;
+impl WindowCaps {
+    fn set(plan_bytes: u64, read_items: u64, table_bytes: u64) -> Self {
+        sources::stream_probe::set_window_caps(Some((
+            plan_bytes,
+            read_items,
+            table_bytes,
+        )));
+        WindowCaps
+    }
+}
+impl Drop for WindowCaps {
+    fn drop(&mut self) {
+        sources::stream_probe::set_window_caps(None);
+    }
+}
+
+/// One transaction touches five wide tables twice each, in turn, so their
+/// held rows interleave, and the caps take two tables per plan: the first
+/// window admits its first two tables and defers the rest with nothing
+/// recorded for them; following windows admit them in first-touch order.
+/// Every row is delivered once, in binary-log order, and each table has
+/// exactly one activation record, in commit order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn a_window_over_its_caps_admits_its_prefix_and_defers_the_rest() {
+    let (container, port) = start(true).await;
+    let mut c = conn(port).await;
+    wide_tables(&mut c, 5).await;
+    let _caps = WindowCaps::set(110_000, 16_384, 110_000);
+    let id = "prefix";
+    let store = Store::memory();
+    let r = run_on(port, id, MysqlProofCfg::default(), &store).await;
+    r.handle.pause();
+    // First touch is not name order.
+    let touch = [3, 0, 4, 1, 2];
+    let mut txn = String::from("BEGIN;");
+    for round in 1..=2 {
+        for i in touch {
+            txn.push_str(&format!(
+                "INSERT INTO t{i:04} (id, v) VALUES ({round}, {i});"
+            ));
+        }
+    }
+    txn.push_str("COMMIT");
+    c.query_drop(txn).await.unwrap();
+    r.handle.resume();
+    r.delivered(5, Duration::from_secs(120)).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while r.rows.load(std::sync::atomic::Ordering::SeqCst) < 10 {
+        assert!(Instant::now() < deadline, "not every row delivered");
+        sleep(Duration::from_millis(50)).await;
+    }
+    sleep(Duration::from_secs(1)).await;
+    let order = r.order.lock().unwrap().clone();
+    let want: Vec<(String, i64)> = (1..=2)
+        .flat_map(|round| touch.map(|i| (format!("t{i:04}"), round)))
+        .collect();
+    assert_eq!(order, want, "every row once, in binary-log order");
+    let mut seqs = Vec::new();
+    for i in touch {
+        let t = format!("t{i:04}");
+        let recs = store.activation(port, id, &t).await;
+        assert_eq!(recs.len(), 1, "{t}: {recs:?}");
+        seqs.push(recs[0].0);
+    }
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "commit order is first-touch order: {seqs:?}"
+    );
+    r.stop().await;
+    container.rm().await.ok();
+    let windows = records(id, "window");
+    let tables: Vec<u64> = windows.iter().map(|w| count(w, "tables")).collect();
+    assert_eq!(tables.first(), Some(&2), "{windows:?}");
+    assert!(tables.iter().all(|t| *t <= 2), "{tables:?}");
+    assert_eq!(tables.iter().sum::<u64>(), 5, "{tables:?}");
+    let deferred: Vec<String> = records(id, "proof")
+        .iter()
+        .filter(|p| p["outcome"] == "deferred")
+        .map(|p| p["table"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        ["t0004", "t0001", "t0002"]
+            .iter()
+            .all(|t| deferred.iter().any(|d| d == t)),
+        "deferred by the first window: {deferred:?}"
+    );
+}
+
+/// A table whose state exceeds the per-table limit, or whose registration
+/// needs more reads than a plan allows, halts the source with its incident
+/// when it is reached, as the window's first table: nothing is delivered or
+/// recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn a_table_no_window_can_take_halts_the_source() {
+    let (container, port) = start(true).await;
+    let mut c = conn(port).await;
+    wide_tables(&mut c, 1).await;
+    for (caps, code) in [
+        (
+            (1 << 30, 16_384, 10_000),
+            ReasonCode::MysqlTableStateTooLarge,
+        ),
+        (
+            (1 << 30, 10, 1 << 30),
+            ReasonCode::MysqlTableRegistryTooLarge,
+        ),
+    ] {
+        let _caps = WindowCaps::set(caps.0, caps.1, caps.2);
+        let id = format!("invalid-{}", code.as_str());
+        let store = Store::memory();
+        let r = run_on(port, &id, MysqlProofCfg::default(), &store).await;
+        c.query_drop(format!(
+            "INSERT INTO t0000 (id, v) VALUES ({}, 1)",
+            caps.1
+        ))
+        .await
+        .unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(60), r.handle.join)
+            .await
+            .expect("the source stops")
+            .expect("the source task completes");
+        let err = end.expect_err("the source halts");
+        let draft = err.draft().expect("an incident");
+        assert_eq!(draft.reason_code, code, "{err}");
+        assert_eq!(
+            draft.evidence.text_of(EvidenceKey::Table),
+            Some("win.t0000")
+        );
+        assert_eq!(r.rows.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(store.activation(port, &id, "t0000").await.is_empty());
+        r.drain.abort();
+    }
+    container.rm().await.ok();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires docker"]
 async fn a_schema_change_closes_the_window() {

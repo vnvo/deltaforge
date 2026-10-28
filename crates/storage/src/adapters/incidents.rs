@@ -351,7 +351,10 @@ pub fn verified_start_check(
         (
             ReasonCode::SourceDecodeFailed
             | ReasonCode::PgMessageTooLarge
-            | ReasonCode::MysqlCaptureContention,
+            | ReasonCode::MysqlCaptureContention
+            | ReasonCode::StateItemTooLarge
+            | ReasonCode::MysqlTableStateTooLarge
+            | ReasonCode::MysqlTableRegistryTooLarge,
             Component::Source { .. },
         ) => Some(PIPELINE_RECOVERED),
         _ => None,

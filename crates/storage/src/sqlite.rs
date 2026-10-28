@@ -376,6 +376,48 @@ impl StorageBackend for SqliteStorageBackend {
                 });
             }
             tx.commit()?;
+            crate::note_batch_reads(&reads, &out);
+            Ok(out)
+        })
+    }
+
+    async fn log_read_streams_within(
+        &self,
+        streams: &[(String, String)],
+        budget: u64,
+    ) -> Result<Vec<Vec<LogEntryMeta>>> {
+        let streams = streams.to_vec();
+        db!(self, move |conn: &Connection| {
+            // One snapshot, stepped row by row and stopped at the budget.
+            let tx = conn.unchecked_transaction()?;
+            let mut out: Vec<Vec<LogEntryMeta>> = Vec::new();
+            {
+                let mut stmt = tx.prepare_cached(
+                    "SELECT seq, COALESCE(ts_ms, ts*1000), capture_id, content_hash, val
+                     FROM df_log WHERE ns=?1 AND key=?2 ORDER BY seq ASC",
+                )?;
+                let mut within = crate::StreamBudget::new(budget);
+                'streams: for (i, (ns, key)) in streams.iter().enumerate() {
+                    let mut rows = stmt.query(params![ns, key])?;
+                    let mut entries = Vec::new();
+                    while let Some(r) = rows.next()? {
+                        let m = LogEntryMeta {
+                            seq: r.get::<_, i64>(0)? as u64,
+                            stored_at_ms: r.get(1)?,
+                            capture_id: r.get(2)?,
+                            content_hash: r.get(3)?,
+                            value: r.get(4)?,
+                        };
+                        if !within.take(i, &m) {
+                            break 'streams;
+                        }
+                        entries.push(m);
+                    }
+                    out.push(entries);
+                }
+            }
+            tx.commit()?;
+            crate::note_stream_reads(&streams[..out.len()], &out);
             Ok(out)
         })
     }
@@ -409,6 +451,7 @@ impl StorageBackend for SqliteStorageBackend {
                 }
             }
             tx.commit()?;
+            crate::note_stream_reads(&streams, &out);
             Ok(out)
         })
     }
@@ -642,6 +685,7 @@ impl StorageBackend for SqliteStorageBackend {
     }
 
     async fn kv_put(&self, ns: &str, key: &str, value: &[u8]) -> Result<()> {
+        crate::check_guarded_write(ns, key, value.len())?;
         let ns = ns.to_string();
         let key = key.to_string();
         let value = value.to_vec();
@@ -664,6 +708,7 @@ impl StorageBackend for SqliteStorageBackend {
         value: &[u8],
         ttl_secs: u64,
     ) -> Result<()> {
+        crate::check_guarded_write(ns, key, value.len())?;
         anyhow::ensure!(
             !crate::is_guarded_namespace(ns),
             "a key in guarded namespace {ns} cannot carry a TTL"
@@ -743,6 +788,7 @@ impl StorageBackend for SqliteStorageBackend {
         key: &str,
         value: &[u8],
     ) -> Result<u64> {
+        crate::check_guarded_write(ns, key, value.len())?;
         let ns = ns.to_string();
         let key = key.to_string();
         let value = value.to_vec();
@@ -825,6 +871,7 @@ impl StorageBackend for SqliteStorageBackend {
         capture_id: &str,
         value: &[u8],
     ) -> Result<LogAppendOutcome> {
+        crate::check_guarded_write(ns, key, value.len())?;
         let ns = ns.to_string();
         let key = key.to_string();
         let capture_id = capture_id.to_string();
