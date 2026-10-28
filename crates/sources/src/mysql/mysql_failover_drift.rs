@@ -1290,22 +1290,56 @@ pub(crate) async fn check_in_stream(
     Ok(())
 }
 
-/// [`check_in_stream`] for an activation window: assess every table first
-/// (any halt stops the window with nothing written), then record them all.
-pub(crate) async fn check_window(
+/// One of a window's tables, for its row-path drift check from the
+/// window's own capture and scan answer.
+pub(crate) struct WindowTable<'a> {
+    pub db: &'a str,
+    pub table: &'a str,
+    /// Its rows' transaction start E (the window's scan starts there).
+    pub at: WmPos,
+    pub at_cp: MySqlCheckpoint,
+    pub timeline: Vec<Stored>,
+    /// Its shape in the window's capture (`None`: not captured).
+    pub capture: Option<super::mysql_binlog_scan::Captured>,
+    /// The window's scan answer for it: the interval (E, S].
+    pub report: &'a super::mysql_binlog_scan::ScanReport,
+}
+
+/// A window's row-path drift: the anchor checked against, and per window
+/// table its verdict (`None`: nothing to check, already checked in this run
+/// or no failover).
+pub(crate) struct WindowDrift {
+    pub anchor: Option<std::sync::Arc<FailoverAnchor>>,
+    pub verdicts: Vec<Option<DriftVerdict>>,
+}
+
+/// The row-path drift of a window's tables, decided from the window's own
+/// capture and each table's scan answer (the interval (E, S] its proof
+/// starts at) by [`pre_assess`], [`proof_start`], [`shape_from`] and
+/// [`finish_assess`]: [`assess`]'s decision, without a capture and a scan
+/// of its own per table. A halt (or a hard stop) of any table is the
+/// error, before anything of the window is written; the verdicts are the
+/// window batch's to commit ([`drift_request`], [`marker_op`]), and
+/// [`window_checked`] notes them once it committed.
+pub(crate) async fn window_verdicts(
     ctx: &mut super::RunCtx,
-    tables: &[(String, String, WmPos, MySqlCheckpoint, Vec<Stored>)],
-) -> SourceResult<()> {
+    tables: &[WindowTable<'_>],
+) -> SourceResult<WindowDrift> {
     let scope = ctx.registry_scope.current()?;
-    let pending: Vec<_> = tables
-        .iter()
-        .filter(|(db, table, ..)| {
-            !ctx.drift_checked
-                .contains(&scope.key(db, table).backend_key())
+    let mut verdicts: Vec<Option<DriftVerdict>> =
+        tables.iter().map(|_| None).collect();
+    let pending: Vec<usize> = (0..tables.len())
+        .filter(|i| {
+            !ctx.drift_checked.contains(
+                &scope.key(tables[*i].db, tables[*i].table).backend_key(),
+            )
         })
         .collect();
     if pending.is_empty() {
-        return Ok(());
+        return Ok(WindowDrift {
+            anchor: None,
+            verdicts,
+        });
     }
     let anchor = match &ctx.failover {
         Some(anchor) => anchor.clone(),
@@ -1319,35 +1353,77 @@ pub(crate) async fn check_window(
             anchor
         }
     };
-    if let Some(anchor) = anchor {
-        let server_uuid = ctx.expected_uuid()?;
-        let env = DriftEnv {
-            backend: &ctx.registry_backend,
-            loader: &ctx.schema,
-            scope: &scope,
-            capture: &ctx.capture,
-            server_uuid: &server_uuid,
-            source_id: &ctx.source_id,
-            halt: ctx.on_schema_drift == deltaforge_config::OnSchemaDrift::Halt,
-            lower_case_table_names: ctx.lower_case_table_names,
-            proofs: Some(&ctx.proof_scanner),
-        };
-        let mut verdicts = Vec::with_capacity(pending.len());
-        for (db, table, at, at_cp, timeline) in &pending {
+    let Some(anchor) = anchor else {
+        return Ok(WindowDrift {
+            anchor: None,
+            verdicts,
+        });
+    };
+    let server_uuid = ctx.expected_uuid()?;
+    let env = DriftEnv {
+        backend: &ctx.registry_backend,
+        loader: &ctx.schema,
+        scope: &scope,
+        capture: &ctx.capture,
+        server_uuid: &server_uuid,
+        source_id: &ctx.source_id,
+        halt: ctx.on_schema_drift == deltaforge_config::OnSchemaDrift::Halt,
+        lower_case_table_names: ctx.lower_case_table_names,
+        proofs: Some(&ctx.proof_scanner),
+    };
+    for i in pending {
+        verdicts[i] = Some(verdict_from(&env, &anchor, &tables[i]).await?);
+    }
+    Ok(WindowDrift {
+        anchor: Some(anchor),
+        verdicts,
+    })
+}
+
+/// One window table's verdict from the window's capture and scan answer:
+/// [`assess`]'s decision (its reads, the proof's start, the shape the
+/// capture proves, the policy), with no capture or scan of its own.
+pub(crate) async fn verdict_from(
+    env: &DriftEnv<'_>,
+    anchor: &FailoverAnchor,
+    t: &WindowTable<'_>,
+) -> SourceResult<DriftVerdict> {
+    match pre_assess(env, anchor, t.db, t.table).await? {
+        Pre::Done(v) => Ok(v),
+        Pre::Shape { key, previous } => {
             let event = FirstEvent::Rows {
-                at,
-                at_cp,
-                timeline,
+                at: &t.at,
+                at_cp: &t.at_cp,
+                timeline: &t.timeline,
             };
-            verdicts.push(assess(&env, &anchor, db, table, event).await?);
-        }
-        for ((db, table, ..), verdict) in pending.iter().zip(verdicts) {
-            record(&env, &anchor, db, table, verdict).await?;
+            let shape = match (proof_start(anchor, &event), &t.capture) {
+                (Some(from), Some(cap)) => shape_from(
+                    env.source_id,
+                    env.lower_case_table_names,
+                    t.db,
+                    t.table,
+                    &from,
+                    cap,
+                    t.report,
+                ),
+                _ => None,
+            };
+            finish_assess(env, t.db, t.table, key, previous, shape)
         }
     }
-    for (db, table, ..) in pending {
-        ctx.drift_checked.insert(scope.key(db, table).backend_key());
-        ctx.drift_resolver.accepted(&format!("{db}.{table}")).await;
+}
+
+/// Note a window's drift-checked tables once its batch committed: each is
+/// checked for this run, and its resolver learns it.
+pub(crate) async fn window_checked(
+    ctx: &mut super::RunCtx,
+    tables: &[(String, String)],
+) -> SourceResult<()> {
+    let scope = ctx.registry_scope.current()?;
+    for (db, table) in tables {
+        if ctx.drift_checked.insert(scope.key(db, table).backend_key()) {
+            ctx.drift_resolver.accepted(&format!("{db}.{table}")).await;
+        }
     }
     Ok(())
 }
@@ -2005,6 +2081,220 @@ mod tests {
             for m in all_markers(&st, db).await {
                 assert_eq!(m.len(), 1, "{m:?}");
             }
+        }
+
+        /// A verdict, summarized for comparison: its outcome, predecessor
+        /// and registered shape, or the incident of its error.
+        fn summary(v: SourceResult<DriftVerdict>) -> String {
+            match v {
+                Ok(DriftVerdict::Completed) => "completed".into(),
+                Ok(DriftVerdict::Marker {
+                    previous,
+                    register,
+                    outcome,
+                    ..
+                }) => format!(
+                    "{outcome:?} {previous:?} {:?}",
+                    register.map(|s| s.fingerprint().to_string())
+                ),
+                Err(e) => {
+                    format!("error {:?}", e.draft().map(|d| d.reason_code))
+                }
+            }
+        }
+
+        /// Every table's verdict both ways, under one anchor, timeline and
+        /// policy: the per-table check (its own capture and scan) and the
+        /// window's inputs (one capture of every table, one scan of
+        /// (E, S]).
+        #[allow(clippy::too_many_arguments)]
+        async fn compare(
+            st: &Store,
+            dsn: &str,
+            db: &str,
+            e_cp: &MySqlCheckpoint,
+            anchor: &FailoverAnchor,
+            timeline: &[Stored],
+            halt: bool,
+            case: &str,
+        ) -> Vec<String> {
+            use crate::mysql::mysql_binlog_scan::{
+                capture_batch, scan_interval,
+            };
+            let here = uuid(dsn).await;
+            let env = env(st, &here, halt);
+            let e = mysql_checkpoint_position(
+                &e_cp.file,
+                e_cp.pos,
+                e_cp.gtid_set.as_deref(),
+            )
+            .unwrap();
+            let names = tables(db);
+            let mut out = Vec::new();
+            let cap = capture_batch(
+                &st.capture,
+                &here,
+                &anchor.current_lineage,
+                &names,
+                8,
+                None,
+            )
+            .await
+            .expect("not cancelled")
+            .unwrap();
+            let report = scan_interval(
+                dsn,
+                4_000_777,
+                &here,
+                &anchor.current_lineage,
+                e_cp,
+                &cap.position,
+                &ScanLimits::default(),
+                &ScanTag {
+                    source_id: "s",
+                    kind: ProofKind::FailoverDrift,
+                },
+            )
+            .await
+            .unwrap();
+            for (d, t) in &names {
+                let old = assess(
+                    &env,
+                    anchor,
+                    d,
+                    t,
+                    FirstEvent::Rows {
+                        at: &e,
+                        at_cp: e_cp,
+                        timeline,
+                    },
+                )
+                .await;
+                let new = verdict_from(
+                    &env,
+                    anchor,
+                    &WindowTable {
+                        db: d,
+                        table: t,
+                        at: e.clone(),
+                        at_cp: e_cp.clone(),
+                        timeline: timeline.to_vec(),
+                        capture: cap.table(d, t),
+                        report: &report,
+                    },
+                )
+                .await;
+                let (old, new) = (summary(old), summary(new));
+                assert_eq!(old, new, "{case}: {t}");
+                out.push(old);
+            }
+            out
+        }
+
+        /// Row-path drift decided from a window's inputs is exactly the
+        /// per-table check's verdict: unchanged, changed, new and
+        /// later-changed tables; the halt policy; a record between F and E;
+        /// an interval a DDL affects; rows before F.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn reused_window_inputs_give_the_per_table_verdict() {
+            let dsn = server(true).await;
+            let db = "drift_reuse";
+            let (f, previous) = prepare(&dsn, db).await;
+            let st = store(
+                Arc::new(storage::MemoryStorageBackend::new()),
+                &dsn,
+                db,
+                &f,
+                &previous,
+            )
+            .await;
+            let e_cp = MySqlCheckpoint {
+                lineage: Some(st.anchor.current_lineage.clone()),
+                ..position(&dsn).await
+            };
+            let e = mysql_checkpoint_position(
+                &e_cp.file,
+                e_cp.pos,
+                e_cp.gtid_set.as_deref(),
+            )
+            .unwrap();
+            // The fixture's tables: u, c, n, x.
+            let adapt =
+                compare(&st, &dsn, db, &e_cp, &st.anchor, &[], false, "adapt")
+                    .await;
+            assert!(adapt[0].starts_with("Unchanged"), "{adapt:?}");
+            assert!(adapt[1].starts_with("Adapted "), "{adapt:?}");
+            assert!(adapt[2].starts_with("NewTable"), "{adapt:?}");
+            let halt =
+                compare(&st, &dsn, db, &e_cp, &st.anchor, &[], true, "halt")
+                    .await;
+            assert!(halt[0].starts_with("Unchanged"), "{halt:?}");
+            assert!(halt[1].starts_with("error"), "{halt:?}");
+            let between = Stored {
+                capture_id: "between".into(),
+                record: crate::mysql::mysql_activation::Record::new(
+                    e,
+                    crate::mysql::mysql_activation::Kind::Ddl,
+                ),
+            };
+            let recorded = compare(
+                &st,
+                &dsn,
+                db,
+                &e_cp,
+                &st.anchor,
+                &[between],
+                false,
+                "a record in (F, E]",
+            )
+            .await;
+            assert!(
+                recorded[0].starts_with("AdaptedUnprovable"),
+                "{recorded:?}"
+            );
+            sql(&dsn, &[&format!("ALTER TABLE {db}.u ADD COLUMN y INT")]).await;
+            let ddl = compare(
+                &st,
+                &dsn,
+                db,
+                &e_cp,
+                &st.anchor,
+                &[],
+                false,
+                "a DDL in (E, S]",
+            )
+            .await;
+            assert!(ddl[0].starts_with("AdaptedUnprovable"), "{ddl:?}");
+            assert!(ddl[1].starts_with("Adapted "), "{ddl:?}");
+            let later = FailoverAnchor {
+                position: Some(position(&dsn).await),
+                ..st.anchor.clone()
+            };
+            let before = compare(
+                &st,
+                &dsn,
+                db,
+                &e_cp,
+                &later,
+                &[],
+                false,
+                "rows before F",
+            )
+            .await;
+            assert!(before[0].starts_with("AdaptedUnprovable"), "{before:?}");
+            let refused = compare(
+                &st,
+                &dsn,
+                db,
+                &e_cp,
+                &later,
+                &[],
+                true,
+                "rows before F, halt",
+            )
+            .await;
+            assert!(refused[0].starts_with("error"), "{refused:?}");
         }
     }
 }

@@ -1267,24 +1267,38 @@ async fn admit_batch(
             })
     };
 
-    // Failover drift, for every table, before anything is decided: every
-    // table is assessed first, so an incident from any of them stops the
-    // whole window with nothing written.
-    let mut drift_tables = Vec::with_capacity(tables.len());
-    for (((db, table), at, _), key) in tables.iter().zip(&keys) {
-        let t = timeline(ctx, key).await?;
-        drift_tables.push((
-            db.clone(),
-            table.clone(),
-            pos(at)?,
-            MySqlCheckpoint {
-                lineage: Some(lineage.to_string()),
-                ..at.clone()
-            },
-            t.all(),
-        ));
-    }
-    super::mysql_failover_drift::check_window(ctx, &drift_tables).await?;
+    // Failover drift, for every table, before anything is decided, from
+    // the window's own capture and scan answers: an incident from any of
+    // them stops the whole window with nothing written. Its outcomes
+    // (registrations and markers) commit in the window's batch.
+    let drift = {
+        use super::mysql_failover_drift::{WindowTable, window_verdicts};
+        let mut window_tables = Vec::with_capacity(tables.len());
+        for (((db, table), at, report), key) in tables.iter().zip(&keys) {
+            let t = timeline(ctx, key).await?;
+            window_tables.push(WindowTable {
+                db,
+                table,
+                at: pos(at)?,
+                at_cp: MySqlCheckpoint {
+                    lineage: Some(lineage.to_string()),
+                    ..at.clone()
+                },
+                timeline: t.all(),
+                capture: cap.table(db, table),
+                report,
+            });
+        }
+        window_verdicts(ctx, &window_tables).await?
+    };
+    // A table's drift registration (the shape at F, checkpoint F), if any.
+    let drift_shape = |i: usize| match &drift.verdicts[i] {
+        Some(super::mysql_failover_drift::DriftVerdict::Marker {
+            register: Some(shape),
+            ..
+        }) => Some(shape.as_ref()),
+        _ => None,
+    };
 
     let mut attempt = 0;
     let mut stats = BatchStats::default();
@@ -1294,6 +1308,8 @@ async fn admit_batch(
         let mut decisions = Vec::with_capacity(tables.len());
         let mut reqs = Vec::new();
         let mut req_of = Vec::with_capacity(tables.len());
+        let mut drift_req_of: Vec<Option<usize>> =
+            Vec::with_capacity(tables.len());
         let mut timelines = Vec::with_capacity(tables.len());
         for (((db, table), at, report), key) in tables.iter().zip(&keys) {
             let t = timeline(ctx, key).await?;
@@ -1333,7 +1349,39 @@ async fn admit_batch(
                     }
                 }
             };
+            // One registration per table: drift's (checkpoint F) when it
+            // registers, the window's own otherwise; both only when they
+            // are the same registration.
+            let i = decisions.len();
+            let drift_req = match (drift_shape(i), &drift.anchor) {
+                (Some(shape), Some(anchor)) => {
+                    if matches!(decision, Decision::Candidate { .. })
+                        && (shape.fingerprint() != tcap.schema.fingerprint()
+                            || serde_json::to_value(shape).ok()
+                                != serde_json::to_value(&tcap.schema).ok())
+                    {
+                        discard(ctx);
+                        return Err(SourceError::Schema {
+                            details: format!(
+                                "table {db}.{table}: its failover drift \
+                                 registration and its window registration \
+                                 differ; nothing of the window was admitted \
+                                 or dispatched and the checkpoint stays \
+                                 before it"
+                            )
+                            .into(),
+                        });
+                    }
+                    reqs.push(super::mysql_failover_drift::drift_request(
+                        key, anchor, shape,
+                    )?);
+                    Some(reqs.len() - 1)
+                }
+                _ => None,
+            };
+            drift_req_of.push(drift_req);
             req_of.push(match &decision {
+                Decision::Candidate { .. } if drift_req.is_some() => drift_req,
                 Decision::Candidate { .. } => {
                     let e_cp = MySqlCheckpoint {
                         lineage: Some(lineage.to_string()),
@@ -1403,6 +1451,15 @@ async fn admit_batch(
                 let Decision::Refused(why, covers) = &decisions[i] else {
                     unreachable!()
                 };
+                // Refused here, registered by its drift check.
+                if let Some(r) = drift_req_of[i] {
+                    let reg = &regs[r];
+                    let base = batch.push_group(reg.ops.clone());
+                    if let Some(e) = reg.entry_op {
+                        reg_entry[r] = Some((base, base + e));
+                    }
+                    op_table.resize(batch.ops.len(), i);
+                }
                 admitted.push(None);
                 outcomes.push((why, covers.clone()));
                 continue;
@@ -1471,6 +1528,31 @@ async fn admit_batch(
                     info!(source_id = %ctx.source_id, %db, %table, why, "no lazy baseline");
                     admitted.push(None);
                     outcomes.push(("not_decisive", Covers::Transaction));
+                    op_table.resize(batch.ops.len(), i);
+                }
+            }
+        }
+        // Each drift outcome's marker, naming its planned registration.
+        if let Some(anchor) = &drift.anchor {
+            for (i, v) in drift.verdicts.iter().enumerate() {
+                if let Some(
+                    super::mysql_failover_drift::DriftVerdict::Marker {
+                        key,
+                        previous,
+                        outcome,
+                        ..
+                    },
+                ) = v
+                {
+                    let current = drift_req_of[i]
+                        .map(|r| (regs[r].version, regs[r].hash.clone()));
+                    batch.ops.push(super::mysql_failover_drift::marker_op(
+                        key,
+                        anchor,
+                        previous.clone(),
+                        current,
+                        *outcome,
+                    )?);
                     op_table.resize(batch.ops.len(), i);
                 }
             }
@@ -1583,6 +1665,10 @@ async fn admit_batch(
                 why,
             );
         }
+        // Drift-checked for this run once committed.
+        let checked: Vec<(String, String)> =
+            tables.iter().map(|(k, ..)| k.clone()).collect();
+        super::mysql_failover_drift::window_checked(ctx, &checked).await?;
         for ((db, table), at, _) in &deferred {
             trace_proof(&tag, db, table, None, None, lctn, "deferred");
             governs.push((

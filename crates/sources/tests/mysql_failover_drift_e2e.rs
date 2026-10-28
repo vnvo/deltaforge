@@ -781,26 +781,21 @@ async fn a_later_tables_drift_stops_the_whole_window() {
     );
 }
 
-/// Drift outcomes are completed facts independent of the window that
-/// produced them: every table's check succeeds and its outcome commits
-/// (marker and live-shape registration), then the window's atomic batch
-/// fails. Nothing is admitted: no row, no activation record, the checkpoint
-/// does not move. The restart reuses exactly those outcomes (one marker per
-/// table, unchanged; no new schema version) and recomputes the whole
-/// window's admission.
-#[tokio::test]
-#[ignore = "requires docker"]
-async fn drift_outcomes_survive_a_failed_window_and_are_reused() {
-    init_test_tracing();
+/// The scenario of the window tests: run 1 on A admits `orders` and
+/// `items`; on B `items` drifted before the failover position and
+/// `orders` did not; B continues A's history. Returns the state, the
+/// scenario, the checkpoint run 1 committed and B's lineage hash.
+async fn drifted_on_b(
+    db: &'static str,
+    faults: &Arc<FaultBackend>,
+) -> (State, Scenario<'static>, sources::MySqlCheckpoint, String) {
+    const ITEMS: &str = "CREATE TABLE items (id INT PRIMARY KEY, n INT)";
     let (a, b) = servers().await;
-    let db = "fd_reuse";
     let sc = Scenario {
-        id: "fd_reuse",
+        id: db,
         db,
         tables: vec![format!("{db}.orders"), format!("{db}.items")],
     };
-    const ITEMS: &str = "CREATE TABLE items (id INT PRIMARY KEY, n INT)";
-    let faults = Arc::new(FaultBackend::new());
     let st = State::on(faults.clone()).await;
     sql(
         a,
@@ -826,7 +821,6 @@ async fn drift_outcomes_survive_a_failed_window_and_are_reused() {
     )
     .await;
     assert_eq!(rows(&items).len(), 2, "run 1 on A");
-    // B: `items` drifted before the failover position, `orders` did not.
     sql(
         b,
         &[
@@ -853,6 +847,33 @@ async fn drift_outcomes_survive_a_failed_window_and_are_reused() {
             .unwrap();
     let uuid = query_one(b, "SELECT @@GLOBAL.server_uuid").await;
     let hash = LineageDescriptor::mysql(&uuid).unwrap().lineage_hash();
+    (st, sc, committed, hash)
+}
+
+/// The window's two rows on B (one transaction).
+fn window_rows(db: &str) -> Vec<String> {
+    vec![
+        "BEGIN".to_string(),
+        format!("INSERT INTO {db}.orders VALUES (2, 'on-b')"),
+        format!("INSERT INTO {db}.items VALUES (2, 2, 2)"),
+        "COMMIT".to_string(),
+    ]
+}
+
+/// Drift outcomes commit in the window's atomic batch: when the batch
+/// fails, nothing of it survives - no drift marker, no live-shape
+/// registration, no activation record, no row, and the checkpoint does not
+/// move. The restart reassesses every table and records each outcome once
+/// (unchanged, adapted), admitting the window from scratch.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn a_failed_window_writes_no_drift_outcome_and_the_restart_records_once()
+{
+    init_test_tracing();
+    let (_, b) = servers().await;
+    let db = "fd_reuse";
+    let faults = Arc::new(FaultBackend::new());
+    let (st, sc, committed, hash) = drifted_on_b(db, &faults).await;
     let latest = |table: &'static str| {
         let key = SchemaKey::new(TENANT, sc.id, &hash, db, table);
         let registry = st.registry.clone();
@@ -866,32 +887,26 @@ async fn drift_outcomes_survive_a_failed_window_and_are_reused() {
     };
 
     // Run 2 on B: the window's atomic batch fails (every activation write
-    // does; drift outcomes are written outside it).
+    // does), and its drift outcomes with it.
     faults
         .fail_writes_to
         .lock()
         .unwrap()
         .push("schemas.v1.activation".into());
     let src = source(&sc, b, &st, OnSchemaDrift::Adapt, SnapshotMode::Never);
-    let (items, _) = run(
-        src,
-        &st,
-        b,
-        &[
-            "BEGIN".to_string(),
-            format!("INSERT INTO {db}.orders VALUES (2, 'on-b')"),
-            format!("INSERT INTO {db}.items VALUES (2, 2, 2)"),
-            "COMMIT".to_string(),
-        ],
-        Duration::from_secs(15),
-    )
-    .await;
+    let (items, _) =
+        run(src, &st, b, &window_rows(db), Duration::from_secs(15)).await;
     assert!(rows(&items).is_empty(), "no row admitted: {items:?}");
     for table in ["orders", "items"] {
         assert!(
             st.activation(b, sc.id, db, table).await.is_empty(),
             "no activation record of {table}"
         );
+        assert!(
+            st.marker(b, sc.id, db, table).await.is_none(),
+            "no drift marker of {table}"
+        );
+        assert_eq!(latest(table).await, None, "no registration of {table}");
     }
     let now: sources::MySqlCheckpoint =
         serde_json::from_slice(&st.ckpt.get_raw(sc.id).await.unwrap().unwrap())
@@ -901,23 +916,9 @@ async fn drift_outcomes_survive_a_failed_window_and_are_reused() {
         (&committed.file, committed.pos, &committed.gtid_set),
         "the checkpoint does not move"
     );
-    let markers = (
-        st.marker(b, sc.id, db, "orders")
-            .await
-            .expect("orders' outcome"),
-        st.marker(b, sc.id, db, "items")
-            .await
-            .expect("items' outcome"),
-    );
-    assert_eq!(markers.0["outcome"], "unchanged");
-    assert_eq!(markers.1["outcome"], "adapted");
-    let versions = (
-        latest("orders").await.expect("orders' live shape"),
-        latest("items").await.expect("items' live shape"),
-    );
 
-    // Run 3 on B, the store healthy: the outcomes are reused as they are,
-    // the window is admitted from scratch.
+    // Run 3 on B, the store healthy: every table reassessed, each outcome
+    // recorded once, the window admitted once.
     faults.fail_writes_to.lock().unwrap().clear();
     let src = source(&sc, b, &st, OnSchemaDrift::Adapt, SnapshotMode::Never);
     let (items, _) = run(src, &st, b, &[], Duration::from_secs(10)).await;
@@ -930,31 +931,80 @@ async fn drift_outcomes_survive_a_failed_window_and_are_reused() {
         })
         .collect();
     assert_eq!(got, vec![2, 2], "both rows of the window, once: {items:?}");
-    for (table, marker) in [("orders", &markers.0), ("items", &markers.1)] {
-        let uuid_key = SchemaKey::new(TENANT, sc.id, &hash, db, table);
+    for (table, outcome) in [("orders", "unchanged"), ("items", "adapted")] {
+        let key = SchemaKey::new(TENANT, sc.id, &hash, db, table);
         let all = st
             .backend
-            .log_list(MARKER_NS, &uuid_key.backend_key())
+            .log_list(MARKER_NS, &key.backend_key())
             .await
             .unwrap();
         assert_eq!(all.len(), 1, "one outcome of {table}");
         assert_eq!(
-            &serde_json::from_slice::<Value>(&all[0].1).unwrap(),
-            marker,
-            "{table}'s outcome reused unchanged"
+            serde_json::from_slice::<Value>(&all[0].1).unwrap()["outcome"],
+            outcome
         );
         assert_eq!(
             st.activation(b, sc.id, db, table).await.len(),
             1,
             "{table} admitted once"
         );
+        assert!(latest(table).await.is_some(), "{table}'s live shape");
     }
-    assert_eq!(
-        (
-            latest("orders").await.unwrap(),
-            latest("items").await.unwrap()
-        ),
-        versions,
-        "no schema version registered again"
+}
+
+/// A window batch whose acknowledgement is lost after it committed
+/// resolves through its marker to the original complete outcome: both
+/// rows once, each table's drift marker and registration once with its
+/// outcome; a restart writes nothing more.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn an_ambiguous_window_commit_resolves_to_the_original_drift_outcome() {
+    init_test_tracing();
+    let (_, b) = servers().await;
+    let db = "fd_ack";
+    let faults = Arc::new(FaultBackend::new());
+    let (st, sc, _, hash) = drifted_on_b(db, &faults).await;
+    *faults.lose_ack_for.lock().unwrap() = Some(MARKER_NS.into());
+    let src = source(&sc, b, &st, OnSchemaDrift::Adapt, SnapshotMode::Never);
+    let (items, _) =
+        run(src, &st, b, &window_rows(db), Duration::from_secs(15)).await;
+    assert!(
+        faults.lose_ack_for.lock().unwrap().is_none(),
+        "the window batch lost its ack"
     );
+    assert_eq!(rows(&items).len(), 2, "both rows once: {items:?}");
+    let outcome = |table: &'static str| {
+        let key = SchemaKey::new(TENANT, sc.id, &hash, db, table);
+        let backend = st.backend.clone();
+        async move {
+            backend
+                .log_list(MARKER_NS, &key.backend_key())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, b)| b)
+                .collect::<Vec<_>>()
+        }
+    };
+    let first = (outcome("orders").await, outcome("items").await);
+    assert_eq!((first.0.len(), first.1.len()), (1, 1), "one marker each");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&first.0[0]).unwrap()["outcome"],
+        "unchanged"
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&first.1[0]).unwrap()["outcome"],
+        "adapted"
+    );
+    let src = source(&sc, b, &st, OnSchemaDrift::Adapt, SnapshotMode::Never);
+    let (items, _) = run(src, &st, b, &[], Duration::from_secs(8)).await;
+    assert!(rows(&items).is_empty(), "nothing again: {items:?}");
+    assert_eq!((outcome("orders").await, outcome("items").await), first);
+    for table in ["orders", "items"] {
+        assert_eq!(
+            st.activation(b, sc.id, db, table).await.len(),
+            1,
+            "{table}"
+        );
+    }
 }
