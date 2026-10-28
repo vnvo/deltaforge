@@ -2544,6 +2544,247 @@ pub(crate) mod atomic_batch_suite {
             .await;
         stream_reads_are_one_snapshot(be.clone(), &format!("{ns}_srsnap"))
             .await;
+        max_ops_see_the_batchs_own_writes(be.clone(), &format!("{ns}_rw"))
+            .await;
+        a_repeated_capture_id_conflicts(be.clone(), &format!("{ns}_dup")).await;
+        contradictory_preconditions_conflict(be.clone(), &format!("{ns}_pre"))
+            .await;
+        an_expired_value_reads_as_absent(be.clone(), &format!("{ns}_ttl"))
+            .await;
+        large_groups_keep_request_order(be.clone(), &format!("{ns}_big")).await;
+    }
+
+    /// A max sees the batch's own earlier writes of its key, and repeated
+    /// writes of one key end as applied in op order.
+    pub async fn max_ops_see_the_batchs_own_writes(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
+        be.kv_put(ns, "hw", b"5").await.unwrap();
+        let batch = AtomicBatch {
+            preconditions: vec![],
+            ops: vec![
+                log(ns, "s", "e1", b"one"),
+                log(ns, "s", "e2", b"two"),
+                // A put then a max of the same key: the max starts from the
+                // put, not from the stored value.
+                BatchOp::KvPut {
+                    ns: ns.into(),
+                    key: "p".into(),
+                    value: BatchValue::Bytes(b"1".to_vec()),
+                },
+                BatchOp::KvMax {
+                    ns: ns.into(),
+                    key: "p".into(),
+                    value: 3,
+                },
+                // Several maxes of one stored key, and a put after them.
+                BatchOp::KvMaxSeq {
+                    ns: ns.into(),
+                    key: "hw".into(),
+                    of: 0,
+                },
+                BatchOp::KvMaxSeq {
+                    ns: ns.into(),
+                    key: "hw".into(),
+                    of: 1,
+                },
+                BatchOp::KvMax {
+                    ns: ns.into(),
+                    key: "hw".into(),
+                    value: 2,
+                },
+                BatchOp::KvPut {
+                    ns: ns.into(),
+                    key: "q".into(),
+                    value: BatchValue::Bytes(b"first".to_vec()),
+                },
+                BatchOp::KvPut {
+                    ns: ns.into(),
+                    key: "q".into(),
+                    value: BatchValue::Bytes(b"last".to_vec()),
+                },
+            ],
+        };
+        let seqs = committed(be.apply_batch(&batch).await.unwrap());
+        let (s1, s2) = (seqs[0].unwrap(), seqs[1].unwrap());
+        assert_eq!(s2, s1 + 1);
+        assert_eq!(be.kv_get(ns, "p").await.unwrap(), Some(b"3".to_vec()));
+        let hw = s2.max(5).to_string().into_bytes();
+        assert_eq!(be.kv_get(ns, "hw").await.unwrap(), Some(hw));
+        assert_eq!(be.kv_get(ns, "q").await.unwrap(), Some(b"last".to_vec()));
+    }
+
+    /// A capture id repeated within one request conflicts and writes
+    /// nothing, as an existing one does.
+    pub async fn a_repeated_capture_id_conflicts(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
+        let batch = AtomicBatch {
+            preconditions: vec![],
+            ops: vec![
+                log(ns, "s", "same", b"one"),
+                log(ns, "t", "other", b"two"),
+                log(ns, "s", "same", b"one"),
+            ],
+        };
+        assert!(matches!(
+            be.apply_batch(&batch).await.unwrap(),
+            BatchOutcome::Conflict { .. }
+        ));
+        assert!(be.log_list(ns, "s").await.unwrap().is_empty());
+        assert!(be.log_list(ns, "t").await.unwrap().is_empty());
+    }
+
+    /// Two different expectations of one stream or key cannot both hold:
+    /// the batch conflicts and writes nothing; the same expectation twice
+    /// holds.
+    pub async fn contradictory_preconditions_conflict(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
+        let head = |seq| Precondition::LogHead {
+            ns: ns.into(),
+            key: "s".into(),
+            seq,
+        };
+        let is = |value: Option<&[u8]>| Precondition::KvIs {
+            ns: ns.into(),
+            key: "k".into(),
+            value: value.map(<[u8]>::to_vec),
+        };
+        let ops = || vec![log(ns, "s", "e", b"v")];
+        for preconditions in
+            [vec![head(0), head(7)], vec![is(None), is(Some(b"x"))]]
+        {
+            let batch = AtomicBatch {
+                preconditions,
+                ops: ops(),
+            };
+            assert!(matches!(
+                be.apply_batch(&batch).await.unwrap(),
+                BatchOutcome::Conflict { .. }
+            ));
+            assert!(be.log_list(ns, "s").await.unwrap().is_empty());
+        }
+        let batch = AtomicBatch {
+            preconditions: vec![head(0), is(None), head(0), is(None)],
+            ops: ops(),
+        };
+        committed(be.apply_batch(&batch).await.unwrap());
+    }
+
+    /// An expired value reads as absent: for a precondition, a max and a
+    /// read.
+    pub async fn an_expired_value_reads_as_absent(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
+        be.kv_put_with_ttl(ns, "gone", b"99", 1).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+        let batch = AtomicBatch {
+            preconditions: vec![Precondition::KvIs {
+                ns: ns.into(),
+                key: "gone".into(),
+                value: None,
+            }],
+            ops: vec![BatchOp::KvMax {
+                ns: ns.into(),
+                key: "gone".into(),
+                value: 4,
+            }],
+        };
+        committed(be.apply_batch(&batch).await.unwrap());
+        assert_eq!(be.kv_get(ns, "gone").await.unwrap(), Some(b"4".to_vec()));
+        be.kv_put_with_ttl(ns, "gone2", b"1", 1).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+        let read = be
+            .read_batch(&[BatchRead::KvGet {
+                ns: ns.into(),
+                key: "gone2".into(),
+            }])
+            .await
+            .unwrap();
+        assert!(matches!(read[..], [BatchReadResult::Kv(None)]));
+    }
+
+    /// Groups larger than one array statement (by items and by bytes) keep
+    /// request order: contiguous sequences in op order, every entry and
+    /// key stored, every read answered at its position.
+    pub async fn large_groups_keep_request_order(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
+        let n = 5000;
+        let mut ops: Vec<BatchOp> = (0..n)
+            .map(|i| {
+                log(
+                    ns,
+                    &format!("s{}", i % 7),
+                    &format!("e{i}"),
+                    format!("v{i}").as_bytes(),
+                )
+            })
+            .collect();
+        // Three entries of 2 MiB: more than one statement's payload.
+        for i in 0..3 {
+            ops.push(log(
+                ns,
+                "big",
+                &format!("b{i}"),
+                &vec![i as u8; 2 * 1024 * 1024],
+            ));
+        }
+        for i in 0..n {
+            ops.push(BatchOp::KvPut {
+                ns: ns.into(),
+                key: format!("k{i}"),
+                value: BatchValue::SeqTemplate {
+                    template: format!("{SEQ_SENTINEL}").into_bytes(),
+                    of: i,
+                },
+            });
+        }
+        let batch = AtomicBatch {
+            preconditions: (0..n)
+                .map(|i| Precondition::KvIs {
+                    ns: ns.into(),
+                    key: format!("k{i}"),
+                    value: None,
+                })
+                .collect(),
+            ops,
+        };
+        let seqs = committed(be.apply_batch(&batch).await.unwrap());
+        let first = seqs[0].unwrap();
+        for (i, s) in seqs.iter().take(n + 3).enumerate() {
+            assert_eq!(*s, Some(first + i as u64), "op {i}");
+        }
+        let reads: Vec<BatchRead> = (0..n)
+            .rev()
+            .map(|i| BatchRead::KvGet {
+                ns: ns.into(),
+                key: format!("k{i}"),
+            })
+            .chain([BatchRead::LogLen {
+                ns: ns.into(),
+                key: "big".into(),
+            }])
+            .collect();
+        let got = be.read_batch(&reads).await.unwrap();
+        for (j, r) in got.iter().take(n).enumerate() {
+            let i = n - 1 - j;
+            let want = (first + i as u64).to_string().into_bytes();
+            assert!(
+                matches!(r, BatchReadResult::Kv(Some(v)) if *v == want),
+                "k{i}: {r:?}"
+            );
+        }
+        assert!(matches!(got[n], BatchReadResult::Len(3)), "{:?}", got[n]);
+        let big = be.log_list(ns, "big").await.unwrap();
+        assert_eq!(big.len(), 3);
+        assert!(big.iter().all(|(_, v)| v.len() == 2 * 1024 * 1024));
     }
 
     /// Every stream as paged out one by one.
