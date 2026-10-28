@@ -817,6 +817,127 @@ async fn a_failed_first_window_aborts_the_speculative_capture() {
     container.rm().await.ok();
 }
 
+/// A stop while window 1's capture waits for `t0000`'s metadata lock and
+/// the next window's speculative capture waits for `t0004`'s: the source
+/// ends at once, whatever `capture_lock_wait_secs` allows
+/// (here its 300 s maximum). Both queued sessions are killed, and nothing
+/// of either window is delivered, recorded or checkpointed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn a_stop_cancels_the_waiting_window_and_speculative_captures() {
+    let (container, port) = start(true).await;
+    let mut c = conn(port).await;
+    tables(&mut c, 5).await;
+    let id = "stop-cancels";
+    let store = Store::memory();
+    let r = run_on(
+        port,
+        id,
+        MysqlProofCfg {
+            capture_lock_wait_secs: 300,
+            ..Default::default()
+        },
+        &store,
+    )
+    .await;
+    // Everything before the two windows' transactions.
+    let before: String = c
+        .query_first("SELECT @@GLOBAL.gtid_executed")
+        .await
+        .unwrap()
+        .unwrap();
+    let (mut first, mut second) = two_windows_present(port, &r, &mut c).await;
+
+    let t = Instant::now();
+    r.handle.stop();
+    let end = tokio::time::timeout(Duration::from_secs(60), r.handle.join)
+        .await
+        .expect("the source stops")
+        .expect("the source task completes");
+    let took = t.elapsed();
+    assert!(took < Duration::from_secs(5), "the stop took {took:?}");
+    // A stop is not a failure: the run ends as on any other stop.
+    assert!(end.is_ok(), "{end:?}");
+    // A kill ends a queued session at once; one no kill reaches keeps
+    // waiting for the lock (up to 300 s).
+    let deadline = Instant::now() + Duration::from_secs(3);
+    for t in ["t0000", "t0004"] {
+        while !mdl_waiters(port, t).await.is_empty() {
+            assert!(Instant::now() < deadline, "a capture still waits on {t}");
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(r.rows.load(std::sync::atomic::Ordering::SeqCst), 0);
+    for i in 0..5 {
+        let t = format!("t{i:04}");
+        assert!(store.activation(port, id, &t).await.is_empty(), "{t}");
+        assert!(!store.registered(port, id, &t).await, "{t} registered");
+    }
+    assert!(records(id, "window").is_empty(), "no window completed");
+    // The stop's checkpoint, if any, is before either window.
+    if let Some(raw) = store.ckpt.get_raw(id).await.unwrap() {
+        let cp: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(cp["gtid_set"].as_str(), Some(before.trim()), "{cp}");
+    }
+    first.query_drop("UNLOCK TABLES").await.unwrap();
+    second.query_drop("UNLOCK TABLES").await.unwrap();
+    r.drain.abort();
+    container.rm().await.ok();
+}
+
+/// A stop while a schema change's forward proof waits for the table's
+/// metadata lock (a single-table capture, whose own lock wait is 30 s):
+/// the source ends at once and the queued session is killed. The schema
+/// change is neither proven nor checkpointed past, so a restart proves it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn a_stop_cancels_a_waiting_forward_proof_capture() {
+    let (container, port) = start(true).await;
+    let mut c = conn(port).await;
+    tables(&mut c, 1).await;
+    let id = "stop-forward";
+    let store = Store::memory();
+    let r = run_on(port, id, MysqlProofCfg::default(), &store).await;
+    let before: String = c
+        .query_first("SELECT @@GLOBAL.gtid_executed")
+        .await
+        .unwrap()
+        .unwrap();
+    r.handle.pause();
+    let mut locker = conn(port).await;
+    locker
+        .query_drop("CREATE TABLE t0009 (id INT PRIMARY KEY, v INT NOT NULL)")
+        .await
+        .unwrap();
+    locker.query_drop("LOCK TABLES t0009 WRITE").await.unwrap();
+    r.handle.resume();
+    wait_for_waiter(port, "t0009").await;
+
+    let t = Instant::now();
+    r.handle.stop();
+    let end = tokio::time::timeout(Duration::from_secs(60), r.handle.join)
+        .await
+        .expect("the source stops")
+        .expect("the source task completes");
+    let took = t.elapsed();
+    assert!(took < Duration::from_secs(5), "the stop took {took:?}");
+    assert!(end.is_ok(), "{end:?}");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !mdl_waiters(port, "t0009").await.is_empty() {
+        assert!(Instant::now() < deadline, "the capture still waits");
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert!(store.activation(port, id, "t0009").await.is_empty());
+    if let Some(raw) = store.ckpt.get_raw(id).await.unwrap() {
+        let cp: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(cp["gtid_set"].as_str(), Some(before.trim()), "{cp}");
+    }
+    locker.query_drop("UNLOCK TABLES").await.unwrap();
+    r.drain.abort();
+    container.rm().await.ok();
+}
+
 /// The first window's commit succeeds but its acknowledgement is lost:
 /// the read-back resolves it (with its original sequences) before the
 /// second window decides, whose records then follow it. Each table has
