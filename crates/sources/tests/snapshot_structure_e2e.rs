@@ -43,6 +43,8 @@ const PAGE: usize = 10;
 struct Counts {
     tables: u64,
     slots: BTreeMap<(&'static str, String), u64>,
+    /// Every counted primitive's calls (the registry's included).
+    ops: BTreeMap<&'static str, u64>,
     shape: sources::snapshot_probe::SnapshotShape,
 }
 
@@ -111,6 +113,11 @@ where
     let counts = Counts {
         tables,
         slots: counting.slot_ops(),
+        ops: counting
+            .ops()
+            .into_iter()
+            .map(|(p, s)| (p, s.calls))
+            .collect(),
         shape: sources::snapshot_probe::shape(),
     };
     handle.stop();
@@ -178,6 +185,21 @@ fn assert_structure(engine: &str, runs: &[Counts]) {
         3 * (walks[1] - walks[0]),
         "{engine}: plan page reads {walks:?}"
     );
+    // Every primitive class (the registry's and the activation records'
+    // among them) grows at most linearly in the table count: 30 -> 90 tables
+    // adds at most three times what 10 -> 30 adds (a constant's jitter
+    // aside).
+    let classes: std::collections::BTreeSet<&str> =
+        runs.iter().flat_map(|c| c.ops.keys().copied()).collect();
+    for p in classes {
+        let at = |i: usize| runs[i].ops.get(p).copied().unwrap_or(0);
+        eprintln!("{engine}: {p} calls {:?}", [at(0), at(1), at(2)]);
+        assert!(
+            at(2).saturating_sub(at(1)) <= 3 * at(1).saturating_sub(at(0)) + 4,
+            "{engine}: {p} grows faster than linearly: {:?}",
+            [at(0), at(1), at(2)]
+        );
+    }
     // Bytes per boundary do not grow with the table count.
     let per = |c: &Counts| c.shape.boundary_bytes / c.shape.boundaries.max(1);
     assert!(
@@ -225,7 +247,13 @@ async fn postgres_generation_operations_are_structurally_linear() -> Result<()>
             tables: vec!["public.st_*".into()],
             tenant: "acme".into(),
             pipeline: "test".into(),
-            registry: test_common::make_registry().await,
+            // One store for the registry and the activation records (and
+            // the snapshot state): the authority production builds, which
+            // atomic baselines require.
+            registry: storage::DurableSchemaRegistry::new(
+                counting.clone() as storage::ArcStorageBackend
+            )
+            .await?,
             registry_scope:
                 sources::registry_scope::SharedRegistryScope::default(),
             backend: counting.clone(),
@@ -278,7 +306,13 @@ async fn mysql_generation_operations_are_structurally_linear() -> Result<()> {
             tables: vec![format!("{db}.st_*")],
             tenant: "acme".into(),
             pipeline: "test".into(),
-            registry: test_common::make_registry().await,
+            // One store for the registry and the activation records (and
+            // the snapshot state): the authority production builds, which
+            // atomic baselines require.
+            registry: storage::DurableSchemaRegistry::new(
+                counting.clone() as storage::ArcStorageBackend
+            )
+            .await?,
             registry_scope:
                 sources::registry_scope::SharedRegistryScope::default(),
             outbox_tables: common::AllowList::default(),
