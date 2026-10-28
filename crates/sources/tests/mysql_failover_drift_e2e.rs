@@ -830,6 +830,8 @@ async fn drifted_on_b(
             ORDERS.to_string(),
             ITEMS.to_string(),
             "ALTER TABLE items ADD COLUMN extra INT".to_string(),
+            // Untracked: a write to it moves the stream past F.
+            "CREATE TABLE untracked (id INT PRIMARY KEY)".to_string(),
         ],
     )
     .await;
@@ -853,6 +855,9 @@ async fn drifted_on_b(
 /// The window's two rows on B (one transaction).
 fn window_rows(db: &str) -> Vec<String> {
     vec![
+        // After a write to an untracked table: the window's E is past the
+        // failover position F.
+        format!("INSERT INTO {db}.untracked VALUES (1)"),
         "BEGIN".to_string(),
         format!("INSERT INTO {db}.orders VALUES (2, 'on-b')"),
         format!("INSERT INTO {db}.items VALUES (2, 2, 2)"),
