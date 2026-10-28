@@ -236,38 +236,211 @@ impl PostgresStorageBackend {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// A key's live value inside `tx` (an expired one reads as absent).
-async fn pg_kv_live(
-    tx: &deadpool_postgres::tokio_postgres::Transaction<'_>,
-    ns: &str,
-    key: &str,
-    now: i64,
-) -> Result<Option<Vec<u8>>> {
-    let row = tx
-        .query_opt(
-            "SELECT val, expires_at FROM df_kv WHERE ns=$1 AND key=$2",
-            &[&ns, &key],
-        )
-        .await?;
-    Ok(row.and_then(|r| {
-        let exp: Option<i64> = r.get(1);
-        (!exp.is_some_and(|e| e <= now)).then(|| r.get(0))
-    }))
+/// Items per array statement (`docs/design/mysql-mass-invalidation.md`,
+/// "Chunking and size limits").
+pub(crate) const SET_CHUNK_ITEMS: usize = 4096;
+/// Payload bytes at which an array statement's chunk closes.
+pub(crate) const SET_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// A group's chunks, in request order, from each item's payload: a chunk
+/// closes once it holds `SET_CHUNK_ITEMS` items or `SET_CHUNK_BYTES` of
+/// payload (an item is added first, then the check).
+pub(crate) fn set_chunks(
+    sizes: impl Iterator<Item = usize>,
+) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let (mut start, mut n, mut bytes) = (0, 0, 0);
+    for (i, size) in sizes.enumerate() {
+        n += 1;
+        bytes += size;
+        if n == SET_CHUNK_ITEMS || bytes >= SET_CHUNK_BYTES {
+            out.push(start..i + 1);
+            (start, n, bytes) = (i + 1, 0, 0);
+        }
+    }
+    if n > 0 {
+        out.push(start..start + n);
+    }
+    out
 }
 
-/// A stream's last sequence inside `tx` (0 when empty).
-async fn pg_log_head(
-    tx: &deadpool_postgres::tokio_postgres::Transaction<'_>,
-    ns: &str,
-    key: &str,
-) -> Result<u64> {
-    Ok(tx
-        .query_opt(
-            "SELECT seq FROM df_log WHERE ns=$1 AND key=$2 ORDER BY seq DESC LIMIT 1",
-            &[&ns, &key],
-        )
-        .await?
-        .map_or(0, |r| r.get::<_, i64>(0) as u64))
+type Tx<'a> = deadpool_postgres::tokio_postgres::Transaction<'a>;
+
+/// Each `(index, ns, key)`'s live value (an expired one reads as absent).
+async fn pg_kv_live_many(
+    tx: &Tx<'_>,
+    items: &[(usize, &str, &str)],
+    now: i64,
+) -> Result<Vec<(usize, Option<Vec<u8>>)>> {
+    let mut out = Vec::with_capacity(items.len());
+    for chunk in set_chunks(items.iter().map(|i| i.1.len() + i.2.len())) {
+        let rows = &items[chunk];
+        let found = tx
+            .query(
+                "SELECT r.i, k.val, k.expires_at
+                 FROM unnest($1::text[], $2::text[]) WITH ORDINALITY AS r(ns, key, i)
+                 LEFT JOIN df_kv k ON k.ns = r.ns AND k.key = r.key
+                 ORDER BY r.i",
+                &[
+                    &rows.iter().map(|i| i.1).collect::<Vec<_>>(),
+                    &rows.iter().map(|i| i.2).collect::<Vec<_>>(),
+                ],
+            )
+            .await?;
+        for r in found {
+            let i = r.get::<_, i64>(0) as usize - 1;
+            let exp: Option<i64> = r.get(2);
+            let val: Option<Vec<u8>> = r.get(1);
+            out.push((
+                rows[i].0,
+                val.filter(|_| !exp.is_some_and(|e| e <= now)),
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Each `(index, ns, key)` stream's last entry.
+async fn pg_log_latest_many(
+    tx: &Tx<'_>,
+    items: &[(usize, &str, &str)],
+) -> Result<Vec<(usize, Option<(u64, Vec<u8>)>)>> {
+    let mut out = Vec::with_capacity(items.len());
+    for chunk in set_chunks(items.iter().map(|i| i.1.len() + i.2.len())) {
+        let rows = &items[chunk];
+        let found = tx
+            .query(
+                "SELECT r.i, l.seq, l.val
+                 FROM unnest($1::text[], $2::text[]) WITH ORDINALITY AS r(ns, key, i)
+                 LEFT JOIN LATERAL (
+                   SELECT seq, val FROM df_log
+                   WHERE ns = r.ns AND key = r.key ORDER BY seq DESC LIMIT 1
+                 ) l ON true
+                 ORDER BY r.i",
+                &[
+                    &rows.iter().map(|i| i.1).collect::<Vec<_>>(),
+                    &rows.iter().map(|i| i.2).collect::<Vec<_>>(),
+                ],
+            )
+            .await?;
+        for r in found {
+            let i = r.get::<_, i64>(0) as usize - 1;
+            let seq: Option<i64> = r.get(1);
+            out.push((rows[i].0, seq.map(|s| (s as u64, r.get(2)))));
+        }
+    }
+    Ok(out)
+}
+
+/// Each `(index, ns, key)` stream's last sequence (0 when empty).
+async fn pg_log_head_many(
+    tx: &Tx<'_>,
+    items: &[(usize, &str, &str)],
+) -> Result<Vec<(usize, u64)>> {
+    let mut out = Vec::with_capacity(items.len());
+    for chunk in set_chunks(items.iter().map(|i| i.1.len() + i.2.len())) {
+        let rows = &items[chunk];
+        let found = tx
+            .query(
+                "SELECT r.i, COALESCE((SELECT l.seq FROM df_log l
+                                       WHERE l.ns = r.ns AND l.key = r.key
+                                       ORDER BY l.seq DESC LIMIT 1), 0)
+                 FROM unnest($1::text[], $2::text[]) WITH ORDINALITY AS r(ns, key, i)
+                 ORDER BY r.i",
+                &[
+                    &rows.iter().map(|i| i.1).collect::<Vec<_>>(),
+                    &rows.iter().map(|i| i.2).collect::<Vec<_>>(),
+                ],
+            )
+            .await?;
+        for r in found {
+            let i = r.get::<_, i64>(0) as usize - 1;
+            out.push((rows[i].0, r.get::<_, i64>(1) as u64));
+        }
+    }
+    Ok(out)
+}
+
+/// Each `(index, ns, key)` stream's entry count.
+async fn pg_log_len_many(
+    tx: &Tx<'_>,
+    items: &[(usize, &str, &str)],
+) -> Result<Vec<(usize, u64)>> {
+    let mut out = Vec::with_capacity(items.len());
+    for chunk in set_chunks(items.iter().map(|i| i.1.len() + i.2.len())) {
+        let rows = &items[chunk];
+        let found = tx
+            .query(
+                "SELECT r.i, (SELECT COUNT(*) FROM df_log l
+                              WHERE l.ns = r.ns AND l.key = r.key)
+                 FROM unnest($1::text[], $2::text[]) WITH ORDINALITY AS r(ns, key, i)
+                 ORDER BY r.i",
+                &[
+                    &rows.iter().map(|i| i.1).collect::<Vec<_>>(),
+                    &rows.iter().map(|i| i.2).collect::<Vec<_>>(),
+                ],
+            )
+            .await?;
+        for r in found {
+            let i = r.get::<_, i64>(0) as usize - 1;
+            out.push((rows[i].0, r.get::<_, i64>(1) as u64));
+        }
+    }
+    Ok(out)
+}
+
+/// The first precondition (in batch order) that no longer holds, with why;
+/// each stream and key is read once. Two different expectations of one
+/// stream or key cannot both hold: the later one is the conflict.
+async fn pg_preconditions_conflict(
+    tx: &Tx<'_>,
+    pre: &[Precondition],
+    now: i64,
+) -> Result<Option<String>> {
+    let mut heads: Vec<(usize, &str, &str)> = Vec::new();
+    let mut values: Vec<(usize, &str, &str)> = Vec::new();
+    let mut head_at = std::collections::HashMap::new();
+    let mut value_at = std::collections::HashMap::new();
+    for (i, p) in pre.iter().enumerate() {
+        match p {
+            Precondition::LogHead { ns, key, .. } => {
+                let k = (ns.as_str(), key.as_str());
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    head_at.entry(k)
+                {
+                    e.insert(heads.len());
+                    heads.push((i, k.0, k.1));
+                }
+            }
+            Precondition::KvIs { ns, key, .. } => {
+                let k = (ns.as_str(), key.as_str());
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    value_at.entry(k)
+                {
+                    e.insert(values.len());
+                    values.push((i, k.0, k.1));
+                }
+            }
+        }
+    }
+    let head_now = pg_log_head_many(tx, &heads).await?;
+    let value_now = pg_kv_live_many(tx, &values, now).await?;
+    for (i, p) in pre.iter().enumerate() {
+        let holds = match p {
+            Precondition::LogHead { ns, key, seq } => {
+                head_now[head_at[&(ns.as_str(), key.as_str())]].1 == *seq
+            }
+            Precondition::KvIs { ns, key, value } => {
+                value_now[value_at[&(ns.as_str(), key.as_str())]].1 == *value
+            }
+        };
+        if !holds {
+            return Ok(Some(format!(
+                "precondition {i} no longer holds ({p:?})"
+            )));
+        }
+    }
+    Ok(None)
 }
 
 const KV_PUT_SQL: &str =
@@ -305,8 +478,11 @@ impl StorageBackend for PostgresStorageBackend {
         &self,
         reads: &[BatchRead],
     ) -> Result<Vec<BatchReadResult>> {
+        if reads.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut c = client!(self);
-        // One snapshot.
+        // One snapshot; one array statement per kind and chunk.
         let tx = c
             .build_transaction()
             .isolation_level(deadpool_postgres::tokio_postgres::IsolationLevel::RepeatableRead)
@@ -314,31 +490,42 @@ impl StorageBackend for PostgresStorageBackend {
             .start()
             .await?;
         let now = now_secs();
-        let mut out = Vec::with_capacity(reads.len());
-        for r in reads {
-            out.push(match r {
-                BatchRead::KvGet { ns, key } => BatchReadResult::Kv(pg_kv_live(&tx, ns, key, now).await?),
-                BatchRead::LogLatest { ns, key } => BatchReadResult::Latest(
-                    tx.query_opt(
-                        "SELECT seq, val FROM df_log WHERE ns=$1 AND key=$2 ORDER BY seq DESC LIMIT 1",
-                        &[ns, key],
-                    )
-                    .await?
-                    .map(|r| (r.get::<_, i64>(0) as u64, r.get(1))),
-                ),
-                BatchRead::LogHead { ns, key } => BatchReadResult::Head(pg_log_head(&tx, ns, key).await?),
-                BatchRead::LogLen { ns, key } => BatchReadResult::Len(
-                    tx.query_one(
-                        "SELECT COUNT(*) FROM df_log WHERE ns=$1 AND key=$2",
-                        &[ns, key],
-                    )
-                    .await?
-                    .get::<_, i64>(0) as u64,
-                ),
-            });
+        let mut out: Vec<Option<BatchReadResult>> = vec![None; reads.len()];
+        let (mut kv, mut latest, mut head, mut len) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (i, r) in reads.iter().enumerate() {
+            match r {
+                BatchRead::KvGet { ns, key } => {
+                    kv.push((i, ns.as_str(), key.as_str()))
+                }
+                BatchRead::LogLatest { ns, key } => {
+                    latest.push((i, ns.as_str(), key.as_str()))
+                }
+                BatchRead::LogHead { ns, key } => {
+                    head.push((i, ns.as_str(), key.as_str()))
+                }
+                BatchRead::LogLen { ns, key } => {
+                    len.push((i, ns.as_str(), key.as_str()))
+                }
+            }
+        }
+        for (k, v) in pg_kv_live_many(&tx, &kv, now).await? {
+            out[k] = Some(BatchReadResult::Kv(v));
+        }
+        for (k, v) in pg_log_latest_many(&tx, &latest).await? {
+            out[k] = Some(BatchReadResult::Latest(v));
+        }
+        for (k, v) in pg_log_head_many(&tx, &head).await? {
+            out[k] = Some(BatchReadResult::Head(v));
+        }
+        for (k, v) in pg_log_len_many(&tx, &len).await? {
+            out[k] = Some(BatchReadResult::Len(v));
         }
         tx.commit().await?;
-        Ok(out)
+        Ok(out
+            .into_iter()
+            .map(|r| r.expect("every read answered"))
+            .collect())
     }
 
     async fn log_read_streams(
@@ -385,6 +572,17 @@ impl StorageBackend for PostgresStorageBackend {
         if fault == Some(BatchFault::BeforeTransaction) {
             anyhow::bail!("injected failure before the transaction");
         }
+        // `AfterWrites(k)`: a failure before the k-th write statement.
+        let mut writes = 0usize;
+        let mut write = |what: &str| -> Result<()> {
+            if fault == Some(BatchFault::AfterWrites(writes)) {
+                anyhow::bail!(
+                    "injected failure after {writes} write statements, before {what}"
+                );
+            }
+            writes += 1;
+            Ok(())
+        };
         let mut c = client!(self);
         // The store lock first, then every read. Read committed: each
         // statement after the lock sees every transaction committed before
@@ -393,101 +591,235 @@ impl StorageBackend for PostgresStorageBackend {
         // holds until this commit. (A repeatable-read or serializable
         // snapshot would be taken by the lock statement itself, before the
         // wait, and miss writers that committed meanwhile.) Dropped without
-        // a commit, the transaction rolls back.
+        // a commit, the transaction rolls back. Every group of items runs as
+        // array statements, chunked (`set_chunks`), all in this transaction.
         let tx = c.transaction().await?;
         tx.execute(LOCK_LOG_SQL, &[&LOG_ALLOCATION_LOCK]).await?;
         let now = now_secs();
-        for (i, p) in batch.preconditions.iter().enumerate() {
-            let holds = match p {
-                Precondition::LogHead { ns, key, seq } => {
-                    pg_log_head(&tx, ns, key).await? == *seq
-                }
-                Precondition::KvIs { ns, key, value } => {
-                    pg_kv_live(&tx, ns, key, now).await? == *value
-                }
-            };
-            if !holds {
-                return Ok(BatchOutcome::Conflict {
-                    why: format!("precondition {i} no longer holds ({p:?})"),
-                });
-            }
+
+        // Preconditions: each stream's head and each key's value read once.
+        if let Some(why) =
+            pg_preconditions_conflict(&tx, &batch.preconditions, now).await?
+        {
+            return Ok(BatchOutcome::Conflict { why });
         }
-        let mut seqs: Vec<Option<u64>> = vec![None; batch.ops.len()];
-        for (i, op) in batch.ops.iter().enumerate() {
-            if fault == Some(BatchFault::AfterWrites(i)) {
-                anyhow::bail!("injected failure after {i} staged writes");
-            }
-            match op {
+
+        // Log entries: new capture ids only. An existing or repeated id is
+        // not inserted, and the short count is a conflict, as one insert at
+        // a time had it.
+        let appends: Vec<(usize, &str, &str, &str, &[u8])> = batch
+            .ops
+            .iter()
+            .enumerate()
+            .filter_map(|(i, op)| match op {
                 BatchOp::LogAppendIfAbsent {
                     ns,
                     key,
                     capture_id,
                     value,
-                } => {
-                    tx.execute(ENSURE_LOG_META_SQL, &[ns, key]).await?;
-                    let inserted = tx
-                        .query_opt(
-                            "INSERT INTO df_log(ns, key, val, ts, ts_ms, capture_id, content_hash)
-                             VALUES($1, $2, $3, $4, $5, $6, $7)
-                             ON CONFLICT (ns, key, capture_id) WHERE capture_id IS NOT NULL
-                             DO NOTHING
-                             RETURNING seq",
-                            &[ns, key, value, &now_secs(), &now_ms(), capture_id, &content_digest(value)],
-                        )
-                        .await?;
-                    let Some(row) = inserted else {
-                        return Ok(BatchOutcome::Conflict {
-                            why: format!(
-                                "{capture_id} already exists in {key}"
-                            ),
-                        });
-                    };
-                    let seq: i64 = row.get(0);
-                    tx.execute(
-                        "UPDATE df_log_meta SET head_seq=GREATEST(head_seq, $3) WHERE ns=$1 AND key=$2",
-                        &[ns, key, &seq],
+                } => Some((
+                    i,
+                    ns.as_str(),
+                    key.as_str(),
+                    capture_id.as_str(),
+                    value.as_slice(),
+                )),
+                _ => None,
+            })
+            .collect();
+        let mut seqs: Vec<Option<u64>> = vec![None; batch.ops.len()];
+        if !appends.is_empty() {
+            // One contiguous block, in op order: every df_log insert holds
+            // the store lock, so nothing else allocates meanwhile.
+            write("the sequence reservation")?;
+            let base: i64 = tx
+                .query_one(
+                    "WITH b AS (SELECT nextval(pg_get_serial_sequence('df_log', 'seq')) AS base)
+                     SELECT base, setval(pg_get_serial_sequence('df_log', 'seq'), base + $1 - 1)
+                     FROM b",
+                    &[&(appends.len() as i64)],
+                )
+                .await?
+                .get(0);
+            for (rank, (i, ..)) in appends.iter().enumerate() {
+                seqs[*i] = Some((base + rank as i64) as u64);
+            }
+            let ms = now_ms();
+            for chunk in set_chunks(
+                appends
+                    .iter()
+                    .map(|a| a.1.len() + a.2.len() + a.3.len() + a.4.len()),
+            ) {
+                let rows = &appends[chunk];
+                write("a log insert")?;
+                let inserted = tx
+                    .execute(
+                        "INSERT INTO df_log(seq, ns, key, val, ts, ts_ms, capture_id, content_hash)
+                         SELECT r.seq, r.ns, r.key, r.val, $5, $6, r.capture_id, r.content_hash
+                         FROM unnest($1::bigint[], $2::text[], $3::text[], $4::bytea[],
+                                     $7::text[], $8::text[])
+                              AS r(seq, ns, key, val, capture_id, content_hash)
+                         ON CONFLICT (ns, key, capture_id) WHERE capture_id IS NOT NULL
+                         DO NOTHING",
+                        &[
+                            &rows.iter().map(|a| seqs[a.0].expect("reserved") as i64).collect::<Vec<_>>(),
+                            &rows.iter().map(|a| a.1).collect::<Vec<_>>(),
+                            &rows.iter().map(|a| a.2).collect::<Vec<_>>(),
+                            &rows.iter().map(|a| a.4).collect::<Vec<_>>(),
+                            &now,
+                            &ms,
+                            &rows.iter().map(|a| a.3).collect::<Vec<_>>(),
+                            &rows.iter().map(|a| content_digest(a.4)).collect::<Vec<_>>(),
+                        ],
                     )
                     .await?;
-                    seqs[i] = Some(seq as u64);
+                if inserted as usize != rows.len() {
+                    return Ok(BatchOutcome::Conflict {
+                        why: format!(
+                            "{} of {} capture ids already exist or repeat",
+                            rows.len() - inserted as usize,
+                            rows.len()
+                        ),
+                    });
                 }
-                BatchOp::KvPut { ns, key, value } => {
-                    let bytes = match value {
+            }
+            // Each touched stream's meta: created at its head, or advanced.
+            let mut streams: Vec<(&str, &str)> = Vec::new();
+            let mut known = std::collections::HashSet::new();
+            for a in &appends {
+                if known.insert((a.1, a.2)) {
+                    streams.push((a.1, a.2));
+                }
+            }
+            for chunk in
+                set_chunks(streams.iter().map(|s| s.0.len() + s.1.len()))
+            {
+                let rows = &streams[chunk];
+                write("a log meta update")?;
+                tx.execute(
+                    "INSERT INTO df_log_meta(ns, key, min_valid_from_seq, head_seq)
+                     SELECT r.ns, r.key, 0,
+                            COALESCE((SELECT MAX(l.seq) FROM df_log l
+                                      WHERE l.ns = r.ns AND l.key = r.key), 0)
+                     FROM unnest($1::text[], $2::text[]) AS r(ns, key)
+                     ON CONFLICT (ns, key) DO UPDATE
+                       SET head_seq = GREATEST(df_log_meta.head_seq, EXCLUDED.head_seq)",
+                    &[
+                        &rows.iter().map(|s| s.0).collect::<Vec<_>>(),
+                        &rows.iter().map(|s| s.1).collect::<Vec<_>>(),
+                    ],
+                )
+                .await?;
+            }
+        }
+
+        // Key-value writes, folded in op order: the value each key ends
+        // with (a max sees the batch's own earlier writes, as one op at a
+        // time did); one upsert per key.
+        let mut state: std::collections::HashMap<
+            (&str, &str),
+            Option<Vec<u8>>,
+        > = std::collections::HashMap::new();
+        let mut unread: Vec<(usize, &str, &str)> = Vec::new();
+        let mut asked = std::collections::HashSet::new();
+        let mut written = std::collections::HashSet::new();
+        for (i, op) in batch.ops.iter().enumerate() {
+            match op {
+                BatchOp::KvPut { ns, key, .. } => {
+                    written.insert((ns.as_str(), key.as_str()));
+                }
+                BatchOp::KvMaxSeq { ns, key, .. }
+                | BatchOp::KvMax { ns, key, .. } => {
+                    let k = (ns.as_str(), key.as_str());
+                    if !written.contains(&k) && asked.insert(k) {
+                        unread.push((i, k.0, k.1));
+                    }
+                    written.insert(k);
+                }
+                _ => {}
+            }
+        }
+        let read = pg_kv_live_many(&tx, &unread, now).await?;
+        for ((_, ns, key), (_, v)) in unread.iter().zip(read) {
+            state.insert((ns, key), v);
+        }
+        let mut order: Vec<(&str, &str)> = Vec::new();
+        for op in &batch.ops {
+            let (k, v) = match op {
+                BatchOp::KvPut { ns, key, value } => (
+                    (ns.as_str(), key.as_str()),
+                    match value {
                         BatchValue::Bytes(b) => b.clone(),
                         BatchValue::SeqTemplate { template, of } => {
                             render_seq(template, seqs[*of].expect("validated"))
                         }
-                    };
-                    pg_kv_put(&tx, ns, key, &bytes).await?;
-                }
+                    },
+                ),
                 BatchOp::KvMaxSeq { ns, key, of } => {
-                    let current = pg_kv_live(&tx, ns, key, now).await?;
-                    let bytes = max_seq_value(
-                        current.as_deref(),
-                        seqs[*of].expect("validated"),
-                    )?;
-                    pg_kv_put(&tx, ns, key, &bytes).await?;
+                    let k = (ns.as_str(), key.as_str());
+                    let current = state.get(&k).cloned().flatten();
+                    (
+                        k,
+                        max_seq_value(
+                            current.as_deref(),
+                            seqs[*of].expect("validated"),
+                        )?,
+                    )
                 }
                 BatchOp::KvMax { ns, key, value } => {
-                    let current = pg_kv_live(&tx, ns, key, now).await?;
-                    let bytes = max_seq_value(current.as_deref(), *value)?;
-                    pg_kv_put(&tx, ns, key, &bytes).await?;
+                    let k = (ns.as_str(), key.as_str());
+                    let current = state.get(&k).cloned().flatten();
+                    (k, max_seq_value(current.as_deref(), *value)?)
                 }
-                BatchOp::CommitMarker { batch_id, digest } => {
-                    let result = crate::encode_batch_result(
-                        &batch.ops[..i],
-                        &seqs[..i],
-                    )?;
-                    tx.execute(
-                        "INSERT INTO df_batch_commit(batch_id, digest, result, committed_at)
-                         VALUES($1, $2, $3, $4)",
-                        &[batch_id, digest, &result, &now_ms()],
-                    )
-                    .await?;
-                }
+                _ => continue,
+            };
+            if !order.contains(&k) {
+                order.push(k);
             }
+            state.insert(k, Some(v));
         }
-        if fault == Some(BatchFault::AfterWrites(batch.ops.len())) {
-            anyhow::bail!("injected failure after every write was staged");
+        let finals: Vec<(&str, &str, Vec<u8>)> = order
+            .iter()
+            .map(|k| (k.0, k.1, state[k].clone().expect("written")))
+            .collect();
+        for chunk in
+            set_chunks(finals.iter().map(|f| f.0.len() + f.1.len() + f.2.len()))
+        {
+            let rows = &finals[chunk];
+            write("a key-value upsert")?;
+            tx.execute(
+                "INSERT INTO df_kv(ns, key, val, updated_at, expires_at)
+                 SELECT r.ns, r.key, r.val, $4, NULL
+                 FROM unnest($1::text[], $2::text[], $3::bytea[]) AS r(ns, key, val)
+                 ON CONFLICT(ns, key) DO UPDATE SET
+                   val=EXCLUDED.val, updated_at=EXCLUDED.updated_at, expires_at=NULL",
+                &[
+                    &rows.iter().map(|f| f.0).collect::<Vec<_>>(),
+                    &rows.iter().map(|f| f.1).collect::<Vec<_>>(),
+                    &rows.iter().map(|f| f.2.as_slice()).collect::<Vec<_>>(),
+                    &now_secs(),
+                ],
+            )
+            .await?;
+        }
+
+        // The commit marker, the batch's last write (validated last).
+        if let Some(BatchOp::CommitMarker { batch_id, digest }) =
+            batch.ops.last()
+        {
+            let i = batch.ops.len() - 1;
+            let result =
+                crate::encode_batch_result(&batch.ops[..i], &seqs[..i])?;
+            write("the commit marker")?;
+            tx.execute(
+                "INSERT INTO df_batch_commit(batch_id, digest, result, committed_at)
+                 VALUES($1, $2, $3, $4)",
+                &[batch_id, digest, &result, &now_ms()],
+            )
+            .await?;
+        }
+        if fault == Some(BatchFault::AfterWrites(writes)) {
+            anyhow::bail!("injected failure after every write statement");
         }
         tx.commit().await?;
         if fault == Some(BatchFault::AfterCommit) {
@@ -1680,6 +2012,124 @@ mod tests {
         );
     }
 
+    /// A batch of several chunks per group, failed before each of its write
+    /// statements in turn: nothing of it is visible from another
+    /// connection and its commit marker is absent; then it commits whole.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires a live PostgreSQL (DELTAFORGE_IT_PG_DSN)"]
+    async fn pg_a_failure_after_any_chunked_statement_leaves_nothing() {
+        let dsn = std::env::var("DELTAFORGE_IT_PG_DSN")
+            .expect("DELTAFORGE_IT_PG_DSN must be set to run this test");
+        let pg = PostgresStorageBackend::connect(&dsn).await.unwrap();
+        let ns = format!("schemas.v1.it{}_chunks", now_ms());
+        let n = SET_CHUNK_ITEMS + 100;
+        let batch = |id: &str| {
+            let mut ops: Vec<BatchOp> = (0..n)
+                .map(|i| BatchOp::LogAppendIfAbsent {
+                    ns: ns.clone(),
+                    key: format!("s{}", i % 3),
+                    capture_id: format!("c{i}"),
+                    value: format!("v{i}").into_bytes(),
+                })
+                .collect();
+            ops.extend((0..n).map(|i| BatchOp::KvPut {
+                ns: ns.clone(),
+                key: format!("k{i}"),
+                value: crate::BatchValue::Bytes(b"x".to_vec()),
+            }));
+            ops.push(BatchOp::CommitMarker {
+                batch_id: id.into(),
+                digest: b"d".to_vec(),
+            });
+            AtomicBatch {
+                preconditions: Vec::new(),
+                ops,
+            }
+        };
+        // The reservation, two insert chunks, the meta upsert, two
+        // key-value chunks and the marker.
+        let statements = 7;
+        let other = PostgresStorageBackend::connect(&dsn).await.unwrap();
+        for k in 0..=statements {
+            let id = format!("fail-{k}");
+            pg.set_batch_fault(Some(BatchFault::AfterWrites(k)));
+            assert!(pg.apply_batch(&batch(&id)).await.is_err(), "{k}");
+            for key in ["s0", "s1", "s2"] {
+                assert!(
+                    other.log_list(&ns, key).await.unwrap().is_empty(),
+                    "{k}"
+                );
+            }
+            assert_eq!(other.kv_get(&ns, "k0").await.unwrap(), None, "{k}");
+            assert_eq!(
+                other.kv_get(&ns, &format!("k{}", n - 1)).await.unwrap(),
+                None
+            );
+            assert!(
+                other.batch_commit_get(&id).await.unwrap().is_none(),
+                "{k}"
+            );
+        }
+        pg.set_batch_fault(Some(BatchFault::AfterWrites(statements + 1)));
+        match pg.apply_batch(&batch("whole")).await.unwrap() {
+            BatchOutcome::Committed { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(other.batch_commit_get("whole").await.unwrap().is_some());
+        let total: usize = entries(&other, &ns).await;
+        assert_eq!(total, n);
+    }
+
+    async fn entries(be: &PostgresStorageBackend, ns: &str) -> usize {
+        let mut total = 0;
+        for key in ["s0", "s1", "s2"] {
+            total += be.log_list(ns, key).await.unwrap().len();
+        }
+        total
+    }
+
+    /// A batch that rolls back after reserving its sequences leaves a gap
+    /// that is never reused: a batch committed meanwhile takes later
+    /// sequences, and the retry later ones still, so committed sequences
+    /// are unique and increase in commit order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires a live PostgreSQL (DELTAFORGE_IT_PG_DSN)"]
+    async fn pg_a_rolled_back_reservation_is_never_reused() {
+        let dsn = std::env::var("DELTAFORGE_IT_PG_DSN")
+            .expect("DELTAFORGE_IT_PG_DSN must be set to run this test");
+        let pg = PostgresStorageBackend::connect(&dsn).await.unwrap();
+        let ns = format!("schemas.v1.it{}_gap", now_ms());
+        let batch = |tag: &str| AtomicBatch {
+            preconditions: Vec::new(),
+            ops: (0..5)
+                .map(|i| BatchOp::LogAppendIfAbsent {
+                    ns: ns.clone(),
+                    key: tag.into(),
+                    capture_id: format!("c{i}"),
+                    value: b"v".to_vec(),
+                })
+                .collect(),
+        };
+        let seqs = |o: BatchOutcome| match o {
+            BatchOutcome::Committed { seqs } => {
+                seqs.into_iter().map(Option::unwrap).collect::<Vec<u64>>()
+            }
+            other => panic!("{other:?}"),
+        };
+        let before = seqs(pg.apply_batch(&batch("before")).await.unwrap());
+        // A reserves its block, then fails before its first insert.
+        pg.set_batch_fault(Some(BatchFault::AfterWrites(1)));
+        assert!(pg.apply_batch(&batch("a")).await.is_err());
+        let b = seqs(pg.apply_batch(&batch("b")).await.unwrap());
+        let a = seqs(pg.apply_batch(&batch("a")).await.unwrap());
+        let last = *before.last().unwrap();
+        assert!(b[0] > last + 5, "B reused A's gap: {before:?} {b:?}");
+        assert!(a[0] > *b.last().unwrap(), "{b:?} {a:?}");
+        for s in [&before, &b, &a] {
+            assert!(s.windows(2).all(|w| w[1] == w[0] + 1), "{s:?}");
+        }
+    }
+
     /// The store lock serializes guarded writes of every source sharing the
     /// store. Qualification at 1, 8 and 32 concurrent sources, each
     /// committing batches on its own stream plus the shared sequence
@@ -1810,6 +2260,29 @@ mod tests {
 
     /// The shared atomic-batch conformance suite against a live PostgreSQL
     /// (env-gated like the log contracts).
+    /// A chunk closes at `SET_CHUNK_ITEMS` items or once its payload reaches
+    /// `SET_CHUNK_BYTES` (the item is added first); request order is kept
+    /// and every item is in exactly one chunk.
+    #[test]
+    fn set_chunks_follow_the_packing_rule() {
+        assert!(set_chunks(std::iter::empty()).is_empty());
+        assert_eq!(set_chunks([1, 1, 1].into_iter()), vec![0..3]);
+        let n = 2 * SET_CHUNK_ITEMS + 1;
+        assert_eq!(
+            set_chunks(std::iter::repeat_n(1, n)),
+            vec![
+                0..SET_CHUNK_ITEMS,
+                SET_CHUNK_ITEMS..2 * SET_CHUNK_ITEMS,
+                2 * SET_CHUNK_ITEMS..n
+            ]
+        );
+        let half = SET_CHUNK_BYTES / 2;
+        assert_eq!(
+            set_chunks([half, half, 1, SET_CHUNK_BYTES * 3, 1].into_iter()),
+            vec![0..2, 2..4, 4..5]
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires a live PostgreSQL (DELTAFORGE_IT_PG_DSN)"]
     async fn pg_atomic_batch_conformance() {

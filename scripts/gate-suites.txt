@@ -19,6 +19,7 @@
 
 # PostgreSQL state-store suites (live database via DSN)
 serial-pg  storage/lib-pg                   -p storage --lib -- --include-ignored --test-threads=1 pg_
+serial     storage/pg_statement_counts      -p storage --test pg_statement_counts
 serial-pg  runner/replay_pg_integration     -p runner --test replay_pg_integration
 serial-pg  sources/lib-pg                   -p sources --lib -- --include-ignored --test-threads=1 pg_queue_
 
