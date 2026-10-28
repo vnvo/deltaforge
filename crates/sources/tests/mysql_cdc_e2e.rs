@@ -2042,3 +2042,78 @@ async fn startup_fails_closed_without_sink_checkpoints() -> Result<()> {
     mysql_drop_db(&pool, &db).await;
     Ok(())
 }
+
+/// The loader reads the run's shared DSN: once a rotation has replaced it
+/// and the old credentials are revoked (password changed, every session of
+/// them ended), a named-table reload connects with the new credentials.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_loader_reloads_on_the_replaced_dsn() -> Result<()> {
+    let (db_name, pool, _dsn) = mysql_setup("ldr_rot").await?;
+    let user = format!(
+        "ldr_{}",
+        db_name.len()
+            + db_name.bytes().map(u64::from).sum::<u64>() as usize % 100_000
+    );
+    let port = test_common::mysql_port().await;
+    let user_dsn =
+        |pw: &str| format!("mysql://{user}:{pw}@127.0.0.1:{port}/{db_name}");
+    let root_dsn = test_common::mysql_root_dsn().await;
+    let mut root = mysql_async::Conn::from_url(&root_dsn).await?;
+    root.query_drop(format!("CREATE TABLE {db_name}.t (id INT PRIMARY KEY)"))
+        .await?;
+    root.query_drop(format!("DROP USER IF EXISTS '{user}'@'%'"))
+        .await?;
+    root.query_drop(format!(
+        "CREATE USER '{user}'@'%' IDENTIFIED BY 'pw-before'"
+    ))
+    .await?;
+    root.query_drop(format!("GRANT SELECT ON *.* TO '{user}'@'%'"))
+        .await?;
+    let scope = sources::registry_scope::SharedRegistryScope::new("test");
+    sources::mysql::establish_registry_scope(
+        &root_dsn,
+        &make_storage_backend().await,
+        &scope,
+        "acme",
+        "test",
+    )
+    .await?;
+    let shared = sources::credentials::SharedDsn::from(user_dsn("pw-before"));
+    let loader = MySqlSchemaLoader::new(
+        shared.clone(),
+        make_registry().await,
+        "acme",
+        scope,
+    );
+    loader.load_schema(&db_name, "t").await?;
+
+    // Rotate: the old password stops working and its sessions end.
+    root.query_drop(format!(
+        "ALTER USER '{user}'@'%' IDENTIFIED BY 'pw-after'"
+    ))
+    .await?;
+    let ids: Vec<u64> = root
+        .exec(
+            "SELECT ID FROM information_schema.PROCESSLIST WHERE USER = ?",
+            (user.as_str(),),
+        )
+        .await?;
+    for id in ids {
+        root.query_drop(format!("KILL {id}")).await.ok();
+    }
+    shared.replace(user_dsn("pw-after").into());
+
+    let fetches = loader.live_fetch_count();
+    loader.reload_schema(&db_name, "t").await?;
+    assert_eq!(
+        loader.live_fetch_count(),
+        fetches + 1,
+        "the reload read the live catalog"
+    );
+
+    root.query_drop(format!("DROP USER '{user}'@'%'")).await?;
+    root.disconnect().await.ok();
+    mysql_drop_db(&pool, &db_name).await;
+    Ok(())
+}

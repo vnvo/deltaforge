@@ -131,15 +131,8 @@ pub(crate) async fn prove(
     // 1. Captures, bound to their intervals by step 3.
     let mut captured = Vec::new();
     for p in open {
-        match capture(
-            ctx.dsn.expose(),
-            &server_uuid,
-            &lineage,
-            &p.db,
-            &p.table,
-            None,
-        )
-        .await
+        match capture(&ctx.dsn, &server_uuid, &lineage, &p.db, &p.table, None)
+            .await
         {
             Ok(cap) => {
                 observe_capture(&tag, &cap);
@@ -186,7 +179,7 @@ pub(crate) async fn prove(
     // 3. One complete scan of (D, S].
     let report = match super::mysql_proof_scanner::shared_interval(
         &ctx.proof_scanner,
-        ctx.dsn.expose(),
+        ctx.dsn.current().expose(),
         &ctx.source_id,
         &server_uuid,
         &lineage,

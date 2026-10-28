@@ -261,7 +261,7 @@ pub(crate) struct RunCtx {
     /// The pipeline's per-table label policy.
     table_metrics: Arc<deltaforge_core::table_metrics::TableMetrics>,
     tenant: String,
-    dsn: crate::credentials::ProtectedDsn,
+    dsn: crate::credentials::SharedDsn,
     #[allow(dead_code)]
     host: String,
     default_db: String,
@@ -1407,6 +1407,9 @@ impl MySqlSource {
         pause_notify: Arc<Notify>,
         ready: deltaforge_core::SourceReady,
     ) -> SourceResult<()> {
+        // The run's one authoritative DSN, shared by every connection
+        // factory of the run (see `SharedDsn`).
+        let run_dsn = crate::credentials::SharedDsn::new(self.dsn.clone());
         // Verify the source lineage ONCE, before any snapshot, stream, or RunCtx.
         // Fail closed if it cannot be established: a swallowed error here would
         // proceed to snapshot/stream with no durable-watermark identity, leaving
@@ -1602,7 +1605,7 @@ impl MySqlSource {
                             backend: &self.backend,
                             loader: &snap_schema_loader,
                             scope: &drift_scope,
-                            dsn: self.dsn.expose(),
+                            dsn: &run_dsn,
                             server_uuid: &server_uuid,
                             source_id: &self.id,
                             halt: self.on_schema_drift
@@ -1730,7 +1733,7 @@ impl MySqlSource {
 
         info!(source_id=%self.id, "prepare_client finished, loading schemas");
         let schema_loader = MySqlSchemaLoader::new(
-            self.dsn.clone(),
+            run_dsn.clone(),
             self.registry.clone(),
             &self.tenant,
             self.registry_scope.clone(),
@@ -1754,7 +1757,7 @@ impl MySqlSource {
                 &self.pipeline,
             ),
             tenant: self.tenant.clone(),
-            dsn: self.dsn.clone(),
+            dsn: run_dsn,
             host,
             default_db,
             server_id,
@@ -1904,7 +1907,7 @@ impl MySqlSource {
                 .await?;
                 Some(mysql_rotation::MySqlRotationRuntime::spawn(
                     spec,
-                    ctx.dsn.clone(),
+                    ctx.dsn.current(),
                     self.id.clone(),
                     self.pipeline.clone(),
                     Arc::clone(&self.backend),
@@ -2355,7 +2358,7 @@ async fn connect_first_stream(
         Some(client.binlog_position)
     };
 
-    let dsn = ctx.dsn.clone();
+    let dsn = ctx.dsn.current();
     let sid = ctx.server_id;
     let make_client = move || {
         let mut c = BinlogClient {
@@ -2391,7 +2394,8 @@ async fn connect_first_stream(
         // Checked again once the stream is open, before any event is read:
         // the setting changes only with a restart, which ends this stream.
         Opened::Stream(stream) => {
-            require_complete_binlog(ctx.dsn.expose(), &expected).await?;
+            require_complete_binlog(ctx.dsn.current().expose(), &expected)
+                .await?;
             Ok(stream)
         }
         // Startup verified this server on every earlier connection: a
@@ -2423,7 +2427,7 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
     } else if !ctx.last_file.is_empty() && ctx.last_pos > 0 {
         (None, Some(ctx.last_file.clone()), Some(ctx.last_pos as u32))
     } else {
-        match resolve_binlog_tail(ctx.dsn.expose(), &expected).await {
+        match resolve_binlog_tail(ctx.dsn.current().expose(), &expected).await {
             Ok((f, p)) => (None, Some(f), Some(p as u32)),
             Err(MySqlSourceError::Lineage(details)) => {
                 return Err(SourceError::Lineage {
@@ -2448,7 +2452,7 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
             pos: pos_to_use.unwrap_or_default().into(),
         },
     };
-    let dsn = ctx.dsn.clone();
+    let dsn = ctx.dsn.current();
     let sid = ctx.server_id;
     let make_client = move || {
         let mut c = BinlogClient {
@@ -2499,7 +2503,7 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
     );
     // A candidate whose binlog may miss applied transactions is refused
     // before reconciliation records anything.
-    require_complete_binlog(ctx.dsn.expose(), &found).await?;
+    require_complete_binlog(ctx.dsn.current().expose(), &found).await?;
     let previous = mysql_identity(&expected);
     let current = mysql_identity(&found);
     run_failover_reconciliation(ctx, previous, current, &resume).await?;
@@ -2519,7 +2523,8 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
     {
         Opened::Stream(stream) => {
             ctx.retry.reset();
-            require_complete_binlog(ctx.dsn.expose(), &expected).await?;
+            require_complete_binlog(ctx.dsn.current().expose(), &expected)
+                .await?;
             Ok(stream)
         }
         Opened::OtherServer(other) => Err(SourceError::Lineage {
@@ -3047,7 +3052,7 @@ async fn verify_gtid_position(
     let mut retrying = None;
     loop {
         let reach = match open_control_connection(
-            ctx.dsn.expose(),
+            ctx.dsn.current().expose(),
             expected,
             CONTROL_CONNECT_TIMEOUT,
         )
@@ -3255,8 +3260,10 @@ async fn check_identity_post_reconnect(
         None => {
             // A reconnect's stream is open, nothing read yet: the server
             // may have restarted with another configuration.
-            require_complete_binlog(ctx.dsn.expose(), &expected).await?;
-            fetch_identity_verified_as(ctx.dsn.expose(), &expected).await?
+            require_complete_binlog(ctx.dsn.current().expose(), &expected)
+                .await?;
+            fetch_identity_verified_as(ctx.dsn.current().expose(), &expected)
+                .await?
         }
     };
 
@@ -3364,7 +3371,7 @@ async fn run_failover_reconciliation(
     };
 
     let mut conn = open_control_connection(
-        ctx.dsn.expose(),
+        ctx.dsn.current().expose(),
         &current_uuid,
         CONTROL_CONNECT_TIMEOUT,
     )

@@ -99,8 +99,11 @@ impl crate::registry_scope::Resident for Arc<LoadedSchema> {
 /// only reserve version numbers, so none is ever reused.
 #[derive(Clone)]
 pub struct MySqlSchemaLoader {
-    pool: Pool,
-    dsn: crate::credentials::ProtectedDsn,
+    /// The run's authoritative DSN (shared with the run).
+    dsn: crate::credentials::SharedDsn,
+    /// The pool, with the DSN it connects with (shared by clones); rebuilt
+    /// when the shared DSN changes.
+    pool: Arc<std::sync::Mutex<(crate::credentials::ProtectedDsn, Pool)>>,
     /// Cache: (db, table) -> Arc<LoadedSchema>
     cache: ArcSchemaCache,
     /// Schema registry for versioning
@@ -127,18 +130,22 @@ impl MySqlSchemaLoader {
     /// into one); the loader shares the protected wrapper rather than a plaintext
     /// copy.
     pub fn new(
-        dsn: impl Into<crate::credentials::ProtectedDsn>,
+        dsn: impl Into<crate::credentials::SharedDsn>,
         registry: Arc<DurableSchemaRegistry>,
         tenant: &str,
         scope: SharedRegistryScope,
     ) -> Self {
         let dsn = dsn.into();
+        let now = dsn.current();
         info!(
             "creating mysql schema loader for {}",
-            redact_password(dsn.expose())
+            redact_password(now.expose())
         );
         Self {
-            pool: Pool::new(dsn.expose()),
+            pool: Arc::new(std::sync::Mutex::new((
+                now.clone(),
+                Pool::new(now.expose()),
+            ))),
             dsn,
             cache: Arc::new(RwLock::new(ScopedCache::default())),
             registry,
@@ -280,19 +287,28 @@ impl MySqlSchemaLoader {
         self.registry.current_sequence()
     }
 
-    /// Replace the connection DSN after a credential rotation, rebuilding the cached
-    /// connection pool so later schema queries use the new credentials. The schema
-    /// cache (shared via `Arc`) is preserved. Called by the run loop at a quiesced
-    /// boundary once the replacement stream is confirmed, so no query is in flight
-    /// against the old DSN.
     /// The schema registry this loader registers versions in.
     pub(crate) fn registry(&self) -> &DurableSchemaRegistry {
         &self.registry
     }
 
-    pub(crate) fn set_dsn(&mut self, dsn: crate::credentials::ProtectedDsn) {
-        self.pool = Pool::new(dsn.expose());
-        self.dsn = dsn;
+    /// The pool for the run's DSN as it is now. A rotation replaced the
+    /// shared DSN: the pool is rebuilt, and the old one is closed in the
+    /// background (no lock is held across I/O).
+    fn pool(&self) -> Pool {
+        let current = self.dsn.current();
+        let mut slot = self.pool.lock().expect("pool lock");
+        if !slot.0.same_dsn(&current) {
+            let old =
+                std::mem::replace(&mut slot.1, Pool::new(current.expose()));
+            slot.0 = current;
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move {
+                    old.disconnect().await.ok();
+                });
+            }
+        }
+        slot.1.clone()
     }
 
     /// Every table `patterns` capture, with its schema resolved (from the
@@ -389,7 +405,7 @@ impl MySqlSchemaLoader {
 
         if row_image.to_lowercase() != "full" {
             warn!(
-                dns=redact_password(self.dsn.expose()),
+                dns=redact_password(self.dsn.current().expose()),
                 binlog_row_image = %row_image,
                 "binlog_row_image is not FULL - before images may be incomplete. \
                 Consider: SET GLOBAL binlog_row_image = 'FULL'"
@@ -682,7 +698,7 @@ impl MySqlSchemaLoader {
                 details: "MySQL loader scoped to a non-MySQL lineage".into(),
             });
         };
-        let mut conn = self.pool.get_conn().await.map_err(conn_error)?;
+        let mut conn = self.pool().get_conn().await.map_err(conn_error)?;
         super::mysql_session::verify_connection(&mut conn, server_uuid)
             .await
             .map_err(|e| e.into_source_error(server_uuid))?;
@@ -698,7 +714,7 @@ impl MySqlSchemaLoader {
     ) -> SourceResult<Live> {
         self.live_fetches
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut conn = self.pool.get_conn().await.map_err(conn_error)?;
+        let mut conn = self.pool().get_conn().await.map_err(conn_error)?;
         let storage::adapters::LineageDescriptor::Mysql { server_uuid } =
             &scope.lineage().descriptor
         else {
@@ -785,7 +801,10 @@ impl MySqlSchemaLoader {
             );
         }
         Self {
-            pool: Pool::new("mysql://localhost/ignored"),
+            pool: Arc::new(std::sync::Mutex::new((
+                "mysql://localhost/ignored".into(),
+                Pool::new("mysql://localhost/ignored"),
+            ))),
             dsn: "mysql://localhost/ignored".into(),
             cache: Arc::new(RwLock::new(scoped)),
             registry: storage::DurableSchemaRegistry::for_testing(),

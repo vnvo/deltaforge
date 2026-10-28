@@ -1489,7 +1489,7 @@ pub(crate) fn kill_failures() -> u64 {
 /// Read `db.table`'s shape between two positions (module docs). Never
 /// requires the server to be quiet: the positions may differ.
 pub(crate) async fn capture(
-    dsn: &str,
+    dsn: &crate::credentials::SharedDsn,
     server_uuid: &str,
     lineage_hash: &str,
     db: &str,
@@ -1511,20 +1511,20 @@ pub(crate) async fn capture(
 /// [`capture`] under the given capture slots.
 pub(crate) async fn capture_with(
     slots: &'static CaptureSlots,
-    dsn: &str,
+    dsn: &crate::credentials::SharedDsn,
     server_uuid: &str,
     lineage_hash: &str,
     db: &str,
     table: &str,
     between: Option<BetweenHook<'_>>,
 ) -> Result<Captured, ProofError> {
-    let pool = mysql_async::Pool::new(dsn);
+    let pool = mysql_async::Pool::new(dsn.current().expose());
     let mut trace = CaptureTrace::default();
     let t0 = Instant::now();
     // Dropped mid-flight, the capture is killed on the server (see
     // `capture_batch_with`).
     let mut guard = KillOnDrop {
-        dsn: dsn.to_string(),
+        dsn: dsn.clone(),
         id: 0,
         slots,
         permit: None,
@@ -1632,7 +1632,8 @@ pub(crate) async fn capture_with(
 /// Kills its connection on the server when dropped while armed (`id`
 /// non-zero), from a detached task, bounded in time.
 struct KillOnDrop {
-    dsn: String,
+    /// The run's DSN, read when the kill connects.
+    dsn: crate::credentials::SharedDsn,
     id: u32,
     slots: &'static CaptureSlots,
     /// The capture's lock-holding slot, held until its session is gone.
@@ -1644,8 +1645,7 @@ impl Drop for KillOnDrop {
         if self.id == 0 {
             return;
         }
-        let (dsn, id, slots) =
-            (std::mem::take(&mut self.dsn), self.id, self.slots);
+        let (dsn, id, slots) = (self.dsn.clone(), self.id, self.slots);
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
             kill_failed(slots, permit, id, "no runtime to run the kill on");
             return;
@@ -1667,7 +1667,8 @@ impl Drop for KillOnDrop {
                 if slots.fail_kills.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err("injected kill failure".to_string());
                 }
-                let mut c = mysql_async::Conn::from_url(dsn.as_str())
+                let now = dsn.current();
+                let mut c = mysql_async::Conn::from_url(now.expose())
                     .await
                     .map_err(|e| format!("connect: {e}"))?;
                 let killed = match c.query_drop(format!("KILL {id}")).await {
@@ -1855,7 +1856,7 @@ async fn lock_all(
 /// table is locked (tests use it to race a multi-table DDL; production
 /// passes `None`).
 pub(crate) async fn capture_batch(
-    dsn: &str,
+    dsn: &crate::credentials::SharedDsn,
     server_uuid: &str,
     lineage_hash: &str,
     tables: &[(String, String)],
@@ -1877,7 +1878,7 @@ pub(crate) async fn capture_batch(
 /// [`capture_batch`] under the given capture slots.
 pub(crate) async fn capture_batch_with(
     slots: &'static CaptureSlots,
-    dsn: &str,
+    dsn: &crate::credentials::SharedDsn,
     server_uuid: &str,
     lineage_hash: &str,
     tables: &[(String, String)],
@@ -1888,7 +1889,7 @@ pub(crate) async fn capture_batch_with(
     let mut sorted: Vec<(String, String)> = tables.to_vec();
     sorted.sort();
     sorted.dedup();
-    let pool = mysql_async::Pool::new(dsn);
+    let pool = mysql_async::Pool::new(dsn.current().expose());
     let mut trace = CaptureTrace::default();
     let t0 = Instant::now();
     // A capture dropped mid-flight (its window failed, was abandoned or
@@ -1896,7 +1897,7 @@ pub(crate) async fn capture_batch_with(
     // rolls back and its metadata locks are released at once, instead of
     // when its query ends.
     let mut guard = KillOnDrop {
-        dsn: dsn.to_string(),
+        dsn: dsn.clone(),
         id: 0,
         slots,
         permit: None,
@@ -2166,7 +2167,7 @@ pub(crate) struct SharedProofs<'a> {
 /// (retention, unknown events, limits, another server) fails closed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn capture_proven(
-    dsn: &str,
+    dsn: &crate::credentials::SharedDsn,
     scan_server_id: u64,
     server_uuid: &str,
     lineage_hash: &str,
@@ -2188,7 +2189,7 @@ pub(crate) async fn capture_proven(
             Some(sp) => {
                 super::mysql_proof_scanner::shared_interval(
                     sp.scanner,
-                    dsn,
+                    dsn.current().expose(),
                     tag.source_id,
                     server_uuid,
                     lineage_hash,
@@ -2202,7 +2203,7 @@ pub(crate) async fn capture_proven(
             }
             None => {
                 scan_interval(
-                    dsn,
+                    dsn.current().expose(),
                     scan_server_id,
                     server_uuid,
                     lineage_hash,
@@ -3586,7 +3587,16 @@ mod tests {
                     Box::leak(Box::new(CaptureSlots::new(4, 4)));
                 let (d, u) = (dsn.clone(), uuid(&dsn).await);
                 let task = tokio::spawn(async move {
-                    capture_with(slots, &d, &u, LINEAGE, db, "t", None).await
+                    capture_with(
+                        slots,
+                        &crate::credentials::SharedDsn::from(d.as_str()),
+                        &u,
+                        LINEAGE,
+                        db,
+                        "t",
+                        None,
+                    )
+                    .await
                 });
                 let deadline = Instant::now() + Duration::from_secs(20);
                 while waiting_capture(&dsn, db, "t").await.is_empty() {
@@ -3646,7 +3656,7 @@ mod tests {
                                 release.acquire().await.unwrap().forget();
                             })
                         };
-                        capture_with(slots, &d, &u, LINEAGE, db, &format!("t{i}"), Some(&hook)).await
+                        capture_with(slots, &crate::credentials::SharedDsn::from(d.as_str()), &u, LINEAGE, db, &format!("t{i}"), Some(&hook)).await
                     }));
                 }
                 tokio::time::sleep(Duration::from_secs(3)).await;
@@ -3693,7 +3703,7 @@ mod tests {
                         let tables = vec![(db.to_string(), "a".to_string())];
                         capture_batch_with(
                             slots,
-                            &d,
+                            &crate::credentials::SharedDsn::from(d.as_str()),
                             &u,
                             LINEAGE,
                             &tables,
@@ -3707,7 +3717,13 @@ mod tests {
                 let started = Instant::now();
                 let tables = vec![(db.to_string(), "b".to_string())];
                 let waited = capture_batch_with(
-                    slots, &dsn, &u, LINEAGE, &tables, 1, None,
+                    slots,
+                    &crate::credentials::SharedDsn::from(dsn.as_str()),
+                    &u,
+                    LINEAGE,
+                    &tables,
+                    1,
+                    None,
                 )
                 .await;
                 assert!(
@@ -3754,7 +3770,7 @@ mod tests {
                             })
                         };
                         let tables = vec![(db.to_string(), format!("t{i}"))];
-                        capture_batch_with(slots, &d, &u, LINEAGE, &tables, 8, Some(&hook)).await
+                        capture_batch_with(slots, &crate::credentials::SharedDsn::from(d.as_str()), &u, LINEAGE, &tables, 8, Some(&hook)).await
                     }));
                 }
                 let deadline = Instant::now() + Duration::from_secs(20);
@@ -3840,7 +3856,7 @@ mod tests {
                         let tables = vec![(db.to_string(), table.to_string())];
                         capture_batch_with(
                             slots,
-                            &d,
+                            &crate::credentials::SharedDsn::from(d.as_str()),
                             &u,
                             LINEAGE,
                             &tables,
@@ -3904,7 +3920,13 @@ mod tests {
                 until(b_inside).await;
                 let tables = vec![(db.to_string(), "c".to_string())];
                 let third = capture_batch_with(
-                    slots, &dsn, &u, LINEAGE, &tables, 1, None,
+                    slots,
+                    &crate::credentials::SharedDsn::from(dsn.as_str()),
+                    &u,
+                    LINEAGE,
+                    &tables,
+                    1,
+                    None,
                 )
                 .await;
                 assert!(
@@ -3929,6 +3951,98 @@ mod tests {
                     failures + 1,
                     "only the failed kill is counted"
                 );
+            }
+
+            /// A cancellation connects with the run's DSN as it is when the
+            /// kill runs: a capture started on credentials A and blocked on a
+            /// held lock, dropped after a rotation replaced the shared DSN
+            /// with B and revoked A, is still killed.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn a_cancellation_uses_the_dsn_replaced_after_its_capture_started()
+             {
+                let dsn = server(true).await;
+                let db = "cancel_rotated";
+                let user = "cancel_rot";
+                sql(
+                    &dsn,
+                    &[
+                        &format!("CREATE DATABASE {db}"),
+                        &format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)"),
+                        &format!("DROP USER IF EXISTS '{user}'@'%'"),
+                        &format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'pw-before'"),
+                        &format!("GRANT SELECT, REPLICATION CLIENT ON *.* TO '{user}'@'%'"),
+                    ],
+                )
+                .await;
+                let port = port(true).await;
+                let as_user =
+                    |pw: &str| format!("mysql://{user}:{pw}@127.0.0.1:{port}/");
+                let shared =
+                    crate::credentials::SharedDsn::from(as_user("pw-before"));
+                let mut holder =
+                    mysql_async::Conn::from_url(&dsn).await.unwrap();
+                holder
+                    .query_drop(format!("LOCK TABLES {db}.t WRITE"))
+                    .await
+                    .unwrap();
+                let slots: &'static CaptureSlots =
+                    Box::leak(Box::new(CaptureSlots::new(4, 4)));
+                let u = uuid(&dsn).await;
+                let task = {
+                    let shared = shared.clone();
+                    tokio::spawn(async move {
+                        let tables = vec![(db.to_string(), "t".to_string())];
+                        capture_batch_with(
+                            slots, &shared, &u, LINEAGE, &tables, 30, None,
+                        )
+                        .await
+                    })
+                };
+                let waiting = |dsn: String| async move {
+                    let mut c =
+                        mysql_async::Conn::from_url(&dsn).await.unwrap();
+                    let ids: Vec<u64> = c
+                        .exec(
+                            "SELECT ID FROM information_schema.PROCESSLIST WHERE USER = ? \
+                             AND STATE = 'Waiting for table metadata lock' AND ID <> CONNECTION_ID()",
+                            (user,),
+                        )
+                        .await
+                        .unwrap();
+                    ids
+                };
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while waiting(dsn.clone()).await.is_empty() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the capture never queued"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                // Rotate: A stops working (the queued session stays), the
+                // shared DSN becomes B.
+                sql(
+                    &dsn,
+                    &[&format!(
+                        "ALTER USER '{user}'@'%' IDENTIFIED BY 'pw-after'"
+                    )],
+                )
+                .await;
+                shared.replace(as_user("pw-after").into());
+                let failures = kill_failures();
+                task.abort();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !waiting(dsn.clone()).await.is_empty() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the cancelled capture was not killed with the replaced DSN"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert_eq!(kill_failures(), failures, "the kill failed");
+                holder.query_drop("UNLOCK TABLES").await.unwrap();
+                sql(&dsn, &[&format!("DROP USER '{user}'@'%'")]).await;
             }
 
             /// A batched capture locks its tables in sorted order, whatever
@@ -3973,7 +4087,7 @@ mod tests {
                     (db.to_string(), "t010".to_string()),
                 ];
                 let cap = capture_batch(
-                    &dsn,
+                    &crate::credentials::SharedDsn::from(dsn.as_str()),
                     &uuid(&dsn).await,
                     LINEAGE,
                     &tables,
@@ -4019,7 +4133,7 @@ mod tests {
                     (db.to_string(), "a".to_string()),
                 ];
                 let r = capture_batch(
-                    &dsn,
+                    &crate::credentials::SharedDsn::from(dsn.as_str()),
                     &uuid(&dsn).await,
                     LINEAGE,
                     &tables,
@@ -4064,7 +4178,7 @@ mod tests {
                     (db.to_string(), "a".to_string()),
                 ];
                 let cap = capture_batch(
-                    &dsn,
+                    &crate::credentials::SharedDsn::from(dsn.as_str()),
                     &uuid(&dsn).await,
                     LINEAGE,
                     &tables,
@@ -4818,7 +4932,7 @@ mod tests {
                 move || a()
             });
             capture_proven(
-                dsn,
+                &crate::credentials::SharedDsn::from(dsn),
                 4_000_140,
                 &uuid(dsn).await,
                 LINEAGE,
@@ -5360,7 +5474,7 @@ mod tests {
                     move || w()
                 };
                 let c = capture(
-                    &dsn,
+                    &crate::credentials::SharedDsn::from(dsn.as_str()),
                     &uuid(&dsn).await,
                     LINEAGE,
                     db,
@@ -5620,7 +5734,7 @@ mod tests {
                 move || w()
             };
             let r = capture_proven(
-                &dsn,
+                &crate::credentials::SharedDsn::from(dsn.as_str()),
                 4_000_141,
                 &uuid(&dsn).await,
                 LINEAGE,
@@ -5640,7 +5754,7 @@ mod tests {
             assert!(matches!(r, Err(ProofError::Limit(_))), "{r:?}");
 
             let r = capture(
-                &dsn,
+                &crate::credentials::SharedDsn::from(dsn.as_str()),
                 "00000000-1111-2222-3333-444444444444",
                 LINEAGE,
                 "cap_fail",
@@ -5650,7 +5764,7 @@ mod tests {
             .await;
             assert!(matches!(r, Err(ProofError::OtherServer(_))), "{r:?}");
             let r = capture(
-                &dsn,
+                &crate::credentials::SharedDsn::from(dsn.as_str()),
                 &uuid(&dsn).await,
                 LINEAGE,
                 "cap_fail",
@@ -5745,7 +5859,7 @@ mod tests {
                         >
                 };
                 let c = capture(
-                    &dsn,
+                    &crate::credentials::SharedDsn::from(dsn.as_str()),
                     &uuid(&dsn).await,
                     LINEAGE,
                     db,
@@ -5837,7 +5951,7 @@ mod tests {
                 move || w()
             };
             let c = capture(
-                &dsn,
+                &crate::credentials::SharedDsn::from(dsn.as_str()),
                 &uuid(&dsn).await,
                 LINEAGE,
                 "cap_cover",

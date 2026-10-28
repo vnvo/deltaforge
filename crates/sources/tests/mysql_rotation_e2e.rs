@@ -350,7 +350,12 @@ async fn collect_create_ids(
     ids
 }
 
-fn mysql_rotation_cfg(db: &str, port: u16, proj: &Projected) -> MysqlSrcCfg {
+fn mysql_rotation_cfg(
+    db: &str,
+    port: u16,
+    proj: &Projected,
+    tables: &[String],
+) -> MysqlSrcCfg {
     MysqlSrcCfg {
         id: "my-rot".to_string(),
         dsn: Some(format!("mysql://127.0.0.1:{port}/{db}")),
@@ -359,7 +364,7 @@ fn mysql_rotation_cfg(db: &str, port: u16, proj: &Projected) -> MysqlSrcCfg {
             username: Some(proj.key_ref("username")),
             password: Some(proj.key_ref("password")),
         }),
-        tables: vec![format!("{db}.orders")],
+        tables: tables.to_vec(),
         table_options: Default::default(),
         outbox: None,
         snapshot: SnapshotCfg {
@@ -421,7 +426,20 @@ async fn start_rotation_harness(
     suffix: &str,
     channel_cap: usize,
 ) -> Result<Harness> {
+    start_rotation_harness_on(suffix, channel_cap, |db| {
+        vec![format!("{db}.orders")]
+    })
+    .await
+}
+
+/// [`start_rotation_harness`] capturing the tables `tables(db)` names.
+async fn start_rotation_harness_on(
+    suffix: &str,
+    channel_cap: usize,
+    tables: impl Fn(&str) -> Vec<String>,
+) -> Result<Harness> {
     let (db, pool, _cdc_dsn) = mysql_setup(suffix).await?;
+    let tables = tables(&db);
     let port = mysql_port().await;
     let root_dsn = mysql_root_dsn().await;
 
@@ -444,7 +462,7 @@ async fn start_rotation_harness(
         ("username", MYSQL_CDC_USER.as_bytes()),
         ("password", MYSQL_CDC_PASSWORD.as_bytes()),
     ]);
-    let cfg = mysql_rotation_cfg(&db, port, &proj);
+    let cfg = mysql_rotation_cfg(&db, port, &proj, &tables);
 
     // Resolve the initial DSN through the real production path so the manager's
     // baseline compose matches it exactly (no spurious startup reconnect).
@@ -461,7 +479,7 @@ async fn start_rotation_harness(
     let src = MySqlSource {
         id: cfg.id.clone(),
         dsn: initial_dsn,
-        tables: vec![format!("{db}.orders")],
+        tables: tables.clone(),
         tenant: "acme".to_string(),
         pipeline: "test".to_string(),
         registry: test_common::registry_on(&backend).await,
@@ -1056,5 +1074,346 @@ async fn mysql_projected_symlink_resolves_through_genuine_build_path()
         resolver,
     )
     .await?;
+    Ok(())
+}
+
+/// Every log line, captured for the credential check below.
+#[derive(Clone, Default)]
+struct LogCapture(Arc<std::sync::Mutex<String>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Fields(String);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(
+                &mut self,
+                f: &tracing::field::Field,
+                v: &dyn std::fmt::Debug,
+            ) {
+                self.0.push_str(&format!(" {}={:?}", f.name(), v));
+            }
+            fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                self.0.push_str(&format!(" {}={}", f.name(), v));
+            }
+        }
+        let mut line = Fields(event.metadata().target().to_string());
+        event.record(&mut line);
+        let mut all = self.0.lock().unwrap();
+        all.push_str(&line.0);
+        all.push('\n');
+    }
+}
+
+/// End every session of the CDC user (a revocation that also terminates
+/// what was authenticated with the old credentials).
+async fn end_cdc_sessions(root_dsn: &str) -> Result<usize> {
+    let mut c = mysql_async::Conn::from_url(root_dsn).await?;
+    let ids: Vec<u64> = c
+        .exec(
+            "SELECT ID FROM information_schema.PROCESSLIST WHERE USER = ?",
+            (MYSQL_CDC_USER,),
+        )
+        .await?;
+    for id in &ids {
+        c.query_drop(format!("KILL {id}")).await.ok();
+    }
+    c.disconnect().await.ok();
+    Ok(ids.len())
+}
+
+/// After a rotation the old password stops working at once (`ALTER USER`),
+/// so any connection still made with it fails. Every kind the source opens
+/// afterwards must use the new credentials: the replication stream, a
+/// capture and its proof for a table first seen after the rotation, and a
+/// reconnect. Neither password ever appears in a log line or in the run's
+/// result. (Cancellation connections are tested below the pipeline, in
+/// `mysql_binlog_scan`.)
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires docker"]
+async fn mysql_rotation_reaches_every_new_connection_and_never_logs_credentials()
+-> Result<()> {
+    use tracing_subscriber::layer::SubscriberExt;
+    let logs = LogCapture::default();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::filter::LevelFilter::TRACE)
+        .with(logs.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let mut h = start_rotation_harness_on("rot_every", 256, |db| {
+        vec![format!("{db}.*")]
+    })
+    .await?;
+    let new_password = format!(
+        "rotated-{}",
+        UNIQ.fetch_add(1, Ordering::SeqCst) + 7_340_033
+    );
+    let dump_before =
+        wait_for_dump_thread(&h.root_dsn, Duration::from_secs(30)).await?;
+    let mut conn = h.pool.get_conn().await?;
+    conn.query_drop(format!(
+        "INSERT INTO {}.orders (sku) VALUES ('before')",
+        h.db
+    ))
+    .await?;
+    conn.disconnect().await.ok();
+    assert!(
+        wait_for_event(&mut h.rx, Duration::from_secs(15)).await,
+        "no event before rotation"
+    );
+
+    // Rotate: the old password is revoked for every new connection.
+    h.rotate_password(&new_password).await?;
+    let dump_after = wait_for_dump_thread_change(
+        &h.root_dsn,
+        dump_before,
+        Duration::from_secs(40),
+    )
+    .await?;
+    // The confirmed replacement's first event (its stream's artificial
+    // Rotate) reaches file tracking exactly once.
+    let rotates_after_apply = |text: &str| -> usize {
+        text.split("credential rotation applied")
+            .nth(1)
+            .map_or(0, |after| {
+                after
+                    .lines()
+                    .filter(|l| l.contains(" message=rotate "))
+                    .count()
+            })
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rotates_after_apply(&logs.0.lock().unwrap()) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the confirmed first event never reached file tracking"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+    sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        rotates_after_apply(&logs.0.lock().unwrap()),
+        1,
+        "the confirmed first event was handed on more than once"
+    );
+
+    // Revocation also ends every session opened with the old credentials:
+    // each pool must open new connections from here on.
+    let ended = end_cdc_sessions(&h.root_dsn).await?;
+    assert!(ended >= 1, "no source session to end");
+    let dump_after = wait_for_dump_thread_change(
+        &h.root_dsn,
+        dump_after,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Replication on the new credentials.
+    let mut conn = h.pool.get_conn().await?;
+    conn.query_drop(format!(
+        "INSERT INTO {}.orders (sku) VALUES ('after')",
+        h.db
+    ))
+    .await?;
+    // Capture and proof: a table first seen after the rotation.
+    conn.query_drop(format!(
+        "CREATE TABLE {}.later (id INT PRIMARY KEY)",
+        h.db
+    ))
+    .await?;
+    conn.query_drop(format!("INSERT INTO {}.later VALUES (1)", h.db))
+        .await?;
+    conn.disconnect().await.ok();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut tables_seen = std::collections::BTreeSet::new();
+    while tables_seen.len() < 2 && Instant::now() < deadline {
+        if let Ok(Some(SourceItem::Event(e))) =
+            timeout(Duration::from_millis(200), h.rx.recv()).await
+        {
+            if matches!(e.op, Op::Create) {
+                tables_seen.insert(e.source.table.clone());
+            }
+        }
+    }
+    assert_eq!(
+        tables_seen.len(),
+        2,
+        "after rotation, events from {tables_seen:?}"
+    );
+
+    // Reconnect on the new credentials: the stream is killed server-side.
+    let mut root = mysql_async::Conn::from_url(&h.root_dsn).await?;
+    root.query_drop(format!("KILL {dump_after}")).await?;
+    let _ = wait_for_dump_thread_change(
+        &h.root_dsn,
+        dump_after,
+        Duration::from_secs(60),
+    )
+    .await?;
+    let mut conn = h.pool.get_conn().await?;
+    conn.query_drop(format!(
+        "INSERT INTO {}.orders (sku) VALUES ('reconnected')",
+        h.db
+    ))
+    .await?;
+    conn.disconnect().await.ok();
+    assert!(
+        wait_for_event(&mut h.rx, Duration::from_secs(30)).await,
+        "no event after the reconnect"
+    );
+
+    let db = h.db.clone();
+    h.handle.stop();
+    let result = h.handle.join().await;
+    root.disconnect().await.ok();
+
+    // No credential in any log line or in the run's result.
+    let result_text = format!("{result:?}");
+    let text = logs.0.lock().unwrap().clone();
+    for secret in [MYSQL_CDC_PASSWORD, new_password.as_str()] {
+        assert!(!text.contains(secret), "a password appeared in the logs");
+        assert!(
+            !result_text.contains(secret),
+            "a password appeared in the run's result"
+        );
+    }
+    assert!(
+        text.lines().count() > 50,
+        "too few log lines were captured to check"
+    );
+    mysql_drop_db(&h.pool, &db).await;
+    Ok(())
+}
+
+/// A rotation whose replacement passes preflight but cannot replicate (its
+/// user has only `REPLICATION CLIENT` and `INSERT`: the server refuses its dump on the
+/// stream's first read) is not applied, and the previous credentials stay
+/// authoritative for the whole run. The candidate could not read tables or
+/// open a dump either, so a table first seen afterwards being captured and
+/// proved (a binlog scan) shows that no loader, capture or scan used it; the
+/// old stream keeps delivering rows, and a reconnect still works.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires docker"]
+async fn mysql_a_rotation_failing_after_preflight_keeps_the_previous_dsn()
+-> Result<()> {
+    use tracing_subscriber::layer::SubscriberExt;
+    let logs = LogCapture::default();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::filter::LevelFilter::INFO)
+        .with(logs.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let mut h = start_rotation_harness_on("rot_kept", 256, |db| {
+        vec![format!("{db}.*")]
+    })
+    .await?;
+    let dump =
+        wait_for_dump_thread(&h.root_dsn, Duration::from_secs(30)).await?;
+    let mut conn = h.pool.get_conn().await?;
+    conn.query_drop(format!(
+        "INSERT INTO {}.orders (sku) VALUES ('before')",
+        h.db
+    ))
+    .await?;
+    conn.disconnect().await.ok();
+    assert!(wait_for_event(&mut h.rx, Duration::from_secs(15)).await);
+
+    // A replacement that preflight accepts and the stream refuses.
+    let user = "rot_noslave";
+    let mut root = mysql_async::Conn::from_url(&h.root_dsn).await?;
+    root.query_drop(format!("DROP USER IF EXISTS '{user}'@'%'"))
+        .await?;
+    root.query_drop(format!(
+        "CREATE USER '{user}'@'%' IDENTIFIED BY 'noslave-pw'"
+    ))
+    .await?;
+    root.query_drop(format!("GRANT REPLICATION CLIENT ON *.* TO '{user}'@'%'"))
+        .await?;
+    // A privilege on the source's database (so the DSN's default database
+    // is usable) that still cannot read a table.
+    root.query_drop(format!("GRANT INSERT ON {}.* TO '{user}'@'%'", h.db))
+        .await?;
+    h.proj
+        .publish(&[("username", user.as_bytes()), ("password", b"noslave-pw")]);
+    // Wait for the rotation's outcome, whichever it is.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let outcome = loop {
+        let text = logs.0.lock().unwrap().clone();
+        if text.contains("credential rotation not applied") {
+            break "kept";
+        }
+        if text.contains("credential rotation applied") {
+            break "applied";
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the rotation was never attempted"
+        );
+        sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        outcome, "kept",
+        "credentials that cannot replicate replaced the working ones"
+    );
+
+    // The previous credentials serve everything that follows.
+    let mut conn = h.pool.get_conn().await?;
+    conn.query_drop(format!(
+        "CREATE TABLE {}.later (id INT PRIMARY KEY)",
+        h.db
+    ))
+    .await?;
+    conn.query_drop(format!("INSERT INTO {}.later VALUES (1)", h.db))
+        .await?;
+    conn.disconnect().await.ok();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut later = false;
+    while !later && Instant::now() < deadline {
+        if let Ok(Some(SourceItem::Event(e))) =
+            timeout(Duration::from_millis(200), h.rx.recv()).await
+        {
+            later = e.source.table == "later";
+        }
+    }
+    assert!(
+        later,
+        "a table first seen after the failed rotation was not proved"
+    );
+    let current =
+        wait_for_dump_thread(&h.root_dsn, Duration::from_secs(5)).await?;
+    root.query_drop(format!("KILL {current}")).await?;
+    let _ = wait_for_dump_thread_change(
+        &h.root_dsn,
+        current,
+        Duration::from_secs(60),
+    )
+    .await?;
+    let users: Vec<String> = root
+        .query("SELECT USER FROM information_schema.PROCESSLIST WHERE COMMAND LIKE 'Binlog Dump%'")
+        .await?;
+    assert_eq!(
+        users,
+        [MYSQL_CDC_USER],
+        "the stream after the failed rotation"
+    );
+    let mut conn = h.pool.get_conn().await?;
+    conn.query_drop(format!(
+        "INSERT INTO {}.orders (sku) VALUES ('after')",
+        h.db
+    ))
+    .await?;
+    conn.disconnect().await.ok();
+    assert!(
+        wait_for_event(&mut h.rx, Duration::from_secs(30)).await,
+        "no event after the reconnect"
+    );
+    let _ = dump;
+
+    root.query_drop(format!("DROP USER '{user}'@'%'")).await?;
+    root.disconnect().await.ok();
+    h.finish().await;
     Ok(())
 }
