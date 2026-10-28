@@ -258,7 +258,12 @@ async fn incidents(
         .collect()
 }
 
-/// The pipeline failed with `reason` (and, if given, the class).
+/// The pipeline failed with `reason` (and, if given, the class). Failure
+/// is visible at once and its incident with it: the pipeline's status
+/// exposes the incident from memory (`durable: false` while its write is
+/// retried in the background). The incident store then holds it within a
+/// short bound; a write that never lands fails with the store's final list.
+/// Returns its id as recovery diagnoses it.
 async fn failed_with(
     mgr: &PipelineManager,
     backend: &ArcStorageBackend,
@@ -267,21 +272,55 @@ async fn failed_with(
     class: Option<&str>,
 ) -> String {
     until_status(mgr, name, "failed").await;
-    let all = incidents(backend, name).await;
-    let hit = all
+    let matches =
+        |r: &str, c: &str| r == reason && class.is_none_or(|k| c.contains(k));
+    // Exposed now, durable or not.
+    let blocking = PipelineController::get(mgr, name)
+        .await
+        .unwrap()
+        .incidents
+        .expect("a failed pipeline's incidents")
+        .blocking;
+    let exposed = blocking
         .iter()
-        .find(|(r, c)| r == reason && class.is_none_or(|k| c.contains(k)));
-    assert!(hit.is_some(), "{name}: no {reason} {class:?} in {all:?}");
+        .find(|b| {
+            matches(
+                b["reason_code"].as_str().unwrap_or_default(),
+                &b["evidence"]["reason_class"].to_string(),
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!("{name}: {reason} {class:?} not exposed: {blocking:?}")
+        });
+    let id = exposed["incident_id"].as_str().unwrap().to_string();
+    // Durable within a short bound.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let all = incidents(backend, name).await;
+        if all.iter().any(|(r, c)| matches(r, c)) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{name}: {reason} {class:?} never written to the incident store: {all:?}"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
     let svc = recovery(mgr);
     use rest_api::recovery::RecoveryController;
     let diag = svc.diagnose(name).await.unwrap();
-    diag["incidents"]
+    let diagnosed = diag["incidents"]
         .as_array()
         .unwrap()
         .iter()
         .find(|i| i["reason_code"] == reason)
         .map(|i| i["incident_id"].as_str().unwrap().to_string())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    assert_eq!(
+        diagnosed, id,
+        "{name}: the exposed incident is the one recovery diagnoses"
+    );
+    id
 }
 
 fn refused(r: Result<(), tokio_postgres::Error>, what: &str) {
