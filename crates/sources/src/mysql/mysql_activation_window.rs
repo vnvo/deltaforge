@@ -1036,8 +1036,12 @@ async fn decide_and_commit(
         admit_batch(ctx, lineage, &done.cap, tables_in_order)
             .await
             .map_err(LoopControl::Fail)?;
+    let decided = governs
+        .iter()
+        .filter(|(_, _, g)| *g != Governs::Deferred)
+        .count();
     Ok(Admitted {
-        tables: required.len(),
+        tables: decided,
         attempts: done.attempts,
         work,
         captured: done.captured,
@@ -1111,6 +1115,69 @@ async fn admit_batch(
         kind: ProofKind::Lazy,
     };
     let lctn = ctx.lower_case_table_names;
+    let scope = ctx.registry_scope.current()?;
+    // The window's prefix (`mysql_window_budget`): its tables in first-touch
+    // order, each with its complete cost, up to the first that would take
+    // the plan over a cap. The rest are deferred: nothing of them is
+    // decided, recorded or written, and their rows go back to the stream
+    // for the next window, whose first table one of them is.
+    let mut tables = tables;
+    let deferred = {
+        use super::mysql_window_budget::{Caps, Prefix, table_cost};
+        let other_lineages = storage::adapters::source_lineage::load(
+            &ctx.registry_backend,
+            &ctx.tenant,
+            &ctx.source_id,
+        )
+        .await
+        .map_err(SourceError::Other)?
+        .map_or(0, |r| r.prior_lineage_hashes.len() as u64);
+        let mut prefix = Prefix::new(Caps::current());
+        let mut cut = tables.len();
+        for (i, ((db, table), at, _)) in tables.iter().enumerate() {
+            // A table gone before the capture holds nothing.
+            let cost = match cap.schemas.get(&(db.clone(), table.clone())) {
+                None => Default::default(),
+                Some(schema) => {
+                    let key = scope.key(db, table);
+                    let t = timeline(ctx, &key).await?;
+                    table_cost(
+                        serde_json::to_vec(schema)
+                            .map_err(|e| SourceError::Other(e.into()))?
+                            .len() as u64,
+                        &t,
+                        other_lineages,
+                        key.backend_key().len() as u64,
+                    )
+                    .map_err(SourceError::Other)?
+                }
+            };
+            match prefix.offer(cost) {
+                Ok(true) => {}
+                Ok(false) => {
+                    cut = i;
+                    break;
+                }
+                Err(invalid) => {
+                    return Err(crate::incident_drafts::mysql_table_too_large(
+                        &ctx.source_id,
+                        db,
+                        table,
+                        &invalid,
+                        at,
+                    ));
+                }
+            }
+        }
+        tables.split_off(cut)
+    };
+    if !deferred.is_empty() {
+        metrics::counter!(
+            "deltaforge_mysql_activation_window_deferred_total",
+            "source" => ctx.source_id.clone(),
+        )
+        .increment(deferred.len() as u64);
+    }
     // A table gone before the capture has no shape: nothing to decide.
     let (tables, gone): (Vec<_>, Vec<_>) = tables
         .into_iter()
@@ -1157,7 +1224,6 @@ async fn admit_batch(
             Governs::Refused(Covers::UntilStatement(d)),
         ));
     }
-    let scope = ctx.registry_scope.current()?;
     let keys: Vec<_> = tables
         .iter()
         .map(|((db, table), _, _)| scope.key(db, table))
@@ -1302,6 +1368,8 @@ async fn admit_batch(
         let mut reg_entry: Vec<Option<(usize, usize)>> = vec![None; regs.len()];
         let mut outcomes: Vec<(&'static str, Covers)> =
             Vec::with_capacity(tables.len());
+        // Each table's ops, to name the table of an item the store refuses.
+        let mut op_table: Vec<usize> = Vec::new();
         for (i, (((db, table), at, report), key)) in
             tables.iter().zip(&keys).enumerate()
         {
@@ -1372,11 +1440,13 @@ async fn admit_batch(
                     });
                     admitted.push(Some((op, proposed, augmented)));
                     outcomes.push(("proven", Covers::Transaction));
+                    op_table.resize(batch.ops.len(), i);
                 }
                 Err(why) => {
                     info!(source_id = %ctx.source_id, %db, %table, why, "no lazy baseline");
                     admitted.push(None);
                     outcomes.push(("not_decisive", Covers::Transaction));
+                    op_table.resize(batch.ops.len(), i);
                 }
             }
         }
@@ -1395,6 +1465,24 @@ async fn admit_batch(
                     Ok(c) => c,
                     Err(e) => {
                         discard(ctx);
+                        // An item over the store's limit: the table it
+                        // belongs to, classified.
+                        if let Some(too) = e.chain().find_map(|c| {
+                            c.downcast_ref::<storage::StateItemTooLarge>()
+                        }) && let Some(i) =
+                            refused_table(&batch, &op_table, &too.key_digest)
+                        {
+                            let ((db, table), at, _) = &tables[i];
+                            return Err(
+                                crate::incident_drafts::state_item_too_large(
+                                    &ctx.source_id,
+                                    db,
+                                    table,
+                                    too,
+                                    at,
+                                ),
+                            );
+                        }
                         return Err(SourceError::Other(e.context(
                             "commit the activation window's admissions",
                         )));
@@ -1470,8 +1558,33 @@ async fn admit_batch(
                 why,
             );
         }
+        for ((db, table), at, _) in &deferred {
+            trace_proof(&tag, db, table, None, None, lctn, "deferred");
+            governs.push((
+                (db.clone(), table.clone()),
+                at.clone(),
+                Governs::Deferred,
+            ));
+        }
         return Ok((stats, governs));
     }
+}
+
+/// The table (index into the window's decided tables) whose op writes the
+/// item with `key_digest`.
+fn refused_table(
+    batch: &storage::AtomicBatch,
+    op_table: &[usize],
+    key_digest: &str,
+) -> Option<usize> {
+    batch.ops.iter().zip(op_table).find_map(|(op, i)| {
+        let (storage::BatchOp::LogAppendIfAbsent { ns, key, .. }
+        | storage::BatchOp::KvPut { ns, key, .. }) = op
+        else {
+            return None;
+        };
+        (storage::state_key_digest(ns, key) == key_digest).then_some(*i)
+    })
 }
 
 /// How a window's atomic batch went: the conflicts that made it decide

@@ -102,11 +102,20 @@ pub enum ReasonCode {
     /// their schema capture (a DDL holds a lock) within its attempts: no
     /// event of the window was delivered.
     MysqlCaptureContention,
+    /// A new state item exceeds the store's item limit: the source stopped
+    /// before writing anything of the batch it belongs to.
+    StateItemTooLarge,
+    /// A MySQL table's state, from capture through commit, exceeds the
+    /// per-table limit: no activation window can take it.
+    MysqlTableStateTooLarge,
+    /// A MySQL table's registry needs more reads than one plan allows (for
+    /// example thousands of lineages): no activation window can take it.
+    MysqlTableRegistryTooLarge,
 }
 
 impl ReasonCode {
     /// Every reason (bounded metric label values).
-    pub const ALL: [ReasonCode; 25] = [
+    pub const ALL: [ReasonCode; 28] = [
         Self::PgDifferentCluster,
         Self::PgContinuityUnproven,
         Self::PgFailoverSlotUnavailable,
@@ -132,6 +141,9 @@ impl ReasonCode {
         Self::SinkDestinationConflict,
         Self::PgMessageTooLarge,
         Self::MysqlCaptureContention,
+        Self::StateItemTooLarge,
+        Self::MysqlTableStateTooLarge,
+        Self::MysqlTableRegistryTooLarge,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -165,6 +177,11 @@ impl ReasonCode {
             Self::SinkDestinationConflict => "sink_destination_conflict",
             Self::PgMessageTooLarge => "pg_message_too_large",
             Self::MysqlCaptureContention => "mysql_capture_contention",
+            Self::StateItemTooLarge => "state_item_too_large",
+            Self::MysqlTableStateTooLarge => "mysql_table_state_too_large",
+            Self::MysqlTableRegistryTooLarge => {
+                "mysql_table_registry_too_large"
+            }
         }
     }
 }
@@ -454,6 +471,14 @@ pub enum EvidenceKey {
     MessageBytes,
     /// A configured message size limit, in bytes.
     MessageLimit,
+    /// A state item's or a table's state size, in bytes.
+    StateBytes,
+    /// The limit that size exceeds, in bytes.
+    StateLimit,
+    /// A SHA-256 of a state item's namespace and key.
+    KeyDigest,
+    /// The reads one table's registration needs.
+    ReadItems,
 }
 
 impl EvidenceKey {
@@ -504,6 +529,10 @@ impl EvidenceKey {
             Self::Owner => "owner",
             Self::MessageBytes => "message_bytes",
             Self::MessageLimit => "message_limit",
+            Self::StateBytes => "state_bytes",
+            Self::StateLimit => "state_limit",
+            Self::KeyDigest => "key_digest",
+            Self::ReadItems => "read_items",
         }
     }
 }
@@ -859,6 +888,33 @@ pub fn explain(
             ev.show(K::Attempts),
             ev.show(K::ReasonClass),
             ev.show(K::CheckpointPosition),
+        ),
+        ReasonCode::StateItemTooLarge => format!(
+            "{component} refused to write a state item of {} bytes for table \
+             {}, over the store's {}-byte item limit (key digest {}). It \
+             stopped before writing anything of that table's batch; the \
+             checkpoint stays before its rows.",
+            ev.show(K::StateBytes),
+            ev.show(K::Table),
+            ev.show(K::StateLimit),
+            ev.show(K::KeyDigest),
+        ),
+        ReasonCode::MysqlTableStateTooLarge => format!(
+            "{component} cannot admit table {}: its state from capture \
+             through commit is {} bytes, over the {}-byte per-table limit. \
+             It stopped before the table's first row; the checkpoint stays \
+             before it.",
+            ev.show(K::Table),
+            ev.show(K::StateBytes),
+            ev.show(K::StateLimit),
+        ),
+        ReasonCode::MysqlTableRegistryTooLarge => format!(
+            "{component} cannot admit table {}: its registration needs {} \
+             reads, over one plan's limit of {}. It stopped before the \
+             table's first row; the checkpoint stays before it.",
+            ev.show(K::Table),
+            ev.show(K::ReadItems),
+            ev.show(K::StateLimit),
         ),
         ReasonCode::SchemaDriftBlocked => format!(
             "{component} stopped on a schema change of table {} ({}) under \

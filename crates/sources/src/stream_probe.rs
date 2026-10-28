@@ -189,3 +189,19 @@ pub(crate) async fn after(point: Point) {
 pub(crate) fn take_disconnect() -> bool {
     DISCONNECT.swap(false, Ordering::SeqCst)
 }
+
+/// Test-set activation-window caps: (plan bytes, plan read items, per-table
+/// bytes), in place of the fixed ones.
+static WINDOW_CAPS: Mutex<Option<(u64, u64, u64)>> = Mutex::new(None);
+
+/// Set (or with `None` clear) the activation window's caps. Test seam:
+/// windows of a few small tables then exercise the prefix and the
+/// per-table limits.
+pub fn set_window_caps(caps: Option<(u64, u64, u64)>) {
+    *WINDOW_CAPS.lock().expect("window caps") = caps;
+}
+
+/// The caps a test set, if any.
+pub(crate) fn window_caps() -> Option<(u64, u64, u64)> {
+    *WINDOW_CAPS.lock().expect("window caps")
+}

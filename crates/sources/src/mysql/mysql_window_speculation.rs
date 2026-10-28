@@ -62,6 +62,10 @@ pub(crate) enum Governs {
     /// Refused, or not captured: the rows it covers go on without a lazy
     /// baseline, never captured on their own.
     Refused(Covers),
+    /// Cut from the window's prefix by its limits (`mysql_window_budget`):
+    /// nothing of it was decided or recorded, so it covers none of its rows;
+    /// they go back to the stream for a later window.
+    Deferred,
 }
 
 /// Whether `statement` precedes the transaction starting at `boundary`
@@ -107,6 +111,7 @@ pub(crate) fn covers_row(
         Governs::Refused(Covers::UntilStatement(d)) => {
             statement_before(d, row) == Some(false)
         }
+        Governs::Deferred => false,
     }
 }
 
@@ -630,6 +635,29 @@ mod tests {
         );
         assert_eq!(first_uncovered(&rows, &decisions), Some(6));
         assert_eq!(first_uncovered(&rows[..6], &decisions), None);
+    }
+
+    /// A table cut from the window's prefix (deferred) covers none of its
+    /// rows: the queue is cut at its first one, before any later row
+    /// (admitted tables' included), and a reserved row of it is uncovered.
+    #[test]
+    fn a_deferred_table_cuts_at_its_first_row() {
+        let a = cp(&format!("{U}:1-3"));
+        let later = cp(&format!("{U}:1-4"));
+        let rows = vec![
+            (0, key("adm"), a.clone()),
+            (1, key("adm"), a.clone()),
+            (2, key("def"), a.clone()),
+            (3, key("adm"), later.clone()),
+            (4, key("def"), later.clone()),
+        ];
+        let decisions = HashMap::from([
+            (key("adm"), (a.clone(), Governs::Admitted)),
+            (key("def"), (a.clone(), Governs::Deferred)),
+        ]);
+        assert_eq!(first_uncovered(&rows, &decisions), Some(2));
+        assert!(!covers_row(&Governs::Deferred, &a, &a));
+        assert!(!reserved_rows_covered(&[(key("def"), later)], &decisions));
     }
 
     #[test]

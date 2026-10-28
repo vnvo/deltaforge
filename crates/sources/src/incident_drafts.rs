@@ -149,6 +149,120 @@ pub(crate) fn mysql_capture_contention(
     )
 }
 
+/// The checkpoint position a window stays before, as evidence text.
+fn window_position(at: &crate::mysql::MySqlCheckpoint) -> String {
+    match &at.gtid_set {
+        Some(g) => g.clone(),
+        None => format!("{}:{}", at.file, at.pos),
+    }
+}
+
+/// A table no activation window can take (`mysql_window_budget::Invalid`):
+/// its state exceeds the per-table limit, or its registration needs more
+/// reads than a plan allows. Nothing of the window was written or
+/// dispatched; the checkpoint stays before it. An operator must act.
+pub(crate) fn mysql_table_too_large(
+    source_id: &str,
+    db: &str,
+    table: &str,
+    invalid: &crate::mysql::WindowInvalid,
+    at: &crate::mysql::MySqlCheckpoint,
+) -> SourceError {
+    use crate::mysql::WindowInvalid;
+    let name = format!("{db}.{table}");
+    let position = window_position(at);
+    let (code, details) = match invalid {
+        WindowInvalid::StateTooLarge { bytes, limit } => (
+            ReasonCode::MysqlTableStateTooLarge,
+            format!(
+                "table {name}'s state is {bytes} bytes, over the {limit}-byte \
+                 per-table limit"
+            ),
+        ),
+        WindowInvalid::RegistryTooLarge { read_items, limit } => (
+            ReasonCode::MysqlTableRegistryTooLarge,
+            format!(
+                "table {name}'s registration needs {read_items} reads, over \
+                 one plan's {limit}"
+            ),
+        ),
+    };
+    let draft = IncidentDraft::new(
+        code,
+        Component::Source {
+            id: source_id.to_string(),
+        },
+        Retryability::OperatorAction,
+        SafetyState::HaltedSafe,
+        CauseCode::SourceSchema,
+    )
+    .discriminate("table", &name)
+    .with_evidence(|e| {
+        e.text(K::SourceId, source_id)
+            .text(K::Table, &name)
+            .text(K::CheckpointPosition, &position);
+        match invalid {
+            WindowInvalid::StateTooLarge { bytes, limit } => {
+                e.count(K::StateBytes, *bytes).count(K::StateLimit, *limit);
+            }
+            WindowInvalid::RegistryTooLarge { read_items, limit } => {
+                e.count(K::ReadItems, *read_items)
+                    .count(K::StateLimit, *limit);
+            }
+        }
+    })
+    .with_actions(&[ActionCode::InspectLogs]);
+    SourceError::incident(
+        draft,
+        SourceError::Schema {
+            details: format!(
+                "activation window: {details}; nothing of the window was \
+                 admitted or dispatched and the checkpoint stays before it"
+            )
+            .into(),
+        },
+    )
+}
+
+/// A new state item of `db.table` over the store's item limit
+/// (`storage::StateItemTooLarge`): refused before anything of its batch was
+/// written. The checkpoint stays before the table's rows.
+pub(crate) fn state_item_too_large(
+    source_id: &str,
+    db: &str,
+    table: &str,
+    too: &storage::StateItemTooLarge,
+    at: &crate::mysql::MySqlCheckpoint,
+) -> SourceError {
+    let name = format!("{db}.{table}");
+    let position = window_position(at);
+    let draft = IncidentDraft::new(
+        ReasonCode::StateItemTooLarge,
+        Component::Source {
+            id: source_id.to_string(),
+        },
+        Retryability::OperatorAction,
+        SafetyState::HaltedSafe,
+        CauseCode::SourceSchema,
+    )
+    .discriminate("key_digest", &too.key_digest)
+    .with_evidence(|e| {
+        e.text(K::SourceId, source_id)
+            .text(K::Table, &name)
+            .count(K::StateBytes, too.size as u64)
+            .count(K::StateLimit, storage::MAX_STATE_ITEM_BYTES as u64)
+            .text(K::KeyDigest, &too.key_digest)
+            .text(K::CheckpointPosition, &position);
+    })
+    .with_actions(&[ActionCode::InspectLogs]);
+    SourceError::incident(
+        draft,
+        SourceError::Schema {
+            details: format!("table {name}: {too}").into(),
+        },
+    )
+}
+
 /// A replication message over the source's configured limit. The stream is
 /// abandoned without a reconnect: a reconnect with the same limit would meet
 /// the same message again. Evidence is the sizes and the source only, never
