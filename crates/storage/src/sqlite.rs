@@ -489,29 +489,47 @@ impl StorageBackend for SqliteStorageBackend {
                 }
             }
             let mut seqs: Vec<Option<u64>> = vec![None; batch.ops.len()];
+            let canonical = crate::canonical_log_ops(&batch.ops)?;
             for (i, op) in batch.ops.iter().enumerate() {
                 if fault == Some(BatchFault::AfterWrites(i)) {
                     anyhow::bail!("injected failure after {i} staged writes");
                 }
                 match op {
-                    BatchOp::LogAppendIfAbsent {
-                        ns,
-                        key,
-                        capture_id,
-                        value,
-                    } => {
-                        let exists: Option<i64> = tx
+                    BatchOp::LogAppendIfAbsent { .. }
+                    | BatchOp::LogAppendIdempotent { .. } => {
+                        let (ns, key, capture_id, value, idempotent) =
+                            op.log_write().expect("a log write");
+                        // A collapsed repeat: its first position's sequence.
+                        if canonical[i] != i {
+                            seqs[i] = seqs[canonical[i]];
+                            continue;
+                        }
+                        let stored: Option<(i64, Vec<u8>)> = tx
                             .prepare_cached(
-                                "SELECT seq FROM df_log WHERE ns=?1 AND key=?2 AND capture_id=?3",
+                                "SELECT seq, val FROM df_log WHERE ns=?1 AND key=?2 AND capture_id=?3",
                             )?
-                            .query_row(params![ns, key, capture_id], |r| r.get(0))
+                            .query_row(params![ns, key, capture_id], |r| {
+                                Ok((r.get(0)?, r.get(1)?))
+                            })
                             .optional()?;
-                        if exists.is_some() {
-                            return Ok(BatchOutcome::Conflict {
-                                why: format!(
-                                    "{capture_id} already exists in {key}"
-                                ),
-                            });
+                        if let Some((seq, stored)) = stored {
+                            if !idempotent {
+                                return Ok(BatchOutcome::Conflict {
+                                    why: format!(
+                                        "{capture_id} already exists in {key}"
+                                    ),
+                                });
+                            }
+                            if stored != value {
+                                return Err(
+                                    crate::LogError::CaptureIdentityConflict {
+                                        capture_id: capture_id.to_string(),
+                                    }
+                                    .into(),
+                                );
+                            }
+                            seqs[i] = Some(seq as u64);
+                            continue;
                         }
                         ensure_log_meta(&tx, ns, key)?;
                         tx.prepare_cached(
