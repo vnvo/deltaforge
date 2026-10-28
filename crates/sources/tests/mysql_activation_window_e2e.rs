@@ -467,9 +467,11 @@ async fn a_window_over_its_caps_admits_its_prefix_and_defers_the_rest() {
     let store = Store::memory();
     let r = run_on(port, id, MysqlProofCfg::default(), &store).await;
     r.handle.pause();
+    // First touch is not name order.
+    let touch = [3, 0, 4, 1, 2];
     let mut txn = String::from("BEGIN;");
     for round in 1..=2 {
-        for i in 0..5 {
+        for i in touch {
             txn.push_str(&format!(
                 "INSERT INTO t{i:04} (id, v) VALUES ({round}, {i});"
             ));
@@ -487,11 +489,11 @@ async fn a_window_over_its_caps_admits_its_prefix_and_defers_the_rest() {
     sleep(Duration::from_secs(1)).await;
     let order = r.order.lock().unwrap().clone();
     let want: Vec<(String, i64)> = (1..=2)
-        .flat_map(|round| (0..5).map(move |i| (format!("t{i:04}"), round)))
+        .flat_map(|round| touch.map(|i| (format!("t{i:04}"), round)))
         .collect();
     assert_eq!(order, want, "every row once, in binary-log order");
     let mut seqs = Vec::new();
-    for i in 0..5 {
+    for i in touch {
         let t = format!("t{i:04}");
         let recs = store.activation(port, id, &t).await;
         assert_eq!(recs.len(), 1, "{t}: {recs:?}");
@@ -499,7 +501,7 @@ async fn a_window_over_its_caps_admits_its_prefix_and_defers_the_rest() {
     }
     assert!(
         seqs.windows(2).all(|w| w[0] < w[1]),
-        "commit order: {seqs:?}"
+        "commit order is first-touch order: {seqs:?}"
     );
     r.stop().await;
     container.rm().await.ok();
@@ -514,7 +516,7 @@ async fn a_window_over_its_caps_admits_its_prefix_and_defers_the_rest() {
         .map(|p| p["table"].as_str().unwrap_or_default().to_string())
         .collect();
     assert!(
-        ["t0002", "t0003", "t0004"]
+        ["t0004", "t0001", "t0002"]
             .iter()
             .all(|t| deferred.iter().any(|d| d == t)),
         "deferred by the first window: {deferred:?}"
