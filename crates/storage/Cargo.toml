@@ -41,6 +41,9 @@ deltaforge-core = { path = "../deltaforge-core", features = ["test-fixtures"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 # Reuse the shared SnapshotStateStore contract suite in adapter tests.
 checkpoints = { path = "../checkpoints", features = ["test-support"] }
+# The statement-count lane runs its own PostgreSQL (pg_stat_statements).
+testcontainers = "0.25"
+gate-ownership = { path = "../gate-ownership" }
 
 [lints]
 workspace = true
