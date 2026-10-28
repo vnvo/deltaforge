@@ -2387,7 +2387,7 @@ pub(crate) async fn capture_proven(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::mysql_ddl_attribution::TableName;
     use super::*;
 
@@ -3333,7 +3333,7 @@ mod tests {
     }
 
     /// Live MySQL 8.4 (Docker): one GTID-mode and one file/position server.
-    mod live {
+    pub(crate) mod live {
         use super::*;
         use crate::mysql::mysql_schema_loader::read_hook;
         use gate_ownership::GateOwned;
@@ -3390,7 +3390,7 @@ mod tests {
             cell.get_or_init(|| start(gtid)).await.1
         }
 
-        async fn server(gtid: bool) -> String {
+        pub(crate) async fn server(gtid: bool) -> String {
             dsn_of(port(gtid).await)
         }
 
@@ -3423,7 +3423,7 @@ mod tests {
             (dsn_of(port), opened)
         }
 
-        async fn sql(dsn: &str, stmts: &[&str]) {
+        pub(crate) async fn sql(dsn: &str, stmts: &[&str]) {
             let mut c = mysql_async::Conn::from_url(dsn).await.unwrap();
             for s in stmts {
                 c.query_drop(*s)
@@ -3432,7 +3432,7 @@ mod tests {
             }
         }
 
-        async fn uuid(dsn: &str) -> String {
+        pub(crate) async fn uuid(dsn: &str) -> String {
             let mut c = mysql_async::Conn::from_url(dsn).await.unwrap();
             c.query_first("SELECT @@GLOBAL.server_uuid")
                 .await
@@ -3440,7 +3440,7 @@ mod tests {
                 .unwrap()
         }
 
-        async fn position(dsn: &str) -> MySqlCheckpoint {
+        pub(crate) async fn position(dsn: &str) -> MySqlCheckpoint {
             let mut c = mysql_async::Conn::from_url(dsn).await.unwrap();
             let mode: Option<String> =
                 c.query_first("SELECT @@GLOBAL.gtid_mode").await.unwrap();

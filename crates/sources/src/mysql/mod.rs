@@ -636,16 +636,15 @@ impl MySqlSource {
             let page = discovery.accept(rows)?;
             crate::snapshot_probe::after_discovery_page().await;
             if let Some(d) = drift {
-                for (db, table) in &page {
-                    mysql_failover_drift::check(
-                        &d.env,
-                        d.anchor,
-                        db,
-                        table,
-                        mysql_failover_drift::FirstEvent::Snapshot,
-                    )
-                    .await?;
-                }
+                // Batched: one capture and scan of (F, S] per chunk, one
+                // atomic commit of its outcomes.
+                mysql_failover_drift::check_snapshot_tables(
+                    &d.env,
+                    d.anchor,
+                    &page,
+                    self.proofs.capture_lock_wait_secs,
+                )
+                .await?;
             }
             loader.warm_from_registry(&page).await?;
             for (db, table) in page {

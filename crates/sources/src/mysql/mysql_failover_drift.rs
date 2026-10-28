@@ -348,6 +348,394 @@ async fn completed(
     Ok(true)
 }
 
+/// A marker's bytes (deterministic: no timestamp).
+fn marker_bytes(
+    anchor: &FailoverAnchor,
+    previous: Option<SchemaRef>,
+    current: Option<SchemaRef>,
+    outcome: Outcome,
+) -> SourceResult<Vec<u8>> {
+    let (previous_schema_version, previous_schema_hash) = previous.unzip();
+    let (current_schema_version, current_schema_hash) = current.unzip();
+    serde_json::to_vec(&DriftMarker {
+        format_version: FORMAT_VERSION,
+        previous_lineage: anchor.previous_lineage.clone(),
+        current_lineage: anchor.current_lineage.clone(),
+        transition: anchor.transition.clone(),
+        previous_schema_version,
+        previous_schema_hash,
+        current_schema_version,
+        current_schema_hash,
+        outcome,
+    })
+    .map_err(|e| SourceError::Other(e.into()))
+}
+
+/// A marker as a batch op: appended idempotently under its deterministic
+/// identity, so a re-applied or resolved batch holds it once.
+pub(crate) fn marker_op(
+    key: &SchemaKey,
+    anchor: &FailoverAnchor,
+    previous: Option<SchemaRef>,
+    current: Option<SchemaRef>,
+    outcome: Outcome,
+) -> SourceResult<storage::BatchOp> {
+    Ok(storage::BatchOp::LogAppendIdempotent {
+        ns: MARKER_NS.into(),
+        key: key.backend_key(),
+        capture_id: marker_id(anchor),
+        value: marker_bytes(anchor, previous, current, outcome)?,
+    })
+}
+
+/// A drift registration as a request: the shape at F, with F as its
+/// checkpoint (what one registration at a time recorded).
+pub(crate) fn drift_request(
+    key: &SchemaKey,
+    anchor: &FailoverAnchor,
+    shape: &MySqlTableSchema,
+) -> SourceResult<storage::adapters::RegistrationRequest> {
+    use schema_registry::SourceSchema as _;
+    Ok(storage::adapters::RegistrationRequest {
+        key: key.clone(),
+        hash: shape.fingerprint().to_string(),
+        schema_json: serde_json::to_value(shape)
+            .map_err(|e| SourceError::Other(e.into()))?,
+        checkpoint: Some(
+            serde_json::to_vec(&anchor.position)
+                .map_err(|e| SourceError::Other(e.into()))?,
+        ),
+    })
+}
+
+/// Commit drift verdicts atomically: every registration (the shape at F,
+/// checkpoint F) and every marker, or none. A completed verdict writes
+/// nothing. A conflict decides the registrations again (bounded).
+pub(crate) async fn commit_verdicts(
+    env: &DriftEnv<'_>,
+    anchor: &FailoverAnchor,
+    verdicts: Vec<DriftVerdict>,
+) -> SourceResult<()> {
+    use storage::adapters::RegistrationPlanning;
+    use storage::{AtomicBatch, CommitResult, commit_atomic_counted};
+    let marks: Vec<_> = verdicts
+        .into_iter()
+        .filter_map(|v| match v {
+            DriftVerdict::Completed => None,
+            DriftVerdict::Marker {
+                key,
+                previous,
+                register,
+                outcome,
+            } => Some((key, previous, register, outcome)),
+        })
+        .collect();
+    if marks.is_empty() {
+        return Ok(());
+    }
+    let registry = env.loader.registry();
+    if !std::sync::Arc::ptr_eq(registry.backend(), env.backend) {
+        return Err(SourceError::Other(anyhow::anyhow!(
+            "failover drift needs the schema registry and its markers in one \
+             state store"
+        )));
+    }
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let mut reqs = Vec::new();
+        let mut req_of = Vec::with_capacity(marks.len());
+        for (key, _, register, _) in &marks {
+            req_of.push(match register {
+                Some(shape) => {
+                    reqs.push(drift_request(key, anchor, shape)?);
+                    Some(reqs.len() - 1)
+                }
+                None => None,
+            });
+        }
+        let (pre, regs) = match registry
+            .plan_registrations(&reqs, chrono::Utc::now())
+            .await
+            .map_err(|e| {
+                SourceError::Other(e.context("plan the drift registrations"))
+            })? {
+            RegistrationPlanning::Planned {
+                preconditions,
+                registrations,
+            } => (preconditions, registrations),
+            RegistrationPlanning::NeedsRepair(broken) => {
+                for k in &broken {
+                    registry.repair_key(k).await.map_err(SourceError::Other)?;
+                }
+                if attempt > DRIFT_BATCH_RETRIES {
+                    return Err(SourceError::Other(anyhow::anyhow!(
+                        "the drift registrations still need repair after \
+                         {attempt} attempts"
+                    )));
+                }
+                continue;
+            }
+        };
+        let mut batch = AtomicBatch {
+            preconditions: pre,
+            ops: Vec::new(),
+        };
+        let mut entries = Vec::with_capacity(regs.len());
+        for reg in &regs {
+            let base = batch.push_group(reg.ops.clone());
+            entries.push(reg.entry_op.map(|e| base + e));
+        }
+        for ((key, previous, _, outcome), r) in marks.iter().zip(&req_of) {
+            let current = r.map(|r| (regs[r].version, regs[r].hash.clone()));
+            batch.ops.push(marker_op(
+                key,
+                anchor,
+                previous.clone(),
+                current,
+                *outcome,
+            )?);
+        }
+        let mut applies = 0;
+        match commit_atomic_counted(
+            env.backend.as_ref(),
+            &batch,
+            DRIFT_BATCH_RETRIES,
+            &mut applies,
+        )
+        .await
+        .map_err(|e| {
+            SourceError::Other(e.context("commit the failover drift outcomes"))
+        })? {
+            CommitResult::Committed(seqs) => {
+                for (reg, entry) in regs.iter().zip(&entries) {
+                    if let Some(op) = entry {
+                        registry.admit_committed(
+                            reg,
+                            seqs[*op].expect("a committed log write"),
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            CommitResult::Conflict(why) => {
+                if attempt > DRIFT_BATCH_RETRIES {
+                    return Err(SourceError::Other(anyhow::anyhow!(
+                        "the failover drift outcomes conflicted {attempt} \
+                         times (last: {why}); nothing was written"
+                    )));
+                }
+                warn!(
+                    source_id = env.source_id,
+                    attempt,
+                    why,
+                    "failover drift: the batch conflicted; planning again"
+                );
+            }
+        }
+    }
+}
+
+/// Conflicting re-plans, or retries of a batch whose outcome a storage
+/// error left unknown, before a drift commit fails closed.
+const DRIFT_BATCH_RETRIES: usize = 3;
+
+/// The snapshot's drift check of a discovery page (first event: the
+/// snapshot), batched: each table's marker and predecessor read, then the
+/// tables needing their shape at F in chunks of at most `MAX_BATCH_TABLES`
+/// in discovery order, each with one capture (its own budget may cut it,
+/// the rest leading the next chunk), one scan of (F, S] and one atomic
+/// commit of its verdicts. A halt stops before anything of its chunk is
+/// written; the decisions are [`assess`]'s, one table at a time.
+pub(crate) async fn check_snapshot_tables(
+    env: &DriftEnv<'_>,
+    anchor: &FailoverAnchor,
+    tables: &[(String, String)],
+    lock_wait_secs: u32,
+) -> SourceResult<()> {
+    use super::mysql_binlog_scan::{BatchCaptureError, capture_batch};
+    let mut decided = Vec::new();
+    let mut pending = Vec::new();
+    for (db, table) in tables {
+        match pre_assess(env, anchor, db, table).await? {
+            Pre::Done(v) => decided.push(v),
+            Pre::Shape { key, previous } => {
+                pending.push((db.clone(), table.clone(), key, previous))
+            }
+        }
+    }
+    // Decided without a shape: committed with the first chunk (alone when
+    // no table needs its shape), so a halt there leaves nothing written.
+    if pending.is_empty() {
+        return commit_verdicts(env, anchor, decided).await;
+    }
+    let from = proof_start(anchor, &FirstEvent::Snapshot);
+    let lctn = env.lower_case_table_names;
+    let tag = ScanTag {
+        source_id: env.source_id,
+        kind: ProofKind::FailoverDrift,
+    };
+    let mut rest = &pending[..];
+    while !rest.is_empty() {
+        let chunk =
+            &rest[..rest.len().min(super::mysql_binlog_scan::MAX_BATCH_TABLES)];
+        let names: Vec<(String, String)> = chunk
+            .iter()
+            .map(|(d, t, ..)| (d.clone(), t.clone()))
+            .collect();
+        // Each table's shape at F, from the chunk's capture and scan.
+        let mut shapes: Vec<Option<MySqlTableSchema>> = vec![None; chunk.len()];
+        let mut taken = chunk.len();
+        if let Some(from) = &from {
+            let cap = match capture_batch(
+                env.capture,
+                env.server_uuid,
+                &anchor.current_lineage,
+                &names,
+                lock_wait_secs,
+                None,
+            )
+            .await?
+            {
+                Ok(cap) => Some(cap),
+                Err(BatchCaptureError::Failed(ProofError::OtherServer(
+                    found,
+                ))) => {
+                    return Err(SourceError::Lineage {
+                        details: format!(
+                            "a failover drift capture reached another server \
+                             ({found}), expected {}",
+                            env.server_uuid
+                        )
+                        .into(),
+                    });
+                }
+                Err(e) => {
+                    warn!(source_id = env.source_id, error = ?e, tables = chunk.len(), "failover drift: no capture");
+                    for (db, table, ..) in chunk {
+                        trace_proof(
+                            &tag,
+                            db,
+                            table,
+                            None,
+                            None,
+                            lctn,
+                            "no_capture",
+                        );
+                    }
+                    None
+                }
+            };
+            if let Some(cap) = cap {
+                // Past the capture's budget: the next chunk's.
+                taken = chunk
+                    .iter()
+                    .position(|(d, t, ..)| {
+                        cap.deferred.contains(&(d.clone(), t.clone()))
+                    })
+                    .unwrap_or(chunk.len())
+                    .max(1);
+                let scanned = match env.proofs {
+                    Some(proofs) => {
+                        super::mysql_proof_scanner::shared_interval(
+                            proofs,
+                            env.capture.dsn().current().expose(),
+                            env.source_id,
+                            env.server_uuid,
+                            &anchor.current_lineage,
+                            from,
+                            &cap.position,
+                            None,
+                            None,
+                            &tag,
+                        )
+                        .await
+                    }
+                    None => {
+                        scan_interval(
+                            env.capture.dsn().current().expose(),
+                            super::mysql_helpers::derive_server_id(&format!(
+                                "{}/failover-drift",
+                                env.source_id
+                            )),
+                            env.server_uuid,
+                            &anchor.current_lineage,
+                            from,
+                            &cap.position,
+                            &ScanLimits::default(),
+                            &tag,
+                        )
+                        .await
+                    }
+                };
+                match scanned {
+                    Ok(report) => {
+                        for (i, (db, table, ..)) in
+                            chunk[..taken].iter().enumerate()
+                        {
+                            shapes[i] = match cap.table(db, table) {
+                                Some(tcap) => {
+                                    observe_capture(&tag, &tcap);
+                                    shape_from(
+                                        env.source_id,
+                                        lctn,
+                                        db,
+                                        table,
+                                        from,
+                                        &tcap,
+                                        &report,
+                                    )
+                                }
+                                None => {
+                                    trace_proof(
+                                        &tag,
+                                        db,
+                                        table,
+                                        None,
+                                        None,
+                                        lctn,
+                                        "no_capture",
+                                    );
+                                    None
+                                }
+                            };
+                        }
+                    }
+                    Err(ProofError::OtherServer(found)) => {
+                        return Err(SourceError::Lineage {
+                            details: format!(
+                                "a failover drift scan reached another server \
+                                 ({found}), expected {}",
+                                env.server_uuid
+                            )
+                            .into(),
+                        });
+                    }
+                    Err(e) => {
+                        warn!(source_id = env.source_id, error = ?e, "failover drift: the interval scan failed");
+                    }
+                }
+            }
+        }
+        let mut verdicts = std::mem::take(&mut decided);
+        for ((db, table, key, previous), shape) in
+            chunk[..taken].iter().zip(shapes)
+        {
+            verdicts.push(finish_assess(
+                env,
+                db,
+                table,
+                key.clone(),
+                previous.clone(),
+                shape,
+            )?);
+        }
+        commit_verdicts(env, anchor, verdicts).await?;
+        rest = &rest[taken..];
+    }
+    Ok(())
+}
+
 async fn write_marker(
     backend: &ArcStorageBackend,
     key: &SchemaKey,
@@ -407,26 +795,27 @@ fn halt_error(
     )
 }
 
-/// The table's shape proven at F, or `None` (unprovable).
-async fn shape_at_failover(
-    env: &DriftEnv<'_>,
+/// Where the interval proving a table's shape at the failover position F
+/// starts, for its first event (its lineage the current one): F for a
+/// snapshot, the rows' transaction start for rows. `None` when no proof is
+/// possible: a DDL first event, F after the rows, or a record of the table
+/// or an applicable barrier in (F, E] (anything incomparable included).
+pub(crate) fn proof_start(
     anchor: &FailoverAnchor,
-    db: &str,
-    table: &str,
     event: &FirstEvent<'_>,
-) -> SourceResult<Option<MySqlTableSchema>> {
+) -> Option<MySqlCheckpoint> {
     let Some(f_cp) = anchor.position.clone() else {
-        return Ok(None);
+        return None;
     };
     let Some(f) = mysql_checkpoint_position(
         &f_cp.file,
         f_cp.pos,
         f_cp.gtid_set.as_deref(),
     ) else {
-        return Ok(None);
+        return None;
     };
     let from = match event {
-        FirstEvent::Ddl => return Ok(None),
+        FirstEvent::Ddl => return None,
         FirstEvent::Snapshot => f_cp.clone(),
         FirstEvent::Rows {
             at,
@@ -437,7 +826,7 @@ async fn shape_at_failover(
                 order_positions(&f, at),
                 CheckpointOrder::Before | CheckpointOrder::Equal
             ) {
-                return Ok(None);
+                return None;
             }
             // Nothing of this table, and no applicable barrier, between F
             // and the rows; anything incomparable is unprovable.
@@ -451,8 +840,8 @@ async fn shape_at_failover(
                     (
                         CheckpointOrder::Before,
                         CheckpointOrder::Before | CheckpointOrder::Equal,
-                    ) => return Ok(None),
-                    _ => return Ok(None),
+                    ) => return None,
+                    _ => return None,
                 }
             }
             (*at_cp).clone()
@@ -460,6 +849,20 @@ async fn shape_at_failover(
     };
     let mut from = from;
     from.lineage = Some(anchor.current_lineage.clone());
+    Some(from)
+}
+
+/// The table's shape proven at F, or `None` (unprovable).
+async fn shape_at_failover(
+    env: &DriftEnv<'_>,
+    anchor: &FailoverAnchor,
+    db: &str,
+    table: &str,
+    event: &FirstEvent<'_>,
+) -> SourceResult<Option<MySqlTableSchema>> {
+    let Some(from) = proof_start(anchor, event) else {
+        return Ok(None);
+    };
     let tag = ScanTag {
         source_id: env.source_id,
         kind: ProofKind::FailoverDrift,
@@ -570,25 +973,70 @@ async fn shape_at_failover(
             return Ok(None);
         }
     };
+    Ok(shape_from(
+        env.source_id,
+        lctn,
+        db,
+        table,
+        &from,
+        &cap,
+        &report,
+    ))
+}
+
+/// The shape a capture proves at F, from a scan of (`from`, the capture's
+/// end]: the capture inside the scanned interval and nothing in it
+/// affecting the table; `None` (traced) otherwise. The one decision of
+/// [`shape_at_failover`] and of the batched checks, whatever took the
+/// capture and the scan.
+pub(crate) fn shape_from(
+    source_id: &str,
+    lctn: u8,
+    db: &str,
+    table: &str,
+    from: &MySqlCheckpoint,
+    cap: &super::mysql_binlog_scan::Captured,
+    report: &super::mysql_binlog_scan::ScanReport,
+) -> Option<MySqlTableSchema> {
+    let tag = ScanTag {
+        source_id,
+        kind: ProofKind::FailoverDrift,
+    };
+    let covered = mysql_checkpoint_position(
+        &from.file,
+        from.pos,
+        from.gtid_set.as_deref(),
+    )
+    .zip(mysql_checkpoint_position(
+        &cap.position.file,
+        cap.position.pos,
+        cap.position.gtid_set.as_deref(),
+    ))
+    .is_some_and(|(f, end)| covers(cap, &f, &end));
+    if !covered {
+        warn!(source_id, %db, %table, "failover drift: the capture started before F");
+        trace_proof(&tag, db, table, Some(cap), None, lctn, "not_covered");
+        return None;
+    }
     if report
         .statements
         .iter()
-        .any(|st| affects(st, db, table, env.lower_case_table_names))
+        .any(|st| affects(st, db, table, lctn))
     {
-        info!(source_id = env.source_id, %db, %table, "failover drift: a DDL or barrier in the interval");
+        info!(source_id, %db, %table, "failover drift: a DDL or barrier in the interval");
         trace_proof(
             &tag,
             db,
             table,
-            Some(&cap),
-            Some(&report),
+            Some(cap),
+            Some(report),
             lctn,
             "relevant_ddl",
         );
-        return Ok(None);
+        return None;
     }
-    trace_proof(&tag, db, table, Some(&cap), Some(&report), lctn, "proven");
-    Ok(Some(cap.schema))
+    trace_proof(&tag, db, table, Some(cap), Some(report), lctn, "proven");
+    Some(cap.schema.clone())
 }
 
 /// Apply `on_schema_drift` to the table's first event under a lineage
@@ -627,6 +1075,35 @@ pub(crate) async fn assess(
     table: &str,
     event: FirstEvent<'_>,
 ) -> SourceResult<DriftVerdict> {
+    match pre_assess(env, anchor, db, table).await? {
+        Pre::Done(verdict) => Ok(verdict),
+        Pre::Shape { key, previous } => {
+            let shape =
+                shape_at_failover(env, anchor, db, table, &event).await?;
+            finish_assess(env, db, table, key, previous, shape)
+        }
+    }
+}
+
+/// What [`pre_assess`] concluded without the table's shape at F.
+pub(crate) enum Pre {
+    /// Decided: completed earlier, or a new table (no predecessor).
+    Done(DriftVerdict),
+    /// The predecessor's latest schema: the verdict needs the shape at F.
+    Shape {
+        key: SchemaKey,
+        previous: schema_registry::SchemaVersion,
+    },
+}
+
+/// [`assess`]'s reads before the shape at F: a completed marker, or the
+/// predecessor's latest (none: a new table; unreadable: an error).
+pub(crate) async fn pre_assess(
+    env: &DriftEnv<'_>,
+    anchor: &FailoverAnchor,
+    db: &str,
+    table: &str,
+) -> SourceResult<Pre> {
     let key = env.scope.key(db, table);
     let previous_key = SchemaKey::new(
         &key.tenant,
@@ -636,7 +1113,7 @@ pub(crate) async fn assess(
         table,
     );
     if completed(env, &key, &previous_key, anchor).await? {
-        return Ok(DriftVerdict::Completed);
+        return Ok(Pre::Done(DriftVerdict::Completed));
     }
     let previous = env
         .loader
@@ -648,12 +1125,12 @@ pub(crate) async fn assess(
         })?;
     let Some(previous) = previous else {
         info!(source_id = env.source_id, %db, %table, "failover drift: no predecessor history (a new table)");
-        return Ok(DriftVerdict::Marker {
+        return Ok(Pre::Done(DriftVerdict::Marker {
             key,
             previous: None,
             register: None,
             outcome: Outcome::NewTable,
-        });
+        }));
     };
     serde_json::from_value::<MySqlTableSchema>(previous.schema_json.clone())
         .map_err(|e| SourceError::Schema {
@@ -664,9 +1141,20 @@ pub(crate) async fn assess(
             )
             .into(),
         })?;
+    Ok(Pre::Shape { key, previous })
+}
 
-    let Some(shape) = shape_at_failover(env, anchor, db, table, &event).await?
-    else {
+/// [`assess`]'s decision from the shape proven at F (`None`: unprovable):
+/// the on_schema_drift policy applied, a halt or a hard stop its error.
+pub(crate) fn finish_assess(
+    env: &DriftEnv<'_>,
+    db: &str,
+    table: &str,
+    key: SchemaKey,
+    previous: schema_registry::SchemaVersion,
+    shape: Option<MySqlTableSchema>,
+) -> SourceResult<DriftVerdict> {
+    let Some(shape) = shape else {
         if env.halt {
             return Err(halt_error(
                 env.source_id,
@@ -1148,5 +1636,379 @@ mod tests {
             .await
             .unwrap();
         assert!(check(vec![valid]).await.is_err());
+    }
+
+    /// Snapshot-time drift through batched admission against the per-table
+    /// path, on a live server: the same outcomes, atomic chunks.
+    mod live {
+        use super::*;
+        use crate::mysql::mysql_binlog_scan::CaptureCtx;
+        use crate::mysql::mysql_binlog_scan::tests::live::{
+            position, server, sql, uuid,
+        };
+        use crate::registry_scope::SharedRegistryScope;
+        use schema_registry::SourceSchema as _;
+        use storage::DurableSchemaRegistry;
+
+        const PREV: &str = "33333333-3333-3333-3333-333333333333";
+
+        struct Store {
+            backend: ArcStorageBackend,
+            loader: MySqlSchemaLoader,
+            registry: Arc<DurableSchemaRegistry>,
+            scope: Arc<RegistryScope>,
+            capture: CaptureCtx,
+            anchor: FailoverAnchor,
+        }
+
+        /// The fixture's tables: `u` unchanged since its predecessor, `c`
+        /// changed before F, `n` new (no predecessor), `x` changed after F.
+        const TABLES: [&str; 4] = ["u", "c", "n", "x"];
+
+        /// The server prepared once per database: the predecessor shapes,
+        /// then F, then the change after it.
+        async fn prepare(
+            dsn: &str,
+            db: &str,
+        ) -> (MySqlCheckpoint, Vec<(String, MySqlTableSchema)>) {
+            sql(
+                dsn,
+                &[
+                    &format!("CREATE DATABASE {db}"),
+                    &format!("CREATE TABLE {db}.u (id INT PRIMARY KEY)"),
+                    &format!("CREATE TABLE {db}.c (id INT PRIMARY KEY)"),
+                    &format!("CREATE TABLE {db}.x (id INT PRIMARY KEY)"),
+                ],
+            )
+            .await;
+            let mut conn = mysql_async::Conn::from_url(dsn).await.unwrap();
+            let shapes =
+                crate::mysql::mysql_schema_loader::fetch_table_schemas_on(
+                    &mut conn,
+                    &[(db, "u"), (db, "c"), (db, "x")],
+                )
+                .await
+                .unwrap();
+            let previous = ["u", "c", "x"]
+                .iter()
+                .map(|t| {
+                    (
+                        t.to_string(),
+                        shapes[&(db.to_string(), t.to_string())].clone(),
+                    )
+                })
+                .collect();
+            sql(
+                dsn,
+                &[
+                    &format!("ALTER TABLE {db}.c ADD COLUMN extra INT"),
+                    &format!("CREATE TABLE {db}.n (id INT PRIMARY KEY)"),
+                ],
+            )
+            .await;
+            let f = position(dsn).await;
+            sql(dsn, &[&format!("ALTER TABLE {db}.x ADD COLUMN later INT")])
+                .await;
+            (f, previous)
+        }
+
+        /// A store that entered this server's lineage from `PREV`, with the
+        /// predecessor shapes registered and the failover anchored at F.
+        async fn store(
+            backend: ArcStorageBackend,
+            dsn: &str,
+            db: &str,
+            f: &MySqlCheckpoint,
+            previous: &[(String, MySqlTableSchema)],
+        ) -> Store {
+            let here = uuid(dsn).await;
+            enter(&backend, PREV).await;
+            enter(&backend, &here).await;
+            let registry =
+                DurableSchemaRegistry::new(backend.clone()).await.unwrap();
+            for (t, schema) in previous {
+                let k = SchemaKey::new("t", "s", &hash(PREV), db, t);
+                registry
+                    .register_version(
+                        &k,
+                        &schema.fingerprint(),
+                        &serde_json::to_value(schema).unwrap(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let shared = SharedRegistryScope::new("s");
+            let scope = shared.publish_for_test(
+                "t",
+                LineageDescriptor::mysql(&here).unwrap(),
+            );
+            let anchor =
+                record_anchor(&backend, "t", "s", &hash(PREV), Some(f.clone()))
+                    .await
+                    .unwrap();
+            Store {
+                loader: MySqlSchemaLoader::new(
+                    dsn,
+                    registry.clone(),
+                    "t",
+                    shared,
+                ),
+                registry,
+                scope,
+                capture: CaptureCtx::detached(dsn),
+                anchor,
+                backend,
+            }
+        }
+
+        fn env<'a>(
+            st: &'a Store,
+            server_uuid: &'a str,
+            halt: bool,
+        ) -> DriftEnv<'a> {
+            DriftEnv {
+                backend: &st.backend,
+                loader: &st.loader,
+                scope: &st.scope,
+                capture: &st.capture,
+                server_uuid,
+                source_id: "s",
+                halt,
+                lower_case_table_names: 0,
+                proofs: None,
+            }
+        }
+
+        fn tables(db: &str) -> Vec<(String, String)> {
+            TABLES
+                .iter()
+                .map(|t| (db.to_string(), t.to_string()))
+                .collect()
+        }
+
+        /// Each table's markers, the store's transition identity masked.
+        async fn markers(st: &Store, db: &str, t: &str) -> Vec<String> {
+            st.backend
+                .log_list(MARKER_NS, &st.scope.key(db, t).backend_key())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, b)| {
+                    let mut m: DriftMarker =
+                        serde_json::from_slice(&b).unwrap();
+                    m.transition = String::new();
+                    serde_json::to_string(&m).unwrap()
+                })
+                .collect()
+        }
+
+        async fn latest(
+            st: &Store,
+            db: &str,
+            t: &str,
+        ) -> Option<(i32, String, serde_json::Value, Option<Vec<u8>>)> {
+            st.registry
+                .get_latest(&st.scope.key(db, t))
+                .await
+                .unwrap()
+                .map(|v| (v.version, v.hash, v.schema_json, v.checkpoint))
+        }
+
+        /// The batched check stores exactly what the per-table check stored:
+        /// the same markers (byte for byte, but for each store's transition
+        /// identity) and the same registrations, for an unchanged, a
+        /// changed, a new and an unprovable (changed after F) table.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn batched_snapshot_drift_stores_what_the_per_table_check_stored()
+        {
+            let dsn = server(true).await;
+            let db = "drift_eq";
+            let (f, previous) = prepare(&dsn, db).await;
+            let here = uuid(&dsn).await;
+            let old = store(
+                Arc::new(storage::MemoryStorageBackend::new()),
+                &dsn,
+                db,
+                &f,
+                &previous,
+            )
+            .await;
+            for (d, t) in tables(db) {
+                check(
+                    &env(&old, &here, false),
+                    &old.anchor,
+                    &d,
+                    &t,
+                    FirstEvent::Snapshot,
+                )
+                .await
+                .unwrap();
+            }
+            let new = store(
+                Arc::new(storage::MemoryStorageBackend::new()),
+                &dsn,
+                db,
+                &f,
+                &previous,
+            )
+            .await;
+            check_snapshot_tables(
+                &env(&new, &here, false),
+                &new.anchor,
+                &tables(db),
+                8,
+            )
+            .await
+            .unwrap();
+            for (t, outcome) in TABLES.iter().zip([
+                "unchanged",
+                "adapted",
+                "new_table",
+                "adapted_unprovable",
+            ]) {
+                let (a, b) =
+                    (markers(&old, db, t).await, markers(&new, db, t).await);
+                assert_eq!(a.len(), 1, "{t}: {a:?}");
+                assert_eq!(a, b, "{t}: markers");
+                assert!(
+                    a[0].contains(&format!("\"outcome\":\"{outcome}\"")),
+                    "{t}: {a:?}"
+                );
+                assert_eq!(
+                    latest(&old, db, t).await,
+                    latest(&new, db, t).await,
+                    "{t}: registration"
+                );
+            }
+        }
+
+        /// Under halt a drifted table refuses its whole chunk before any
+        /// write: no marker and no registration for any table of it.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_halt_refuses_the_whole_chunk_before_any_write() {
+            let dsn = server(true).await;
+            let db = "drift_halt";
+            let (f, previous) = prepare(&dsn, db).await;
+            let here = uuid(&dsn).await;
+            let st = store(
+                Arc::new(storage::MemoryStorageBackend::new()),
+                &dsn,
+                db,
+                &f,
+                &previous,
+            )
+            .await;
+            let err = check_snapshot_tables(
+                &env(&st, &here, true),
+                &st.anchor,
+                &tables(db),
+                8,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                err.draft().map(|d| d.reason_code),
+                Some(deltaforge_core::incident::ReasonCode::SchemaDriftBlocked),
+                "{err}"
+            );
+            for t in TABLES {
+                assert!(markers(&st, db, t).await.is_empty(), "{t}");
+                assert_eq!(latest(&st, db, t).await, None, "{t}");
+            }
+        }
+
+        /// A chunk whose commit acknowledgement is lost resolves through its
+        /// marker to the original complete outcome; checking again finds
+        /// every table completed and writes nothing.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn an_ambiguous_drift_commit_resolves_to_the_original_outcome() {
+            use storage::BatchFaults as _;
+            let dsn = server(true).await;
+            let db = "drift_ack";
+            let (f, previous) = prepare(&dsn, db).await;
+            let here = uuid(&dsn).await;
+            let mem = Arc::new(storage::MemoryStorageBackend::new());
+            let st = store(mem.clone(), &dsn, db, &f, &previous).await;
+            mem.set_batch_fault(Some(storage::BatchFault::AfterCommit));
+            check_snapshot_tables(
+                &env(&st, &here, false),
+                &st.anchor,
+                &tables(db),
+                8,
+            )
+            .await
+            .unwrap();
+            let first: Vec<_> = all_markers(&st, db).await;
+            check_snapshot_tables(
+                &env(&st, &here, false),
+                &st.anchor,
+                &tables(db),
+                8,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                all_markers(&st, db).await,
+                first,
+                "nothing more written"
+            );
+            for m in &first {
+                assert_eq!(m.len(), 1);
+            }
+        }
+
+        async fn all_markers(st: &Store, db: &str) -> Vec<Vec<String>> {
+            let mut out = Vec::new();
+            for t in TABLES {
+                out.push(markers(st, db, t).await);
+            }
+            out
+        }
+
+        /// A chunk whose commit fails leaves nothing durable: no marker and
+        /// no registration; checking again records each table once.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_failed_drift_commit_leaves_nothing_and_a_rerun_records_once()
+        {
+            let dsn = server(true).await;
+            let db = "drift_fail";
+            let (f, previous) = prepare(&dsn, db).await;
+            let here = uuid(&dsn).await;
+            let faults =
+                Arc::new(storage::adapters::test_util::FaultBackend::new());
+            let st = store(faults.clone(), &dsn, db, &f, &previous).await;
+            faults.fail_writes_to.lock().unwrap().push(MARKER_NS.into());
+            assert!(
+                check_snapshot_tables(
+                    &env(&st, &here, false),
+                    &st.anchor,
+                    &tables(db),
+                    8
+                )
+                .await
+                .is_err()
+            );
+            for t in TABLES {
+                assert!(markers(&st, db, t).await.is_empty(), "{t}");
+                assert_eq!(latest(&st, db, t).await, None, "{t}");
+            }
+            faults.fail_writes_to.lock().unwrap().clear();
+            check_snapshot_tables(
+                &env(&st, &here, false),
+                &st.anchor,
+                &tables(db),
+                8,
+            )
+            .await
+            .unwrap();
+            for m in all_markers(&st, db).await {
+                assert_eq!(m.len(), 1, "{m:?}");
+            }
+        }
     }
 }
