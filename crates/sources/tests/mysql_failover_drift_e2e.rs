@@ -950,6 +950,18 @@ async fn a_failed_window_writes_no_drift_outcome_and_the_restart_records_once()
         );
         assert!(latest(table).await.is_some(), "{table}'s live shape");
     }
+    // The live shape is drift's registration: checkpoint F (the failover
+    // position, run 1's committed checkpoint), not the window's E.
+    let key = SchemaKey::new(TENANT, sc.id, &hash, db, "items");
+    let registered = st.registry.get_latest(&key).await.unwrap().unwrap();
+    let at: Option<sources::MySqlCheckpoint> =
+        serde_json::from_slice(registered.checkpoint.as_deref().unwrap())
+            .unwrap();
+    assert_eq!(
+        at.map(|c| c.gtid_set),
+        Some(committed.gtid_set.clone()),
+        "items' registration carries F"
+    );
 }
 
 /// A window batch whose acknowledgement is lost after it committed
