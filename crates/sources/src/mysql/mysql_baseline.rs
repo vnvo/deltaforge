@@ -178,13 +178,23 @@ pub(crate) async fn establish(
     // 1. A capture of each table's shape, bound to its interval by step 2.
     let mut captured = Vec::new();
     for c in candidates {
-        match capture(&ctx.dsn, &server_uuid, &lineage, &c.db, &c.table, None)
-            .await
+        match capture(
+            &ctx.dsn,
+            &server_uuid,
+            &lineage,
+            &c.db,
+            &c.table,
+            None,
+            &ctx.cancel,
+        )
+        .await
         {
             Ok(cap) => {
                 observe_capture(&tag, &cap);
                 captured.push((c, cap))
             }
+            // A stop: nothing is decided; the run ends without advancing.
+            Err(ProofError::Cancelled) => return Err(SourceError::Cancelled),
             // The connection reached another server: never a "no baseline".
             Err(ProofError::OtherServer(found)) => {
                 return Err(other_server(&server_uuid, &found));
@@ -386,13 +396,23 @@ pub(crate) async fn establish_at(
         info!(source_id = %ctx.source_id, %db, %table, why, "no lazy baseline (decided by the activation window)");
         return Ok(false);
     }
-    let cap = match capture(&ctx.dsn, &server_uuid, &lineage, db, table, None)
-        .await
+    let cap = match capture(
+        &ctx.dsn,
+        &server_uuid,
+        &lineage,
+        db,
+        table,
+        None,
+        &ctx.cancel,
+    )
+    .await
     {
         Ok(cap) => {
             observe_capture(&tag, &cap);
             cap
         }
+        // A stop: nothing is decided; the run ends without advancing.
+        Err(ProofError::Cancelled) => return Err(SourceError::Cancelled),
         Err(ProofError::OtherServer(found)) => {
             return Err(other_server(&server_uuid, &found));
         }

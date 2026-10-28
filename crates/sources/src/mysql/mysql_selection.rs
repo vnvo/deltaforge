@@ -1065,10 +1065,13 @@ async fn full_fallback(
             // read, never a stream boundary: no stream anchor.
             anchor: None,
         }),
+        &ctx.cancel,
     )
     .await
     {
         Ok(cap) => cap,
+        // A stop: nothing is decided; the run ends without advancing.
+        Err(ProofError::Cancelled) => return Err(SourceError::Cancelled),
         Err(ProofError::OtherServer(found)) => {
             return Err(SourceError::Lineage {
                 details: format!("a schema capture reached another server ({found}), expected {server_uuid}").into(),

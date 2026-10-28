@@ -889,7 +889,8 @@ async fn a_stop_cancels_the_waiting_window_and_speculative_captures() {
 /// A stop while a schema change's forward proof waits for the table's
 /// metadata lock (a single-table capture, whose own lock wait is 30 s):
 /// the source ends at once and the queued session is killed. The schema
-/// change is neither proven nor checkpointed past, so a restart proves it.
+/// change stays pending and the checkpoint unchanged, so a restart proves
+/// it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires docker"]
 async fn a_stop_cancels_a_waiting_forward_proof_capture() {
@@ -898,12 +899,14 @@ async fn a_stop_cancels_a_waiting_forward_proof_capture() {
     tables(&mut c, 1).await;
     let id = "stop-forward";
     let store = Store::memory();
-    let r = run_on(port, id, MysqlProofCfg::default(), &store).await;
-    let before: String = c
-        .query_first("SELECT @@GLOBAL.gtid_executed")
+    // A first run ends with a clean stop: its checkpoint is the resume point.
+    run_on(port, id, MysqlProofCfg::default(), &store)
         .await
-        .unwrap()
-        .unwrap();
+        .stop()
+        .await;
+    let checkpoint = store.ckpt.get_raw(id).await.unwrap();
+    assert!(checkpoint.is_some(), "the clean stop wrote no checkpoint");
+    let r = run_on(port, id, MysqlProofCfg::default(), &store).await;
     r.handle.pause();
     let mut locker = conn(port).await;
     locker
@@ -928,13 +931,31 @@ async fn a_stop_cancels_a_waiting_forward_proof_capture() {
         assert!(Instant::now() < deadline, "the capture still waits");
         sleep(Duration::from_millis(50)).await;
     }
-    assert!(store.activation(port, id, "t0009").await.is_empty());
-    if let Some(raw) = store.ckpt.get_raw(id).await.unwrap() {
-        let cp: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-        assert_eq!(cp["gtid_set"].as_str(), Some(before.trim()), "{cp}");
-    }
+    // Only the schema change itself, still pending: no proof binds it.
+    let recs = store.activation(port, id, "t0009").await;
+    assert!(recs.iter().all(|(_, r)| r["kind"] == "ddl"), "{recs:#?}");
+    assert!(!store.registered(port, id, "t0009").await, "registered");
+    assert_eq!(
+        store.ckpt.get_raw(id).await.unwrap(),
+        checkpoint,
+        "the checkpoint moved"
+    );
     locker.query_drop("UNLOCK TABLES").await.unwrap();
     r.drain.abort();
+
+    // The restart, from the unchanged checkpoint, handles the schema
+    // change again and proves it.
+    let again = run_on(port, id, MysqlProofCfg::default(), &store).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let recs = store.activation(port, id, "t0009").await;
+        if recs.iter().any(|(_, r)| r["kind"] == "observed") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never proven: {recs:#?}");
+        sleep(Duration::from_millis(100)).await;
+    }
+    again.stop().await;
     container.rm().await.ok();
 }
 

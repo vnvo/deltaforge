@@ -125,6 +125,8 @@ pub(crate) struct DriftEnv<'a> {
     pub loader: &'a MySqlSchemaLoader,
     pub scope: &'a RegistryScope,
     pub dsn: &'a crate::credentials::SharedDsn,
+    /// The run's stop: an in-flight capture is cancelled.
+    pub cancel: &'a tokio_util::sync::CancellationToken,
     pub server_uuid: &'a str,
     pub source_id: &'a str,
     pub halt: bool,
@@ -471,6 +473,7 @@ async fn shape_at_failover(
         db,
         table,
         None,
+        env.cancel,
     )
     .await
     {
@@ -478,6 +481,8 @@ async fn shape_at_failover(
             observe_capture(&tag, &cap);
             cap
         }
+        // A stop: nothing is decided; the run ends without advancing.
+        Err(ProofError::Cancelled) => return Err(SourceError::Cancelled),
         Err(ProofError::OtherServer(found)) => {
             return Err(SourceError::Lineage {
                 details: format!(
@@ -790,6 +795,7 @@ pub(crate) async fn check_in_stream(
             loader: &ctx.schema,
             scope: &scope,
             dsn: &ctx.dsn,
+            cancel: &ctx.cancel,
             server_uuid: &server_uuid,
             source_id: &ctx.source_id,
             halt: ctx.on_schema_drift == deltaforge_config::OnSchemaDrift::Halt,
@@ -840,6 +846,7 @@ pub(crate) async fn check_window(
             loader: &ctx.schema,
             scope: &scope,
             dsn: &ctx.dsn,
+            cancel: &ctx.cancel,
             server_uuid: &server_uuid,
             source_id: &ctx.source_id,
             halt: ctx.on_schema_drift == deltaforge_config::OnSchemaDrift::Halt,
@@ -969,6 +976,7 @@ mod tests {
             loader: &loader,
             scope: &scope,
             dsn: &crate::credentials::SharedDsn::from(""),
+            cancel: &tokio_util::sync::CancellationToken::new(),
             server_uuid: B,
             source_id: "s",
             halt: true,
@@ -1089,6 +1097,7 @@ mod tests {
                     loader,
                     scope,
                     dsn: &crate::credentials::SharedDsn::from(""),
+                    cancel: &tokio_util::sync::CancellationToken::new(),
                     server_uuid: B,
                     source_id: "s",
                     halt: true,

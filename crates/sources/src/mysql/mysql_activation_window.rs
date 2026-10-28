@@ -568,6 +568,7 @@ pub(super) async fn maybe_window(
         source_id: ctx.source_id.clone(),
         lock_wait_secs: cfg.capture_lock_wait_secs,
         scanner: std::sync::Arc::clone(&ctx.proof_scanner),
+        cancel: ctx.cancel.clone(),
     };
     let mut collector = Collector::new(
         ahead,
@@ -830,6 +831,9 @@ pub(crate) struct CaptureScan {
     pub source_id: String,
     pub lock_wait_secs: u32,
     pub scanner: std::sync::Arc<super::mysql_proof_scanner::ProofScanner>,
+    /// The run's stop: an in-flight capture (also a speculative one) is
+    /// cancelled.
+    pub cancel: tokio_util::sync::CancellationToken,
     pub anchor: Option<super::mysql_binlog_scan::Anchor>,
 }
 
@@ -867,10 +871,15 @@ pub(crate) async fn capture_and_scan(
             tables,
             cs.lock_wait_secs,
             None,
+            &cs.cancel,
         )
         .await
         {
             Ok(c) => break c,
+            // A stop: never retried; nothing of the window was dispatched.
+            Err(BatchCaptureError::Failed(ProofError::Cancelled)) => {
+                return Err(SourceError::Cancelled);
+            }
             Err(BatchCaptureError::Failed(ProofError::OtherServer(found))) => {
                 return Err(SourceError::Lineage {
                     details: format!(

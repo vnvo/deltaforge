@@ -1606,6 +1606,7 @@ impl MySqlSource {
                             loader: &snap_schema_loader,
                             scope: &drift_scope,
                             dsn: &run_dsn,
+                            cancel: &cancel,
                             server_uuid: &server_uuid,
                             source_id: &self.id,
                             halt: self.on_schema_drift
@@ -2088,7 +2089,15 @@ impl MySqlSource {
         if let Some(rt) = rotation.take() {
             rt.shutdown().await;
         }
-        loop_result?;
+        match loop_result {
+            // A stop cancelled work in flight (a capture): the event it
+            // served is unfinished, so no checkpoint is written and a
+            // restart handles that event again.
+            Err(SourceError::Cancelled) if ctx.cancel.is_cancelled() => {
+                return Ok(());
+            }
+            r => r?,
+        }
 
         // Best-effort final checkpoint update. Persist the read position as the
         // aggregate checkpoint ONLY when this store does not derive the resume position
