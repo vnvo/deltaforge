@@ -4703,6 +4703,56 @@ mod tests {
                 assert_eq!(all.schemas[&k("mm")].columns.len(), 9);
             }
 
+            /// The largest table definition MySQL 8.4 accepts (4,096
+            /// columns, the most any engine allows, each with a maximal
+            /// 1,024-character comment and a default) is read whole within
+            /// the store's item limit, and its encoded schema takes at most
+            /// half of it: a registration of any real table is a valid item.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn the_largest_table_definition_fits_half_the_item_limit() {
+                let dsn = server(true).await;
+                let db = "max_def";
+                let comment = "c".repeat(1024);
+                let cols: String = (0..4095)
+                    .map(|k| {
+                        format!(", col_{k:04} INT NOT NULL DEFAULT {k} COMMENT '{comment}'")
+                    })
+                    .collect();
+                sql(
+                    &dsn,
+                    &[
+                        &format!("CREATE DATABASE {db}"),
+                        &format!(
+                            "CREATE TABLE {db}.widest (id INT PRIMARY KEY COMMENT '{comment}'{cols}) \
+                             ENGINE=MyISAM"
+                        ),
+                    ],
+                )
+                .await;
+                let mut c = mysql_async::Conn::from_url(&dsn).await.unwrap();
+                let read = crate::mysql::mysql_schema_loader::fetch_table_schemas_within(
+                    &mut c,
+                    &[(db, "widest")],
+                    u64::MAX,
+                    storage::MAX_STATE_ITEM_BYTES as u64,
+                )
+                .await
+                .unwrap();
+                assert_eq!(read.kept, 1, "read whole within the item limit");
+                assert_eq!(read.oversized, None);
+                let schema =
+                    &read.schemas[&(db.to_string(), "widest".to_string())];
+                assert_eq!(schema.columns.len(), 4096);
+                let encoded = serde_json::to_vec(schema).unwrap().len();
+                eprintln!("the widest table's encoded schema: {encoded} bytes");
+                // Its registration entry wraps the schema with a few fields.
+                assert!(
+                    encoded + 4096 <= storage::MAX_STATE_ITEM_BYTES / 2,
+                    "{encoded} bytes"
+                );
+            }
+
             /// A table whose own rows exceed the item limit stops the
             /// schema read where it is reached: as the first table, nothing
             /// is kept and its size is reported; later, the tables before it

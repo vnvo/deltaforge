@@ -25,6 +25,7 @@ serial-pg  sources/lib-pg                   -p sources --lib -- --include-ignore
 
 # Timing-sensitive or fixed-port suites
 serial     sources/mysql_rotation_e2e       -p sources --test mysql_rotation_e2e
+serial     sources/mysql_window_memory_e2e  -p sources --test mysql_window_memory_e2e
 serial     sources/postgres_rotation_e2e    -p sources --test postgres_rotation_e2e
 serial     runner/throughput_e2e            -p runner --test throughput_e2e
 serial     runner/mysql_throughput_e2e      -p runner --test mysql_throughput_e2e
