@@ -52,7 +52,8 @@ use super::schema_key::SchemaKey;
 use super::source_lineage;
 use crate::ArcStorageBackend;
 
-const V1_NS: &str = "schemas.v1";
+/// The registry's namespace (its version streams and indexes).
+pub const V1_NS: &str = "schemas.v1";
 const LEGACY_NS: &str = "schemas";
 const INDEX_NS: &str = "schemas.v1.index";
 const MIGRATION_NS: &str = "schemas.v1.migration";

@@ -964,12 +964,14 @@ async fn admit_window(
     batch: BTreeMap<(String, String), MySqlCheckpoint>,
     order: Vec<(String, String)>,
 ) -> Result<Admitted, LoopControl> {
-    let tables: Vec<(String, String)> = batch.keys().cloned().collect();
-    let froms: Vec<MySqlCheckpoint> = batch
-        .values()
-        .map(|a| MySqlCheckpoint {
+    // First-touch order: the capture reads schemas in it and stops at the
+    // budget (`mysql_window_budget`).
+    let tables: Vec<(String, String)> = order.clone();
+    let froms: Vec<MySqlCheckpoint> = tables
+        .iter()
+        .map(|k| MySqlCheckpoint {
             lineage: Some(capture.lineage.clone()),
-            ..a.clone()
+            ..batch[k].clone()
         })
         .collect();
     let head = MySqlCheckpoint {
@@ -1001,8 +1003,7 @@ async fn admit_speculated(
             )))
         })?
         .map_err(LoopControl::Fail)?;
-    let speculated: Vec<(String, String)> =
-        pending.batch.keys().cloned().collect();
+    let speculated: Vec<(String, String)> = pending.order.clone();
     decide_and_commit(ctx, lineage, done, required, &speculated, order).await
 }
 
@@ -1135,6 +1136,30 @@ async fn admit_batch(
         let mut prefix = Prefix::new(Caps::current());
         let mut cut = tables.len();
         for (i, ((db, table), at, _)) in tables.iter().enumerate() {
+            // Past the capture's budget: unread, so the prefix ends here. The
+            // window's first table is unread only when its own rows exceed
+            // the store's item limit.
+            if cap.deferred.contains(&(db.clone(), table.clone())) {
+                if i == 0 {
+                    let key = scope.key(db, table);
+                    let too = storage::StateItemTooLarge {
+                        size: cap.oversized.unwrap_or_default() as usize,
+                        key_digest: storage::state_key_digest(
+                            storage::adapters::schema_registry::V1_NS,
+                            &key.backend_key(),
+                        ),
+                    };
+                    return Err(crate::incident_drafts::state_item_too_large(
+                        &ctx.source_id,
+                        db,
+                        table,
+                        &too,
+                        at,
+                    ));
+                }
+                cut = i;
+                break;
+            }
             // A table gone before the capture holds nothing.
             let cost = match cap.schemas.get(&(db.clone(), table.clone())) {
                 None => Default::default(),
@@ -1900,6 +1925,8 @@ mod tests {
                     })
                     .collect(),
                 missing: Vec::new(),
+                deferred: Vec::new(),
+                oversized: None,
                 trace: Default::default(),
             }
         }

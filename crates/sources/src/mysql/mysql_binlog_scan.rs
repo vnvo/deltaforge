@@ -1811,6 +1811,12 @@ pub(crate) struct BatchCaptured {
     pub schemas: HashMap<(String, String), MySqlTableSchema>,
     /// Tables that do not exist (dropped since their rows): no shape.
     pub missing: Vec<(String, String)>,
+    /// Tables past the capture's budget, in rank order: not read, so
+    /// neither captured nor missing (`fetch_table_schemas_within`).
+    pub deferred: Vec<(String, String)>,
+    /// The first deferred table's bytes when its own rows exceeded the
+    /// store's item limit.
+    pub oversized: Option<u64>,
     pub trace: CaptureTrace,
 }
 
@@ -1961,9 +1967,16 @@ pub(crate) async fn capture_batch_with(
 ) -> Result<Result<BatchCaptured, BatchCaptureError>, Cancelled> {
     let dsn = &cx.dsn;
     let failed = |e: ProofError| BatchCaptureError::Failed(e);
-    let mut sorted: Vec<(String, String)> = tables.to_vec();
+    // The window's rank order (first touch) for the schema read; the
+    // sorted order for the locks.
+    let mut ranked: Vec<(String, String)> = Vec::with_capacity(tables.len());
+    for t in tables {
+        if !ranked.contains(t) {
+            ranked.push(t.clone());
+        }
+    }
+    let mut sorted: Vec<(String, String)> = ranked.clone();
     sorted.sort();
-    sorted.dedup();
     let pool = mysql_async::Pool::new(dsn.current().expose());
     let mut trace = CaptureTrace::default();
     let t0 = Instant::now();
@@ -2083,17 +2096,32 @@ pub(crate) async fn capture_batch_with(
             .map_err(failed)?;
         trace.positions = t.elapsed();
         let t = Instant::now();
-        let schemas = super::mysql_schema_loader::fetch_table_schemas_on(
-            &mut conn, &present,
+        // In rank order, within the plan budget: the tables past it are
+        // deferred, unread (`mysql_window_budget`).
+        let in_rank: Vec<(&str, &str)> = ranked
+            .iter()
+            .filter(|k| present.contains(&(k.0.as_str(), k.1.as_str())))
+            .map(|(db, table)| (db.as_str(), table.as_str()))
+            .collect();
+        let within = super::mysql_schema_loader::fetch_table_schemas_within(
+            &mut conn,
+            &in_rank,
+            super::mysql_window_budget::Caps::current().plan.bytes,
+            storage::MAX_STATE_ITEM_BYTES as u64,
         )
         .await
         .map_err(|e| failed(ProofError::Capture(e.to_string())))?;
         trace.schema = t.elapsed();
-        for (db, table) in &present {
+        let schemas = within.schemas;
+        for (db, table) in &in_rank[..within.kept] {
             if !schemas.contains_key(&(db.to_string(), table.to_string())) {
                 missing.push((db.to_string(), table.to_string()));
             }
         }
+        let deferred: Vec<(String, String)> = in_rank[within.kept..]
+            .iter()
+            .map(|(db, table)| (db.to_string(), table.to_string()))
+            .collect();
         let t = Instant::now();
         let position = read_position(&mut conn, gtid_mode, lineage_hash)
             .await
@@ -2119,6 +2147,8 @@ pub(crate) async fn capture_batch_with(
             position,
             schemas,
             missing,
+            deferred,
+            oversized: within.oversized,
             trace: CaptureTrace::default(),
         })
     };
@@ -4597,6 +4627,125 @@ mod tests {
                 assert_eq!(kill_failures(), failures, "the kill failed");
                 holder.query_drop("UNLOCK TABLES").await.unwrap();
                 sql(&dsn, &[&format!("DROP USER '{user}'@'%'")]).await;
+            }
+
+            /// A wide table (eight 1,000-character column comments).
+            fn wide(db: &str, t: &str) -> String {
+                let comment = "x".repeat(1000);
+                let cols: String = (1..=8)
+                    .map(|k| format!(", c{k} INT COMMENT '{comment}'"))
+                    .collect();
+                format!("CREATE TABLE {db}.{t} (id INT PRIMARY KEY{cols})")
+            }
+
+            /// A batched capture reads its tables' schemas in the window's
+            /// rank order, not by name, within the plan budget: the tables
+            /// before the first one over it are captured, that one and the
+            /// rest are deferred unread (neither captured nor missing), and
+            /// a missing table among the kept stays missing.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn a_batched_capture_reads_in_rank_order_within_its_budget() {
+                let dsn = server(true).await;
+                let db = "rank_cap";
+                sql(
+                    &dsn,
+                    &[
+                        &format!("CREATE DATABASE {db}"),
+                        &format!("CREATE TABLE {db}.zz (id INT PRIMARY KEY)"),
+                        &wide(db, "mm"),
+                        &format!("CREATE TABLE {db}.aa (id INT PRIMARY KEY)"),
+                    ],
+                )
+                .await;
+                let k = |t: &str| (db.to_string(), t.to_string());
+                let ranked = vec![k("zz"), k("gone"), k("mm"), k("aa")];
+                let slots: &'static CaptureSlots =
+                    Box::leak(Box::new(CaptureSlots::new(4, 4)));
+                crate::stream_probe::set_window_caps(Some((
+                    5_000, 16_384, 5_000,
+                )));
+                let cap = capture_batch_with(
+                    slots,
+                    &CaptureCtx::detached(dsn.as_str()),
+                    &uuid(&dsn).await,
+                    LINEAGE,
+                    &ranked,
+                    8,
+                    None,
+                )
+                .await
+                .expect("not cancelled");
+                crate::stream_probe::set_window_caps(None);
+                let cap = cap.unwrap();
+                let mut captured: Vec<_> =
+                    cap.schemas.keys().cloned().collect();
+                captured.sort();
+                assert_eq!(captured, vec![k("zz")]);
+                assert_eq!(cap.missing, vec![k("gone")]);
+                assert_eq!(cap.deferred, vec![k("mm"), k("aa")]);
+                assert_eq!(cap.oversized, None);
+                // Unlimited, every table is captured, whatever its rank.
+                let all = capture_batch_with(
+                    slots,
+                    &CaptureCtx::detached(dsn.as_str()),
+                    &uuid(&dsn).await,
+                    LINEAGE,
+                    &ranked,
+                    8,
+                    None,
+                )
+                .await
+                .expect("not cancelled")
+                .unwrap();
+                assert_eq!(all.schemas.len(), 3);
+                assert!(all.deferred.is_empty());
+                assert_eq!(all.schemas[&k("mm")].columns.len(), 9);
+            }
+
+            /// A table whose own rows exceed the item limit stops the
+            /// schema read where it is reached: as the first table, nothing
+            /// is kept and its size is reported; later, the tables before it
+            /// are kept whole.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn a_table_over_the_item_limit_stops_the_schema_read() {
+                let dsn = server(true).await;
+                let db = "item_cap";
+                sql(
+                    &dsn,
+                    &[
+                        &format!("CREATE DATABASE {db}"),
+                        &format!(
+                            "CREATE TABLE {db}.small (id INT PRIMARY KEY)"
+                        ),
+                        &wide(db, "big"),
+                    ],
+                )
+                .await;
+                let read = |tables: Vec<(&'static str, &'static str)>| {
+                    let dsn = dsn.clone();
+                    async move {
+                        let mut c =
+                            mysql_async::Conn::from_url(&dsn).await.unwrap();
+                        crate::mysql::mysql_schema_loader::fetch_table_schemas_within(
+                            &mut c, &tables, u64::MAX, 2_000,
+                        )
+                        .await
+                        .unwrap()
+                    }
+                };
+                let first = read(vec![(db, "big"), (db, "small")]).await;
+                assert_eq!(first.kept, 0);
+                assert!(
+                    first.oversized.is_some_and(|b| b > 2_000),
+                    "{first:?}"
+                );
+                assert!(first.schemas.is_empty());
+                let later = read(vec![(db, "small"), (db, "big")]).await;
+                assert_eq!(later.kept, 1);
+                assert!(later.oversized.is_some());
+                assert_eq!(later.schemas.len(), 1);
             }
 
             /// A batched capture locks its tables in sorted order, whatever

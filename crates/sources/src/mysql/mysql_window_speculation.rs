@@ -175,6 +175,8 @@ pub(crate) struct Pending {
     pub closed_by: &'static str,
     pub lineage: String,
     pub batch: BTreeMap<(String, String), MySqlCheckpoint>,
+    /// The batch's tables in first-touch order: the capture's rank order.
+    pub order: Vec<(String, String)>,
     pub task: AbortOnDrop<Result<CapturedWindow, SourceError>>,
 }
 
@@ -231,6 +233,8 @@ pub(crate) struct Collector {
     head: Option<(u64, Instant, MySqlCheckpoint)>,
     head_anchor: Option<super::mysql_binlog_scan::Anchor>,
     batch: BTreeMap<(String, String), MySqlCheckpoint>,
+    /// The batch's tables in first-touch order.
+    order: Vec<(String, String)>,
     events: usize,
     bytes: u64,
     end_seq: u64,
@@ -266,6 +270,7 @@ impl Collector {
             head: None,
             head_anchor: None,
             batch: BTreeMap::new(),
+            order: Vec::new(),
             events: 0,
             bytes: 0,
             end_seq: 0,
@@ -376,7 +381,9 @@ impl Collector {
                 // ordinary window's does at dispatch.
                 self.head_anchor = self.ahead.txn_anchor.clone();
             }
-            self.batch.insert(k, at);
+            if self.batch.insert(k.clone(), at).is_none() {
+                self.order.push(k);
+            }
         }
         if self.head.is_some() {
             self.end_seq = seq;
@@ -393,14 +400,13 @@ impl Collector {
     /// Close the window and start its capture and scan.
     fn close(&mut self, why: &'static str) {
         self.closed = Some(why);
-        let tables: Vec<(String, String)> =
-            self.batch.keys().cloned().collect();
-        let froms: Vec<MySqlCheckpoint> = self
-            .batch
-            .values()
-            .map(|a| MySqlCheckpoint {
+        // First-touch order: the capture's rank order.
+        let tables: Vec<(String, String)> = self.order.clone();
+        let froms: Vec<MySqlCheckpoint> = tables
+            .iter()
+            .map(|k| MySqlCheckpoint {
                 lineage: Some(self.inputs.lineage.clone()),
-                ..a.clone()
+                ..self.batch[k].clone()
             })
             .collect();
         let head = self.head.as_ref().map(|(_, _, h)| MySqlCheckpoint {
@@ -438,6 +444,7 @@ impl Collector {
                     closed_by,
                     lineage: self.inputs.lineage.clone(),
                     batch: self.batch,
+                    order: self.order,
                     task,
                 }),
             ),
