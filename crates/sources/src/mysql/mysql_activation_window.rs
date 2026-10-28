@@ -2173,6 +2173,59 @@ mod tests {
                 assert!(barrier_bytes == 0 || none.is_empty());
             }
 
+            /// The prefetch at a speculative window's head reads within
+            /// the plan budget, in the order given: under a budget that
+            /// takes only the barriers and the first tables, only those are
+            /// cached; the rest are read when reached.
+            #[tokio::test]
+            #[ignore = "sets the process-wide window caps: run serially (gate lane)"]
+            async fn the_timeline_prefetch_stops_at_the_plan_budget() {
+                let ctx =
+                    ctx_on(std::sync::Arc::new(FaultBackend::new())).await;
+                let keys = fixture(&ctx).await;
+                let mut asked = keys.clone();
+                asked.reverse();
+                let mut ctx = ctx;
+                // A budget that takes the barriers and about a third of the
+                // table streams (the fixture's streams are a few records).
+                let all: u64 = ctx
+                    .registry_backend
+                    .log_read_streams(
+                        &asked
+                            .iter()
+                            .map(|k| {
+                                (ACTIVATION_NS.to_string(), table_stream(k))
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .await
+                    .unwrap()
+                    .iter()
+                    .flatten()
+                    .map(storage::log_entry_bytes)
+                    .sum();
+                crate::stream_probe::set_window_caps(Some((
+                    all / 3 + 4096,
+                    16_384,
+                    1 << 30,
+                )));
+                crate::mysql::mysql_selection::load_timelines(&mut ctx, &asked)
+                    .await;
+                crate::stream_probe::set_window_caps(None);
+                let cached: Vec<bool> = asked
+                    .iter()
+                    .map(|k| ctx.selection.timeline(&k.backend_key()).is_some())
+                    .collect();
+                assert!(cached[0], "the first table is read");
+                assert!(
+                    !cached[cached.len() - 1],
+                    "the last is left: {cached:?}"
+                );
+                // A prefix: no table cached after one left out.
+                let first_out = cached.iter().position(|c| !c).unwrap();
+                assert!(cached[first_out..].iter().all(|c| !c), "{cached:?}");
+            }
+
             #[tokio::test]
             async fn the_batch_equals_the_per_table_reads_reading_each_stream_once()
              {
