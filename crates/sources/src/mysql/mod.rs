@@ -34,6 +34,8 @@ mod mysql_activation_window;
 mod mysql_baseline;
 mod mysql_binlog_scan;
 mod mysql_checkpoint_lineage;
+mod mysql_connections;
+pub mod mysql_control;
 mod mysql_ddl_attribution;
 mod mysql_failover_drift;
 mod mysql_forward_proof;
@@ -1401,6 +1403,16 @@ impl MySqlSource {
         mysql_server_lineage(server_id, file)
     }
 
+    /// The source's control-plane pool (`mysql_control`): shared by every
+    /// run and schema loader of the source.
+    pub(crate) fn control_pool(&self) -> mysql_control::ControlPool {
+        mysql_control::source_pool(
+            &self.tenant,
+            &self.id,
+            self.proofs.control_connections,
+        )
+    }
+
     async fn run_inner(
         &self,
         tx: mpsc::Sender<SourceItem>,
@@ -1413,11 +1425,13 @@ impl MySqlSource {
         // The run's one authoritative DSN, shared by every connection
         // factory of the run (see `SharedDsn`).
         let run_dsn = crate::credentials::SharedDsn::new(self.dsn.clone());
-        // The run's one capture context (that DSN and the run's stop),
-        // shared by every schema capture of the run.
+        // The run's one capture context (that DSN, the run's stop and the
+        // source's control-plane pool), shared by every schema capture of
+        // the run.
         let captures = mysql_binlog_scan::CaptureCtx::for_run(
             run_dsn.clone(),
             cancel.clone(),
+            self.control_pool(),
         );
         // Verify the source lineage ONCE, before any snapshot, stream, or RunCtx.
         // Fail closed if it cannot be established: a swallowed error here would
