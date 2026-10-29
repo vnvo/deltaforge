@@ -315,6 +315,16 @@ async fn establish_chunk(
         Err(BatchCaptureError::Failed(ProofError::OtherServer(found))) => {
             return Err(other_server(&server_uuid, &found));
         }
+        // Saturation defers, as any failed capture: a baseline only proves
+        // early what each table's lazy proof proves at its first rows.
+        Err(BatchCaptureError::Failed(ProofError::Saturated { .. })) => {
+            super::mysql_control::note_deferral(
+                &ctx.source_id,
+                "baseline",
+                chunk.len(),
+            );
+            return skip_all("no_capture");
+        }
         Err(e) => {
             warn!(source_id = %ctx.source_id, error = ?e, tables = chunk.len(), "no baselines: the chunk's capture failed");
             return skip_all("no_capture");
@@ -1615,6 +1625,102 @@ mod tests {
             assert_eq!(baselines(&timeline(&st, db, "u").await.0).len(), 1);
             assert!(baselines(&timeline(&st, db, "t").await.0).is_empty());
             assert_eq!(st.ckpt.get_raw(db).await.unwrap().unwrap(), committed);
+        }
+
+        /// A saturated control plane for the next capture: a runner budget
+        /// whose only ordinary permit another source holds (released by
+        /// dropping what is returned); the capture waits at most 1 s.
+        async fn starve_next_capture(
+            dsn: &str,
+        ) -> crate::mysql::mysql_control::ControlConn {
+            use crate::mysql::mysql_control::{Budget, Class, ControlPool};
+            let mut c = mysql_async::Conn::from_url(dsn).await.unwrap();
+            let uuid: String = c
+                .query_first("SELECT @@GLOBAL.server_uuid")
+                .await
+                .unwrap()
+                .unwrap();
+            c.disconnect().await.ok();
+            let budget: &'static Budget = Box::leak(Box::new(Budget::new(
+                crate::mysql::mysql_binlog_scan::KILL_RESERVE + 1,
+            )));
+            let held = ControlPool::detached(budget, "other", 2)
+                .connect(Class::Catalog, dsn, &uuid, Duration::from_secs(5))
+                .await
+                .unwrap();
+            *crate::mysql::mysql_binlog_scan::STARVE_NEXT.lock().unwrap() =
+                Some((
+                    ControlPool::detached(budget, "starved", 2),
+                    Duration::from_secs(1),
+                ));
+            held
+        }
+
+        /// A saturated control plane at the snapshot's baselines defers
+        /// them, as any failed capture does: counted and logged, no baseline
+        /// at the anchor, and each table's first rows after the snapshot
+        /// are proven by its lazy baseline and delivered (never left
+        /// unprotected).
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn saturated_baselines_are_deferred_to_lazy_proofs() {
+            reset_hooks();
+            let port = server(true).await;
+            let db = "base_saturated";
+            let tables = ["a", "b"];
+            prepare(port, db, &tables).await;
+            for t in &tables {
+                sql(port, &[format!("INSERT INTO {db}.{t} VALUES (1, 1)")])
+                    .await;
+            }
+            let names: Vec<String> =
+                tables.iter().map(|t| format!("{db}.{t}")).collect();
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let st = state().await;
+            let held = starve_next_capture(&dsn(port, "")).await;
+            let before = crate::mysql::mysql_control::saturation_deferrals();
+            // The snapshot, its baselines' capture starved.
+            let (_, res) =
+                run(&st, port, db, &names, SnapshotMode::Initial, &[]).await;
+            drop(held);
+            res.unwrap();
+            assert!(
+                crate::mysql::mysql_binlog_scan::STARVE_NEXT
+                    .lock()
+                    .unwrap()
+                    .is_none(),
+                "the baselines' capture drew on the starved pool"
+            );
+            assert_eq!(
+                crate::mysql::mysql_control::saturation_deferrals(),
+                before + 1,
+                "one chunk deferred"
+            );
+            for t in tables {
+                let (table, _) = timeline(&st, db, t).await;
+                assert!(baselines(&table).is_empty(), "{t}: deferred");
+            }
+            // Later rows: each table's lazy baseline proves them, and they
+            // are delivered.
+            let after: Vec<String> = tables
+                .iter()
+                .map(|t| format!("INSERT INTO {db}.{t} VALUES (2, 2)"))
+                .collect();
+            let (rows, res) =
+                run(&st, port, db, &names, SnapshotMode::Initial, &after).await;
+            res.unwrap();
+            let two = deltaforge_core::canonical::fixture::value(
+                &serde_json::json!(2),
+            );
+            for t in tables {
+                let (table, _) = timeline(&st, db, t).await;
+                assert_eq!(baselines(&table).len(), 1, "{t}: proven lazily");
+                assert!(
+                    rows.iter().any(|e| e.source.table == t
+                        && e.after.as_ref().unwrap().get("id") == Some(&two)),
+                    "{t}: its later row delivered"
+                );
+            }
         }
 
         /// After a barrier (here a versioned-comment DDL, unattributable), a

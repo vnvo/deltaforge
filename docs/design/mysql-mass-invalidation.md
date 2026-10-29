@@ -884,10 +884,18 @@ Today it takes about 30 statements per table, about 61,000.
 - A capture takes its lock-holding slot before its connection, so a capture
   waiting for a slot holds no connection.
 - Saturation raises the incident where a capture cannot be skipped: an
-  activation window's capture (not retried in place) and a failover drift
-  capture (never recorded as an unprovable drift). A snapshot baseline or a
-  forward proof that cannot capture leaves its table to the lazy proof, as
-  for any failed capture.
+  activation window's capture (not retried in place), a failover drift
+  capture (never recorded as an unprovable drift) and a DDL's forward proof
+  (a pending DDL's next rows have no lazy proof: deferring would turn
+  contention into a stop needing a re-snapshot). A forward proof stops
+  before its DDL is emitted or checkpointed; the restart replays the DDL,
+  binds it and delivers the rows after it.
+- A snapshot baseline keeps its existing safe deferral on saturation, never
+  the blocking incident: it only proves early what the table's lazy proof
+  proves at its next rows, before they are delivered.
+  Each deferral is logged and counted
+  (`deltaforge_mysql_control_saturation_deferrals_total{kind}`), and tests
+  show the deferred table proven by its lazy baseline at its next rows.
 - A connection is reused only for the same DSN (as a digest) and server; a
   connection opened for no particular server (identity reads that learn the
   server) is budgeted and never reused.

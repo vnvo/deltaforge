@@ -139,10 +139,18 @@ for cancelling captures):
 - Waits are first come, first served. A capture waits at most its
   `capture_lock_wait_secs`; a position query or a health check at most 5 s,
   one health check at a time per source; a catalog read at most 30 s.
-- A capture that gets no connection within its wait stops the source with a
-  `mysql_control_plane_saturated` incident and is retried by the restart.
-  A snapshot baseline or a forward proof that cannot capture leaves its
-  table to the lazy proof, as for any failed capture.
+- An activation window's, a failover drift check's or a DDL's forward
+  proof capture that gets no connection within its wait stops the source
+  with a `mysql_control_plane_saturated` incident and is retried by the
+  restart: without it, rows could not be decoded, drift decided, or the
+  rows after the DDL proven. A forward proof stops before its DDL is
+  emitted or checkpointed; the restart replays the DDL and proves it.
+- A snapshot baseline that gets no connection keeps its existing safe
+  deferral, as for any failed capture: it only proves early what the
+  table's lazy proof proves at its next rows, so the table is proven there
+  before any of those rows is delivered. Each deferral is logged and
+  counted in `deltaforge_mysql_control_saturation_deferrals_total{kind}`
+  (`kind="baseline"`); it never raises an incident.
 - Cancelling a capture never waits for a pool: it draws on the reserve.
 - After a credential rotation or a failover, connections opened before it
   are never reused: the idle one closes at once, the others when returned.

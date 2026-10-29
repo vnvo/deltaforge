@@ -695,6 +695,34 @@ impl<L: Link> Pool<L> {
     }
 }
 
+static SATURATION_DEFERRALS: AtomicU64 = AtomicU64::new(0);
+
+/// A capture that would only add a proof early (a snapshot baseline) got
+/// no connection: its tables keep their lazy proof.
+/// Counted (`deltaforge_mysql_control_saturation_deferrals_total{kind}`)
+/// and logged; never an incident.
+pub(crate) fn note_deferral(source: &str, kind: &'static str, tables: usize) {
+    SATURATION_DEFERRALS.fetch_add(1, Ordering::SeqCst);
+    metrics::counter!(
+        "deltaforge_mysql_control_saturation_deferrals_total",
+        "kind" => kind,
+    )
+    .increment(1);
+    warn!(
+        source_id = %source,
+        kind,
+        tables,
+        "the MySQL control plane is saturated: no {kind} capture; the \
+         tables are left to their lazy proofs"
+    );
+}
+
+/// Deferrals so far ([`note_deferral`]).
+#[cfg(test)]
+pub(crate) fn saturation_deferrals() -> u64 {
+    SATURATION_DEFERRALS.load(Ordering::SeqCst)
+}
+
 fn waited(class: Class, t0: Instant) {
     metrics::histogram!(
         "deltaforge_mysql_control_permit_wait_seconds",

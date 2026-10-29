@@ -1643,13 +1643,14 @@ pub(crate) async fn capture_with(
             })?
             .expect("capture slots are never closed");
         guard.permit = Some(permit);
-        let mut conn = cx
-            .control
+        let (control, wait) =
+            control_for(cx, budget.saturating_sub(waited.elapsed()));
+        let mut conn = control
             .connect(
                 super::mysql_control::Class::Capture,
                 dsn.current().expose(),
                 server_uuid,
-                budget.saturating_sub(waited.elapsed()),
+                wait,
             )
             .await
             .map_err(control_error)?;
@@ -1924,6 +1925,26 @@ fn server_code(e: &mysql_async::Error) -> Option<u16> {
 
 /// A failed statement of a batched capture: the connection (I/O or the
 /// driver) as `Open`, anything the server answered as `Capture`.
+/// Test-only: the next capture draws on this pool, waiting at most this
+/// long (a saturated control plane, on the real capture path).
+#[cfg(test)]
+pub(crate) static STARVE_NEXT: std::sync::Mutex<
+    Option<(super::mysql_control::ControlPool, Duration)>,
+> = std::sync::Mutex::new(None);
+
+/// The pool a capture draws on, and its wait: the run's, within what its
+/// lock-wait budget leaves.
+fn control_for(
+    cx: &CaptureCtx,
+    wait: Duration,
+) -> (super::mysql_control::ControlPool, Duration) {
+    #[cfg(test)]
+    if let Some(starved) = STARVE_NEXT.lock().unwrap().take() {
+        return starved;
+    }
+    (cx.control.clone(), wait)
+}
+
 /// A capture's control connection that could not be had: saturation keeps
 /// its class, a connect failure is an open failure, another server is
 /// refused.
@@ -2074,13 +2095,14 @@ pub(crate) async fn capture_batch_with(
             })?
             .expect("capture slots are never closed");
         guard.permit = Some(permit);
-        let mut conn = cx
-            .control
+        let (control, wait) =
+            control_for(cx, budget.saturating_sub(waited.elapsed()));
+        let mut conn = control
             .connect(
                 super::mysql_control::Class::Capture,
                 dsn.current().expose(),
                 server_uuid,
-                budget.saturating_sub(waited.elapsed()),
+                wait,
             )
             .await
             .map_err(|e| failed(control_error(e)))?;
