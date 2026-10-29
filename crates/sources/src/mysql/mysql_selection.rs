@@ -2773,6 +2773,76 @@ mod tests {
             assert_eq!(z.barriers().count(), 1, "the lineage barrier only");
         }
 
+        /// A record naming a version the registry does not have fails its
+        /// table exactly as the table's own read does, and caches nothing;
+        /// the batch's other tables are unaffected.
+        #[tokio::test]
+        async fn a_record_naming_a_missing_version_fails_its_table() {
+            let backend: ArcStorageBackend =
+                Arc::new(storage::MemoryStorageBackend::new());
+            let mut ctx = ctx_on(backend).await;
+            let scope = ctx.registry_scope.current().unwrap();
+            let (bad, good) = (scope.key("d", "bad"), scope.key("d", "good"));
+            let record = Record::new(
+                WmPos::MysqlGtid {
+                    gtid_set: format!("{U}:1-3"),
+                },
+                Kind::Baseline {
+                    version: 7,
+                    schema_hash: "h".into(),
+                    to: WmPos::MysqlGtid {
+                        gtid_set: format!("{U}:1-4"),
+                    },
+                    scan_digest: "s".into(),
+                    binds: None,
+                    classifier_version: CLASSIFIER_VERSION.into(),
+                },
+            );
+            ctx.registry_backend
+                .log_append_if_absent(
+                    ACTIVATION_NS,
+                    &table_stream(&bad),
+                    "baseline-7",
+                    &crate::mysql::mysql_activation::encode_record(&record)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let own = crate::mysql::mysql_activation::read_table_head(
+                &ctx.registry_backend,
+                ctx.schema.registry(),
+                &bad,
+            )
+            .await;
+            let Err(own) = own else {
+                panic!("the per-table read accepts a missing version");
+            };
+            let mut have = std::collections::HashMap::new();
+            let read = crate::mysql::mysql_history::read_each(
+                &ctx.registry_backend,
+                ctx.schema.registry(),
+                &[bad.clone(), good.clone()],
+                &mut have,
+                |_| true,
+            )
+            .await
+            .unwrap();
+            let crate::mysql::mysql_history::Loaded::Invalid(e) = &read[0]
+            else {
+                panic!("{:?}", read[0]);
+            };
+            assert_eq!(e.to_string(), own.to_string());
+            assert!(matches!(
+                read[1],
+                crate::mysql::mysql_history::Loaded::Ok { .. }
+            ));
+            let Err(err) = timeline(&mut ctx, &bad).await else {
+                panic!("a missing version is accepted");
+            };
+            assert!(err.to_string().contains("version 7"), "{err}");
+            assert!(ctx.selection.timeline(&bad.backend_key()).is_none());
+        }
+
         /// The only barrier writer is `append_barrier`: a new one appending
         /// without invalidating the cache fails this test.
         #[test]
