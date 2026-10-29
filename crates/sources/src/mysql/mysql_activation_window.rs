@@ -2891,8 +2891,9 @@ mod tests {
         }
     }
 
-    /// Exhausted lock attempts are the contention incident; other failures
-    /// keep their connection or schema class (never the incident).
+    /// Exhausted lock attempts are the contention incident and saturation
+    /// the saturation incident; other failures keep their connection or
+    /// schema class (never an incident).
     #[test]
     fn capture_failures_keep_their_class() {
         let tables = [("d".to_string(), "t".to_string())];
@@ -2915,6 +2916,23 @@ mod tests {
                 Some(deltaforge_core::incident::ReasonCode::MysqlCaptureContention)
             );
         }
+        // No control-plane connection within the wait: the saturation
+        // incident, naming the bound that stayed full.
+        let e = fail(BatchCaptureError::Failed(ProofError::Saturated {
+            scope: "runner",
+            why: "saturated".into(),
+        }));
+        let draft = e.draft().expect("an incident");
+        assert_eq!(
+            draft.reason_code,
+            deltaforge_core::incident::ReasonCode::MysqlControlPlaneSaturated
+        );
+        assert_eq!(
+            draft
+                .evidence
+                .text_of(deltaforge_core::incident::EvidenceKey::ReasonClass),
+            Some("runner")
+        );
         let e = fail(BatchCaptureError::Failed(ProofError::Open(
             "refused".into(),
         )));

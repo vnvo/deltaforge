@@ -1227,9 +1227,12 @@ mod tests {
             .await;
         let in_use = get(&pool, &s, Class::Capture).await.unwrap();
         let p = pool.clone();
+        let t = tokio::time::Instant::now();
         let drain = tokio::spawn(async move { p.drain(DRAIN_TIMEOUT).await });
         settle().await;
+        // Closed by the drain itself, long before its TTL would.
         assert!(!pool.has_idle());
+        assert!(t.elapsed() < IDLE_TTL, "{:?}", t.elapsed());
         assert_eq!(s.live(), 1);
         assert!(!drain.is_finished(), "waits for the connection in use");
         in_use.release().await;
