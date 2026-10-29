@@ -131,6 +131,23 @@ pub(crate) const SELECTION_CACHE_ENTRIES: usize = 4096;
 /// barrier streams (each once) and selected schemas.
 pub(crate) const SELECTION_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
+/// What a decoded record holds beyond its stored bytes (its in-memory
+/// layout and allocation overhead), counted per record so the byte bound
+/// covers resident memory (measured: `tests/mysql_window_memory_e2e.rs`).
+const RECORD_OVERHEAD: u64 = std::mem::size_of::<Stored>() as u64 + 64;
+/// What one cache entry holds beyond its contents (keys, the LRU node).
+const ENTRY_OVERHEAD: u64 = 512;
+
+/// A timeline's cache cost: its records' stored bytes and their overhead.
+fn timeline_cost(t: &Timeline) -> u64 {
+    t.bytes + t.records.len() as u64 * RECORD_OVERHEAD + ENTRY_OVERHEAD
+}
+
+/// A barrier stream's cache cost (held once).
+fn stream_cost(s: &BarrierStream) -> u64 {
+    s.bytes + s.records.len() as u64 * RECORD_OVERHEAD
+}
+
 /// `deltaforge_mysql_selection_cache_evictions_total{pipeline,source}`.
 pub(crate) const METRIC_EVICTIONS: &str =
     "deltaforge_mysql_selection_cache_evictions_total";
@@ -279,7 +296,7 @@ impl Caches {
                 {
                     *refs -= 1;
                     if *refs == 0 {
-                        let gone = held.bytes;
+                        let gone = stream_cost(held);
                         self.barriers.remove(&s.stream);
                         self.bytes -= gone;
                     }
@@ -373,10 +390,10 @@ impl Caches {
                         .get(&s.stream)
                         .is_none_or(|(held, _)| held != *s)
                 })
-                .map(|s| s.bytes)
+                .map(|s| stream_cost(s))
                 .sum();
             if self.timelines < self.max_tables
-                && self.bytes + timeline.bytes + new <= self.max_bytes
+                && self.bytes + timeline_cost(&timeline) + new <= self.max_bytes
             {
                 break;
             }
@@ -395,16 +412,16 @@ impl Caches {
                 // append invalidates every timeline of the older).
                 _ => {
                     if let Some((old, _)) = self.barriers.remove(&s.stream) {
-                        self.bytes -= old.bytes;
+                        self.bytes -= stream_cost(&old);
                     }
                     self.barriers.insert(s.stream.clone(), (s.clone(), 1));
-                    self.bytes += s.bytes;
+                    self.bytes += stream_cost(s);
                 }
             }
         }
         self.timelines += 1;
-        self.bytes += shared.bytes;
-        let bytes = shared.bytes;
+        let bytes = timeline_cost(&shared);
+        self.bytes += bytes;
         self.entries.push(
             CacheKey::Timeline(key),
             (Cached::Timeline(Arc::new(shared), false), bytes),
@@ -447,7 +464,7 @@ impl Caches {
     ) {
         let bytes = serde_json::to_vec(&v.schema_json)
             .map_or(0, |b| b.len() as u64)
-            + 64;
+            + ENTRY_OVERHEAD;
         self.put(
             CacheKey::Version(table, v.version),
             Cached::Version(Arc::new(v)),
@@ -551,7 +568,7 @@ impl Caches {
     pub(crate) fn barrier_appended(&mut self, stream: &str) {
         self.invalidate_where(|t| t.starts_with(stream));
         if let Some((s, _)) = self.barriers.remove(stream) {
-            self.bytes -= s.bytes;
+            self.bytes -= stream_cost(&s);
         }
     }
 
@@ -564,9 +581,94 @@ impl Caches {
     }
 }
 
+/// A cache of `tables` timelines of `records` baselines each, sharing one
+/// barrier stream, built as a loaded cache holds them, with the bytes it
+/// estimates: a measurement seam (the estimate against resident memory,
+/// `tests/mysql_window_memory_e2e.rs`). The cache is returned opaque, held
+/// until dropped.
+#[doc(hidden)]
+pub fn cache_memory_probe(
+    tables: usize,
+    records: usize,
+) -> (u64, Box<dyn std::any::Any + Send>) {
+    const U: &str = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+    let bytes_of = |s: &Stored| -> u64 {
+        let value =
+            mysql_activation::encode_record(&s.record).expect("encodes");
+        storage::log_entry_bytes(&storage::LogEntryMeta {
+            seq: 0,
+            stored_at_ms: 0,
+            capture_id: Some(s.capture_id.clone()),
+            content_hash: None,
+            value,
+        })
+    };
+    let shared = {
+        let records: Vec<Stored> = (1..=3)
+            .map(|i| Stored {
+                capture_id: format!("{i:064x}"),
+                record: Record::new(
+                    WmPos::MysqlGtid {
+                        gtid_set: format!("{U}:1-{i}"),
+                    },
+                    Kind::Barrier {
+                        scope: mysql_activation::BarrierScope::Lineage,
+                    },
+                ),
+            })
+            .collect();
+        let bytes = records.iter().map(bytes_of).sum();
+        Arc::new(BarrierStream {
+            stream: "probe/".into(),
+            records,
+            head: 3,
+            bytes,
+        })
+    };
+    let mut caches = Caches::with_limits(
+        usize::MAX / 2,
+        u64::MAX / 2,
+        metrics::Counter::noop(),
+    );
+    for t in 0..tables {
+        let records: Vec<Stored> = (0..records)
+            .map(|i| Stored {
+                capture_id: format!("{:064x}", t * 1_000_000 + i),
+                record: Record::new(
+                    WmPos::MysqlGtid {
+                        gtid_set: format!("{U}:1-{}", 10 + i),
+                    },
+                    Kind::Baseline {
+                        version: 1 + i as i32,
+                        schema_hash: format!("{i:064x}"),
+                        to: WmPos::MysqlGtid {
+                            gtid_set: format!("{U}:1-{}", 11 + i),
+                        },
+                        scan_digest: format!("{i:064x}"),
+                        binds: None,
+                        classifier_version: CLASSIFIER_VERSION.into(),
+                    },
+                ),
+            })
+            .collect();
+        let bytes = records.iter().map(bytes_of).sum();
+        caches.put_timeline(
+            format!("probe/d/t{t}"),
+            Arc::new(Timeline {
+                records,
+                table_head: 1,
+                streams: vec![shared.clone()],
+                bytes,
+            }),
+        );
+    }
+    (caches.bytes, Box::new(caches))
+}
+
 /// A selected schema's estimated bytes: its encoding.
 fn schema_bytes(loaded: &LoadedSchema) -> u64 {
-    serde_json::to_vec(&loaded.schema).map_or(0, |b| b.len() as u64) + 64
+    serde_json::to_vec(&loaded.schema).map_or(0, |b| b.len() as u64)
+        + ENTRY_OVERHEAD
 }
 
 fn invalid(key: &SchemaKey, why: impl Into<String>) -> anyhow::Error {
@@ -2590,9 +2692,13 @@ mod tests {
                     caches.bytes()
                 );
             }
-            // 4 timelines of 54 MiB and the 10 MiB stream once: 226 MiB.
+            // 4 timelines of 54 MiB (and their entries) and the 10 MiB
+            // stream once: about 226 MiB.
             assert_eq!(caches.timelines(), 4);
-            assert_eq!(caches.bytes(), 4 * (54 << 20) + (10 << 20));
+            assert_eq!(
+                caches.bytes(),
+                4 * ((54 << 20) + ENTRY_OVERHEAD) + (10 << 20)
+            );
             assert_eq!(caches.barrier_streams().len(), 1);
             // The last timeline holding the stream takes it with it.
             caches.barrier_appended("lineage/");

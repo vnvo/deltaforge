@@ -57,6 +57,8 @@ pub(crate) use mysql_history::{
     TIMELINE_MAX_BYTES, TooLarge as TimelineTooLarge,
 };
 pub use mysql_schema_loader::{LoadedSchema, MySqlSchemaLoader};
+#[doc(hidden)]
+pub use mysql_selection::cache_memory_probe;
 pub(crate) use mysql_window_budget::Invalid as WindowInvalid;
 
 pub mod mysql_rotation;
