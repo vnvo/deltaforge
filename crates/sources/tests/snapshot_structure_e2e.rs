@@ -281,6 +281,7 @@ async fn postgres_generation_operations_are_structurally_linear() -> Result<()>
 async fn mysql_generation_operations_are_structurally_linear() -> Result<()> {
     let _run = RUN.lock().await;
     let mut runs = Vec::new();
+    let mut opened_by_size = Vec::new();
     for n in SIZES {
         let (db, pool, _dsn) =
             test_common::mysql_setup(&format!("struct{n}")).await?;
@@ -325,9 +326,29 @@ async fn mysql_generation_operations_are_structurally_linear() -> Result<()> {
             proofs: Default::default(),
             type_mapping: deltaforge_core::TypeMapping::V2,
         };
+        // The connections of the generation, baselines included.
+        let root = test_common::mysql_root_dsn().await;
+        test_common::mysql_connections_reset(&id);
+        let before = test_common::mysql_server_connections(&root).await;
         runs.push(complete(&src, &id, n, &counting, &inner).await?);
+        let opened =
+            test_common::mysql_server_connections(&root).await - before;
+        let peaks = test_common::mysql_connections(&id);
+        eprintln!(
+            "snapshot of {n} tables: {opened} server connections opened; \
+             peaks {peaks:?}"
+        );
+        // Lock + max_parallel_tables workers.
+        test_common::assert_mysql_connection_bounds("snapshot", &peaks, 4);
+        opened_by_size.push(opened);
         test_common::mysql_drop_db(&pool, &db).await;
     }
+    // Not one connection per table: 9 times the tables open at most a few
+    // more connections (timing: idle expiry, reconnects).
+    assert!(
+        opened_by_size[2] <= opened_by_size[0] + 8,
+        "connections opened by size {SIZES:?}: {opened_by_size:?}"
+    );
     assert_structure("mysql", &runs);
     Ok(())
 }

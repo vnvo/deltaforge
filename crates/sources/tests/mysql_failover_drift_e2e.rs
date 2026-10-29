@@ -852,6 +852,85 @@ async fn drifted_on_b(
     (st, sc, committed, hash)
 }
 
+/// A failover reaching many tables at once: run 2 on B first touches 40
+/// tables, each with its failover drift check. The source's connections
+/// stay within their bounds, and the connections the server sees opened are
+/// not one per table (`docs/design/mysql-mass-invalidation.md`, section 5).
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn a_failover_over_many_tables_stays_within_the_connection_bounds() {
+    init_test_tracing();
+    const N: usize = 40;
+    let (a, b) = servers().await;
+    let db = "fd_many";
+    let sc = Scenario {
+        id: db,
+        db,
+        tables: vec![format!("{db}.*")],
+    };
+    let st = State::new().await;
+    let schema: Vec<String> = (0..N)
+        .map(|i| format!("CREATE TABLE t{i:03} (id INT PRIMARY KEY, n INT)"))
+        .collect();
+    let mut on_a = vec![
+        format!("DROP DATABASE IF EXISTS {db}"),
+        format!("CREATE DATABASE {db}"),
+        format!("USE {db}"),
+    ];
+    on_a.extend(schema.iter().cloned());
+    sql(a, &on_a).await;
+    let first: Vec<String> = (0..N)
+        .map(|i| format!("INSERT INTO {db}.t{i:03} VALUES (1, 1)"))
+        .collect();
+    let src = source(&sc, a, &st, OnSchemaDrift::Adapt, SnapshotMode::Never);
+    let (items, _) = run(src, &st, a, &first, Duration::from_secs(6)).await;
+    assert_eq!(rows(&items).len(), N, "run 1 on A");
+    let mut on_b = vec![
+        format!("DROP DATABASE IF EXISTS {db}"),
+        format!("CREATE DATABASE {db}"),
+        format!("USE {db}"),
+    ];
+    on_b.extend(schema.iter().cloned());
+    sql(b, &on_b).await;
+    let executed = query_one(a, "SELECT @@GLOBAL.gtid_executed").await;
+    sql(
+        b,
+        &[
+            "RESET BINARY LOGS AND GTIDS".to_string(),
+            format!("SET GLOBAL gtid_purged = '{executed}'"),
+        ],
+    )
+    .await;
+    let mut burst = vec!["BEGIN".to_string()];
+    burst.extend(
+        (0..N).map(|i| format!("INSERT INTO {db}.t{i:03} VALUES (2, 2)")),
+    );
+    burst.push("COMMIT".to_string());
+    test_common::mysql_connections_reset(db);
+    let root = dsn(b, "");
+    let before = test_common::mysql_server_connections(&root).await;
+    let src = source(&sc, b, &st, OnSchemaDrift::Halt, SnapshotMode::Never);
+    let (items, ended) = run(src, &st, b, &burst, Duration::from_secs(8)).await;
+    let opened = test_common::mysql_server_connections(&root).await - before;
+    let peaks = test_common::mysql_connections(db);
+    eprintln!(
+        "failover over {N} tables: {opened} server connections opened; \
+         peaks {peaks:?}"
+    );
+    assert!(ended.is_none(), "still streaming: {ended:?}");
+    assert_eq!(rows(&items).len(), N, "run 2 on B");
+    for i in 0..N {
+        let m = st
+            .marker(b, sc.id, db, &format!("t{i:03}"))
+            .await
+            .expect("recorded");
+        assert_eq!(m["outcome"], "unchanged", "t{i:03}: {m}");
+    }
+    test_common::assert_mysql_connection_bounds("failover", &peaks, 0);
+    // The run's own startup and status reads, never one per table.
+    assert!(opened <= 24, "{opened} connections for {N} tables");
+}
+
 /// The window's two rows on B (one transaction).
 fn window_rows(db: &str) -> Vec<String> {
     vec![

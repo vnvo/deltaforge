@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// What a connection is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum Kind {
+pub enum Kind {
     /// A binlog session: the stream, or a proof scan.
     Replication,
     /// A control-plane connection (captures, catalog, position, health).
@@ -22,7 +22,7 @@ pub(crate) enum Kind {
 }
 
 impl Kind {
-    pub(crate) fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Replication => "replication",
             Self::Control => "control",
@@ -90,16 +90,14 @@ fn gauge(source: &str, kind: Kind, now: i64) {
 }
 
 /// `source`'s open connections of `kind` now, and the most at once since
-/// the last [`reset_peak`].
-#[cfg(test)]
-pub(crate) fn connections(source: &str, kind: Kind) -> (i64, i64) {
+/// the last [`reset_peak`] (a diagnostic, for measurements).
+pub fn connections(source: &str, kind: Kind) -> (i64, i64) {
     let c = count(source, kind);
     (c.now.load(Ordering::SeqCst), c.peak.load(Ordering::SeqCst))
 }
 
 /// Start a new peak at the current count (measurements).
-#[cfg(test)]
-pub(crate) fn reset_peak(source: &str, kind: Kind) {
+pub fn reset_peak(source: &str, kind: Kind) {
     let c = count(source, kind);
     c.peak.store(c.now.load(Ordering::SeqCst), Ordering::SeqCst);
 }

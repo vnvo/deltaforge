@@ -927,3 +927,63 @@ pub fn row_view(row: &deltaforge_core::CanonicalRow) -> serde_json::Value {
         deltaforge_core::TypeMapping::V2,
     ))
 }
+
+/// Source `id`'s MySQL connections by kind: (open now, most at once since
+/// the last [`mysql_connections_reset`]).
+pub fn mysql_connections(
+    id: &str,
+) -> std::collections::BTreeMap<&'static str, (i64, i64)> {
+    use sources::mysql::mysql_connections::{Kind, connections};
+    [
+        Kind::Replication,
+        Kind::Control,
+        Kind::Cancellation,
+        Kind::SnapshotCopy,
+    ]
+    .into_iter()
+    .map(|k| (k.label(), connections(id, k)))
+    .collect()
+}
+
+/// Start new peaks for source `id`'s MySQL connections.
+pub fn mysql_connections_reset(id: &str) {
+    use sources::mysql::mysql_connections::{Kind, reset_peak};
+    for k in [
+        Kind::Replication,
+        Kind::Control,
+        Kind::Cancellation,
+        Kind::SnapshotCopy,
+    ] {
+        reset_peak(id, k);
+    }
+}
+
+/// The server's `Connections` status: every connection attempt since it
+/// started (this one included).
+pub async fn mysql_server_connections(dsn: &str) -> u64 {
+    let mut c = mysql_async::Conn::from_url(dsn).await.unwrap();
+    let row: Option<(String, u64)> = c
+        .query_first("SHOW GLOBAL STATUS LIKE 'Connections'")
+        .await
+        .unwrap();
+    c.disconnect().await.ok();
+    row.unwrap().1
+}
+
+/// The bounds every MySQL source's connections stay within, whatever its
+/// table count (`docs/design/mysql-mass-invalidation.md`, section 5):
+/// at most `P` (default 4) control connections, at most one stream plus
+/// two activation-window openings at a time for each of at most two
+/// windows, no snapshot connection beyond `snapshot_copy`, and no
+/// cancellation unless a capture was stopped.
+pub fn assert_mysql_connection_bounds(
+    what: &str,
+    peaks: &std::collections::BTreeMap<&'static str, (i64, i64)>,
+    snapshot_copy: i64,
+) {
+    let peak = |k: &str| peaks[k].1;
+    assert!(peak("control") <= 4, "{what}: {peaks:?}");
+    assert!(peak("replication") <= 5, "{what}: {peaks:?}");
+    assert!(peak("snapshot_copy") <= snapshot_copy, "{what}: {peaks:?}");
+    assert_eq!(peak("cancellation"), 0, "{what}: {peaks:?}");
+}

@@ -362,8 +362,26 @@ async fn burst(gtid: bool) {
             .await
             .unwrap();
     }
+    // Connections from here: the cold activation of every table.
+    test_common::mysql_connections_reset(&id);
+    let opened = test_common::mysql_server_connections(&dsn(port, DB)).await;
     r.handle.resume();
     r.delivered(n, Duration::from_secs(120)).await;
+    let opened =
+        test_common::mysql_server_connections(&dsn(port, DB)).await - opened;
+    let peaks = test_common::mysql_connections(&id);
+    sleep(Duration::from_secs(1)).await;
+    let steady = test_common::mysql_connections(&id);
+    eprintln!(
+        "cold activation of {n} tables (gtid={gtid}): {opened} server \
+         connections opened; peaks {peaks:?}; steady {steady:?}"
+    );
+    test_common::assert_mysql_connection_bounds("cold activation", &peaks, 0);
+    // Independent of the table count: not one per table (two counted
+    // connections are this test's own status reads).
+    assert!(opened <= 24, "{opened} connections for {n} tables");
+    assert!(steady["control"].0 <= 1, "{steady:?}");
+    assert_eq!(steady["replication"].0, 1, "{steady:?}");
     let got = r.firsts.lock().unwrap().clone();
     for i in 0..n as i64 {
         assert_eq!(got.get(&format!("t{i:04}")), Some(&(1, i)), "t{i:04}");

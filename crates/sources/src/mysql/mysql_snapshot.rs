@@ -1567,6 +1567,7 @@ mod live_anchor_tests {
 
         // Establish the anchor while writes are in flight.
         let (mut workers, position) = acquire_locked_anchor(
+            "test",
             &dsn,
             &live_uuid(&dsn).await,
             4,
@@ -1648,6 +1649,7 @@ mod live_anchor_tests {
             .unwrap();
 
         let (workers, _pos) = acquire_locked_anchor(
+            "test",
             &dsn,
             &live_uuid(&dsn).await,
             2,
@@ -1747,6 +1749,7 @@ mod live_anchor_tests {
 
         let started = Instant::now();
         let res = acquire_locked_anchor(
+            "test",
             &dsn,
             &live_uuid(&dsn).await,
             2,
@@ -1764,6 +1767,7 @@ mod live_anchor_tests {
         blocker.query_drop("UNLOCK TABLES").await.unwrap();
         drop(blocker);
         let (workers, _pos) = acquire_locked_anchor(
+            "test",
             &dsn,
             &live_uuid(&dsn).await,
             2,

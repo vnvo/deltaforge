@@ -806,8 +806,13 @@ Today it takes about 30 statements per table, about 61,000.
 ### 5. MySQL control-plane connections
 
 **Limits.**
-- **Per source:** a `mysql_async::Pool` with constraints min 0, max `P`
-  (default 4, valid 2-16, validated config). It is used for:
+- **Per source:** a pool of at most `P` connections (default 4, valid 2-16,
+  `proofs.control_connections`), keyed by tenant and source so a source's
+  runs and schema loaders share it. It is DeltaForge's own
+  (`mysql_control`), not a `mysql_async::Pool`: that pool opens and closes
+  connections internally, so neither a runner permit held for exactly a
+  connection's life nor an eviction from outside can be built on it. It is
+  used for:
   - captures and `capture_batch`;
   - schema reads;
   - health and preflight checks;
@@ -864,14 +869,34 @@ Today it takes about 30 statements per table, about 61,000.
 
   | Class | On timeout |
   |---|---|
-  | Capture (window, baseline, drift) | bounded by `capture_lock_wait_secs` overall; classified `mysql_capture_contention` |
+  | Capture (window, baseline, drift) | bounded by `capture_lock_wait_secs` overall: the lock-holding slot first (its timeout is `mysql_capture_contention`), then a connection within what remains (its timeout is `mysql_control_plane_saturated`) |
+  | Catalog read (schema loader) | 30 s; a retryable connection error |
   | Position query | 5 s; retried by the caller's existing policy |
   | Health and preflight | 5 s; reported as "unknown", not "failed" |
   | Cancellation | never waits on a pool; draws only on the reserve |
 
-- **Fair queueing:** acquisition is FIFO within a class. Health checks are
+- **Fair queueing:** acquisition is FIFO within a class (as built: FIFO
+  across all classes, per source and for the runner). Health checks are
   limited to one in flight per source, so they cannot starve captures, and
   captures cannot starve the single health check beyond its timeout.
+
+**As built (5d).**
+- A capture takes its lock-holding slot before its connection, so a capture
+  waiting for a slot holds no connection.
+- Saturation raises the incident where a capture cannot be skipped: an
+  activation window's capture (not retried in place) and a failover drift
+  capture (never recorded as an unprovable drift). A snapshot baseline or a
+  forward proof that cannot capture leaves its table to the lazy proof, as
+  for any failed capture.
+- A connection is reused only for the same DSN (as a digest) and server; a
+  connection opened for no particular server (identity reads that learn the
+  server) is budgeted and never reused.
+- Outside the budget: the one-shot `deltaforge preflight` command (its own
+  process), and public helpers no production path calls.
+- Measured on the live suites: a 200-table cold activation opened 2 server
+  connections (control peak 1, replication peak 2); a 40-table failover
+  window 9 (its startup included; control peak 2); a snapshot generation 13
+  at 10, 30 and 90 tables alike (control peak 2, snapshot copy 4).
 
 **Draining on rotation and failover.**
 - **Rotation:** applied only at a boundary with nothing pending. Today's

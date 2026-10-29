@@ -363,6 +363,19 @@ impl CaptureCtx {
         }
     }
 
+    /// A context of its own on `control` (tests).
+    #[cfg(test)]
+    pub(crate) fn detached_on(
+        dsn: impl Into<crate::credentials::SharedDsn>,
+        control: super::mysql_control::ControlPool,
+    ) -> Self {
+        Self {
+            dsn: dsn.into(),
+            cancel: CancellationToken::new(),
+            control,
+        }
+    }
+
     /// Stop the context's run (tests).
     #[cfg(test)]
     pub(crate) fn stop(&self) {
@@ -5502,13 +5515,15 @@ pub(crate) mod tests {
                 timeout_secs: 30,
                 ..Default::default()
             };
-            let scan = open_replication_session_abortive(&client, &uuid)
-                .await
-                .unwrap();
+            let scan =
+                open_replication_session_abortive(&client, &uuid, "test")
+                    .await
+                    .unwrap();
             assert_eq!(scan.linger().unwrap(), Some(Duration::ZERO));
             drop(scan);
-            let stream =
-                open_replication_session(&client, &uuid).await.unwrap();
+            let stream = open_replication_session(&client, &uuid, "test")
+                .await
+                .unwrap();
             assert_ne!(stream.linger().unwrap(), Some(Duration::ZERO));
         }
 
@@ -6954,6 +6969,209 @@ pub(crate) mod tests {
                 );
                 let idle = sessions(&root, "reads_u").await;
                 assert!(idle <= 1, "{idle} idle connections retained");
+            }
+
+            /// A pool of its own on `budget` (`P` = 2).
+            fn pool_on(
+                budget: &'static crate::mysql::mysql_control::Budget,
+                name: &str,
+            ) -> crate::mysql::mysql_control::ControlPool {
+                crate::mysql::mysql_control::ControlPool::detached(
+                    budget, name, 2,
+                )
+            }
+
+            /// Cancellation never waits behind ordinary work: with every
+            /// ordinary permit of the runner held by `L` captures queued
+            /// for their tables' metadata locks (single and batched), a stop
+            /// kills each of them through the reserve, at once, with no
+            /// failed kill.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn cancellation_draws_on_its_reserve_with_the_budget_full() {
+                let root = server(true).await;
+                let db = "control_cancel";
+                sql(
+                    &root,
+                    &[
+                        &format!("CREATE DATABASE {db}"),
+                        &format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)"),
+                    ],
+                )
+                .await;
+                let mut holder =
+                    mysql_async::Conn::from_url(&root).await.unwrap();
+                holder
+                    .query_drop(format!("LOCK TABLES {db}.t WRITE"))
+                    .await
+                    .unwrap();
+                const L: usize = 2;
+                // G = R + L: the L captures take every ordinary permit.
+                let budget: &'static crate::mysql::mysql_control::Budget =
+                    Box::leak(Box::new(
+                        crate::mysql::mysql_control::Budget::new(
+                            KILL_RESERVE + L,
+                        ),
+                    ));
+                let slots: &'static CaptureSlots =
+                    Box::leak(Box::new(CaptureSlots::new(L, L)));
+                let cx = CaptureCtx::detached_on(
+                    root.as_str(),
+                    pool_on(budget, "cancel"),
+                );
+                let u = uuid(&root).await;
+                let failures = kill_failures();
+                let tasks: Vec<_> = (0..L)
+                    .map(|i| {
+                        positioned::cancellable(
+                            slots,
+                            cx.clone(),
+                            &u,
+                            db,
+                            i % 2 == 1,
+                            None,
+                        )
+                    })
+                    .collect();
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while positioned_waiting(&root, db).await < L {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the captures never queued"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert_eq!(
+                    budget.available(),
+                    0,
+                    "every ordinary permit is held"
+                );
+                let t = Instant::now();
+                cx.stop();
+                for task in tasks {
+                    let r = tokio::time::timeout(Duration::from_secs(2), task)
+                        .await
+                        .expect("a cancelled capture returns at once")
+                        .unwrap();
+                    assert!(matches!(r, Err(Cancelled)), "{r:?}");
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while positioned_waiting(&root, db).await > 0 {
+                    assert!(
+                        Instant::now() < deadline,
+                        "a killed session still waits"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert!(
+                    t.elapsed() < Duration::from_secs(5),
+                    "{:?}",
+                    t.elapsed()
+                );
+                assert_eq!(kill_failures(), failures, "a kill failed");
+                assert_eq!(slots.retired(), 0);
+                holder.query_drop("UNLOCK TABLES").await.unwrap();
+            }
+
+            /// Sessions queued for `db.t`'s metadata lock.
+            async fn positioned_waiting(dsn: &str, db: &str) -> usize {
+                let mut c = mysql_async::Conn::from_url(dsn).await.unwrap();
+                let n: Option<u64> = c
+                    .exec_first(
+                        "SELECT COUNT(*) FROM information_schema.PROCESSLIST \
+                         WHERE STATE = 'Waiting for table metadata lock' AND DB IS NULL \
+                         AND INFO LIKE ?",
+                        (format!("%`{db}`.`t`%"),),
+                    )
+                    .await
+                    .unwrap();
+                c.disconnect().await.ok();
+                n.unwrap_or(0) as usize
+            }
+
+            /// A capture that gets no control-plane connection within its
+            /// wait is `Saturated`, naming the bound that stayed full, and
+            /// becomes the `mysql_control_plane_saturated` incident; neither
+            /// carries the DSN or its credentials.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn a_capture_without_a_connection_is_saturated() {
+                use crate::mysql::mysql_control::Class;
+                let root = server(true).await;
+                let db = "control_saturated";
+                sql(
+                    &root,
+                    &[
+                        &format!("CREATE DATABASE {db}"),
+                        &format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)"),
+                    ],
+                )
+                .await;
+                let dsn = account(&root, "sat_u").await;
+                let u = uuid(&root).await;
+                // G = R + 1: another source holds the only ordinary permit.
+                let budget: &'static crate::mysql::mysql_control::Budget =
+                    Box::leak(Box::new(
+                        crate::mysql::mysql_control::Budget::new(
+                            KILL_RESERVE + 1,
+                        ),
+                    ));
+                let other = pool_on(budget, "other");
+                let held = other
+                    .connect(Class::Catalog, &dsn, &u, Duration::from_secs(5))
+                    .await
+                    .unwrap();
+                let cx = CaptureCtx::detached_on(
+                    dsn.as_str(),
+                    pool_on(budget, "starved"),
+                );
+                let tables = vec![(db.to_string(), "t".to_string())];
+                let t = Instant::now();
+                let r = capture_batch(&cx, &u, LINEAGE, &tables, 1, None)
+                    .await
+                    .expect("not cancelled");
+                let Err(BatchCaptureError::Failed(
+                    e @ ProofError::Saturated { scope, .. },
+                )) = r
+                else {
+                    panic!("{r:?}");
+                };
+                assert_eq!(scope, "runner");
+                assert!(
+                    t.elapsed() >= Duration::from_secs(1),
+                    "{:?}",
+                    t.elapsed()
+                );
+                let at = position(&root).await;
+                let err = crate::incident_drafts::mysql_control_plane_saturated(
+                    "src",
+                    "activation window",
+                    &tables,
+                    scope,
+                    &at,
+                );
+                let deltaforge_core::SourceError::Incident { draft, .. } = &err
+                else {
+                    panic!("{err:?}");
+                };
+                assert_eq!(
+                    draft.reason_code,
+                    deltaforge_core::incident::ReasonCode::MysqlControlPlaneSaturated
+                );
+                for text in
+                    [e.to_string(), format!("{err}"), format!("{err:?}")]
+                {
+                    assert!(
+                        !text.contains("sat_u") && !text.contains(":pw@"),
+                        "{text}"
+                    );
+                }
+                held.release().await;
+                // With the permit back, the capture proceeds.
+                let ok = capture_batch(&cx, &u, LINEAGE, &tables, 5, None)
+                    .await
+                    .expect("not cancelled");
+                assert!(ok.is_ok(), "{ok:?}");
             }
         }
     }

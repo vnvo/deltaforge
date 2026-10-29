@@ -33,7 +33,7 @@ mod mysql_activation_window;
 mod mysql_baseline;
 mod mysql_binlog_scan;
 mod mysql_checkpoint_lineage;
-mod mysql_connections;
+pub mod mysql_connections;
 pub mod mysql_control;
 mod mysql_ddl_attribution;
 mod mysql_failover_drift;
@@ -4035,9 +4035,12 @@ mod identity_fail_closed_tests {
 
     #[tokio::test]
     async fn fetch_identity_verified_fails_closed_when_query_unavailable() {
-        let err = fetch_identity_verified(UNREACHABLE_DSN)
-            .await
-            .expect_err("unreachable server must fail closed");
+        let err = fetch_identity_verified(
+            &super::mysql_control::ControlPool::standalone("unreachable"),
+            UNREACHABLE_DSN,
+        )
+        .await
+        .expect_err("unreachable server must fail closed");
         let msg = err.to_string();
         assert!(
             msg.contains("refusing to stream"),
