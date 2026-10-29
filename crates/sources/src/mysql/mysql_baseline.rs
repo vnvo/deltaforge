@@ -25,9 +25,10 @@ use deltaforge_core::{CheckpointOrder, SourceError, SourceResult};
 use schema_registry::SourceSchema as _;
 use tracing::{info, warn};
 
+#[cfg(test)]
+use super::mysql_activation::select;
 use super::mysql_activation::{
-    self, Kind, Record, Selection, Stored, baseline_capture_id, select,
-    table_stream,
+    self, Kind, Record, Selection, Stored, baseline_capture_id, table_stream,
 };
 use super::mysql_activation_window::PreparedOutcome;
 use super::mysql_binlog_scan::{
@@ -166,16 +167,43 @@ pub(crate) async fn establish(
         warn!(source_id = %ctx.source_id, "unparseable start position: no baselines");
         return Ok(0);
     };
-    let candidates = candidates(ctx, tracked, &r0).await?;
+    // The candidates are read as the chunks need them, in discovery order:
+    // at most one chunk's (and one batched read) at a time.
+    let mut pending: std::collections::VecDeque<(Candidate, Timeline)> =
+        Default::default();
+    let mut barriers = Default::default();
+    let mut next = 0;
     let mut written = 0;
-    let mut at = 0;
-    while at < candidates.len() {
-        let end = (at + super::mysql_binlog_scan::MAX_BATCH_TABLES)
-            .min(candidates.len());
+    loop {
+        let plan = super::mysql_window_budget::Caps::current().plan.bytes;
+        while next < tracked.len()
+            && pending.len() < super::mysql_binlog_scan::MAX_BATCH_TABLES
+            && pending.iter().map(|(_, t)| t.bytes).sum::<u64>() < plan
+        {
+            let take = (tracked.len() - next)
+                .min(super::mysql_history::BATCH_MAX_TABLES)
+                .min(
+                    super::mysql_binlog_scan::MAX_BATCH_TABLES - pending.len(),
+                );
+            pending.extend(
+                candidates(
+                    ctx,
+                    &tracked[next..next + take],
+                    &r0,
+                    &mut barriers,
+                )
+                .await?,
+            );
+            next += take;
+        }
+        if pending.is_empty() {
+            break;
+        }
         let chunk =
-            establish_chunk(ctx, &candidates[at..end], &r0, &r0_cp).await?;
+            establish_chunk(ctx, pending.make_contiguous(), &r0, &r0_cp)
+                .await?;
         written += chunk.written;
-        at += chunk.consumed.max(1);
+        pending.drain(..chunk.consumed.clamp(1, pending.len()));
         #[cfg(test)]
         {
             use std::sync::atomic::Ordering::SeqCst;
@@ -198,50 +226,64 @@ pub(crate) async fn establish(
     Ok(written)
 }
 
-/// Each tracked table not proven at R0, in the given (discovery) order,
+/// Each of `tracked` not proven at R0, in the given (discovery) order,
 /// with its timeline (records, barriers and their heads) and the barrier it
-/// binds.
+/// binds: their histories read in bounded batches, every barrier stream
+/// once (`barriers` holds those read so far). A table whose timeline is over
+/// its limit gets no baseline (its rows' own proof stops on it).
 async fn candidates(
     ctx: &RunCtx,
     tracked: &[(String, String)],
     r0: &WmPos,
+    barriers: &mut std::collections::HashMap<
+        String,
+        std::sync::Arc<super::mysql_history::BarrierStream>,
+    >,
 ) -> SourceResult<Vec<(Candidate, Timeline)>> {
+    use super::mysql_history::Loaded;
     let scope = ctx.registry_scope.current()?;
     let storage = |e: anyhow::Error| {
         SourceError::Other(e.context("read the activation timeline"))
     };
+    let keys: Vec<SchemaKey> =
+        tracked.iter().map(|(db, t)| scope.key(db, t)).collect();
+    let read = super::mysql_history::read_each(
+        &ctx.registry_backend,
+        ctx.schema.registry(),
+        &keys,
+        barriers,
+        |_| true,
+    )
+    .await
+    .map_err(storage)?;
     let mut out = Vec::new();
-    for (db, table) in tracked {
-        let key = scope.key(db, table);
-        let (records, table_head) = mysql_activation::read_table_head(
-            &ctx.registry_backend,
-            ctx.schema.registry(),
-            &key,
-        )
-        .await
-        .map_err(storage)?;
-        let (barriers, barrier_heads) =
-            mysql_activation::read_barriers_head(&ctx.registry_backend, &key)
-                .await
-                .map_err(storage)?;
-        let all: Vec<Stored> =
-            records.iter().chain(barriers.iter()).cloned().collect();
-        if matches!(select(&all, r0), Selection::Proven { .. }) {
+    for ((db, table), loaded) in tracked.iter().zip(read) {
+        let t = match loaded {
+            Loaded::Ok { table, streams, .. } => Timeline {
+                records: table.records,
+                table_head: table.head,
+                streams,
+                bytes: table.bytes,
+            },
+            Loaded::Invalid(e) => return Err(storage(e.into())),
+            Loaded::TooLarge(e) => {
+                warn!(source_id = %ctx.source_id, %db, %table, error = %e, "no baseline");
+                continue;
+            }
+            Loaded::Unread => unreachable!("every table is read"),
+        };
+        if matches!(t.select_decisive(r0).0, Selection::Proven { .. }) {
             continue;
         }
-        match barrier_to_bind(&records, &barriers, r0) {
+        let barriers: Vec<Stored> = t.barriers().cloned().collect();
+        match barrier_to_bind(&t.records, &barriers, r0) {
             Ok(binds) => out.push((
                 Candidate {
                     db: db.clone(),
                     table: table.clone(),
                     binds,
                 },
-                Timeline {
-                    records,
-                    barriers,
-                    table_head,
-                    barrier_heads,
-                },
+                t,
             )),
             Err(why) => {
                 warn!(source_id = %ctx.source_id, %db, %table, why, "no baseline");
@@ -555,7 +597,7 @@ async fn establish_chunk(
                 .map(|(_, t)| t)
                 .expect("a chunk table");
             let (table_head, barrier_heads) = if attempt == 1 {
-                (t.table_head, t.barrier_heads.clone())
+                (t.table_head, t.barrier_heads())
             } else {
                 let (_, head) = mysql_activation::read_table_head(
                     &ctx.registry_backend,
@@ -962,7 +1004,8 @@ pub(crate) async fn establish_at(
         kind: ProofKind::Lazy,
     };
     let lctn = ctx.lower_case_table_names;
-    let binds = match barrier_to_bind(&current.records, &current.barriers, &e) {
+    let barriers: Vec<Stored> = current.barriers().cloned().collect();
+    let binds = match barrier_to_bind(&current.records, &barriers, &e) {
         Ok(binds) => binds,
         Err(why) => {
             info!(source_id = %ctx.source_id, %db, %table, why, "no lazy baseline");

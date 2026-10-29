@@ -540,6 +540,27 @@ pub(crate) async fn resolve_binding(
     ddl_id: &str,
     supported_classifier: &str,
 ) -> Result<Option<i32>> {
+    resolve_binding_known(
+        registry,
+        key,
+        records,
+        ddl_id,
+        supported_classifier,
+        &HashMap::new(),
+    )
+    .await
+}
+
+/// [`resolve_binding`], with the hashes of `known` versions read before
+/// the registry's (the same answer, without a store read for them).
+pub(crate) async fn resolve_binding_known(
+    registry: &DurableSchemaRegistry,
+    key: &SchemaKey,
+    records: &[Stored],
+    ddl_id: &str,
+    supported_classifier: &str,
+    known: &HashMap<i32, String>,
+) -> Result<Option<i32>> {
     let bad = |why: String| -> anyhow::Error {
         TimelineError(format!(
             "forward binding of ddl {ddl_id} in {}: {why}",
@@ -583,7 +604,11 @@ pub(crate) async fn resolve_binding(
             proof.classifier_version
         )));
     }
-    match registry.version_hash(key, *version).await? {
+    let hash = match known.get(version) {
+        Some(h) => Some(h.clone()),
+        None => registry.version_hash(key, *version).await?,
+    };
+    match hash {
         Some(hash) if hash == proof.schema_hash => {}
         other => {
             return Err(bad(format!(
@@ -665,7 +690,7 @@ pub(crate) async fn read_stream_head(
 /// A stream's entries as records, with its last sequence (0 when empty):
 /// every entry must carry a capture identity and decode as a record of
 /// this build's format.
-fn decode_stream(
+pub(crate) fn decode_stream(
     stream: &str,
     entries: &[storage::LogEntryMeta],
 ) -> std::result::Result<(Vec<Stored>, u64), TimelineError> {

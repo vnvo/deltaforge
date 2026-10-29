@@ -39,6 +39,7 @@ mod mysql_ddl_attribution;
 mod mysql_failover_drift;
 mod mysql_forward_proof;
 mod mysql_helpers;
+mod mysql_history;
 mod mysql_proof_scanner;
 mod mysql_selection;
 mod mysql_session;
@@ -51,6 +52,10 @@ pub mod mysql_decode;
 pub mod mysql_jsonb;
 
 mod mysql_schema_loader;
+pub(crate) use mysql_activation::ACTIVATION_NS as ACTIVATION_NS_NAME;
+pub(crate) use mysql_history::{
+    TIMELINE_MAX_BYTES, TooLarge as TimelineTooLarge,
+};
 pub use mysql_schema_loader::{LoadedSchema, MySqlSchemaLoader};
 pub(crate) use mysql_window_budget::Invalid as WindowInvalid;
 
@@ -1898,7 +1903,7 @@ impl MySqlSource {
         // stream opens. An ordinary restart at the committed position writes
         // none.
         if needs_snapshot || !committed_resume {
-            record_stream_start(&ctx).await?;
+            record_stream_start(&mut ctx).await?;
         }
         initialize_sink_checkpoints(&ctx).await?;
 
@@ -2911,8 +2916,8 @@ async fn initialize_sink_checkpoints(ctx: &RunCtx) -> SourceResult<()> {
 /// The lineage-wide barrier of a stream discontinuity at the position the
 /// stream starts from (its identity is that position, so a repeated start at
 /// the same position re-derives it).
-async fn record_stream_start(ctx: &RunCtx) -> SourceResult<()> {
-    use mysql_activation::{BarrierScope, EventIdentity, record_barrier};
+async fn record_stream_start(ctx: &mut RunCtx) -> SourceResult<()> {
+    use mysql_activation::{BarrierScope, EventIdentity};
     let gtid = ctx.gtid_text();
     let position = crate::durable_checkpoint::mysql_checkpoint_position(
         &ctx.last_file,
@@ -2927,9 +2932,10 @@ async fn record_stream_start(ctx: &RunCtx) -> SourceResult<()> {
         .into(),
     })?;
     let key = ctx.registry_scope.current()?.key("", "");
-    record_barrier(
+    mysql_selection::append_barrier(
         &ctx.registry_backend,
         ctx.schema.registry(),
+        &mut ctx.selection,
         &key,
         BarrierScope::Lineage,
         &EventIdentity::StreamStart {

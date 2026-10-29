@@ -450,6 +450,10 @@ pub struct DurableSchemaRegistry {
     counters: Counters,
 }
 
+/// The most versions one [`DurableSchemaRegistry::version_hashes`] call
+/// reads.
+pub const VERSION_HASHES_MAX: usize = 4096;
+
 impl DurableSchemaRegistry {
     /// Build over an existing backend. Performs no stream enumeration or replay:
     /// it reads the durable schema sequence high-water (O(1)), bootstrapping it
@@ -1423,6 +1427,151 @@ impl DurableSchemaRegistry {
             .map(|v| v.hash))
     }
 
+    /// [`Self::version_hash`] of every `(key, version)` in `wanted`, in its
+    /// order, read in one snapshot (`read_batch`, at most
+    /// [`VERSION_HASHES_MAX`] per call): one store round trip instead of one
+    /// per version.
+    pub async fn version_hashes(
+        &self,
+        wanted: &[(SchemaKey, i32)],
+    ) -> Result<Vec<Option<String>>> {
+        anyhow::ensure!(
+            wanted.len() <= VERSION_HASHES_MAX,
+            "a batched version lookup of {} exceeds its bound of {VERSION_HASHES_MAX}",
+            wanted.len()
+        );
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let reads: Vec<crate::BatchRead> = wanted
+            .iter()
+            .map(|(k, v)| crate::BatchRead::KvGet {
+                ns: INDEX_NS.to_string(),
+                key: format!("v/{}/{v}", k.backend_key()),
+            })
+            .collect();
+        let got = self
+            .backend
+            .read_batch(&reads)
+            .await
+            .context("schema registry: failed to read version indexes")?;
+        wanted
+            .iter()
+            .zip(got)
+            .map(|((k, version), r)| match r {
+                crate::BatchReadResult::Kv(Some(b)) => {
+                    let idx: VersionIndex = serde_json::from_slice(&b)
+                        .map_err(|e| {
+                            anyhow::Error::new(CorruptRecord(format!(
+                                "schema registry: corrupt version index \
+                                 {version} of {}: {e}",
+                                k.backend_key()
+                            )))
+                        })?;
+                    Ok(Some(idx.hash))
+                }
+                crate::BatchReadResult::Kv(None) => Ok(None),
+                other => Err(anyhow::anyhow!(
+                    "schema registry: unexpected batch read result {other:?}"
+                )),
+            })
+            .collect()
+    }
+
+    /// [`Self::get_version`] of every `(key, version)` in `wanted`, in its
+    /// order (at most [`VERSION_HASHES_MAX`]): the version indexes in one
+    /// snapshot, then each indexed stream's latest entry in another; a
+    /// version that is not its stream's latest is read on its own (the
+    /// same answer, one more round trip).
+    pub async fn get_versions(
+        &self,
+        wanted: &[(SchemaKey, i32)],
+    ) -> Result<Vec<Option<SchemaVersion>>> {
+        anyhow::ensure!(
+            wanted.len() <= VERSION_HASHES_MAX,
+            "a batched version read of {} exceeds its bound of {VERSION_HASHES_MAX}",
+            wanted.len()
+        );
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let reads: Vec<crate::BatchRead> = wanted
+            .iter()
+            .map(|(k, v)| crate::BatchRead::KvGet {
+                ns: INDEX_NS.to_string(),
+                key: format!("v/{}/{v}", k.backend_key()),
+            })
+            .collect();
+        let got = self
+            .backend
+            .read_batch(&reads)
+            .await
+            .context("schema registry: failed to read version indexes")?;
+        let mut indexes: Vec<Option<VersionIndex>> =
+            Vec::with_capacity(got.len());
+        for ((k, version), r) in wanted.iter().zip(got) {
+            indexes.push(match r {
+                crate::BatchReadResult::Kv(Some(b)) => {
+                    Some(serde_json::from_slice(&b).map_err(|e| {
+                        anyhow::Error::new(CorruptRecord(format!(
+                            "schema registry: corrupt version index \
+                             {version} of {}: {e}",
+                            k.backend_key()
+                        )))
+                    })?)
+                }
+                crate::BatchReadResult::Kv(None) => None,
+                other => anyhow::bail!(
+                    "schema registry: unexpected batch read result {other:?}"
+                ),
+            });
+        }
+        let latest_reads: Vec<crate::BatchRead> = wanted
+            .iter()
+            .zip(&indexes)
+            .filter_map(|((k, _), idx)| {
+                idx.as_ref().map(|idx| crate::BatchRead::LogLatest {
+                    ns: V1_NS.to_string(),
+                    key: stream_key(&k.backend_key(), idx.stream),
+                })
+            })
+            .collect();
+        let mut latest = self
+            .backend
+            .read_batch(&latest_reads)
+            .await
+            .context("schema registry: failed to read latest versions")?
+            .into_iter();
+        let mut out = Vec::with_capacity(wanted.len());
+        for ((k, version), idx) in wanted.iter().zip(indexes) {
+            let Some(idx) = idx else {
+                out.push(None);
+                continue;
+            };
+            let skey = stream_key(&k.backend_key(), idx.stream);
+            match latest.next() {
+                Some(crate::BatchReadResult::Latest(Some((seq, bytes))))
+                    if seq == idx.sequence =>
+                {
+                    let v = parse_v1(&bytes, seq, &skey)?;
+                    if v.version != *version || v.hash != idx.hash {
+                        return Err(anyhow::Error::new(CorruptRecord(
+                            format!(
+                                "schema registry: version {version} of {}: entry \
+                             disagrees with its index",
+                                k.backend_key()
+                            ),
+                        )));
+                    }
+                    out.push(Some(v));
+                }
+                // Not the latest: read it on its own.
+                _ => out.push(self.get_version(k, *version).await?),
+            }
+        }
+        Ok(out)
+    }
+
     /// One version of `key` by number, read through the version index (no
     /// history scan). An index entry whose log entry is missing or disagrees
     /// with it is a corrupt record.
@@ -1921,6 +2070,93 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hw, 100, "the high-water went back from 100 to {hw}");
+    }
+
+    /// The batched lookup answers exactly as one `version_hash` per
+    /// version: existing and missing versions, of several keys, in the
+    /// request's order.
+    #[tokio::test]
+    async fn batched_version_hashes_answer_as_one_lookup_each() {
+        let (_f, b) = backend();
+        let r = reg(&b).await;
+        let (a, c) = (skey("s", "l", "a"), skey("s", "l", "c"));
+        for (k, h) in [(&a, "a1"), (&a, "a2"), (&c, "c1")] {
+            r.register_version(k, h, &json!({ "h": h }), None)
+                .await
+                .unwrap();
+        }
+        let wanted = vec![
+            (c.clone(), 1),
+            (a.clone(), 2),
+            (a.clone(), 3),
+            (a.clone(), 1),
+            (skey("s", "l", "none"), 1),
+        ];
+        let mut one_each = Vec::new();
+        for (k, v) in &wanted {
+            one_each.push(r.version_hash(k, *v).await.unwrap());
+        }
+        assert_eq!(r.version_hashes(&wanted).await.unwrap(), one_each);
+        assert_eq!(
+            one_each,
+            [
+                Some("c1".into()),
+                Some("a2".into()),
+                None,
+                Some("a1".into()),
+                None
+            ]
+        );
+        assert!(r.version_hashes(&[]).await.unwrap().is_empty());
+        let over = vec![(a.clone(), 1); VERSION_HASHES_MAX + 1];
+        assert!(r.version_hashes(&over).await.is_err());
+    }
+
+    /// The batched read answers exactly as one `get_version` per version:
+    /// latest and older versions, missing ones, several keys, in order.
+    #[tokio::test]
+    async fn batched_versions_answer_as_one_read_each() {
+        let (_f, b) = backend();
+        let r = reg(&b).await;
+        let (a, c) = (skey("s", "l", "a"), skey("s", "l", "c"));
+        for (k, h) in [(&a, "a1"), (&a, "a2"), (&c, "c1")] {
+            r.register_version(k, h, &json!({ "h": h }), None)
+                .await
+                .unwrap();
+        }
+        let wanted = vec![
+            (a.clone(), 2),
+            (c.clone(), 1),
+            (a.clone(), 1),
+            (a.clone(), 9),
+            (skey("s", "l", "none"), 1),
+        ];
+        let mut one_each = Vec::new();
+        for (k, v) in &wanted {
+            one_each.push(r.get_version(k, *v).await.unwrap());
+        }
+        let batched = r.get_versions(&wanted).await.unwrap();
+        let view = |v: &Vec<Option<SchemaVersion>>| -> Vec<_> {
+            v.iter()
+                .map(|v| {
+                    v.as_ref().map(|v| (v.version, v.hash.clone(), v.sequence))
+                })
+                .collect()
+        };
+        assert_eq!(view(&batched), view(&one_each));
+        assert_eq!(
+            view(&batched)
+                .iter()
+                .map(|v| v.as_ref().map(|v| v.1.clone()))
+                .collect::<Vec<_>>(),
+            [
+                Some("a2".into()),
+                Some("c1".into()),
+                Some("a1".into()),
+                None,
+                None
+            ]
+        );
     }
 
     fn skey(source: &str, lineage: &str, table: &str) -> SchemaKey {

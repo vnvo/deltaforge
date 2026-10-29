@@ -309,6 +309,109 @@ fn head_tables(
     }
 }
 
+/// Known tables the cache no longer holds (evicted) return here: when a
+/// head table's timeline is not cached, the stream's next events are held
+/// (`ctx.prefetched`, dispatched before the stream is read again, windows
+/// opening over them as over any held events), within the window's own
+/// bounds, and every uncached table among them is loaded with the head's in
+/// one bounded batch (`mysql_selection::load_timelines`), not one table at
+/// a time. A read error ends the hold and is raised where the stream is
+/// read next.
+async fn prefetch_histories(
+    ctx: &mut RunCtx,
+    stream: &mut BinlogStream,
+    head: &[(String, String, MySqlCheckpoint)],
+) -> Result<(), LoopControl> {
+    if ctx.pending.is_some()
+        || !ctx.prefetched.is_empty()
+        || ctx.prefetch_error.is_some()
+    {
+        return Ok(());
+    }
+    let Ok(scope) = ctx.registry_scope.current() else {
+        return Ok(());
+    };
+    let max = ctx.selection.batch_room();
+    let mut keys: Vec<storage::adapters::SchemaKey> = Vec::new();
+    let add = |ctx: &mut RunCtx,
+               keys: &mut Vec<storage::adapters::SchemaKey>,
+               db: &str,
+               table: &str| {
+        let k = scope.key(db, table);
+        if keys.len() < max
+            && ctx.allow.matches(db, table)
+            && !keys.contains(&k)
+            && ctx.selection.timeline(&k.backend_key()).is_none()
+        {
+            keys.push(k);
+        }
+    };
+    for (db, table, _) in head {
+        add(ctx, &mut keys, db, table);
+    }
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let cfg = ctx.proofs.clone();
+    let deadline =
+        ctx.last_received + Duration::from_millis(cfg.activation_window_ms);
+    let (mut events, mut bytes) = (0usize, 0u64);
+    while events < cfg.activation_window_events
+        && bytes < cfg.activation_window_bytes
+        && keys.len() < max
+    {
+        let Some(left) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+        else {
+            break;
+        };
+        // A cancelled read loses nothing (the vendored channel keeps what
+        // it read), so the time bound can interrupt it.
+        let read = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => return Err(LoopControl::Stop),
+            r = tokio::time::timeout(left, stream.read()) => r,
+        };
+        match read {
+            Err(_) => break,
+            Ok(Err(e)) => {
+                ctx.prefetch_error = Some(e);
+                break;
+            }
+            Ok(Ok((h, d))) => {
+                events += 1;
+                bytes += u64::from(h.event_length);
+                let mut tables = Vec::new();
+                held_tables(&d, &mut tables);
+                for (db, table) in tables {
+                    add(ctx, &mut keys, &db, &table);
+                }
+                let seq = ctx.next_held_seq;
+                ctx.next_held_seq += 1;
+                ctx.prefetched.push_back((Instant::now(), seq, h, d));
+            }
+        }
+    }
+    super::mysql_selection::load_timelines(ctx, &keys).await;
+    Ok(())
+}
+
+/// The tables an event's table maps name (a compressed transaction's too).
+fn held_tables(d: &EventData, out: &mut Vec<(String, String)>) {
+    match d {
+        EventData::TableMap(tm) => {
+            out.push((tm.database_name.clone(), tm.table_name.clone()))
+        }
+        EventData::TransactionPayload(tp) => {
+            for (_, d) in &tp.uncompressed_events {
+                held_tables(d, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Run a window before `header`'s position advances, when its event is the
 /// first rows of a table without a positional proof (see the module docs).
 /// Returns with nothing done otherwise. On success, the read-ahead events
@@ -364,6 +467,7 @@ pub(super) async fn maybe_window(
     if found.is_empty() {
         return not_here(ctx);
     }
+    prefetch_histories(ctx, stream, &found).await?;
     let mut batch: BTreeMap<(String, String), MySqlCheckpoint> =
         BTreeMap::new();
     // First-touch order: the order the batch commits in.
@@ -1328,7 +1432,8 @@ async fn admit_batch(
             let t = timeline(ctx, key).await?;
             let e = pos(at)?;
             let tcap = cap.table(db, table).expect("captured tables only");
-            let decision = match barrier_to_bind(&t.records, &t.barriers, &e) {
+            let barriers: Vec<Stored> = t.barriers().cloned().collect();
+            let decision = match barrier_to_bind(&t.records, &barriers, &e) {
                 Err(why) => {
                     info!(source_id = %ctx.source_id, %db, %table, why, "no lazy baseline");
                     Decision::Refused("no_binding", Covers::Transaction)
@@ -1518,7 +1623,7 @@ async fn admit_batch(
                         key: stream.clone(),
                         seq: t.table_head,
                     });
-                    for (b, head) in &t.barrier_heads {
+                    for (b, head) in &t.barrier_heads() {
                         batch.preconditions.push(Precondition::LogHead {
                             ns: BARRIER_NS.into(),
                             key: b.clone(),

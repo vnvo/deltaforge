@@ -205,7 +205,18 @@ impl StorageBackend for CountingBackend {
                 self.read("read_batch", ns, key);
             }
         }
-        self.inner.read_batch(reads).await
+        let out = self.inner.read_batch(reads).await?;
+        if reads.iter().any(|r| {
+            let (storage::BatchRead::KvGet { ns, key }
+            | storage::BatchRead::LogLatest { ns, key }
+            | storage::BatchRead::LogHead { ns, key }
+            | storage::BatchRead::LogLen { ns, key }) = r;
+            !self.is_uncounted(ns, key)
+        }) {
+            // One call, however many items it reads.
+            self.count("read_batch", 0, 0);
+        }
+        Ok(out)
     }
     async fn apply_batch(
         &self,
@@ -226,6 +237,25 @@ impl StorageBackend for CountingBackend {
     ) -> Result<usize> {
         self.inner.batch_commit_sweep(before_ms, limit).await
     }
+    async fn log_read_streams_bounded(
+        &self,
+        streams: &[(String, String)],
+        max_bytes: u64,
+        max_entries: u64,
+    ) -> Result<Vec<Vec<storage::LogEntryMeta>>> {
+        let out = self
+            .inner
+            .log_read_streams_bounded(streams, max_bytes, max_entries)
+            .await?;
+        let mut raw = 0;
+        for entries in &out {
+            raw += entries.iter().map(|e| e.value.len()).sum::<usize>();
+        }
+        // One call, however many streams it reads.
+        self.count("log_read_streams_bounded", raw, 0);
+        Ok(out)
+    }
+
     async fn log_read_streams(
         &self,
         streams: &[(String, String)],

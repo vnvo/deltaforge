@@ -35,11 +35,12 @@ use super::RunCtx;
 use super::mysql_activation::{
     self, ACTIVATION_NS, EventIdentity, FullProof, Kind, Record, Selection,
     Stored, TimelineError, baseline_capture_id, full_capture_id,
-    resolve_binding, select_decisive, table_stream,
+    select_decisive, table_stream,
 };
 use super::mysql_binlog_scan::{
     CLASSIFIER_VERSION, ProofError, ScanLimits, capture_proven,
 };
+use super::mysql_history::BarrierStream;
 use super::mysql_schema_loader::LoadedSchema;
 use super::mysql_signature::{
     SIGNATURE_FORMAT, Signature, Verdict, compare, is_full,
@@ -51,17 +52,21 @@ use crate::durable_checkpoint::{WmPos, order_positions};
 /// a DDL or barrier affecting the table lands inside the capture interval).
 const CAPTURE_ATTEMPTS: u32 = 5;
 
-/// A table's validated timeline: its records and the barriers that apply.
+/// A table's validated timeline: its records and the barrier streams that
+/// apply to it (its lineage's, then its database's), shared with every
+/// timeline they apply to.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Timeline {
     pub records: Vec<Stored>,
-    pub barriers: Vec<Stored>,
     /// The sequence of the table stream's last record when it was read (0
     /// when empty): an append's proof that nothing else was stored since.
     pub table_head: u64,
-    /// The barrier streams read, with their last sequences: what an atomic
-    /// batch's preconditions rest on.
-    pub barrier_heads: Vec<(String, u64)>,
+    /// The barrier streams read, with their records and last sequences:
+    /// what an atomic batch's preconditions rest on.
+    pub streams: Vec<Arc<BarrierStream>>,
+    /// The estimated bytes of `records` (its streams are accounted once
+    /// each, where they are cached).
+    pub bytes: u64,
 }
 
 /// Versions an atomic batch plans for one table but has not committed:
@@ -76,25 +81,55 @@ impl Timeline {
         row: &WmPos,
     ) -> (Selection, Option<String>) {
         mysql_activation::select_decisive_in(
-            self.records.iter().chain(self.barriers.iter()),
+            self.records.iter().chain(self.barriers()),
             row,
         )
+    }
+
+    /// The barriers that apply, in their streams' order.
+    pub(crate) fn barriers(&self) -> impl Iterator<Item = &Stored> + Clone {
+        self.streams.iter().flat_map(|s| s.records.iter())
+    }
+
+    /// The barrier streams read, with their last sequences.
+    pub(crate) fn barrier_heads(&self) -> Vec<(String, u64)> {
+        self.streams
+            .iter()
+            .map(|s| (s.stream.clone(), s.head))
+            .collect()
     }
 
     pub(crate) fn all(&self) -> Vec<Stored> {
         self.records
             .iter()
-            .chain(self.barriers.iter())
+            .chain(self.barriers())
             .cloned()
             .collect()
     }
+
+    /// A timeline of `records` with `barriers` as one barrier stream
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn of(records: Vec<Stored>, barriers: Vec<Stored>) -> Self {
+        Self {
+            records,
+            table_head: 0,
+            streams: vec![Arc::new(BarrierStream {
+                stream: "barriers".into(),
+                records: barriers,
+                head: 0,
+                bytes: 0,
+            })],
+            bytes: 0,
+        }
+    }
 }
 
-/// The per-source entry budget shared by the timeline and selection caches.
-/// Entries beyond it are evicted least recently used first; an evicted entry
-/// is rebuilt exactly from the durable registry and activation records (no
-/// live catalog query), so the bound costs reads, never correctness.
+/// The cache's table bound: at most this many tables' timelines.
 pub(crate) const SELECTION_CACHE_ENTRIES: usize = 4096;
+/// The cache's byte bound: at most this many estimated bytes of timelines,
+/// barrier streams (each once) and selected schemas.
+pub(crate) const SELECTION_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// `deltaforge_mysql_selection_cache_evictions_total{pipeline,source}`.
 pub(crate) const METRIC_EVICTIONS: &str =
@@ -108,6 +143,18 @@ enum CacheKey {
     /// signature). The key carries the lineage; the decisive record carries
     /// the row position's effective proof.
     Selection(String, String, String),
+    /// A registered version of a table, read ahead with its timeline.
+    Version(String, i32),
+}
+
+impl CacheKey {
+    fn table(&self) -> &str {
+        match self {
+            CacheKey::Timeline(t)
+            | CacheKey::Selection(t, _, _)
+            | CacheKey::Version(t, _) => t,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -116,13 +163,26 @@ enum Cached {
     /// version (then an activation window need not select it again).
     Timeline(Arc<Timeline>, bool),
     Selection(Arc<LoadedSchema>),
+    Version(Arc<schema_registry::SchemaVersion>),
 }
 
-/// Per-run caches, bounded by one shared LRU budget. Only this process
-/// appends activation records for this source (the store gate), so
-/// invalidating on every append keeps them exact.
+/// Per-run caches of timelines and selections, bounded together by
+/// tables and estimated bytes (`docs/design/mysql-mass-invalidation.md`,
+/// section 6): admission evicts the least recently used entries until the
+/// new one fits, before inserting it. Barrier streams are held once, shared
+/// by the timelines they apply to, and dropped with the last of them. Only
+/// this process appends activation records and barriers for this source
+/// (the store gate), so invalidating on every append keeps them exact; an
+/// evicted entry is rebuilt exactly from the durable records.
 pub(crate) struct Caches {
-    entries: lru::LruCache<CacheKey, Cached>,
+    entries: lru::LruCache<CacheKey, (Cached, u64)>,
+    /// Barrier streams, by stream key, with the cached timelines holding
+    /// each.
+    barriers: std::collections::HashMap<String, (Arc<BarrierStream>, usize)>,
+    timelines: usize,
+    bytes: u64,
+    max_tables: usize,
+    max_bytes: u64,
     evictions: metrics::Counter,
 }
 
@@ -130,22 +190,30 @@ impl std::fmt::Debug for Caches {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Caches")
             .field("entries", &self.entries.len())
-            .field("budget", &self.entries.cap())
+            .field("timelines", &self.timelines)
+            .field("bytes", &self.bytes)
             .finish()
     }
 }
 
 impl Default for Caches {
     fn default() -> Self {
-        Self::with_budget(SELECTION_CACHE_ENTRIES, metrics::Counter::noop())
+        Self::with_limits(
+            SELECTION_CACHE_ENTRIES,
+            SELECTION_CACHE_BYTES,
+            metrics::Counter::noop(),
+        )
     }
 }
 
 impl Caches {
     /// The source's caches, counting evictions under its labels.
     pub(crate) fn new(pipeline: &str, source: &str) -> Self {
-        Self::with_budget(
-            SELECTION_CACHE_ENTRIES,
+        let (tables, bytes) = crate::stream_probe::selection_cache_limits()
+            .unwrap_or((SELECTION_CACHE_ENTRIES, SELECTION_CACHE_BYTES));
+        Self::with_limits(
+            tables,
+            bytes,
             metrics::counter!(
                 METRIC_EVICTIONS,
                 "pipeline" => pipeline.to_string(),
@@ -154,39 +222,115 @@ impl Caches {
         )
     }
 
-    fn with_budget(budget: usize, evictions: metrics::Counter) -> Self {
+    fn with_limits(
+        max_tables: usize,
+        max_bytes: u64,
+        evictions: metrics::Counter,
+    ) -> Self {
+        assert!(max_tables > 0, "a positive table bound");
         Self {
-            entries: lru::LruCache::new(
-                std::num::NonZeroUsize::new(budget).expect("a positive budget"),
-            ),
+            entries: lru::LruCache::unbounded(),
+            barriers: Default::default(),
+            timelines: 0,
+            bytes: 0,
+            max_tables,
+            max_bytes,
             evictions,
         }
     }
 
-    fn put(&mut self, key: CacheKey, value: Cached) {
-        if let Some((old, _)) = self.entries.push(key.clone(), value)
-            && old != key
-        {
-            self.evictions.increment(1);
+    /// The estimated bytes held: entries and barrier streams.
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Timelines held.
+    #[cfg(test)]
+    pub(crate) fn timelines(&self) -> usize {
+        self.timelines
+    }
+
+    /// The barrier streams held.
+    pub(crate) fn barrier_streams(
+        &self,
+    ) -> std::collections::HashMap<String, Arc<BarrierStream>> {
+        self.barriers
+            .iter()
+            .map(|(k, (s, _))| (k.clone(), s.clone()))
+            .collect()
+    }
+
+    /// Remove `key`'s entry, with its accounting.
+    fn remove(&mut self, key: &CacheKey) {
+        if let Some((cached, bytes)) = self.entries.pop(key) {
+            self.forget(cached, bytes);
         }
+    }
+
+    fn forget(&mut self, cached: Cached, bytes: u64) {
+        self.bytes -= bytes;
+        if let Cached::Timeline(t, _) = cached {
+            self.timelines -= 1;
+            // Its barrier streams go with the last timeline holding them.
+            for s in &t.streams {
+                if let Some((held, refs)) = self.barriers.get_mut(&s.stream)
+                    && Arc::ptr_eq(held, s)
+                {
+                    *refs -= 1;
+                    if *refs == 0 {
+                        let gone = held.bytes;
+                        self.barriers.remove(&s.stream);
+                        self.bytes -= gone;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Evict the least recently used entry; `false` when there is none.
+    fn evict_one(&mut self) -> bool {
+        let Some((_, (cached, b))) = self.entries.pop_lru() else {
+            return false;
+        };
+        self.forget(cached, b);
+        self.evictions.increment(1);
+        true
+    }
+
+    /// Insert a selection of `bytes`, evicting until it fits (never above
+    /// the bounds; one that cannot fit is not cached).
+    fn put(&mut self, key: CacheKey, value: Cached, bytes: u64) {
+        self.remove(&key);
+        while self.bytes + bytes > self.max_bytes {
+            if !self.evict_one() {
+                return;
+            }
+        }
+        self.bytes += bytes;
+        self.entries.push(key, (value, bytes));
+    }
+
+    /// The most tables one batched load brings in: never more than half
+    /// the cache, so a batch never evicts what it loaded.
+    pub(crate) fn batch_room(&self) -> usize {
+        (self.max_tables / 2).clamp(1, super::mysql_history::BATCH_MAX_TABLES)
     }
 
     pub(crate) fn timeline(&mut self, key: &str) -> Option<Arc<Timeline>> {
         match self.entries.get(&CacheKey::Timeline(key.to_string()))? {
-            Cached::Timeline(t, _) => Some(t.clone()),
+            (Cached::Timeline(t, _), _) => Some(t.clone()),
             _ => None,
         }
     }
 
-    /// Whether the table's last selection proved a version since its
-    /// timeline last changed.
     /// The backend keys of every table flagged proven, read without
     /// touching recency (a speculative window's candidate filter).
     pub(crate) fn proven_keys(&self) -> std::collections::HashSet<String> {
         self.entries
             .iter()
             .filter_map(|(k, v)| match (k, v) {
-                (CacheKey::Timeline(key), Cached::Timeline(_, true)) => {
+                (CacheKey::Timeline(key), (Cached::Timeline(_, true), _)) => {
                     Some(key.clone())
                 }
                 _ => None,
@@ -194,17 +338,19 @@ impl Caches {
             .collect()
     }
 
+    /// Whether the table's last selection proved a version since its
+    /// timeline last changed.
     pub(crate) fn is_proven(&mut self, key: &SchemaKey) -> bool {
         matches!(
             self.entries.peek(&CacheKey::Timeline(key.backend_key())),
-            Some(Cached::Timeline(_, true))
+            Some((Cached::Timeline(_, true), _))
         )
     }
 
     /// The table's last selection proved a version over its cached
     /// timeline (no extra entry: a flag on that timeline's).
     fn mark_proven(&mut self, key: &SchemaKey) {
-        if let Some(Cached::Timeline(_, proven)) = self
+        if let Some((Cached::Timeline(_, proven), _)) = self
             .entries
             .peek_mut(&CacheKey::Timeline(key.backend_key()))
         {
@@ -212,8 +358,57 @@ impl Caches {
         }
     }
 
+    /// Cache `timeline`, holding its barrier streams once: a stream already
+    /// held is shared, a new one is held (and accounted) from here.
     fn put_timeline(&mut self, key: String, timeline: Arc<Timeline>) {
-        self.put(CacheKey::Timeline(key), Cached::Timeline(timeline, false));
+        self.remove(&CacheKey::Timeline(key.clone()));
+        // Evict until the timeline, and those of its streams not held, fit
+        // (an eviction may drop a stream it would have shared).
+        loop {
+            let new: u64 = timeline
+                .streams
+                .iter()
+                .filter(|s| {
+                    self.barriers
+                        .get(&s.stream)
+                        .is_none_or(|(held, _)| held != *s)
+                })
+                .map(|s| s.bytes)
+                .sum();
+            if self.timelines < self.max_tables
+                && self.bytes + timeline.bytes + new <= self.max_bytes
+            {
+                break;
+            }
+            if !self.evict_one() {
+                return;
+            }
+        }
+        let mut shared = (*timeline).clone();
+        for s in shared.streams.iter_mut() {
+            match self.barriers.get_mut(&s.stream) {
+                Some((held, refs)) if *held == *s => {
+                    *s = held.clone();
+                    *refs += 1;
+                }
+                // Another read of the stream: the newer one is held (an
+                // append invalidates every timeline of the older).
+                _ => {
+                    if let Some((old, _)) = self.barriers.remove(&s.stream) {
+                        self.bytes -= old.bytes;
+                    }
+                    self.barriers.insert(s.stream.clone(), (s.clone(), 1));
+                    self.bytes += s.bytes;
+                }
+            }
+        }
+        self.timelines += 1;
+        self.bytes += shared.bytes;
+        let bytes = shared.bytes;
+        self.entries.push(
+            CacheKey::Timeline(key),
+            (Cached::Timeline(Arc::new(shared), false), bytes),
+        );
     }
 
     fn selection(
@@ -226,9 +421,38 @@ impl Caches {
             signature.clone(),
         );
         match self.entries.get(&key)? {
-            Cached::Selection(s) => Some(s.clone()),
+            (Cached::Selection(s), _) => Some(s.clone()),
             _ => None,
         }
+    }
+
+    fn version(
+        &mut self,
+        table: &str,
+        version: i32,
+    ) -> Option<Arc<schema_registry::SchemaVersion>> {
+        match self
+            .entries
+            .get(&CacheKey::Version(table.to_string(), version))?
+        {
+            (Cached::Version(v), _) => Some(v.clone()),
+            _ => None,
+        }
+    }
+
+    fn put_version(
+        &mut self,
+        table: String,
+        v: schema_registry::SchemaVersion,
+    ) {
+        let bytes = serde_json::to_vec(&v.schema_json)
+            .map_or(0, |b| b.len() as u64)
+            + 64;
+        self.put(
+            CacheKey::Version(table, v.version),
+            Cached::Version(Arc::new(v)),
+            bytes,
+        );
     }
 
     fn put_selection(
@@ -236,15 +460,33 @@ impl Caches {
         (table, decisive, signature): (String, String, String),
         loaded: Arc<LoadedSchema>,
     ) {
+        let bytes = schema_bytes(&loaded);
         self.put(
             CacheKey::Selection(table, decisive, signature),
             Cached::Selection(loaded),
+            bytes,
         );
     }
 
     #[cfg(test)]
     pub(crate) fn with_budget_for_test(budget: usize) -> Self {
-        Self::with_budget(budget, metrics::Counter::noop())
+        Self::with_limits(
+            budget,
+            SELECTION_CACHE_BYTES,
+            metrics::Counter::noop(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limits_for_test(tables: usize, bytes: u64) -> Self {
+        Self::with_limits(tables, bytes, metrics::Counter::noop())
+    }
+
+    /// Change the bounds, keeping what is held (tests).
+    #[cfg(test)]
+    pub(crate) fn set_limits_for_test(&mut self, tables: usize, bytes: u64) {
+        self.max_tables = tables;
+        self.max_bytes = bytes;
     }
 
     #[cfg(test)]
@@ -253,9 +495,9 @@ impl Caches {
             key.backend_key(),
             Arc::new(Timeline {
                 records: Vec::new(),
-                barriers: Vec::new(),
                 table_head: 0,
-                barrier_heads: Vec::new(),
+                streams: Vec::new(),
+                bytes: 0,
             }),
         );
     }
@@ -265,20 +507,29 @@ impl Caches {
         self.entries.len()
     }
 
+    /// The entries held for the table `key` (tests).
+    #[cfg(test)]
+    pub(crate) fn held_for(&self, key: &SchemaKey) -> usize {
+        let k = key.backend_key();
+        self.entries.iter().filter(|(e, _)| e.table() == k).count()
+    }
+
     /// A record was appended for `key`.
     pub(crate) fn invalidate(&mut self, key: &SchemaKey) {
         let k = key.backend_key();
-        let stale: Vec<CacheKey> = self
+        self.invalidate_where(|t| t == k);
+    }
+
+    fn invalidate_where(&mut self, stale: impl Fn(&str) -> bool) {
+        let keys: Vec<CacheKey> = self
             .entries
             .iter()
             .map(|(key, _)| key)
-            .filter(|key| match key {
-                CacheKey::Timeline(t) | CacheKey::Selection(t, _, _) => t == &k,
-            })
+            .filter(|key| stale(key.table()))
             .cloned()
             .collect();
-        for key in stale {
-            self.entries.pop(&key);
+        for key in keys {
+            self.remove(&key);
         }
     }
 
@@ -299,10 +550,28 @@ impl Caches {
         self.install(key, timeline);
     }
 
-    /// A barrier (or anything lineage-wide) was appended.
+    /// A barrier was appended to `stream` (a lineage's or a database's):
+    /// the stream, and every timeline and selection of a table it applies
+    /// to, are stale. Every other table stays cached.
+    pub(crate) fn barrier_appended(&mut self, stream: &str) {
+        self.invalidate_where(|t| t.starts_with(stream));
+        if let Some((s, _)) = self.barriers.remove(stream) {
+            self.bytes -= s.bytes;
+        }
+    }
+
+    /// Everything is stale (a reload request without a table).
     pub(crate) fn invalidate_all(&mut self) {
         self.entries.clear();
+        self.barriers.clear();
+        self.timelines = 0;
+        self.bytes = 0;
     }
+}
+
+/// A selected schema's estimated bytes: its encoding.
+fn schema_bytes(loaded: &LoadedSchema) -> u64 {
+    serde_json::to_vec(&loaded.schema).map_or(0, |b| b.len() as u64) + 64
 }
 
 fn invalid(key: &SchemaKey, why: impl Into<String>) -> anyhow::Error {
@@ -379,6 +648,7 @@ fn unique_match(
 }
 
 /// Validate every piece of decisive evidence in a table's timeline.
+#[cfg(test)]
 pub(crate) async fn validate(
     registry: &DurableSchemaRegistry,
     key: &SchemaKey,
@@ -409,12 +679,13 @@ pub(crate) async fn validate_planned(
                     let ddl = binds.as_deref().ok_or_else(|| {
                         invalid(key, "a forward binding binds nothing")
                     })?;
-                    match resolve_binding(
+                    match mysql_activation::resolve_binding_known(
                         registry,
                         key,
                         &timeline.records,
                         ddl,
                         CLASSIFIER_VERSION,
+                        planned,
                     )
                     .await?
                     {
@@ -441,8 +712,7 @@ pub(crate) async fn validate_planned(
                     )
                     .await?;
                     if let Some(b) = binds {
-                        if timeline.barriers.iter().any(|x| &x.capture_id == b)
-                        {
+                        if timeline.barriers().any(|x| &x.capture_id == b) {
                             if bound_barriers.contains(&b.as_str()) {
                                 return Err(invalid(
                                     key,
@@ -509,11 +779,8 @@ async fn validate_baseline(
         return Err(invalid(key, "baseline R0 is not at or before S"));
     }
     if let Some(b) = binds {
-        let bound: Vec<&Stored> = timeline
-            .barriers
-            .iter()
-            .filter(|x| &x.capture_id == b)
-            .collect();
+        let bound: Vec<&Stored> =
+            timeline.barriers().filter(|x| &x.capture_id == b).collect();
         match bound.as_slice() {
             [one] if one.record.position == s.record.position => {}
             _ => {
@@ -627,7 +894,7 @@ async fn validate_full(
             .records
             .iter()
             .filter(|x| x.record.kind == Kind::Ddl)
-            .chain(timeline.barriers.iter())
+            .chain(timeline.barriers())
             .filter(|x| &x.capture_id == b)
             .collect();
         match bound.as_slice() {
@@ -649,6 +916,14 @@ async fn validate_full(
     Ok(())
 }
 
+/// The table's validated timeline: cached, or read now. A miss reads it
+/// together with the other uncached tables the stream reaches next (read
+/// ahead or held), at most [`BATCH_MAX_TABLES`], in one bounded batch
+/// (`mysql_history`): each installed as validated exactly as its own read
+/// would. A timeline over its limit stops the source
+/// (`mysql_timeline_too_large`) before the table's rows are dispatched.
+///
+/// [`BATCH_MAX_TABLES`]: super::mysql_history::BATCH_MAX_TABLES
 pub(crate) async fn timeline(
     ctx: &mut RunCtx,
     key: &SchemaKey,
@@ -657,71 +932,200 @@ pub(crate) async fn timeline(
     if let Some(t) = ctx.selection.timeline(&k) {
         return Ok(t);
     }
-    let registry = ctx.schema.registry();
-    let (records, table_head) =
-        mysql_activation::read_table_head(&ctx.registry_backend, registry, key)
-            .await
-            .map_err(timeline_error)?;
-    let (barriers, barrier_heads) =
-        mysql_activation::read_barriers_head(&ctx.registry_backend, key)
-            .await
-            .map_err(timeline_error)?;
-    let t = Timeline {
-        records,
-        barriers,
-        table_head,
-        barrier_heads,
-    };
-    validate(registry, key, &t).await.map_err(timeline_error)?;
-    let t = Arc::new(t);
-    ctx.selection.put_timeline(k, t.clone());
-    Ok(t)
+    let mut keys = vec![key.clone()];
+    if let Ok(scope) = ctx.registry_scope.current() {
+        let room = ctx.selection.batch_room();
+        for (db, table) in upcoming(ctx) {
+            if keys.len() >= room {
+                break;
+            }
+            let other = scope.key(&db, &table);
+            if ctx.allow.matches(&db, &table)
+                && !keys.contains(&other)
+                && ctx.selection.timeline(&other.backend_key()).is_none()
+            {
+                keys.push(other);
+            }
+        }
+    }
+    let mine = install(ctx, &keys, |k| k == key).await?;
+    mine.expect("the missed table is read")
 }
 
-/// Read the timelines of `keys` not already cached in one store snapshot
-/// ([`mysql_activation::read_timelines`]) and install each one that
-/// decodes and validates exactly as [`timeline`] would. A table whose read
-/// or validation fails is left out (its own [`timeline`] read reports it
-/// as it always does); a failed store read installs nothing. Called only
-/// once a window is current: a speculative window never touches the cache.
+/// Read the timelines of `keys` not already cached in bounded batches
+/// (`mysql_history`) and install each one that decodes, fits its limit and
+/// validates exactly as [`timeline`] would. A table left out is read (and
+/// reported) when it is reached; a failed store read installs nothing.
+/// Called only once a window is current: a speculative window never
+/// touches the cache.
 pub(crate) async fn load_timelines(ctx: &mut RunCtx, keys: &[SchemaKey]) {
-    let missing: Vec<SchemaKey> = keys
-        .iter()
-        .filter(|k| ctx.selection.timeline(&k.backend_key()).is_none())
-        .cloned()
-        .collect();
+    let mut missing: Vec<SchemaKey> = Vec::new();
+    for k in keys {
+        if ctx.selection.timeline(&k.backend_key()).is_none()
+            && !missing.contains(k)
+        {
+            missing.push(k.clone());
+        }
+    }
     if missing.is_empty() {
         return;
     }
-    let registry = ctx.schema.registry();
-    // Within the plan budget, in the given order: a table left out is read
-    // when it is reached.
-    let Ok(read) = mysql_activation::read_timelines_within(
+    let _ = install(ctx, &missing, |_| false).await;
+}
+
+/// Read `keys`' histories (those `alone` names read alone if their batch
+/// could not take them) and install every valid timeline within its limit.
+/// The outcome for the key `alone` names, if any.
+async fn install(
+    ctx: &mut RunCtx,
+    keys: &[SchemaKey],
+    alone: impl Fn(&SchemaKey) -> bool,
+) -> SourceResult<Option<SourceResult<Arc<Timeline>>>> {
+    use super::mysql_history::Loaded;
+    let registry = ctx.schema.registry_arc();
+    let mut have = ctx.selection.barrier_streams();
+    let read = super::mysql_history::read_each(
         &ctx.registry_backend,
-        registry,
-        &missing,
-        super::mysql_window_budget::Caps::current().plan.bytes,
+        &registry,
+        keys,
+        &mut have,
+        &alone,
     )
     .await
-    else {
-        return;
-    };
-    let by_key: std::collections::HashMap<String, &SchemaKey> =
-        missing.iter().map(|k| (k.backend_key(), k)).collect();
-    for (bk, parts) in read {
-        let Ok((records, table_head, barriers, barrier_heads)) = parts else {
-            continue;
+    .map_err(timeline_error)?;
+    let mut mine = None;
+    for (key, loaded) in keys.iter().zip(read) {
+        let outcome = match loaded {
+            Loaded::Ok {
+                table,
+                streams,
+                hashes,
+            } => {
+                let t = Timeline {
+                    records: table.records,
+                    table_head: table.head,
+                    streams,
+                    bytes: table.bytes,
+                };
+                match validate_planned(&registry, key, &t, &hashes).await {
+                    Ok(()) => {
+                        let t = Arc::new(t);
+                        ctx.selection
+                            .put_timeline(key.backend_key(), t.clone());
+                        Ok(t)
+                    }
+                    Err(e) => Err(timeline_error(e)),
+                }
+            }
+            Loaded::Invalid(e) => Err(timeline_error(e.into())),
+            Loaded::TooLarge(e) => Err(timeline_too_large(ctx, &e)),
+            Loaded::Unread => continue,
         };
-        let t = Timeline {
-            records,
-            barriers,
-            table_head,
-            barrier_heads,
-        };
-        if validate(registry, by_key[&bk], &t).await.is_ok() {
-            ctx.selection.put_timeline(bk, Arc::new(t));
+        if alone(key) {
+            mine = Some(outcome);
         }
     }
+    // The versions the installed tables' last proofs name, read ahead in
+    // one batch: a returning table's selection then reads nothing more.
+    let mut wanted = Vec::new();
+    for key in keys {
+        let bk = key.backend_key();
+        let Some(t) = ctx.selection.timeline(&bk) else {
+            continue;
+        };
+        let last = t.records.iter().rev().find_map(|r| match &r.record.kind {
+            Kind::Observed { version, .. } | Kind::Baseline { version, .. } => {
+                Some(*version)
+            }
+            _ => None,
+        });
+        if let Some(v) = last
+            && ctx.selection.version(&bk, v).is_none()
+        {
+            wanted.push((key.clone(), v));
+        }
+    }
+    if !wanted.is_empty()
+        && let Ok(read) = registry.get_versions(&wanted).await
+    {
+        for ((key, _), v) in wanted.iter().zip(read) {
+            if let Some(v) = v {
+                ctx.selection.put_version(key.backend_key(), v);
+            }
+        }
+    }
+    Ok(mine)
+}
+
+/// Append a barrier for `scope` and invalidate what it makes stale: the
+/// barrier stream, and the timelines and selections of every table it
+/// applies to (`Caches::barrier_appended`). The only way the source writes
+/// a barrier (its two writers: the stream start and DDL handling), so every
+/// append keeps the cache exact. Invalidated whatever the append returned:
+/// a failed append may still have been stored.
+pub(crate) async fn append_barrier(
+    backend: &storage::ArcStorageBackend,
+    registry: &DurableSchemaRegistry,
+    selection: &mut Caches,
+    key: &SchemaKey,
+    scope: mysql_activation::BarrierScope,
+    event: &EventIdentity,
+    position: WmPos,
+) -> anyhow::Result<storage::AppendStatus> {
+    let stream = mysql_activation::barrier_stream(key, &scope);
+    let appended = mysql_activation::record_barrier(
+        backend, registry, key, scope, event, position,
+    )
+    .await;
+    selection.barrier_appended(&stream);
+    appended
+}
+
+/// The tables the stream reaches next: those of the events read ahead and
+/// held, in order, each once.
+fn upcoming(ctx: &RunCtx) -> Vec<(String, String)> {
+    use mysql_binlog_connector_rust::event::event_data::EventData;
+    fn visit(d: &EventData, out: &mut Vec<(String, String)>) {
+        match d {
+            EventData::TableMap(tm) => {
+                let t = (tm.database_name.clone(), tm.table_name.clone());
+                if !out.contains(&t) {
+                    out.push(t);
+                }
+            }
+            EventData::TransactionPayload(tp) => {
+                for (_, d) in &tp.uncompressed_events {
+                    visit(d, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for (_, d) in &ctx.lookahead {
+        visit(d, &mut out);
+    }
+    for (_, _, _, d) in &ctx.prefetched {
+        visit(d, &mut out);
+    }
+    out
+}
+
+/// The `mysql_timeline_too_large` stop: nothing of the table's rows is
+/// dispatched, the checkpoint stays before them.
+fn timeline_too_large(
+    ctx: &RunCtx,
+    e: &super::mysql_history::TooLarge,
+) -> SourceError {
+    let at = super::MySqlCheckpoint {
+        file: ctx.last_file.clone(),
+        pos: ctx.last_event_start,
+        gtid_set: ctx.gtid_text(),
+        lineage: None,
+        snapshot_completed: None,
+        snapshot_chain: None,
+    };
+    crate::incident_drafts::mysql_timeline_too_large(&ctx.source_id, e, &at)
 }
 
 fn timeline_error(e: anyhow::Error) -> SourceError {
@@ -742,6 +1146,19 @@ fn fail(db: &str, table: &str, why: &str) -> SourceError {
     }
 }
 
+/// [`loaded`], from the version read ahead with the table's timeline when
+/// the cache holds it.
+async fn loaded_cached(
+    ctx: &mut RunCtx,
+    key: &SchemaKey,
+    version: i32,
+) -> SourceResult<(Arc<LoadedSchema>, MySqlTableSchema)> {
+    match ctx.selection.version(&key.backend_key(), version) {
+        Some(v) => loaded_from(&v, version),
+        None => loaded(ctx.schema.registry(), key, version).await,
+    }
+}
+
 async fn loaded(
     registry: &DurableSchemaRegistry,
     key: &SchemaKey,
@@ -754,6 +1171,14 @@ async fn loaded(
         .ok_or_else(|| {
             timeline_error(anyhow::anyhow!("version {version} is missing"))
         })?;
+    loaded_from(&v, version)
+}
+
+fn loaded_from(
+    v: &schema_registry::SchemaVersion,
+    version: i32,
+) -> SourceResult<(Arc<LoadedSchema>, MySqlTableSchema)> {
+    debug_assert_eq!(v.version, version);
     let schema = schema_of(&v.schema_json).map_err(timeline_error)?;
     Ok((
         Arc::new(LoadedSchema::new(
@@ -833,8 +1258,7 @@ pub(crate) async fn select_for_rows(
             if let Some(hit) = ctx.selection.selection(&cache_key) {
                 return Ok(hit);
             }
-            let (loaded, schema) =
-                loaded(ctx.schema.registry(), &key, version).await?;
+            let (loaded, schema) = loaded_cached(ctx, &key, version).await?;
             // The proven version comes from authoritative complete-schema
             // evidence; it must not contradict the TableMap.
             if let Verdict::Mismatch(why) = compare(&schema, tm) {
@@ -918,12 +1342,7 @@ pub(crate) async fn admit_decisive_planned(
         }
         _ => return Err("the proposed record proves no version".into()),
     };
-    let mut augmented = Timeline {
-        records: current.records.clone(),
-        barriers: current.barriers.clone(),
-        table_head: current.table_head,
-        barrier_heads: current.barrier_heads.clone(),
-    };
+    let mut augmented = current.clone();
     augmented.records.push(proposed.clone());
     validate_planned(registry, key, &augmented, planned)
         .await
@@ -1023,7 +1442,7 @@ async fn full_fallback(
         .records
         .iter()
         .filter(|s| s.record.kind == Kind::Ddl)
-        .chain(t.barriers.iter())
+        .chain(t.barriers())
         .filter(|s| {
             order_positions(&s.record.position, row) == CheckpointOrder::Equal
         })
@@ -1182,21 +1601,21 @@ mod tests {
     use super::*;
     use crate::mysql::mysql_table_schema::MySqlColumn;
 
+    /// Under churn the cache never holds more than its tables and its
+    /// bytes, and evicts (counted under the source's labels) only to make
+    /// room.
     #[test]
-    fn the_shared_budget_bounds_both_caches_under_churn() {
+    fn the_table_and_byte_bounds_hold_under_churn() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
         let rec = DebuggingRecorder::new();
         let budget = 16;
         let puts = metrics::with_local_recorder(&rec, || {
             let mut caches = Caches::new("p", "s");
-            caches
-                .entries
-                .resize(std::num::NonZeroUsize::new(budget).unwrap());
+            caches.max_tables = budget;
+            caches.max_bytes = 20 * 1024;
             let timeline = Arc::new(Timeline {
-                records: Vec::new(),
-                barriers: Vec::new(),
                 table_head: 0,
-                barrier_heads: Vec::new(),
+                ..Timeline::of(Vec::new(), Vec::new())
             });
             let loaded = Arc::new(LoadedSchema::new(
                 MySqlTableSchema::new(Vec::new()),
@@ -1213,9 +1632,10 @@ mod tests {
                     loaded.clone(),
                 );
                 puts += 2;
-                assert!(caches.len() <= budget);
+                assert!(caches.timelines() <= budget);
+                assert!(caches.bytes() <= caches.max_bytes);
             }
-            assert_eq!(caches.len(), budget);
+            assert_eq!(caches.timelines(), budget);
             puts
         });
         let evictions: Vec<_> = rec
@@ -1241,10 +1661,8 @@ mod tests {
     fn invalidation_drops_only_the_tables_entries() {
         let mut caches = Caches::with_budget_for_test(64);
         let t = Arc::new(Timeline {
-            records: Vec::new(),
-            barriers: Vec::new(),
             table_head: 0,
-            barrier_heads: Vec::new(),
+            ..Timeline::of(Vec::new(), Vec::new())
         });
         let loaded = Arc::new(LoadedSchema::new(
             MySqlTableSchema::new(Vec::new()),
@@ -1485,10 +1903,8 @@ mod tests {
 
     async fn check(f: &Fixture, records: Vec<Stored>) -> Result<(), String> {
         let t = Timeline {
-            records,
-            barriers: Vec::new(),
             table_head: 0,
-            barrier_heads: Vec::new(),
+            ..Timeline::of(records, Vec::new())
         };
         validate(&f.reg, &f.key, &t)
             .await
@@ -1607,10 +2023,8 @@ mod tests {
         };
         let admit = |records: Vec<Stored>, barriers: Vec<Stored>, p: Stored| {
             let current = Timeline {
-                records,
-                barriers,
                 table_head: 0,
-                barrier_heads: Vec::new(),
+                ..Timeline::of(records, barriers)
             };
             let (f, row) = (&f, row.clone());
             async move { admit_decisive(&f.reg, &f.key, &current, p, &row).await }
@@ -1675,10 +2089,8 @@ mod tests {
         )
         .await;
         let current = Timeline {
-            records: vec![later],
-            barriers: Vec::new(),
             table_head: 0,
-            barrier_heads: Vec::new(),
+            ..Timeline::of(vec![later], Vec::new())
         };
         let err = admit_decisive(
             &f.reg,
@@ -1756,10 +2168,8 @@ mod tests {
                 read_table_head(&f.backend, &f.reg, &f.key).await.unwrap();
             let barriers = read_barriers(&f.backend, &f.key).await.unwrap();
             Timeline {
-                records,
-                barriers,
-                table_head,
-                barrier_heads: Vec::new(),
+                table_head: table_head,
+                ..Timeline::of(records, barriers)
             }
         }
 
@@ -1773,7 +2183,7 @@ mod tests {
 
         fn same(a: &Timeline, b: &Timeline) -> bool {
             a.records == b.records
-                && a.barriers == b.barriers
+                && a.barriers().eq(b.barriers())
                 && a.table_head == b.table_head
         }
 
@@ -1925,10 +2335,8 @@ mod tests {
             caches.put_timeline(
                 f.key.backend_key(),
                 Arc::new(Timeline {
-                    records: Vec::new(),
-                    barriers: Vec::new(),
                     table_head: 0,
-                    barrier_heads: Vec::new(),
+                    ..Timeline::of(Vec::new(), Vec::new())
                 }),
             );
             let current = Timeline::clone(
@@ -1980,10 +2388,8 @@ mod tests {
             caches.put_timeline(
                 f.key.backend_key(),
                 Arc::new(Timeline {
-                    records: Vec::new(),
-                    barriers: Vec::new(),
                     table_head: 0,
-                    barrier_heads: Vec::new(),
+                    ..Timeline::of(Vec::new(), Vec::new())
                 }),
             );
             let current = Timeline::clone(
@@ -2058,6 +2464,244 @@ mod tests {
             );
             equivalent(&f, &mut caches, &gtid("1-5")).await;
             assert_eq!(fresh(&f).await.records.len(), 2);
+        }
+    }
+
+    /// The per-timeline hard limit (design section 6): a timeline over
+    /// 100,000 records (the table's stream with its barrier streams) fails
+    /// closed as `mysql_timeline_too_large`, never loaded whole.
+    mod timeline_limit {
+        use super::*;
+        use crate::gtid_set::GtidSet;
+        use crate::mysql::mysql_activation::{BARRIER_NS, BarrierScope};
+        use crate::mysql::mysql_schema_loader::MySqlSchemaLoader;
+        use storage::ArcStorageBackend;
+        use tokio::sync::mpsc;
+
+        const U: &str = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+
+        async fn ctx_on(backend: ArcStorageBackend) -> RunCtx {
+            let (tx, _rx) = mpsc::channel(8);
+            let mut ctx = crate::mysql::mysql_event::tests::make_runctx(tx);
+            ctx.registry_backend = backend.clone();
+            let registry = storage::DurableSchemaRegistry::new(backend.clone())
+                .await
+                .unwrap();
+            ctx.schema = MySqlSchemaLoader::new(
+                "mysql://fake",
+                registry,
+                &ctx.tenant,
+                ctx.registry_scope.clone(),
+            );
+            crate::registry_scope::establish_scope(
+                &backend,
+                &ctx.registry_scope,
+                &ctx.tenant,
+                &ctx.source_id,
+                storage::adapters::LineageDescriptor::mysql(U).unwrap(),
+            )
+            .await
+            .unwrap();
+            ctx.last_gtid = Some(GtidSet::parse(&format!("{U}:1-50")).unwrap());
+            ctx
+        }
+
+        /// `n` raw entries in `ns`/`stream` of `size` bytes each: the limit
+        /// stops the read before anything is decoded.
+        async fn raw(
+            ctx: &RunCtx,
+            ns: &str,
+            stream: &str,
+            n: u64,
+            size: usize,
+        ) {
+            for _ in 0..n {
+                ctx.registry_backend
+                    .log_append(ns, stream, &vec![b'x'; size])
+                    .await
+                    .unwrap();
+            }
+        }
+
+        fn too_large(err: &SourceError) -> bool {
+            err.draft().map(|d| d.reason_code.as_str())
+                == Some("mysql_timeline_too_large")
+        }
+
+        /// Over the record limit by its lineage barriers alone: every
+        /// table of the lineage fails closed, never loaded whole.
+        #[tokio::test]
+        async fn a_timeline_over_its_record_limit_fails_closed() {
+            let backend: ArcStorageBackend =
+                Arc::new(storage::MemoryStorageBackend::new());
+            let mut ctx = ctx_on(backend).await;
+            let key = ctx.registry_scope.current().unwrap().key("d", "x");
+            let lineage = crate::mysql::mysql_activation::barrier_stream(
+                &key,
+                &BarrierScope::Lineage,
+            );
+            raw(&ctx, BARRIER_NS, &lineage, 100_001, 8).await;
+            let Err(err) = timeline(&mut ctx, &key).await else {
+                panic!("over the limit, yet loaded whole");
+            };
+            assert!(too_large(&err), "{err}");
+            assert!(ctx.selection.timeline(&key.backend_key()).is_none());
+        }
+
+        /// Over the byte limit by its own stream: the table fails closed;
+        /// another table of the lineage is unaffected.
+        #[tokio::test]
+        async fn a_timeline_over_its_byte_limit_fails_closed() {
+            let backend: ArcStorageBackend =
+                Arc::new(storage::MemoryStorageBackend::new());
+            let mut ctx = ctx_on(backend).await;
+            let scope = ctx.registry_scope.current().unwrap();
+            let (big, small) = (scope.key("d", "big"), scope.key("d", "small"));
+            raw(&ctx, ACTIVATION_NS, &table_stream(&big), 65, 1 << 20).await;
+            let Err(err) = timeline(&mut ctx, &big).await else {
+                panic!("over the limit, yet loaded whole");
+            };
+            assert!(too_large(&err), "{err}");
+            let t = timeline(&mut ctx, &small).await.unwrap();
+            assert!(t.records.is_empty());
+        }
+
+        /// The cache's estimated total never exceeds its byte bound, with
+        /// timelines just under the per-timeline limit sharing one barrier
+        /// stream (held, and counted, once).
+        #[test]
+        fn a_full_cache_stays_within_its_bytes() {
+            let shared = Arc::new(BarrierStream {
+                stream: "lineage/".into(),
+                records: Vec::new(),
+                head: 1,
+                bytes: 10 << 20,
+            });
+            let mut caches = Caches::default();
+            for i in 0..20 {
+                caches.put_timeline(
+                    format!("lineage/d/t{i}"),
+                    Arc::new(Timeline {
+                        records: Vec::new(),
+                        table_head: 0,
+                        streams: vec![shared.clone()],
+                        bytes: super::super::super::mysql_history::TIMELINE_MAX_BYTES
+                            - (10 << 20),
+                    }),
+                );
+                assert!(
+                    caches.bytes() <= SELECTION_CACHE_BYTES,
+                    "{}",
+                    caches.bytes()
+                );
+            }
+            // 4 timelines of 54 MiB and the 10 MiB stream once: 226 MiB.
+            assert_eq!(caches.timelines(), 4);
+            assert_eq!(caches.bytes(), 4 * (54 << 20) + (10 << 20));
+            assert_eq!(caches.barrier_streams().len(), 1);
+            // The last timeline holding the stream takes it with it.
+            caches.barrier_appended("lineage/");
+            assert_eq!((caches.timelines(), caches.bytes()), (0, 0));
+        }
+
+        /// A barrier invalidates exactly what it applies to: a database's,
+        /// that database's tables; a lineage's, every table; nothing else.
+        #[tokio::test]
+        async fn a_barrier_invalidates_what_it_applies_to() {
+            let backend: ArcStorageBackend =
+                Arc::new(storage::MemoryStorageBackend::new());
+            let mut ctx = ctx_on(backend).await;
+            let scope = ctx.registry_scope.current().unwrap();
+            let keys = [
+                scope.key("a", "x"),
+                scope.key("a", "y"),
+                scope.key("b", "z"),
+            ];
+            async fn load(ctx: &mut RunCtx, keys: &[SchemaKey]) {
+                for k in keys {
+                    timeline(ctx, k).await.unwrap();
+                }
+            }
+            let cached = |ctx: &mut RunCtx| {
+                keys.iter()
+                    .map(|k| ctx.selection.timeline(&k.backend_key()).is_some())
+                    .collect::<Vec<_>>()
+            };
+            load(&mut ctx, &keys).await;
+            let at = |i: u64| WmPos::MysqlGtid {
+                gtid_set: format!("{U}:1-{i}"),
+            };
+            let db_a = BarrierScope::Database { db: "a".into() };
+            append_barrier(
+                &ctx.registry_backend.clone(),
+                &ctx.schema.registry_arc(),
+                &mut ctx.selection,
+                &keys[0],
+                db_a,
+                &EventIdentity::Gtid {
+                    gtid: format!("{U}:51"),
+                    ordinal: 0,
+                },
+                at(51),
+            )
+            .await
+            .unwrap();
+            assert_eq!(cached(&mut ctx), [false, false, true]);
+            load(&mut ctx, &keys).await;
+            // The reloaded timelines hold the new barrier.
+            let x = timeline(&mut ctx, &keys[0]).await.unwrap();
+            assert_eq!(x.barriers().count(), 1);
+            append_barrier(
+                &ctx.registry_backend.clone(),
+                &ctx.schema.registry_arc(),
+                &mut ctx.selection,
+                &keys[0],
+                BarrierScope::Lineage,
+                &EventIdentity::Gtid {
+                    gtid: format!("{U}:52"),
+                    ordinal: 0,
+                },
+                at(52),
+            )
+            .await
+            .unwrap();
+            assert_eq!(cached(&mut ctx), [false, false, false]);
+            assert_eq!(ctx.selection.bytes(), 0);
+            load(&mut ctx, &keys).await;
+            let z = timeline(&mut ctx, &keys[2]).await.unwrap();
+            assert_eq!(z.barriers().count(), 1, "the lineage barrier only");
+        }
+
+        /// The only barrier writer is `append_barrier`: a new one appending
+        /// without invalidating the cache fails this test.
+        #[test]
+        fn every_barrier_append_goes_through_append_barrier() {
+            let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/mysql");
+            let mut calls = Vec::new();
+            for e in std::fs::read_dir(dir).unwrap() {
+                let path = e.unwrap().path();
+                if path.extension().is_none_or(|x| x != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                // Production code only: the test modules may write raw.
+                let code =
+                    text.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+                for (i, line) in code.lines().enumerate() {
+                    if line.contains("record_barrier(")
+                        && !line.trim_start().starts_with("//")
+                        && !line.contains("fn record_barrier(")
+                    {
+                        calls.push(format!(
+                            "{}:{}",
+                            path.file_name().unwrap().to_string_lossy(),
+                            i + 1
+                        ));
+                    }
+                }
+            }
+            assert_eq!(calls.len(), 1, "{calls:?}");
+            assert!(calls[0].starts_with("mysql_selection.rs"), "{calls:?}");
         }
     }
 }

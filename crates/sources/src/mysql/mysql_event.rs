@@ -1214,9 +1214,7 @@ async fn record_query(
     classified: &super::mysql_ddl_attribution::Classified,
     sql_loggable: bool,
 ) -> SourceResult<()> {
-    use super::mysql_activation::{
-        BarrierScope, EventIdentity, record_barrier, record_ddl,
-    };
+    use super::mysql_activation::{BarrierScope, EventIdentity, record_ddl};
     use super::mysql_ddl_attribution::{BarrierScopeOf, DdlEffect};
 
     let effect =
@@ -1299,7 +1297,6 @@ async fn record_query(
     );
     let mut pending = Vec::new();
     let mut invalidated = Vec::new();
-    let barrier_written = barrier.is_some();
     for t in &tables {
         let (db, table) = (name(&t.db), name(&t.table));
         let key = scope.key(&db, &table);
@@ -1330,21 +1327,25 @@ async fn record_query(
             "statement not attributable to tables: activation barrier"
         );
         let key = scope.key("", "");
-        record_barrier(backend, registry, &key, barrier, &event, position)
-            .await
-            .map_err(|e| fail("barrier", e))?;
+        super::mysql_selection::append_barrier(
+            backend,
+            registry,
+            &mut ctx.selection,
+            &key,
+            barrier,
+            &event,
+            position,
+        )
+        .await
+        .map_err(|e| fail("barrier", e))?;
     }
     // Paused at the DDL: prove before its event is emitted and before any
     // later event is read.
     super::mysql_forward_proof::prove(ctx, pending).await?;
     // Selections and validated timelines read before these records are
-    // stale.
-    if barrier_written {
-        ctx.selection.invalidate_all();
-    } else {
-        for key in &invalidated {
-            ctx.selection.invalidate(key);
-        }
+    // stale (a barrier's were invalidated with its append).
+    for key in &invalidated {
+        ctx.selection.invalidate(key);
     }
     // The loader's cached shapes of what the statement may change are stale:
     // forgotten, never reloaded here (a new version enters the registry only
@@ -2430,16 +2431,26 @@ pub(crate) mod tests {
             table_name: "items".into(),
             ..orders.clone()
         };
-        // Room for one table's timeline and selection.
-        ctx.selection = Caches::with_budget_for_test(2);
-
+        ctx.selection = Caches::with_budget_for_test(1);
         let first = select_for_rows(&mut ctx, &orders).await.unwrap();
+        // Room for one table's timeline and selection.
+        let one = ctx.selection.bytes();
+        ctx.selection.set_limits_for_test(1, one);
         assert!(Arc::ptr_eq(
             &first,
             &select_for_rows(&mut ctx, &orders).await.unwrap()
         ));
         select_for_rows(&mut ctx, &items).await.unwrap();
-        assert_eq!(ctx.selection.len(), 2, "orders' entries were evicted");
+        let orders_key = ctx
+            .registry_scope
+            .current()
+            .unwrap()
+            .key(&orders.database_name, &orders.table_name);
+        assert_eq!(
+            ctx.selection.held_for(&orders_key),
+            0,
+            "orders' entries were evicted"
+        );
 
         let rebuilt = select_for_rows(&mut ctx, &orders).await.unwrap();
         assert!(!Arc::ptr_eq(&first, &rebuilt), "rebuilt, not cached");

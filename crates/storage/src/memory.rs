@@ -190,33 +190,22 @@ impl StorageBackend for MemoryStorageBackend {
         streams: &[(String, String)],
         budget: u64,
     ) -> Result<Vec<Vec<LogEntryMeta>>> {
-        let store = self.log.read().await;
-        let mut within = crate::StreamBudget::new(budget);
-        let mut out: Vec<Vec<LogEntryMeta>> = Vec::new();
-        'streams: for (i, (ns, key)) in streams.iter().enumerate() {
-            let mut entries = Vec::new();
-            for e in store
-                .entries
-                .get(&(ns.clone(), key.clone()))
-                .into_iter()
-                .flatten()
-            {
-                let m = LogEntryMeta {
-                    seq: e.seq,
-                    stored_at_ms: e.ts_ms,
-                    capture_id: e.capture_id.clone(),
-                    content_hash: e.content_hash.clone(),
-                    value: e.value.clone(),
-                };
-                if !within.take(i, &m) {
-                    break 'streams;
-                }
-                entries.push(m);
-            }
-            out.push(entries);
-        }
-        crate::note_stream_reads(&streams[..out.len()], &out);
-        Ok(out)
+        read_streams_budgeted(self, streams, crate::StreamBudget::new(budget))
+            .await
+    }
+
+    async fn log_read_streams_bounded(
+        &self,
+        streams: &[(String, String)],
+        max_bytes: u64,
+        max_entries: u64,
+    ) -> Result<Vec<Vec<LogEntryMeta>>> {
+        read_streams_budgeted(
+            self,
+            streams,
+            crate::StreamBudget::bounded(max_bytes, max_entries),
+        )
+        .await
     }
 
     async fn read_batch(
@@ -1045,6 +1034,40 @@ impl StorageBackend for MemoryStorageBackend {
         }
         Ok(to_drop)
     }
+}
+
+/// Stream reads within `within` (see `StreamBudget`), in place.
+async fn read_streams_budgeted(
+    be: &MemoryStorageBackend,
+    streams: &[(String, String)],
+    mut within: crate::StreamBudget,
+) -> Result<Vec<Vec<LogEntryMeta>>> {
+    let store = be.log.read().await;
+    let mut out: Vec<Vec<LogEntryMeta>> = Vec::new();
+    'streams: for (i, (ns, key)) in streams.iter().enumerate() {
+        let mut entries = Vec::new();
+        for e in store
+            .entries
+            .get(&(ns.clone(), key.clone()))
+            .into_iter()
+            .flatten()
+        {
+            let m = LogEntryMeta {
+                seq: e.seq,
+                stored_at_ms: e.ts_ms,
+                capture_id: e.capture_id.clone(),
+                content_hash: e.content_hash.clone(),
+                value: e.value.clone(),
+            };
+            if !within.take(i, &m) {
+                break 'streams;
+            }
+            entries.push(m);
+        }
+        out.push(entries);
+    }
+    crate::note_stream_reads(&streams[..out.len()], &out);
+    Ok(out)
 }
 
 #[cfg(test)]

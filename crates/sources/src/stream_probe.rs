@@ -205,3 +205,18 @@ pub fn set_window_caps(caps: Option<(u64, u64, u64)>) {
 pub(crate) fn window_caps() -> Option<(u64, u64, u64)> {
     *WINDOW_CAPS.lock().expect("window caps")
 }
+
+static SELECTION_CACHE_LIMITS: std::sync::Mutex<Option<(usize, u64)>> =
+    std::sync::Mutex::new(None);
+
+/// Set (or with `None` clear) the selection cache's bounds (tables, bytes)
+/// for sources started from here. Test seam: a few tables then exercise
+/// eviction and the return of evicted tables.
+pub fn set_selection_cache_limits(limits: Option<(usize, u64)>) {
+    *SELECTION_CACHE_LIMITS.lock().expect("cache limits") = limits;
+}
+
+/// The bounds a test set, if any.
+pub(crate) fn selection_cache_limits() -> Option<(usize, u64)> {
+    *SELECTION_CACHE_LIMITS.lock().expect("cache limits")
+}
