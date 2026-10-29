@@ -443,6 +443,46 @@ async fn pg_preconditions_conflict(
     Ok(None)
 }
 
+/// A log write as the batch checks it: its position, stream, capture
+/// identity, bytes and whether a stored identical entry answers it.
+type LogWrite<'a> = (usize, &'a str, &'a str, &'a str, &'a [u8], bool);
+
+/// The stored `(seq, value)` of each `unique` log write's capture identity
+/// that its stream holds already, by index into `unique`.
+async fn pg_stored_captures(
+    tx: &Tx<'_>,
+    unique: &[LogWrite<'_>],
+) -> Result<Vec<(usize, (u64, Vec<u8>))>> {
+    let mut out = Vec::new();
+    let mut offset = 0;
+    for chunk in
+        set_chunks(unique.iter().map(|u| u.1.len() + u.2.len() + u.3.len()))
+    {
+        let rows = &unique[chunk];
+        let found = tx
+            .query(
+                "SELECT r.i, l.seq, l.val
+                 FROM unnest($1::text[], $2::text[], $3::text[])
+                      WITH ORDINALITY AS r(ns, key, capture_id, i)
+                 JOIN df_log l ON l.ns = r.ns AND l.key = r.key
+                                AND l.capture_id = r.capture_id
+                 ORDER BY r.i",
+                &[
+                    &rows.iter().map(|u| u.1).collect::<Vec<_>>(),
+                    &rows.iter().map(|u| u.2).collect::<Vec<_>>(),
+                    &rows.iter().map(|u| u.3).collect::<Vec<_>>(),
+                ],
+            )
+            .await?;
+        for r in found {
+            let i = r.get::<_, i64>(0) as usize - 1;
+            out.push((offset + i, (r.get::<_, i64>(1) as u64, r.get(2))));
+        }
+        offset += rows.len();
+    }
+    Ok(out)
+}
+
 const KV_PUT_SQL: &str =
     "INSERT INTO df_kv(ns, key, val, updated_at, expires_at)
      VALUES($1, $2, $3, $4, NULL)
@@ -669,30 +709,45 @@ impl StorageBackend for PostgresStorageBackend {
             return Ok(BatchOutcome::Conflict { why });
         }
 
-        // Log entries: new capture ids only. An existing or repeated id is
-        // not inserted, and the short count is a conflict, as one insert at
-        // a time had it.
-        let appends: Vec<(usize, &str, &str, &str, &[u8])> = batch
+        // Log entries. A repeated identity collapsed onto its first position
+        // (`canonical_log_ops`); each remaining identity is checked against
+        // the store at once: a stored one is a conflict (`Absent`), or, with
+        // identical bytes, answered with its original sequence
+        // (`AbsentOrIdentical`; other bytes fail closed). Only new
+        // identities are inserted, numbered in first-input order.
+        let canonical = crate::canonical_log_ops(&batch.ops)?;
+        let unique: Vec<LogWrite<'_>> = batch
             .ops
             .iter()
             .enumerate()
-            .filter_map(|(i, op)| match op {
-                BatchOp::LogAppendIfAbsent {
-                    ns,
-                    key,
-                    capture_id,
-                    value,
-                } => Some((
-                    i,
-                    ns.as_str(),
-                    key.as_str(),
-                    capture_id.as_str(),
-                    value.as_slice(),
-                )),
-                _ => None,
+            .filter(|(i, _)| canonical[*i] == *i)
+            .filter_map(|(i, op)| {
+                op.log_write().map(|(ns, key, cid, value, idem)| {
+                    (i, ns, key, cid, value, idem)
+                })
             })
             .collect();
         let mut seqs: Vec<Option<u64>> = vec![None; batch.ops.len()];
+        for (j, (seq, stored)) in pg_stored_captures(&tx, &unique).await? {
+            let (i, _, key, capture_id, value, idempotent) = unique[j];
+            if !idempotent {
+                return Ok(BatchOutcome::Conflict {
+                    why: format!("{capture_id} already exists in {key}"),
+                });
+            }
+            if stored != value {
+                return Err(crate::LogError::CaptureIdentityConflict {
+                    capture_id: capture_id.to_string(),
+                }
+                .into());
+            }
+            seqs[i] = Some(seq);
+        }
+        let appends: Vec<(usize, &str, &str, &str, &[u8])> = unique
+            .iter()
+            .filter(|u| seqs[u.0].is_none())
+            .map(|u| (u.0, u.1, u.2, u.3, u.4))
+            .collect();
         if !appends.is_empty() {
             // One contiguous block, in op order: every df_log insert holds
             // the store lock, so nothing else allocates meanwhile.
@@ -775,6 +830,13 @@ impl StorageBackend for PostgresStorageBackend {
                     ],
                 )
                 .await?;
+            }
+        }
+
+        // A collapsed repeat: its first position's sequence.
+        for (i, c) in canonical.iter().enumerate() {
+            if *c != i {
+                seqs[i] = seqs[*c];
             }
         }
 

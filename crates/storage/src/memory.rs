@@ -299,31 +299,45 @@ impl StorageBackend for MemoryStorageBackend {
         let mut staged_kv: Vec<(NsKey, Vec<u8>)> = Vec::new();
         let mut staged_marker: Option<(String, crate::BatchCommitRecord)> =
             None;
+        let canonical = crate::canonical_log_ops(&batch.ops)?;
         for (i, op) in batch.ops.iter().enumerate() {
             if fault == Some(BatchFault::AfterWrites(i)) {
                 anyhow::bail!("injected failure after {i} staged writes");
             }
             match op {
-                BatchOp::LogAppendIfAbsent {
-                    ns,
-                    key,
-                    capture_id,
-                    value,
-                } => {
-                    let k = (ns.clone(), key.clone());
-                    let exists = log.entries.get(&k).is_some_and(|v| {
-                        v.iter().any(|e| {
+                BatchOp::LogAppendIfAbsent { .. }
+                | BatchOp::LogAppendIdempotent { .. } => {
+                    let (ns, key, capture_id, value, idempotent) =
+                        op.log_write().expect("a log write");
+                    // A collapsed repeat: its first position's sequence.
+                    if canonical[i] != i {
+                        seqs[i] = seqs[canonical[i]];
+                        continue;
+                    }
+                    let k = (ns.to_string(), key.to_string());
+                    let stored = log.entries.get(&k).and_then(|v| {
+                        v.iter().find(|e| {
                             e.capture_id.as_deref() == Some(capture_id)
                         })
-                    }) || staged_logs.iter().any(|(sk, e)| {
-                        sk == &k && e.capture_id.as_deref() == Some(capture_id)
                     });
-                    if exists {
-                        return Ok(BatchOutcome::Conflict {
-                            why: format!(
-                                "{capture_id} already exists in {key}"
-                            ),
-                        });
+                    if let Some(e) = stored {
+                        if !idempotent {
+                            return Ok(BatchOutcome::Conflict {
+                                why: format!(
+                                    "{capture_id} already exists in {key}"
+                                ),
+                            });
+                        }
+                        if e.value != value {
+                            return Err(
+                                crate::LogError::CaptureIdentityConflict {
+                                    capture_id: capture_id.to_string(),
+                                }
+                                .into(),
+                            );
+                        }
+                        seqs[i] = Some(e.seq);
+                        continue;
                     }
                     next += 1;
                     seqs[i] = Some(next);
@@ -331,8 +345,8 @@ impl StorageBackend for MemoryStorageBackend {
                         k,
                         MemLogEntry {
                             seq: next,
-                            value: value.clone(),
-                            capture_id: Some(capture_id.clone()),
+                            value: value.to_vec(),
+                            capture_id: Some(capture_id.to_string()),
                             content_hash: Some(content_digest(value)),
                             ts_ms: now_ms(),
                         },

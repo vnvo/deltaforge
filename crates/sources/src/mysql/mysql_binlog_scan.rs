@@ -2387,7 +2387,7 @@ pub(crate) async fn capture_proven(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::mysql_ddl_attribution::TableName;
     use super::*;
 
@@ -2402,7 +2402,15 @@ mod tests {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
-            let production = match text.find("\n#[cfg(test)]\nmod ") {
+            // The test module, however visible it is.
+            let production = match [
+                "\n#[cfg(test)]\nmod tests",
+                "\n#[cfg(test)]\npub(crate) mod tests",
+            ]
+            .iter()
+            .filter_map(|m| text.find(m))
+            .min()
+            {
                 Some(i) => &text[..i],
                 None => &text[..],
             };
@@ -2454,8 +2462,14 @@ mod tests {
         // Every production capture, by path: what it passes as its context.
         let calls = [
             ("mysql_forward_proof.rs", "capture(&ctx.capture,", 1),
+            // The lazy baseline, and the per-table snapshot path (kept as the
+            // batched one's test reference).
             ("mysql_baseline.rs", "capture(&ctx.capture,", 2),
+            // Snapshot baselines, one batched capture per chunk.
+            ("mysql_baseline.rs", "capture_batch(&ctx.capture,", 1),
+            // The per-table drift check, and snapshot-time drift per chunk.
             ("mysql_failover_drift.rs", "capture(env.capture,", 1),
+            ("mysql_failover_drift.rs", "capture_batch(env.capture,", 1),
             ("mysql_selection.rs", "capture_proven(&ctx.capture,", 1),
             (
                 "mysql_activation_window.rs",
@@ -2511,7 +2525,7 @@ mod tests {
             );
             total += n;
         }
-        assert_eq!(total, 9);
+        assert_eq!(total, 11);
         // The window's captures (also speculative ones) and the snapshot's
         // and stream's drift checks carry the run's context.
         let window = &sources
@@ -3333,7 +3347,7 @@ mod tests {
     }
 
     /// Live MySQL 8.4 (Docker): one GTID-mode and one file/position server.
-    mod live {
+    pub(crate) mod live {
         use super::*;
         use crate::mysql::mysql_schema_loader::read_hook;
         use gate_ownership::GateOwned;
@@ -3390,7 +3404,7 @@ mod tests {
             cell.get_or_init(|| start(gtid)).await.1
         }
 
-        async fn server(gtid: bool) -> String {
+        pub(crate) async fn server(gtid: bool) -> String {
             dsn_of(port(gtid).await)
         }
 
@@ -3423,7 +3437,7 @@ mod tests {
             (dsn_of(port), opened)
         }
 
-        async fn sql(dsn: &str, stmts: &[&str]) {
+        pub(crate) async fn sql(dsn: &str, stmts: &[&str]) {
             let mut c = mysql_async::Conn::from_url(dsn).await.unwrap();
             for s in stmts {
                 c.query_drop(*s)
@@ -3432,7 +3446,7 @@ mod tests {
             }
         }
 
-        async fn uuid(dsn: &str) -> String {
+        pub(crate) async fn uuid(dsn: &str) -> String {
             let mut c = mysql_async::Conn::from_url(dsn).await.unwrap();
             c.query_first("SELECT @@GLOBAL.server_uuid")
                 .await
@@ -3440,7 +3454,7 @@ mod tests {
                 .unwrap()
         }
 
-        async fn position(dsn: &str) -> MySqlCheckpoint {
+        pub(crate) async fn position(dsn: &str) -> MySqlCheckpoint {
             let mut c = mysql_async::Conn::from_url(dsn).await.unwrap();
             let mode: Option<String> =
                 c.query_first("SELECT @@GLOBAL.gtid_mode").await.unwrap();

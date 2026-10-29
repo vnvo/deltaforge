@@ -51,6 +51,10 @@ pub struct FaultBackend {
         std::sync::Mutex<Option<(String, String, Vec<u8>)>>,
     /// Every `apply_batch` waits forever (a store that stopped answering).
     pub stall_batches: AtomicBool,
+    /// One-shot: the next `apply_batch` writing to this namespace commits
+    /// on the inner store, then fails (a lost acknowledgement: the outcome
+    /// is ambiguous to the caller).
+    pub lose_ack_for: std::sync::Mutex<Option<String>>,
 }
 
 /// See [`FaultBackend::pause_after_slot_list`]: (namespace, reached,
@@ -93,6 +97,7 @@ impl FaultBackend {
             pause_after_slot_list: std::sync::Mutex::new(None),
             write_after_batch_error: std::sync::Mutex::new(None),
             stall_batches: AtomicBool::new(false),
+            lose_ack_for: std::sync::Mutex::new(None),
         }
     }
 
@@ -173,6 +178,7 @@ impl StorageBackend for FaultBackend {
         for op in &batch.ops {
             let ns = match op {
                 crate::BatchOp::LogAppendIfAbsent { ns, .. }
+                | crate::BatchOp::LogAppendIdempotent { ns, .. }
                 | crate::BatchOp::KvPut { ns, .. }
                 | crate::BatchOp::KvMaxSeq { ns, .. }
                 | crate::BatchOp::KvMax { ns, .. } => ns,
@@ -185,7 +191,22 @@ impl StorageBackend for FaultBackend {
         if self.stall_batches.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
+        let lose_ack = {
+            let mut armed = self.lose_ack_for.lock().unwrap();
+            let hit = armed.as_ref().is_some_and(|ns| {
+                batch.ops.iter().any(|op| {
+                    op.log_write().is_some_and(|w| w.0 == ns)
+                        || matches!(op, crate::BatchOp::KvPut { ns: n, .. } if n == ns)
+                })
+            });
+            hit && armed.take().is_some()
+        };
         let out = self.inner.apply_batch(batch).await;
+        if lose_ack && out.is_ok() {
+            anyhow::bail!(
+                "injected: the batch committed and its acknowledgement was lost"
+            );
+        }
         if out.is_err() {
             let later = self.write_after_batch_error.lock().unwrap().take();
             if let Some((ns, key, value)) = later {

@@ -711,12 +711,27 @@ Today it takes about 30 statements per table, about 61,000.
 
 ### 3. Failover drift by window
 
-- **Assessment:** `check_window` assesses a window's pending tables together:
-  - one `capture_batch` from the pool (sorted metadata locks);
-  - one `shared_interval` request, within the window's two stream openings;
-  - per-table verdicts decided in memory by the existing functions.
-- **Recording:** markers and captured registrations become ops of the
-  window's atomic batch (`AbsentOrIdentical` for the idempotent marker).
+- **Assessment (row path):** a window's pending tables are decided from the
+  window's own `capture_batch` and each table's `shared_intervals` answer,
+  the interval (E, S] its proof starts at: the per-table check's decision
+  (`pre_assess`, `proof_start`, `shape_from`, `finish_assess`), with no
+  capture or scan of its own. Equivalence tests show the reused inputs give
+  the per-table verdict for unchanged, changed, new and later-changed
+  tables, an affected interval, a record between F and E, rows before F
+  and the halt policy.
+- **Recording:** markers (`LogAppendIdempotent`, deterministic identity and
+  bytes) and captured registrations are ops of the window's atomic batch.
+  When the batch fails, nothing of the drift outcome survives; the restart
+  reassesses and records once. An ambiguous commit resolves through the
+  batch's marker to the original outcome.
+- **One registration per table:** when drift registers a table (the shape
+  at F, checkpoint F), that registration is the table's only one in the
+  batch and the baseline names its planned version. A window registration
+  is merged only when it is the same registration (key, hash and schema);
+  any other difference fails the window closed.
+- **Snapshot time:** the drift check of a discovery page runs in chunks of
+  at most 2,048 tables in discovery order, each with one `capture_batch`,
+  one scan of (F, S] and one atomic commit of its outcomes.
 - **Incidents:** a drift incident still stops the whole window before any
   write.
 - **Connection costs, reported apart:** the failover's reconnection (stream
@@ -742,9 +757,17 @@ Today it takes about 30 statements per table, about 61,000.
 - **Equivalence test:** with positions fixed, the old per-table path and the
   new batched path write identical bytes and sequences. With live timing,
   they compare equal after excluding `to`, `scan_digest` and `capture_id`.
-- **Atomicity:** registrations and baselines of a page commit in one batch
-  (`AbsentOrIdentical`). Planning registers through `plan_registrations`, one
-  batch per page.
+- **Chunks:** a page's candidates are established in chunks of at most
+  2,048 tables in discovery order. Each chunk owns its capture, its S, its
+  scan and its atomic commit; the window limits may end a chunk early, and
+  its untouched suffix leads the next chunk. A committed chunk stays valid
+  when a later one fails.
+- **Atomicity:** registrations and baselines of a chunk commit in one batch
+  (baselines `LogAppendIdempotent`). Planning registers through
+  `plan_registrations`, one batch per chunk.
+- **Per-table decisions unchanged:** an uncovered capture interval or a
+  relevant statement leaves the table unproven, with no registration or
+  baseline from that attempt, as in the per-table path.
 - **Unchanged:** copy and owner checks.
 
 **Compatibility across versions and restarts.**
@@ -756,15 +779,19 @@ Today it takes about 30 statements per table, about 61,000.
   writing a second one, and the reverse holds too.
 - **The candidate loop's reads:** two serial store reads per table today.
   They become one `load_timelines` call per page (section 6).
+- **Correction (5c):** a generation is never resumed part-way. A crash
+  before the generation completes replaces it (`snapshot_driver::decide`):
+  a new generation, a new anchor R0' and a new stream-start barrier there,
+  then every table established at R0'. An earlier revision assumed a
+  page-level resume; no such path exists, and 5c does not add one.
 - **Required tests:**
-  - **Restart halfway through a generation:** pages 1-2 established, the
-    process killed, the generation resumed. Pages 1-2 write nothing, and
-    pages 3 onward are established once.
-  - **Mixed versions:** pages established by the old per-table binary, then
-    the generation resumed by the batched binary. Each table has exactly one
-    baseline, sequences are unique, and rows select the same versions as an
-    all-old or all-new run.
-  - **Retry after an ambiguous page commit:** the commit identity resolves
+  - **Replay at the same R0:** establish run again at the same anchor writes
+    nothing.
+  - **Interrupted generation:** chunks committed, the run failed, the
+    generation replaced: every table is established exactly once at R0',
+    binding R0''s barrier. A baseline of the old generation (or of the
+    per-table path) at R0 does not prove the table at R0'.
+  - **Retry after an ambiguous chunk commit:** the commit identity resolves
     it. Committed means no rewrite; absent means a re-apply that writes each
     table once.
   - **DDL between pages:** a DDL on a page-3 table after page 2 commits puts

@@ -2750,6 +2750,7 @@ mod tests {
             for op in registrations.iter().flat_map(|p| &p.ops) {
                 let ns = match op {
                     crate::BatchOp::LogAppendIfAbsent { ns, .. }
+                    | crate::BatchOp::LogAppendIdempotent { ns, .. }
                     | crate::BatchOp::KvPut { ns, .. }
                     | crate::BatchOp::KvMaxSeq { ns, .. }
                     | crate::BatchOp::KvMax { ns, .. } => ns,

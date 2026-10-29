@@ -423,8 +423,19 @@ pub const SEQ_SENTINEL: u64 = u64::MAX;
 /// same batch by its position in `ops`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchOp {
-    /// A new entry under a capture identity that must not exist yet.
+    /// A new entry under a capture identity that must not exist yet: a
+    /// stored entry under it is a conflict.
     LogAppendIfAbsent {
+        ns: String,
+        key: String,
+        capture_id: String,
+        value: Vec<u8>,
+    },
+    /// An entry under a capture identity that may exist already with these
+    /// exact bytes (the single-call `log_append_if_absent`'s rule): a stored
+    /// identical entry answers with its original sequence, one with other
+    /// bytes fails closed (`LogError::CaptureIdentityConflict`).
+    LogAppendIdempotent {
         ns: String,
         key: String,
         capture_id: String,
@@ -680,6 +691,18 @@ pub fn batch_digest(batch: &AtomicBatch) -> Vec<u8> {
                 put(&mut h, capture_id.as_bytes());
                 put(&mut h, value);
             }
+            BatchOp::LogAppendIdempotent {
+                ns,
+                key,
+                capture_id,
+                value,
+            } => {
+                put(&mut h, b"LogAppendIdempotent");
+                put(&mut h, ns.as_bytes());
+                put(&mut h, key.as_bytes());
+                put(&mut h, capture_id.as_bytes());
+                put(&mut h, value);
+            }
             BatchOp::KvPut { ns, key, value } => {
                 put(&mut h, b"KvPut");
                 put(&mut h, ns.as_bytes());
@@ -761,11 +784,19 @@ pub fn encode_batch_result(
     put_varint(&mut out, ops.len() as u64);
     for (op, seq) in ops.iter().zip(seqs) {
         match (op, seq) {
-            (BatchOp::LogAppendIfAbsent { .. }, Some(s)) => {
+            (
+                BatchOp::LogAppendIfAbsent { .. }
+                | BatchOp::LogAppendIdempotent { .. },
+                Some(s),
+            ) => {
                 out.push(STATUS_LOG_INSERTED);
                 put_varint(&mut out, *s);
             }
-            (BatchOp::LogAppendIfAbsent { .. }, None) => {
+            (
+                BatchOp::LogAppendIfAbsent { .. }
+                | BatchOp::LogAppendIdempotent { .. },
+                None,
+            ) => {
                 anyhow::bail!("batch result: a log write has no sequence")
             }
             (BatchOp::CommitMarker { .. }, _) => {
@@ -912,7 +943,8 @@ impl AtomicBatch {
         for op in &self.ops {
             // A rendered template is never longer than its sentinel form.
             let item = match op {
-                BatchOp::LogAppendIfAbsent { ns, key, value, .. } => {
+                BatchOp::LogAppendIfAbsent { ns, key, value, .. }
+                | BatchOp::LogAppendIdempotent { ns, key, value, .. } => {
                     Some((ns, key, value.len()))
                 }
                 BatchOp::KvPut { ns, key, value } => Some((
@@ -931,6 +963,9 @@ impl AtomicBatch {
                 check_state_item(ns, key, size)?;
             }
         }
+        // A capture identity repeated within the request: identical bytes
+        // collapse onto its first position, other bytes fail closed.
+        canonical_log_ops(&self.ops)?;
         for (i, op) in self.ops.iter().enumerate() {
             let of = match op {
                 BatchOp::CommitMarker { .. } => {
@@ -940,7 +975,8 @@ impl AtomicBatch {
                     );
                     continue;
                 }
-                BatchOp::LogAppendIfAbsent { .. } => continue,
+                BatchOp::LogAppendIfAbsent { .. }
+                | BatchOp::LogAppendIdempotent { .. } => continue,
                 BatchOp::KvPut {
                     value: BatchValue::Bytes(_),
                     ..
@@ -960,16 +996,68 @@ impl AtomicBatch {
                 BatchOp::KvMax { .. } => continue,
             };
             anyhow::ensure!(
-                of < i
-                    && matches!(
-                        self.ops[of],
-                        BatchOp::LogAppendIfAbsent { .. }
-                    ),
+                of < i && self.ops[of].log_write().is_some(),
                 "batch op {i}: `of` {of} is not an earlier log write"
             );
         }
         Ok(())
     }
+}
+
+impl BatchOp {
+    /// A log write's stream, capture identity and bytes, and whether a
+    /// stored identical entry answers it (`LogAppendIdempotent`).
+    pub fn log_write(&self) -> Option<(&str, &str, &str, &[u8], bool)> {
+        match self {
+            BatchOp::LogAppendIfAbsent {
+                ns,
+                key,
+                capture_id,
+                value,
+            } => Some((ns, key, capture_id, value, false)),
+            BatchOp::LogAppendIdempotent {
+                ns,
+                key,
+                capture_id,
+                value,
+            } => Some((ns, key, capture_id, value, true)),
+            _ => None,
+        }
+    }
+}
+
+/// For each op, the position its log write collapses onto: its own, or the
+/// first earlier write of the same `(ns, key, capture_id)` with identical
+/// bytes (a repeated identity with other bytes is
+/// `LogError::CaptureIdentityConflict`, refused before any statement). Ops
+/// that are not log writes map to themselves.
+pub(crate) fn canonical_log_ops(ops: &[BatchOp]) -> Result<Vec<usize>> {
+    let mut first: std::collections::HashMap<(&str, &str, &str), usize> =
+        std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(ops.len());
+    for (i, op) in ops.iter().enumerate() {
+        let Some((ns, key, capture_id, value, _)) = op.log_write() else {
+            out.push(i);
+            continue;
+        };
+        match first.get(&(ns, key, capture_id)) {
+            Some(&j) => {
+                let same = ops[j].log_write().is_some_and(|w| w.3 == value);
+                if !same {
+                    return Err(LogError::CaptureIdentityConflict {
+                        capture_id: capture_id.to_string(),
+                    }
+                    .into());
+                }
+                out.push(j);
+            }
+            None => {
+                first.insert((ns, key, capture_id), i);
+                out.push(i);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// `template` with the sequence `seq` in place of the sentinel.
@@ -1097,6 +1185,13 @@ async fn commit_attempts(
             }
             Err(e) => e,
         };
+        // Refused before any write: nothing to resolve, never retried.
+        if err.chain().any(|c| {
+            c.downcast_ref::<LogError>().is_some()
+                || c.downcast_ref::<StateItemTooLarge>().is_some()
+        }) {
+            return Err(err);
+        }
         attempt += 1;
         // Only the marker decides; its lookup may fail transiently and is
         // retried, never skipped.
@@ -2747,7 +2842,6 @@ pub(crate) mod atomic_batch_suite {
             .await;
         max_ops_see_the_batchs_own_writes(be.clone(), &format!("{ns}_rw"))
             .await;
-        a_repeated_capture_id_conflicts(be.clone(), &format!("{ns}_dup")).await;
         contradictory_preconditions_conflict(be.clone(), &format!("{ns}_pre"))
             .await;
         an_expired_value_reads_as_absent(be.clone(), &format!("{ns}_ttl"))
@@ -2756,6 +2850,24 @@ pub(crate) mod atomic_batch_suite {
         oversized_items_are_refused(be.clone(), &format!("{ns}_m")).await;
         stream_reads_stop_at_their_budget(be.clone(), &format!("{ns}_within"))
             .await;
+        identical_duplicates_collapse(be.clone(), &format!("{ns}_collapse"))
+            .await;
+        a_duplicate_with_other_bytes_fails_closed(
+            be.clone(),
+            &format!("{ns}_dupconf"),
+        )
+        .await;
+        absent_or_identical_maps_existing_and_new(
+            be.clone(),
+            &format!("{ns}_aoi"),
+        )
+        .await;
+        a_resolved_mapping_is_the_original(
+            be.clone(),
+            faults,
+            &format!("{ns}_orig"),
+        )
+        .await;
         oversized_legacy_items_stay_readable(
             be.clone(),
             &format!("{ns}_legacy"),
@@ -2822,28 +2934,6 @@ pub(crate) mod atomic_batch_suite {
         let hw = s2.max(5).to_string().into_bytes();
         assert_eq!(be.kv_get(ns, "hw").await.unwrap(), Some(hw));
         assert_eq!(be.kv_get(ns, "q").await.unwrap(), Some(b"last".to_vec()));
-    }
-
-    /// A capture id repeated within one request conflicts and writes
-    /// nothing, as an existing one does.
-    pub async fn a_repeated_capture_id_conflicts(
-        be: Arc<dyn StorageBackend>,
-        ns: &str,
-    ) {
-        let batch = AtomicBatch {
-            preconditions: vec![],
-            ops: vec![
-                log(ns, "s", "same", b"one"),
-                log(ns, "t", "other", b"two"),
-                log(ns, "s", "same", b"one"),
-            ],
-        };
-        assert!(matches!(
-            be.apply_batch(&batch).await.unwrap(),
-            BatchOutcome::Conflict { .. }
-        ));
-        assert!(be.log_list(ns, "s").await.unwrap().is_empty());
-        assert!(be.log_list(ns, "t").await.unwrap().is_empty());
     }
 
     /// Two different expectations of one stream or key cannot both hold:
@@ -3114,6 +3204,182 @@ pub(crate) mod atomic_batch_suite {
             assert_eq!(&got[..], &full[..answered], "budget {budget}");
         }
         assert!(be.log_read_streams_within(&[], 0).await.unwrap().is_empty());
+    }
+
+    fn idem(ns: &str, key: &str, id: &str, value: &[u8]) -> BatchOp {
+        BatchOp::LogAppendIdempotent {
+            ns: ns.into(),
+            key: key.into(),
+            capture_id: id.into(),
+            value: value.to_vec(),
+        }
+    }
+
+    fn just(batch: Vec<BatchOp>) -> AtomicBatch {
+        AtomicBatch {
+            preconditions: vec![],
+            ops: batch,
+        }
+    }
+
+    /// Identical duplicates of a capture id within one request collapse
+    /// onto the first: every position maps to its one sequence, new entries
+    /// are numbered in first-input order, and the stream holds one entry.
+    pub async fn identical_duplicates_collapse(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
+        for mode in [log as fn(&str, &str, &str, &[u8]) -> BatchOp, idem] {
+            let key = format!(
+                "dup-{}",
+                matches!(
+                    mode(ns, "k", "i", b""),
+                    BatchOp::LogAppendIdempotent { .. }
+                )
+            );
+            let seqs = committed(
+                be.apply_batch(&just(vec![
+                    mode(ns, &key, "x", b"one"),
+                    mode(ns, &key, "y", b"two"),
+                    mode(ns, &key, "x", b"one"),
+                ]))
+                .await
+                .unwrap(),
+            );
+            assert_eq!(seqs[0], seqs[2], "{key}");
+            assert_eq!(seqs[1], Some(seqs[0].unwrap() + 1), "{key}");
+            assert_eq!(be.log_list(ns, &key).await.unwrap().len(), 2, "{key}");
+        }
+    }
+
+    /// The same capture id with different bytes within one request fails
+    /// closed before any statement: nothing is written or applied.
+    pub async fn a_duplicate_with_other_bytes_fails_closed(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
+        for mode in [log as fn(&str, &str, &str, &[u8]) -> BatchOp, idem] {
+            let mut applies = 0;
+            let err = commit_atomic_counted(
+                be.as_ref(),
+                &just(vec![
+                    mode(ns, "d", "x", b"one"),
+                    mode(ns, "d", "x", b"two"),
+                ]),
+                3,
+                &mut applies,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err.downcast_ref::<LogError>(),
+                    Some(LogError::CaptureIdentityConflict { .. })
+                ),
+                "{err:#}"
+            );
+            assert_eq!(applies, 0, "refused before any statement");
+            assert!(be.log_list(ns, "d").await.unwrap().is_empty());
+        }
+    }
+
+    /// AbsentOrIdentical accepts a durable identical entry with its
+    /// original sequence (a template of it renders that sequence), while
+    /// new ids, interleaved, are numbered in first-input order; a durable
+    /// entry with other bytes fails closed, applied once, never retried.
+    pub async fn absent_or_identical_maps_existing_and_new(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
+        let first = committed(
+            be.apply_batch(&just(vec![idem(ns, "s", "e", b"held")]))
+                .await
+                .unwrap(),
+        );
+        let e = first[0].unwrap();
+        let seqs = committed(
+            be.apply_batch(&just(vec![
+                idem(ns, "s", "a", b"a"),
+                idem(ns, "s", "e", b"held"),
+                log(ns, "t", "b", b"b"),
+                idem(ns, "s", "e", b"held"),
+                idem(ns, "s", "c", b"c"),
+                BatchOp::KvPut {
+                    ns: ns.into(),
+                    key: "of-e".into(),
+                    value: BatchValue::SeqTemplate {
+                        template: format!("{SEQ_SENTINEL}").into_bytes(),
+                        of: 1,
+                    },
+                },
+            ]))
+            .await
+            .unwrap(),
+        );
+        let a = seqs[0].unwrap();
+        assert_eq!(seqs[1], Some(e), "the original sequence");
+        assert_eq!(seqs[3], Some(e));
+        assert_eq!(seqs[2], Some(a + 1), "first-input order");
+        assert_eq!(seqs[4], Some(a + 2));
+        assert_eq!(
+            be.kv_get(ns, "of-e").await.unwrap(),
+            Some(e.to_string().into_bytes())
+        );
+        assert_eq!(be.log_list(ns, "s").await.unwrap().len(), 3);
+        let mut applies = 0;
+        let err = commit_atomic_counted(
+            be.as_ref(),
+            &just(vec![idem(ns, "s", "f", b"f"), idem(ns, "s", "e", b"other")]),
+            3,
+            &mut applies,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<LogError>(),
+                Some(LogError::CaptureIdentityConflict { .. })
+            ),
+            "{err:#}"
+        );
+        assert_eq!(applies, 1, "never retried");
+        assert!(be.log_find_capture(ns, "s", "f").await.unwrap().is_none());
+    }
+
+    /// A lost acknowledgement of a batch with existing and new ids resolves
+    /// from its marker to the original mapping; no other block is taken.
+    pub async fn a_resolved_mapping_is_the_original(
+        be: Arc<dyn StorageBackend>,
+        faults: &dyn BatchFaults,
+        ns: &str,
+    ) {
+        let held = committed(
+            be.apply_batch(&just(vec![idem(ns, "r", "e", b"held")]))
+                .await
+                .unwrap(),
+        )[0];
+        faults.set_batch_fault(Some(BatchFault::AfterCommit));
+        let batch = just(vec![
+            idem(ns, "r", "n1", b"1"),
+            idem(ns, "r", "e", b"held"),
+            idem(ns, "r", "n2", b"2"),
+        ]);
+        let seqs = match commit_atomic(be.as_ref(), &batch, 3).await.unwrap() {
+            CommitResult::Committed(seqs) => seqs,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(seqs[1], held);
+        let n1 = be.log_find_capture(ns, "r", "n1").await.unwrap().unwrap().0;
+        let n2 = be.log_find_capture(ns, "r", "n2").await.unwrap().unwrap().0;
+        assert_eq!((seqs[0], seqs[2]), (Some(n1), Some(n2)));
+        assert_eq!(n2, n1 + 1);
+        let next = committed(
+            be.apply_batch(&just(vec![idem(ns, "r", "later", b"l")]))
+                .await
+                .unwrap(),
+        )[0]
+        .unwrap();
+        assert_eq!(next, n2 + 1, "no block taken by a re-apply");
     }
 
     /// Every stream as paged out one by one.
