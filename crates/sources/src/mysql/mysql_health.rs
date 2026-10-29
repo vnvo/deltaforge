@@ -127,20 +127,21 @@ pub async fn run_preflight<S: AsRef<str>>(
 /// [`run_preflight`] on a control connection verified as `expected_uuid`:
 /// the checks that gate a snapshot describe the verified server only.
 pub(crate) async fn run_preflight_verified<S: AsRef<str>>(
+    control: &super::mysql_control::ControlPool,
     dsn: &str,
     expected_uuid: &str,
     tables: &[(S, S)],
     max_parallel_tables: usize,
 ) -> Result<PreflightReport> {
-    let mut conn = super::mysql_session::open_control_connection(
-        dsn,
-        expected_uuid,
-        std::time::Duration::from_secs(10),
-    )
-    .await
-    .map_err(|e| anyhow::Error::new(e.into_source_error(expected_uuid)))?;
+    use super::mysql_control::Class;
+    let mut conn = control
+        .connect(Class::Health, dsn, expected_uuid, Class::Health.wait())
+        .await
+        .map_err(|e| anyhow::Error::new(e.into_source_error(expected_uuid)))?;
     let report = run_preflight_on(&mut conn, tables, max_parallel_tables).await;
-    conn.disconnect().await.ok();
+    if report.is_ok() {
+        conn.release().await;
+    }
     report
 }
 
@@ -391,20 +392,19 @@ impl PreflightReport {
 /// Called synchronously after all workers finish, before writing `finished = true`.
 /// Returns Ok if still present or if verification can't be performed (transient).
 /// Returns Err only on confirmed purge.
-pub async fn verify_binlog_position(
+pub(crate) async fn verify_binlog_position(
+    control: &super::mysql_control::ControlPool,
     dsn: &str,
     expected_uuid: &str,
     captured_file: &str,
 ) -> Result<()> {
+    use super::mysql_control::Class;
     // Only the verified server's binlog list answers this.
-    let mut conn = super::mysql_session::open_control_connection(
-        dsn,
-        expected_uuid,
-        std::time::Duration::from_secs(10),
-    )
-    .await
-    .map_err(|e| anyhow::Error::new(e.into_source_error(expected_uuid)))
-    .context("final position check")?;
+    let mut conn = control
+        .connect(Class::Position, dsn, expected_uuid, Class::Position.wait())
+        .await
+        .map_err(|e| anyhow::Error::new(e.into_source_error(expected_uuid)))
+        .context("final position check")?;
 
     let rows: Vec<Row> = conn
         .query("SHOW BINARY LOGS")
@@ -477,13 +477,19 @@ pub async fn fetch_server_identity(
         .get_conn()
         .await
         .context("fetch_server_identity: connect failed")?;
+    let r = fetch_server_identity_on(&mut conn).await;
+    conn.disconnect().await.ok();
+    r
+}
 
+/// [`fetch_server_identity`] on an open connection.
+pub(crate) async fn fetch_server_identity_on(
+    conn: &mut mysql_async::Conn,
+) -> Result<Option<MySqlServerIdentity>> {
     let row: Option<(Option<String>,)> = conn
         .query_first("SELECT @@global.server_uuid")
         .await
         .context("fetch_server_identity: query failed")?;
-
-    conn.disconnect().await.ok();
 
     let uuid = row.and_then(|(v,)| v).filter(|s| {
         !s.is_empty() && s != "00000000-0000-0000-0000-000000000000"

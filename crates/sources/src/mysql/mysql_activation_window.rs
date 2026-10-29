@@ -893,6 +893,19 @@ pub(crate) async fn capture_and_scan(
                     .into(),
                 });
             }
+            // Saturation already waited the capture's whole budget: not
+            // retried in place; the restart retries.
+            Err(
+                e @ BatchCaptureError::Failed(ProofError::Saturated { .. }),
+            ) => {
+                return Err(capture_failure(
+                    &cs.source_id,
+                    tables,
+                    attempts,
+                    head,
+                    e,
+                ));
+            }
             Err(e) if attempts < CAPTURE_ATTEMPTS => {
                 warn!(source_id = %cs.source_id, attempt = attempts, error = ?e, tables = tables.len(), "activation window: the batched capture failed; retrying");
             }
@@ -1723,6 +1736,15 @@ fn capture_failure(
         BatchCaptureError::Contention { code, why } => {
             crate::incident_drafts::mysql_capture_contention(
                 source_id, tables, attempts, code, at, &why,
+            )
+        }
+        BatchCaptureError::Failed(ProofError::Saturated { scope, .. }) => {
+            crate::incident_drafts::mysql_control_plane_saturated(
+                source_id,
+                "activation window",
+                tables,
+                scope,
+                at,
             )
         }
         BatchCaptureError::Failed(ProofError::Open(why)) => {

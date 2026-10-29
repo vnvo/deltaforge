@@ -288,9 +288,10 @@ pub(crate) enum ProofError {
     )]
     SeekLimit(String),
     /// No control-plane connection could be had within the capture's wait
-    /// (`mysql_control`): the runner or the source is at its bound.
-    #[error("{0}")]
-    Saturated(String),
+    /// (`mysql_control`): `scope` (`runner` or `source`) stayed at its
+    /// bound.
+    #[error("{why}")]
+    Saturated { scope: &'static str, why: String },
 }
 
 /// The run stopped while a capture was in flight: its session is killed
@@ -893,6 +894,7 @@ pub(crate) async fn scan_interval_at(
         ..Default::default()
     };
     let result = scan(
+        tag.source_id,
         dsn,
         server_id,
         server_uuid,
@@ -975,7 +977,9 @@ fn source_txns(set: &GtidSet, server_uuid: &str) -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn scan(
+    source: &str,
     dsn: &str,
     server_id: u64,
     server_uuid: &str,
@@ -1120,7 +1124,7 @@ async fn scan(
 
     let mut stream = tokio::time::timeout(
         limits.max_duration,
-        open_replication_session_abortive(&client, server_uuid),
+        open_replication_session_abortive(&client, server_uuid, source),
     )
     .await
     .map_err(|_| {
@@ -1606,6 +1610,7 @@ pub(crate) async fn capture_with(
     // `capture_batch_with`).
     let mut guard = KillOnDrop {
         dsn: dsn.clone(),
+        source: cx.control.source().to_string(),
         id: 0,
         slots,
         permit: None,
@@ -1630,7 +1635,7 @@ pub(crate) async fn capture_with(
             .control
             .connect(
                 super::mysql_control::Class::Capture,
-                &dsn.current(),
+                dsn.current().expose(),
                 server_uuid,
                 budget.saturating_sub(waited.elapsed()),
             )
@@ -1727,6 +1732,8 @@ pub(crate) async fn capture_with(
 struct KillOnDrop {
     /// The run's DSN, read when the kill connects.
     dsn: crate::credentials::SharedDsn,
+    /// Its source, which the kill connection is counted for.
+    source: String,
     id: u32,
     slots: &'static CaptureSlots,
     /// The capture's lock-holding slot, held until its session is gone.
@@ -1739,6 +1746,7 @@ impl Drop for KillOnDrop {
             return;
         }
         let (dsn, id, slots) = (self.dsn.clone(), self.id, self.slots);
+        let source = std::mem::take(&mut self.source);
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
             kill_failed(slots, permit, id, "no runtime to run the kill on");
             return;
@@ -1761,6 +1769,10 @@ impl Drop for KillOnDrop {
                     return Err("injected kill failure".to_string());
                 }
                 let now = dsn.current();
+                let _counted = super::mysql_connections::Counted::new(
+                    &source,
+                    super::mysql_connections::Kind::Cancellation,
+                );
                 let mut c = mysql_async::Conn::from_url(now.expose())
                     .await
                     .map_err(|e| format!("connect: {e}"))?;
@@ -1907,7 +1919,10 @@ fn control_error(e: super::mysql_control::ControlError) -> ProofError {
     use super::mysql_control::ControlError;
     use super::mysql_session::SessionError;
     match e {
-        ControlError::Saturated { .. } => ProofError::Saturated(e.to_string()),
+        ControlError::Saturated { scope, .. } => ProofError::Saturated {
+            scope,
+            why: e.to_string(),
+        },
         ControlError::Session(SessionError::Connect(why)) => {
             ProofError::Open(format!("connect: {why}"))
         }
@@ -2024,6 +2039,7 @@ pub(crate) async fn capture_batch_with(
     // when its query ends.
     let mut guard = KillOnDrop {
         dsn: dsn.clone(),
+        source: cx.control.source().to_string(),
         id: 0,
         slots,
         permit: None,
@@ -2050,7 +2066,7 @@ pub(crate) async fn capture_batch_with(
             .control
             .connect(
                 super::mysql_control::Class::Capture,
-                &dsn.current(),
+                dsn.current().expose(),
                 server_uuid,
                 budget.saturating_sub(waited.elapsed()),
             )
@@ -2589,6 +2605,7 @@ pub(crate) mod tests {
         let before = kill_failures();
         drop(KillOnDrop {
             dsn: "mysql://u:p@127.0.0.1:1/".into(),
+            source: "test".into(),
             id: 42,
             slots,
             permit: None,

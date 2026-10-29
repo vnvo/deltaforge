@@ -91,12 +91,14 @@ fn gauge(source: &str, kind: Kind, now: i64) {
 
 /// `source`'s open connections of `kind` now, and the most at once since
 /// the last [`reset_peak`].
+#[cfg(test)]
 pub(crate) fn connections(source: &str, kind: Kind) -> (i64, i64) {
     let c = count(source, kind);
     (c.now.load(Ordering::SeqCst), c.peak.load(Ordering::SeqCst))
 }
 
 /// Start a new peak at the current count (measurements).
+#[cfg(test)]
 pub(crate) fn reset_peak(source: &str, kind: Kind) {
     let c = count(source, kind);
     c.peak.store(c.now.load(Ordering::SeqCst), Ordering::SeqCst);

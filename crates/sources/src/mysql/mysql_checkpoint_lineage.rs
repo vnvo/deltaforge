@@ -73,6 +73,8 @@ pub(crate) trait GtidAvailability: Send + Sync {
 
 /// The live check against the source server.
 pub(crate) struct LiveGtidAvailability<'a> {
+    /// The source's control pool.
+    pub control: &'a super::mysql_control::ControlPool,
     pub dsn: &'a str,
     /// The `server_uuid` of the verified current lineage.
     pub server_uuid: String,
@@ -81,19 +83,23 @@ pub(crate) struct LiveGtidAvailability<'a> {
 #[async_trait]
 impl GtidAvailability for LiveGtidAvailability<'_> {
     async fn verify_executed(&self, sets: &[String]) -> Result<(), String> {
+        use super::mysql_control::Class;
         use mysql_async::prelude::Queryable;
-        let mut conn = super::mysql_session::open_control_connection(
-            self.dsn,
-            &self.server_uuid,
-            std::time::Duration::from_secs(10),
-        )
-        .await
-        .map_err(|e| {
-            format!(
-                "connection is not the verified {}: {e:?}",
-                self.server_uuid
+        let mut conn = self
+            .control
+            .connect(
+                Class::Position,
+                self.dsn,
+                &self.server_uuid,
+                Class::Position.wait(),
             )
-        })?;
+            .await
+            .map_err(|e| {
+                format!(
+                    "connection is not the verified {}: {e:?}",
+                    self.server_uuid
+                )
+            })?;
         let result = async {
             for set in sets {
                 let executed: Option<i64> = conn
@@ -120,7 +126,9 @@ impl GtidAvailability for LiveGtidAvailability<'_> {
             Ok(())
         }
         .await;
-        conn.disconnect().await.ok();
+        if result.is_ok() {
+            conn.release().await;
+        }
         result
     }
 }

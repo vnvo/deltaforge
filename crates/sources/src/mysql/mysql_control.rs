@@ -103,8 +103,12 @@ impl From<SessionError> for ControlError {
 }
 
 impl ControlError {
-    pub(crate) fn is_saturated(&self) -> bool {
-        matches!(self, Self::Saturated { .. })
+    /// As a session error: saturation is a (retryable) connect failure.
+    pub(crate) fn into_session(self) -> SessionError {
+        match self {
+            Self::Session(e) => e,
+            saturated => SessionError::Connect(saturated.to_string()),
+        }
     }
 
     /// The source error: identity failures are lineage errors, connect
@@ -155,11 +159,13 @@ impl Budget {
     }
 
     /// The whole budget (`G`).
+    #[cfg(test)]
     pub(crate) fn total(&self) -> usize {
         self.total
     }
 
     /// Ordinary permits free now.
+    #[cfg(test)]
     pub(crate) fn available(&self) -> usize {
         self.ordinary.available_permits()
     }
@@ -352,7 +358,10 @@ impl<L: Link> Inner<L> {
     /// idle connection is closed.
     fn reuse(&self, ident: &str) -> Option<Entry<L>> {
         let e = self.take_idle()?;
-        if e.ident == ident && e.epoch == self.epoch.load(Ordering::SeqCst) {
+        if !ident.is_empty()
+            && e.ident == ident
+            && e.epoch == self.epoch.load(Ordering::SeqCst)
+        {
             Some(e)
         } else {
             close(e);
@@ -415,7 +424,9 @@ impl<L: Link> Checked<L> {
             return;
         };
         let pool = self.pool.clone();
-        if e.epoch != pool.epoch.load(Ordering::SeqCst) || !e.link.reset().await
+        if e.ident.is_empty()
+            || e.epoch != pool.epoch.load(Ordering::SeqCst)
+            || !e.link.reset().await
         {
             close(e);
             return;
@@ -499,11 +510,13 @@ impl<L: Link> Pool<L> {
     }
 
     /// Connections open now (in use or idle).
+    #[cfg(test)]
     pub(crate) fn open(&self) -> usize {
         self.inner.open.0.lock().expect("open lock").values().sum()
     }
 
     /// Whether an idle connection is kept.
+    #[cfg(test)]
     pub(crate) fn has_idle(&self) -> bool {
         self.inner.idle.lock().expect("idle lock").is_some()
     }
@@ -759,30 +772,59 @@ impl ControlPool {
     pub(crate) async fn connect(
         &self,
         class: Class,
-        dsn: &crate::credentials::ProtectedDsn,
+        dsn: &str,
         server_uuid: &str,
         wait: Duration,
     ) -> Result<ControlConn, ControlError> {
         let ident = ident(dsn, server_uuid);
         self.checkout(class, &ident, wait, |t| async move {
-            super::mysql_session::open_control_connection(
-                dsn.expose(),
-                server_uuid,
-                t,
-            )
-            .await
-            .map(MySqlLink)
+            super::mysql_session::open_control_connection(dsn, server_uuid, t)
+                .await
+                .map(MySqlLink)
         })
         .await
     }
 }
 
+impl ControlPool {
+    /// A pool of the default size on the runner's budget, outside any
+    /// source's registry entry (callers with no tenant to key it by).
+    pub(crate) fn standalone(source: &str) -> Self {
+        Pool::new(budget(), source, DEFAULT_POOL_SIZE)
+    }
+
+    /// A control connection through `dsn` to whichever server answers, for
+    /// a caller that reads the server's identity itself: budgeted like any
+    /// other, never reused (closed when returned).
+    pub(crate) async fn connect_unverified(
+        &self,
+        class: Class,
+        dsn: &str,
+        wait: Duration,
+    ) -> Result<ControlConn, ControlError> {
+        self.checkout(class, UNVERIFIED, wait, |t| async move {
+            let opts = mysql_async::Opts::from_url(dsn)
+                .map_err(|e| SessionError::Connect(e.to_string()))?;
+            tokio::time::timeout(t, mysql_async::Conn::new(opts))
+                .await
+                .map_err(|_| SessionError::Connect("connect timed out".into()))?
+                .map(MySqlLink)
+                .map_err(|e| SessionError::Connect(e.to_string()))
+        })
+        .await
+    }
+}
+
+/// The identity of a connection opened for no particular server: never
+/// reused.
+const UNVERIFIED: &str = "";
+
 /// What a connection is reusable for: its DSN (as a digest: no credential
 /// is kept in clear) and its server.
-fn ident(dsn: &crate::credentials::ProtectedDsn, server_uuid: &str) -> String {
+fn ident(dsn: &str, server_uuid: &str) -> String {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
-    h.update(dsn.expose().as_bytes());
+    h.update(dsn.as_bytes());
     format!(
         "{}|{}",
         hex::encode(h.finalize()),

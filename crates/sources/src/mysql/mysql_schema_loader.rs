@@ -698,7 +698,7 @@ impl MySqlSchemaLoader {
         self.control
             .connect(
                 Class::Catalog,
-                &self.dsn.current(),
+                self.dsn.current().expose(),
                 server_uuid,
                 Class::Catalog.wait(),
             )
@@ -864,12 +864,6 @@ pub(crate) async fn discovery_page(
         None => conn.query(&sql).await.map_err(query_error)?,
     };
     Ok(rows)
-}
-
-fn conn_error(e: mysql_async::Error) -> SourceError {
-    SourceError::Connect {
-        details: format!("mysql connection: {}", e).into(),
-    }
 }
 
 fn query_error(e: mysql_async::Error) -> SourceError {

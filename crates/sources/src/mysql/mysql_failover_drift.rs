@@ -610,6 +610,22 @@ pub(crate) async fn check_snapshot_tables(
                         .into(),
                     });
                 }
+                // Saturation is never an unprovable drift outcome: nothing
+                // is decided or recorded, and a restart retries.
+                Err(BatchCaptureError::Failed(ProofError::Saturated {
+                    scope,
+                    ..
+                })) => {
+                    return Err(
+                        crate::incident_drafts::mysql_control_plane_saturated(
+                            env.source_id,
+                            "failover drift",
+                            &names,
+                            scope,
+                            from,
+                        ),
+                    );
+                }
                 Err(e) => {
                     warn!(source_id = env.source_id, error = ?e, tables = chunk.len(), "failover drift: no capture");
                     for (db, table, ..) in chunk {
@@ -888,6 +904,17 @@ async fn shape_at_failover(
                 )
                 .into(),
             });
+        }
+        // Saturation is never an unprovable drift outcome: nothing is
+        // decided or recorded, and a restart retries.
+        Err(ProofError::Saturated { scope, .. }) => {
+            return Err(crate::incident_drafts::mysql_control_plane_saturated(
+                env.source_id,
+                "failover drift",
+                &[(db.to_string(), table.to_string())],
+                scope,
+                &from,
+            ));
         }
         Err(e) => {
             warn!(source_id = env.source_id, %db, %table, error = ?e, "failover drift: no capture");

@@ -67,6 +67,12 @@ struct Args {
     /// `snapshot.max_snapshot_connections`.
     #[arg(long, default_value_t = sources::snapshot_permits::DEFAULT_MAX_SNAPSHOT_CONNECTIONS)]
     max_snapshot_connections: u32,
+    /// MySQL control-plane connections allowed at once across every source
+    /// of this process (captures, catalog reads, position queries, health
+    /// checks and cancellations; 4 of them are reserved for cancellations).
+    /// Each source's own pool is `proofs.control_connections`.
+    #[arg(long, default_value_t = sources::mysql::mysql_control::DEFAULT_MAX_CONTROL_CONNECTIONS)]
+    max_mysql_control_connections: u32,
     /// Recovery admin listener (`deltaforge recover`). Loopback only; use an
     /// SSH tunnel for remote administration.
     #[arg(long, default_value = "127.0.0.1:9091")]
@@ -249,6 +255,11 @@ async fn main() -> Result<()> {
     // The process-wide snapshot connection cap, before any pipeline starts.
     sources::snapshot_permits::configure(args.max_snapshot_connections)
         .map_err(|e| anyhow::anyhow!(e))?;
+    // The process-wide MySQL control-plane budget, likewise.
+    sources::mysql::mysql_control::configure(
+        args.max_mysql_control_connections,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
 
     // One-shot subcommands run before server/observability boot (no port binds).
     if let Some(Command::Recover {

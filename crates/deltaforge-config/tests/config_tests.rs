@@ -1272,9 +1272,8 @@ fn postgres_max_message_bytes_is_bounded() {
 fn mysql_proof_bounds_are_validated() {
     use deltaforge_config::{
         MYSQL_PROOF_CONTROL_CONNECTIONS, MYSQL_PROOF_LOCK_WAIT_SECS,
-        MYSQL_PROOF_MAX_SEEK_MS,
-        MYSQL_PROOF_WINDOW_BYTES, MYSQL_PROOF_WINDOW_EVENTS,
-        MYSQL_PROOF_WINDOW_MS, MysqlProofCfg,
+        MYSQL_PROOF_MAX_SEEK_MS, MYSQL_PROOF_WINDOW_BYTES,
+        MYSQL_PROOF_WINDOW_EVENTS, MYSQL_PROOF_WINDOW_MS, MysqlProofCfg,
     };
     let parse = |json: &str| serde_json::from_str::<MysqlProofCfg>(json);
     let d = parse("{}").unwrap();

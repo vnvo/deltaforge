@@ -82,8 +82,43 @@ fn check(found: Option<String>, expected: &str) -> Result<(), SessionError> {
 pub(crate) async fn open_replication_session(
     client: &BinlogClient,
     expected_uuid: &str,
-) -> Result<BinlogStream, SessionError> {
-    open_session(client, expected_uuid, false).await
+    source: &str,
+) -> Result<Session, SessionError> {
+    open_session(client, expected_uuid, false)
+        .await
+        .map(|s| Session::new(s, source))
+}
+
+/// An open replication session, counted as one of its source's replication
+/// connections until dropped (`mysql_connections`).
+pub(crate) struct Session {
+    stream: BinlogStream,
+    _counted: super::mysql_connections::Counted,
+}
+
+impl Session {
+    fn new(stream: BinlogStream, source: &str) -> Self {
+        Self {
+            stream,
+            _counted: super::mysql_connections::Counted::new(
+                source,
+                super::mysql_connections::Kind::Replication,
+            ),
+        }
+    }
+}
+
+impl std::ops::Deref for Session {
+    type Target = BinlogStream;
+    fn deref(&self) -> &BinlogStream {
+        &self.stream
+    }
+}
+
+impl std::ops::DerefMut for Session {
+    fn deref_mut(&mut self) -> &mut BinlogStream {
+        &mut self.stream
+    }
 }
 
 /// [`open_replication_session`] for a short-lived reader (the interval
@@ -95,8 +130,11 @@ pub(crate) async fn open_replication_session(
 pub(crate) async fn open_replication_session_abortive(
     client: &BinlogClient,
     expected_uuid: &str,
-) -> Result<BinlogStream, SessionError> {
-    open_session(client, expected_uuid, true).await
+    source: &str,
+) -> Result<Session, SessionError> {
+    open_session(client, expected_uuid, true)
+        .await
+        .map(|s| Session::new(s, source))
 }
 
 async fn open_session(

@@ -145,6 +145,8 @@ pub struct SnapshotCtx<'a> {
 /// the run's own generation at the version it holds) and stops the copy.
 /// A connection to another server stops the copy (the generation is lost).
 pub(crate) struct GenerationGuard {
+    /// The source's control pool: each check is a health connection of it.
+    pub control: super::mysql_control::ControlPool,
     pub dsn: crate::credentials::ProtectedDsn,
     pub expected_uuid: String,
     pub captured_file: String,
@@ -284,13 +286,18 @@ pub(crate) fn spawn_generation_guard(
 async fn binlog_finding(
     g: &GenerationGuard,
 ) -> std::result::Result<crate::snapshot_driver::GuardFinding, String> {
+    use super::mysql_control::Class;
     use crate::snapshot_driver::GuardFinding;
-    let mut conn = match super::mysql_session::open_control_connection(
-        g.dsn.expose(),
-        &g.expected_uuid,
-        Duration::from_secs(10),
-    )
-    .await
+    let mut conn = match g
+        .control
+        .connect(
+            Class::Health,
+            g.dsn.expose(),
+            &g.expected_uuid,
+            Class::Health.wait(),
+        )
+        .await
+        .map_err(super::mysql_control::ControlError::into_session)
     {
         Ok(c) => c,
         Err(super::mysql_session::SessionError::Connect(e)) => {
@@ -311,7 +318,7 @@ async fn binlog_finding(
             return Ok(GuardFinding::Ok);
         }
     };
-    conn.disconnect().await.ok();
+    conn.release().await;
     let available: Vec<String> = rows
         .into_iter()
         .filter_map(|mut r: Row| r.take::<String, usize>(0))
@@ -410,7 +417,7 @@ pub(crate) struct MyCopyCtx<'a> {
     pub plan: PlanPages,
     /// The workers' consistent-snapshot connections, all opened under the
     /// anchor's read lock: each one's read view is the generation's.
-    pub workers: Vec<Conn>,
+    pub workers: Vec<CopyConn>,
     pub publisher: Arc<GenerationPublisher>,
     pub generation: u64,
     pub lineage: PersistedLineage,
@@ -452,7 +459,8 @@ pub(crate) async fn copy_generation(ctx: MyCopyCtx<'_>) -> Result<()> {
             ctx.source_id.to_string(),
         );
         running.spawn(async move {
-            let mut conn = conn;
+            // Counted for as long as this worker holds its connection.
+            let (mut conn, _counted) = conn.into_parts();
             loop {
                 if stop.is_cancelled() {
                     bail!("snapshot cancelled");
@@ -649,13 +657,53 @@ fn catalog_moved(detail: String) -> String {
 pub(crate) const SNAPSHOT_SESSION: &str =
     "SET SESSION time_zone = '+00:00', character_set_results = binary";
 
+/// A snapshot connection, counted as one of its source's snapshot-copy
+/// connections until dropped (`mysql_connections`).
+pub(crate) struct CopyConn {
+    conn: Conn,
+    _counted: super::mysql_connections::Counted,
+}
+
+impl CopyConn {
+    fn new(conn: Conn, source: &str) -> Self {
+        Self {
+            conn,
+            _counted: super::mysql_connections::Counted::new(
+                source,
+                super::mysql_connections::Kind::SnapshotCopy,
+            ),
+        }
+    }
+}
+
+impl CopyConn {
+    /// The connection, and its count (dropped when the connection is).
+    fn into_parts(self) -> (Conn, super::mysql_connections::Counted) {
+        (self.conn, self._counted)
+    }
+}
+
+impl std::ops::Deref for CopyConn {
+    type Target = Conn;
+    fn deref(&self) -> &Conn {
+        &self.conn
+    }
+}
+
+impl std::ops::DerefMut for CopyConn {
+    fn deref_mut(&mut self) -> &mut Conn {
+        &mut self.conn
+    }
+}
+
 pub(crate) async fn acquire_locked_anchor(
+    source: &str,
     dsn: &str,
     expected_uuid: &str,
     num_workers: usize,
     timeout_dur: Duration,
     mut check: PlanCheck<'_>,
-) -> Result<(Vec<Conn>, MySqlCheckpoint)> {
+) -> Result<(Vec<CopyConn>, MySqlCheckpoint)> {
     let opts = Opts::from_url(dsn).context("parse mysql dsn")?;
     // Each connection proves it is the verified server before it is used:
     // the anchor position and every worker's rows must come from one server.
@@ -664,9 +712,12 @@ pub(crate) async fn acquire_locked_anchor(
     };
 
     // Dedicated, non-pooled lock connection: dropping it releases FTWRL.
-    let mut lock_conn = Conn::new(opts.clone())
-        .await
-        .context("connect lock connection")?;
+    let mut lock_conn = CopyConn::new(
+        Conn::new(opts.clone())
+            .await
+            .context("connect lock connection")?,
+        source,
+    );
     super::mysql_session::verify_connection(&mut lock_conn, expected_uuid)
         .await
         .map_err(verify)?;
@@ -688,9 +739,12 @@ pub(crate) async fn acquire_locked_anchor(
 
         let mut workers = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
-            let mut c = Conn::new(opts.clone())
-                .await
-                .context("connect snapshot worker")?;
+            let mut c = CopyConn::new(
+                Conn::new(opts.clone())
+                    .await
+                    .context("connect snapshot worker")?,
+                source,
+            );
             super::mysql_session::verify_connection(&mut c, expected_uuid)
                 .await
                 .map_err(verify)?;
@@ -715,7 +769,7 @@ pub(crate) async fn acquire_locked_anchor(
         // worker's read view exactly.
         let position = capture_binlog_position(&mut lock_conn).await?;
         verify_plan_under_lock(&mut lock_conn, &mut check).await?;
-        Result::<(Vec<Conn>, MySqlCheckpoint)>::Ok((workers, position))
+        Result::<(Vec<CopyConn>, MySqlCheckpoint)>::Ok((workers, position))
     };
 
     let (workers, position) = match timeout(timeout_dur, setup).await {
