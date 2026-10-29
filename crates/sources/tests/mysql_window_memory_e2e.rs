@@ -243,3 +243,26 @@ async fn a_windows_memory_is_bounded_by_its_plan() {
     );
     container.rm().await.ok();
 }
+
+/// The selection cache's byte estimate (what its 256 MiB bound counts)
+/// covers the memory its timelines hold, for timelines of 1, 100 and
+/// 10,000 records per table (`docs/design/mysql-mass-invalidation.md`,
+/// section 6): resident memory never exceeds the estimate, and the estimate
+/// stays within twice resident memory.
+#[test]
+fn the_cache_estimate_covers_resident_memory() {
+    for (tables, records) in [(4096, 1), (1000, 100), (10, 10_000)] {
+        let before = held();
+        let (estimate, cache) =
+            sources::mysql::cache_memory_probe(tables, records);
+        let resident = (held() - before) as u64;
+        drop(cache);
+        let ratio = resident as f64 / estimate as f64;
+        eprintln!(
+            "{tables} tables of {records} records: estimate {estimate} bytes, \
+             resident {resident} bytes, ratio {ratio:.2}"
+        );
+        assert!(resident <= estimate, "{resident} > {estimate}");
+        assert!(estimate <= 2 * resident, "{estimate} > 2 x {resident}");
+    }
+}

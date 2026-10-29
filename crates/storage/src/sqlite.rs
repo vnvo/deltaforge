@@ -341,6 +341,49 @@ macro_rules! db {
     }};
 }
 
+impl SqliteStorageBackend {
+    /// Stream reads within `within` (see `StreamBudget`): one snapshot,
+    /// stepped row by row and stopped at the budget.
+    async fn read_streams_budgeted(
+        &self,
+        streams: &[(String, String)],
+        mut within: crate::StreamBudget,
+    ) -> Result<Vec<Vec<LogEntryMeta>>> {
+        let streams = streams.to_vec();
+        db!(self, move |conn: &Connection| {
+            let tx = conn.unchecked_transaction()?;
+            let mut out: Vec<Vec<LogEntryMeta>> = Vec::new();
+            {
+                let mut stmt = tx.prepare_cached(
+                    "SELECT seq, COALESCE(ts_ms, ts*1000), capture_id, content_hash, val
+                     FROM df_log WHERE ns=?1 AND key=?2 ORDER BY seq ASC",
+                )?;
+                'streams: for (i, (ns, key)) in streams.iter().enumerate() {
+                    let mut rows = stmt.query(params![ns, key])?;
+                    let mut entries = Vec::new();
+                    while let Some(r) = rows.next()? {
+                        let m = LogEntryMeta {
+                            seq: r.get::<_, i64>(0)? as u64,
+                            stored_at_ms: r.get(1)?,
+                            capture_id: r.get(2)?,
+                            content_hash: r.get(3)?,
+                            value: r.get(4)?,
+                        };
+                        if !within.take(i, &m) {
+                            break 'streams;
+                        }
+                        entries.push(m);
+                    }
+                    out.push(entries);
+                }
+            }
+            tx.commit()?;
+            crate::note_stream_reads(&streams[..out.len()], &out);
+            Ok(out)
+        })
+    }
+}
+
 #[async_trait]
 impl StorageBackend for SqliteStorageBackend {
     async fn read_batch(
@@ -386,40 +429,21 @@ impl StorageBackend for SqliteStorageBackend {
         streams: &[(String, String)],
         budget: u64,
     ) -> Result<Vec<Vec<LogEntryMeta>>> {
-        let streams = streams.to_vec();
-        db!(self, move |conn: &Connection| {
-            // One snapshot, stepped row by row and stopped at the budget.
-            let tx = conn.unchecked_transaction()?;
-            let mut out: Vec<Vec<LogEntryMeta>> = Vec::new();
-            {
-                let mut stmt = tx.prepare_cached(
-                    "SELECT seq, COALESCE(ts_ms, ts*1000), capture_id, content_hash, val
-                     FROM df_log WHERE ns=?1 AND key=?2 ORDER BY seq ASC",
-                )?;
-                let mut within = crate::StreamBudget::new(budget);
-                'streams: for (i, (ns, key)) in streams.iter().enumerate() {
-                    let mut rows = stmt.query(params![ns, key])?;
-                    let mut entries = Vec::new();
-                    while let Some(r) = rows.next()? {
-                        let m = LogEntryMeta {
-                            seq: r.get::<_, i64>(0)? as u64,
-                            stored_at_ms: r.get(1)?,
-                            capture_id: r.get(2)?,
-                            content_hash: r.get(3)?,
-                            value: r.get(4)?,
-                        };
-                        if !within.take(i, &m) {
-                            break 'streams;
-                        }
-                        entries.push(m);
-                    }
-                    out.push(entries);
-                }
-            }
-            tx.commit()?;
-            crate::note_stream_reads(&streams[..out.len()], &out);
-            Ok(out)
-        })
+        self.read_streams_budgeted(streams, crate::StreamBudget::new(budget))
+            .await
+    }
+
+    async fn log_read_streams_bounded(
+        &self,
+        streams: &[(String, String)],
+        max_bytes: u64,
+        max_entries: u64,
+    ) -> Result<Vec<Vec<LogEntryMeta>>> {
+        self.read_streams_budgeted(
+            streams,
+            crate::StreamBudget::bounded(max_bytes, max_entries),
+        )
+        .await
     }
 
     async fn log_read_streams(

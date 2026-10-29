@@ -115,11 +115,15 @@ pub enum ReasonCode {
     /// within its wait: the runner's budget or the source's pool stayed
     /// full. Nothing of the window or drift check was delivered.
     MysqlControlPlaneSaturated,
+    /// A MySQL table's activation timeline (its records and the barriers
+    /// that apply) exceeds the per-timeline limit: it is never loaded
+    /// whole, and the table's rows cannot be decoded.
+    MysqlTimelineTooLarge,
 }
 
 impl ReasonCode {
     /// Every reason (bounded metric label values).
-    pub const ALL: [ReasonCode; 29] = [
+    pub const ALL: [ReasonCode; 30] = [
         Self::PgDifferentCluster,
         Self::PgContinuityUnproven,
         Self::PgFailoverSlotUnavailable,
@@ -149,6 +153,7 @@ impl ReasonCode {
         Self::MysqlTableStateTooLarge,
         Self::MysqlTableRegistryTooLarge,
         Self::MysqlControlPlaneSaturated,
+        Self::MysqlTimelineTooLarge,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -188,6 +193,7 @@ impl ReasonCode {
                 "mysql_table_registry_too_large"
             }
             Self::MysqlControlPlaneSaturated => "mysql_control_plane_saturated",
+            Self::MysqlTimelineTooLarge => "mysql_timeline_too_large",
         }
     }
 }
@@ -931,6 +937,18 @@ pub fn explain(
             ev.show(K::BlockingCount),
             ev.show(K::Table),
             ev.show(K::ReasonClass),
+            ev.show(K::CheckpointPosition),
+        ),
+        ReasonCode::MysqlTimelineTooLarge => format!(
+            "{component} cannot decode the rows of table {}: its activation \
+             timeline holds more than 100,000 records or {} bytes (counted \
+             when read whole: {} records, {} bytes; stream key digest {}). \
+             It stopped before the table's rows; the checkpoint stays at {}.",
+            ev.show(K::Table),
+            ev.show(K::StateLimit),
+            ev.show(K::ReadItems),
+            ev.show(K::StateBytes),
+            ev.show(K::KeyDigest),
             ev.show(K::CheckpointPosition),
         ),
         ReasonCode::SchemaDriftBlocked => format!(

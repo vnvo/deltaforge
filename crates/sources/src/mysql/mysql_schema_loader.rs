@@ -294,6 +294,11 @@ impl MySqlSchemaLoader {
         &self.registry
     }
 
+    /// [`Self::registry`], shared.
+    pub(crate) fn registry_arc(&self) -> Arc<DurableSchemaRegistry> {
+        self.registry.clone()
+    }
+
     /// Every table `patterns` capture, with its schema resolved (from the
     /// durable registry when known, otherwise from the catalog). Collects
     /// all pages: diagnostics and tests only; a snapshot consumes the pages

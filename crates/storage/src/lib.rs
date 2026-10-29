@@ -302,6 +302,32 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
         Ok(out)
     }
 
+    /// [`log_read_streams`](Self::log_read_streams) within `max_bytes`
+    /// ([`log_entry_bytes`]) and `max_entries` entries together: the leading
+    /// streams, in request order, read whole within both bounds, the first
+    /// one not exempt. The read stops at the first entry past either bound,
+    /// which is not kept, so at most the bounds plus that one entry are ever
+    /// held; a result shorter than the request means the next stream did
+    /// not fit. The default reads everything first and is for test doubles
+    /// only; every production backend stops reading at the bounds.
+    async fn log_read_streams_bounded(
+        &self,
+        streams: &[(String, String)],
+        max_bytes: u64,
+        max_entries: u64,
+    ) -> Result<Vec<Vec<LogEntryMeta>>> {
+        let all = self.log_read_streams(streams).await?;
+        let mut within = StreamBudget::bounded(max_bytes, max_entries);
+        let mut out = Vec::with_capacity(all.len());
+        for (i, entries) in all.into_iter().enumerate() {
+            if !entries.iter().all(|e| within.take(i, e)) {
+                break;
+            }
+            out.push(entries);
+        }
+        Ok(out)
+    }
+
     /// Apply `batch` atomically (see [`AtomicBatch`]). The default refuses:
     /// a backend that cannot commit atomically never pretends to.
     async fn apply_batch(&self, _batch: &AtomicBatch) -> Result<BatchOutcome> {
@@ -596,21 +622,47 @@ pub fn log_entry_bytes(e: &LogEntryMeta) -> u64 {
 pub(crate) struct StreamBudget {
     budget: u64,
     total: u64,
+    /// No stream is exempt (the first one included), and at most
+    /// `max_entries` entries are kept.
+    strict: bool,
+    max_entries: u64,
+    entries: u64,
 }
 
 impl StreamBudget {
     pub(crate) fn new(budget: u64) -> Self {
-        Self { budget, total: 0 }
+        Self {
+            budget,
+            total: 0,
+            strict: false,
+            max_entries: u64::MAX,
+            entries: 0,
+        }
+    }
+
+    /// A budget no stream is exempt from, of at most `max_entries` entries
+    /// too.
+    pub(crate) fn bounded(budget: u64, max_entries: u64) -> Self {
+        Self {
+            strict: true,
+            max_entries,
+            ..Self::new(budget)
+        }
     }
 
     /// Count an entry of stream `i`; `false`: it does not fit, and the read
     /// stops before stream `i`.
     pub(crate) fn take(&mut self, i: usize, e: &LogEntryMeta) -> bool {
         let bytes = log_entry_bytes(e);
-        if i > 0 && self.total + bytes > self.budget {
+        let exempt = !self.strict && i == 0;
+        if !exempt
+            && (self.total + bytes > self.budget
+                || self.entries + 1 > self.max_entries)
+        {
             return false;
         }
         self.total += bytes;
+        self.entries += 1;
         true
     }
 }
@@ -2850,6 +2902,8 @@ pub(crate) mod atomic_batch_suite {
         oversized_items_are_refused(be.clone(), &format!("{ns}_m")).await;
         stream_reads_stop_at_their_budget(be.clone(), &format!("{ns}_within"))
             .await;
+        stream_reads_stop_at_their_bounds(be.clone(), &format!("{ns}_bounded"))
+            .await;
         identical_duplicates_collapse(be.clone(), &format!("{ns}_collapse"))
             .await;
         a_duplicate_with_other_bytes_fails_closed(
@@ -3204,6 +3258,60 @@ pub(crate) mod atomic_batch_suite {
             assert_eq!(&got[..], &full[..answered], "budget {budget}");
         }
         assert!(be.log_read_streams_within(&[], 0).await.unwrap().is_empty());
+    }
+
+    /// A bounded stream read answers the leading streams read whole within
+    /// both bounds together, the first one not exempt: exactly as the full
+    /// read answers them, and none from the first that does not fit.
+    pub async fn stream_reads_stop_at_their_bounds(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
+        for (key, n) in [("a", 3), ("c", 3), ("d", 1)] {
+            for i in 0..n {
+                be.log_append(ns, key, &vec![i as u8; 1000]).await.unwrap();
+            }
+        }
+        let streams: Vec<(String, String)> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|k| (ns.to_string(), k.to_string()))
+            .collect();
+        let full = be.log_read_streams(&streams).await.unwrap();
+        let a_bytes: u64 = full[0].iter().map(log_entry_bytes).sum();
+        let c_bytes: u64 = full[2].iter().map(log_entry_bytes).sum();
+        // By bytes: the first stream is not exempt.
+        for (bytes, answered) in [
+            (0, 0),
+            (a_bytes - 1, 0),
+            (a_bytes, 2),
+            (a_bytes + c_bytes - 1, 2),
+            (a_bytes + c_bytes, 3),
+            (u64::MAX, 4),
+        ] {
+            let got = be
+                .log_read_streams_bounded(&streams, bytes, u64::MAX)
+                .await
+                .unwrap();
+            assert_eq!(got.len(), answered, "bytes {bytes}");
+            assert_eq!(&got[..], &full[..answered], "bytes {bytes}");
+        }
+        // By entries, together.
+        for (entries, answered) in
+            [(0, 0), (2, 0), (3, 2), (5, 2), (6, 3), (7, 4)]
+        {
+            let got = be
+                .log_read_streams_bounded(&streams, u64::MAX, entries)
+                .await
+                .unwrap();
+            assert_eq!(got.len(), answered, "entries {entries}");
+            assert_eq!(&got[..], &full[..answered], "entries {entries}");
+        }
+        assert!(
+            be.log_read_streams_bounded(&[], 0, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn idem(ns: &str, key: &str, id: &str, value: &[u8]) -> BatchOp {

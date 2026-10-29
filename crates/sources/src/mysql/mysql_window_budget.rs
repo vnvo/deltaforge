@@ -171,7 +171,7 @@ pub(crate) fn table_cost(
     key_bytes: u64,
 ) -> anyhow::Result<Cost> {
     let mut timeline_bytes = 0u64;
-    for s in timeline.records.iter().chain(&timeline.barriers) {
+    for s in timeline.records.iter().chain(timeline.barriers()) {
         timeline_bytes += (super::mysql_activation::encode_record(&s.record)?
             .len()
             + s.capture_id.len()) as u64;
@@ -179,7 +179,7 @@ pub(crate) fn table_cost(
     // Plan reads: 7 in the first phase, at most 8 (two per existing entry)
     // and one per other lineage in the second; preconditions: 8, one per
     // other lineage and one per barrier stream; 2 capture-id checks.
-    let barrier_heads = timeline.barrier_heads.len() as u64;
+    let barrier_heads = timeline.streams.len() as u64;
     let read_items =
         7 + 8 + other_lineages + 8 + other_lineages + barrier_heads + 2;
     Ok(Cost {

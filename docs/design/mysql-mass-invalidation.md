@@ -992,6 +992,34 @@ Today it takes about 30 statements per table, about 61,000.
   and DDL handling). Each must be killed by a test that appends a barrier
   and then asserts that a cached table's selection changes accordingly.
 
+**As built (5e).**
+- **Loader:** `mysql_history` reads a batch of at most 256 tables in one
+  `log_read_streams_bounded` statement: the barrier streams the cache does
+  not hold first, each once, then the tables' streams. It is bounded
+  together by 64 MiB and 100,000 records, holding at most those plus one
+  entry, the first stream not exempt. The versions the records name are
+  checked with one `version_hashes` read, and the installed tables' current
+  versions are read ahead with one `get_versions` (two batched reads).
+- **Prefetch:** a miss loads the missed table with the uncached tables of
+  the lookahead and held events. When a head table is uncached and nothing
+  is held, the stream's next events are held within the window's bounds (a
+  history read-ahead into the held-event queue, where windows still open)
+  so returning known tables load together. A batch never exceeds half the
+  cache's tables.
+- **Cache accounting:** the 256 MiB counts stored bytes plus each decoded
+  record's and entry's overhead, so it covers resident memory (measured:
+  resident 0.66 to 0.75 of the estimate for timelines of 1, 100 and 10,000
+  records per table). Selections and read-ahead versions are bounded by
+  bytes; timelines by tables and bytes.
+- **Barriers:** `append_barrier` is the only writer; it invalidates the
+  stream and the timelines and selections of every table under the
+  stream's key prefix. A structural test fails on a new writer.
+- **Snapshot candidates:** read in the same batches, per chunk, so at most
+  one chunk's candidates and one batched read are held.
+- **Measured (store calls, counting backend):** 300 cached tables after a
+  barrier of another database, 0 (2,100 before); 300 tables returning to a
+  64-table cache, 56 (about 2,100 before).
+
 ### Head-of-line delay after the change
 
 - A window's control-plane cost becomes:

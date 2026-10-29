@@ -123,6 +123,50 @@ source:
       max_seek_ms: 10000
 ```
 
+### Activation histories
+
+A table's schema version at its rows is chosen from its activation
+timeline: the records of its own stream and the barriers that apply to it
+(its lineage's and its database's), kept in the state store.
+
+- **Cached and bounded:** a source caches at most 4,096 tables' timelines
+  and 256 MiB of them (records, barrier streams once each, and the schemas
+  it read), whichever comes first. The bytes cover resident memory.
+  Admission evicts the least recently used entries first; an evicted table
+  is read again exactly from the store.
+- **Read in batches:** a table the cache does not hold is read with the
+  other uncached tables the stream is about to reach (the events an
+  activation window read ahead or holds, or a short read-ahead within the
+  window's bounds), at most 256 tables per statement, each barrier stream
+  once. Known tables returning after eviction cost a few store calls per
+  batch, not per table.
+- **Barriers:** a barrier invalidates only the cached timelines and
+  selections of the tables it applies to: a database barrier, that
+  database's; a lineage barrier, every table's.
+- **The per-timeline limit:** a timeline is never loaded whole beyond
+  100,000 records or 64 MiB (stored bytes), its barrier streams included.
+  A table over the limit stops the source with a `mysql_timeline_too_large`
+  incident before any of its rows is dispatched; the checkpoint stays
+  before them. It needs an operator: the timeline does not shrink by
+  itself. Before upgrading, this read-only query on the state store
+  (PostgreSQL or SQLite) lists the activation and barrier streams that are
+  large, as records and approximate bytes:
+
+  ```sql
+  SELECT ns, key, COUNT(*) AS records,
+         SUM(LENGTH(val) + COALESCE(LENGTH(capture_id), 0)
+             + COALESCE(LENGTH(content_hash), 0) + 32) AS bytes
+  FROM df_log
+  WHERE ns IN ('schemas.v1.activation', 'schemas.v1.activation.barrier')
+  GROUP BY ns, key
+  HAVING COUNT(*) > 10000 OR SUM(LENGTH(val)) > 8388608
+  ORDER BY bytes DESC;
+  ```
+
+  A table's timeline is its activation stream (`key` is the table's key)
+  plus its lineage's and its database's barrier streams (keys that prefix
+  it).
+
 ### Control-plane connections
 
 Every SQL connection a MySQL source opens besides its binlog stream and its

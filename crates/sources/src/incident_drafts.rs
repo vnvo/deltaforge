@@ -198,6 +198,47 @@ pub(crate) fn mysql_control_plane_saturated(
     )
 }
 
+/// A table whose activation timeline is over the per-timeline limit
+/// (`mysql_history`): never loaded whole, so its rows cannot be decoded.
+/// Nothing of them was dispatched; the checkpoint stays at `at`. An
+/// operator must act (the timeline does not shrink by itself).
+pub(crate) fn mysql_timeline_too_large(
+    source_id: &str,
+    e: &crate::mysql::TimelineTooLarge,
+    at: &crate::mysql::MySqlCheckpoint,
+) -> SourceError {
+    let position = window_position(at);
+    let digest =
+        storage::state_key_digest(crate::mysql::ACTIVATION_NS_NAME, &e.stream);
+    let draft = IncidentDraft::new(
+        ReasonCode::MysqlTimelineTooLarge,
+        Component::Source {
+            id: source_id.to_string(),
+        },
+        Retryability::OperatorAction,
+        SafetyState::HaltedSafe,
+        CauseCode::SourceSchema,
+    )
+    .discriminate("table", &e.table)
+    .with_evidence(|ev| {
+        ev.text(K::SourceId, source_id)
+            .text(K::Table, &e.table)
+            .count(K::StateLimit, crate::mysql::TIMELINE_MAX_BYTES)
+            .text(K::KeyDigest, &digest)
+            .text(K::CheckpointPosition, &position);
+        if let Some((records, bytes)) = e.measured {
+            ev.count(K::ReadItems, records).count(K::StateBytes, bytes);
+        }
+    })
+    .with_actions(&[ActionCode::InspectLogs]);
+    SourceError::incident(
+        draft,
+        SourceError::Schema {
+            details: format!("{e}; no row of it was dispatched").into(),
+        },
+    )
+}
+
 /// The checkpoint position a window stays before, as evidence text.
 fn window_position(at: &crate::mysql::MySqlCheckpoint) -> String {
     match &at.gtid_set {

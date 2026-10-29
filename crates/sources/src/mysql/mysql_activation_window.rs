@@ -309,6 +309,109 @@ fn head_tables(
     }
 }
 
+/// Known tables the cache no longer holds (evicted) return here: when a
+/// head table's timeline is not cached, the stream's next events are held
+/// (`ctx.prefetched`, dispatched before the stream is read again, windows
+/// opening over them as over any held events), within the window's own
+/// bounds, and every uncached table among them is loaded with the head's in
+/// one bounded batch (`mysql_selection::load_timelines`), not one table at
+/// a time. A read error ends the hold and is raised where the stream is
+/// read next.
+async fn prefetch_histories(
+    ctx: &mut RunCtx,
+    stream: &mut BinlogStream,
+    head: &[(String, String, MySqlCheckpoint)],
+) -> Result<(), LoopControl> {
+    if ctx.pending.is_some()
+        || !ctx.prefetched.is_empty()
+        || ctx.prefetch_error.is_some()
+    {
+        return Ok(());
+    }
+    let Ok(scope) = ctx.registry_scope.current() else {
+        return Ok(());
+    };
+    let max = ctx.selection.batch_room();
+    let mut keys: Vec<storage::adapters::SchemaKey> = Vec::new();
+    let add = |ctx: &mut RunCtx,
+               keys: &mut Vec<storage::adapters::SchemaKey>,
+               db: &str,
+               table: &str| {
+        let k = scope.key(db, table);
+        if keys.len() < max
+            && ctx.allow.matches(db, table)
+            && !keys.contains(&k)
+            && ctx.selection.timeline(&k.backend_key()).is_none()
+        {
+            keys.push(k);
+        }
+    };
+    for (db, table, _) in head {
+        add(ctx, &mut keys, db, table);
+    }
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let cfg = ctx.proofs.clone();
+    let deadline =
+        ctx.last_received + Duration::from_millis(cfg.activation_window_ms);
+    let (mut events, mut bytes) = (0usize, 0u64);
+    while events < cfg.activation_window_events
+        && bytes < cfg.activation_window_bytes
+        && keys.len() < max
+    {
+        let Some(left) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+        else {
+            break;
+        };
+        // A cancelled read loses nothing (the vendored channel keeps what
+        // it read), so the time bound can interrupt it.
+        let read = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => return Err(LoopControl::Stop),
+            r = tokio::time::timeout(left, stream.read()) => r,
+        };
+        match read {
+            Err(_) => break,
+            Ok(Err(e)) => {
+                ctx.prefetch_error = Some(e);
+                break;
+            }
+            Ok(Ok((h, d))) => {
+                events += 1;
+                bytes += u64::from(h.event_length);
+                let mut tables = Vec::new();
+                held_tables(&d, &mut tables);
+                for (db, table) in tables {
+                    add(ctx, &mut keys, &db, &table);
+                }
+                let seq = ctx.next_held_seq;
+                ctx.next_held_seq += 1;
+                ctx.prefetched.push_back((Instant::now(), seq, h, d));
+            }
+        }
+    }
+    super::mysql_selection::load_timelines(ctx, &keys).await;
+    Ok(())
+}
+
+/// The tables an event's table maps name (a compressed transaction's too).
+fn held_tables(d: &EventData, out: &mut Vec<(String, String)>) {
+    match d {
+        EventData::TableMap(tm) => {
+            out.push((tm.database_name.clone(), tm.table_name.clone()))
+        }
+        EventData::TransactionPayload(tp) => {
+            for (_, d) in &tp.uncompressed_events {
+                held_tables(d, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Run a window before `header`'s position advances, when its event is the
 /// first rows of a table without a positional proof (see the module docs).
 /// Returns with nothing done otherwise. On success, the read-ahead events
@@ -364,6 +467,7 @@ pub(super) async fn maybe_window(
     if found.is_empty() {
         return not_here(ctx);
     }
+    prefetch_histories(ctx, stream, &found).await?;
     let mut batch: BTreeMap<(String, String), MySqlCheckpoint> =
         BTreeMap::new();
     // First-touch order: the order the batch commits in.
@@ -1328,7 +1432,8 @@ async fn admit_batch(
             let t = timeline(ctx, key).await?;
             let e = pos(at)?;
             let tcap = cap.table(db, table).expect("captured tables only");
-            let decision = match barrier_to_bind(&t.records, &t.barriers, &e) {
+            let barriers: Vec<Stored> = t.barriers().cloned().collect();
+            let decision = match barrier_to_bind(&t.records, &barriers, &e) {
                 Err(why) => {
                     info!(source_id = %ctx.source_id, %db, %table, why, "no lazy baseline");
                     Decision::Refused("no_binding", Covers::Transaction)
@@ -1518,7 +1623,7 @@ async fn admit_batch(
                         key: stream.clone(),
                         seq: t.table_head,
                     });
-                    for (b, head) in &t.barrier_heads {
+                    for (b, head) in &t.barrier_heads() {
                         batch.preconditions.push(Precondition::LogHead {
                             ns: BARRIER_NS.into(),
                             key: b.clone(),
@@ -2114,8 +2219,9 @@ mod tests {
             use super::*;
             use crate::mysql::mysql_activation::{
                 BARRIER_NS, BarrierScope, barrier_stream, read_barriers_head,
-                read_timelines, read_timelines_within, table_stream,
+                table_stream,
             };
+            use crate::mysql::mysql_history::{self, Loaded};
             use storage::StorageBackend as _;
             use storage::adapters::test_util::FaultBackend;
 
@@ -2183,28 +2289,19 @@ mod tests {
                 keys
             }
 
-            /// One snapshot read gives byte for byte what each table's own
-            /// reads give, duplicates requested included; each table stream
-            /// and each shared barrier stream is read exactly once, in one
-            /// call.
-            /// Within a budget: the barriers, then the tables in the
-            /// order asked while their streams fit whole; the rest are left
-            /// out (read when reached), and nothing is usable when the
+            /// Within its bounds a batched history read takes the barrier
+            /// streams, then the tables in the order asked while their
+            /// streams fit whole (the first one not exempt); the rest are
+            /// left (read when reached), and nothing is usable when the
             /// barriers alone do not fit.
             #[tokio::test]
-            async fn a_budgeted_timeline_read_stops_in_the_order_asked() {
+            async fn a_bounded_history_read_stops_in_the_order_asked() {
                 let ctx =
                     ctx_on(std::sync::Arc::new(FaultBackend::new())).await;
                 let keys = fixture(&ctx).await;
                 let mut asked = keys.clone();
                 asked.reverse();
-                let all = read_timelines(
-                    &ctx.registry_backend,
-                    ctx.schema.registry(),
-                    &asked,
-                )
-                .await
-                .unwrap();
+                let none = std::collections::HashMap::new();
                 // The bytes of the barriers and of each asked table's stream.
                 let streams: Vec<(String, String)> = asked
                     .iter()
@@ -2243,11 +2340,13 @@ mod tests {
                             .sum::<u64>()
                 };
                 for n in [1, 7, asked.len()] {
-                    let got = read_timelines_within(
+                    let got = mysql_history::read(
                         &ctx.registry_backend,
                         ctx.schema.registry(),
                         &asked,
+                        &none,
                         bytes(n),
+                        u64::MAX,
                     )
                     .await
                     .unwrap();
@@ -2258,80 +2357,25 @@ mod tests {
                         .take_while(|(i, _)| bytes(i + 1) <= bytes(n))
                         .map(|(_, k)| k.backend_key())
                         .collect();
-                    let mut keys: Vec<String> = got.keys().cloned().collect();
+                    let mut keys: Vec<String> =
+                        got.tables.keys().cloned().collect();
                     keys.sort();
                     let mut want = fits.clone();
                     want.sort();
-                    assert_eq!(keys, want, "budget for {n} tables");
-                    for k in &fits {
-                        assert_eq!(
-                            got[k].as_ref().unwrap().0.len(),
-                            all[k].as_ref().unwrap().0.len()
-                        );
-                    }
+                    assert_eq!(keys, want, "bounds for {n} tables");
+                    assert_eq!(got.cut.is_some(), fits.len() < asked.len());
                 }
-                let none = read_timelines_within(
+                let short = mysql_history::read(
                     &ctx.registry_backend,
                     ctx.schema.registry(),
                     &asked,
-                    0,
+                    &none,
+                    barrier_bytes.saturating_sub(1),
+                    u64::MAX,
                 )
                 .await
                 .unwrap();
-                assert!(barrier_bytes == 0 || none.is_empty());
-            }
-
-            /// The prefetch at a speculative window's head reads within
-            /// the plan budget, in the order given: under a budget that
-            /// takes only the barriers and the first tables, only those are
-            /// cached; the rest are read when reached.
-            #[tokio::test]
-            #[ignore = "sets the process-wide window caps: run serially (gate lane)"]
-            async fn the_timeline_prefetch_stops_at_the_plan_budget() {
-                let ctx =
-                    ctx_on(std::sync::Arc::new(FaultBackend::new())).await;
-                let keys = fixture(&ctx).await;
-                let mut asked = keys.clone();
-                asked.reverse();
-                let mut ctx = ctx;
-                // A budget that takes the barriers and about a third of the
-                // table streams (the fixture's streams are a few records).
-                let all: u64 = ctx
-                    .registry_backend
-                    .log_read_streams(
-                        &asked
-                            .iter()
-                            .map(|k| {
-                                (ACTIVATION_NS.to_string(), table_stream(k))
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .await
-                    .unwrap()
-                    .iter()
-                    .flatten()
-                    .map(storage::log_entry_bytes)
-                    .sum();
-                crate::stream_probe::set_window_caps(Some((
-                    all / 3 + 4096,
-                    16_384,
-                    1 << 30,
-                )));
-                crate::mysql::mysql_selection::load_timelines(&mut ctx, &asked)
-                    .await;
-                crate::stream_probe::set_window_caps(None);
-                let cached: Vec<bool> = asked
-                    .iter()
-                    .map(|k| ctx.selection.timeline(&k.backend_key()).is_some())
-                    .collect();
-                assert!(cached[0], "the first table is read");
-                assert!(
-                    !cached[cached.len() - 1],
-                    "the last is left: {cached:?}"
-                );
-                // A prefix: no table cached after one left out.
-                let first_out = cached.iter().position(|c| !c).unwrap();
-                assert!(cached[first_out..].iter().all(|c| !c), "{cached:?}");
+                assert!(barrier_bytes == 0 || short.tables.is_empty());
             }
 
             #[tokio::test]
@@ -2344,10 +2388,13 @@ mod tests {
                 asked.extend(keys[..5].iter().cloned());
                 asked.reverse();
                 faults.stream_reads.lock().unwrap().clear();
-                let got = read_timelines(
+                let mut have = std::collections::HashMap::new();
+                let got = mysql_history::read_each(
                     &ctx.registry_backend,
                     ctx.schema.registry(),
                     &asked,
+                    &mut have,
+                    |_| true,
                 )
                 .await
                 .unwrap();
@@ -2379,10 +2426,21 @@ mod tests {
                     }
                 }
                 assert_eq!(tables, &want[..], "the order asked");
-                assert_eq!(got.len(), 30);
+                assert_eq!(got.len(), asked.len());
                 for k in &keys {
-                    let (records, head, barriers, heads) =
-                        got[&k.backend_key()].as_ref().unwrap().clone();
+                    let i = asked.iter().position(|a| a == k).unwrap();
+                    let Loaded::Ok { table, streams, .. } = &got[i] else {
+                        panic!("{:?}", got[i]);
+                    };
+                    let (records, head) = (table.records.clone(), table.head);
+                    let barriers: Vec<_> = streams
+                        .iter()
+                        .flat_map(|s| s.records.iter().cloned())
+                        .collect();
+                    let heads: Vec<_> = streams
+                        .iter()
+                        .map(|s| (s.stream.clone(), s.head))
+                        .collect();
                     let one = read_table_head(
                         &ctx.registry_backend,
                         ctx.schema.registry(),
@@ -2416,10 +2474,12 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                let got = read_timelines(
+                let got = mysql_history::read_each(
                     &ctx.registry_backend,
                     ctx.schema.registry(),
                     &keys,
+                    &mut std::collections::HashMap::new(),
+                    |_| true,
                 )
                 .await
                 .unwrap();
@@ -2430,14 +2490,11 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
-                assert_eq!(
-                    got[&keys[3].backend_key()]
-                        .as_ref()
-                        .unwrap_err()
-                        .to_string(),
-                    own.to_string()
-                );
-                assert!(got[&keys[4].backend_key()].is_ok());
+                let Loaded::Invalid(e) = &got[3] else {
+                    panic!("{:?}", got[3]);
+                };
+                assert_eq!(e.to_string(), own.to_string());
+                assert!(matches!(got[4], Loaded::Ok { .. }));
                 super::super::super::super::mysql_selection::load_timelines(
                     &mut ctx, &keys,
                 )
@@ -2454,10 +2511,12 @@ mod tests {
                     .fail_log_read_meta
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 assert!(
-                    read_timelines(
+                    mysql_history::read_each(
                         &fresh.registry_backend,
                         fresh.schema.registry(),
-                        &keys
+                        &keys,
+                        &mut std::collections::HashMap::new(),
+                        |_| true,
                     )
                     .await
                     .is_err()
@@ -2473,8 +2532,8 @@ mod tests {
                 }
             }
 
-            /// Installed timelines equal what `timeline` reads, and 2,048
-            /// tables fit one read while 2,049 are refused.
+            /// Installed timelines equal what `timeline` reads, and a batch
+            /// takes at most its bound of tables.
             #[tokio::test]
             async fn installed_timelines_equal_individual_reads_up_to_the_bound()
              {
@@ -2497,25 +2556,32 @@ mod tests {
                         .unwrap();
                     assert_eq!(*a, *b, "{}", k.backend_key());
                 }
-                let many: Vec<_> = (0..2049)
+                let max = mysql_history::BATCH_MAX_TABLES;
+                let many: Vec<_> = (0..=max)
                     .map(|i| key_in(&ctx, "d", &format!("m{i:04}")))
                     .collect();
-                assert_eq!(
-                    read_timelines(
-                        &ctx.registry_backend,
-                        ctx.schema.registry(),
-                        &many[..2048]
-                    )
-                    .await
-                    .unwrap()
-                    .len(),
-                    2048
-                );
+                let none = std::collections::HashMap::new();
+                let (backend, registry) =
+                    (&ctx.registry_backend, ctx.schema.registry());
+                let full = mysql_history::read(
+                    backend,
+                    registry,
+                    &many[..max],
+                    &none,
+                    u64::MAX,
+                    u64::MAX,
+                )
+                .await
+                .unwrap();
+                assert_eq!(full.tables.len(), max);
                 assert!(
-                    read_timelines(
-                        &ctx.registry_backend,
-                        ctx.schema.registry(),
-                        &many
+                    mysql_history::read(
+                        backend,
+                        registry,
+                        &many,
+                        &none,
+                        u64::MAX,
+                        u64::MAX
                     )
                     .await
                     .is_err()
