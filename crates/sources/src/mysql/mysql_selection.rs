@@ -2663,6 +2663,74 @@ mod tests {
             assert!(t.records.is_empty());
         }
 
+        /// `n` valid records of `kind` in `ns`/`stream`, written raw.
+        async fn records(
+            ctx: &RunCtx,
+            ns: &str,
+            stream: &str,
+            n: u64,
+            kind: Kind,
+        ) {
+            for i in 1..=n {
+                let r = Record::new(
+                    WmPos::MysqlGtid {
+                        gtid_set: format!("{U}:1-{i}"),
+                    },
+                    kind.clone(),
+                );
+                ctx.registry_backend
+                    .log_append_if_absent(
+                        ns,
+                        stream,
+                        &format!("r{i}"),
+                        &crate::mysql::mysql_activation::encode_record(&r)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
+        /// Over the limit only with the barrier streams the cache already
+        /// holds: the table's own read fits, the timeline does not; it
+        /// fails closed.
+        #[tokio::test]
+        async fn cached_barrier_streams_count_toward_the_limit() {
+            let backend: ArcStorageBackend =
+                Arc::new(storage::MemoryStorageBackend::new());
+            let mut ctx = ctx_on(backend).await;
+            let scope = ctx.registry_scope.current().unwrap();
+            let (first, big) = (scope.key("d", "first"), scope.key("d", "big"));
+            let lineage = crate::mysql::mysql_activation::barrier_stream(
+                &first,
+                &BarrierScope::Lineage,
+            );
+            records(
+                &ctx,
+                BARRIER_NS,
+                &lineage,
+                60_000,
+                Kind::Barrier {
+                    scope: BarrierScope::Lineage,
+                },
+            )
+            .await;
+            // The lineage stream is cached with the first table.
+            timeline(&mut ctx, &first).await.unwrap();
+            records(
+                &ctx,
+                ACTIVATION_NS,
+                &table_stream(&big),
+                50_000,
+                Kind::Unknown,
+            )
+            .await;
+            let Err(err) = timeline(&mut ctx, &big).await else {
+                panic!("over the limit with its cached barriers, yet loaded");
+            };
+            assert!(too_large(&err), "{err}");
+        }
+
         /// The cache's estimated total never exceeds its byte bound, with
         /// timelines just under the per-timeline limit sharing one barrier
         /// stream (held, and counted, once).
