@@ -1220,12 +1220,14 @@ mod tests {
     {
         let s = Server::default();
         let pool = Pool::detached(budget(32), "src", 4);
+        // One connection in use, another idle.
+        let in_use = get(&pool, &s, Class::Capture).await.unwrap();
         get(&pool, &s, Class::Capture)
             .await
             .unwrap()
             .release()
             .await;
-        let in_use = get(&pool, &s, Class::Capture).await.unwrap();
+        assert!(pool.has_idle());
         let p = pool.clone();
         let t = tokio::time::Instant::now();
         let drain = tokio::spawn(async move { p.drain(DRAIN_TIMEOUT).await });
