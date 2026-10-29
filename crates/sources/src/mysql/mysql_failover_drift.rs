@@ -2060,6 +2060,76 @@ mod tests {
             }
         }
 
+        /// A drift check whose capture gets no control-plane connection
+        /// (batched and per table) stops with `mysql_control_plane_saturated`
+        /// and decides nothing: no marker and no registration. Saturation is
+        /// never an unprovable drift outcome.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_saturated_drift_capture_decides_nothing() {
+            use crate::mysql::mysql_control::{Budget, Class, ControlPool};
+            let dsn = server(true).await;
+            let db = "drift_saturated";
+            let (f, previous) = prepare(&dsn, db).await;
+            let here = uuid(&dsn).await;
+            let mut st = store(
+                Arc::new(storage::MemoryStorageBackend::new()),
+                &dsn,
+                db,
+                &f,
+                &previous,
+            )
+            .await;
+            // G = R + 1: another source holds the only ordinary permit.
+            let budget: &'static Budget = Box::leak(Box::new(Budget::new(
+                crate::mysql::mysql_binlog_scan::KILL_RESERVE + 1,
+            )));
+            let other = ControlPool::detached(budget, "other", 2);
+            let held = other
+                .connect(
+                    Class::Catalog,
+                    &dsn,
+                    &here,
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+            st.capture = CaptureCtx::detached_on(
+                dsn.as_str(),
+                ControlPool::detached(budget, "starved", 2),
+            );
+            let saturated = |e: &SourceError| {
+                e.draft().map(|d| d.reason_code)
+                    == Some(
+                        deltaforge_core::incident::ReasonCode::MysqlControlPlaneSaturated,
+                    )
+            };
+            let err = check_snapshot_tables(
+                &env(&st, &here, false),
+                &st.anchor,
+                &tables(db),
+                1,
+            )
+            .await
+            .unwrap_err();
+            assert!(saturated(&err), "{err}");
+            let err = check(
+                &env(&st, &here, false),
+                &st.anchor,
+                db,
+                "c",
+                FirstEvent::Snapshot,
+            )
+            .await
+            .unwrap_err();
+            assert!(saturated(&err), "{err}");
+            for t in TABLES {
+                assert!(markers(&st, db, t).await.is_empty(), "{t}");
+                assert_eq!(latest(&st, db, t).await, None, "{t}");
+            }
+            held.release().await;
+        }
+
         async fn all_markers(st: &Store, db: &str) -> Vec<Vec<String>> {
             let mut out = Vec::new();
             for t in TABLES {

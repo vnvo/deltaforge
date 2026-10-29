@@ -726,9 +726,10 @@ impl std::ops::DerefMut for Checked<MySqlLink> {
     }
 }
 
-static SOURCES: OnceLock<
-    Mutex<HashMap<(String, String), Weak<Inner<MySqlLink>>>>,
-> = OnceLock::new();
+/// Every source's pool, by tenant and source.
+type Sources = Mutex<HashMap<(String, String), Weak<Inner<MySqlLink>>>>;
+
+static SOURCES: OnceLock<Sources> = OnceLock::new();
 
 /// `(tenant, source)`'s pool on the runner's budget: the one in use,
 /// resized to `size`, or a new one.

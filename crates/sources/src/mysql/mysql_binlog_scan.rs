@@ -990,7 +990,6 @@ fn source_txns(set: &GtidSet, server_uuid: &str) -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn scan(
     source: &str,
     dsn: &str,
@@ -6904,6 +6903,9 @@ pub(crate) mod tests {
                     .collect();
                 let (stop, sampler) = peak(&root, "queue_u");
                 tokio::time::sleep(Duration::from_secs(3)).await;
+                // Queued for a slot, a capture holds no connection: the
+                // pool stays free for the source's other uses.
+                assert_eq!(sessions(&root, "queue_u").await, 0);
                 drop(held);
                 for t in tasks {
                     let r = t.await.unwrap().expect("not cancelled");
