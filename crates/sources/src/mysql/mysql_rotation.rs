@@ -137,8 +137,15 @@ async fn preflight_on(
         // No durable identity to prove against: terminal.
         Ok(_) => return Err(RotationReject::IdentityMismatch),
     };
+    // Its own connection, never reused: each preflight (Stage A and the
+    // Stage-B recheck) proves the server on the connection that answers it.
     let mut conn = match control
-        .connect(Class::Position, new_dsn, &expected, Class::Position.wait())
+        .connect_once(
+            Class::Position,
+            new_dsn,
+            &expected,
+            Class::Position.wait(),
+        )
         .await
         .map_err(ControlError::into_session)
     {

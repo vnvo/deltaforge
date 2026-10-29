@@ -41,6 +41,8 @@ pub const DEFAULT_POOL_SIZE: usize = 4;
 pub(crate) const IDLE_TTL: Duration = Duration::from_secs(10);
 /// The bound on a drain's wait for its source's connections to close.
 pub(crate) const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// The bound on checking that an idle connection still answers.
+const ALIVE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The bound on opening one control connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -130,6 +132,8 @@ impl ControlError {
 pub(crate) trait Link: Send + 'static {
     /// Clear the session for its next user. `false`: it cannot be reused.
     fn reset(&mut self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
+    /// Whether it still answers (an idle connection, before its reuse).
+    fn alive(&mut self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
     /// Close it.
     fn close(self) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
@@ -571,13 +575,19 @@ impl<L: Link> Pool<L> {
             let idled = inner.idled.notified();
             tokio::pin!(idled);
             idled.as_mut().enable();
-            if let Some(e) = inner.reuse(ident) {
-                waited(class, t0);
-                return Ok(Checked {
-                    entry: Some(e),
-                    pool: inner.clone(),
-                    _health: health,
-                });
+            if let Some(mut e) = inner.reuse(ident) {
+                // An idle connection may have died meanwhile (the server
+                // or the network closed it): never handed out unchecked.
+                if e.link.alive().await {
+                    waited(class, t0);
+                    return Ok(Checked {
+                        entry: Some(e),
+                        pool: inner.clone(),
+                        _health: health,
+                    });
+                }
+                close(e);
+                continue;
             }
             tokio::select! {
                 p = inner.cap.clone().acquire_owned() => {
@@ -701,6 +711,16 @@ impl Link for MySqlLink {
         Box::pin(async move { self.0.reset().await.is_ok() })
     }
 
+    fn alive(&mut self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        use mysql_async::prelude::Queryable as _;
+        Box::pin(async move {
+            matches!(
+                tokio::time::timeout(ALIVE_TIMEOUT, self.0.ping()).await,
+                Ok(Ok(()))
+            )
+        })
+    }
+
     fn close(self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(async move {
             self.0.disconnect().await.ok();
@@ -794,6 +814,24 @@ impl ControlPool {
         Pool::new(budget(), source, DEFAULT_POOL_SIZE)
     }
 
+    /// [`Pool::connect`], on a connection of its own that is never reused
+    /// (closed when returned): for checks whose every run proves the
+    /// server on its own connection.
+    pub(crate) async fn connect_once(
+        &self,
+        class: Class,
+        dsn: &str,
+        server_uuid: &str,
+        wait: Duration,
+    ) -> Result<ControlConn, ControlError> {
+        self.checkout(class, UNVERIFIED, wait, |t| async move {
+            super::mysql_session::open_control_connection(dsn, server_uuid, t)
+                .await
+                .map(MySqlLink)
+        })
+        .await
+    }
+
     /// A control connection through `dsn` to whichever server answers, for
     /// a caller that reads the server's identity itself: budgeted like any
     /// other, never reused (closed when returned).
@@ -843,12 +881,18 @@ mod tests {
         closed: Arc<AtomicUsize>,
         delay: Duration,
         reset_ok: bool,
+        dead: Arc<AtomicBool>,
     }
 
     impl Link for Fake {
         fn reset(&mut self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
             let ok = self.reset_ok;
             Box::pin(async move { ok })
+        }
+
+        fn alive(&mut self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+            let dead = self.dead.load(Ordering::SeqCst);
+            Box::pin(async move { !dead })
         }
 
         fn close(self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
@@ -867,6 +911,8 @@ mod tests {
         delay: Duration,
         fail: Arc<AtomicBool>,
         bad_reset: Arc<AtomicBool>,
+        /// Every connection opened so far stops answering.
+        dead: Arc<AtomicBool>,
     }
 
     impl Server {
@@ -884,6 +930,7 @@ mod tests {
                         closed: s.closed.clone(),
                         delay: s.delay,
                         reset_ok: !s.bad_reset.load(Ordering::SeqCst),
+                        dead: s.dead.clone(),
                     })
                 })
             }
@@ -1035,6 +1082,28 @@ mod tests {
         settle().await;
         assert!(!pool.has_idle());
         assert_eq!(s.live(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_idle_connection_is_replaced_not_reused() {
+        let s = Server::default();
+        let pool = Pool::detached(budget(32), "src", 4);
+        get(&pool, &s, Class::Capture)
+            .await
+            .unwrap()
+            .release()
+            .await;
+        s.dead.store(true, Ordering::SeqCst);
+        let fresh = Server {
+            opened: s.opened.clone(),
+            closed: s.closed.clone(),
+            ..Default::default()
+        };
+        let c = get(&pool, &fresh, Class::Capture).await.unwrap();
+        settle().await;
+        assert_eq!(s.opened.load(Ordering::SeqCst), 2, "a new one opened");
+        assert_eq!(s.live(), 1, "the dead one closed");
+        assert!(!c.entry.as_ref().unwrap().link.dead.load(Ordering::SeqCst));
     }
 
     #[tokio::test(start_paused = true)]
