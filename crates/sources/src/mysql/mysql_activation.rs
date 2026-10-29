@@ -27,7 +27,7 @@ use anyhow::{Context, Result};
 use deltaforge_core::CheckpointOrder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use storage::adapters::SchemaKey;
 use storage::{AppendStatus, ArcStorageBackend, DurableSchemaRegistry};
 
@@ -729,126 +729,6 @@ pub(crate) fn decode_stream(
         out.push(Stored { capture_id, record });
     }
     Ok((out, head))
-}
-
-/// The most tables, and encoded stream-key bytes, one batched timeline read
-/// takes (the activation window's own bounds).
-pub(crate) const TIMELINE_READ_MAX_TABLES: usize =
-    super::mysql_binlog_scan::MAX_BATCH_TABLES;
-pub(crate) const TIMELINE_READ_MAX_KEY_BYTES: usize = 1 << 20;
-
-/// One table's timeline parts as [`read_table_head`] and
-/// [`read_barriers_head`] return them: its records and stream head, the
-/// barriers that apply (lineage, then database), and their heads.
-pub(crate) type TimelineParts =
-    (Vec<Stored>, u64, Vec<Stored>, Vec<(String, u64)>);
-
-/// The timeline parts of `keys` (deduplicated, in canonical order), all
-/// from one store snapshot: each table stream and each shared barrier
-/// stream read exactly once (`log_read_streams`), decoded exactly as the
-/// per-table reads decode them. Per table: its parts, or the error its own
-/// read would have failed with (a version its records name is validated
-/// the same way). A read failure, or a request beyond the bounds, is an
-/// error with nothing usable.
-pub(crate) async fn read_timelines(
-    backend: &ArcStorageBackend,
-    registry: &DurableSchemaRegistry,
-    keys: &[SchemaKey],
-) -> Result<BTreeMap<String, Result<TimelineParts>>> {
-    read_timelines_within(backend, registry, keys, u64::MAX).await
-}
-
-/// [`read_timelines`] within `budget` bytes of entries: the shared barrier
-/// streams first, then each table's stream in `keys`' order (the window's
-/// first-touch order); a table whose stream is not read whole within the
-/// budget is left out (read when it is reached), and so is every table
-/// when the barriers alone do not fit.
-pub(crate) async fn read_timelines_within(
-    backend: &ArcStorageBackend,
-    registry: &DurableSchemaRegistry,
-    keys: &[SchemaKey],
-    budget: u64,
-) -> Result<BTreeMap<String, Result<TimelineParts>>> {
-    // In `keys`' order, each table once.
-    let mut tables: Vec<(String, &SchemaKey)> = Vec::new();
-    for k in keys {
-        let bk = k.backend_key();
-        if !tables.iter().any(|(b, _)| *b == bk) {
-            tables.push((bk, k));
-        }
-    }
-    anyhow::ensure!(
-        tables.len() <= TIMELINE_READ_MAX_TABLES,
-        "a batched timeline read of {} tables exceeds its bound of {TIMELINE_READ_MAX_TABLES}",
-        tables.len()
-    );
-    let mut barriers: BTreeMap<String, ()> = BTreeMap::new();
-    for (_, k) in &tables {
-        for b in barrier_streams(k) {
-            barriers.insert(b, ());
-        }
-    }
-    let mut streams: Vec<(String, String)> = barriers
-        .keys()
-        .map(|b| (BARRIER_NS.to_string(), b.clone()))
-        .collect();
-    streams.extend(
-        tables
-            .iter()
-            .map(|(_, k)| (ACTIVATION_NS.to_string(), table_stream(k))),
-    );
-    let key_bytes: usize = streams.iter().map(|(n, k)| n.len() + k.len()).sum();
-    anyhow::ensure!(
-        key_bytes <= TIMELINE_READ_MAX_KEY_BYTES,
-        "a batched timeline read of {key_bytes} key bytes exceeds its bound of \
-         {TIMELINE_READ_MAX_KEY_BYTES}"
-    );
-    let read = backend
-        .log_read_streams_within(&streams, budget)
-        .await
-        .context("read activation streams")?;
-    // Barriers not read whole: nothing is usable.
-    if read.len() < barriers.len() {
-        return Ok(BTreeMap::new());
-    }
-    let mut by_stream: HashMap<
-        String,
-        std::result::Result<(Vec<Stored>, u64), TimelineError>,
-    > = HashMap::with_capacity(streams.len());
-    for ((_, stream), entries) in streams.iter().zip(&read) {
-        by_stream.insert(stream.clone(), decode_stream(stream, entries));
-    }
-    let mut out = BTreeMap::new();
-    for (bk, key) in tables {
-        // A table past the budget: not read.
-        if !by_stream.contains_key(&table_stream(key)) {
-            continue;
-        }
-        let parts = async {
-            let (records, head) = match &by_stream[&table_stream(key)] {
-                Ok(r) => r.clone(),
-                Err(e) => return Err(e.clone().into()),
-            };
-            for r in &records {
-                validate_version(registry, key, &r.record).await?;
-            }
-            let mut all = Vec::new();
-            let mut heads = Vec::new();
-            for b in barrier_streams(key) {
-                match &by_stream[&b] {
-                    Ok((records, head)) => {
-                        all.extend(records.iter().cloned());
-                        heads.push((b, *head));
-                    }
-                    Err(e) => return Err(e.clone().into()),
-                }
-            }
-            Ok((records, head, all, heads))
-        }
-        .await;
-        out.insert(bk, parts);
-    }
-    Ok(out)
 }
 
 /// Read a table's records and validate every version they name.

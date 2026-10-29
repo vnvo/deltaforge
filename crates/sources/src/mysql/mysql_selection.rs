@@ -477,11 +477,6 @@ impl Caches {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_limits_for_test(tables: usize, bytes: u64) -> Self {
-        Self::with_limits(tables, bytes, metrics::Counter::noop())
-    }
-
     /// Change the bounds, keeping what is held (tests).
     #[cfg(test)]
     pub(crate) fn set_limits_for_test(&mut self, tables: usize, bytes: u64) {
@@ -2168,7 +2163,7 @@ mod tests {
                 read_table_head(&f.backend, &f.reg, &f.key).await.unwrap();
             let barriers = read_barriers(&f.backend, &f.key).await.unwrap();
             Timeline {
-                table_head: table_head,
+                table_head,
                 ..Timeline::of(records, barriers)
             }
         }

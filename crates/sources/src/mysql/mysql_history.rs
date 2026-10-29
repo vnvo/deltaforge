@@ -327,19 +327,20 @@ pub(crate) async fn read_each(
         have.extend(read.barriers.drain());
         for key in chunk {
             let bk = key.backend_key();
-            let loaded = match (read.tables.remove(&bk), streams_of(key, have))
-            {
-                (Some(table), Some(streams)) => {
-                    let hashes = read.hashes.remove(&bk).unwrap_or_default();
-                    loaded(key, table, streams, hashes)
-                }
-                // Cut short (or a barrier stream it needs is corrupt):
-                // read alone.
-                _ if alone(key) => {
-                    read_alone(backend, registry, key, have).await?
-                }
-                _ => Loaded::Unread,
-            };
+            let loaded =
+                match (read.tables.get(&bk).cloned(), streams_of(key, have)) {
+                    (Some(table), Some(streams)) => {
+                        let hashes =
+                            read.hashes.get(&bk).cloned().unwrap_or_default();
+                        loaded(key, table, streams, hashes)
+                    }
+                    // Cut short (or a barrier stream it needs is corrupt):
+                    // read alone.
+                    _ if alone(key) => {
+                        read_alone(backend, registry, key, have).await?
+                    }
+                    _ => Loaded::Unread,
+                };
             out.push(loaded);
         }
     }
