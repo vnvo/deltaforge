@@ -1271,9 +1271,9 @@ fn postgres_max_message_bytes_is_bounded() {
 #[test]
 fn mysql_proof_bounds_are_validated() {
     use deltaforge_config::{
-        MYSQL_PROOF_LOCK_WAIT_SECS, MYSQL_PROOF_MAX_SEEK_MS,
-        MYSQL_PROOF_WINDOW_BYTES, MYSQL_PROOF_WINDOW_EVENTS,
-        MYSQL_PROOF_WINDOW_MS, MysqlProofCfg,
+        MYSQL_PROOF_CONTROL_CONNECTIONS, MYSQL_PROOF_LOCK_WAIT_SECS,
+        MYSQL_PROOF_MAX_SEEK_MS, MYSQL_PROOF_WINDOW_BYTES,
+        MYSQL_PROOF_WINDOW_EVENTS, MYSQL_PROOF_WINDOW_MS, MysqlProofCfg,
     };
     let parse = |json: &str| serde_json::from_str::<MysqlProofCfg>(json);
     let d = parse("{}").unwrap();
@@ -1284,11 +1284,12 @@ fn mysql_proof_bounds_are_validated() {
             d.activation_window_events,
             d.activation_window_bytes,
             d.max_seek_ms,
-            d.capture_lock_wait_secs
+            d.capture_lock_wait_secs,
+            d.control_connections
         ),
-        (50, 10_000, 16 * 1024 * 1024, 10_000, 30)
+        (50, 10_000, 16 * 1024 * 1024, 10_000, 30, 4)
     );
-    let fields: [(&str, u64, u64); 5] = [
+    let fields: [(&str, u64, u64); 6] = [
         (
             "activation_window_ms",
             *MYSQL_PROOF_WINDOW_MS.start(),
@@ -1313,6 +1314,11 @@ fn mysql_proof_bounds_are_validated() {
             "capture_lock_wait_secs",
             u64::from(*MYSQL_PROOF_LOCK_WAIT_SECS.start()),
             u64::from(*MYSQL_PROOF_LOCK_WAIT_SECS.end()),
+        ),
+        (
+            "control_connections",
+            *MYSQL_PROOF_CONTROL_CONNECTIONS.start() as u64,
+            *MYSQL_PROOF_CONTROL_CONNECTIONS.end() as u64,
         ),
     ];
     for (name, min, max) in fields {

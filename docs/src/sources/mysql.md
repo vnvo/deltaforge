@@ -109,6 +109,7 @@ configuration is loaded:
 | `activation_window_bytes` | `16777216` | 65,536 to 268,435,456 | At most this many bytes of events buffered by a window. |
 | `capture_lock_wait_secs` | `30` | 1 to 300 | How long a window's capture waits for each table's metadata lock, on each of its three attempts. |
 | `max_seek_ms` | `10000` | 100 to 600,000 | A proof scan with no known start offset fails closed when the server sends no transaction within this bound. |
+| `control_connections` | `4` | 2 to 16 | The source's control-plane pool: at most this many SQL connections at once for schema captures, catalog reads, position queries and health checks. |
 
 ```yaml
 source:
@@ -121,6 +122,44 @@ source:
       activation_window_ms: 50
       max_seek_ms: 10000
 ```
+
+### Control-plane connections
+
+Every SQL connection a MySQL source opens besides its binlog stream and its
+snapshot copy (schema captures, catalog reads, position and identity
+queries, health checks) comes from the source's pool of
+`proofs.control_connections`, within one budget for the whole process,
+`--max-mysql-control-connections` (default `32`, of which `4` are reserved
+for cancelling captures):
+
+- A connection holds its permits from before it opens until it has closed.
+- A returned connection is kept as the source's one idle connection for at
+  most 10 s; any other closes. When the process budget is full, every idle
+  connection closes at once to make room.
+- Waits are first come, first served. A capture waits at most its
+  `capture_lock_wait_secs`; a position query or a health check at most 5 s,
+  one health check at a time per source; a catalog read at most 30 s.
+- An activation window's, a failover drift check's or a DDL's forward
+  proof capture that gets no connection within its wait stops the source
+  with a `mysql_control_plane_saturated` incident and is retried by the
+  restart: without it, rows could not be decoded, drift decided, or the
+  rows after the DDL proven. A forward proof stops before its DDL is
+  emitted or checkpointed; the restart replays the DDL and proves it.
+- A snapshot baseline that gets no connection keeps its existing safe
+  deferral, as for any failed capture: it only proves early what the
+  table's lazy proof proves at its next rows, so the table is proven there
+  before any of those rows is delivered. Each deferral is logged and
+  counted in `deltaforge_mysql_control_saturation_deferrals_total{kind}`
+  (`kind="baseline"`); it never raises an incident.
+- Cancelling a capture never waits for a pool: it draws on the reserve.
+- After a credential rotation or a failover, connections opened before it
+  are never reused: the idle one closes at once, the others when returned.
+
+`deltaforge_mysql_connections{source, kind}` reports a source's open
+connections by kind (`replication`, `control`, `cancellation`,
+`snapshot_copy`). `deltaforge_mysql_control_permit_wait_seconds{class}`,
+`deltaforge_mysql_control_permit_timeouts_total{class, scope}` and
+`deltaforge_mysql_control_idle_evictions_total` report the waits.
 
 ## Resume Behavior
 

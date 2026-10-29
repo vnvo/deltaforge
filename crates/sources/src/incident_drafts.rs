@@ -149,6 +149,55 @@ pub(crate) fn mysql_capture_contention(
     )
 }
 
+/// A schema capture that got no control-plane connection within its wait
+/// (`mysql_control`): `scope` names the bound that stayed full (`runner` or
+/// `source`). Nothing that needed the capture was delivered or recorded;
+/// the checkpoint stays at `at`. A restart retries once connections free
+/// up. No DSN or credential is part of it.
+pub(crate) fn mysql_control_plane_saturated(
+    source_id: &str,
+    what: &str,
+    tables: &[(String, String)],
+    scope: &str,
+    at: &crate::mysql::MySqlCheckpoint,
+) -> SourceError {
+    let first = tables
+        .first()
+        .map(|(d, t)| format!("{d}.{t}"))
+        .unwrap_or_default();
+    let position = window_position(at);
+    let draft = IncidentDraft::new(
+        ReasonCode::MysqlControlPlaneSaturated,
+        Component::Source {
+            id: source_id.to_string(),
+        },
+        Retryability::AutoRetry,
+        SafetyState::HaltedSafe,
+        CauseCode::SourceBackpressure,
+    )
+    .discriminate("boundary", &position)
+    .with_evidence(|e| {
+        e.text(K::SourceId, source_id)
+            .text(K::Table, &first)
+            .count(K::BlockingCount, tables.len() as u64)
+            .text(K::ReasonClass, scope)
+            .text(K::CheckpointPosition, &position);
+    })
+    .with_actions(&[ActionCode::InspectLogs]);
+    SourceError::incident(
+        draft,
+        SourceError::Connect {
+            details: format!(
+                "{what}: no MySQL control-plane connection for the schema \
+                 capture of {} table(s) (first {first}): the {scope} bound \
+                 stayed full",
+                tables.len()
+            )
+            .into(),
+        },
+    )
+}
+
 /// The checkpoint position a window stays before, as evidence text.
 fn window_position(at: &crate::mysql::MySqlCheckpoint) -> String {
     match &at.gtid_set {

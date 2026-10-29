@@ -287,6 +287,11 @@ pub(crate) enum ProofError {
         "the binlog seek exceeded its bound ({0}); the interval is unproven"
     )]
     SeekLimit(String),
+    /// No control-plane connection could be had within the capture's wait
+    /// (`mysql_control`): `scope` (`runner` or `source`) stayed at its
+    /// bound.
+    #[error("{why}")]
+    Saturated { scope: &'static str, why: String },
 }
 
 /// The run stopped while a capture was in flight: its session is killed
@@ -313,6 +318,8 @@ impl From<Cancelled> for deltaforge_core::SourceError {
 pub(crate) struct CaptureCtx {
     dsn: crate::credentials::SharedDsn,
     cancel: CancellationToken,
+    /// The source's control-plane pool: every capture's connection.
+    control: super::mysql_control::ControlPool,
 }
 
 impl CaptureCtx {
@@ -320,8 +327,13 @@ impl CaptureCtx {
     pub(crate) fn for_run(
         dsn: crate::credentials::SharedDsn,
         cancel: CancellationToken,
+        control: super::mysql_control::ControlPool,
     ) -> Self {
-        Self { dsn, cancel }
+        Self {
+            dsn,
+            cancel,
+            control,
+        }
     }
 
     /// The run's authoritative DSN.
@@ -329,7 +341,13 @@ impl CaptureCtx {
         &self.dsn
     }
 
-    /// A context of its own (tests), stopped with [`CaptureCtx::stop`].
+    /// The source's control-plane pool.
+    pub(crate) fn control(&self) -> &super::mysql_control::ControlPool {
+        &self.control
+    }
+
+    /// A context of its own (tests), with a pool of its own of the default
+    /// size on the runner's budget, stopped with [`CaptureCtx::stop`].
     #[cfg(test)]
     pub(crate) fn detached(
         dsn: impl Into<crate::credentials::SharedDsn>,
@@ -337,6 +355,24 @@ impl CaptureCtx {
         Self {
             dsn: dsn.into(),
             cancel: CancellationToken::new(),
+            control: super::mysql_control::ControlPool::detached(
+                super::mysql_control::budget(),
+                "detached",
+                super::mysql_control::DEFAULT_POOL_SIZE,
+            ),
+        }
+    }
+
+    /// A context of its own on `control` (tests).
+    #[cfg(test)]
+    pub(crate) fn detached_on(
+        dsn: impl Into<crate::credentials::SharedDsn>,
+        control: super::mysql_control::ControlPool,
+    ) -> Self {
+        Self {
+            dsn: dsn.into(),
+            cancel: CancellationToken::new(),
+            control,
         }
     }
 
@@ -871,6 +907,7 @@ pub(crate) async fn scan_interval_at(
         ..Default::default()
     };
     let result = scan(
+        tag.source_id,
         dsn,
         server_id,
         server_uuid,
@@ -954,6 +991,7 @@ fn source_txns(set: &GtidSet, server_uuid: &str) -> u64 {
 
 #[allow(clippy::too_many_arguments)]
 async fn scan(
+    source: &str,
     dsn: &str,
     server_id: u64,
     server_uuid: &str,
@@ -1098,7 +1136,7 @@ async fn scan(
 
     let mut stream = tokio::time::timeout(
         limits.max_duration,
-        open_replication_session_abortive(&client, server_uuid),
+        open_replication_session_abortive(&client, server_uuid, source),
     )
     .await
     .map_err(|_| {
@@ -1578,40 +1616,22 @@ pub(crate) async fn capture_with(
     between: Option<BetweenHook<'_>>,
 ) -> Result<Result<Captured, ProofError>, Cancelled> {
     let dsn = &cx.dsn;
-    let pool = mysql_async::Pool::new(dsn.current().expose());
     let mut trace = CaptureTrace::default();
     let t0 = Instant::now();
     // Dropped mid-flight, the capture is killed on the server (see
     // `capture_batch_with`).
     let mut guard = KillOnDrop {
         dsn: dsn.clone(),
+        source: cx.control.source().to_string(),
         id: 0,
         slots,
         permit: None,
     };
     let body = async {
-        let mut conn = pool
-            .get_conn()
-            .await
-            .map_err(|e| ProofError::Capture(e.to_string()))?;
-        let mode: Option<String> = conn
-            .query_first("SELECT @@GLOBAL.gtid_mode")
-            .await
-            .map_err(|e| ProofError::Capture(e.to_string()))?;
-        let gtid_mode = mode.is_some_and(|m| m.eq_ignore_ascii_case("ON"));
-        // Identity first: nothing is locked or read on another server.
-        let live: Option<String> = conn
-            .query_first("SELECT @@GLOBAL.server_uuid")
-            .await
-            .map_err(|e| ProofError::Capture(e.to_string()))?;
-        if !live
-            .as_deref()
-            .is_some_and(|l| server_uuid.eq_ignore_ascii_case(l.trim()))
-        {
-            return Err(ProofError::OtherServer(format!("{live:?}")));
-        }
-        // A lock-holding slot first, within the lock-wait budget; then the
-        // table's metadata lock, held until COMMIT (module docs).
+        // A lock-holding slot first, within the lock-wait budget: a capture
+        // waiting for one holds no connection. Then a connection of the
+        // source's pool, proven to be the server, within what remains;
+        // then the table's metadata lock, held until COMMIT (module docs).
         let budget = Duration::from_secs(u64::from(LOCK_WAIT_SECS));
         let waited = Instant::now();
         let permit = tokio::time::timeout(budget, slots.holding.acquire())
@@ -1623,7 +1643,23 @@ pub(crate) async fn capture_with(
             })?
             .expect("capture slots are never closed");
         guard.permit = Some(permit);
+        let (control, wait) =
+            control_for(cx, budget.saturating_sub(waited.elapsed()));
+        let mut conn = control
+            .connect(
+                super::mysql_control::Class::Capture,
+                dsn.current().expose(),
+                server_uuid,
+                wait,
+            )
+            .await
+            .map_err(control_error)?;
         guard.id = conn.id();
+        let mode: Option<String> = conn
+            .query_first("SELECT @@GLOBAL.gtid_mode")
+            .await
+            .map_err(|e| ProofError::Capture(e.to_string()))?;
+        let gtid_mode = mode.is_some_and(|m| m.eq_ignore_ascii_case("ON"));
         let remaining =
             budget.saturating_sub(waited.elapsed()).as_secs().max(1);
         for q in [
@@ -1678,7 +1714,9 @@ pub(crate) async fn capture_with(
         conn.query_drop("COMMIT")
             .await
             .map_err(|e| ProofError::Capture(format!("COMMIT: {e}")))?;
-        conn.disconnect().await.ok();
+        // Unarmed first: a returned connection is never killed.
+        guard.id = 0;
+        conn.release().await;
         Ok(Captured {
             from,
             position,
@@ -1696,7 +1734,6 @@ pub(crate) async fn capture_with(
     };
     guard.id = 0;
     guard.permit = None;
-    pool.disconnect().await.ok();
     Ok(result.map(|mut c| {
         c.trace = trace;
         c
@@ -1708,6 +1745,8 @@ pub(crate) async fn capture_with(
 struct KillOnDrop {
     /// The run's DSN, read when the kill connects.
     dsn: crate::credentials::SharedDsn,
+    /// Its source, which the kill connection is counted for.
+    source: String,
     id: u32,
     slots: &'static CaptureSlots,
     /// The capture's lock-holding slot, held until its session is gone.
@@ -1720,6 +1759,7 @@ impl Drop for KillOnDrop {
             return;
         }
         let (dsn, id, slots) = (self.dsn.clone(), self.id, self.slots);
+        let source = std::mem::take(&mut self.source);
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
             kill_failed(slots, permit, id, "no runtime to run the kill on");
             return;
@@ -1742,6 +1782,10 @@ impl Drop for KillOnDrop {
                     return Err("injected kill failure".to_string());
                 }
                 let now = dsn.current();
+                let _counted = super::mysql_connections::Counted::new(
+                    &source,
+                    super::mysql_connections::Kind::Cancellation,
+                );
                 let mut c = mysql_async::Conn::from_url(now.expose())
                     .await
                     .map_err(|e| format!("connect: {e}"))?;
@@ -1881,6 +1925,49 @@ fn server_code(e: &mysql_async::Error) -> Option<u16> {
 
 /// A failed statement of a batched capture: the connection (I/O or the
 /// driver) as `Open`, anything the server answered as `Capture`.
+/// Test-only: the next capture draws on this pool, waiting at most this
+/// long (a saturated control plane, on the real capture path).
+#[cfg(test)]
+pub(crate) static STARVE_NEXT: std::sync::Mutex<
+    Option<(super::mysql_control::ControlPool, Duration)>,
+> = std::sync::Mutex::new(None);
+
+/// The pool a capture draws on, and its wait: the run's, within what its
+/// lock-wait budget leaves.
+fn control_for(
+    cx: &CaptureCtx,
+    wait: Duration,
+) -> (super::mysql_control::ControlPool, Duration) {
+    #[cfg(test)]
+    if let Some(starved) = STARVE_NEXT.lock().unwrap().take() {
+        return starved;
+    }
+    (cx.control.clone(), wait)
+}
+
+/// A capture's control connection that could not be had: saturation keeps
+/// its class, a connect failure is an open failure, another server is
+/// refused.
+fn control_error(e: super::mysql_control::ControlError) -> ProofError {
+    use super::mysql_control::ControlError;
+    use super::mysql_session::SessionError;
+    match e {
+        ControlError::Saturated { scope, .. } => ProofError::Saturated {
+            scope,
+            why: e.to_string(),
+        },
+        ControlError::Session(SessionError::Connect(why)) => {
+            ProofError::Open(format!("connect: {why}"))
+        }
+        ControlError::Session(SessionError::OtherServer { found }) => {
+            ProofError::OtherServer(format!("{found:?}"))
+        }
+        ControlError::Session(SessionError::NoIdentity(why)) => {
+            ProofError::OtherServer(why)
+        }
+    }
+}
+
 fn batch_error(e: mysql_async::Error, what: &str) -> BatchCaptureError {
     BatchCaptureError::Failed(match e {
         mysql_async::Error::Io(_) | mysql_async::Error::Driver(_) => {
@@ -1977,7 +2064,6 @@ pub(crate) async fn capture_batch_with(
     }
     let mut sorted: Vec<(String, String)> = ranked.clone();
     sorted.sort();
-    let pool = mysql_async::Pool::new(dsn.current().expose());
     let mut trace = CaptureTrace::default();
     let t0 = Instant::now();
     // A capture dropped mid-flight (its window failed, was abandoned or
@@ -1986,34 +2072,17 @@ pub(crate) async fn capture_batch_with(
     // when its query ends.
     let mut guard = KillOnDrop {
         dsn: dsn.clone(),
+        source: cx.control.source().to_string(),
         id: 0,
         slots,
         permit: None,
     };
     let body = async {
-        let mut conn = pool
-            .get_conn()
-            .await
-            .map_err(|e| batch_error(e, "connect"))?;
-        let mode: Option<String> = conn
-            .query_first("SELECT @@GLOBAL.gtid_mode")
-            .await
-            .map_err(|e| batch_error(e, "gtid_mode"))?;
-        let gtid_mode = mode.is_some_and(|m| m.eq_ignore_ascii_case("ON"));
-        // Identity first: nothing is locked or read on another server.
-        let live: Option<String> = conn
-            .query_first("SELECT @@GLOBAL.server_uuid")
-            .await
-            .map_err(|e| batch_error(e, "server_uuid"))?;
-        if !live
-            .as_deref()
-            .is_some_and(|l| server_uuid.eq_ignore_ascii_case(l.trim()))
-        {
-            return Err(failed(ProofError::OtherServer(format!("{live:?}"))));
-        }
         // A lock-holding slot first (the runner-wide bound), within the
-        // lock-wait budget; the session's own lock wait gets what remains.
-        // Armed only now: a capture holds no lock before its slot.
+        // lock-wait budget: a capture waiting for one holds no connection
+        // and no lock. Then a connection of the source's pool, proven to be
+        // the server (nothing is locked or read on another), within what
+        // remains; the session's own lock wait gets the rest.
         let budget = Duration::from_secs(u64::from(lock_wait_secs));
         let waited = Instant::now();
         let permit = tokio::time::timeout(budget, slots.holding.acquire())
@@ -2026,7 +2095,23 @@ pub(crate) async fn capture_batch_with(
             })?
             .expect("capture slots are never closed");
         guard.permit = Some(permit);
+        let (control, wait) =
+            control_for(cx, budget.saturating_sub(waited.elapsed()));
+        let mut conn = control
+            .connect(
+                super::mysql_control::Class::Capture,
+                dsn.current().expose(),
+                server_uuid,
+                wait,
+            )
+            .await
+            .map_err(|e| failed(control_error(e)))?;
         guard.id = conn.id();
+        let mode: Option<String> = conn
+            .query_first("SELECT @@GLOBAL.gtid_mode")
+            .await
+            .map_err(|e| batch_error(e, "gtid_mode"))?;
+        let gtid_mode = mode.is_some_and(|m| m.eq_ignore_ascii_case("ON"));
         let remaining =
             budget.saturating_sub(waited.elapsed()).as_secs().max(1);
         for q in [
@@ -2141,7 +2226,9 @@ pub(crate) async fn capture_batch_with(
         conn.query_drop("COMMIT")
             .await
             .map_err(|e| batch_error(e, "COMMIT"))?;
-        conn.disconnect().await.ok();
+        // Unarmed first: a returned connection is never killed.
+        guard.id = 0;
+        conn.release().await;
         Ok(BatchCaptured {
             from,
             position,
@@ -2160,7 +2247,6 @@ pub(crate) async fn capture_batch_with(
     };
     guard.id = 0;
     guard.permit = None;
-    pool.disconnect().await.ok();
     Ok(result.map(|mut c| {
         c.trace = trace;
         c
@@ -2451,7 +2537,7 @@ pub(crate) mod tests {
         let run = &sources.iter().find(|(f, _, _)| f == "mod.rs").unwrap().2;
         assert!(
             run.contains(
-                "letcaptures=mysql_binlog_scan::CaptureCtx::for_run(run_dsn.clone(),cancel.clone(),);"
+                "letcaptures=mysql_binlog_scan::CaptureCtx::for_run(run_dsn.clone(),cancel.clone(),self.control_pool(),);"
             ),
             "the run's context is built from the run's DSN and stop"
         );
@@ -2553,6 +2639,7 @@ pub(crate) mod tests {
         let before = kill_failures();
         drop(KillOnDrop {
             dsn: "mysql://u:p@127.0.0.1:1/".into(),
+            source: "test".into(),
             id: 42,
             slots,
             permit: None,
@@ -3908,7 +3995,7 @@ pub(crate) mod tests {
             /// A capture under `cx` on `db.t` (single, or the batched form
             /// with a 300 s lock wait); `hold` pauses it, once locked, until
             /// it is dropped. A failed capture is its error's text.
-            fn cancellable(
+            pub(super) fn cancellable(
                 slots: &'static CaptureSlots,
                 cx: CaptureCtx,
                 u: &str,
@@ -5449,13 +5536,15 @@ pub(crate) mod tests {
                 timeout_secs: 30,
                 ..Default::default()
             };
-            let scan = open_replication_session_abortive(&client, &uuid)
-                .await
-                .unwrap();
+            let scan =
+                open_replication_session_abortive(&client, &uuid, "test")
+                    .await
+                    .unwrap();
             assert_eq!(scan.linger().unwrap(), Some(Duration::ZERO));
             drop(scan);
-            let stream =
-                open_replication_session(&client, &uuid).await.unwrap();
+            let stream = open_replication_session(&client, &uuid, "test")
+                .await
+                .unwrap();
             assert_ne!(stream.linger().unwrap(), Some(Duration::ZERO));
         }
 
@@ -6743,6 +6832,371 @@ pub(crate) mod tests {
             // Starting inside the interval, or ending before its end.
             assert!(!covers(&c, &b, &b));
             assert!(!covers(&c, &before, &a));
+        }
+
+        /// The control-plane connection bounds (design section 5): every
+        /// count is of one dedicated account's sessions, so nothing else on
+        /// the server is counted.
+        mod control_connections {
+            use super::*;
+
+            /// The per-source pool's default size (`P`).
+            const P: usize = 4;
+
+            /// A dedicated account on `dsn`'s server, and a DSN for it.
+            async fn account(dsn: &str, user: &str) -> String {
+                sql(
+                    dsn,
+                    &[
+                        &format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'pw'"),
+                        &format!("GRANT ALL ON *.* TO '{user}'@'%'"),
+                    ],
+                )
+                .await;
+                dsn.replacen("root:pw@", &format!("{user}:pw@"), 1)
+            }
+
+            /// `user`'s open sessions.
+            async fn sessions(dsn: &str, user: &str) -> usize {
+                let mut c = mysql_async::Conn::from_url(dsn).await.unwrap();
+                let n: Option<u64> = c
+                    .exec_first(
+                        "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE USER = ?",
+                        (user,),
+                    )
+                    .await
+                    .unwrap();
+                c.disconnect().await.ok();
+                n.unwrap_or(0) as usize
+            }
+
+            /// Samples `user`'s sessions until stopped; returns the peak.
+            fn peak(
+                dsn: &str,
+                user: &'static str,
+            ) -> (Arc<AtomicU32>, tokio::task::JoinHandle<usize>) {
+                let stop = Arc::new(AtomicU32::new(0));
+                let (s, d) = (stop.clone(), dsn.to_string());
+                let task = tokio::spawn(async move {
+                    let mut most = 0;
+                    while s.load(Ordering::SeqCst) == 0 {
+                        most = most.max(sessions(&d, user).await);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    most
+                });
+                (stop, task)
+            }
+
+            /// Captures queued for a lock-holding slot (single and batched)
+            /// stay within the source's pool: one source never holds more
+            /// than `P` control connections, however many captures wait.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn queued_captures_stay_within_the_sources_pool() {
+                let root = server(true).await;
+                let db = "control_queue";
+                sql(
+                    &root,
+                    &[
+                        &format!("CREATE DATABASE {db}"),
+                        &format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)"),
+                    ],
+                )
+                .await;
+                let dsn = account(&root, "queue_u").await;
+                let u = uuid(&root).await;
+                let slots: &'static CaptureSlots =
+                    Box::leak(Box::new(CaptureSlots::new(1, 1)));
+                // The only lock-holding slot is taken: every capture queues.
+                let held = slots.holding.acquire().await.unwrap();
+                let cx = CaptureCtx::detached(dsn.as_str());
+                let tasks: Vec<_> = (0..2 * P)
+                    .map(|i| {
+                        positioned::cancellable(
+                            slots,
+                            cx.clone(),
+                            &u,
+                            db,
+                            i % 2 == 1,
+                            None,
+                        )
+                    })
+                    .collect();
+                let (stop, sampler) = peak(&root, "queue_u");
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                // Queued for a slot, a capture holds no connection: the
+                // pool stays free for the source's other uses.
+                assert_eq!(sessions(&root, "queue_u").await, 0);
+                drop(held);
+                for t in tasks {
+                    let r = t.await.unwrap().expect("not cancelled");
+                    assert!(r.is_ok(), "{r:?}");
+                }
+                stop.store(1, Ordering::SeqCst);
+                let most = sampler.await.unwrap();
+                assert!(
+                    most <= P,
+                    "{} queued captures held {most} connections, above P = {P}",
+                    2 * P
+                );
+            }
+
+            /// Concurrent schema reads stay within the source's pool, and
+            /// once they finish at most one idle connection is retained.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn schema_reads_stay_within_the_pool_and_retain_one_idle() {
+                let root = server(true).await;
+                let db = "control_reads";
+                let n = 4 * P;
+                let mut ddl = vec![format!("CREATE DATABASE {db}")];
+                ddl.extend((0..n).map(|i| {
+                    format!("CREATE TABLE {db}.t{i} (id INT PRIMARY KEY)")
+                }));
+                let ddl: Vec<&str> = ddl.iter().map(String::as_str).collect();
+                sql(&root, &ddl).await;
+                let dsn = account(&root, "reads_u").await;
+                let scope = crate::registry_scope::SharedRegistryScope::new(
+                    "control_reads",
+                );
+                scope.publish_for_test(
+                    "acme",
+                    storage::adapters::LineageDescriptor::mysql(
+                        &uuid(&root).await,
+                    )
+                    .unwrap(),
+                );
+                let loader = crate::mysql::MySqlSchemaLoader::new(
+                    dsn.as_str(),
+                    storage::DurableSchemaRegistry::for_testing(),
+                    "acme",
+                    scope,
+                );
+                let (stop, sampler) = peak(&root, "reads_u");
+                let reads: Vec<_> = (0..n)
+                    .map(|i| {
+                        let l = loader.clone();
+                        tokio::spawn(async move {
+                            l.load_schema(db, &format!("t{i}")).await
+                        })
+                    })
+                    .collect();
+                for r in reads {
+                    r.await.unwrap().expect("schema read");
+                }
+                stop.store(1, Ordering::SeqCst);
+                let most = sampler.await.unwrap();
+                assert!(
+                    most <= P,
+                    "{n} concurrent schema reads held {most} connections, above P = {P}"
+                );
+                let idle = sessions(&root, "reads_u").await;
+                assert!(idle <= 1, "{idle} idle connections retained");
+            }
+
+            /// A pool of its own on `budget` (`P` = 2).
+            fn pool_on(
+                budget: &'static crate::mysql::mysql_control::Budget,
+                name: &str,
+            ) -> crate::mysql::mysql_control::ControlPool {
+                crate::mysql::mysql_control::ControlPool::detached(
+                    budget, name, 2,
+                )
+            }
+
+            /// Cancellation never waits behind ordinary work: with every
+            /// ordinary permit of the runner held by `L` captures queued
+            /// for their tables' metadata locks (single and batched), a stop
+            /// kills each of them through the reserve, at once, with no
+            /// failed kill.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn cancellation_draws_on_its_reserve_with_the_budget_full() {
+                let root = server(true).await;
+                let db = "control_cancel";
+                sql(
+                    &root,
+                    &[
+                        &format!("CREATE DATABASE {db}"),
+                        &format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)"),
+                    ],
+                )
+                .await;
+                let mut holder =
+                    mysql_async::Conn::from_url(&root).await.unwrap();
+                holder
+                    .query_drop(format!("LOCK TABLES {db}.t WRITE"))
+                    .await
+                    .unwrap();
+                const L: usize = 2;
+                // G = R + L: the L captures take every ordinary permit.
+                let budget: &'static crate::mysql::mysql_control::Budget =
+                    Box::leak(Box::new(
+                        crate::mysql::mysql_control::Budget::new(
+                            KILL_RESERVE + L,
+                        ),
+                    ));
+                let slots: &'static CaptureSlots =
+                    Box::leak(Box::new(CaptureSlots::new(L, L)));
+                let cx = CaptureCtx::detached_on(
+                    root.as_str(),
+                    pool_on(budget, "cancel"),
+                );
+                let u = uuid(&root).await;
+                let failures = kill_failures();
+                let tasks: Vec<_> = (0..L)
+                    .map(|i| {
+                        positioned::cancellable(
+                            slots,
+                            cx.clone(),
+                            &u,
+                            db,
+                            i % 2 == 1,
+                            None,
+                        )
+                    })
+                    .collect();
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while positioned_waiting(&root, db).await < L {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the captures never queued"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert_eq!(
+                    budget.available(),
+                    0,
+                    "every ordinary permit is held"
+                );
+                let t = Instant::now();
+                cx.stop();
+                for task in tasks {
+                    let r = tokio::time::timeout(Duration::from_secs(2), task)
+                        .await
+                        .expect("a cancelled capture returns at once")
+                        .unwrap();
+                    assert!(matches!(r, Err(Cancelled)), "{r:?}");
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while positioned_waiting(&root, db).await > 0 {
+                    assert!(
+                        Instant::now() < deadline,
+                        "a killed session still waits"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert!(
+                    t.elapsed() < Duration::from_secs(5),
+                    "{:?}",
+                    t.elapsed()
+                );
+                assert_eq!(kill_failures(), failures, "a kill failed");
+                assert_eq!(slots.retired(), 0);
+                holder.query_drop("UNLOCK TABLES").await.unwrap();
+            }
+
+            /// Sessions queued for `db.t`'s metadata lock.
+            async fn positioned_waiting(dsn: &str, db: &str) -> usize {
+                let mut c = mysql_async::Conn::from_url(dsn).await.unwrap();
+                let n: Option<u64> = c
+                    .exec_first(
+                        "SELECT COUNT(*) FROM information_schema.PROCESSLIST \
+                         WHERE STATE = 'Waiting for table metadata lock' AND DB IS NULL \
+                         AND INFO LIKE ?",
+                        (format!("%`{db}`.`t`%"),),
+                    )
+                    .await
+                    .unwrap();
+                c.disconnect().await.ok();
+                n.unwrap_or(0) as usize
+            }
+
+            /// A capture that gets no control-plane connection within its
+            /// wait is `Saturated`, naming the bound that stayed full, and
+            /// becomes the `mysql_control_plane_saturated` incident; neither
+            /// carries the DSN or its credentials.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn a_capture_without_a_connection_is_saturated() {
+                use crate::mysql::mysql_control::Class;
+                let root = server(true).await;
+                let db = "control_saturated";
+                sql(
+                    &root,
+                    &[
+                        &format!("CREATE DATABASE {db}"),
+                        &format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)"),
+                    ],
+                )
+                .await;
+                let dsn = account(&root, "sat_u").await;
+                let u = uuid(&root).await;
+                // G = R + 1: another source holds the only ordinary permit.
+                let budget: &'static crate::mysql::mysql_control::Budget =
+                    Box::leak(Box::new(
+                        crate::mysql::mysql_control::Budget::new(
+                            KILL_RESERVE + 1,
+                        ),
+                    ));
+                let other = pool_on(budget, "other");
+                let held = other
+                    .connect(Class::Catalog, &dsn, &u, Duration::from_secs(5))
+                    .await
+                    .unwrap();
+                let cx = CaptureCtx::detached_on(
+                    dsn.as_str(),
+                    pool_on(budget, "starved"),
+                );
+                let tables = vec![(db.to_string(), "t".to_string())];
+                let t = Instant::now();
+                let r = capture_batch(&cx, &u, LINEAGE, &tables, 1, None)
+                    .await
+                    .expect("not cancelled");
+                let Err(BatchCaptureError::Failed(
+                    e @ ProofError::Saturated { scope, .. },
+                )) = r
+                else {
+                    panic!("{r:?}");
+                };
+                assert_eq!(scope, "runner");
+                assert!(
+                    t.elapsed() >= Duration::from_secs(1),
+                    "{:?}",
+                    t.elapsed()
+                );
+                let at = position(&root).await;
+                let err = crate::incident_drafts::mysql_control_plane_saturated(
+                    "src",
+                    "activation window",
+                    &tables,
+                    scope,
+                    &at,
+                );
+                let deltaforge_core::SourceError::Incident { draft, .. } = &err
+                else {
+                    panic!("{err:?}");
+                };
+                assert_eq!(
+                    draft.reason_code,
+                    deltaforge_core::incident::ReasonCode::MysqlControlPlaneSaturated
+                );
+                for text in
+                    [e.to_string(), format!("{err}"), format!("{err:?}")]
+                {
+                    assert!(
+                        !text.contains("sat_u") && !text.contains(":pw@"),
+                        "{text}"
+                    );
+                }
+                held.release().await;
+                // With the permit back, the capture proceeds.
+                let ok = capture_batch(&cx, &u, LINEAGE, &tables, 5, None)
+                    .await
+                    .expect("not cancelled");
+                assert!(ok.is_ok(), "{ok:?}");
+            }
         }
     }
 }

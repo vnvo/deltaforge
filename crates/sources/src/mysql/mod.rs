@@ -7,8 +7,7 @@ use std::{
 use async_trait::async_trait;
 use deltaforge_config::SnapshotMode;
 use mysql_binlog_connector_rust::{
-    binlog_client::BinlogClient, binlog_stream::BinlogStream,
-    event::table_map_event::TableMapEvent,
+    binlog_client::BinlogClient, event::table_map_event::TableMapEvent,
 };
 use serde::{Deserialize, Serialize};
 use storage::{ArcStorageBackend, DurableSchemaRegistry};
@@ -34,6 +33,8 @@ mod mysql_activation_window;
 mod mysql_baseline;
 mod mysql_binlog_scan;
 mod mysql_checkpoint_lineage;
+pub mod mysql_connections;
+pub mod mysql_control;
 mod mysql_ddl_attribution;
 mod mysql_failover_drift;
 mod mysql_forward_proof;
@@ -67,10 +68,11 @@ pub use mysql_identity::{
 };
 
 mod mysql_table_schema;
+use crate::mysql::mysql_control::Class;
 use crate::mysql::mysql_helpers::{
     Opened, connect_binlog_with_retries, resolve_binlog_tail,
 };
-use crate::mysql::mysql_session::{SessionError, open_control_connection};
+use crate::mysql::mysql_session::SessionError;
 pub use mysql_table_schema::{MySqlColumn, MySqlTableSchema};
 
 pub mod mysql_snapshot;
@@ -83,7 +85,7 @@ use crate::failover::identity::{
 };
 use crate::failover::reconciler::{ReconcileInput, SchemaReconciler};
 use crate::mysql::mysql_health::{
-    PositionReachability, check_position_reachability_on, fetch_server_identity,
+    PositionReachability, check_position_reachability_on,
 };
 use crate::registry_scope::{
     ScopeChange, SharedRegistryScope, establish_scope, previous_scope,
@@ -770,7 +772,9 @@ impl MySqlSource {
         generation: u64,
         tables: u64,
     ) -> SourceResult<Option<u64>> {
+        let control = self.control_pool();
         let mut report = mysql_health::run_preflight_verified(
+            &control,
             self.dsn.expose(),
             server_uuid,
             &[] as &[(&str, &str)],
@@ -778,10 +782,11 @@ impl MySqlSource {
         )
         .await
         .map_err(|e| typed(e, "snapshot preflight"))?;
-        let mut conn = open_control_connection(
+        let mut conn = control_conn(
+            &control,
+            Class::Health,
             self.dsn.expose(),
             server_uuid,
-            CONTROL_CONNECT_TIMEOUT,
         )
         .await
         .map_err(|e| e.into_source_error(server_uuid))?;
@@ -809,7 +814,7 @@ impl MySqlSource {
                 break;
             }
         }
-        conn.disconnect().await.ok();
+        conn.release().await;
         report.apply_size_estimate(
             total,
             tables as usize,
@@ -1020,6 +1025,7 @@ impl MySqlSource {
         crate::snapshot_probe::before_anchor().await;
         let (worker_conns, mut position) =
             mysql_snapshot::acquire_locked_anchor(
+                &self.id,
                 self.dsn.expose(),
                 server_uuid,
                 workers,
@@ -1087,6 +1093,7 @@ impl MySqlSource {
             Default::default();
         let guard = mysql_snapshot::spawn_generation_guard(
             mysql_snapshot::GenerationGuard {
+                control: self.control_pool(),
                 dsn: self.dsn.clone(),
                 expected_uuid: server_uuid.to_string(),
                 captured_file: position.file.clone(),
@@ -1217,6 +1224,7 @@ impl MySqlSource {
         // only after the anchor baselines too ([`Self::finish_generation`]).
         let final_started = std::time::Instant::now();
         mysql_health::verify_binlog_position(
+            &self.control_pool(),
             self.dsn.expose(),
             server_uuid,
             &position.file,
@@ -1310,7 +1318,13 @@ impl MySqlSource {
         &self,
         progress: &mysql_snapshot::MysqlSnapshotProgress,
     ) -> SourceResult<bool> {
-        let mut conn = mysql_async::Conn::from_url(self.dsn.expose())
+        let mut conn = self
+            .control_pool()
+            .connect_unverified(
+                Class::Catalog,
+                self.dsn.expose(),
+                Class::Catalog.wait(),
+            )
             .await
             .map_err(|e| SourceError::Connect {
                 details: format!(
@@ -1335,7 +1349,7 @@ impl MySqlSource {
                 scan.observe(progress.table_done(&db, &table));
             }
         }
-        conn.disconnect().await.ok();
+        conn.release().await;
         Ok(scan.ambiguous(progress.finished))
     }
 
@@ -1362,12 +1376,18 @@ impl MySqlSource {
     /// `@@server_uuid` (file-free, rotation-immune); fall back to
     /// `server_id` + the current binlog file.
     async fn capture_snapshot_lineage(&self) -> SourceResult<PersistedLineage> {
-        use mysql_async::{Pool, Row, prelude::Queryable};
-        let pool = Pool::new(self.dsn.expose());
-        let mut conn = pool
-            .get_conn()
+        use mysql_async::{Row, prelude::Queryable};
+        let mut conn = self
+            .control_pool()
+            .connect_unverified(
+                Class::Position,
+                self.dsn.expose(),
+                Class::Position.wait(),
+            )
             .await
-            .map_err(|e| SourceError::Other(e.into()))?;
+            .map_err(|e| SourceError::Connect {
+                details: e.to_string().into(),
+            })?;
         let uuid: Option<String> = conn
             .query_first("SELECT @@global.server_uuid")
             .await
@@ -1401,6 +1421,16 @@ impl MySqlSource {
         mysql_server_lineage(server_id, file)
     }
 
+    /// The source's control-plane pool (`mysql_control`): shared by every
+    /// run and schema loader of the source.
+    pub(crate) fn control_pool(&self) -> mysql_control::ControlPool {
+        mysql_control::source_pool(
+            &self.tenant,
+            &self.id,
+            self.proofs.control_connections,
+        )
+    }
+
     async fn run_inner(
         &self,
         tx: mpsc::Sender<SourceItem>,
@@ -1413,11 +1443,13 @@ impl MySqlSource {
         // The run's one authoritative DSN, shared by every connection
         // factory of the run (see `SharedDsn`).
         let run_dsn = crate::credentials::SharedDsn::new(self.dsn.clone());
-        // The run's one capture context (that DSN and the run's stop),
-        // shared by every schema capture of the run.
+        // The run's one capture context (that DSN, the run's stop and the
+        // source's control-plane pool), shared by every schema capture of
+        // the run.
         let captures = mysql_binlog_scan::CaptureCtx::for_run(
             run_dsn.clone(),
             cancel.clone(),
+            self.control_pool(),
         );
         // Verify the source lineage ONCE, before any snapshot, stream, or RunCtx.
         // Fail closed if it cannot be established: a swallowed error here would
@@ -1434,7 +1466,9 @@ impl MySqlSource {
         // another connection: both must name one server before anything is
         // recorded. From here on every connection proves it is this server
         // before it is trusted.
-        let root = fetch_identity_verified(self.dsn.expose()).await?;
+        let root =
+            fetch_identity_verified(captures.control(), self.dsn.expose())
+                .await?;
         let same_server = match (&durable_lineage, &root) {
             (
                 PersistedLineage::MysqlGtid { source_uuid },
@@ -1461,8 +1495,12 @@ impl MySqlSource {
                 "MySQL source verified a non-MySQL identity"
             )));
         };
-        require_complete_binlog(self.dsn.expose(), &root_id.server_uuid)
-            .await?;
+        require_complete_binlog(
+            captures.control(),
+            self.dsn.expose(),
+            &root_id.server_uuid,
+        )
+        .await?;
         establish_scope(
             &self.backend,
             &self.registry_scope,
@@ -1493,6 +1531,7 @@ impl MySqlSource {
             &self.id,
             &lineage_hash,
             &mysql_checkpoint_lineage::LiveGtidAvailability {
+                control: captures.control(),
                 dsn: self.dsn.expose(),
                 server_uuid: server_uuid.clone(),
             },
@@ -1516,10 +1555,11 @@ impl MySqlSource {
             };
             let position = match committed.and_then(|c| c.gtid_set) {
                 Some(set) => {
-                    let mut conn = open_control_connection(
+                    let mut conn = control_conn(
+                        captures.control(),
+                        Class::Position,
                         self.dsn.expose(),
                         &server_uuid,
-                        CONTROL_CONNECT_TIMEOUT,
                     )
                     .await
                     .map_err(|e| e.into_source_error(&server_uuid))?;
@@ -1527,7 +1567,7 @@ impl MySqlSource {
                         mysql_health::require_gtid_executed(&mut conn, &set)
                             .await
                             .is_ok();
-                    conn.disconnect().await.ok();
+                    conn.release().await;
                     proven.then(|| MySqlCheckpoint {
                         file: String::new(),
                         pos: 0,
@@ -1621,6 +1661,7 @@ impl MySqlSource {
                                 == deltaforge_config::OnSchemaDrift::Halt,
                             lower_case_table_names:
                                 fetch_lower_case_table_names(
+                                    captures.control(),
                                     self.dsn.expose(),
                                     &server_uuid,
                                 )
@@ -1658,6 +1699,7 @@ impl MySqlSource {
             let mut retry = common::retry::RetryPolicy::default();
             loop {
                 match prepare_client(
+                    captures.control(),
                     self.dsn.expose(),
                     &server_uuid,
                     &self.id,
@@ -1710,11 +1752,18 @@ impl MySqlSource {
         // opening the binlog stream. Reused below for the pre-connect position
         // decision and for the durable identity resolution. Fails closed: the
         // stream must not open on an unverified server.
-        let live =
-            fetch_identity_verified_as(self.dsn.expose(), &server_uuid).await?;
-        let lower_case_table_names =
-            fetch_lower_case_table_names(self.dsn.expose(), &server_uuid)
-                .await?;
+        let live = fetch_identity_verified_as(
+            captures.control(),
+            self.dsn.expose(),
+            &server_uuid,
+        )
+        .await?;
+        let lower_case_table_names = fetch_lower_case_table_names(
+            captures.control(),
+            self.dsn.expose(),
+            &server_uuid,
+        )
+        .await?;
 
         // A failover (stored identity != live) is reconciled below, before
         // the stream opens, against the EXACT position the stream will start
@@ -1911,6 +1960,7 @@ impl MySqlSource {
         let mut rotation = match &self.rotation {
             Some(spec) => {
                 mysql_rotation::require_gtid_mode(
+                    ctx.capture.control(),
                     self.dsn.expose(),
                     &ctx.expected_uuid()?,
                 )
@@ -1920,6 +1970,7 @@ impl MySqlSource {
                     ctx.dsn.current(),
                     self.id.clone(),
                     self.pipeline.clone(),
+                    ctx.capture.control().clone(),
                     Arc::clone(&self.backend),
                     ctx.server_id,
                     ctx.default_db.clone(),
@@ -2363,7 +2414,7 @@ impl Source for MySqlSource {
 async fn connect_first_stream(
     ctx: &RunCtx,
     client: BinlogClient,
-) -> SourceResult<BinlogStream> {
+) -> SourceResult<mysql_session::Session> {
     let init_gtid = client.gtid_enabled.then(|| client.gtid_set.clone());
     let init_file = if client.gtid_enabled {
         None
@@ -2412,8 +2463,12 @@ async fn connect_first_stream(
         // Checked again once the stream is open, before any event is read:
         // the setting changes only with a restart, which ends this stream.
         Opened::Stream(stream) => {
-            require_complete_binlog(ctx.dsn.current().expose(), &expected)
-                .await?;
+            require_complete_binlog(
+                ctx.capture.control(),
+                ctx.dsn.current().expose(),
+                &expected,
+            )
+            .await?;
             Ok(stream)
         }
         // Startup verified this server on every earlier connection: a
@@ -2434,7 +2489,9 @@ async fn connect_first_stream(
 /// failover candidate, accepted only after reconciliation proves it on
 /// connections verified as U and records it durably; a fresh session verified
 /// as U is then opened. Callers see a ready stream regardless.
-async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
+async fn reconnect_stream(
+    ctx: &mut RunCtx,
+) -> SourceResult<mysql_session::Session> {
     // Every reopen (same server, rotation recovery, failover candidate)
     // resumes from a proven boundary only.
     ctx.abandon_open_transaction().await?;
@@ -2445,7 +2502,13 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
     } else if !ctx.last_file.is_empty() && ctx.last_pos > 0 {
         (None, Some(ctx.last_file.clone()), Some(ctx.last_pos as u32))
     } else {
-        match resolve_binlog_tail(ctx.dsn.current().expose(), &expected).await {
+        match resolve_binlog_tail(
+            ctx.capture.control(),
+            ctx.dsn.current().expose(),
+            &expected,
+        )
+        .await
+        {
             Ok((f, p)) => (None, Some(f), Some(p as u32)),
             Err(MySqlSourceError::Lineage(details)) => {
                 return Err(SourceError::Lineage {
@@ -2521,7 +2584,12 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
     );
     // A candidate whose binlog may miss applied transactions is refused
     // before reconciliation records anything.
-    require_complete_binlog(ctx.dsn.current().expose(), &found).await?;
+    require_complete_binlog(
+        ctx.capture.control(),
+        ctx.dsn.current().expose(),
+        &found,
+    )
+    .await?;
     let previous = mysql_identity(&expected);
     let current = mysql_identity(&found);
     run_failover_reconciliation(ctx, previous, current, &resume).await?;
@@ -2541,8 +2609,12 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
     {
         Opened::Stream(stream) => {
             ctx.retry.reset();
-            require_complete_binlog(ctx.dsn.current().expose(), &expected)
-                .await?;
+            require_complete_binlog(
+                ctx.capture.control(),
+                ctx.dsn.current().expose(),
+                &expected,
+            )
+            .await?;
             Ok(stream)
         }
         Opened::OtherServer(other) => Err(SourceError::Lineage {
@@ -2743,15 +2815,17 @@ impl RunCtx {
 /// Refuse a server whose binlog does not hold every transaction it applies
 /// (`mysql_health::require_complete_binlog`).
 pub(crate) async fn require_complete_binlog(
+    control: &mysql_control::ControlPool,
     dsn: &str,
     expected_uuid: &str,
 ) -> SourceResult<()> {
-    let mut conn =
-        open_control_connection(dsn, expected_uuid, CONTROL_CONNECT_TIMEOUT)
-            .await
-            .map_err(|e| e.into_source_error(expected_uuid))?;
+    let mut conn = control_conn(control, Class::Position, dsn, expected_uuid)
+        .await
+        .map_err(|e| e.into_source_error(expected_uuid))?;
     let r = mysql_health::require_complete_binlog(&mut conn).await;
-    conn.disconnect().await.ok();
+    if r.is_ok() {
+        conn.release().await;
+    }
     r.map_err(|details| SourceError::Incompatible {
         details: details.into(),
     })
@@ -2761,17 +2835,19 @@ pub(crate) async fn require_complete_binlog(
 /// to registry keys (0: as written; 1: stored lower case; 2: compared case
 /// insensitively but stored as written).
 async fn fetch_lower_case_table_names(
+    control: &mysql_control::ControlPool,
     dsn: &str,
     expected_uuid: &str,
 ) -> SourceResult<u8> {
     use mysql_async::prelude::Queryable;
-    let mut conn =
-        open_control_connection(dsn, expected_uuid, CONTROL_CONNECT_TIMEOUT)
-            .await
-            .map_err(|e| e.into_source_error(expected_uuid))?;
+    let mut conn = control_conn(control, Class::Position, dsn, expected_uuid)
+        .await
+        .map_err(|e| e.into_source_error(expected_uuid))?;
     let value: Result<Option<u8>, _> =
         conn.query_first("SELECT @@lower_case_table_names").await;
-    conn.disconnect().await.ok();
+    if value.is_ok() {
+        conn.release().await;
+    }
     match value {
         Ok(Some(v @ 0..=2)) => Ok(v),
         Ok(other) => Err(SourceError::Incompatible {
@@ -2883,8 +2959,18 @@ fn advance_position(
     }
 }
 
-/// Connect timeout for identity-verified control connections.
-const CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// A control connection of `control` through `dsn`, proven to be
+/// `expected_uuid`, within `class`'s wait.
+async fn control_conn(
+    control: &mysql_control::ControlPool,
+    class: Class,
+    dsn: &str,
+    expected_uuid: &str,
+) -> Result<mysql_control::ControlConn, mysql_control::ControlError> {
+    control
+        .connect(class, dsn, expected_uuid, class.wait())
+        .await
+}
 
 fn mysql_identity(server_uuid: &str) -> ServerIdentity {
     ServerIdentity::MySql(mysql_health::MySqlServerIdentity {
@@ -2896,20 +2982,18 @@ fn mysql_identity(server_uuid: &str) -> ServerIdentity {
 /// (the verified registry lineage). Transient connect failures are retried
 /// (bounded); another server or an unverifiable identity is a lineage error.
 async fn fetch_identity_verified_as(
+    control: &mysql_control::ControlPool,
     dsn: &str,
     expected_uuid: &str,
 ) -> SourceResult<ServerIdentity> {
     let mut attempt = 0u32;
     loop {
-        match open_control_connection(
-            dsn,
-            expected_uuid,
-            CONTROL_CONNECT_TIMEOUT,
-        )
-        .await
+        match control_conn(control, Class::Position, dsn, expected_uuid)
+            .await
+            .map_err(mysql_control::ControlError::into_session)
         {
             Ok(conn) => {
-                conn.disconnect().await.ok();
+                conn.release().await;
                 return Ok(mysql_identity(expected_uuid));
             }
             Err(SessionError::Connect(e)) => {
@@ -2946,10 +3030,22 @@ const IDENTITY_FETCH_ATTEMPTS: u32 = 5;
 /// source must never continue against an unverified server, so a persistent
 /// fetch failure (or a server that exposes no identity) stops the source rather
 /// than being silently skipped.
-async fn fetch_identity_verified(dsn: &str) -> SourceResult<ServerIdentity> {
+async fn fetch_identity_verified(
+    control: &mysql_control::ControlPool,
+    dsn: &str,
+) -> SourceResult<ServerIdentity> {
     let mut attempt = 0u32;
     loop {
-        match fetch_server_identity(dsn).await {
+        let fetched = match control
+            .connect_unverified(Class::Position, dsn, Class::Position.wait())
+            .await
+        {
+            Ok(mut conn) => {
+                mysql_health::fetch_server_identity_on(&mut conn).await
+            }
+            Err(e) => Err(anyhow::anyhow!("connect: {e}")),
+        };
+        match fetched {
             Ok(Some(id)) => return Ok(ServerIdentity::from(id)),
             Ok(None) => {
                 return Err(SourceError::Other(anyhow::anyhow!(
@@ -3007,7 +3103,11 @@ pub async fn establish_registry_scope(
     tenant: &str,
     source_id: &str,
 ) -> SourceResult<ScopeChange> {
-    let live = fetch_identity_verified(dsn).await?;
+    let live = fetch_identity_verified(
+        &mysql_control::source_pool_as_is(tenant, source_id),
+        dsn,
+    )
+    .await?;
     Ok(establish_scope(
         backend,
         shared,
@@ -3069,12 +3169,14 @@ async fn verify_gtid_position(
     let gtid = ctx.checkpoint_gtid.as_deref();
     let mut retrying = None;
     loop {
-        let reach = match open_control_connection(
+        let reach = match control_conn(
+            ctx.capture.control(),
+            Class::Position,
             ctx.dsn.current().expose(),
             expected,
-            CONTROL_CONNECT_TIMEOUT,
         )
         .await
+        .map_err(mysql_control::ControlError::into_session)
         {
             Ok(mut conn) => {
                 let r = check_position_reachability_on(
@@ -3083,7 +3185,9 @@ async fn verify_gtid_position(
                     gtid,
                 )
                 .await;
-                conn.disconnect().await.ok();
+                if r.is_ok() {
+                    conn.release().await;
+                }
                 r.unwrap_or_else(|e| PositionReachability::Unknown {
                     transient: false,
                     reason: format!("{e:#}"),
@@ -3278,10 +3382,18 @@ async fn check_identity_post_reconnect(
         None => {
             // A reconnect's stream is open, nothing read yet: the server
             // may have restarted with another configuration.
-            require_complete_binlog(ctx.dsn.current().expose(), &expected)
-                .await?;
-            fetch_identity_verified_as(ctx.dsn.current().expose(), &expected)
-                .await?
+            require_complete_binlog(
+                ctx.capture.control(),
+                ctx.dsn.current().expose(),
+                &expected,
+            )
+            .await?;
+            fetch_identity_verified_as(
+                ctx.capture.control(),
+                ctx.dsn.current().expose(),
+                &expected,
+            )
+            .await?
         }
     };
 
@@ -3388,16 +3500,17 @@ async fn run_failover_reconciliation(
         }
     };
 
-    let mut conn = open_control_connection(
+    let mut conn = control_conn(
+        ctx.capture.control(),
+        Class::Position,
         ctx.dsn.current().expose(),
         &current_uuid,
-        CONTROL_CONNECT_TIMEOUT,
     )
     .await
     .map_err(|e| e.into_source_error(&current_uuid))?;
     let record =
         failover_record(ctx, &mut conn, &previous, &current, resume_set).await;
-    conn.disconnect().await.ok();
+    drop(conn);
     let record = record?;
 
     // Schema drift is not decided here: each table is checked lazily at its
@@ -3408,6 +3521,12 @@ async fn run_failover_reconciliation(
     // Reconciled: record the lineage edge (fail closed) and publish it - from
     // here on every connection must prove it is `current`.
     sync_registry_lineage(ctx, &current).await?;
+    // Nothing opened to the previous server is used again: the idle
+    // connection closes now, those in use when returned (bounded).
+    ctx.capture
+        .control()
+        .drain(mysql_control::DRAIN_TIMEOUT)
+        .await;
 
     // The failover position F for every table's lazy drift check, durable
     // before the identity record (an earlier anchor for this lineage transition,
@@ -3916,9 +4035,12 @@ mod identity_fail_closed_tests {
 
     #[tokio::test]
     async fn fetch_identity_verified_fails_closed_when_query_unavailable() {
-        let err = fetch_identity_verified(UNREACHABLE_DSN)
-            .await
-            .expect_err("unreachable server must fail closed");
+        let err = fetch_identity_verified(
+            &super::mysql_control::ControlPool::standalone("unreachable"),
+            UNREACHABLE_DSN,
+        )
+        .await
+        .expect_err("unreachable server must fail closed");
         let msg = err.to_string();
         assert!(
             msg.contains("refusing to stream"),

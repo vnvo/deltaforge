@@ -1,9 +1,7 @@
 use crc32fast::Hasher;
 use deltaforge_core::{CheckpointMeta, SourceError, SourceResult};
 use mysql_async::{Row, prelude::Queryable};
-use mysql_binlog_connector_rust::{
-    binlog_client::BinlogClient, binlog_stream::BinlogStream,
-};
+use mysql_binlog_connector_rust::binlog_client::BinlogClient;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -17,6 +15,7 @@ use common::{
 use super::{MySqlCheckpoint, MySqlSourceError, MySqlSourceResult};
 
 pub(super) async fn prepare_client(
+    control: &super::mysql_control::ControlPool,
     dsn: &str,
     expected_uuid: &str,
     source_id: &str,
@@ -75,14 +74,15 @@ pub(super) async fn prepare_client(
         }
     } else {
         info!("no previous checkpoint, reading the binlog tail ..");
-        match resolve_binlog_tail(dsn, expected_uuid).await {
+        match resolve_binlog_tail(control, dsn, expected_uuid).await {
             Ok((file, pos)) => {
                 info!(source_id = %source_id, %file, %pos, "start from end (first run)");
                 client.binlog_filename = file;
                 client.binlog_position = pos as u32;
                 // Also fetch the full executed GTID set so reconnects resume
                 // from here rather than replaying the full binlog history.
-                match fetch_executed_gtid_set(dsn, expected_uuid).await {
+                match fetch_executed_gtid_set(control, dsn, expected_uuid).await
+                {
                     // With GTID off the executed set is '' (not NULL): no
                     // GTID resume position, stay on the file/position tail.
                     Ok(Some(gtid_set)) if !gtid_set.trim().is_empty() => {
@@ -112,7 +112,7 @@ pub(super) async fn prepare_client(
 /// A replication session opened by [`connect_binlog_with_retries`].
 pub(super) enum Opened {
     /// Verified as the expected server; the dump command was issued.
-    Stream(BinlogStream),
+    Stream(super::mysql_session::Session),
     /// The session reached another server (its `server_uuid`) and was closed
     /// before the dump command: no event was read.
     OtherServer(String),
@@ -206,7 +206,7 @@ async fn connect_binlog(
 
     match tokio::time::timeout(
         Duration::from_secs(30),
-        open_replication_session(&client, expected_uuid),
+        open_replication_session(&client, expected_uuid, source_id),
     )
     .await
     {
@@ -273,17 +273,17 @@ pub(super) fn derive_server_id(id: &str) -> u64 {
 /// The position is read on a control connection verified as `expected_uuid`:
 /// it is a fact about that server only.
 pub(super) async fn resolve_binlog_tail(
+    control: &super::mysql_control::ControlPool,
     dsn: &str,
     expected_uuid: &str,
 ) -> MySqlSourceResult<(String, u64)> {
+    use super::mysql_control::Class;
     info!("connecting to MySQL for binlog tail resolution");
 
-    let mut conn = match super::mysql_session::open_control_connection(
-        dsn,
-        expected_uuid,
-        Duration::from_secs(10),
-    )
-    .await
+    let mut conn = match control
+        .connect(Class::Position, dsn, expected_uuid, Class::Position.wait())
+        .await
+        .map_err(super::mysql_control::ControlError::into_session)
     {
         Ok(conn) => {
             info!("connected to MySQL (identity verified)");
@@ -312,7 +312,7 @@ pub(super) async fn resolve_binlog_tail(
         Ok(None) => warn!("could not determine current user"),
         Err(e) => {
             error!("failed to check current user: {}", e);
-            conn.disconnect().await?;
+            drop(conn);
             return Err(MySqlSourceError::BinlogConnect(format!(
                 "failed to check current user: {e}"
             )));
@@ -335,7 +335,7 @@ pub(super) async fn resolve_binlog_tail(
                     "successfully got binlog position: file={}, pos={}",
                     file, pos
                 );
-                conn.disconnect().await?;
+                conn.release().await;
                 return Ok((file, pos));
             } else {
                 warn!("SHOW BINARY LOG STATUS returned incomplete data");
@@ -369,7 +369,7 @@ pub(super) async fn resolve_binlog_tail(
                     "successfully got binlog position via legacy command: file={}, pos={}",
                     file, pos
                 );
-                conn.disconnect().await?;
+                conn.release().await;
                 return Ok((file, pos));
             } else {
                 warn!("SHOW MASTER STATUS returned incomplete data");
@@ -477,7 +477,7 @@ pub(super) async fn resolve_binlog_tail(
             .push(format!("FAIL: Failed to get MySQL version: {}", e)),
     }
 
-    conn.disconnect().await?;
+    conn.release().await;
 
     // Print diagnostics and bail
     error!("could not resolve binlog end position. Diagnostics:");
@@ -529,16 +529,15 @@ pub(crate) fn short_sql(s: &str, max: usize) -> String {
 /// `@@GLOBAL.gtid_executed`, read on a control connection verified as
 /// `expected_uuid`.
 pub(super) async fn fetch_executed_gtid_set(
+    control: &super::mysql_control::ControlPool,
     dsn: &str,
     expected_uuid: &str,
 ) -> SourceResult<Option<String>> {
-    let mut conn = super::mysql_session::open_control_connection(
-        dsn,
-        expected_uuid,
-        Duration::from_secs(10),
-    )
-    .await
-    .map_err(|e| e.into_source_error(expected_uuid))?;
+    use super::mysql_control::Class;
+    let mut conn = control
+        .connect(Class::Position, dsn, expected_uuid, Class::Position.wait())
+        .await
+        .map_err(|e| e.into_source_error(expected_uuid))?;
 
     // Returns NULL if GTID is disabled
     let row: Option<(Option<String>,)> = conn
@@ -546,9 +545,7 @@ pub(super) async fn fetch_executed_gtid_set(
         .await
         .map_err(|e| SourceError::Other(e.into()))?;
 
-    conn.disconnect()
-        .await
-        .map_err(|e| SourceError::Other(e.into()))?;
+    conn.release().await;
 
     // The server's text (it prints newlines), in the one canonical form.
     match row.and_then(|(s,)| s) {

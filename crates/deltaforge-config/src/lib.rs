@@ -572,6 +572,10 @@ pub struct MysqlProofCfg {
     /// How long a window's capture waits for each table's metadata lock (a
     /// schema change in progress holds it) before the attempt fails.
     pub capture_lock_wait_secs: u32,
+    /// The source's control-plane pool: at most this many SQL connections
+    /// for captures, catalog reads, position queries and health checks,
+    /// within the runner-wide `--max-mysql-control-connections`.
+    pub control_connections: usize,
 }
 
 /// `activation_window_ms`: at least 1 (no window would mean a capture per
@@ -589,6 +593,9 @@ pub const MYSQL_PROOF_MAX_SEEK_MS: std::ops::RangeInclusive<u64> =
 /// `capture_lock_wait_secs`: 1 s (MySQL's least `lock_wait_timeout`) to
 /// 300 s (three attempts hold the stream).
 pub const MYSQL_PROOF_LOCK_WAIT_SECS: std::ops::RangeInclusive<u32> = 1..=300;
+/// `control_connections`: 2 (a capture and one other use at once) to 16.
+pub const MYSQL_PROOF_CONTROL_CONNECTIONS: std::ops::RangeInclusive<usize> =
+    2..=16;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -603,6 +610,8 @@ struct MysqlProofCfgRaw {
     max_seek_ms: u64,
     #[serde(default = "MysqlProofCfg::default_lock_wait_secs")]
     capture_lock_wait_secs: u32,
+    #[serde(default = "MysqlProofCfg::default_control_connections")]
+    control_connections: usize,
 }
 
 fn in_range<T: PartialOrd + std::fmt::Display + Copy>(
@@ -651,6 +660,11 @@ impl TryFrom<MysqlProofCfgRaw> for MysqlProofCfg {
                 r.capture_lock_wait_secs,
                 &MYSQL_PROOF_LOCK_WAIT_SECS,
             )?,
+            control_connections: in_range(
+                "control_connections",
+                r.control_connections,
+                &MYSQL_PROOF_CONTROL_CONNECTIONS,
+            )?,
         })
     }
 }
@@ -671,6 +685,9 @@ impl MysqlProofCfg {
     fn default_lock_wait_secs() -> u32 {
         30
     }
+    fn default_control_connections() -> usize {
+        4
+    }
 }
 
 impl Default for MysqlProofCfg {
@@ -681,6 +698,7 @@ impl Default for MysqlProofCfg {
             activation_window_bytes: Self::default_window_bytes(),
             max_seek_ms: Self::default_max_seek_ms(),
             capture_lock_wait_secs: Self::default_lock_wait_secs(),
+            control_connections: Self::default_control_connections(),
         }
     }
 }

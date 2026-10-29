@@ -111,11 +111,15 @@ pub enum ReasonCode {
     /// A MySQL table's registry needs more reads than one plan allows (for
     /// example thousands of lineages): no activation window can take it.
     MysqlTableRegistryTooLarge,
+    /// A MySQL schema capture could not get a control-plane connection
+    /// within its wait: the runner's budget or the source's pool stayed
+    /// full. Nothing of the window or drift check was delivered.
+    MysqlControlPlaneSaturated,
 }
 
 impl ReasonCode {
     /// Every reason (bounded metric label values).
-    pub const ALL: [ReasonCode; 28] = [
+    pub const ALL: [ReasonCode; 29] = [
         Self::PgDifferentCluster,
         Self::PgContinuityUnproven,
         Self::PgFailoverSlotUnavailable,
@@ -144,6 +148,7 @@ impl ReasonCode {
         Self::StateItemTooLarge,
         Self::MysqlTableStateTooLarge,
         Self::MysqlTableRegistryTooLarge,
+        Self::MysqlControlPlaneSaturated,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -182,6 +187,7 @@ impl ReasonCode {
             Self::MysqlTableRegistryTooLarge => {
                 "mysql_table_registry_too_large"
             }
+            Self::MysqlControlPlaneSaturated => "mysql_control_plane_saturated",
         }
     }
 }
@@ -915,6 +921,17 @@ pub fn explain(
             ev.show(K::Table),
             ev.show(K::ReadItems),
             ev.show(K::StateLimit),
+        ),
+        ReasonCode::MysqlControlPlaneSaturated => format!(
+            "{component} could not get a MySQL control-plane connection for \
+             the schema capture of {} table(s) (first {}): the {} bound stayed \
+             full. It stopped before the rows that needed the capture; the \
+             checkpoint stays at {}. Retried by a restart once connections \
+             free up.",
+            ev.show(K::BlockingCount),
+            ev.show(K::Table),
+            ev.show(K::ReasonClass),
+            ev.show(K::CheckpointPosition),
         ),
         ReasonCode::SchemaDriftBlocked => format!(
             "{component} stopped on a schema change of table {} ({}) under \

@@ -7,7 +7,7 @@
 //! - On-demand reload capability
 
 use metrics::counter;
-use mysql_async::{Pool, Row, prelude::Queryable};
+use mysql_async::{Row, prelude::Queryable};
 use schema_registry::SourceSchema;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -101,9 +101,11 @@ impl crate::registry_scope::Resident for Arc<LoadedSchema> {
 pub struct MySqlSchemaLoader {
     /// The run's authoritative DSN (shared with the run).
     dsn: crate::credentials::SharedDsn,
-    /// The pool, with the DSN it connects with (shared by clones); rebuilt
-    /// when the shared DSN changes.
-    pool: Arc<std::sync::Mutex<(crate::credentials::ProtectedDsn, Pool)>>,
+    /// The source's control-plane pool (`mysql_control`), shared with its
+    /// runs: catalog reads are [`Class::Catalog`] connections of it.
+    ///
+    /// [`Class::Catalog`]: super::mysql_control::Class::Catalog
+    control: super::mysql_control::ControlPool,
     /// Cache: (db, table) -> Arc<LoadedSchema>
     cache: ArcSchemaCache,
     /// Schema registry for versioning
@@ -142,10 +144,10 @@ impl MySqlSchemaLoader {
             redact_password(now.expose())
         );
         Self {
-            pool: Arc::new(std::sync::Mutex::new((
-                now.clone(),
-                Pool::new(now.expose()),
-            ))),
+            control: super::mysql_control::source_pool_as_is(
+                tenant,
+                scope.source_id(),
+            ),
             dsn,
             cache: Arc::new(RwLock::new(ScopedCache::default())),
             registry,
@@ -292,25 +294,6 @@ impl MySqlSchemaLoader {
         &self.registry
     }
 
-    /// The pool for the run's DSN as it is now. A rotation replaced the
-    /// shared DSN: the pool is rebuilt, and the old one is closed in the
-    /// background (no lock is held across I/O).
-    fn pool(&self) -> Pool {
-        let current = self.dsn.current();
-        let mut slot = self.pool.lock().expect("pool lock");
-        if !slot.0.same_dsn(&current) {
-            let old =
-                std::mem::replace(&mut slot.1, Pool::new(current.expose()));
-            slot.0 = current;
-            if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                rt.spawn(async move {
-                    old.disconnect().await.ok();
-                });
-            }
-        }
-        slot.1.clone()
-    }
-
     /// Every table `patterns` capture, with its schema resolved (from the
     /// durable registry when known, otherwise from the catalog). Collects
     /// all pages: diagnostics and tests only; a snapshot consumes the pages
@@ -389,7 +372,7 @@ impl MySqlSchemaLoader {
     /// A connection verified to reach the scoped server, for discovery.
     pub(crate) async fn discovery_conn(
         &self,
-    ) -> SourceResult<mysql_async::Conn> {
+    ) -> SourceResult<super::mysql_control::ControlConn> {
         self.verified_conn().await
     }
 
@@ -403,6 +386,7 @@ impl MySqlSchemaLoader {
             .map_err(query_error)?
             .unwrap();
 
+        conn.release().await;
         if row_image.to_lowercase() != "full" {
             warn!(
                 dns=redact_password(self.dsn.current().expose()),
@@ -435,6 +419,7 @@ impl MySqlSchemaLoader {
             .await?;
             tables.extend(discovery.accept(rows)?);
         }
+        conn.release().await;
         Ok(tables)
     }
 
@@ -689,7 +674,9 @@ impl MySqlSchemaLoader {
 
     /// A pooled connection that proved it is the scope's verified server:
     /// catalog facts (which tables exist) come only from that server.
-    async fn verified_conn(&self) -> SourceResult<mysql_async::Conn> {
+    async fn verified_conn(
+        &self,
+    ) -> SourceResult<super::mysql_control::ControlConn> {
         let scope = self.scope.current()?;
         let storage::adapters::LineageDescriptor::Mysql { server_uuid } =
             &scope.lineage().descriptor
@@ -698,11 +685,25 @@ impl MySqlSchemaLoader {
                 details: "MySQL loader scoped to a non-MySQL lineage".into(),
             });
         };
-        let mut conn = self.pool().get_conn().await.map_err(conn_error)?;
-        super::mysql_session::verify_connection(&mut conn, server_uuid)
+        self.catalog_conn(server_uuid).await
+    }
+
+    /// A catalog connection of the source's pool, proven to be
+    /// `server_uuid` (when opened, or as the idle connection opened for it).
+    async fn catalog_conn(
+        &self,
+        server_uuid: &str,
+    ) -> SourceResult<super::mysql_control::ControlConn> {
+        use super::mysql_control::Class;
+        self.control
+            .connect(
+                Class::Catalog,
+                self.dsn.current().expose(),
+                server_uuid,
+                Class::Catalog.wait(),
+            )
             .await
-            .map_err(|e| e.into_source_error(server_uuid))?;
-        Ok(conn)
+            .map_err(|e| e.into_source_error(server_uuid))
     }
 
     /// Fetch schema from INFORMATION_SCHEMA.
@@ -714,13 +715,19 @@ impl MySqlSchemaLoader {
     ) -> SourceResult<Live> {
         self.live_fetches
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut conn = self.pool().get_conn().await.map_err(conn_error)?;
         let storage::adapters::LineageDescriptor::Mysql { server_uuid } =
             &scope.lineage().descriptor
         else {
             return Ok(Live::OtherLineage("a non-MySQL lineage".into()));
         };
-        fetch_table_schema_on(&mut conn, server_uuid, db, table).await
+        let mut conn = self.catalog_conn(server_uuid).await?;
+        let live =
+            fetch_table_schema_on(&mut conn, server_uuid, db, table).await;
+        // Returned for reuse only after a clean read.
+        if live.is_ok() {
+            conn.release().await;
+        }
+        live
     }
 
     /// Get column names only (for backward compatibility with event handling).
@@ -801,10 +808,10 @@ impl MySqlSchemaLoader {
             );
         }
         Self {
-            pool: Arc::new(std::sync::Mutex::new((
-                "mysql://localhost/ignored".into(),
-                Pool::new("mysql://localhost/ignored"),
-            ))),
+            control: super::mysql_control::source_pool_as_is(
+                "test",
+                scope.source_id(),
+            ),
             dsn: "mysql://localhost/ignored".into(),
             cache: Arc::new(RwLock::new(scoped)),
             registry: storage::DurableSchemaRegistry::for_testing(),
@@ -857,12 +864,6 @@ pub(crate) async fn discovery_page(
         None => conn.query(&sql).await.map_err(query_error)?,
     };
     Ok(rows)
-}
-
-fn conn_error(e: mysql_async::Error) -> SourceError {
-    SourceError::Connect {
-        details: format!("mysql connection: {}", e).into(),
-    }
 }
 
 fn query_error(e: mysql_async::Error) -> SourceError {

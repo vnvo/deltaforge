@@ -563,7 +563,9 @@ mod tests {
                 timeout_secs: 30,
                 ..Default::default()
             };
-            let mut s = open_replication_session(&client, uuid).await.unwrap();
+            let mut s = open_replication_session(&client, uuid, "test")
+                .await
+                .unwrap();
             loop {
                 let (_, data) = s.read().await.unwrap();
                 if let EventData::TableMap(tm) = data {

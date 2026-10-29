@@ -149,6 +149,29 @@ pub(crate) async fn prove(
             Err(ProofError::OtherServer(found)) => {
                 return Err(other_server(&server_uuid, &found));
             }
+            // Saturation never defers: a pending DDL's next rows have no
+            // lazy proof. The source stops before the DDL is emitted or
+            // checkpointed, nothing of the proof written; the restart
+            // replays the DDL and proves it again.
+            Err(ProofError::Saturated { scope, .. }) => {
+                let before_ddl = MySqlCheckpoint {
+                    file: ctx.last_file.clone(),
+                    pos: ctx.last_event_start,
+                    gtid_set: ctx.gtid_text(),
+                    lineage: Some(lineage.clone()),
+                    snapshot_completed: None,
+                    snapshot_chain: None,
+                };
+                return Err(
+                    crate::incident_drafts::mysql_control_plane_saturated(
+                        &ctx.source_id,
+                        "forward proof",
+                        &[(p.db.clone(), p.table.clone())],
+                        scope,
+                        &before_ddl,
+                    ),
+                );
+            }
             Err(e) => {
                 warn!(source_id = %ctx.source_id, db = %p.db, table = %p.table, error = ?e, "forward proof: no capture; the DDL stays pending");
                 trace_proof(
@@ -550,6 +573,157 @@ mod tests {
             let mut r = run(&st, port, db, &[&format!("{db}.t")]).await;
             ddl_event(&mut r.rx, "ADD COLUMN w").await;
             assert_eq!(records(&st, db, "t").await, before);
+            stop(r.handle).await;
+        }
+
+        /// A saturated control plane for the next capture: a runner budget
+        /// whose only ordinary permit another source holds (released by
+        /// dropping what is returned); the capture waits at most 1 s.
+        async fn starve_next_capture(
+            dsn: &str,
+        ) -> crate::mysql::mysql_control::ControlConn {
+            use crate::mysql::mysql_control::{Budget, Class, ControlPool};
+            let mut c = mysql_async::Conn::from_url(dsn).await.unwrap();
+            let uuid: String = c
+                .query_first("SELECT @@GLOBAL.server_uuid")
+                .await
+                .unwrap()
+                .unwrap();
+            c.disconnect().await.ok();
+            let budget: &'static Budget = Box::leak(Box::new(Budget::new(
+                crate::mysql::mysql_binlog_scan::KILL_RESERVE + 1,
+            )));
+            let held = ControlPool::detached(budget, "other", 2)
+                .connect(Class::Catalog, dsn, &uuid, Duration::from_secs(5))
+                .await
+                .unwrap();
+            *crate::mysql::mysql_binlog_scan::STARVE_NEXT.lock().unwrap() =
+                Some((
+                    ControlPool::detached(budget, "starved", 2),
+                    Duration::from_secs(1),
+                ));
+            held
+        }
+
+        /// A saturated control plane at a DDL's forward proof is the
+        /// `mysql_control_plane_saturated` incident (AutoRetry), never a
+        /// deferral: the source stops before the DDL is emitted or
+        /// checkpointed, reads no later row, and keeps no proof of it (no
+        /// binding, no new version). The restart replays the DDL, binds it
+        /// and delivers the row after it exactly once. The incident carries
+        /// no DSN or credential.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_saturated_forward_proof_stops_and_the_restart_binds_the_ddl()
+        {
+            let port = server(true).await;
+            let db = "fwd_saturated";
+            prepare(port, db).await;
+            let st = state(Arc::new(MemoryStorageBackend::new())).await;
+            let t = format!("{db}.t");
+            // A committed position before the DDL.
+            let r = run(&st, port, db, &[&t]).await;
+            stop(r.handle).await;
+            let committed = st.ckpt.get_raw(db).await.unwrap();
+            assert!(committed.is_some());
+            let versions = || {
+                let key = st.scope.current().unwrap().key(db, "t");
+                let reg = st.registry.clone();
+                async move {
+                    crate::mysql::mysql_activation::tests_support::history(
+                        &reg, &key,
+                    )
+                    .await
+                    .len()
+                }
+            };
+            let registered = versions().await;
+            let deferrals = crate::mysql::mysql_control::saturation_deferrals();
+
+            let mut r = run(&st, port, db, &[&t]).await;
+            let held = starve_next_capture(&dsn(port)).await;
+            sql(
+                port,
+                &[
+                    &format!("ALTER TABLE {t} ADD COLUMN w INT"),
+                    &format!("INSERT INTO {t} VALUES (1, 1, 7)"),
+                ],
+            )
+            .await;
+            let ended =
+                tokio::time::timeout(Duration::from_secs(60), r.handle.join)
+                    .await
+                    .expect("stops")
+                    .expect("task");
+            drop(held);
+            let err = ended.expect_err("the saturated proof stops the source");
+            assert_eq!(
+                err.draft().map(|d| d.reason_code),
+                Some(
+                    deltaforge_core::incident::ReasonCode::MysqlControlPlaneSaturated
+                ),
+                "{err}"
+            );
+            for text in [format!("{err}"), format!("{err:?}")] {
+                assert!(
+                    !text.contains("root:") && !text.contains(":pw@"),
+                    "{text}"
+                );
+            }
+            let mut emitted = Vec::new();
+            while let Ok(item) = r.rx.try_recv() {
+                if let SourceItem::Event(e) = item {
+                    emitted.push(e);
+                }
+            }
+            assert!(
+                emitted.iter().all(|e| e.source.table != "t"),
+                "neither the DDL nor the row after it: {emitted:?}"
+            );
+            assert_eq!(st.ckpt.get_raw(db).await.unwrap(), committed);
+            let recs = records(&st, db, "t").await;
+            for d in ddls(&recs) {
+                assert_eq!(bound(&st, db, "t", &recs, d).await, None);
+            }
+            assert_eq!(versions().await, registered, "no version from it");
+            assert_eq!(
+                crate::mysql::mysql_control::saturation_deferrals(),
+                deferrals,
+                "not a deferral"
+            );
+
+            // The restart: the DDL replays and is bound; the row after it
+            // is delivered once, decoded with the new column.
+            let mut r = run(&st, port, db, &[&t]).await;
+            ddl_event(&mut r.rx, "ADD COLUMN w").await;
+            let recs = records(&st, db, "t").await;
+            let d = ddls(&recs);
+            assert_eq!(d.len(), 1, "{recs:?}");
+            assert!(bound(&st, db, "t", &recs, d[0]).await.is_some());
+            let seven = deltaforge_core::canonical::fixture::value(
+                &serde_json::json!(7),
+            );
+            let mut rows = 0;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while let Some(left) =
+                deadline.checked_duration_since(Instant::now())
+            {
+                match tokio::time::timeout(left, r.rx.recv()).await {
+                    Ok(Some(SourceItem::Event(e)))
+                        if e.ddl.is_none() && e.source.table == "t" =>
+                    {
+                        assert_eq!(
+                            e.after.as_ref().unwrap().get("w"),
+                            Some(&seven),
+                            "decoded with the new column"
+                        );
+                        rows += 1;
+                    }
+                    Ok(Some(_)) => {}
+                    _ => break,
+                }
+            }
+            assert_eq!(rows, 1, "the row after the DDL, exactly once");
             stop(r.handle).await;
         }
 
