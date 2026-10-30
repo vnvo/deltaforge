@@ -137,6 +137,25 @@ impl Prefix {
         Ok(true)
     }
 
+    /// Whether `cost` fits an empty plan: `Err` when no plan can take the
+    /// table alone (the per-table limit, or any plan cap).
+    pub(crate) fn fits_alone(caps: Caps, cost: Cost) -> Result<(), Invalid> {
+        let mut alone = Self::new(caps);
+        match alone.offer(cost)? {
+            true => Ok(()),
+            false if cost.bytes > caps.plan.bytes => {
+                Err(Invalid::StateTooLarge {
+                    bytes: cost.bytes,
+                    limit: caps.plan.bytes,
+                })
+            }
+            false => Err(Invalid::RegistryTooLarge {
+                read_items: cost.read_items,
+                limit: caps.plan.read_items,
+            }),
+        }
+    }
+
     /// The tables in the prefix.
     #[cfg(test)]
     pub(crate) fn tables(&self) -> usize {
@@ -180,14 +199,41 @@ pub(crate) fn table_cost(
     // and one per other lineage in the second; preconditions: 8, one per
     // other lineage and one per barrier stream; 2 capture-id checks.
     let barrier_heads = timeline.streams.len() as u64;
+    Ok(cost_of(
+        schema_bytes,
+        timeline_bytes,
+        barrier_heads,
+        other_lineages,
+        key_bytes,
+    ))
+}
+
+/// One table's cost in a forward proof's batch: its registration and its
+/// binding, counted as a window counts a table with an empty timeline (the
+/// proof reads no timeline and checks no barrier head).
+pub(crate) fn proof_table_cost(
+    schema_bytes: u64,
+    other_lineages: u64,
+    key_bytes: u64,
+) -> Cost {
+    cost_of(schema_bytes, 0, 0, other_lineages, key_bytes)
+}
+
+fn cost_of(
+    schema_bytes: u64,
+    timeline_bytes: u64,
+    barrier_heads: u64,
+    other_lineages: u64,
+    key_bytes: u64,
+) -> Cost {
     let read_items =
         7 + 8 + other_lineages + 8 + other_lineages + barrier_heads + 2;
-    Ok(Cost {
+    Cost {
         bytes: 5 * schema_bytes + timeline_bytes + TABLE_WRITE_OVERHEAD,
         read_items,
         read_key_bytes: read_items * (key_bytes + 64),
         write_ops: TABLE_WRITE_OPS,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -247,6 +293,31 @@ mod tests {
         let mut p = Prefix::new(caps());
         assert_eq!(p.offer(cost(100, 50, 7)), Ok(true));
         assert_eq!(p.total(), cost(100, 50, 7));
+    }
+
+    /// A table fits alone only within the per-table limit and every plan
+    /// cap; past a plan cap it is invalid even under the per-table limit.
+    #[test]
+    fn a_table_fits_alone_only_within_every_cap() {
+        assert_eq!(Prefix::fits_alone(caps(), cost(100, 50, 7)), Ok(()));
+        let wide = Caps {
+            table_bytes: 1000,
+            ..caps()
+        };
+        assert_eq!(
+            Prefix::fits_alone(wide, cost(101, 1, 1)),
+            Err(Invalid::StateTooLarge {
+                bytes: 101,
+                limit: 100
+            })
+        );
+        assert_eq!(
+            Prefix::fits_alone(caps(), cost(1, 51, 1)),
+            Err(Invalid::RegistryTooLarge {
+                read_items: 51,
+                limit: 50
+            })
+        );
     }
 
     /// A table over the per-table limit or the read-item cap is invalid

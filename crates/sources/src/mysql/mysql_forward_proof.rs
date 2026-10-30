@@ -13,16 +13,21 @@
 //! 3. one complete scan of (D, S] in which nothing affects the table: no DDL
 //!    attributed to it, no database barrier for its database, no lineage
 //!    barrier;
-//! 4. only then: the captured shape is registered through the normal
-//!    registry path, and `Observed { binds: ddl_id, proof }` is appended at D
-//!    with the exact capture identity of the pending `ddl` record.
+//! 4. only then: the captured shape's registration and
+//!    `Observed { binds: ddl_id, proof }` at D commit in one atomic batch
+//!    (`docs/design/mysql-ddl-proof-transactions.md`, C1). Every table is
+//!    wholly in one batch; a multi-table DDL whose tables do not fit one is
+//!    committed in several, in order.
 //!
-//! Any failure leaves the DDL pending (rows after it stay unproven); a
-//! connection that reached another server stops the source. A DROP gets no
-//! forward proof. Replay: a binding already present for the `ddl` record is
-//! the durable evidence, so nothing is captured or appended again
-//! (byte-identical). A crash after registration but before the binding
-//! repeats the proof; registration deduplicates the shape.
+//! The pending `ddl` record is written before the capture, on its own. Any
+//! failure leaves the DDL pending (rows after it stay unproven), with no
+//! registration or binding from an uncommitted batch and no checkpoint
+//! advance; a connection that reached another server stops the source. A
+//! DROP gets no forward proof. Replay: a binding already present for the
+//! `ddl` record is the durable evidence only once `resolve_binding`
+//! validates it; nothing is then captured or appended again. A crash before
+//! a batch commits leaves its tables pending, and the restart proves them
+//! again.
 
 use deltaforge_core::{CheckpointOrder, SourceError, SourceResult};
 use tracing::{info, warn};
@@ -33,8 +38,16 @@ use super::mysql_binlog_scan::{
     CLASSIFIER_VERSION, ProofError, ProofKind, ScanTag, capture, covers,
     observe_capture, trace_proof,
 };
-use super::{MySqlCheckpoint, RunCtx};
-use crate::durable_checkpoint::{mysql_checkpoint_position, order_positions};
+use super::mysql_binlog_scan::{Captured, ScanReport};
+use super::mysql_window_budget::{Caps, Cost, Prefix, proof_table_cost};
+use super::{MySqlCheckpoint, RunCtx, WindowInvalid};
+use crate::durable_checkpoint::{
+    WmPos, mysql_checkpoint_position, order_positions,
+};
+use crate::registry_scope::RegistryScope;
+use schema_registry::SourceSchema;
+use storage::DurableSchemaRegistry;
+use storage::adapters::{RegistrationPlanning, RegistrationRequest, SchemaKey};
 
 /// A tracked table whose shape a DDL left pending.
 pub(crate) struct Pending {
@@ -154,21 +167,13 @@ pub(crate) async fn prove(
             // checkpointed, nothing of the proof written; the restart
             // replays the DDL and proves it again.
             Err(ProofError::Saturated { scope, .. }) => {
-                let before_ddl = MySqlCheckpoint {
-                    file: ctx.last_file.clone(),
-                    pos: ctx.last_event_start,
-                    gtid_set: ctx.gtid_text(),
-                    lineage: Some(lineage.clone()),
-                    snapshot_completed: None,
-                    snapshot_chain: None,
-                };
                 return Err(
                     crate::incident_drafts::mysql_control_plane_saturated(
                         &ctx.source_id,
                         "forward proof",
                         &[(p.db.clone(), p.table.clone())],
                         scope,
-                        &before_ddl,
+                        &before_ddl(ctx, &lineage),
                     ),
                 );
             }
@@ -243,10 +248,10 @@ pub(crate) async fn prove(
         }
     };
 
-    // 4. Register, then bind.
+    // 4. Register and bind: the tables the scan proves, in atomic batches.
     let checkpoint =
         serde_json::to_vec(&d_cp).map_err(|e| SourceError::Other(e.into()))?;
-    let mut written = 0;
+    let mut proven = Vec::with_capacity(captured.len());
     for (p, cap) in captured {
         if !covers(&cap, &d, &s) {
             warn!(source_id = %ctx.source_id, db = %p.db, table = %p.table, "forward proof: the scan does not cover the capture interval; the DDL stays pending");
@@ -278,41 +283,368 @@ pub(crate) async fn prove(
             );
             continue;
         }
-        let (version, schema_hash) = ctx
-            .schema
-            .register_captured(&p.db, &p.table, &cap.schema, &checkpoint)
-            .await?;
-        let key = scope.key(&p.db, &p.table);
-        mysql_activation::record_forward_proof(
-            &ctx.registry_backend,
-            ctx.schema.registry(),
-            &key,
-            &p.ddl_id,
-            d.clone(),
-            version,
-            ForwardProof {
-                classifier_version: CLASSIFIER_VERSION.to_string(),
-                to: s.clone(),
-                scan_digest: report.digest.clone(),
-                schema_hash,
-            },
-        )
-        .await
-        .map_err(|e| {
-            SourceError::Other(e.context("persist a forward-proof binding"))
-        })?;
-        trace_proof(
-            &tag,
+        proven.push((p, cap));
+    }
+    let bound = Bound {
+        d: &d,
+        s: &s,
+        report: &report,
+        checkpoint: &checkpoint,
+        lineage: &lineage,
+    };
+    let written = commit_proofs(ctx, &scope, &tag, &bound, proven).await?;
+    info!(source_id = %ctx.source_id, bindings = written, "forward proof after DDL");
+    Ok(written)
+}
+
+/// What every binding of one forward proof shares.
+struct Bound<'a> {
+    d: &'a WmPos,
+    s: &'a WmPos,
+    report: &'a ScanReport,
+    /// The registration checkpoint: D.
+    checkpoint: &'a [u8],
+    lineage: &'a str,
+}
+
+/// The checkpoint before the DDL: where a stopped proof leaves the source.
+fn before_ddl(ctx: &RunCtx, lineage: &str) -> MySqlCheckpoint {
+    MySqlCheckpoint {
+        file: ctx.last_file.clone(),
+        pos: ctx.last_event_start,
+        gtid_set: ctx.gtid_text(),
+        lineage: Some(lineage.to_string()),
+        snapshot_completed: None,
+        snapshot_chain: None,
+    }
+}
+
+/// One proven table's request and cost, from its capture.
+fn proof_request(
+    key: &SchemaKey,
+    cap: &Captured,
+    checkpoint: &[u8],
+    other_lineages: u64,
+) -> SourceResult<(RegistrationRequest, Cost)> {
+    let schema_json = serde_json::to_value(&cap.schema)
+        .map_err(|e| SourceError::Other(e.into()))?;
+    let schema_bytes = serde_json::to_vec(&schema_json)
+        .map_err(|e| SourceError::Other(e.into()))?
+        .len() as u64;
+    let cost = proof_table_cost(
+        schema_bytes,
+        other_lineages,
+        key.backend_key().len() as u64,
+    );
+    Ok((
+        RegistrationRequest {
+            key: key.clone(),
+            hash: cap.schema.fingerprint().to_string(),
+            schema_json,
+            checkpoint: Some(checkpoint.to_vec()),
+        },
+        cost,
+    ))
+}
+
+/// The tables of a batch, in order, cut where the next one would take the
+/// batch over a cap; `Err` names a table no batch can take alone.
+fn group(
+    caps: Caps,
+    costs: &[(usize, Cost)],
+) -> Result<Vec<Vec<usize>>, (usize, WindowInvalid)> {
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+    let mut prefix = Prefix::new(caps);
+    for (i, cost) in costs {
+        Prefix::fits_alone(caps, *cost).map_err(|e| (*i, e))?;
+        if !prefix.offer(*cost).map_err(|e| (*i, e))? {
+            groups.push(std::mem::take(&mut current));
+            prefix = Prefix::new(caps);
+            prefix.offer(*cost).map_err(|e| (*i, e))?;
+        }
+        current.push(*i);
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    Ok(groups)
+}
+
+/// Commit the registrations and bindings of the `proven` tables
+/// (`docs/design/mysql-ddl-proof-transactions.md`, C1): every table wholly
+/// in one atomic batch, its registration and its binding together. The
+/// preflight sizes every table before the first commit, keeping one cost
+/// per table; a table no batch can take alone stops the source with
+/// nothing of the proof written. A batch's plan exists only while it is
+/// committed. A conflict plans the batch again from fresh reads and sizes
+/// it again (bounded); a batch that no longer fits is split. The pending
+/// `ddl` records stay as written; a stop leaves every table not yet
+/// committed pending. Returns how many bindings were committed.
+async fn commit_proofs(
+    ctx: &RunCtx,
+    scope: &RegistryScope,
+    tag: &ScanTag<'_>,
+    bound: &Bound<'_>,
+    proven: Vec<(Pending, Captured)>,
+) -> SourceResult<usize> {
+    use super::mysql_activation::{
+        ACTIVATION_NS, Kind, Record, encode_record, forward_capture_id,
+        table_stream,
+    };
+    use super::mysql_activation_window::{
+        BATCH_CONFLICT_RETRIES, BATCH_STORAGE_RETRIES,
+    };
+    use storage::{AtomicBatch, BatchOp, CommitResult, commit_atomic_counted};
+
+    if proven.is_empty() {
+        return Ok(0);
+    }
+    // One store holds the registry and the activation records, or no batch
+    // can commit them together.
+    if !std::sync::Arc::ptr_eq(
+        ctx.schema.registry().backend(),
+        &ctx.registry_backend,
+    ) {
+        return Err(SourceError::Other(anyhow::anyhow!(
+            "the forward proof needs the schema registry and the activation \
+             records in one state store"
+        )));
+    }
+    let lctn = ctx.lower_case_table_names;
+    let keys: Vec<SchemaKey> = proven
+        .iter()
+        .map(|(p, _)| scope.key(&p.db, &p.table))
+        .collect();
+    let stopped = |i: usize, invalid: WindowInvalid| {
+        let (p, _) = &proven[i];
+        crate::incident_drafts::mysql_table_too_large(
+            &ctx.source_id,
             &p.db,
             &p.table,
-            Some(&cap),
-            Some(&report),
-            lctn,
-            "proven",
-        );
-        written += 1;
+            &invalid,
+            &before_ddl(ctx, bound.lineage),
+        )
+    };
+    let too_large = |i: usize, too: &storage::StateItemTooLarge| {
+        let (p, _) = &proven[i];
+        crate::incident_drafts::state_item_too_large(
+            &ctx.source_id,
+            &p.db,
+            &p.table,
+            too,
+            &before_ddl(ctx, bound.lineage),
+        )
+    };
+    let other_lineages = || async {
+        storage::adapters::source_lineage::load(
+            &ctx.registry_backend,
+            &ctx.tenant,
+            &ctx.source_id,
+        )
+        .await
+        .map(|r| r.map_or(0, |r| r.prior_lineage_hashes.len() as u64))
+        .map_err(SourceError::Other)
+    };
+    // The costs of the tables in `of`, from their captures; an entry over
+    // the store's item limit stops the source here.
+    let costs = |of: &[usize],
+                 others: u64|
+     -> SourceResult<Vec<(usize, Cost)>> {
+        let mut out = Vec::with_capacity(of.len());
+        for &i in of {
+            let (req, cost) = proof_request(
+                &keys[i],
+                &proven[i].1,
+                bound.checkpoint,
+                others,
+            )?;
+            let size = DurableSchemaRegistry::registration_entry_bound(&req)
+                .map_err(SourceError::Other)?;
+            if size > storage::MAX_STATE_ITEM_BYTES {
+                return Err(too_large(
+                    i,
+                    &storage::StateItemTooLarge {
+                        size,
+                        key_digest: storage::state_key_digest(
+                            storage::adapters::schema_registry::V1_NS,
+                            &keys[i].backend_key(),
+                        ),
+                    },
+                ));
+            }
+            out.push((i, cost));
+        }
+        Ok(out)
+    };
+
+    // Preflight: every table sized, one cost each, before any commit.
+    let caps = Caps::current();
+    let all: Vec<usize> = (0..proven.len()).collect();
+    let mut queue: std::collections::VecDeque<Vec<usize>> =
+        group(caps, &costs(&all, other_lineages().await?)?)
+            .map_err(|(i, e)| stopped(i, e))?
+            .into();
+
+    let registry = ctx.schema.registry();
+    let mut written = 0;
+    let mut applies = 0;
+    while let Some(mut batch_tables) = queue.pop_front() {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            if attempt > 1 {
+                // Sized again from fresh reads: a batch that no longer fits
+                // is split, its rest committed after it.
+                let mut regrouped = group(
+                    caps,
+                    &costs(&batch_tables, other_lineages().await?)?,
+                )
+                .map_err(|(i, e)| stopped(i, e))?;
+                batch_tables = regrouped.remove(0);
+                for rest in regrouped.into_iter().rev() {
+                    queue.push_front(rest);
+                }
+            }
+            let mut reqs = Vec::with_capacity(batch_tables.len());
+            for &i in &batch_tables {
+                reqs.push(
+                    proof_request(&keys[i], &proven[i].1, bound.checkpoint, 0)?
+                        .0,
+                );
+            }
+            let (preconditions, regs) = match registry
+                .plan_registrations(&reqs, chrono::Utc::now())
+                .await
+                .map_err(|e| {
+                    SourceError::Other(
+                        e.context("plan the forward proof's registrations"),
+                    )
+                })? {
+                RegistrationPlanning::Planned {
+                    preconditions,
+                    registrations,
+                } => (preconditions, registrations),
+                RegistrationPlanning::NeedsRepair(broken) => {
+                    for k in &broken {
+                        registry
+                            .repair_key(k)
+                            .await
+                            .map_err(SourceError::Other)?;
+                    }
+                    if attempt > BATCH_CONFLICT_RETRIES {
+                        return Err(SourceError::Other(anyhow::anyhow!(
+                            "the forward proof's registrations still need repair \
+                             after {attempt} attempts; the DDL stays pending"
+                        )));
+                    }
+                    continue;
+                }
+            };
+            let mut batch = AtomicBatch {
+                preconditions,
+                ops: Vec::new(),
+            };
+            // Each table's registration entry op, and the table of every op
+            // (to name the table of an item the store refuses).
+            let mut entry_ops = Vec::with_capacity(regs.len());
+            let mut op_table = Vec::new();
+            for (&i, reg) in batch_tables.iter().zip(&regs) {
+                let (p, _) = &proven[i];
+                let key = &keys[i];
+                let base = batch.push_group(reg.ops.clone());
+                entry_ops.push(reg.entry_op.map(|e| base + e));
+                let record = Record::new(
+                    bound.d.clone(),
+                    Kind::Observed {
+                        version: reg.version,
+                        binds: Some(p.ddl_id.clone()),
+                        proof: Some(ForwardProof {
+                            classifier_version: CLASSIFIER_VERSION.to_string(),
+                            to: bound.s.clone(),
+                            scan_digest: bound.report.digest.clone(),
+                            schema_hash: reg.hash.clone(),
+                        }),
+                        full: None,
+                    },
+                );
+                let stream = table_stream(key);
+                let capture_id =
+                    forward_capture_id(&key.lineage_hash, &stream, &record)
+                        .map_err(SourceError::Other)?;
+                batch.ops.push(BatchOp::LogAppendIdempotent {
+                    ns: ACTIVATION_NS.into(),
+                    key: stream,
+                    capture_id,
+                    value: encode_record(&record)
+                        .map_err(SourceError::Other)?,
+                });
+                op_table.resize(batch.ops.len(), i);
+            }
+            let committed = match commit_atomic_counted(
+                ctx.registry_backend.as_ref(),
+                &batch,
+                BATCH_STORAGE_RETRIES,
+                &mut applies,
+            )
+            .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    if let Some(too) = e.chain().find_map(|c| {
+                        c.downcast_ref::<storage::StateItemTooLarge>()
+                    }) && let Some(i) =
+                        super::mysql_activation_window::refused_table(
+                            &batch,
+                            &op_table,
+                            &too.key_digest,
+                        )
+                    {
+                        return Err(too_large(i, too));
+                    }
+                    return Err(SourceError::Other(
+                        e.context("persist a forward-proof binding"),
+                    ));
+                }
+            };
+            let seqs = match committed {
+                CommitResult::Committed(seqs) => seqs,
+                CommitResult::Conflict(why) => {
+                    if attempt > BATCH_CONFLICT_RETRIES {
+                        return Err(SourceError::Other(anyhow::anyhow!(
+                            "the forward proof's batch conflicted {attempt} times \
+                             (last: {why}); the DDL stays pending"
+                        )));
+                    }
+                    warn!(source_id = %ctx.source_id, attempt, why, "forward proof: the batch conflicted; planning again");
+                    continue;
+                }
+            };
+            // Committed: the registry's cache learns it, and only now.
+            for (reg, op) in regs.iter().zip(&entry_ops) {
+                if let Some(op) = op {
+                    registry.admit_committed(
+                        reg,
+                        seqs[*op].expect("a committed log write"),
+                    );
+                }
+            }
+            for &i in &batch_tables {
+                let (p, cap) = &proven[i];
+                trace_proof(
+                    tag,
+                    &p.db,
+                    &p.table,
+                    Some(cap),
+                    Some(bound.report),
+                    lctn,
+                    "proven",
+                );
+            }
+            written += batch_tables.len();
+            break;
+        }
     }
-    info!(source_id = %ctx.source_id, bindings = written, "forward proof after DDL");
     Ok(written)
 }
 
@@ -486,6 +818,30 @@ mod tests {
 
         fn ddls(recs: &[Stored]) -> Vec<&Stored> {
             recs.iter().filter(|s| s.record.kind == Kind::Ddl).collect()
+        }
+
+        /// The number of registered versions of `db.table`.
+        async fn versions(st: &State, db: &str, table: &str) -> usize {
+            let key = st.scope.current().unwrap().key(db, table);
+            crate::mysql::mysql_activation::tests_support::history(
+                &st.registry,
+                &key,
+            )
+            .await
+            .len()
+        }
+
+        /// The store writes made, one per call (`batch`: one atomic batch),
+        /// to the registry and activation namespaces.
+        fn schema_writes(fault: &FaultBackend) -> Vec<String> {
+            fault
+                .write_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|ns| ns.starts_with("schemas") || *ns == "batch")
+                .cloned()
+                .collect()
         }
 
         /// The validated forward binding of `ddl` (panics on invalid
@@ -739,10 +1095,12 @@ mod tests {
             a_live_ddl_is_bound(false).await;
         }
 
+        /// The registration and the binding are one atomic batch: a crash at
+        /// the binding's write leaves neither (the DDL pending, no version
+        /// from it), and the restart proves it again with one new version.
         #[tokio::test]
         #[ignore = "requires docker"]
-        async fn a_crash_between_registration_and_binding_finishes_the_binding()
-        {
+        async fn a_crash_at_the_binding_leaves_no_registration() {
             let port = server(true).await;
             let db = "fwd_crash";
             prepare(port, db).await;
@@ -750,20 +1108,11 @@ mod tests {
             let st = state(fault.clone()).await;
             let r = run(&st, port, db, &[&format!("{db}.t")]).await;
             stop(r.handle).await;
-            let key_versions = |st: &State| {
-                let key = st.scope.current().unwrap().key(db, "t");
-                let reg = st.registry.clone();
-                async move {
-                    crate::mysql::mysql_activation::tests_support::history(
-                        &reg, &key,
-                    )
-                    .await
-                    .len()
-                }
-            };
+            let before = versions(&st, db, "t").await;
             let r = run(&st, port, db, &[&format!("{db}.t")]).await;
-            // The DDL's activation writes: its `ddl` record, then the binding.
-            *fault.fail_after_writes_to.lock().unwrap() =
+            // The DDL's activation writes: its `ddl` record, then the
+            // binding, where the process crashes.
+            *fault.crash_after_writes_to.lock().unwrap() =
                 Some((crate::mysql::mysql_activation::ACTIVATION_NS.into(), 1));
             sql(port, &[&format!("ALTER TABLE {db}.t ADD COLUMN z INT")]).await;
             let res =
@@ -771,26 +1120,26 @@ mod tests {
                     .await
                     .expect("stops")
                     .expect("task");
-            assert!(res.is_err(), "the failed binding stops the source");
+            assert!(res.is_err(), "the failed batch stops the source");
             let recs = records(&st, db, "t").await;
             let d = ddls(&recs);
-            assert_eq!(d.len(), 1);
+            assert_eq!(d.len(), 1, "the pending record stays");
+            assert_eq!(bound(&st, db, "t", &recs, d[0]).await, None);
             assert_eq!(
-                bound(&st, db, "t", &recs, d[0]).await,
-                None,
-                "registered but not bound"
+                versions(&st, db, "t").await,
+                before,
+                "no registration without its binding"
             );
-            let registered = key_versions(&st).await;
 
-            // Restart: the DDL replays, the proof repeats, registration
-            // deduplicates, the same DDL gets its binding.
+            // Restart: the DDL replays, is proven and bound once.
+            *fault.crash_after_writes_to.lock().unwrap() = None;
             let mut r = run(&st, port, db, &[&format!("{db}.t")]).await;
             ddl_event(&mut r.rx, "ADD COLUMN z").await;
             let recs = records(&st, db, "t").await;
             let d = ddls(&recs);
             assert_eq!(d.len(), 1);
             assert!(bound(&st, db, "t", &recs, d[0]).await.is_some());
-            assert_eq!(key_versions(&st).await, registered, "no new version");
+            assert_eq!(versions(&st, db, "t").await, before + 1);
             stop(r.handle).await;
         }
 
@@ -949,6 +1298,286 @@ mod tests {
                 }
             }
             assert_eq!(records(&st, db, "t").await, tampered);
+        }
+
+        /// A forward proof writes two store transactions: the pending `ddl`
+        /// record, then one atomic batch holding the registration and the
+        /// binding.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_forward_proof_is_two_write_transactions() {
+            let port = server(true).await;
+            let db = "fwd_txns";
+            prepare(port, db).await;
+            let fault = Arc::new(FaultBackend::new());
+            let st = state(fault.clone()).await;
+            let t = format!("{db}.t");
+            let r = run(&st, port, db, &[&t]).await;
+            stop(r.handle).await;
+            let mut r = run(&st, port, db, &[&t]).await;
+            fault.write_calls.lock().unwrap().clear();
+            sql(port, &[&format!("ALTER TABLE {t} ADD COLUMN w INT")]).await;
+            ddl_event(&mut r.rx, "ADD COLUMN w").await;
+            let writes = schema_writes(&fault);
+            stop(r.handle).await;
+            let recs = records(&st, db, "t").await;
+            let d = ddls(&recs);
+            assert_eq!(d.len(), 1, "{recs:?}");
+            assert!(bound(&st, db, "t", &recs, d[0]).await.is_some());
+            assert_eq!(
+                writes,
+                [crate::mysql::mysql_activation::ACTIVATION_NS, "batch"],
+                "the pending record, then one batch"
+            );
+        }
+
+        /// The tables of a multi-table DDL that do not fit one batch are
+        /// committed in several, each table wholly in one. A crash between
+        /// them leaves the first bound and the second pending with no
+        /// version from the proof; the restart validates the first binding
+        /// and proves the second.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_multi_table_ddl_over_the_budget_commits_per_table_batches() {
+            let port = server(true).await;
+            let db = "fwd_split";
+            sql(
+                port,
+                &[
+                    &format!("DROP DATABASE IF EXISTS {db}"),
+                    &format!("CREATE DATABASE {db}"),
+                    &format!("CREATE TABLE {db}.a (id INT PRIMARY KEY)"),
+                    &format!("CREATE TABLE {db}.c (id INT PRIMARY KEY)"),
+                ],
+            )
+            .await;
+            let fault = Arc::new(FaultBackend::new());
+            let st = state(fault.clone()).await;
+            let tracked = [format!("{db}.b"), format!("{db}.d")];
+            let tracked: Vec<&str> =
+                tracked.iter().map(String::as_str).collect();
+            let r = run(&st, port, db, &tracked).await;
+            stop(r.handle).await;
+            // One table per batch: a table's plan reads fit, two do not.
+            crate::stream_probe::set_window_caps(Some((
+                crate::mysql::mysql_window_budget::PLAN_BYTES,
+                40,
+                crate::mysql::mysql_window_budget::TABLE_BYTES,
+            )));
+            let r = run(&st, port, db, &tracked).await;
+            fault.write_calls.lock().unwrap().clear();
+            // The `ddl` records of both names of both tables and the first
+            // batch's binding, then a crash at the second batch.
+            *fault.crash_after_writes_to.lock().unwrap() =
+                Some((crate::mysql::mysql_activation::ACTIVATION_NS.into(), 5));
+            sql(
+                port,
+                &[&format!("RENAME TABLE {db}.a TO {db}.b, {db}.c TO {db}.d")],
+            )
+            .await;
+            let res =
+                tokio::time::timeout(Duration::from_secs(60), r.handle.join)
+                    .await
+                    .expect("stops")
+                    .expect("task");
+            let writes = schema_writes(&fault);
+            assert!(res.is_err(), "the failed batch stops the source");
+            let activation = crate::mysql::mysql_activation::ACTIVATION_NS;
+            assert_eq!(
+                writes,
+                [activation, activation, activation, activation, "batch"],
+                "the pending records, then the first table's batch; the \
+                 second table's never reached the store"
+            );
+            let b = records(&st, db, "b").await;
+            assert!(bound(&st, db, "b", &b, ddls(&b)[0]).await.is_some());
+            let d = records(&st, db, "d").await;
+            assert_eq!(bound(&st, db, "d", &d, ddls(&d)[0]).await, None);
+            assert_eq!(versions(&st, db, "d").await, 0, "no version for d");
+
+            *fault.crash_after_writes_to.lock().unwrap() = None;
+            let mut r = run(&st, port, db, &tracked).await;
+            ddl_event(&mut r.rx, "RENAME TABLE").await;
+            crate::stream_probe::set_window_caps(None);
+            for t in ["b", "d"] {
+                let recs = records(&st, db, t).await;
+                assert!(
+                    bound(&st, db, t, &recs, ddls(&recs)[0]).await.is_some()
+                );
+                assert_eq!(versions(&st, db, t).await, 1, "{t}");
+            }
+            stop(r.handle).await;
+        }
+
+        /// A table whose own contribution exceeds an empty batch stops the
+        /// proof with the classified incident before anything of it is
+        /// written: the DDL stays pending, no version, no checkpoint
+        /// advance.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn an_oversized_table_stops_the_proof_with_nothing_written() {
+            let port = server(true).await;
+            let db = "fwd_oversized";
+            prepare(port, db).await;
+            let st = state(Arc::new(MemoryStorageBackend::new())).await;
+            let t = format!("{db}.t");
+            let r = run(&st, port, db, &[&t]).await;
+            stop(r.handle).await;
+            let committed = st.ckpt.get_raw(db).await.unwrap();
+            let before = versions(&st, db, "t").await;
+            crate::stream_probe::set_window_caps(Some((
+                crate::mysql::mysql_window_budget::PLAN_BYTES,
+                16_384,
+                10,
+            )));
+            let r = run(&st, port, db, &[&t]).await;
+            sql(port, &[&format!("ALTER TABLE {t} ADD COLUMN w INT")]).await;
+            let res =
+                tokio::time::timeout(Duration::from_secs(60), r.handle.join)
+                    .await
+                    .expect("stops")
+                    .expect("task");
+            crate::stream_probe::set_window_caps(None);
+            let err = res.expect_err("the oversized table stops the source");
+            assert_eq!(
+                err.draft().map(|d| d.reason_code),
+                Some(deltaforge_core::incident::ReasonCode::MysqlTableStateTooLarge),
+                "{err}"
+            );
+            let recs = records(&st, db, "t").await;
+            let d = ddls(&recs);
+            assert_eq!(d.len(), 1, "the pending record stays");
+            assert_eq!(bound(&st, db, "t", &recs, d[0]).await, None);
+            assert_eq!(versions(&st, db, "t").await, before);
+            assert_eq!(st.ckpt.get_raw(db).await.unwrap(), committed);
+        }
+
+        /// Another registration of the same table between the plan and the
+        /// commit fails the batch's preconditions: nothing is written, the
+        /// proof plans again and numbers after it, as the serial path does.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_concurrent_registration_replans_the_proof() {
+            let port = server(true).await;
+            let db = "fwd_conflict";
+            prepare(port, db).await;
+            let fault = Arc::new(FaultBackend::new());
+            let st = state(fault.clone()).await;
+            let t = format!("{db}.t");
+            let r = run(&st, port, db, &[&t]).await;
+            stop(r.handle).await;
+            let mut r = run(&st, port, db, &[&t]).await;
+            let key = st.scope.current().unwrap().key(db, "t");
+            let injected = Arc::new(std::sync::Mutex::new(None));
+            let seen = injected.clone();
+            let k = key.clone();
+            *fault.before_next_batch.lock().unwrap() =
+                Some(storage::adapters::test_util::BatchHook(Box::new(
+                    move |inner| {
+                        Box::pin(async move {
+                            let other = DurableSchemaRegistry::new(inner)
+                                .await
+                                .unwrap();
+                            let v = other
+                                .register_with_checkpoint(
+                                    &k,
+                                    "concurrent",
+                                    &serde_json::json!({"concurrent": true}),
+                                    None,
+                                )
+                                .await
+                                .unwrap();
+                            *seen.lock().unwrap() = Some(v);
+                        })
+                    },
+                )));
+            sql(port, &[&format!("ALTER TABLE {t} ADD COLUMN w INT")]).await;
+            ddl_event(&mut r.rx, "ADD COLUMN w").await;
+            stop(r.handle).await;
+            let other = injected.lock().unwrap().expect("the hook ran");
+            let recs = records(&st, db, "t").await;
+            let d = ddls(&recs);
+            let version = bound(&st, db, "t", &recs, d[0])
+                .await
+                .expect("the DDL is bound");
+            assert_eq!(version, other + 1, "numbered after the other");
+            let shape = st.registry.version_hash(&key, version).await.unwrap();
+            assert_ne!(shape.as_deref(), Some("concurrent"));
+        }
+
+        /// A registration that conflicts on every attempt stops the source
+        /// after the bounded re-plans: the DDL stays pending, unbound, with
+        /// no version from the proof.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_proof_that_always_conflicts_stops_with_the_ddl_pending() {
+            fn arm(
+                fault: Arc<FaultBackend>,
+                key: storage::adapters::SchemaKey,
+                n: Arc<std::sync::atomic::AtomicUsize>,
+            ) {
+                let again = fault.clone();
+                *fault.before_next_batch.lock().unwrap() =
+                    Some(storage::adapters::test_util::BatchHook(Box::new(
+                        move |inner| {
+                            Box::pin(async move {
+                                let i = n.fetch_add(
+                                    1,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
+                                let other = DurableSchemaRegistry::new(inner)
+                                    .await
+                                    .unwrap();
+                                other
+                                    .register_with_checkpoint(
+                                        &key,
+                                        &format!("concurrent-{i}"),
+                                        &serde_json::json!({"concurrent": i}),
+                                        None,
+                                    )
+                                    .await
+                                    .unwrap();
+                                arm(again, key, n);
+                            })
+                        },
+                    )));
+            }
+            let port = server(true).await;
+            let db = "fwd_conflict_always";
+            prepare(port, db).await;
+            let fault = Arc::new(FaultBackend::new());
+            let st = state(fault.clone()).await;
+            let t = format!("{db}.t");
+            let r = run(&st, port, db, &[&t]).await;
+            stop(r.handle).await;
+            let committed = st.ckpt.get_raw(db).await.unwrap();
+            let r = run(&st, port, db, &[&t]).await;
+            let key = st.scope.current().unwrap().key(db, "t");
+            let conflicts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            arm(fault.clone(), key.clone(), conflicts.clone());
+            sql(port, &[&format!("ALTER TABLE {t} ADD COLUMN w INT")]).await;
+            let res =
+                tokio::time::timeout(Duration::from_secs(60), r.handle.join)
+                    .await
+                    .expect("stops")
+                    .expect("task");
+            *fault.before_next_batch.lock().unwrap() = None;
+            assert!(res.is_err(), "{res:?}");
+            let recs = records(&st, db, "t").await;
+            let d = ddls(&recs);
+            assert_eq!(d.len(), 1, "the pending record stays");
+            assert_eq!(bound(&st, db, "t", &recs, d[0]).await, None);
+            let history =
+                crate::mysql::mysql_activation::tests_support::history(
+                    &st.registry,
+                    &key,
+                )
+                .await;
+            assert!(
+                history.iter().all(|h| !h.contains("\"w\"")),
+                "no version from the proof: {history:?}"
+            );
+            assert_eq!(st.ckpt.get_raw(db).await.unwrap(), committed);
         }
     }
 }

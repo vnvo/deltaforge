@@ -1172,9 +1172,9 @@ async fn decide_and_commit(
 }
 
 /// Conflicting re-reads of an atomic batch before the window fails closed.
-const BATCH_CONFLICT_RETRIES: usize = 3;
+pub(crate) const BATCH_CONFLICT_RETRIES: usize = 3;
 /// Retries of a batch whose outcome a storage error left unknown.
-const BATCH_STORAGE_RETRIES: usize = 3;
+pub(crate) const BATCH_STORAGE_RETRIES: usize = 3;
 
 /// One table's decision before the batch: refused (and why), or a
 /// candidate whose shape is registered and whose baseline is proposed.
@@ -1801,13 +1801,14 @@ async fn admit_batch(
 
 /// The table (index into the window's decided tables) whose op writes the
 /// item with `key_digest`.
-fn refused_table(
+pub(crate) fn refused_table(
     batch: &storage::AtomicBatch,
     op_table: &[usize],
     key_digest: &str,
 ) -> Option<usize> {
     batch.ops.iter().zip(op_table).find_map(|(op, i)| {
         let (storage::BatchOp::LogAppendIfAbsent { ns, key, .. }
+        | storage::BatchOp::LogAppendIdempotent { ns, key, .. }
         | storage::BatchOp::KvPut { ns, key, .. }) = op
         else {
             return None;

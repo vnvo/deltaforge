@@ -37,6 +37,10 @@ pub struct FaultBackend {
     /// `(namespace, n)`: allow `n` more writes to the namespace, fail the
     /// next one, then clear (a crash at that write).
     pub fail_after_writes_to: std::sync::Mutex<Option<(String, u64)>>,
+    /// `(namespace, n)`: allow `n` more writes to the namespace, then fail
+    /// every further one until cleared (a process that crashed there: no
+    /// retry of it succeeds).
+    pub crash_after_writes_to: std::sync::Mutex<Option<(String, u64)>>,
     /// Yield to the scheduler after every slot read, so concurrent
     /// read-modify-write cycles interleave as they can on a real store.
     pub yield_after_slot_reads: AtomicBool,
@@ -55,6 +59,30 @@ pub struct FaultBackend {
     /// on the inner store, then fails (a lost acknowledgement: the outcome
     /// is ambiguous to the caller).
     pub lose_ack_for: std::sync::Mutex<Option<String>>,
+    /// Every write call that reached the store (past the injected faults),
+    /// one per call: its namespace,
+    /// or `batch` for an `apply_batch` (one transaction on a SQL store).
+    pub write_calls: std::sync::Mutex<Vec<String>>,
+    /// One-shot: run before the next `apply_batch` reaches the store, with
+    /// the inner store (another writer acting between a plan and its
+    /// commit).
+    pub before_next_batch: std::sync::Mutex<Option<BatchHook>>,
+}
+
+/// What a [`BatchHook`] runs: given the inner store, a future to await.
+pub type BatchHookFn = dyn FnOnce(
+        ArcStorageBackend,
+    )
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    + Send;
+
+/// See [`FaultBackend::before_next_batch`].
+pub struct BatchHook(pub Box<BatchHookFn>);
+
+impl std::fmt::Debug for BatchHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BatchHook")
+    }
 }
 
 /// See [`FaultBackend::pause_after_slot_list`]: (namespace, reached,
@@ -93,6 +121,9 @@ impl FaultBackend {
             batched_stream_reads: std::sync::atomic::AtomicU64::new(0),
             fail_writes_to: std::sync::Mutex::new(Vec::new()),
             fail_after_writes_to: std::sync::Mutex::new(None),
+            crash_after_writes_to: std::sync::Mutex::new(None),
+            write_calls: std::sync::Mutex::new(Vec::new()),
+            before_next_batch: std::sync::Mutex::new(None),
             yield_after_slot_reads: AtomicBool::new(false),
             pause_after_slot_list: std::sync::Mutex::new(None),
             write_after_batch_error: std::sync::Mutex::new(None),
@@ -114,7 +145,14 @@ impl FaultBackend {
         self.writes_left.store(n, Ordering::SeqCst);
     }
 
+    /// A write call to `ns`: checked against the faults, then counted.
     fn write(&self, ns: &str) -> Result<()> {
+        self.check(ns)?;
+        self.write_calls.lock().unwrap().push(ns.to_string());
+        Ok(())
+    }
+
+    fn check(&self, ns: &str) -> Result<()> {
         anyhow::ensure!(
             !self.fail_writes_to.lock().unwrap().iter().any(|n| n == ns),
             "injected write failure in namespace {ns}"
@@ -130,6 +168,13 @@ impl FaultBackend {
                     *left -= 1;
                 }
             }
+        }
+        if let Some((target, left)) =
+            self.crash_after_writes_to.lock().unwrap().as_mut()
+            && target == ns
+        {
+            anyhow::ensure!(*left > 0, "injected crash at a write in {ns}");
+            *left -= 1;
         }
         let left = self.writes_left.load(Ordering::SeqCst);
         if left == 0 && self.one_shot.swap(false, Ordering::SeqCst) {
@@ -186,7 +231,12 @@ impl StorageBackend for FaultBackend {
                 // write.
                 crate::BatchOp::CommitMarker { .. } => continue,
             };
-            self.write(ns)?;
+            self.check(ns)?;
+        }
+        self.write_calls.lock().unwrap().push("batch".into());
+        let hook = self.before_next_batch.lock().unwrap().take();
+        if let Some(hook) = hook {
+            (hook.0)(self.inner.clone()).await;
         }
         if self.stall_batches.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;

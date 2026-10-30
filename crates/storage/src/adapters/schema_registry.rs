@@ -757,6 +757,26 @@ impl DurableSchemaRegistry {
 
     // ---- planned registration (one atomic batch) --------------------------
 
+    /// An upper bound of the encoded entry a planned registration of `req`
+    /// writes (the widest version number and registration time), to check
+    /// against [`crate::MAX_STATE_ITEM_BYTES`] before anything is planned.
+    pub fn registration_entry_bound(
+        req: &RegistrationRequest,
+    ) -> Result<usize> {
+        let entry = LogEntry {
+            format_version: CURRENT_FORMAT_VERSION,
+            record_version: CURRENT_RECORD_VERSION,
+            version: Some(i32::MIN),
+            origin_sequence: None,
+            hash: req.hash.clone(),
+            schema_json: req.schema_json.clone(),
+            registered_at: Utc::now(),
+            checkpoint: req.checkpoint.clone(),
+        };
+        // A timestamp's fraction and year widen it by at most this much.
+        Ok(serde_json::to_vec(&entry)?.len() + 32)
+    }
+
     /// Plan the registration of every request for one atomic batch (see
     /// `docs/design/mysql-proof-seek.md`, "The atomic batch contract"):
     /// the same version numbering as [`Self::register_with_checkpoint`]

@@ -498,32 +498,6 @@ pub(crate) async fn record_ddl(
     Ok(id)
 }
 
-/// Append the forward-proof binding of the pending `ddl` record `ddl_id` at
-/// its position D: `version` (already registered) with its evidence.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn record_forward_proof(
-    backend: &ArcStorageBackend,
-    registry: &DurableSchemaRegistry,
-    key: &SchemaKey,
-    ddl_id: &str,
-    position: WmPos,
-    version: i32,
-    proof: ForwardProof,
-) -> Result<AppendStatus> {
-    let record = Record::new(
-        position,
-        Kind::Observed {
-            version,
-            binds: Some(ddl_id.to_string()),
-            proof: Some(proof),
-            full: None,
-        },
-    );
-    let stream = table_stream(key);
-    let id = forward_capture_id(&key.lineage_hash, &stream, &record)?;
-    append(backend, registry, key, ACTIVATION_NS, &stream, &id, &record).await
-}
-
 /// The validated forward binding of the `ddl` record `ddl_id` in `records`
 /// (the table's stream): `Ok(None)` only when nothing binds it; the bound
 /// version when exactly one record binds it and that record is complete,
