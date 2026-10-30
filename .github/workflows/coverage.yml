@@ -28,8 +28,11 @@ jobs:
           tool: cargo-llvm-cov
 
       - name: Generate coverage report
-        # Vendored third-party crates (vendor/) are not DeltaForge code.
-        run: cargo llvm-cov --workspace --ignore-filename-regex '/vendor/' --lcov --output-path lcov.info
+        # Vendored third-party crates (vendor/) are not DeltaForge code, and
+        # the actdiag measurement harness runs by hand against Docker (its
+        # unit tests still run here; its analyzer checks and smoke script are
+        # its own validation).
+        run: cargo llvm-cov --workspace --ignore-filename-regex '(/vendor/|/crates/perf-harness/actdiag/)' --lcov --output-path lcov.info
 
       - name: Upload to Coveralls
         uses: coverallsapp/github-action@v2
