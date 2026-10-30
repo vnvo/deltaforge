@@ -1159,7 +1159,7 @@ mod tests {
 
         /// Every table's registration and binding commit together: the
         /// store holds one version per table, bound by validated evidence,
-        /// and the context's registry knows it from the commit.
+        /// and the context's registry reports it.
         #[tokio::test]
         async fn a_proof_commits_each_table_registered_and_bound() {
             let st = store();
@@ -1178,7 +1178,7 @@ mod tests {
                     .get_latest(&key(&ctx, &p.table))
                     .await
                     .unwrap()
-                    .expect("the cache admits the committed version");
+                    .expect("the committed version");
                 assert_eq!((latest.version, latest.hash), (1, hash(cap)));
             }
         }
