@@ -39,6 +39,7 @@ use super::mysql_binlog_scan::{
     observe_capture, trace_proof,
 };
 use super::mysql_binlog_scan::{Captured, ScanReport};
+use super::mysql_selection::{PlannedVersions, Timeline};
 use super::mysql_window_budget::{Caps, Cost, Prefix, proof_table_cost};
 use super::{MySqlCheckpoint, RunCtx, WindowInvalid};
 use crate::durable_checkpoint::{
@@ -46,6 +47,7 @@ use crate::durable_checkpoint::{
 };
 use crate::registry_scope::RegistryScope;
 use schema_registry::SourceSchema;
+use std::sync::Arc;
 use storage::DurableSchemaRegistry;
 use storage::adapters::{RegistrationPlanning, RegistrationRequest, SchemaKey};
 
@@ -55,6 +57,35 @@ pub(crate) struct Pending {
     pub table: String,
     /// The exact capture identity of the table's pending `ddl` record.
     pub ddl_id: String,
+    /// Its cached timeline before the `ddl` record, when C3 may install.
+    pub snapshot: Option<Snapshot>,
+}
+
+/// A pending table's cached timeline, taken before its `ddl` record was
+/// appended (`docs/design/mysql-ddl-proof-transactions.md`, C3), with the
+/// sequence that append stored the record at (an append that found the
+/// record already stored is a replay: no snapshot).
+pub(crate) struct Snapshot {
+    pub timeline: Arc<Timeline>,
+    pub ddl_seq: u64,
+}
+
+/// A table's timeline after its proof committed, found current by
+/// [`fresh_timelines`]: the caller installs it if its cache still holds
+/// `snapshot`.
+pub(crate) struct Fresh {
+    pub key: SchemaKey,
+    pub snapshot: Arc<Timeline>,
+    pub timeline: Timeline,
+}
+
+/// What a forward proof's batches committed for one table: its binding's
+/// sequence, and the version it binds with that version's hash.
+struct Committed {
+    table: usize,
+    binding_seq: u64,
+    version: i32,
+    hash: String,
 }
 
 fn other_server(expected: &str, found: &str) -> SourceError {
@@ -68,13 +99,14 @@ fn other_server(expected: &str, found: &str) -> SourceError {
 }
 
 /// Prove the post-DDL shape of every `pending` table at the DDL's position
-/// (the stream's current position). Returns how many bindings were written.
+/// (the stream's current position). Returns the committed tables' timelines
+/// found current (C3); the caller invalidates every other touched table.
 pub(crate) async fn prove(
     ctx: &RunCtx,
     pending: Vec<Pending>,
-) -> SourceResult<usize> {
+) -> SourceResult<Vec<Fresh>> {
     if pending.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     let scope = ctx.registry_scope.current()?;
     let lineage = scope.lineage().lineage_hash.clone();
@@ -94,7 +126,7 @@ pub(crate) async fn prove(
         d_cp.gtid_set.as_deref(),
     ) else {
         warn!(source_id = %ctx.source_id, "unparseable DDL position: the DDL stays pending");
-        return Ok(0);
+        return Ok(Vec::new());
     };
     let storage = |e: anyhow::Error| {
         SourceError::Other(e.context("forward proof: activation timeline"))
@@ -133,7 +165,7 @@ pub(crate) async fn prove(
         }
     }
     if open.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
     let tag = ScanTag {
@@ -193,14 +225,14 @@ pub(crate) async fn prove(
     }
     let Some(s_cp) = captured.last().map(|(_, cap)| cap.position.clone())
     else {
-        return Ok(0);
+        return Ok(Vec::new());
     };
     let Some(s) = mysql_checkpoint_position(
         &s_cp.file,
         s_cp.pos,
         s_cp.gtid_set.as_deref(),
     ) else {
-        return Ok(0);
+        return Ok(Vec::new());
     };
 
     // 2. D <= S in the verified lineage.
@@ -209,7 +241,7 @@ pub(crate) async fn prove(
         CheckpointOrder::Before | CheckpointOrder::Equal
     ) {
         warn!(source_id = %ctx.source_id, "forward proof: the capture is not at or after the DDL; the DDL stays pending");
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
     // 3. One complete scan of (D, S].
@@ -244,7 +276,7 @@ pub(crate) async fn prove(
                     "scan_failed",
                 );
             }
-            return Ok(0);
+            return Ok(Vec::new());
         }
     };
 
@@ -292,9 +324,10 @@ pub(crate) async fn prove(
         checkpoint: &checkpoint,
         lineage: &lineage,
     };
-    let written = commit_proofs(ctx, &scope, &tag, &bound, proven).await?;
+    let committed = commit_proofs(ctx, &scope, &tag, &bound, &proven).await?;
+    let written = committed.len();
     info!(source_id = %ctx.source_id, bindings = written, "forward proof after DDL");
-    Ok(written)
+    Ok(fresh_timelines(ctx, &scope, &proven, &committed).await)
 }
 
 /// What every binding of one forward proof shares.
@@ -386,8 +419,8 @@ async fn commit_proofs(
     scope: &RegistryScope,
     tag: &ScanTag<'_>,
     bound: &Bound<'_>,
-    proven: Vec<(Pending, Captured)>,
-) -> SourceResult<usize> {
+    proven: &[(Pending, Captured)],
+) -> SourceResult<Vec<Committed>> {
     use super::mysql_activation::{
         ACTIVATION_NS, Kind, Record, encode_record, forward_capture_id,
         table_stream,
@@ -398,7 +431,7 @@ async fn commit_proofs(
     use storage::{AtomicBatch, BatchOp, CommitResult, commit_atomic_counted};
 
     if proven.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     // One store holds the registry and the activation records, or no batch
     // can commit them together.
@@ -487,7 +520,7 @@ async fn commit_proofs(
             .into();
 
     let registry = ctx.schema.registry();
-    let mut written = 0;
+    let mut out = Vec::with_capacity(proven.len());
     let mut applies = 0;
     while let Some(mut batch_tables) = queue.pop_front() {
         let mut attempt = 0;
@@ -548,6 +581,7 @@ async fn commit_proofs(
             // Each table's registration entry op, and the table of every op
             // (to name the table of an item the store refuses).
             let mut entry_ops = Vec::with_capacity(regs.len());
+            let mut binding_ops = Vec::with_capacity(regs.len());
             let mut op_table = Vec::new();
             for (&i, reg) in batch_tables.iter().zip(&regs) {
                 let (p, _) = &proven[i];
@@ -572,6 +606,7 @@ async fn commit_proofs(
                 let capture_id =
                     forward_capture_id(&key.lineage_hash, &stream, &record)
                         .map_err(SourceError::Other)?;
+                binding_ops.push(batch.ops.len());
                 batch.ops.push(BatchOp::LogAppendIdempotent {
                     ns: ACTIVATION_NS.into(),
                     key: stream,
@@ -629,7 +664,9 @@ async fn commit_proofs(
                     );
                 }
             }
-            for &i in &batch_tables {
+            for ((&i, reg), op) in
+                batch_tables.iter().zip(&regs).zip(&binding_ops)
+            {
                 let (p, cap) = &proven[i];
                 trace_proof(
                     tag,
@@ -640,12 +677,165 @@ async fn commit_proofs(
                     lctn,
                     "proven",
                 );
+                out.push(Committed {
+                    table: i,
+                    binding_seq: seqs[*op].expect("a committed log write"),
+                    version: reg.version,
+                    hash: reg.hash.clone(),
+                });
             }
-            written += batch_tables.len();
             break;
         }
     }
-    Ok(written)
+    Ok(out)
+}
+
+/// The committed tables' timelines that are still current (C3), each its
+/// snapshot followed by exactly its `ddl` record and its binding, decoded
+/// from the store as a load decodes them and validated as a load validates
+/// them. Current means, at this read: the table stream holds exactly those
+/// two entries after the snapshot's head, and every barrier stream is where
+/// the snapshot read it. Freshness holds at the read, not through the
+/// install; the interval after it is safe only because no other writer
+/// exists, so a table has a snapshot only under the store-gate witness
+/// ([`storage::adapters::store_gate::server_holds`], checked where the
+/// snapshot is taken). A table that fails any check, or a read error, is
+/// left out (the caller invalidates it).
+async fn fresh_timelines(
+    ctx: &RunCtx,
+    scope: &RegistryScope,
+    proven: &[(Pending, Captured)],
+    committed: &[Committed],
+) -> Vec<Fresh> {
+    use super::mysql_activation::{ACTIVATION_NS, BARRIER_NS, table_stream};
+    use storage::{BatchRead, BatchReadResult};
+
+    let backend = &ctx.registry_backend;
+    let candidates: Vec<(&Committed, &Snapshot)> = committed
+        .iter()
+        .filter_map(|c| proven[c.table].0.snapshot.as_ref().map(|s| (c, s)))
+        .collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let reads: Vec<BatchRead> = candidates
+        .iter()
+        .flat_map(|(_, s)| {
+            s.timeline.streams.iter().map(|b| BatchRead::LogHead {
+                ns: BARRIER_NS.into(),
+                key: b.stream.clone(),
+            })
+        })
+        .collect();
+    let heads = match backend.read_batch(&reads).await {
+        Ok(h) if h.len() == reads.len() => h,
+        other => {
+            warn!(source_id = %ctx.source_id, outcome = ?other.map(|h| h.len()), "forward proof: barrier heads unread; the proven timelines reload");
+            return Vec::new();
+        }
+    };
+    let mut heads = heads.into_iter();
+    let mut out = Vec::new();
+    for (c, snap) in candidates {
+        let t = &snap.timeline;
+        // Every head is consumed, current or not, to keep the rest aligned.
+        let mut barriers_current = true;
+        for b in &t.streams {
+            barriers_current &= matches!(
+                heads.next(),
+                Some(BatchReadResult::Head(h)) if h == b.head
+            );
+        }
+        if !barriers_current {
+            continue;
+        }
+        let (p, _) = &proven[c.table];
+        let key = scope.key(&p.db, &p.table);
+        let stream = table_stream(&key);
+        let after = match backend
+            .log_read_meta_since(ACTIVATION_NS, &stream, t.table_head, 3)
+            .await
+        {
+            Ok(after) => after,
+            Err(e) => {
+                warn!(source_id = %ctx.source_id, error = ?e, "forward proof: the table stream is unread; its timeline reloads");
+                continue;
+            }
+        };
+        if !matches!(
+            after.as_slice(),
+            [ddl, binding] if ddl.seq == snap.ddl_seq && binding.seq == c.binding_seq
+        ) {
+            continue;
+        }
+        let Ok((records, head)) =
+            super::mysql_activation::decode_stream(&stream, &after)
+        else {
+            continue;
+        };
+        let table = super::mysql_history::TableStream {
+            records: t.records.iter().cloned().chain(records).collect(),
+            head,
+            bytes: t.bytes
+                + after.iter().map(storage::log_entry_bytes).sum::<u64>(),
+        };
+        if super::mysql_history::within_limit(&key, &table, &t.streams).is_err()
+        {
+            continue;
+        }
+        let timeline = Timeline {
+            records: table.records,
+            table_head: table.head,
+            streams: t.streams.clone(),
+            bytes: table.bytes,
+        };
+        let planned = PlannedVersions::from([(c.version, c.hash.clone())]);
+        if super::mysql_selection::validate_planned(
+            ctx.schema.registry(),
+            &key,
+            &timeline,
+            &planned,
+        )
+        .await
+        .is_err()
+        {
+            continue;
+        }
+        out.push(Fresh {
+            key,
+            snapshot: t.clone(),
+            timeline,
+        });
+    }
+    out
+}
+
+/// Test seams of C3's interval between the freshness check and the install.
+#[cfg(test)]
+pub(crate) mod hooks {
+    use super::RunCtx;
+    use std::sync::Mutex;
+
+    /// What [`BEFORE_INSTALL`] runs.
+    pub(crate) type BeforeInstall = Box<dyn FnOnce(&mut RunCtx) + Send>;
+
+    /// One-shot: runs on the source's task after the proof's freshness
+    /// check, before the install (a writer acting in that interval).
+    pub(crate) static BEFORE_INSTALL: Mutex<Option<BeforeInstall>> =
+        Mutex::new(None);
+
+    /// Every timeline installed, with its table's backend key and the
+    /// snapshot's estimated bytes.
+    pub(crate) static INSTALLED: Mutex<
+        Vec<(String, u64, super::super::mysql_selection::Timeline)>,
+    > = Mutex::new(Vec::new());
+
+    pub(crate) fn before_install(ctx: &mut RunCtx) {
+        let hook = BEFORE_INSTALL.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook(ctx);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1578,6 +1768,391 @@ mod tests {
                 "no version from the proof: {history:?}"
             );
             assert_eq!(st.ckpt.get_raw(db).await.unwrap(), committed);
+        }
+
+        // ---- C3: installing a proven table's timeline -------------------
+
+        /// The table stream reads of `db.table` made since the last clear.
+        fn table_reads(
+            fault: &FaultBackend,
+            st: &State,
+            db: &str,
+            t: &str,
+        ) -> usize {
+            let key = st.scope.current().unwrap().key(db, t);
+            let stream = crate::mysql::mysql_activation::table_stream(&key);
+            fault
+                .stream_reads
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(ns, k)| {
+                    ns == crate::mysql::mysql_activation::ACTIVATION_NS
+                        && *k == stream
+                })
+                .count()
+        }
+
+        /// The timelines installed for `db.table` since the last clear.
+        fn installed(
+            st: &State,
+            db: &str,
+            t: &str,
+        ) -> Vec<(u64, crate::mysql::mysql_selection::Timeline)> {
+            let key = st.scope.current().unwrap().key(db, t).backend_key();
+            super::super::hooks::INSTALLED
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(k, _, _)| *k == key)
+                .map(|(_, b, t)| (*b, t.clone()))
+                .collect()
+        }
+
+        /// Wait for a row event of `table` whose `w` is `w`.
+        async fn row_with_w(
+            rx: &mut mpsc::Receiver<SourceItem>,
+            table: &str,
+            w: i64,
+        ) {
+            let want = deltaforge_core::canonical::fixture::value(
+                &serde_json::json!(w),
+            );
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while let Some(left) =
+                deadline.checked_duration_since(Instant::now())
+            {
+                match tokio::time::timeout(left, rx.recv()).await {
+                    Ok(Some(SourceItem::Event(e)))
+                        if e.ddl.is_none()
+                            && e.source.table == table
+                            && e.after.as_ref().and_then(|a| a.get("w"))
+                                == Some(&want) =>
+                    {
+                        return;
+                    }
+                    Ok(Some(_)) => {}
+                    _ => break,
+                }
+            }
+            panic!("no row of {table} with w = {w}");
+        }
+
+        /// A record appended to `stream` by another writer, straight into
+        /// `backend` (no source, no cache).
+        async fn foreign_append(
+            backend: &ArcStorageBackend,
+            ns: &str,
+            stream: &str,
+            id: &str,
+            kind: Kind,
+        ) {
+            let record = crate::mysql::mysql_activation::Record::new(
+                crate::durable_checkpoint::WmPos::MysqlGtid {
+                    gtid_set: "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-1000000"
+                        .into(),
+                },
+                kind,
+            );
+            backend
+                .log_append_if_absent(
+                    ns,
+                    stream,
+                    id,
+                    &crate::mysql::mysql_activation::encode_record(&record)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        /// A tracked table, cached by a row before its DDL, on a store whose
+        /// gate this process holds (`gated`) or not, with the C3 probes
+        /// cleared; returns the run and the table's key.
+        async fn cached_table(
+            db: &str,
+            gated: bool,
+        ) -> (Arc<FaultBackend>, State, Run, u16) {
+            let port = server(true).await;
+            prepare(port, db).await;
+            let fault = Arc::new(FaultBackend::new());
+            let st = state(fault.clone()).await;
+            if gated {
+                let backend: ArcStorageBackend = fault.clone();
+                storage::adapters::store_gate::acquire(
+                    &backend,
+                    storage::adapters::store_gate::GateRole::Server,
+                )
+                .await
+                .unwrap();
+                assert!(storage::adapters::store_gate::server_holds(
+                    &st.backend
+                ));
+            }
+            let t = format!("{db}.t");
+            let r = run(&st, port, db, &[&t]).await;
+            stop(r.handle).await;
+            let mut r = run(&st, port, db, &[&t]).await;
+            sql(port, &[&format!("INSERT INTO {t} VALUES (1, 1)")]).await;
+            let mut seen = false;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !seen && Instant::now() < deadline {
+                if let Ok(Some(SourceItem::Event(e))) =
+                    tokio::time::timeout(Duration::from_secs(1), r.rx.recv())
+                        .await
+                {
+                    seen = e.ddl.is_none() && e.source.table == "t";
+                }
+            }
+            assert!(seen, "the row before the DDL caches the timeline");
+            fault.stream_reads.lock().unwrap().clear();
+            fault
+                .batched_stream_reads
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            super::super::hooks::INSTALLED.lock().unwrap().clear();
+            *super::super::hooks::BEFORE_INSTALL.lock().unwrap() = None;
+            (fault, st, r, port)
+        }
+
+        /// With the store-gate witness, a cached table's proven timeline is
+        /// installed: the row after the DDL needs no history load (the table
+        /// stream is read twice: the replay check and the freshness check),
+        /// and the installed timeline equals a fresh read of the store
+        /// (records, head and bytes).
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_cached_proven_table_takes_its_records_without_a_reload() {
+            let db = "fwd_install";
+            let (fault, st, mut r, port) = cached_table(db, true).await;
+            sql(
+                port,
+                &[
+                    &format!("ALTER TABLE {db}.t ADD COLUMN w INT"),
+                    &format!("INSERT INTO {db}.t VALUES (2, 2, 7)"),
+                ],
+            )
+            .await;
+            ddl_event(&mut r.rx, "ADD COLUMN w").await;
+            row_with_w(&mut r.rx, "t", 7).await;
+            assert_eq!(
+                table_reads(&fault, &st, db, "t"),
+                2,
+                "the replay check and the freshness check"
+            );
+            assert_eq!(
+                fault
+                    .batched_stream_reads
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "no history load"
+            );
+            stop(r.handle).await;
+            let got = installed(&st, db, "t");
+            assert_eq!(got.len(), 1);
+            let key = st.scope.current().unwrap().key(db, "t");
+            let stream = crate::mysql::mysql_activation::table_stream(&key);
+            let entries = st
+                .backend
+                .log_read_meta_since(
+                    crate::mysql::mysql_activation::ACTIVATION_NS,
+                    &stream,
+                    0,
+                    10_000,
+                )
+                .await
+                .unwrap();
+            let fresh = records(&st, db, "t").await;
+            let (snapshot_bytes, got) = &got[0];
+            assert_eq!(got.records, fresh, "the records a load reads");
+            assert_eq!(got.table_head, entries.last().unwrap().seq);
+            assert_eq!(
+                got.bytes - snapshot_bytes,
+                entries[entries.len() - 2..]
+                    .iter()
+                    .map(storage::log_entry_bytes)
+                    .sum::<u64>(),
+                "the snapshot's estimate and its two new entries, as a load \
+                 counts them"
+            );
+        }
+
+        /// Without the witness, nothing is installed: the proven table
+        /// reloads, and its row after the DDL is decoded with its new shape.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn without_the_store_gate_witness_nothing_is_installed() {
+            let db = "fwd_no_witness";
+            let (fault, st, mut r, port) = cached_table(db, false).await;
+            sql(
+                port,
+                &[
+                    &format!("ALTER TABLE {db}.t ADD COLUMN w INT"),
+                    &format!("INSERT INTO {db}.t VALUES (2, 2, 7)"),
+                ],
+            )
+            .await;
+            ddl_event(&mut r.rx, "ADD COLUMN w").await;
+            row_with_w(&mut r.rx, "t", 7).await;
+            stop(r.handle).await;
+            assert!(installed(&st, db, "t").is_empty());
+            assert!(
+                fault
+                    .batched_stream_reads
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    >= 1,
+                "the table reloads"
+            );
+        }
+
+        /// Another writer's append to the table stream, or to a barrier
+        /// stream of the table, before the proof's commit: the freshness
+        /// check sees it and nothing is installed.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn an_append_or_barrier_before_the_check_prevents_the_install() {
+            use crate::mysql::mysql_activation::{
+                ACTIVATION_NS, BARRIER_NS, BarrierScope, barrier_stream,
+                table_stream,
+            };
+            for (i, barrier) in [false, true].into_iter().enumerate() {
+                let db = if barrier {
+                    "fwd_pre_barrier"
+                } else {
+                    "fwd_pre_append"
+                };
+                let (fault, st, mut r, port) = cached_table(db, true).await;
+                let key = st.scope.current().unwrap().key(db, "t");
+                let (ns, stream, kind) = if barrier {
+                    let scope = BarrierScope::Database { db: db.into() };
+                    (
+                        BARRIER_NS,
+                        barrier_stream(&key, &scope),
+                        Kind::Barrier { scope },
+                    )
+                } else {
+                    (ACTIVATION_NS, table_stream(&key), Kind::Ddl)
+                };
+                *fault.before_next_batch.lock().unwrap() =
+                    Some(storage::adapters::test_util::BatchHook(Box::new(
+                        move |inner| {
+                            Box::pin(async move {
+                                foreign_append(
+                                    &inner,
+                                    ns,
+                                    &stream,
+                                    &format!("foreign-{i}"),
+                                    kind,
+                                )
+                                .await;
+                            })
+                        },
+                    )));
+                sql(port, &[&format!("ALTER TABLE {db}.t ADD COLUMN w INT")])
+                    .await;
+                ddl_event(&mut r.rx, "ADD COLUMN w").await;
+                stop(r.handle).await;
+                assert!(installed(&st, db, "t").is_empty(), "{db}");
+            }
+        }
+
+        /// An in-process barrier or eviction between the check and the
+        /// install: the cache no longer holds the snapshot, and nothing is
+        /// installed.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn an_invalidation_after_the_check_prevents_the_install() {
+            use crate::mysql::mysql_activation::{
+                BarrierScope, barrier_stream,
+            };
+            for evict in [false, true] {
+                let db = if evict {
+                    "fwd_post_evict"
+                } else {
+                    "fwd_post_barrier"
+                };
+                let (_fault, st, mut r, port) = cached_table(db, true).await;
+                let key = st.scope.current().unwrap().key(db, "t");
+                let lineage = barrier_stream(&key, &BarrierScope::Lineage);
+                *super::super::hooks::BEFORE_INSTALL.lock().unwrap() =
+                    Some(Box::new(move |ctx| {
+                        if evict {
+                            ctx.selection.invalidate_all();
+                        } else {
+                            ctx.selection.barrier_appended(&lineage);
+                        }
+                    }));
+                sql(port, &[&format!("ALTER TABLE {db}.t ADD COLUMN w INT")])
+                    .await;
+                ddl_event(&mut r.rx, "ADD COLUMN w").await;
+                stop(r.handle).await;
+                assert!(installed(&st, db, "t").is_empty(), "{db}");
+            }
+        }
+
+        /// Another process's write between the check and the install is not
+        /// seen: freshness holds at the check only. With the witness the
+        /// install goes ahead without it (the timeline then misses the
+        /// write), which is why C3 rests on ownership: while this process
+        /// holds the gate, no other server can start on the store. Without
+        /// the witness the same write is followed by a reload.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_write_after_the_check_is_excluded_only_by_ownership() {
+            use crate::mysql::mysql_activation::{ACTIVATION_NS, table_stream};
+            for gated in [true, false] {
+                let db = if gated {
+                    "fwd_post_gated"
+                } else {
+                    "fwd_post_open"
+                };
+                let (_fault, st, mut r, port) = cached_table(db, gated).await;
+                let key = st.scope.current().unwrap().key(db, "t");
+                let stream = table_stream(&key);
+                let backend = st.backend.clone();
+                *super::super::hooks::BEFORE_INSTALL.lock().unwrap() =
+                    Some(Box::new(move |_ctx| {
+                        // Another process: its own runtime, on its own thread.
+                        std::thread::spawn(move || {
+                            tokio::runtime::Builder::new_current_thread()
+                                .build()
+                                .unwrap()
+                                .block_on(foreign_append(
+                                    &backend,
+                                    ACTIVATION_NS,
+                                    &stream,
+                                    "foreign-after-check",
+                                    Kind::Ddl,
+                                ));
+                        })
+                        .join()
+                        .unwrap();
+                    }));
+                sql(port, &[&format!("ALTER TABLE {db}.t ADD COLUMN w INT")])
+                    .await;
+                ddl_event(&mut r.rx, "ADD COLUMN w").await;
+                stop(r.handle).await;
+                let got = installed(&st, db, "t");
+                if gated {
+                    assert_eq!(got.len(), 1);
+                    assert_ne!(
+                        got[0].1.records,
+                        records(&st, db, "t").await,
+                        "not seen: the interval is excluded by ownership only"
+                    );
+                    let err = storage::adapters::store_gate::acquire(
+                        &st.backend,
+                        storage::adapters::store_gate::GateRole::Server,
+                    )
+                    .await
+                    .expect_err("a second server cannot start on the store");
+                    assert!(matches!(
+                        err,
+                        storage::adapters::store_gate::GateError::Held(_)
+                    ));
+                } else {
+                    assert!(got.is_empty());
+                }
+            }
         }
     }
 }

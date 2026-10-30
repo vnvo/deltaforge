@@ -482,20 +482,30 @@ async fn validate_version(
 }
 
 /// Append the `ddl` record that `event` at `position` establishes for the
-/// table `key` (spec 7.5): the shape after it is pending.
+/// table `key` (spec 7.5): the shape after it is pending. Returns its capture
+/// identity and how it was stored (inserted now, or already present: a
+/// replay).
 pub(crate) async fn record_ddl(
     backend: &ArcStorageBackend,
     registry: &DurableSchemaRegistry,
     key: &SchemaKey,
     event: &EventIdentity,
     position: WmPos,
-) -> Result<String> {
+) -> Result<(String, storage::LogAppendOutcome)> {
     let record = Record::new(position, Kind::Ddl);
     let stream = table_stream(key);
     let id = capture_id(&key.lineage_hash, event, &stream, &record);
-    append(backend, registry, key, ACTIVATION_NS, &stream, &id, &record)
-        .await?;
-    Ok(id)
+    let out = append_outcome(
+        backend,
+        registry,
+        key,
+        ACTIVATION_NS,
+        &stream,
+        &id,
+        &record,
+    )
+    .await?;
+    Ok((id, out))
 }
 
 /// The validated forward binding of the `ddl` record `ddl_id` in `records`

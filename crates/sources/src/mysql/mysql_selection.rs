@@ -562,6 +562,27 @@ impl Caches {
         self.install(key, timeline);
     }
 
+    /// Install `timeline` for `key` only while the cache still holds
+    /// `snapshot` itself (the same `Arc`): an eviction, a barrier or any
+    /// invalidation since the snapshot wins, and the table reloads. Whether
+    /// it was installed (an install that does not fit the bounds leaves the
+    /// table uncached, never stale).
+    pub(crate) fn install_if_current(
+        &mut self,
+        key: &SchemaKey,
+        snapshot: &Arc<Timeline>,
+        timeline: Arc<Timeline>,
+    ) -> bool {
+        let current = matches!(
+            self.entries.peek(&CacheKey::Timeline(key.backend_key())),
+            Some((Cached::Timeline(t, _), _)) if Arc::ptr_eq(t, snapshot)
+        );
+        if current {
+            self.install(key, timeline);
+        }
+        current
+    }
+
     /// A barrier was appended to `stream` (a lineage's or a database's):
     /// the stream, and every timeline and selection of a table it applies
     /// to, are stale. Every other table stays cached.

@@ -20,6 +20,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::ArcStorageBackend;
+use std::sync::Arc;
 
 const NS: &str = "store_gate";
 const KEY: &str = "gate";
@@ -155,6 +156,10 @@ impl GateGuard {
 
     /// Release the gate (only if this guard's owner still holds it).
     pub async fn release(self) -> Result<(), GateError> {
+        SERVER_HELD
+            .lock()
+            .expect("server-held gates")
+            .retain(|(_, owner)| *owner != self.holder.owner_id);
         release_owned(&self.backend, &self.holder.owner_id)
             .await
             .map(|_| ())
@@ -271,6 +276,12 @@ async fn acquire_as(
                 .map_err(GateError::Storage)?,
         };
         if won {
+            if holder.role == GateRole::Server {
+                SERVER_HELD
+                    .lock()
+                    .expect("server-held gates")
+                    .push((Arc::downgrade(backend), holder.owner_id.clone()));
+            }
             return Ok(GateGuard {
                 backend: backend.clone(),
                 holder,
@@ -278,6 +289,28 @@ async fn acquire_as(
         }
     }
     Err(GateError::Contended)
+}
+
+/// The stores whose gate this process acquired as `server` and has not
+/// released, by the backend it acquired them through.
+static SERVER_HELD: std::sync::Mutex<
+    Vec<(std::sync::Weak<dyn crate::StorageBackend>, String)>,
+> = std::sync::Mutex::new(Vec::new());
+
+/// Whether this process holds the store gate of `backend` as `server`,
+/// acquired through this exact backend: then no other server or migration
+/// writes to the store while it runs (`docs/design/mysql-ddl-proof-transactions.md`,
+/// C3 writer ownership). A backend that only wraps or shares the store is
+/// not that witness.
+pub fn server_holds(backend: &ArcStorageBackend) -> bool {
+    let addr = |b: &ArcStorageBackend| Arc::as_ptr(b) as *const ();
+    SERVER_HELD
+        .lock()
+        .expect("server-held gates")
+        .iter()
+        .any(|(held, _)| {
+            held.upgrade().is_some_and(|h| addr(&h) == addr(backend))
+        })
 }
 
 /// Take over a gate held by the unfinished migration `owner_id` for the same
@@ -424,6 +457,23 @@ mod tests {
         let migration = acquire(&b, GateRole::Migration).await.unwrap();
         migration.release().await.unwrap();
         assert_eq!(status(&b).await.unwrap(), GateState::Unlocked);
+    }
+
+    /// The witness names only the exact backend a server acquired the gate
+    /// through, only while it holds it; a migration's gate, another backend
+    /// over its own store, and a released gate are not the witness.
+    #[tokio::test]
+    async fn only_a_held_server_gate_is_the_witness() {
+        let (a, other) = (backend(), backend());
+        assert!(!server_holds(&a));
+        let server = acquire(&a, GateRole::Server).await.unwrap();
+        assert!(server_holds(&a));
+        assert!(!server_holds(&other));
+        server.release().await.unwrap();
+        assert!(!server_holds(&a));
+        let migration = acquire(&a, GateRole::Migration).await.unwrap();
+        assert!(!server_holds(&a));
+        migration.release().await.unwrap();
     }
 
     #[tokio::test]
