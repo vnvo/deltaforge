@@ -840,6 +840,79 @@ pub(crate) mod hooks {
 
 #[cfg(test)]
 mod tests {
+    use super::{Caps, Cost, WindowInvalid, group};
+
+    fn caps() -> Caps {
+        Caps {
+            plan: Cost {
+                bytes: 100,
+                read_items: 50,
+                read_key_bytes: 10_000,
+                write_ops: 20,
+            },
+            table_bytes: 1000,
+        }
+    }
+
+    fn cost(bytes: u64, read_items: u64) -> (usize, Cost) {
+        (
+            0,
+            Cost {
+                bytes,
+                read_items,
+                read_key_bytes: read_items,
+                write_ops: 7,
+            },
+        )
+    }
+
+    fn costs(of: &[(u64, u64)]) -> Vec<(usize, Cost)> {
+        of.iter()
+            .enumerate()
+            .map(|(i, (b, r))| (i, cost(*b, *r).1))
+            .collect()
+    }
+
+    /// Tables are batched in order, each batch closing before the table
+    /// that would take it over a cap; every table is in exactly one batch.
+    #[test]
+    fn tables_are_batched_in_order_within_the_caps() {
+        assert_eq!(
+            group(caps(), &costs(&[(40, 1), (40, 1), (40, 1), (10, 1)])),
+            Ok(vec![vec![0, 1], vec![2, 3]])
+        );
+        assert_eq!(
+            group(caps(), &costs(&[(1, 30), (1, 30), (1, 10)])),
+            Ok(vec![vec![0], vec![1, 2]])
+        );
+        assert_eq!(group(caps(), &[]), Ok(Vec::<Vec<usize>>::new()));
+    }
+
+    /// A table no batch can take alone is refused, by its index, even
+    /// under the per-table limit (over a batch cap): nothing is grouped.
+    #[test]
+    fn a_table_over_a_batch_cap_is_refused_before_any_batch() {
+        assert_eq!(
+            group(caps(), &costs(&[(10, 1), (101, 1)])),
+            Err((
+                1,
+                WindowInvalid::StateTooLarge {
+                    bytes: 101,
+                    limit: 100
+                }
+            ))
+        );
+        assert_eq!(
+            group(caps(), &costs(&[(10, 51)])),
+            Err((
+                0,
+                WindowInvalid::RegistryTooLarge {
+                    read_items: 51,
+                    limit: 50
+                }
+            ))
+        );
+    }
     /// Live MySQL 8.4 (Docker).
     mod live {
         use super::super::*;
