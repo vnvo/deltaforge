@@ -1066,6 +1066,7 @@ pub(crate) async fn timeline(
             }
         }
     }
+    let _phase = crate::perf_phases::Phase::start("history_load");
     let mine = install(ctx, &keys, |k| k == key).await?;
     mine.expect("the missed table is read")
 }

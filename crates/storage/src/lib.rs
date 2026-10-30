@@ -19,6 +19,7 @@ use async_trait::async_trait;
 
 pub mod adapters;
 pub mod memory;
+pub(crate) mod perf_phases;
 pub mod postgres;
 pub mod sqlite;
 

@@ -1178,6 +1178,7 @@ async fn handle_query(
         let (db, mut payload) =
             ddl_identity(&classified, ctx.lower_case_table_names, &q.schema);
         payload.insert("sql".into(), q.query.clone().into());
+        let _phase = crate::perf_phases::Phase::start("emit");
         emit_ddl_event(ctx, header, &db, payload.into()).await?;
         return Ok(());
     }
@@ -1237,6 +1238,7 @@ async fn record_query(
             (Vec::new(), Some(BarrierScope::Database { db: name(&db) }))
         }
     };
+    let _phase = crate::perf_phases::Phase::start("ddl_records");
 
     // After a failover, a tracked table's first event may be this DDL: its
     // drift policy applies before any record is written.
@@ -1311,10 +1313,11 @@ async fn record_query(
         } else {
             None
         };
-        let (ddl_id, stored) =
-            record_ddl(&backend, registry, &key, &event, position.clone())
-                .await
-                .map_err(|e| fail("ddl record", e))?;
+        let recorded = {
+            let _phase = crate::perf_phases::Phase::start("pending_record");
+            record_ddl(&backend, registry, &key, &event, position.clone()).await
+        };
+        let (ddl_id, stored) = recorded.map_err(|e| fail("ddl record", e))?;
         invalidated.push(key.clone());
         if proves {
             let snapshot = cached

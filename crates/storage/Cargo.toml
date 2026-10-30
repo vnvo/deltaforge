@@ -7,6 +7,8 @@ description = "Unified durable storage abstraction for DeltaForge runtime state"
 
 [features]
 default = ["sqlite", "postgres"]
+# Phase timings of the store, for measurement builds only.
+perf-phases = []
 sqlite = ["rusqlite"]
 postgres = ["deadpool-postgres"]
 # Exposes `adapters::test_util` (fault-injecting backend) to dependent crates' tests.

@@ -501,13 +501,14 @@ async fn pg_kv_put(
 }
 
 macro_rules! client {
-    ($self:expr) => {
+    ($self:expr) => {{
+        let _wait = crate::perf_phases::Phase::start("store_pool_wait");
         $self
             .pool
             .get()
             .await
             .map_err(|e| anyhow!("pool get: {e}"))?
-    };
+    }};
 }
 
 // ── StorageBackend ────────────────────────────────────────────────────────────

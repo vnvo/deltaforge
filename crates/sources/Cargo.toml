@@ -6,6 +6,8 @@ license = "MIT OR Apache-2.0"
 
 [features]
 default = []
+# Phase timings of the MySQL DDL path, for measurement builds only.
+perf-phases = ["storage/perf-phases"]
 # Native Vault-triggered credential rotation. Enables the secrets crate's Vault
 # provider so a `trigger: { type: vault }` rotation can connect and poll. Off by
 # default; a Vault-configured rotation fails closed in a build without it.

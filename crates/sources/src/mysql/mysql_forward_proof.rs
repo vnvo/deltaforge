@@ -133,6 +133,7 @@ pub(crate) async fn prove(
     };
 
     // Replay: a binding already recorded for the pending DDL is the proof.
+    let replay_phase = crate::perf_phases::Phase::start("replay_check");
     let mut open = Vec::new();
     for p in pending {
         let key = scope.key(&p.db, &p.table);
@@ -164,6 +165,7 @@ pub(crate) async fn prove(
             }
         }
     }
+    drop(replay_phase);
     if open.is_empty() {
         return Ok(Vec::new());
     }
@@ -174,6 +176,7 @@ pub(crate) async fn prove(
     };
     let lctn = ctx.lower_case_table_names;
     // 1. Captures, bound to their intervals by step 3.
+    let capture_phase = crate::perf_phases::Phase::start("capture");
     let mut captured = Vec::new();
     for p in open {
         // A stop ends the proof (`?`): nothing is decided.
@@ -223,6 +226,7 @@ pub(crate) async fn prove(
             }
         }
     }
+    drop(capture_phase);
     let Some(s_cp) = captured.last().map(|(_, cap)| cap.position.clone())
     else {
         return Ok(Vec::new());
@@ -245,6 +249,7 @@ pub(crate) async fn prove(
     }
 
     // 3. One complete scan of (D, S].
+    let scan_phase = crate::perf_phases::Phase::start("scan");
     let report = match super::mysql_proof_scanner::shared_interval(
         &ctx.proof_scanner,
         ctx.dsn.current().expose(),
@@ -280,6 +285,7 @@ pub(crate) async fn prove(
         }
     };
 
+    drop(scan_phase);
     // 4. Register and bind: the tables the scan proves, in atomic batches.
     let checkpoint =
         serde_json::to_vec(&d_cp).map_err(|e| SourceError::Other(e.into()))?;
@@ -324,9 +330,12 @@ pub(crate) async fn prove(
         checkpoint: &checkpoint,
         lineage: &lineage,
     };
+    let register_phase = crate::perf_phases::Phase::start("register_bind");
     let committed = commit_proofs(ctx, &scope, &tag, &bound, &proven).await?;
+    drop(register_phase);
     let written = committed.len();
     info!(source_id = %ctx.source_id, bindings = written, "forward proof after DDL");
+    let _phase = crate::perf_phases::Phase::start("fresh_check");
     Ok(fresh_timelines(ctx, &scope, &proven, &committed).await)
 }
 
@@ -546,14 +555,15 @@ async fn commit_proofs(
                         .0,
                 );
             }
-            let (preconditions, regs) = match registry
-                .plan_registrations(&reqs, chrono::Utc::now())
-                .await
-                .map_err(|e| {
-                    SourceError::Other(
-                        e.context("plan the forward proof's registrations"),
-                    )
-                })? {
+            let plan_phase = crate::perf_phases::Phase::start("plan");
+            let planning =
+                registry.plan_registrations(&reqs, chrono::Utc::now()).await;
+            drop(plan_phase);
+            let (preconditions, regs) = match planning.map_err(|e| {
+                SourceError::Other(
+                    e.context("plan the forward proof's registrations"),
+                )
+            })? {
                 RegistrationPlanning::Planned {
                     preconditions,
                     registrations,
@@ -616,14 +626,16 @@ async fn commit_proofs(
                 });
                 op_table.resize(batch.ops.len(), i);
             }
-            let committed = match commit_atomic_counted(
+            let commit_phase = crate::perf_phases::Phase::start("commit");
+            let result = commit_atomic_counted(
                 ctx.registry_backend.as_ref(),
                 &batch,
                 BATCH_STORAGE_RETRIES,
                 &mut applies,
             )
-            .await
-            {
+            .await;
+            drop(commit_phase);
+            let committed = match result {
                 Ok(c) => c,
                 Err(e) => {
                     if let Some(too) = e.chain().find_map(|c| {
