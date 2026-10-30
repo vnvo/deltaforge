@@ -925,6 +925,643 @@ mod tests {
             ))
         );
     }
+    /// The proof's store path without MySQL: [`commit_proofs`] and
+    /// [`fresh_timelines`] on a real (in-memory) store, with synthetic
+    /// captures and injected store faults. The live tests below cover the
+    /// same path end to end against MySQL.
+    mod store {
+        use super::super::*;
+        use crate::gtid_set::GtidSet;
+        use crate::mysql::mysql_activation::{
+            ACTIVATION_NS, BARRIER_NS, BarrierScope, EventIdentity, Kind,
+            Record, append, barrier_stream, read_table, record_ddl,
+            table_stream,
+        };
+        use crate::mysql::mysql_binlog_scan::ScanTag;
+        use crate::mysql::mysql_schema_loader::MySqlSchemaLoader;
+        use crate::mysql::mysql_table_schema::{MySqlColumn, MySqlTableSchema};
+        use deltaforge_core::incident::ReasonCode;
+        use std::time::Duration;
+        use storage::adapters::test_util::{BatchHook, FaultBackend};
+        use storage::{
+            ArcStorageBackend, BatchFault, BatchFaults, MemoryStorageBackend,
+        };
+
+        const U: &str = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+
+        /// A store whose batches can fail inside the transaction
+        /// (`memory`), behind the fault wrapper the context writes through.
+        struct Store {
+            memory: Arc<MemoryStorageBackend>,
+            fault: Arc<FaultBackend>,
+        }
+
+        fn store() -> Store {
+            let memory = Arc::new(MemoryStorageBackend::new());
+            let fault = Arc::new(FaultBackend::wrap(memory.clone()));
+            Store { memory, fault }
+        }
+
+        async fn ctx_on(backend: ArcStorageBackend) -> RunCtx {
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let mut ctx = crate::mysql::mysql_event::tests::make_runctx(tx);
+            ctx.registry_backend = backend.clone();
+            let registry =
+                DurableSchemaRegistry::new(backend.clone()).await.unwrap();
+            ctx.schema = MySqlSchemaLoader::new(
+                "mysql://fake",
+                registry,
+                &ctx.tenant,
+                ctx.registry_scope.clone(),
+            );
+            crate::registry_scope::establish_scope(
+                &backend,
+                &ctx.registry_scope,
+                &ctx.tenant,
+                &ctx.source_id,
+                storage::adapters::LineageDescriptor::mysql(U).unwrap(),
+            )
+            .await
+            .unwrap();
+            ctx.last_gtid = Some(GtidSet::parse(&format!("{U}:1-60")).unwrap());
+            ctx
+        }
+
+        fn at(k: u64) -> MySqlCheckpoint {
+            MySqlCheckpoint {
+                file: "mysql-bin.000001".into(),
+                pos: 4 + 100 * k,
+                gtid_set: Some(format!("{U}:1-{k}")),
+                lineage: None,
+                snapshot_completed: None,
+                snapshot_chain: None,
+            }
+        }
+
+        fn wm(k: u64) -> WmPos {
+            let p = at(k);
+            mysql_checkpoint_position(&p.file, p.pos, p.gtid_set.as_deref())
+                .unwrap()
+        }
+
+        fn key(ctx: &RunCtx, t: &str) -> SchemaKey {
+            ctx.registry_scope.current().unwrap().key("d", t)
+        }
+
+        /// A capture of `t` at S (70) with the columns `id` and `col`.
+        fn captured(col: &str) -> Captured {
+            Captured {
+                from: at(65),
+                position: at(70),
+                schema: MySqlTableSchema::new(vec![
+                    MySqlColumn::new("id", "int", "int", true, 1),
+                    MySqlColumn::new(col, "int", "int", true, 2),
+                ]),
+                attempts: 1,
+                trace: Default::default(),
+            }
+        }
+
+        fn report() -> ScanReport {
+            ScanReport {
+                statements: Vec::new(),
+                events: 0,
+                bytes: 0,
+                duration: Duration::ZERO,
+                digest: "digest".into(),
+                trace: Default::default(),
+                frontier: None,
+                session_anchor: None,
+                positioned_at: None,
+                work: Default::default(),
+            }
+        }
+
+        /// The tables' pending `ddl` records at D (60), as the stream writes
+        /// them, each with its cached timeline when `snapshot` (taken before
+        /// the record, as the caller takes it).
+        async fn pending(
+            ctx: &mut RunCtx,
+            tables: &[(&str, &str)],
+            snapshot: bool,
+        ) -> Vec<(Pending, Captured)> {
+            let mut out = Vec::new();
+            for (i, (t, col)) in tables.iter().enumerate() {
+                let k = key(ctx, t);
+                let cached = if snapshot {
+                    crate::mysql::mysql_selection::load_timelines(
+                        ctx,
+                        std::slice::from_ref(&k),
+                    )
+                    .await;
+                    Some(
+                        ctx.selection
+                            .timeline(&k.backend_key())
+                            .expect("cached"),
+                    )
+                } else {
+                    None
+                };
+                let (ddl_id, stored) = record_ddl(
+                    &ctx.registry_backend,
+                    ctx.schema.registry(),
+                    &k,
+                    &EventIdentity::Gtid {
+                        gtid: format!("{U}:60"),
+                        ordinal: i as u32,
+                    },
+                    wm(60),
+                )
+                .await
+                .unwrap();
+                out.push((
+                    Pending {
+                        db: "d".into(),
+                        table: t.to_string(),
+                        ddl_id,
+                        snapshot: cached.map(|timeline| Snapshot {
+                            timeline,
+                            ddl_seq: stored.seq,
+                        }),
+                    },
+                    captured(col),
+                ));
+            }
+            out
+        }
+
+        /// [`commit_proofs`] of `proven` at D = 60, S = 70.
+        async fn commit(
+            ctx: &RunCtx,
+            proven: &[(Pending, Captured)],
+        ) -> SourceResult<Vec<Committed>> {
+            let scope = ctx.registry_scope.current().unwrap();
+            let lineage = scope.lineage().lineage_hash.clone();
+            let (d, s, report) = (wm(60), wm(70), report());
+            let checkpoint = serde_json::to_vec(&at(60)).unwrap();
+            let tag = ScanTag {
+                source_id: &ctx.source_id,
+                kind: crate::mysql::mysql_binlog_scan::ProofKind::Forward,
+            };
+            let bound = Bound {
+                d: &d,
+                s: &s,
+                report: &report,
+                checkpoint: &checkpoint,
+                lineage: &lineage,
+            };
+            commit_proofs(ctx, &scope, &tag, &bound, proven).await
+        }
+
+        /// What the store holds for `t`, read through a registry of its own
+        /// (no cache of the context's): the registered versions' hashes, and
+        /// the version the validated binding of `ddl_id` binds.
+        async fn durable(
+            ctx: &RunCtx,
+            t: &str,
+            ddl_id: &str,
+        ) -> (Vec<String>, Option<i32>) {
+            let k = key(ctx, t);
+            let registry =
+                DurableSchemaRegistry::new(ctx.registry_backend.clone())
+                    .await
+                    .unwrap();
+            let mut hashes = Vec::new();
+            for v in 1.. {
+                match registry.version_hash(&k, v).await.unwrap() {
+                    Some(h) => hashes.push(h),
+                    None => break,
+                }
+            }
+            let records = read_table(&ctx.registry_backend, &registry, &k)
+                .await
+                .unwrap();
+            assert_eq!(
+                records.iter().filter(|s| s.capture_id == ddl_id).count(),
+                1,
+                "the pending record stays, once: {records:?}"
+            );
+            let bound = resolve_binding(
+                &registry,
+                &k,
+                &records,
+                ddl_id,
+                CLASSIFIER_VERSION,
+            )
+            .await
+            .expect("valid binding evidence");
+            (hashes, bound)
+        }
+
+        fn hash(cap: &Captured) -> String {
+            cap.schema.fingerprint().to_string()
+        }
+
+        /// Every table's registration and binding commit together: the
+        /// store holds one version per table, bound by validated evidence,
+        /// and the context's registry knows it from the commit.
+        #[tokio::test]
+        async fn a_proof_commits_each_table_registered_and_bound() {
+            let st = store();
+            let mut ctx = ctx_on(st.fault.clone()).await;
+            let proven =
+                pending(&mut ctx, &[("a", "x"), ("b", "y")], false).await;
+            let committed = commit(&ctx, &proven).await.unwrap();
+            assert_eq!(committed.len(), 2);
+            for (p, cap) in &proven {
+                let (hashes, bound) = durable(&ctx, &p.table, &p.ddl_id).await;
+                assert_eq!(hashes, [hash(cap)], "{}", p.table);
+                assert_eq!(bound, Some(1), "{}", p.table);
+                let latest = ctx
+                    .schema
+                    .registry()
+                    .get_latest(&key(&ctx, &p.table))
+                    .await
+                    .unwrap()
+                    .expect("the cache admits the committed version");
+                assert_eq!((latest.version, latest.hash), (1, hash(cap)));
+            }
+        }
+
+        /// A store that fails inside the batch's transaction, on every
+        /// attempt: nothing of the proof is stored (no version, no binding,
+        /// the `ddl` record pending) and the context's registry learned
+        /// nothing. Once the store recovers, the same proof commits once.
+        #[tokio::test]
+        async fn a_failed_batch_leaves_nothing_of_the_proof() {
+            fn fail_every_batch(
+                st: Arc<FaultBackend>,
+                memory: Arc<MemoryStorageBackend>,
+            ) {
+                let again = st.clone();
+                *st.before_next_batch.lock().unwrap() =
+                    Some(BatchHook(Box::new(move |_inner| {
+                        Box::pin(async move {
+                            memory.set_batch_fault(Some(
+                                BatchFault::AfterWrites(1),
+                            ));
+                            fail_every_batch(again, memory);
+                        })
+                    })));
+            }
+            let st = store();
+            let mut ctx = ctx_on(st.fault.clone()).await;
+            let proven =
+                pending(&mut ctx, &[("a", "x"), ("b", "y")], false).await;
+            fail_every_batch(st.fault.clone(), st.memory.clone());
+            assert!(commit(&ctx, &proven).await.is_err());
+            *st.fault.before_next_batch.lock().unwrap() = None;
+            st.memory.set_batch_fault(None);
+            for (p, _) in &proven {
+                assert_eq!(
+                    durable(&ctx, &p.table, &p.ddl_id).await,
+                    (vec![], None)
+                );
+                assert!(
+                    ctx.schema
+                        .registry()
+                        .get_latest(&key(&ctx, &p.table))
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "no version admitted from an uncommitted batch"
+                );
+            }
+
+            commit(&ctx, &proven).await.unwrap();
+            for (p, cap) in &proven {
+                assert_eq!(
+                    durable(&ctx, &p.table, &p.ddl_id).await,
+                    (vec![hash(cap)], Some(1))
+                );
+            }
+        }
+
+        /// An attempt whose outcome the store did not acknowledge is
+        /// resolved from its commit marker: committed (acknowledgement lost)
+        /// or not (failed before the commit, applied again). Either way the
+        /// store holds exactly one version and one binding per table, and
+        /// the returned binding is the stored one.
+        #[tokio::test]
+        async fn an_unacknowledged_batch_is_resolved_from_its_marker() {
+            for fault in [BatchFault::AfterCommit, BatchFault::AfterWrites(1)] {
+                let st = store();
+                let mut ctx = ctx_on(st.fault.clone()).await;
+                let proven = pending(&mut ctx, &[("a", "x")], false).await;
+                st.memory.set_batch_fault(Some(fault));
+                let committed = commit(&ctx, &proven).await.unwrap();
+                assert!(!st.memory.batch_fault_armed(), "{fault:?} was hit");
+                let (p, cap) = &proven[0];
+                assert_eq!(
+                    durable(&ctx, "a", &p.ddl_id).await,
+                    (vec![hash(cap)], Some(1)),
+                    "{fault:?}"
+                );
+                let k = key(&ctx, "a");
+                let entries = ctx
+                    .registry_backend
+                    .log_read_meta_since(
+                        ACTIVATION_NS,
+                        &table_stream(&k),
+                        0,
+                        10,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(entries.len(), 2, "the ddl record and one binding");
+                assert_eq!(
+                    committed[0].binding_seq, entries[1].seq,
+                    "{fault:?}"
+                );
+            }
+        }
+
+        /// A table whose registration entry would exceed the store's item
+        /// limit is refused with `state_item_too_large` before any batch:
+        /// no table of the proof is written, the smaller one included.
+        #[tokio::test]
+        async fn an_oversized_item_is_refused_before_any_write() {
+            let st = store();
+            let mut ctx = ctx_on(st.fault.clone()).await;
+            let mut proven =
+                pending(&mut ctx, &[("a", "x"), ("b", "y")], false).await;
+            let huge = "c".repeat(storage::MAX_STATE_ITEM_BYTES);
+            proven[1].1.schema = MySqlTableSchema::new(vec![MySqlColumn::new(
+                "id", &huge, "int", true, 1,
+            )]);
+            let err = commit(&ctx, &proven).await.err().expect("refused");
+            assert_eq!(
+                err.draft().map(|d| d.reason_code),
+                Some(ReasonCode::StateItemTooLarge),
+                "{err}"
+            );
+            for (p, _) in &proven {
+                assert_eq!(
+                    durable(&ctx, &p.table, &p.ddl_id).await,
+                    (vec![], None)
+                );
+            }
+        }
+
+        /// A table no batch can take alone (here: a source with so many
+        /// earlier lineages that one registration's reads exceed a plan) is
+        /// refused with its classified incident (here the registry's reads:
+        /// `mysql_table_registry_too_large`) before any batch: no table of
+        /// the proof is written.
+        #[tokio::test]
+        async fn a_table_no_batch_can_take_is_refused_before_any_write() {
+            let st = store();
+            let mut ctx = ctx_on(st.fault.clone()).await;
+            let proven =
+                pending(&mut ctx, &[("a", "x"), ("b", "y")], false).await;
+            let backend = ctx.registry_backend.clone();
+            let mut lineage = storage::adapters::source_lineage::load(
+                &backend,
+                &ctx.tenant,
+                &ctx.source_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let caps =
+                super::super::super::mysql_window_budget::PLAN_READ_ITEMS;
+            lineage.prior_lineage_hashes =
+                (0..caps / 2).map(|i| format!("{i:032x}")).collect();
+            // The record as the store keeps it (`schema_lineage`,
+            // `{tenant}/{source_id}`); the load below proves the layout.
+            backend
+                .kv_put(
+                    "schema_lineage",
+                    &format!("{}/{}", ctx.tenant, ctx.source_id),
+                    &serde_json::to_vec(&lineage).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                storage::adapters::source_lineage::load(
+                    &backend,
+                    &ctx.tenant,
+                    &ctx.source_id
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .prior_lineage_hashes
+                .len() as u64,
+                caps / 2
+            );
+            let err = commit(&ctx, &proven).await.err().expect("refused");
+            assert_eq!(
+                err.draft().map(|d| d.reason_code),
+                Some(ReasonCode::MysqlTableRegistryTooLarge),
+                "{err}"
+            );
+            for (p, _) in &proven {
+                assert_eq!(
+                    durable(&ctx, &p.table, &p.ddl_id).await,
+                    (vec![], None)
+                );
+            }
+        }
+
+        /// Another writer registering the table before every batch
+        /// commits: `n` times, the proof plans again and binds the version
+        /// after the other writer's; on every attempt, the proof stops
+        /// after its bounded re-plans with nothing of it stored.
+        #[tokio::test]
+        async fn a_conflicting_batch_is_planned_again_a_bounded_number_of_times()
+         {
+            use super::super::super::mysql_activation_window::BATCH_CONFLICT_RETRIES;
+            fn register_before(
+                st: Arc<FaultBackend>,
+                key: SchemaKey,
+                left: Arc<std::sync::atomic::AtomicUsize>,
+            ) {
+                let again = st.clone();
+                *st.before_next_batch.lock().unwrap() =
+                    Some(BatchHook(Box::new(move |inner| {
+                        Box::pin(async move {
+                            use std::sync::atomic::Ordering::SeqCst;
+                            if left.fetch_sub(1, SeqCst) == 0 {
+                                left.store(0, SeqCst);
+                                return;
+                            }
+                            let other = DurableSchemaRegistry::new(inner)
+                                .await
+                                .unwrap();
+                            let n = other
+                                .get_latest(&key)
+                                .await
+                                .unwrap()
+                                .map_or(0, |v| v.version);
+                            other
+                                .register_with_checkpoint(
+                                    &key,
+                                    &format!("other-{n}"),
+                                    &serde_json::json!({ "other": n }),
+                                    None,
+                                )
+                                .await
+                                .unwrap();
+                            register_before(again, key, left);
+                        })
+                    })));
+            }
+            for (others, commits) in [
+                (1, true),
+                (BATCH_CONFLICT_RETRIES, true),
+                (BATCH_CONFLICT_RETRIES + 1, false),
+            ] {
+                let st = store();
+                let mut ctx = ctx_on(st.fault.clone()).await;
+                let proven = pending(&mut ctx, &[("a", "x")], false).await;
+                let k = key(&ctx, "a");
+                register_before(
+                    st.fault.clone(),
+                    k.clone(),
+                    Arc::new(std::sync::atomic::AtomicUsize::new(others)),
+                );
+                let result = commit(&ctx, &proven).await;
+                *st.fault.before_next_batch.lock().unwrap() = None;
+                let (p, cap) = &proven[0];
+                let (hashes, bound) = durable(&ctx, "a", &p.ddl_id).await;
+                let theirs: Vec<String> =
+                    (0..others).map(|n| format!("other-{n}")).collect();
+                if commits {
+                    assert_eq!(result.unwrap().len(), 1, "{others}");
+                    assert_eq!(hashes[..others], theirs[..]);
+                    assert_eq!(hashes[others..], [hash(cap)], "after theirs");
+                    assert_eq!(bound, Some(others as i32 + 1));
+                } else {
+                    assert!(result.is_err(), "{others}");
+                    assert_eq!(hashes, theirs, "no version from the proof");
+                    assert_eq!(bound, None);
+                }
+            }
+        }
+
+        /// The committed tables' timelines, found current or not.
+        async fn fresh(
+            ctx: &RunCtx,
+            proven: &[(Pending, Captured)],
+            committed: &[Committed],
+        ) -> Vec<Fresh> {
+            let scope = ctx.registry_scope.current().unwrap();
+            fresh_timelines(ctx, &scope, proven, committed).await
+        }
+
+        /// A proven table whose stream holds exactly its snapshot, its
+        /// `ddl` record and its binding is current: the timeline equals a
+        /// load of the store, and installs while the cache still holds the
+        /// snapshot. Once the cache has moved on, nothing installs.
+        #[tokio::test]
+        async fn a_current_timeline_equals_a_load_and_installs_only_over_its_snapshot()
+         {
+            let st = store();
+            let mut ctx = ctx_on(st.fault.clone()).await;
+            let proven =
+                pending(&mut ctx, &[("a", "x"), ("b", "y")], true).await;
+            let committed = commit(&ctx, &proven).await.unwrap();
+            let got = fresh(&ctx, &proven, &committed).await;
+            assert_eq!(got.len(), 2);
+            let mut loaded = ctx_on(st.fault.clone()).await;
+            for f in &got {
+                crate::mysql::mysql_selection::load_timelines(
+                    &mut loaded,
+                    std::slice::from_ref(&f.key),
+                )
+                .await;
+                let load =
+                    loaded.selection.timeline(&f.key.backend_key()).unwrap();
+                assert_eq!(f.timeline.records, load.records);
+                assert_eq!(f.timeline.table_head, load.table_head);
+                assert_eq!(f.timeline.streams.len(), load.streams.len());
+            }
+            let (a, b) = (&got[0], &got[1]);
+            assert!(ctx.selection.install_if_current(
+                &a.key,
+                &a.snapshot,
+                Arc::new(a.timeline.clone())
+            ));
+            assert_eq!(
+                ctx.selection
+                    .timeline(&a.key.backend_key())
+                    .unwrap()
+                    .records,
+                a.timeline.records
+            );
+            ctx.selection.invalidate(&b.key);
+            assert!(!ctx.selection.install_if_current(
+                &b.key,
+                &b.snapshot,
+                Arc::new(b.timeline.clone())
+            ));
+            assert!(ctx.selection.timeline(&b.key.backend_key()).is_none());
+        }
+
+        /// Not current, so the caller reloads instead: another writer's
+        /// entry in the table stream or in a barrier stream of the table
+        /// after the snapshot, a table without a snapshot (a replayed
+        /// record, or no store-gate witness), or a store read that fails.
+        #[tokio::test]
+        async fn a_timeline_not_current_is_left_to_reload() {
+            for case in ["table", "barrier", "no snapshot", "read fails"] {
+                let st = store();
+                let mut ctx = ctx_on(st.fault.clone()).await;
+                let proven =
+                    pending(&mut ctx, &[("a", "x")], case != "no snapshot")
+                        .await;
+                let k = key(&ctx, "a");
+                // Another writer's entry, after the snapshot.
+                let foreign = match case {
+                    "table" => {
+                        Some((ACTIVATION_NS, table_stream(&k), Kind::Ddl))
+                    }
+                    "barrier" => {
+                        let scope = BarrierScope::Database { db: "d".into() };
+                        Some((
+                            BARRIER_NS,
+                            barrier_stream(&k, &scope),
+                            Kind::Barrier { scope },
+                        ))
+                    }
+                    _ => None,
+                };
+                if let Some((ns, stream, kind)) = foreign {
+                    append(
+                        &ctx.registry_backend,
+                        ctx.schema.registry(),
+                        &k,
+                        ns,
+                        &stream,
+                        "foreign",
+                        &Record::new(wm(61), kind),
+                    )
+                    .await
+                    .unwrap();
+                }
+                let committed = commit(&ctx, &proven).await.unwrap();
+                st.fault.fail_log_read_meta.store(
+                    case == "read fails",
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                assert!(
+                    fresh(&ctx, &proven, &committed).await.is_empty(),
+                    "{case}"
+                );
+                st.fault
+                    .fail_log_read_meta
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                let (p, cap) = &proven[0];
+                assert_eq!(
+                    durable(&ctx, "a", &p.ddl_id).await,
+                    (vec![hash(cap)], Some(1)),
+                    "{case}: the proof itself is committed"
+                );
+            }
+        }
+    }
+
     /// Live MySQL 8.4 (Docker).
     mod live {
         use super::super::*;
