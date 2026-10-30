@@ -4,23 +4,31 @@ docs/design/mysql-ddl-proof-transactions.md, section 7, before any result
 was seen.
 
     analyze.py <series-dir> --old LABEL --new LABEL [--also LABEL ...]
-               [--max-diff 0.03]
+               [--max-diff 0.03] [--min-reps N] [--out DIR]
 
 With --max-diff (the instrumentation overhead check, section 6), a metric
 also needs its medians within that fraction of each other, in either
 direction, or within its absolute tolerance.
 
-Writes <series-dir>/summary.md and verdicts.json. The rule applies only to
-the end-to-end metrics; phase histograms are reported as distributions
-(count, mean), never judged, and are not traces of individual DDLs.
+Writes summary.md and verdicts.json to --out (default: the series
+directory). The rule applies only to the end-to-end metrics; phase
+histograms are reported as distributions (count, mean), never judged, and
+are not traces of individual DDLs.
 
-Exit status: 0 when every judged metric is "no worse" and every run is
-correct; 1 otherwise (a worse or inconclusive metric, a failed run, or a
-correctness failure).
+The series must be complete, or the analysis fails: the comparisons and
+repetitions come from the series' invocation.json, and every named build
+needs at least --min-reps (default: the invocation's repetitions, never
+fewer than 3) successful runs of every comparison, each with every metric
+of its kind.
+
+Exit status: 0 when the series is complete, every judged metric is "no
+worse" and every run is correct; 1 otherwise (an incomplete series, a worse
+or inconclusive metric, a failed run, or a correctness failure).
 """
 import argparse
 import json
 import pathlib
+import re
 import statistics
 import sys
 
@@ -35,6 +43,7 @@ TOLERANCE = {
     "drain_s": 1.0,
 }
 INCONCLUSIVE_SPREAD = 0.15
+MIN_REPS = 3
 
 
 def metrics(run):
@@ -42,18 +51,77 @@ def metrics(run):
     out = {"drain_s": run.get("drain_s")}
     if "ddl" in run:
         d = run["ddl"]
-        out["phase_completion_s"] = d["phase_completion_s"]
-        out["per_ddl_ms"] = d["per_ddl_ms"]
+        out["phase_completion_s"] = d.get("phase_completion_s")
+        out["per_ddl_ms"] = d.get("per_ddl_ms")
         if run.get("busy", 0) and d.get("busy_lag_ms"):
-            out["busy_lag_p99_ms"] = d["busy_lag_ms"]["p99"]
-            out["busy_lag_max_ms"] = d["busy_lag_ms"]["max"]
+            out["busy_lag_p99_ms"] = d["busy_lag_ms"].get("p99")
+            out["busy_lag_max_ms"] = d["busy_lag_ms"].get("max")
     if "activation" in run:
         a = run["activation"]
-        out["phase_completion_s"] = a["phase_completion_s"]
+        out["phase_completion_s"] = a.get("phase_completion_s")
         if a.get("activation_ms"):
-            out["activation_p50_ms"] = a["activation_ms"]["p50"]
-            out["activation_p99_ms"] = a["activation_ms"]["p99"]
-    return {k: v for k, v in out.items() if v is not None}
+            out["activation_p50_ms"] = a["activation_ms"].get("p50")
+            out["activation_p99_ms"] = a["activation_ms"].get("p99")
+    return {k: v for k, v in out.items() if isinstance(v, (int, float))}
+
+
+def required(run):
+    """The metrics a run of its kind must have, or None for an unknown kind."""
+    if "ddl" in run:
+        req = {"drain_s", "phase_completion_s", "per_ddl_ms"}
+        if run.get("rate", 0) > 0:
+            req |= {"busy_lag_p99_ms", "busy_lag_max_ms"}
+        return req
+    if "activation" in run:
+        return {"drain_s", "phase_completion_s", "activation_p50_ms", "activation_p99_ms"}
+    return None
+
+
+def invocation(d):
+    """(comparisons, repetitions, build labels) the series was started with."""
+    j = json.loads((d / "invocation.json").read_text())
+    args = j["args"]
+    m = re.search(r"comparisons: \[([^\]]*)\]", args)
+    r = re.search(r"\breps: (\d+)", args)
+    if not m or not r:
+        raise ValueError("invocation.json args name no comparisons or reps")
+    comparisons = re.findall(r'"([^"]+)"', m.group(1))
+    labels = [b["label"] for b in j.get("builds", [])]
+    return comparisons, int(r.group(1)), labels
+
+
+def completeness(runs, labels, comparisons, built, min_reps):
+    """Every reason the series cannot be judged; empty when it is complete."""
+    problems = []
+    if not runs:
+        problems.append("no runs")
+    if len(set(labels)) != len(labels):
+        problems.append(f"a build is named twice: {labels}")
+    for l in labels:
+        if l not in built:
+            problems.append(f"build {l} is not in the series (built: {', '.join(built)})")
+    for c in sorted({r.get("comparison") for r in runs} - set(comparisons), key=str):
+        problems.append(f"comparison {c} was not started by the series")
+    seen = set()
+    for r in runs:
+        key = (r.get("comparison"), r.get("build"), r.get("rep"))
+        if key in seen:
+            problems.append(f"{key[0]} {key[1]} rep {key[2]} appears twice")
+        seen.add(key)
+    for c in comparisons:
+        for l in labels:
+            ok = [r for r in runs if r.get("comparison") == c and r.get("build") == l and "failed" not in r]
+            if len(ok) < min_reps:
+                problems.append(f"{c} {l}: {len(ok)} successful runs, need {min_reps}")
+            for r in ok:
+                req = required(r)
+                if req is None:
+                    problems.append(f"{c} {l} rep {r.get('rep')}: neither a ddl nor an activation run")
+                    continue
+                missing = sorted(req - set(metrics(r)))
+                if missing:
+                    problems.append(f"{c} {l} rep {r.get('rep')}: missing {', '.join(missing)}")
+    return problems
 
 
 def spread(values):
@@ -116,10 +184,23 @@ def main():
     ap.add_argument("--new", required=True)
     ap.add_argument("--also", action="append", default=[])
     ap.add_argument("--max-diff", type=float)
+    ap.add_argument("--min-reps", type=int)
+    ap.add_argument("--out")
     a = ap.parse_args()
     d = pathlib.Path(a.series)
-    runs = [json.loads(l) for l in (d / "runs.jsonl").read_text().splitlines() if l]
+    out = pathlib.Path(a.out) if a.out else d
+    out.mkdir(parents=True, exist_ok=True)
+    runs_file = d / "runs.jsonl"
+    runs = [json.loads(l) for l in runs_file.read_text().splitlines() if l] if runs_file.exists() else []
     labels = [a.old, a.new, *a.also]
+    try:
+        comparisons, reps, built = invocation(d)
+        problems = []
+    except (OSError, ValueError, KeyError) as e:
+        comparisons, reps, built = sorted({r.get("comparison") for r in runs}, key=str), 0, []
+        problems = [f"invocation.json unusable: {e}"]
+    min_reps = max(a.min_reps if a.min_reps is not None else reps, MIN_REPS)
+    problems += completeness(runs, labels, comparisons, built, min_reps)
     failed = [r for r in runs if "failed" in r]
     incorrect = [
         r for r in runs
@@ -129,13 +210,14 @@ def main():
     lines = [f"# actdiag summary: {d.name}", ""]
     lines += [
         f"Runs: {len(runs)}; failed: {len(failed)}; incorrect: {len(incorrect)}.",
+        f"Comparisons: {', '.join(comparisons) or '-'}; at least {min_reps} successful runs per build.",
         f"Judged: `{a.new}` against `{a.old}` (section 7 rule; tolerances "
         + ", ".join(f"{k} {v}" for k, v in TOLERANCE.items()) + ").",
         "",
     ]
-    for cmp in sorted({r["comparison"] for r in runs}):
-        ok = [r for r in runs if r["comparison"] == cmp and "failed" not in r]
-        by = {l: [r for r in ok if r["build"] == l] for l in labels}
+    for cmp in comparisons:
+        ok = [r for r in runs if r.get("comparison") == cmp and "failed" not in r]
+        by = {l: [r for r in ok if r.get("build") == l] for l in labels}
         lines += [f"## {cmp}", ""]
         names = sorted({k for r in ok for k in metrics(r)})
         lines.append("| metric | " + " | ".join(f"{l} median (runs)" for l in labels) + " | verdict |")
@@ -178,6 +260,10 @@ def main():
                     f"{per['advisory_xact_locks']:.1f} store-lock calls"
                 )
         lines.append("")
+    if not verdicts:
+        problems.append("no metric was judged")
+    if problems:
+        lines += ["## Incomplete series (not judged)", ""] + [f"- {p}" for p in problems] + [""]
     if failed or incorrect:
         lines += ["## Failed or incorrect runs", ""]
         for r in failed:
@@ -185,13 +271,15 @@ def main():
         for r in incorrect:
             lines.append(f"- {r['comparison']} {r['build']} rep {r.get('rep')}: ledger not equal")
         lines.append("")
-    (d / "summary.md").write_text("\n".join(lines) + "\n")
-    (d / "verdicts.json").write_text(json.dumps(verdicts, indent=2) + "\n")
+    (out / "summary.md").write_text("\n".join(lines) + "\n")
+    (out / "verdicts.json").write_text(
+        json.dumps({"complete": not problems, "problems": problems, "verdicts": verdicts}, indent=2) + "\n"
+    )
     bad = any(
         j["verdict"] != "no worse" for c in verdicts.values() for j in c.values()
     )
-    print((d / "summary.md").read_text())
-    sys.exit(1 if bad or failed or incorrect else 0)
+    print((out / "summary.md").read_text())
+    sys.exit(1 if problems or bad or failed or incorrect else 0)
 
 
 if __name__ == "__main__":

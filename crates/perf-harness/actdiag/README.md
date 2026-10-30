@@ -13,7 +13,8 @@ changes no product behavior. Its own check is `smoke.sh`.
 | `build.sh` | Builds one runner, `plain` or with the `perf-phases` feature, in a dedicated worktree, and records its identity (`identity.json`). |
 | `backport_phases.py` | Applies the `perf-phases` instrumentation to f0171b4e or 3ff3773c, which predate it. |
 | `patches/` | That instrumentation as a patch per revision. |
-| `analyze.py` | Summarizes a series and judges it by the section 7 rule. |
+| `analyze.py` | Summarizes a series and judges it by the section 7 rule; fails on an incomplete series. |
+| `analyze_test.py` | The analyzer's synthetic checks (`python3 -I analyze_test.py`). |
 | `smoke.sh` | The harness's unit tests and a 10-DDL run of one build against itself. |
 | `retain.sh` | Manifest, durable copy and verification of a completed series. |
 
@@ -101,6 +102,14 @@ recorded and kept.
    ```
    analyze.py target/perf/evidence/<series> --old old --new change --also main
    ```
+
+   The series must be complete, or the analysis exits 1 and lists what is
+   missing under "Incomplete series": every comparison of its
+   `invocation.json`, every named build of it, at least the invocation's
+   repetitions (never fewer than 3) of successful runs per build and
+   comparison, no repetition twice, and every metric of a run's kind in
+   each of them. `--out` writes the summary elsewhere, as a re-analysis of
+   a retained series does.
 
 5. Retain it with `retain.sh target/perf/evidence/<series>`, before removing
    anything of it.

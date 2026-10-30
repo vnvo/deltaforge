@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# The harness's own check (outside the core gate): its unit tests, then a
-# 10-DDL unloaded comparison of one build against itself on the PostgreSQL
-# store, which must drain authoritatively with the ledger equal in every
-# run. Run before every measured series and after any harness change.
+# The harness's own check (outside the core gate): its unit tests and the
+# analyzer's synthetic checks, then a 10-DDL unloaded comparison of one build
+# against itself on the PostgreSQL store, which must drain authoritatively
+# with the ledger equal in every run. Run before every measured series and after any harness change.
 #
 #   smoke.sh <build-dir> <out-dir>
 set -euo pipefail
@@ -10,6 +10,7 @@ BUILD=$1 OUT=$2
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$ROOT"
 cargo test -q -p perf-harness --bin actdiag
+python3 -I crates/perf-harness/actdiag/analyze_test.py
 cargo build -q --release -p perf-harness --bin actdiag
 target/release/actdiag --build a="$BUILD" --build b="$BUILD" \
   --comparisons ddl-unloaded --scale 0.034 --reps 1 --store postgres \
@@ -26,6 +27,9 @@ for r in runs:
     assert r["drain"]["checkpoints"], "no sink checkpoint"
 print("smoke: 2 runs drained, ledgers equal")
 PY
-python3 crates/perf-harness/actdiag/analyze.py "$OUT" --old a --new b >/dev/null || true
+# One repetition is below the analyzer's minimum: the summary is written and
+# the series reported incomplete.
+python3 -I crates/perf-harness/actdiag/analyze.py "$OUT" --old a --new b >/dev/null && exit 1
+grep -q "Incomplete series" "$OUT/summary.md"
 test -s "$OUT/summary.md"
 echo "smoke: ok ($OUT)"

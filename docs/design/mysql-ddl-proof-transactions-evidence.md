@@ -30,6 +30,13 @@ were removed.
 | pg-ddl-20261030 | 27 | 0 | 0 | c63022dbcaeac8c3dd83f21abb5beaf485c4586b2766d5398c1239fcabcc4000 |
 | sqlite-act-20261030 | 27 | 0 | 0 | 85aa8a8ed9faed0fea578d6eaa8a7665db4966779d072c27f302693a28ddd346 |
 
+The analyzer fails on an incomplete series. That means a missing build,
+comparison or metric, fewer repetitions than the series was started with
+(never fewer than 3), or no judged metric. All three series were
+re-analyzed from their retained copies with it. Each is complete, and every
+verdict is identical to the original analysis. The re-analysis is retained
+as `reanalysis-20261031`.
+
 ## Instrumentation overhead (section 6)
 
 `ddl-unloaded` and `ddl-loaded` on PostgreSQL, each revision built with and
