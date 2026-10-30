@@ -185,10 +185,18 @@ struct Build {
 }
 
 async fn start_kafka() -> Result<ContainerAsync<GenericImage>> {
-    std::process::Command::new("docker")
-        .args(["rm", "-f", KAFKA_NAME])
+    // A leftover broker of an earlier invocation is not ours to remove: it
+    // is reported and the series refuses to start.
+    let out = std::process::Command::new("docker")
+        .args(["ps", "-aq", "--filter", &format!("name=^/{KAFKA_NAME}$")])
         .output()
-        .ok();
+        .context("docker ps")?;
+    let leftover = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !leftover.is_empty() {
+        bail!(
+            "container {KAFKA_NAME} ({leftover}) exists; remove it by ID once it is checked"
+        );
+    }
     let c = GenericImage::new(KAFKA_IMAGE.0, KAFKA_IMAGE.1)
         .with_wait_for(WaitFor::Duration {
             length: Duration::from_secs(15),
