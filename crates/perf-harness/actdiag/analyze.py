@@ -17,9 +17,8 @@ are not traces of individual DDLs.
 
 The series must be complete, or the analysis fails: the comparisons and
 repetitions come from the series' invocation.json, and every named build
-needs at least --min-reps (default: the invocation's repetitions, never
-fewer than 3) successful runs of every comparison, each with every metric
-of its kind.
+needs at least the largest of the invocation's repetitions, --min-reps and
+3 successful runs of every comparison, each with every metric of its kind.
 
 Exit status: 0 when the series is complete, every judged metric is "no
 worse" and every run is correct; 1 otherwise (an incomplete series, a worse
@@ -199,7 +198,7 @@ def main():
     except (OSError, ValueError, KeyError) as e:
         comparisons, reps, built = sorted({r.get("comparison") for r in runs}, key=str), 0, []
         problems = [f"invocation.json unusable: {e}"]
-    min_reps = max(a.min_reps if a.min_reps is not None else reps, MIN_REPS)
+    min_reps = max(reps, a.min_reps or 0, MIN_REPS)
     problems += completeness(runs, labels, comparisons, built, min_reps)
     failed = [r for r in runs if "failed" in r]
     incorrect = [

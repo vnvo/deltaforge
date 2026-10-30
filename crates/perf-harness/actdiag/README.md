@@ -105,9 +105,10 @@ recorded and kept.
 
    The series must be complete, or the analysis exits 1 and lists what is
    missing under "Incomplete series": every comparison of its
-   `invocation.json`, every named build of it, at least the invocation's
-   repetitions (never fewer than 3) of successful runs per build and
-   comparison, no repetition twice, and every metric of a run's kind in
+   `invocation.json`, every named build of it, successful runs per build
+   and comparison numbering at least the largest of the invocation's
+   repetitions, `--min-reps` and 3 (a lower `--min-reps` never lowers the
+   invocation's count), no repetition twice, and every metric of a run's kind in
    each of them. `--out` writes the summary elsewhere, as a re-analysis of
    a retained series does.
 

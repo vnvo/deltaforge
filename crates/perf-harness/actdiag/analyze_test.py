@@ -120,6 +120,14 @@ class Analyze(unittest.TestCase):
         rc, v = self.analyze(series(reps=2), reps=2, extra=("--min-reps", "1"))
         self.assert_incomplete(rc, v, "2 successful runs, need 3")
 
+    def test_a_lower_minimum_does_not_override_the_invocation(self):
+        rc, v = self.analyze(series(reps=3), reps=5, extra=("--min-reps", "3"))
+        self.assert_incomplete(rc, v, "3 successful runs, need 5")
+
+    def test_a_higher_minimum_raises_the_invocation(self):
+        rc, v = self.analyze(series(reps=3), reps=3, extra=("--min-reps", "4"))
+        self.assert_incomplete(rc, v, "3 successful runs, need 4")
+
     def test_a_failed_run_does_not_count_as_a_repetition(self):
         runs = series()
         runs[0]["failed"] = "drain timeout"
