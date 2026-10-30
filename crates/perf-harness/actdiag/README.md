@@ -27,14 +27,22 @@ CAB).
 | Comparison | Fixture | Load during the phase | Phase |
 |---|---|---|---|
 | `ddl-unloaded` | 100 tables | none | 300 `CREATE TABLE`, each followed by a row in the new table |
-| `ddl-loaded` | 1,000 tables | 2,000 rows/s on 150 busy tables | 1,000 DDLs alternating `CREATE TABLE` (with a row) and `ALTER TABLE .. ADD COLUMN` on a busy table (with a row through its writer) |
+| `ddl-loaded` | 1,000 tables | 2,000 rows/s on 150 busy tables | 1,000 DDLs alternating `CREATE TABLE` (with a row) and `ALTER TABLE .. ADD COLUMN` of a cached idle table, each altered once (with a row through its writer) |
 | `ddl-burst` | 150 tables | 2,000 rows/s on all 150 | 4,200 `CREATE TABLE`, each with a row: 4,350 tables pass the 4,096-table cache |
 | `act-fresh` | 200 tables | - | first rows at 400/s, one per table, then 10 s of ordinary rows |
 | `act-burst` | 200 tables | - | all first rows at once, then ordinary rows |
 | `act-restart` | 200 tables | - | activated, drained and restarted, then first rows at 400/s |
 
-Busy tables get one row each before the phase, so their timelines are
-cached when the DDLs start. The DDLs run on one connection as fast as the
+Busy tables, and the tables the ALTERs change, get one row each before the
+phase, so their timelines are cached when the DDLs start. No table is
+altered twice: a table altered again before its forward proof runs keeps
+the earlier DDL pending, and without `binlog_row_metadata = FULL` its next
+rows stop the source (the known forward-proof failure follow-up), a
+different path from the one measured here.
+
+A restart re-creates the pipeline with the same spec (the runner does not
+keep API-created pipelines); the same source id resumes from its durable
+state. The DDLs run on one connection as fast as the
 server accepts them, so the runner works through a backlog.
 
 ## What a run measures

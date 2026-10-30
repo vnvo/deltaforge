@@ -98,7 +98,9 @@ enum DdlKind {
     /// `CREATE TABLE` of a new table, then a row into it.
     Create,
     /// Alternately a `CREATE TABLE` and an `ALTER TABLE .. ADD COLUMN` of a
-    /// busy table (its row through that table's writer).
+    /// cached idle table, each altered once (its row through its writer):
+    /// a table altered again before its proof runs keeps that DDL pending,
+    /// which is a different path (the forward-proof failure follow-up).
     Alternate,
 }
 
@@ -220,6 +222,7 @@ async fn start_kafka() -> Result<ContainerAsync<GenericImage>> {
         .with_env_var("CLUSTER_ID", "QWN0RGlhZ0thZmthMDAwMQ")
         // The image runs as appuser: a tmpfs it can write.
         .with_mount(Mount::tmpfs_mount("/var/lib/kafka/data").with_mode(0o1777))
+        .with_mount(Mount::tmpfs_mount("/etc/kafka/secrets").with_mode(0o1777))
         .with_mapped_port(KAFKA_HOST_PORT, KAFKA_HOST_PORT.tcp())
         .gate_owned()
         .start()
@@ -247,6 +250,25 @@ async fn create_topic(topic: &str) -> Result<()> {
         r.map_err(|(t, e)| anyhow!("create topic {t}: {e}"))?;
     }
     Ok(())
+}
+
+/// The containers this invocation created, by exact ID.
+static CREATED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn created(id: &str) {
+    CREATED.lock().unwrap().push(id.to_string());
+}
+
+/// Remove every container this invocation created that still exists, with
+/// any anonymous volume (there is none: data is on tmpfs).
+fn remove_created() {
+    let ids: Vec<String> = CREATED.lock().unwrap().drain(..).collect();
+    for id in ids {
+        std::process::Command::new("docker")
+            .args(["rm", "-f", "-v", &id])
+            .output()
+            .ok();
+    }
 }
 
 /// One repetition's MySQL server and state store.
@@ -302,6 +324,10 @@ impl Fresh {
         } else {
             None
         };
+        created(mysql.id());
+        if let Some(c) = &state {
+            created(c.id());
+        }
         let fresh = Fresh { mysql, state };
         // The images restart once after initializing: wait for a session.
         let deadline = Instant::now() + Duration::from_secs(120);
@@ -472,6 +498,15 @@ async fn api(
         bail!("{path}: {status}: {text}");
     }
     Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+/// The blocking incidents of a pipeline that failed, or `None` while it
+/// has not.
+async fn failure(name: &str) -> Option<String> {
+    let v = api(reqwest::Method::GET, &format!("/pipelines/{name}"), None)
+        .await
+        .ok()?;
+    (v["status"] == "failed").then(|| v["incidents"]["blocking"].to_string())
 }
 
 async fn wait_running(name: &str) -> Result<()> {
@@ -884,7 +919,12 @@ impl Live {
 
 /// Insert a marker into the control table until one arrives; the time from
 /// the first marker.
-async fn marker(fresh: &Fresh, live: &Live, timeout: Duration) -> Result<f64> {
+async fn marker(
+    fresh: &Fresh,
+    name: &str,
+    live: &Live,
+    timeout: Duration,
+) -> Result<f64> {
     let mut c = mysql_async::Conn::from_url(fresh.loadgen_dsn().await?).await?;
     let t0 = Instant::now();
     loop {
@@ -906,6 +946,9 @@ async fn marker(fresh: &Fresh, live: &Live, timeout: Duration) -> Result<f64> {
                 return Ok(t0.elapsed().as_secs_f64());
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if let Some(f) = failure(name).await {
+            bail!("the pipeline failed: {f}");
         }
         if t0.elapsed() > timeout {
             bail!("no marker arrived within {timeout:?}");
@@ -1052,6 +1095,10 @@ async fn drain(
                 json!({"final_gtid": final_gtid, "checkpoints": cps, "ledger": ledger}),
             ));
         }
+        if let Some(f) = failure(name).await {
+            c.disconnect().await.ok();
+            bail!("the pipeline failed while draining: {f}");
+        }
         if t0.elapsed() > timeout {
             c.disconnect().await.ok();
             bail!(
@@ -1122,7 +1169,8 @@ async fn run_on(
     )?;
     api(reqwest::Method::POST, "/pipelines", Some(&spec)).await?;
     wait_running(&name).await?;
-    let first_marker_s = marker(fresh, &live, Duration::from_secs(120)).await?;
+    let first_marker_s =
+        marker(fresh, &name, &live, Duration::from_secs(120)).await?;
 
     let mut result = json!({
         "comparison": cmp.name,
@@ -1156,8 +1204,11 @@ async fn run_on(
             runner.down().await?;
             restarts += 1;
             runner = launch(build, dir, state_dsn.as_deref(), restarts).await?;
+            // API-created pipelines are not kept across a restart: the same
+            // spec (same source id) resumes from its durable state.
+            api(reqwest::Method::POST, "/pipelines", Some(&spec)).await?;
             wait_running(&name).await?;
-            marker(fresh, &live, Duration::from_secs(120)).await?;
+            marker(fresh, &name, &live, Duration::from_secs(120)).await?;
         }
         let before = metrics_text().await;
         // First rows: one per table, at the rate or all at once.
@@ -1235,12 +1286,26 @@ async fn run_on(
         result["phases"] = phase_delta(&before, &after);
         result["counters_after"] = json!(counters(&after));
     } else {
-        // Busy tables: cached by a first row each, then loaded.
+        // Busy tables, and the idle tables the ALTERs change: cached by a
+        // first row each. Then the busy tables are loaded.
         let busy: Vec<u32> = (0..cmp.busy as u32).collect();
-        for &t in &busy {
+        let n_alters = match cmp.ddl {
+            DdlKind::Alternate => cmp.ddls / 2,
+            DdlKind::Create => 0,
+        };
+        if cmp.busy + n_alters > cmp.tables {
+            bail!(
+                "{} busy and {n_alters} altered tables need {} tables",
+                cmp.busy,
+                cmp.busy + n_alters
+            );
+        }
+        let altered: Vec<u32> =
+            (cmp.busy as u32..(cmp.busy + n_alters) as u32).collect();
+        for &t in busy.iter().chain(&altered) {
             writers.send(live.id(), t, false)?;
         }
-        if !busy.is_empty() {
+        if !busy.is_empty() || !altered.is_empty() {
             drain(fresh, &name, &live, drain_timeout).await?;
         }
         let loader = (!busy.is_empty() && cmp.rate > 0.0).then(|| {
@@ -1268,8 +1333,9 @@ async fn run_on(
         let mut alters = 0usize;
         let t_ddl = Instant::now();
         for i in 0..cmp.ddls {
-            let create =
-                cmp.ddl == DdlKind::Create || i % 2 == 0 || busy.is_empty();
+            let create = cmp.ddl == DdlKind::Create
+                || i % 2 == 0
+                || alters >= altered.len();
             let id = live.id();
             if create {
                 ddl_conn
@@ -1291,7 +1357,7 @@ async fn run_on(
                     ddl: true,
                 });
             } else {
-                let t = busy[alters % busy.len()];
+                let t = altered[alters];
                 alters += 1;
                 ddl_conn
                     .query_drop(format!(
@@ -1307,6 +1373,7 @@ async fn run_on(
         ddl_conn.disconnect().await.ok();
         // Phase completion: every DDL's row delivered.
         let deadline = Instant::now() + drain_timeout;
+        let mut polls = 0u64;
         let t_done = loop {
             let done = {
                 let seen = live.seen.lock().unwrap();
@@ -1319,12 +1386,16 @@ async fn run_on(
                 break ats.into_iter().max().unwrap_or(t_ddl);
             }
             if Instant::now() > deadline {
-                halt.store(true, Ordering::Relaxed);
-                stop.store(true, Ordering::Relaxed);
                 bail!(
                     "the DDL phase did not complete within {drain_timeout:?}"
                 );
             }
+            if polls.is_multiple_of(10)
+                && let Some(f) = failure(&name).await
+            {
+                bail!("the pipeline failed in the DDL phase: {f}");
+            }
+            polls += 1;
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
         let after_phase = metrics_text().await;
@@ -1538,60 +1609,77 @@ async fn main() -> Result<()> {
         args.out.join("invocation.json"),
         serde_json::to_vec_pretty(&environment(&args, &builds).await)?,
     )?;
-    let _kafka = start_kafka().await?;
-    let mut runs = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(args.out.join("runs.jsonl"))?;
-    let mut seq: u64 = 1;
-    for cmp in &comparisons {
-        let drain_timeout = args
-            .drain_timeout_s
-            .map(Duration::from_secs)
-            .unwrap_or(cmp.drain_timeout);
-        for rep in 0..args.reps {
-            // Rotated order: rep r starts at build r.
-            for k in 0..builds.len() {
-                let build = &builds[(rep + k) % builds.len()];
-                let dir = args.out.join("runs").join(format!(
-                    "{}-{}-r{}",
-                    cmp.name,
-                    build.label,
-                    rep + 1
-                ));
-                eprintln!(
-                    "[{}] {} {} rep {} (seq {seq})",
-                    sh("date -Is"),
-                    cmp.name,
-                    build.label,
-                    rep + 1
-                );
-                let mut v = run(
-                    cmp,
-                    build,
-                    args.store == "postgres",
-                    seq,
-                    args.seed + rep as u64,
-                    &dir,
-                    drain_timeout,
-                )
-                .await?;
-                v["rep"] = json!(rep + 1);
-                v["order"] = json!(k);
-                v["comparison"] = json!(cmp.name);
-                v["build"] = json!(build.label);
-                v["store"] = json!(args.store);
-                use std::io::Write as _;
-                writeln!(runs, "{}", serde_json::to_string(&v)?)?;
-                runs.flush()?;
-                if let Some(f) = v.get("failed") {
-                    eprintln!("  FAILED: {f}");
+    let kafka = start_kafka().await?;
+    created(kafka.id());
+    let series = async {
+        let mut runs = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(args.out.join("runs.jsonl"))?;
+        let mut seq: u64 = 1;
+        for cmp in &comparisons {
+            let drain_timeout = args
+                .drain_timeout_s
+                .map(Duration::from_secs)
+                .unwrap_or(cmp.drain_timeout);
+            for rep in 0..args.reps {
+                // Rotated order: rep r starts at build r.
+                for k in 0..builds.len() {
+                    let build = &builds[(rep + k) % builds.len()];
+                    let dir = args.out.join("runs").join(format!(
+                        "{}-{}-r{}",
+                        cmp.name,
+                        build.label,
+                        rep + 1
+                    ));
+                    eprintln!(
+                        "[{}] {} {} rep {} (seq {seq})",
+                        sh("date -Is"),
+                        cmp.name,
+                        build.label,
+                        rep + 1
+                    );
+                    let mut v = run(
+                        cmp,
+                        build,
+                        args.store == "postgres",
+                        seq,
+                        args.seed + rep as u64,
+                        &dir,
+                        drain_timeout,
+                    )
+                    .await?;
+                    v["rep"] = json!(rep + 1);
+                    v["order"] = json!(k);
+                    v["comparison"] = json!(cmp.name);
+                    v["build"] = json!(build.label);
+                    v["store"] = json!(args.store);
+                    use std::io::Write as _;
+                    writeln!(runs, "{}", serde_json::to_string(&v)?)?;
+                    runs.flush()?;
+                    if let Some(f) = v.get("failed") {
+                        eprintln!("  FAILED: {f}");
+                    }
+                    seq += 1;
                 }
-                seq += 1;
             }
         }
-    }
-    Ok(())
+        Ok::<_, anyhow::Error>(())
+    };
+    // An interrupt ends the series like a failure: the current run's
+    // runner is killed with it, and every container this invocation
+    // created is removed.
+    let mut term = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate(),
+    )?;
+    let result = tokio::select! {
+        r = series => r,
+        _ = tokio::signal::ctrl_c() => Err(anyhow!("interrupted")),
+        _ = term.recv() => Err(anyhow!("terminated")),
+    };
+    drop(kafka);
+    remove_created();
+    result
 }
 
 #[cfg(test)]
