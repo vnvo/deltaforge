@@ -3232,6 +3232,41 @@ mod tests {
                 assert_eq!((versions.len(), bound), (1, Some(1)));
             }
 
+            /// A stop that arrives after the last batch committed, while its
+            /// timeline's freshness is read, still ends the proof: the
+            /// binding stays, the proof ends `Cancelled` (the DDL is not
+            /// emitted).
+            #[tokio::test(start_paused = true)]
+            async fn a_stop_during_the_freshness_reads_is_honored() {
+                let st = store();
+                let mut ctx = ctx_with(&st, bounds()).await;
+                let p: Vec<Pending> = pending(&mut ctx, &[("a", "x")], true)
+                    .await
+                    .into_iter()
+                    .map(|(p, _)| p)
+                    .collect();
+                let id = p[0].ddl_id.clone();
+                let cancel = ctx.cancel.clone();
+                let fault = st.fault.clone();
+                // Armed as the batch starts: the next plan read is the
+                // freshness read after the commit.
+                *st.fault.before_next_batch.lock().unwrap() =
+                    Some(BatchHook(Box::new(move |_| {
+                        *fault.before_next_read_batch.lock().unwrap() =
+                            Some(BatchHook(Box::new(move |_| {
+                                cancel.cancel();
+                                Box::pin(async {})
+                            })));
+                        Box::pin(async {})
+                    })));
+                let err = prove_with(&ctx, &Script::default(), p)
+                    .await
+                    .err()
+                    .unwrap();
+                assert!(matches!(err, SourceError::Cancelled), "{err}");
+                assert_eq!(durable(&ctx, "a", &id).await.1, Some(1));
+            }
+
             /// Every failure has one decision; the transient ones (and only
             /// they) are retried, identity, saturation and credentials stop,
             /// and evidence, bounds, retention and protocol defer.
