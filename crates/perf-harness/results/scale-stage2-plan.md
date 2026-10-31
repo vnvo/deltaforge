@@ -134,10 +134,11 @@ is a lower bound on the true peak.
   (`deltaforge_mysql_selection_cache_bytes` and
   `deltaforge_mysql_selection_cache_timelines`, new, sampled every 250 ms),
   against its limits of 4,096 tables and 256 MiB;
-- **in-flight working memory:** the largest activation window's payload
-  (the proof trace's window `bytes`), against the 64 MiB plan budget; a
-  history load in flight is bounded by one timeline's limit and is not
-  measured separately;
+- **in-flight working memory:** the largest activation window's buffered
+  binary-log events (the proof trace's window `bytes`). A plan's write
+  payload (at most 64 MiB) and a history load in flight (at most one
+  timeline's limit) are bounded by construction and not exported, so they
+  are not measured;
 - **process:** RSS sampled every 250 ms, and jemalloc's allocation totals.
 
 ## Drain completion
