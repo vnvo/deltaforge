@@ -2787,6 +2787,51 @@ mod tests {
                 ));
             }
 
+            /// A saturated control plane on a retry stops the source on
+            /// `mysql_control_plane_saturated`, as before retries existed;
+            /// the retrying incident is withdrawn
+            /// (`ended_by_mysql_control_plane_saturated`).
+            #[tokio::test(start_paused = true)]
+            async fn saturation_stops_the_retries() {
+                let st = store();
+                let mut ctx = ctx_with(&st, bounds()).await;
+                let p = tables(&mut ctx, &["a"]).await;
+                let script = Script::with(&[(
+                    "a",
+                    vec![
+                        contention(),
+                        Step::Fail(
+                            ProofError::Saturated {
+                                scope: "runner",
+                                why: "full".into(),
+                            },
+                            Duration::ZERO,
+                        ),
+                    ],
+                )]);
+                let err = prove_with(&ctx, &script, p).await.err().unwrap();
+                assert_eq!(
+                    err.draft().map(|d| d.reason_code),
+                    Some(ReasonCode::MysqlControlPlaneSaturated)
+                );
+                assert_eq!(script.calls.lock().unwrap().len(), 2);
+                let rec = ctx
+                    .incidents
+                    .list()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|r| {
+                        r.reason_code
+                            == ReasonCode::MysqlForwardProofUnavailable
+                    })
+                    .unwrap();
+                assert!(
+                    withdrawn(&rec, "ended_by_mysql_control_plane_saturated"),
+                    "{rec:?}"
+                );
+            }
+
             /// A stop during a backoff (30.5 s, in the first one), or during
             /// a capture's lock wait (40 s, in the second attempt), ends the
             /// proof at once: `Cancelled`, the retrying incident withdrawn
@@ -4339,6 +4384,15 @@ mod tests {
             }
         }
 
+        /// The `observed` records binding `ddl`: exactly one once bound.
+        fn bindings(recs: &[Stored], ddl: &Stored) -> usize {
+            recs.iter()
+                .filter(|s| {
+                    matches!(&s.record.kind, Kind::Observed { binds: Some(b), .. } if *b == ddl.capture_id)
+                })
+                .count()
+        }
+
         /// The pipeline's incidents.
         async fn incidents(
             st: &State,
@@ -4491,6 +4545,7 @@ mod tests {
                 bound(&st, db, "t", &recs, d[0]).await.is_some(),
                 "bound by a retried forward proof, not deferred"
             );
+            assert_eq!(bindings(&recs, d[0]), 1, "one durable binding");
             assert_eq!(versions(&st, db, "t").await, before + 1);
             assert!(
                 !recs
@@ -4619,12 +4674,34 @@ mod tests {
             let d = ddls(&recs);
             assert_eq!(d.len(), 1);
             assert!(bound(&st, db, "t", &recs, d[0]).await.is_some());
+            assert_eq!(bindings(&recs, d[0]), 1, "one durable binding");
             let row = row_of(&mut r.rx, "t").await;
             assert_eq!(
                 row.after.as_ref().unwrap().get("w"),
                 Some(&deltaforge_core::canonical::fixture::value(
                     &serde_json::json!(7)
                 ))
+            );
+            // Within this uninterrupted run the row is delivered once (a
+            // duplicate across the stop and replay would be allowed: delivery
+            // is at-least-once).
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        match r.rx.recv().await {
+                            Some(SourceItem::Event(e))
+                                if e.ddl.is_none() && e.source.table == "t" =>
+                            {
+                                break;
+                            }
+                            Some(_) => {}
+                            None => std::future::pending::<()>().await,
+                        }
+                    }
+                })
+                .await
+                .is_err(),
+                "the row once"
             );
             stop(r.handle).await;
         }
