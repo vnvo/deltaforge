@@ -244,7 +244,8 @@ pub async fn fixture(infra: &Infra, tables: usize) -> Result<f64> {
             .await?;
     }
     c.disconnect().await?;
-    // Tables on 8 connections.
+    // Tables on 8 connections (aborted if the build is cancelled).
+    let mut guard = Tasks::default();
     let mut tasks = Vec::new();
     for w in 0..8 {
         let mut c = root(infra).await?;
@@ -259,6 +260,7 @@ pub async fn fixture(infra: &Infra, tables: usize) -> Result<f64> {
             c.disconnect().await?;
             Ok::<_, anyhow::Error>(())
         }));
+        guard.add(tasks.last().unwrap());
     }
     for t in tasks {
         t.await??;
@@ -275,7 +277,8 @@ struct Commit {
 }
 
 /// What arrived: per id the first arrival, duplicates, order violations
-/// (a table's id below one already seen), and bytes.
+/// (a table's id below one already seen), rows from outside the run's ids,
+/// bytes, and the next offset to read (the topic has one partition).
 #[derive(Default)]
 struct Seen {
     first: HashMap<i64, Instant>,
@@ -283,12 +286,16 @@ struct Seen {
     duplicates: u64,
     out_of_order: u64,
     unknown_table: u64,
+    foreign: u64,
     bytes: u64,
     first_marker: Option<Instant>,
+    markers: std::collections::HashSet<i64>,
+    next_offset: i64,
 }
 
 fn consume(
     topic: &str,
+    id_base: i64,
     tables: Arc<HashMap<String, u32>>,
     seen: Arc<Mutex<Seen>>,
     stop: Arc<AtomicBool>,
@@ -317,8 +324,9 @@ fn consume(
                 Err(_) => continue,
             };
             let now = Instant::now();
-            let Some(payload) = m.payload() else { continue };
             let mut s = seen.lock().unwrap();
+            s.next_offset = s.next_offset.max(m.offset() + 1);
+            let Some(payload) = m.payload() else { continue };
             s.bytes += (payload.len() + m.key().map_or(0, <[u8]>::len)) as u64;
             let Ok(v) = serde_json::from_slice::<Value>(payload) else {
                 continue;
@@ -330,8 +338,15 @@ fn consume(
                 _ => None,
             };
             let Some(id) = id else { continue };
+            // A row of another run (an earlier run's events, if any were
+            // still readable) fails the run.
+            if id < id_base || id >= id_base + RUN_IDS {
+                s.foreign += 1;
+                continue;
+            }
             if id % RUN_IDS >= MARKER {
                 s.first_marker.get_or_insert(now);
+                s.markers.insert(id);
                 continue;
             }
             let name = format!(
@@ -361,7 +376,7 @@ fn consume(
 /// DeltaForge's counters of the study, summed over labels. Its histograms
 /// are exported as summaries: their `_sum` and `_count` series are read
 /// (the bare name carries quantiles).
-const DF_COUNTERS: [&str; 17] = [
+const DF_COUNTERS: [&str; 25] = [
     "deltaforge_checkpoints_total",
     "deltaforge_kafka_requests_total",
     "deltaforge_sink_bytes_total",
@@ -382,6 +397,15 @@ const DF_COUNTERS: [&str; 17] = [
     "deltaforge_mysql_proof_scan_seconds_count",
     "deltaforge_mysql_proof_scan_seek_seconds_sum",
     "deltaforge_mysql_proof_scan_setup_seconds_sum",
+    "deltaforge_mysql_activation_windows_total",
+    "deltaforge_mysql_selection_cache_evictions_total",
+    // Measured failures (`DF_FAILURES`).
+    "deltaforge_mysql_control_permit_timeouts_total",
+    "deltaforge_mysql_control_saturation_deferrals_total",
+    "deltaforge_mysql_activation_window_deferred_total",
+    "deltaforge_mysql_activation_window_overflow_total",
+    "deltaforge_mysql_proof_rounds_failed_total",
+    "deltaforge_mysql_capture_kill_failures_total",
 ];
 
 async fn df_counters() -> Option<HashMap<&'static str, f64>> {
@@ -489,6 +513,7 @@ async fn position_binlog(
         // Single-row transactions on the writers' connections until the
         // offset is reached.
         let done = Arc::new(AtomicBool::new(false));
+        let mut guard = Tasks::default();
         let mut tasks = Vec::new();
         for _ in 0..WRITERS {
             let mut w = loadgen(infra).await?;
@@ -505,6 +530,7 @@ async fn position_binlog(
                 w.disconnect().await.ok();
                 Ok::<_, anyhow::Error>(())
             }));
+            guard.add(tasks.last().unwrap());
         }
         let outcome = loop {
             let (f, pos) = binlog_position(c).await?;
@@ -556,6 +582,8 @@ fn proof_trace(stdout: &Path) -> Value {
     };
     let (mut proofs, mut seeks) = (0u64, Vec::new());
     let mut outcomes: HashMap<String, u64> = HashMap::new();
+    // Tables handed on after their window committed (activated).
+    let mut released = std::collections::HashSet::new();
     // Each activation window: its size beside its phases and state-store
     // commit, so the commit reads per table.
     let mut windows = Vec::new();
@@ -574,8 +602,16 @@ fn proof_trace(stdout: &Path) -> Value {
                     .or_default() += 1;
             }
             Some("scan") => seeks.push(r["seek_ms"].as_f64().unwrap_or(0.0)),
+            Some("release") => {
+                released.insert(format!(
+                    "{}.{}",
+                    r["db"].as_str().unwrap_or_default(),
+                    r["table"].as_str().unwrap_or_default()
+                ));
+            }
             Some("window") => windows.push(json!({
                 "tables": r["tables"], "events": r["events"],
+                "bytes": r["bytes"], "cut": r["cut"],
                 "closed_by": r["closed_by"], "prefetched": r["prefetched"],
                 "read_ms": r["read_ms"], "capture_ms": r["capture_ms"],
                 "capture_lock_ms": r["capture_lock_ms"],
@@ -597,11 +633,34 @@ fn proof_trace(stdout: &Path) -> Value {
         })
         .collect();
     json!({
+        "released_tables": released.len(),
+        "window_summary": window_summary(&windows),
         "proofs": proofs, "outcomes": outcomes, "scans": seeks.len(),
         "seek_total_ms": seeks.iter().sum::<f64>(),
         "seek_ms": quantiles(seeks.clone()),
         "seek_by_decile": deciles,
         "windows": windows,
+    })
+}
+
+/// The windows of a run: their number, tables per window, atomic plans
+/// (applies plus conflicts), cuts, the largest buffered events, and commit
+/// time.
+fn window_summary(windows: &[Value]) -> Value {
+    let num = |w: &Value, k: &str| w[k].as_f64().unwrap_or(0.0);
+    let plans: Vec<f64> = windows
+        .iter()
+        .map(|w| num(w, "batch_applies") + num(w, "batch_conflicts"))
+        .collect();
+    json!({
+        "windows": windows.len(),
+        "tables": windows.iter().map(|w| num(w, "tables")).sum::<f64>(),
+        "tables_per_window": quantiles(windows.iter().map(|w| num(w, "tables")).collect()),
+        "plans": plans.iter().sum::<f64>(),
+        "plans_per_window": quantiles(plans),
+        "cuts": windows.iter().filter(|w| w["cut"] == json!(true)).count(),
+        "bytes_max": windows.iter().map(|w| num(w, "bytes")).fold(0.0, f64::max),
+        "commit_ms": quantiles(windows.iter().map(|w| num(w, "commit_ms")).collect()),
     })
 }
 
@@ -645,12 +704,15 @@ pub async fn run(
     );
     let seen = Arc::new(Mutex::new(Seen::default()));
     let stop = Arc::new(AtomicBool::new(false));
+    let mut tasks = Tasks::default();
     let consumer = consume(
         &topic,
+        id_base,
         Arc::clone(&names),
         Arc::clone(&seen),
         Arc::clone(&stop),
     )?;
+    tasks.add(&consumer);
 
     // The active set: the same for every run of the point.
     let mut order: Vec<usize> = (0..point.tables).collect();
@@ -661,17 +723,42 @@ pub async fn run(
     let mut inactive: Vec<usize> = order[n_active..].to_vec();
 
     let mut mon = root(infra).await?;
+    let datadir_before = datadir_bytes(infra).await;
     let binlog_start =
         position_binlog(infra, &mut mon, point.binlog_mib, point.pad).await?;
+    let gtid_start: String = mon
+        .query_first("SELECT @@GLOBAL.gtid_executed")
+        .await?
+        .unwrap_or_default();
     let status0 = mysql_status(&mut mon).await?;
     let binlog0 = binlog_bytes(&mut mon).await?;
     let db_cpu0 = infra.db_cpu_usec(crate::Engine::Mysql);
 
     // Start.
     let t_create = Instant::now();
+    // On the PostgreSQL store, a database of the run's own.
+    let state_db = match sys {
+        Sys::Df(_) if infra.state.is_some() => {
+            let db = format!("st_scale_{seq}");
+            infra
+                .state_exec("postgres", &format!("CREATE DATABASE {db}"))
+                .await?;
+            Some(db)
+        }
+        _ => None,
+    };
+    let state_dsn = match &state_db {
+        Some(db) => infra.state_dsn(db).await,
+        None => None,
+    };
     let process = match sys {
         Sys::Df(binary) => {
-            let p = Process::start(binary, &dir.join("state"), None).await?;
+            let p = Process::start(
+                binary,
+                &dir.join("state"),
+                state_dsn.as_deref(),
+            )
+            .await?;
             let spec = json!({
                 "apiVersion": "deltaforge/v1",
                 "kind": "Pipeline",
@@ -766,10 +853,12 @@ pub async fn run(
             if PERF_COUNTERS.get().copied().unwrap_or(false) =>
         {
             let pid = p.pid();
-            Some(tokio::spawn(async move {
+            let t = tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(15)).await;
                 perf_counters(pid, 30).await
-            }))
+            });
+            tasks.add(&t);
+            Some(t)
         }
         _ => None,
     };
@@ -803,6 +892,7 @@ pub async fn run(
             c.disconnect().await.ok();
             Ok::<_, anyhow::Error>(())
         }));
+        tasks.add(writers.last().unwrap());
     }
     let scheduler = {
         let sets = Arc::clone(&sets);
@@ -838,6 +928,7 @@ pub async fn run(
             }
         })
     };
+    tasks.add(&scheduler);
     // Offered changes: the schedule's count, for the generator check.
     {
         let mut t = Duration::ZERO;
@@ -861,6 +952,9 @@ pub async fn run(
     let (mut stopped_at, mut resumed_at) = (None, None);
     let mut conns_max = 0u64;
     let mut rss_max = 0u64;
+    // DeltaForge's sampled gauges, each at its largest sample.
+    let mut gauge_peaks: HashMap<String, f64> = HashMap::new();
+    let is_df = matches!(sys, Sys::Df(_));
     let mut binlog_peak = binlog0;
     let mut step_results = Vec::new();
     let mut capacity_stop = None;
@@ -909,12 +1003,21 @@ pub async fn run(
         conns_max =
             conns_max.max(system_connections(&mut mon).await.unwrap_or(0));
         rss_max = rss_max.max(sys_rss(sys, process.as_ref()));
+        if is_df && let Some(g) = df_gauges().await {
+            keep_peaks(&mut gauge_peaks, g);
+        }
         binlog_peak =
             binlog_peak.max(binlog_bytes(&mut mon).await.unwrap_or(0));
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     halt.store(true, Ordering::Relaxed);
     let t_load_end = Instant::now();
+    // A load that ends during the catch-up stop still resumes the system,
+    // so that the drain can complete.
+    if stopped_at.is_some() && resumed_at.is_none() {
+        control(sys, &name, "resume").await?;
+        resumed_at = Some(Instant::now());
+    }
     scheduler.await.ok();
     let mut writer_error = None;
     for w in writers {
@@ -924,26 +1027,80 @@ pub async fn run(
     }
     let commits = std::mem::take(&mut *commits.lock().unwrap());
 
-    // Drain: until every committed row arrived (300 s at most).
-    let drain_deadline = Instant::now() + Duration::from_secs(300);
+    // Drain (`results/scale-stage2-plan.md`): every committed row arrived
+    // and the system's durable frontier covers MySQL's final GTID set. A
+    // timeout fails the run.
+    let final_gtid: String = mon
+        .query_first("SELECT @@GLOBAL.gtid_executed")
+        .await?
+        .unwrap_or_default();
+    // One marker row after it, in both systems' runs: Debezium's committed
+    // offset stops before the last transaction it processed (a restart
+    // repeats it with skip counts), so its frontier covers every load
+    // transaction once a later transaction has been processed and its
+    // offset committed. Markers are outside the ledger.
+    markers += 1;
+    lg.query_drop(format!(
+        "INSERT INTO {} (id, a, b, c) VALUES ({}, 0, 'marker', 0)",
+        table_name(active[0]),
+        id_base + MARKER + markers
+    ))
+    .await?;
+    let drain_marker = id_base + MARKER + markers;
+    let t_drain = Instant::now();
+    let mut last_frontier = Value::Null;
+    let mut drain_error: Option<String> = None;
+    let mut durable_frontier = Value::Null;
+    let mut connector_stopped = false;
+    let mut delivered_s = None;
     loop {
-        let missing = {
+        let (missing, marker) = {
             let s = seen.lock().unwrap();
-            commits
+            let missing = commits
                 .iter()
                 .filter(|c| !s.first.contains_key(&c.id))
-                .count()
+                .count();
+            (missing, s.markers.contains(&drain_marker))
         };
-        if missing == 0 || Instant::now() > drain_deadline {
+        if missing == 0 {
+            delivered_s.get_or_insert(t_drain.elapsed().as_secs_f64());
+        }
+        if missing == 0 && marker {
+            match frontier(
+                sys,
+                &name,
+                &final_gtid,
+                &mut mon,
+                &mut connector_stopped,
+            )
+            .await
+            {
+                Ok((true, f)) => {
+                    durable_frontier = f;
+                    break;
+                }
+                Ok((false, seen)) => last_frontier = seen,
+                Err(e) => {
+                    drain_error = Some(format!("drain: {e:#}"));
+                    break;
+                }
+            }
+        }
+        if t_drain.elapsed() > DRAIN_TIMEOUT {
+            drain_error = Some(format!(
+                "drain timed out after {DRAIN_TIMEOUT:?}: {missing} rows missing, durable frontier covered: false (last seen: {last_frontier})"
+            ));
             break;
         }
         conns_max =
             conns_max.max(system_connections(&mut mon).await.unwrap_or(0));
         rss_max = rss_max.max(sys_rss(sys, process.as_ref()));
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        if is_df && let Some(g) = df_gauges().await {
+            keep_peaks(&mut gauge_peaks, g);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    // Duplicates that arrive late.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    let frontier_s = t_drain.elapsed().as_secs_f64();
 
     let cpu = sys_cpu(sys, process.as_ref()) - cpu0;
     let perf = match counters {
@@ -972,8 +1129,8 @@ pub async fn run(
         _ => None,
     };
 
-    // Stop the system.
-    stop.store(true, Ordering::Relaxed);
+    // Shut the system down, then read the topic to its end: the ledger is
+    // checked over everything delivered, through the shutdown.
     let allocs = match (sys, process) {
         (Sys::Df(_), Some(p)) => {
             api(reqwest::Method::DELETE, &format!("/pipelines/{name}"), None)
@@ -987,12 +1144,46 @@ pub async fn run(
         }
         _ => None,
     };
+    let end_offset = topic_end(&topic).await;
+    let t_consumer = Instant::now();
+    match end_offset {
+        Ok(end) => {
+            while seen.lock().unwrap().next_offset < end {
+                if t_consumer.elapsed() > CONSUMER_DRAIN_TIMEOUT {
+                    drain_error.get_or_insert(format!(
+                        "the consumer did not reach the topic's end ({end}) within {CONSUMER_DRAIN_TIMEOUT:?}"
+                    ));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        Err(e) => {
+            drain_error.get_or_insert(format!("the topic's end: {e:#}"));
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    consumer.await.ok();
     // DeltaForge's proofs, from its trace (its standard output).
     let proofs = match sys {
         Sys::Df(_) => proof_trace(&dir.join("state").join("stderr.out")),
         Sys::Dbz(..) => Value::Null,
     };
-    consumer.await.ok();
+    let store_statements = match &state_db {
+        Some(db) => {
+            let v = state_statements(infra, db).await;
+            infra
+                .state_exec(
+                    "postgres",
+                    &format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"),
+                )
+                .await
+                .ok();
+            v
+        }
+        None => Value::Null,
+    };
+    let datadir_after = datadir_bytes(infra).await;
     mon.disconnect().await.ok();
 
     // Raw rows, for any later analysis: each committed row's id, table,
@@ -1164,24 +1355,98 @@ pub async fn run(
         }),
         _ => Value::Null,
     };
+    // Activation counts (`results/scale-stage2-plan.md`): the fixture's
+    // tables are all selected; touched tables had a committed row; a
+    // touched table whose first row arrived was activated (for DeltaForge
+    // also counted from its trace's `release` records).
+    let touched: std::collections::HashSet<u32> =
+        commits.iter().map(|c| c.table).collect();
+    let first_arrivals: Vec<Instant> = first_of_table
+        .values()
+        .filter_map(|id| s.first.get(id).copied())
+        .collect();
+    let time_to_last_activation_s = first_arrivals
+        .iter()
+        .max()
+        .map(|a| a.saturating_duration_since(t_load).as_secs_f64());
+    // After the catch-up resume: from the resume to the first row arriving,
+    // and the latency of rows committed after it in tables activated before
+    // the stop (the restart path, not first touches).
+    let resume_to_first_arrival_s = resumed_at.and_then(|r| {
+        s.first
+            .values()
+            .filter(|a| **a >= r)
+            .min()
+            .map(|a| a.saturating_duration_since(r).as_secs_f64())
+    });
+    let known_before_stop: std::collections::HashSet<u32> = match stopped_at {
+        Some(st) => by_activation
+            .iter()
+            .filter(|(c, _)| {
+                first_of_table.get(&c.table) == Some(&c.id) && c.at < st
+            })
+            .map(|(c, _)| c.table)
+            .collect(),
+        None => Default::default(),
+    };
+    let after_resume_known: Vec<f64> = match resumed_at {
+        Some(r) => commits
+            .iter()
+            .filter(|c| c.at >= r && known_before_stop.contains(&c.table))
+            .filter_map(lat)
+            .collect(),
+        None => Vec::new(),
+    };
+    let failures = if is_df {
+        measured_failures(&df_delta)
+    } else {
+        Vec::new()
+    };
+    let mut failures = failures;
+    if is_df
+        && !touched.is_empty()
+        && proofs["windows"].as_array().is_none_or(|w| w.is_empty())
+    {
+        failures.push("no proof trace (PERF_RUST_LOG must enable deltaforge::proof_trace)".into());
+    }
     let ok = writer_error.is_none()
+        && drain_error.is_none()
+        && failures.is_empty()
         && missing == 0
+        && s.duplicates == 0
         && s.out_of_order == 0
+        && s.foreign == 0
+        && s.unknown_table == 0
         && generator_share.is_none_or(|g| g >= LIMIT_SHARE);
     Ok(json!({
         "ok": ok,
-        "error": writer_error,
+        "error": writer_error.or(drain_error.clone()),
+        "drain_error": drain_error,
+        "measured_failures": failures,
         "generator_bound": generator_share.is_some_and(|g| g < LIMIT_SHARE),
         "tables": point.tables, "active": point.active, "active_tables": n_active,
         "workload": point.workload.name(), "rotate": point.rotate,
-        "rotations": rotations, "activated_tables": activated.len(),
+        "rotations": rotations, "activation_set": activated.len(),
         "catchup_phase": catchup,
         "ready_s": ready_s, "first_event_s": first_event_s,
         "load_s": load_secs, "offered": offered_n, "committed": commits.len(),
         "generator_share": generator_share,
         "achieved_per_s": commits.len() as f64 / load_secs,
         "missing": missing, "duplicates": s.duplicates, "out_of_order": s.out_of_order,
-        "unknown_table": s.unknown_table,
+        "unknown_table": s.unknown_table, "foreign": s.foreign,
+        "selected_tables": point.tables, "touched_tables": touched.len(),
+        "activated_tables": first_arrivals.len(),
+        "released_tables": proofs["released_tables"],
+        "time_to_last_activation_s": time_to_last_activation_s,
+        "resume_to_first_arrival_s": resume_to_first_arrival_s,
+        "latency_after_resume_known_ms": quantiles(after_resume_known),
+        "drain": {"delivered_s": delivered_s, "frontier_s": frontier_s,
+                  "final_gtid": final_gtid, "durable_frontier": durable_frontier,
+                  "consumer_end_s": t_consumer.elapsed().as_secs_f64()},
+        "gtid_start": gtid_start,
+        "datadir_bytes_before": datadir_before, "datadir_bytes_after": datadir_after,
+        "gauge_peaks": gauge_peaks,
+        "store_statements": store_statements,
         "latency_steady_ms": quantiles(steady),
         "latency_activation_ms": quantiles(activation),
         "latency_activation_by_decile": deciles,
@@ -1297,14 +1562,34 @@ async fn control(sys: &Sys<'_>, name: &str, action: &str) -> Result<()> {
     }
 }
 
-/// Free disk (GiB, the build disk) and available memory (GiB).
+/// Free disk (GiB: the lowest of the harness output's disk and Docker's
+/// data disk) and available memory (GiB).
 fn floors() -> (f64, f64) {
+    static DOCKER_ROOT: std::sync::OnceLock<Option<String>> =
+        std::sync::OnceLock::new();
+    let docker = DOCKER_ROOT.get_or_init(|| {
+        let o = std::process::Command::new("docker")
+            .args(["info", "--format", "{{.DockerRootDir}}"])
+            .output()
+            .ok()?;
+        let root = String::from_utf8(o.stdout).ok()?.trim().to_string();
+        (!root.is_empty()).then_some(root)
+    });
+    let mut args = vec!["-B1", "--output=avail", "."];
+    if let Some(root) = docker {
+        args.push(root);
+    }
     let disk = std::process::Command::new("df")
-        .args(["-B1", "--output=avail", "."])
+        .args(&args)
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|t| t.lines().nth(1)?.trim().parse::<f64>().ok())
+        .and_then(|t| {
+            t.lines()
+                .skip(1)
+                .filter_map(|l| l.trim().parse::<f64>().ok())
+                .reduce(f64::min)
+        })
         .unwrap_or(0.0)
         / f64::from(1u32 << 30);
     let mem = std::fs::read_to_string("/proc/meminfo")
@@ -1320,6 +1605,373 @@ fn floors() -> (f64, f64) {
         .unwrap_or(0.0)
         / f64::from(1u32 << 20);
     (disk, mem)
+}
+
+/// The study's resource floors (`results/scale-stage2-plan.md`): free disk
+/// and available memory, in GiB, watched every second.
+const FLOOR_DISK_GIB: f64 = 25.0;
+const FLOOR_MEM_GIB: f64 = 4.0;
+const MONITOR_EVERY: Duration = Duration::from_secs(1);
+
+/// The breach of a floor by `disk` and `mem` (GiB), if any.
+fn floor_breach(disk: f64, mem: f64) -> Option<String> {
+    (disk < FLOOR_DISK_GIB || mem < FLOOR_MEM_GIB).then(|| {
+        format!(
+            "resource floor: {disk:.1} GiB disk free, {mem:.1} GiB memory available (floors {FLOOR_DISK_GIB} and {FLOOR_MEM_GIB})"
+        )
+    })
+}
+
+/// An invocation's continuous resource monitor: it samples the floors every
+/// second (into `monitor.jsonl`) from its start to its drop, keeps the
+/// lowest values since the last [`Monitor::take_low`], and holds the first
+/// breach, which cancels the step in progress ([`guarded`]).
+struct Monitor {
+    breach: tokio::sync::watch::Receiver<Option<String>>,
+    low: Arc<Mutex<(f64, f64)>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Monitor {
+    async fn start(out: &Path) -> Result<Monitor> {
+        use std::io::Write;
+        let mut log = std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(out.join("monitor.jsonl"))?,
+        );
+        let (tx, breach) = tokio::sync::watch::channel(None);
+        let low = Arc::new(Mutex::new((f64::INFINITY, f64::INFINITY)));
+        let (first_tx, first) = tokio::sync::oneshot::channel();
+        let task = {
+            let low = Arc::clone(&low);
+            tokio::spawn(async move {
+                let mut first_tx = Some(first_tx);
+                loop {
+                    let (disk, mem) = tokio::task::spawn_blocking(floors)
+                        .await
+                        .unwrap_or((0.0, 0.0));
+                    {
+                        let mut l = low.lock().unwrap();
+                        l.0 = l.0.min(disk);
+                        l.1 = l.1.min(mem);
+                    }
+                    let unix_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis());
+                    writeln!(
+                        log,
+                        "{}",
+                        json!({"unix_ms": unix_ms, "disk_gib": disk, "mem_gib": mem})
+                    )
+                    .ok();
+                    log.flush().ok();
+                    if let Some(b) = floor_breach(disk, mem) {
+                        tx.send_if_modified(|v| {
+                            v.is_none().then(|| *v = Some(b)).is_some()
+                        });
+                    }
+                    if let Some(f) = first_tx.take() {
+                        f.send(()).ok();
+                    }
+                    tokio::time::sleep(MONITOR_EVERY).await;
+                }
+            })
+        };
+        first.await.ok();
+        Ok(Monitor { breach, low, task })
+    }
+
+    /// The first breach, if one happened.
+    fn breached(&self) -> Option<String> {
+        self.breach.borrow().clone()
+    }
+
+    /// Resolves at the first breach.
+    async fn breach(&self) -> String {
+        let mut rx = self.breach.clone();
+        loop {
+            if let Some(b) = rx.borrow_and_update().clone() {
+                return b;
+            }
+            if rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// The lowest free disk and available memory (GiB) since the last call.
+    fn take_low(&self) -> (f64, f64) {
+        std::mem::replace(
+            &mut *self.low.lock().unwrap(),
+            (f64::INFINITY, f64::INFINITY),
+        )
+    }
+}
+
+impl Drop for Monitor {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Run `step` unless a floor is breached first: a breach drops it (its
+/// process and its spawned tasks with it, [`Tasks`]) and fails it.
+async fn guarded<T>(
+    monitor: &Monitor,
+    step: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    if let Some(b) = monitor.breached() {
+        bail!(b);
+    }
+    tokio::select! {
+        r = step => r,
+        b = monitor.breach() => Err(anyhow!(b)),
+    }
+}
+
+/// Spawned tasks, aborted when dropped: a cancelled or failed step leaves
+/// none running.
+#[derive(Default)]
+struct Tasks(Vec<tokio::task::AbortHandle>);
+
+impl Tasks {
+    fn add<T>(&mut self, task: &tokio::task::JoinHandle<T>) {
+        self.0.push(task.abort_handle());
+    }
+}
+
+impl Drop for Tasks {
+    fn drop(&mut self) {
+        for t in &self.0 {
+            t.abort();
+        }
+    }
+}
+
+/// Stop a run's system after a failed or cancelled run (best effort): its
+/// pipeline or connector is deleted. A DeltaForge process dropped with the
+/// run was already killed.
+async fn stop_after_failure(sys: &Sys<'_>, name: &str) {
+    match sys {
+        Sys::Df(_) => {
+            api(reqwest::Method::DELETE, &format!("/pipelines/{name}"), None)
+                .await
+                .ok();
+        }
+        Sys::Dbz(c, _) => c.delete(name).await,
+    }
+}
+
+/// How long the drain waits for delivery and the durable frontier, and the
+/// consumer for the topic's end after the shutdown.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
+const CONSUMER_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Whether GTID set `set` contains `final_gtid` (MySQL decides).
+async fn gtid_covers(
+    c: &mut mysql_async::Conn,
+    final_gtid: &str,
+    set: &str,
+) -> Result<bool> {
+    let sub: Option<i64> = c
+        .exec_first("SELECT GTID_SUBSET(?, ?)", (final_gtid, set))
+        .await?;
+    Ok(sub == Some(1))
+}
+
+/// The system's durable frontier, and whether it covers `final_gtid`:
+/// DeltaForge's sink checkpoints, or Debezium's committed offset (the
+/// connector is stopped first, so that its tasks commit it; `stopped`
+/// records that).
+async fn frontier(
+    sys: &Sys<'_>,
+    name: &str,
+    final_gtid: &str,
+    c: &mut mysql_async::Conn,
+    stopped: &mut bool,
+) -> Result<(bool, Value)> {
+    match sys {
+        Sys::Df(_) => {
+            let cps = api(
+                reqwest::Method::GET,
+                &format!("/pipelines/{name}/checkpoints"),
+                None,
+            )
+            .await?;
+            let Some(list) = cps.as_array() else {
+                return Ok((false, cps));
+            };
+            if !list.iter().any(|cp| cp["sink_id"] == "kafka") {
+                return Ok((false, cps));
+            }
+            for cp in list {
+                let Some(set) = cp["position"]["gtid_set"].as_str() else {
+                    return Ok((false, cps));
+                };
+                if !gtid_covers(c, final_gtid, set).await? {
+                    return Ok((false, cps));
+                }
+            }
+            Ok((true, cps))
+        }
+        Sys::Dbz(connect, _) => {
+            if !*stopped {
+                connect.stop_connector(name).await?;
+                *stopped = true;
+            }
+            let v = connect.offsets(name).await?;
+            let Some(list) = v["offsets"].as_array().filter(|l| !l.is_empty())
+            else {
+                return Ok((false, v));
+            };
+            for o in list {
+                let Some(set) = o["offset"]["gtids"].as_str() else {
+                    bail!(
+                        "the connector's committed offset has no GTID set: {o}"
+                    );
+                };
+                if !gtid_covers(c, final_gtid, set).await? {
+                    return Ok((false, v));
+                }
+            }
+            Ok((true, v))
+        }
+    }
+}
+
+/// The topic's end offset (its one partition's high watermark).
+async fn topic_end(topic: &str) -> Result<i64> {
+    let topic = topic.to_string();
+    tokio::task::spawn_blocking(move || {
+        let c: rdkafka::consumer::BaseConsumer = ClientConfig::new()
+            .set("bootstrap.servers", brokers())
+            .create()?;
+        let (_, high) =
+            c.fetch_watermarks(&topic, 0, Duration::from_secs(10))?;
+        Ok(high)
+    })
+    .await?
+}
+
+/// MySQL's data directory size (bytes), in its container.
+async fn datadir_bytes(infra: &Infra) -> Option<u64> {
+    let o = tokio::process::Command::new("docker")
+        .args(["exec", infra.mysql.id(), "du", "-sb", "/var/lib/mysql"])
+        .output()
+        .await
+        .ok()?;
+    String::from_utf8(o.stdout)
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// A run's store statements on the PostgreSQL store (`pg_stat_statements`
+/// of its own database): every statement, and its commits and begins.
+async fn state_statements(infra: &Infra, db: &str) -> Value {
+    let Ok(c) = infra.state_client("postgres").await else {
+        return Value::Null;
+    };
+    let row = c
+        .query_one(
+            "SELECT coalesce(sum(s.calls), 0)::bigint, \
+                    coalesce(sum(s.calls) FILTER (WHERE s.query ILIKE 'commit%'), 0)::bigint, \
+                    coalesce(sum(s.calls) FILTER (WHERE s.query ILIKE 'begin%' OR s.query ILIKE 'start transaction%'), 0)::bigint \
+             FROM pg_stat_statements s JOIN pg_database d ON d.oid = s.dbid \
+             WHERE d.datname = $1",
+            &[&db],
+        )
+        .await;
+    match row {
+        Ok(r) => json!({
+            "statements": r.get::<_, i64>(0),
+            "commits": r.get::<_, i64>(1),
+            "begins": r.get::<_, i64>(2),
+        }),
+        Err(e) => json!({"error": e.to_string()}),
+    }
+}
+
+/// DeltaForge's sampled gauges: MySQL connections by kind, and the
+/// selection cache's estimated bytes and timelines (summed over sources).
+const DF_GAUGES: [&str; 3] = [
+    "deltaforge_mysql_connections",
+    "deltaforge_mysql_selection_cache_bytes",
+    "deltaforge_mysql_selection_cache_timelines",
+];
+
+/// The gauges in a metrics text, keyed `name` or `name{kind}` for the
+/// connections.
+fn parse_gauges(text: &str) -> HashMap<String, f64> {
+    let mut out: HashMap<String, f64> = HashMap::new();
+    for l in text.lines() {
+        for name in DF_GAUGES {
+            let Some(rest) = l.strip_prefix(name) else {
+                continue;
+            };
+            if !(rest.starts_with('{') || rest.starts_with(' ')) {
+                continue;
+            }
+            let Some(v) =
+                l.rsplit(' ').next().and_then(|v| v.parse::<f64>().ok())
+            else {
+                continue;
+            };
+            let key = match rest
+                .split_once("kind=\"")
+                .and_then(|(_, k)| k.split_once('"'))
+            {
+                Some((kind, _)) => format!("{name}{{{kind}}}"),
+                None => name.to_string(),
+            };
+            *out.entry(key).or_default() += v;
+        }
+    }
+    out
+}
+
+async fn df_gauges() -> Option<HashMap<String, f64>> {
+    let text = reqwest::get(format!("http://{METRICS}/metrics"))
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    Some(parse_gauges(&text))
+}
+
+/// Keep each gauge's largest sample.
+fn keep_peaks(peaks: &mut HashMap<String, f64>, sample: HashMap<String, f64>) {
+    for (k, v) in sample {
+        let p = peaks.entry(k).or_insert(v);
+        *p = p.max(v);
+    }
+}
+
+/// DeltaForge's counters whose increase fails a run (a measured failure,
+/// kept and investigated: `results/scale-stage2-plan.md`).
+const DF_FAILURES: [&str; 6] = [
+    "deltaforge_mysql_control_permit_timeouts_total",
+    "deltaforge_mysql_control_saturation_deferrals_total",
+    "deltaforge_mysql_activation_window_deferred_total",
+    "deltaforge_mysql_activation_window_overflow_total",
+    "deltaforge_mysql_proof_rounds_failed_total",
+    "deltaforge_mysql_capture_kill_failures_total",
+];
+
+/// The measured failures in a run's counter increases.
+fn measured_failures(delta: &Value) -> Vec<String> {
+    DF_FAILURES
+        .iter()
+        .filter_map(|k| {
+            let v = delta[*k].as_f64().unwrap_or(0.0);
+            (v > 0.0).then(|| format!("{k} +{v}"))
+        })
+        .collect()
 }
 
 /// The study's plan, from the command line.
@@ -1431,6 +2083,18 @@ pub async fn study(
             }
         }
     };
+    // DeltaForge's activation counts come from its proof trace.
+    if binaries
+        .iter()
+        .any(|(_, s)| matches!(s, crate::System::DeltaForge(_)))
+        && !std::env::var("PERF_RUST_LOG")
+            .is_ok_and(|v| v.contains("deltaforge::proof_trace=info"))
+    {
+        bail!(
+            "the scaling study needs DeltaForge's proof trace: set PERF_RUST_LOG to include deltaforge::proof_trace=info"
+        );
+    }
+    let monitor = Monitor::start(out).await?;
     let mut generation = 0u32;
     let mut connect = start_worker(generation).await?;
     let mut runs = std::fs::OpenOptions::new()
@@ -1442,15 +2106,36 @@ pub async fn study(
         .append(true)
         .open(out.join("fixtures.jsonl"))?;
     let base = Duration::from_secs(plan.seconds);
+    let unix_s = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64())
+    };
     let mut seq = 0u64;
+    // The runs' place in the invocation (warm-ups included).
+    let mut index = 0u64;
     let mut outcome = Ok(());
     plan.check_points()?;
     'tables: for &tables in &plan.tables {
         if plan.points(tables).is_empty() {
             continue;
         }
-        let secs = fixture(infra, tables).await?;
-        writeln!(fixtures, "{}", json!({"tables": tables, "build_s": secs}))?;
+        monitor.take_low();
+        let secs = match guarded(&monitor, fixture(infra, tables)).await {
+            Ok(secs) => secs,
+            Err(e) => {
+                outcome = Err(e.context(format!("the {tables}-table fixture")));
+                break 'tables;
+            }
+        };
+        let (disk_low, mem_low) = monitor.take_low();
+        writeln!(
+            fixtures,
+            "{}",
+            json!({"tables": tables, "build_s": secs,
+                   "datadir_bytes": datadir_bytes(infra).await,
+                   "disk_low_gib": disk_low, "mem_low_gib": mem_low})
+        )?;
         eprintln!("fixture of {tables} tables built in {secs:.0} s");
         let points = plan.points(tables);
         let mut todo: Vec<(Point, Option<usize>)> = Vec::new();
@@ -1472,14 +2157,12 @@ pub async fn study(
                     binaries.iter().rev().collect()
                 };
             for (label, system) in order {
-                let (disk, mem) = floors();
-                if disk < 25.0 || mem < 4.0 {
-                    outcome = Err(anyhow::anyhow!(
-                        "resource floor: {disk:.1} GiB disk free, {mem:.1} GiB memory available (floors 25 and 4)"
-                    ));
+                if let Some(b) = monitor.breached() {
+                    outcome = Err(anyhow!(b));
                     break 'tables;
                 }
                 seq += 1;
+                index += 1;
                 let rep_name =
                     rep.map_or("warmup".to_string(), |r| format!("r{r}"));
                 let tag = format!("{}-{label}-{rep_name}-{seq}", point.id());
@@ -1491,21 +2174,38 @@ pub async fn study(
                         None => bail!("no Kafka Connect worker"),
                     },
                 };
-                let r = run(
-                    infra,
-                    &sys,
-                    &point,
-                    seq,
-                    &tag,
-                    &dir,
-                    base,
-                    plan.catchup,
+                monitor.take_low();
+                let started_unix_s = unix_s();
+                let r = guarded(
+                    &monitor,
+                    run(
+                        infra,
+                        &sys,
+                        &point,
+                        seq,
+                        &tag,
+                        &dir,
+                        base,
+                        plan.catchup,
+                    ),
                 )
                 .await;
+                if r.is_err() {
+                    // A failed or cancelled run's system is stopped before
+                    // anything else runs.
+                    stop_after_failure(&sys, &format!("s-{tag}")).await;
+                }
+                let (disk_low, mem_low) = monitor.take_low();
                 let failed = !matches!(&r, Ok(v) if v["ok"] == json!(true));
                 let result = r.unwrap_or_else(
                     |e| json!({"ok": false, "error": format!("{e:#}")}),
                 );
+                let order_record = json!({
+                    "seq": seq, "index": index,
+                    "started_unix_s": started_unix_s, "ended_unix_s": unix_s(),
+                    "disk_low_gib": disk_low, "mem_low_gib": mem_low,
+                    "connect_worker_idle": matches!(system, crate::System::DeltaForge(_)) && connect.is_some(),
+                });
                 eprintln!(
                     "{} {label} {rep_name}: {}",
                     point.id(),
@@ -1529,7 +2229,7 @@ pub async fn study(
                     writeln!(
                         runs,
                         "{}",
-                        json!({"point": point.id(), "version": label, "rep": rep, "worker": worker, "result": result})
+                        json!({"point": point.id(), "version": label, "rep": rep, "worker": worker, "order": order_record, "result": result})
                     )?;
                 }
                 if failed
@@ -1728,6 +2428,131 @@ mod tests {
             t += Duration::from_millis(1);
         }
         assert!((n / 10.0 - 2_000.0).abs() < 1.0, "{n}");
+    }
+
+    /// Connections are kept by kind, summed over sources; the cache gauges
+    /// are summed; a longer name sharing a gauge's prefix is not read.
+    #[test]
+    fn gauges_are_read_by_kind() {
+        let text = "\
+# TYPE deltaforge_mysql_connections gauge
+deltaforge_mysql_connections{kind=\"control\",source=\"a\"} 3
+deltaforge_mysql_connections{kind=\"control\",source=\"b\"} 2
+deltaforge_mysql_connections{kind=\"replication\",source=\"a\"} 1
+deltaforge_mysql_selection_cache_bytes{pipeline=\"p\",source=\"a\"} 1048576
+deltaforge_mysql_selection_cache_timelines{pipeline=\"p\",source=\"a\"} 40
+deltaforge_mysql_connections_other{kind=\"control\"} 99
+";
+        let g = parse_gauges(text);
+        assert_eq!(g["deltaforge_mysql_connections{control}"], 5.0);
+        assert_eq!(g["deltaforge_mysql_connections{replication}"], 1.0);
+        assert_eq!(g["deltaforge_mysql_selection_cache_bytes"], 1_048_576.0);
+        assert_eq!(g["deltaforge_mysql_selection_cache_timelines"], 40.0);
+        assert_eq!(g.len(), 4, "{g:?}");
+        let mut peaks = HashMap::new();
+        keep_peaks(&mut peaks, g);
+        keep_peaks(
+            &mut peaks,
+            parse_gauges("deltaforge_mysql_connections{kind=\"control\"} 1\n"),
+        );
+        assert_eq!(peaks["deltaforge_mysql_connections{control}"], 5.0);
+    }
+
+    /// A window's plans are its applies and its conflicts.
+    #[test]
+    fn windows_count_plans_and_cuts() {
+        let w = |tables: u64, applies: u64, conflicts: u64, cut: bool| {
+            json!({"tables": tables, "batch_applies": applies,
+                   "batch_conflicts": conflicts, "cut": cut,
+                   "bytes": tables * 10, "commit_ms": 2.0})
+        };
+        let s = window_summary(&[
+            w(910, 1, 0, true),
+            w(300, 2, 1, false),
+            w(5, 1, 0, false),
+        ]);
+        assert_eq!(s["windows"], 3);
+        assert_eq!(s["tables"], 1215.0);
+        assert_eq!(s["plans"], 5.0);
+        assert_eq!(s["plans_per_window"]["max"], 3.0);
+        assert_eq!(s["cuts"], 1);
+        assert_eq!(s["bytes_max"], 9100.0);
+        assert_eq!(window_summary(&[])["windows"], 0);
+    }
+
+    /// Any increase of a failure counter fails the run, named with it.
+    #[test]
+    fn failure_counters_fail_the_run() {
+        let mut d = serde_json::Map::new();
+        for k in DF_COUNTERS {
+            d.insert(k.to_string(), json!(0.0));
+        }
+        assert!(measured_failures(&Value::Object(d.clone())).is_empty());
+        d.insert(
+            "deltaforge_mysql_control_saturation_deferrals_total".into(),
+            json!(2.0),
+        );
+        d.insert(
+            "deltaforge_mysql_activation_windows_total".into(),
+            json!(9.0),
+        );
+        assert_eq!(
+            measured_failures(&Value::Object(d)),
+            ["deltaforge_mysql_control_saturation_deferrals_total +2"]
+        );
+        for k in DF_FAILURES {
+            assert!(DF_COUNTERS.contains(&k), "{k} is read");
+        }
+    }
+
+    #[test]
+    fn the_floors_are_25_gib_disk_and_4_gib_memory() {
+        assert!(floor_breach(25.0, 4.0).is_none());
+        assert!(floor_breach(24.9, 64.0).is_some());
+        assert!(floor_breach(400.0, 3.9).is_some());
+    }
+
+    /// A breach cancels the step in progress at once: the step is dropped,
+    /// and the tasks it spawned are aborted with it.
+    #[tokio::test]
+    async fn a_breach_cancels_the_step_and_its_tasks() {
+        let (tx, breach) = tokio::sync::watch::channel(None);
+        let monitor = Monitor {
+            breach,
+            low: Arc::new(Mutex::new((f64::INFINITY, f64::INFINITY))),
+            task: tokio::spawn(std::future::pending::<()>()),
+        };
+        let ticks = Arc::new(AtomicU64::new(0));
+        let step = {
+            let ticks = Arc::clone(&ticks);
+            async move {
+                let mut tasks = Tasks::default();
+                let t = tokio::spawn(async move {
+                    loop {
+                        ticks.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                });
+                tasks.add(&t);
+                tokio::time::sleep(Duration::from_secs(3_600)).await;
+                Ok::<_, anyhow::Error>(())
+            }
+        };
+        let breached = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tx.send_replace(Some("resource floor: test".into()));
+        };
+        let started = Instant::now();
+        let (r, ()) = tokio::join!(guarded(&monitor, step), breached);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(r.unwrap_err().to_string().contains("resource floor"));
+        let after = ticks.load(Ordering::SeqCst);
+        assert!(after > 0, "the task ran before the breach");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(ticks.load(Ordering::SeqCst), after, "the task was aborted");
+        // A later step does not start.
+        let late = guarded(&monitor, async { Ok::<_, anyhow::Error>(()) });
+        assert!(late.await.is_err());
     }
 }
 

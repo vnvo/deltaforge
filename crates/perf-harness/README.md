@@ -188,12 +188,37 @@ not sync its logs.
 
 Each run records:
 
-- correctness (missing, duplicated, out-of-order rows);
+- correctness (missing, duplicated, out-of-order rows, and rows from
+  outside the run's ids or of an unknown table);
 - startup, catch-up and drain times;
-- steady, activation (first row per table) and catch-up latency;
-- DeltaForge's proofs and their seek, from its proof trace;
-- resources, MySQL and Kafka counters;
+- steady, activation (first row per table) and catch-up latency, and after
+  the catch-up resume the latency of tables activated before the stop;
+- selected, touched and activated tables, and DeltaForge's windows, plans,
+  proofs and their seek, from its proof trace;
+- resources, MySQL and Kafka counters; DeltaForge's connections by kind and
+  selection-cache accounting, sampled every 250 ms;
+- its place in the invocation, and MySQL's data directory size before and
+  after;
 - its raw commit and arrival times (`rows.csv`).
+
+Stage 2's rules (`results/scale-stage2-plan.md`) apply to every run:
+
+- **Drain:** every committed row arrived and the durable frontier covers
+  MySQL's final `gtid_executed` (DeltaForge's sink checkpoints; Debezium's
+  committed offset, after the connector is stopped), then the system is
+  shut down and the topic read to its end. A timeout fails the run.
+- **Measured failures:** permit timeouts, saturation deferrals, window
+  deferrals or overflows, failed proof rounds and capture-kill failures
+  fail a run, which is kept with its cause.
+- **Resource floors:** 25 GiB free disk (the output's and Docker's) and
+  4 GiB of available memory, sampled every second into `monitor.jsonl`. A
+  breach cancels the fixture build or run in progress, records it as failed
+  and ends the invocation.
+- **Store:** with `--state-store postgres` each DeltaForge run gets a
+  database of its own, and reports its store statements and commits.
+- **Proof trace:** a DeltaForge run needs
+  `PERF_RUST_LOG=warn,deltaforge::proof_trace=info`; the study refuses to
+  start without it.
 
 An interrupt (Ctrl-C or SIGTERM) stops the runner and removes the
 invocation's containers and their volumes. `PERF_RUST_LOG` sets the
