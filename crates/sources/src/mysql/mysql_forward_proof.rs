@@ -2382,6 +2382,18 @@ mod tests {
                     .collect()
             }
 
+            /// The identity the supervisor gives the draft the source stops
+            /// on (bound to the current recovery epoch, as the retrying
+            /// incident was).
+            async fn stop_identity(
+                ctx: &RunCtx,
+                draft: &deltaforge_core::incident::IncidentDraft,
+            ) -> deltaforge_core::incident::IncidentId {
+                let epoch = ctx.incidents.recovery_epoch().await.unwrap();
+                storage::adapters::incidents::bind_epoch(draft.clone(), epoch)
+                    .incident_id(&ctx.pipeline)
+            }
+
             async fn only_incident(ctx: &RunCtx) -> IncidentRecord {
                 let all = ctx.incidents.list().await.unwrap();
                 assert_eq!(all.len(), 1, "{all:?}");
@@ -2482,7 +2494,7 @@ mod tests {
                 );
                 let rec = only_incident(&ctx).await;
                 assert_eq!(rec.retryability, Retryability::AutoRetry);
-                assert_eq!(rec.incident_id, draft.incident_id(&ctx.pipeline));
+                assert_eq!(rec.incident_id, stop_identity(&ctx, draft).await);
                 assert_eq!(durable(&ctx, "a", &id).await, (vec![], None));
             }
 
@@ -2727,7 +2739,7 @@ mod tests {
                         .holds(EvidenceKey::ReasonClass, "authentication")
                 );
                 let rec = only_incident(&ctx).await;
-                assert_eq!(rec.incident_id, draft.incident_id(&ctx.pipeline));
+                assert_eq!(rec.incident_id, stop_identity(&ctx, draft).await);
                 assert!(matches!(
                     err,
                     SourceError::Incident { ref cause, .. }
@@ -4638,9 +4650,15 @@ mod tests {
             // the same incident into operator action from the stop's draft.
             let incident = only_incident(&st).await;
             assert_eq!(incident.retryability, Retryability::AutoRetry);
+            let store = storage::adapters::incidents::IncidentStore::new(
+                st.backend.clone(),
+                "test",
+            );
+            let epoch = store.recovery_epoch().await.unwrap();
             assert_eq!(
                 incident.incident_id,
-                draft.incident_id("test"),
+                storage::adapters::incidents::bind_epoch(draft.clone(), epoch)
+                    .incident_id("test"),
                 "the stop's draft is the retrying incident"
             );
             assert_eq!(st.ckpt.get_raw(db).await.unwrap(), committed);

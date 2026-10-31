@@ -356,7 +356,8 @@ pub fn verified_start_check(
             | ReasonCode::MysqlTableStateTooLarge
             | ReasonCode::MysqlTableRegistryTooLarge
             | ReasonCode::MysqlControlPlaneSaturated
-            | ReasonCode::MysqlTimelineTooLarge,
+            | ReasonCode::MysqlTimelineTooLarge
+            | ReasonCode::MysqlForwardProofUnavailable,
             Component::Source { .. },
         ) => Some(PIPELINE_RECOVERED),
         _ => None,
