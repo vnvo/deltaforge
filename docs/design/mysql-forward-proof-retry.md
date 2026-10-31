@@ -250,48 +250,50 @@ Metrics:
 7. On exhaustion, cancellation or any terminal stop, the DDL is neither emitted nor checkpointed, and the restart replays it.
 8. One incident per proof boundary and recovery epoch. It is resolved, reclassified or withdrawn, and never left open as `auto_retry` after the proof ends.
 
-## 5. Tests (each written and seen failing first)
+## 5. Tests
 
-**Setup.** The tests are live on MySQL 8.4 unless marked otherwise. Each test builds its run with its own `RetryLimits` (for example a 6 s deadline, 2 s lock waits, backoff 0.2/0.4/0.8 s). The blocker is a second session that holds the table's metadata lock (`LOCK TABLES t WRITE`) and releases it on a signal.
+The live regressions (1 and 2 below) were written first and seen failing on the code before this change: the transient lock wait deferred the DDL instead of binding it, and the held lock let the DDL be emitted instead of stopping the source.
 
-**Delivery checks, wherever events are checked:**
+**Docker-free** (`mysql_forward_proof::tests::store::retry`). These run the real retry loop (`prove_with`), `commit_proofs`, the store and the incident store, on a paused clock. Only the MySQL capture and scan are scripted (the `Probe` seam; the live probe calls the real `capture` and the shared scanner).
 
-- **No missing events:** every source row and the DDL reach the sink. This is checked with the ledger's equality.
-- **No duplicate durable bindings:** at most one `Observed` binding per `ddl` record, and at most one registered version per captured shape. This is read from the store.
-- **Duplicate deliveries** are not a failure across a stop and replay: delivery is at-least-once, and consumers deduplicate on the event id. Within one uninterrupted run, the DDL event is delivered once.
+| Test | Shows |
+|---|---|
+| `the_last_permitted_attempt_can_recover` | With the production bounds, attempts start at 0, 31, 65 and 111 s; the fourth proves the table; `verified_recovery` (`forward_proof_bound`) |
+| `four_failed_attempts_exhaust_the_proof` | Four attempts, nothing past 120 s; the operator-action draft is the retrying incident's identity; nothing bound |
+| `no_attempt_starts_after_the_deadline` | With 100 s, the fourth attempt (111 s) never starts: the backoff is cut to the 5 s left, then exhaustion after three |
+| `a_capture_needs_its_smallest_budget_left` | Within an attempt, tables 2 and 3 are not captured with 0.5 s left; they stay retrying (`deadline`) |
+| `a_scan_is_cut_at_the_deadline` | A scan still running at the deadline is dropped; the table stays retrying; exhausted at exactly 10 s |
+| `a_transient_failure_then_a_refusal_is_not_a_recovery` | Contention, then untrusted evidence: deferred; withdrawn as `ended_deferred`, never `verified_recovery`; the original evidence kept |
+| `a_deferral_outside_the_scope_leaves_a_recovery` | Mixed: one table recovered, another deferred with no transient failure (outside the scope): `verified_recovery` |
+| `a_free_table_commits_once_while_another_retries` | Multi-table: the free table commits once; after exhaustion the restart resolves it by its binding (not captured, no second version) and proves the other |
+| `no_batch_starts_after_the_deadline` | Expiry between batches: the first batch, started before the deadline, resolves after it; no second batch starts; the second table stays retrying |
+| `a_stop_during_commit_resolution_starts_no_further_batch` | A stop while the first batch's lost acknowledgement is resolved through its marker: one binding, no further batch or replan, `Cancelled`, withdrawn as `ended_cancelled` |
+| `a_stop_ends_the_retries` | A stop in a backoff and in a lock wait ends the proof at that instant; `ended_cancelled`; nothing bound |
+| `an_authentication_failure_stops_without_a_retry` | After a transient failure: the operator-action draft of the same incident, cause `source_auth`, no further attempt |
+| `an_authorization_failure_stops_at_once` | No retry and no retrying incident |
+| `another_server_stops_the_retries` | Lineage stop, no further attempt, `ended_by_lineage` |
+| `saturation_stops_the_retries` | `mysql_control_plane_saturated` as before, `ended_by_mysql_control_plane_saturated` |
+| `every_proof_error_is_decided` | Each `ProofError` and failure class decided as in §3.3 |
 
-| # | Test | Expect |
+Also Docker-free: `mysql_failure::tests` (server codes, I/O kinds, driver errors, the binlog connector's errors, and the vendored connect-timeout text) and `a_withdrawal_updates_only_its_terminal_evidence` in the incident store (the overlay in the same transition, existing callers' evidence unchanged, operator-action records untouched).
+
+**Live** (MySQL 8.4; per-run injected bounds of 2 s lock waits within 8 s; the blocker is a session holding `LOCK TABLES t WRITE` with the DDL run under it):
+
+| # | Test | Shows |
 |---|---|---|
-| 1 | Recovers on attempt 2: the blocker is released during the first backoff | Proven on attempt 2; one binding; the DDL is emitted once; the incident is recorded, then `verified_recovery`; the next rows are proven by the forward proof, not by a lazy baseline |
-| 2 | Recovers at the last permitted attempt: the last attempt the start rule permits has its start time computed from the injected limits, and the blocker is released shortly before it | Proven on that attempt; `verified_recovery`; the attempt count equals the limit |
-| 3 | Exhausted at the deadline: the blocker is held past it | The source stops before the DDL; the checkpoint is before D; the incident is reclassified to `operator_action` with the attempt count and class; no capture session of the proof is in the processlist after the deadline plus the kill slack; no attempt starts after the deadline. Then release and restart: the DDL is bound once, with no missing events. |
-| 4 | Deadline within an attempt: three tables, and the second capture would start with less than the smallest useful budget left | It does not start; tables 2 and 3 stay `Retrying`; exhausted |
-| 5 | Transient, then deferred: attempt 1 hits the lock wait; before release, the blocking session runs an `ALTER` on the table, so attempt 2 finds `relevant_ddl` | Ends `Deferred`; no `verified_recovery`; withdrawn as `operation_cancelled` with `ended_deferred`; the DDL is emitted with the table pending; the stream then reads the `ALTER` and proves after it |
-| 6 | Mixed: table A fails transiently, then is proven; table B is deferred for `relevant_ddl` with no transient failure | `verified_recovery` (B is outside the scope); B is pending, as today |
-| 7 | Multi-table exhaustion: one table blocked, one free | The free table commits in attempt 1, exactly once; after exhaustion and restart it is resolved by its binding with no recapture |
-| 8 | Commit in flight at the deadline: a store hook delays the batch past the deadline, then loses its acknowledgement | The batch resolves through its marker after the deadline; one binding; no capture or scan starts after the deadline; the freshness reads are skipped and the table is invalidated |
-| 9 | Cancelled during a lock wait, during a scan, and during a backoff | `Cancelled`; the capture session is killed; withdrawn with `ended_cancelled`; the checkpoint is before D; the restart binds the DDL |
-| 10 | Terminal stops during the retries: another server (DSN redirected after attempt 1), saturation, authentication (password changed between attempts) | The terminal stop with no further attempt; the retrying incident withdrawn with `ended_by_lineage`, `ended_by_mysql_control_plane_saturated` or `ended_by_auth`; the terminal incident raised as today |
-| 11 | Paused stream at the deadline: the blocker is held until exhaustion, then the run restarts. A separate case holds the stream near the deadline and recovers at the last permitted attempt (as test 2). | Both: no missing events; no duplicate durable bindings; duplicates judged only against at-least-once; whether the replication connection survived the pause or reconnected from the checkpoint before D |
-| 12 | Not retried: a relevant DDL in (D, S]; a purged interval (a scanner segment fault, Docker-free where the seam allows); a missing table; a protocol error (injected) | One attempt; deferred as today; no incident |
-| 13 | Classification (Docker-free): every `ProofError` variant and each listed `Io` kind, driver error and server code through `classify` | The class in §3.3 |
-| 14 | Withdrawal evidence (Docker-free, store): `cancel_auto_retry(id, evidence)` | Replaces the evidence in the same transition; leaves operator-action records alone; existing callers keep their evidence |
+| 1 | `a_transient_lock_wait_is_retried_and_the_ddl_bound` | Released during the first backoff: one durable binding, one new version, no lazy baseline, the row after the DDL decoded with the new column, `verified_recovery` |
+| 2 | `retries_exhausted_stop_the_source_before_the_ddl` | Held past the deadline: stops before the DDL within the bound, at most four attempts, no capture session left waiting, checkpoint unchanged, nothing of the table emitted, the retrying incident still `auto_retry` with the stop draft's identity. Restart: one binding, the row after the DDL delivered, and once within the run |
+| 3 | `a_transient_failure_then_a_refusal_is_a_deferral` | The blocking session changes the table again before releasing it: deferred, withdrawn as `ended_deferred`, the second DDL proven |
+| 4 | `a_stop_during_a_lock_wait_ends_the_proof` | Stopped in the second attempt's lock wait: ends within 3 s, the session killed, nothing emitted, checkpointed or bound, `ended_cancelled`; the restart binds |
+| 5 | `an_authorization_failure_stops_before_the_ddl` | `SELECT` revoked: stops at once on the operator-action draft (`authorization`, `source_auth`, root error `Auth`), no retrying incident, no credentials in the error; with the grant back the restart binds |
 
-**Mutants:**
+Exact timing (the last permitted attempt, the deadline boundary) is tested Docker-free on the paused clock; live tests assert bounds only, because a capture's MySQL `lock_wait_timeout` is whole seconds of what is left after its connect.
 
-- the attempt bound;
-- the per-capture deadline check, and the smallest useful budget;
-- the timeout around the capture and around the scan;
-- the skipping of freshness reads after the deadline;
-- one class flipped each way;
-- the `verified_recovery` condition (scope against all tables);
-- the reclassification on exhaustion;
-- the withdrawal outcomes;
-- the reuse of an earlier attempt's capture.
+**Delivery checks:** the live tests check that the rows after the DDL reach the sink (no missing event), that a DDL has exactly one durable binding, and that a row is delivered once within an uninterrupted run. A duplicate across a stop and replay is not a failure (delivery is at-least-once).
 
-Each must be killed or argued equivalent.
+**Not live:** a multi-table DDL with only one table blocked cannot be produced reliably (a `RENAME` under `LOCK TABLES` locks all of its tables), so that case is Docker-free. Another server, saturation and authentication during the retries are Docker-free; the live suite already covers each stop on its own.
 
-The live forward-proof suite runs in the gate's `sources/lib` command. Test 11 may need a serial lane if its run time requires one.
+**Mutants** are listed in the PR with their results.
 
 ## 6. Out of scope
 
