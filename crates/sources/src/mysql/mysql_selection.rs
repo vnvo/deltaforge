@@ -151,6 +151,12 @@ fn stream_cost(s: &BarrierStream) -> u64 {
 /// `deltaforge_mysql_selection_cache_evictions_total{pipeline,source}`.
 pub(crate) const METRIC_EVICTIONS: &str =
     "deltaforge_mysql_selection_cache_evictions_total";
+/// `deltaforge_mysql_selection_cache_bytes{pipeline,source}`: the
+/// estimated bytes held (entries and barrier streams).
+pub(crate) const METRIC_BYTES: &str = "deltaforge_mysql_selection_cache_bytes";
+/// `deltaforge_mysql_selection_cache_timelines{pipeline,source}`.
+pub(crate) const METRIC_TIMELINES: &str =
+    "deltaforge_mysql_selection_cache_timelines";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum CacheKey {
@@ -200,7 +206,25 @@ pub(crate) struct Caches {
     bytes: u64,
     max_tables: usize,
     max_bytes: u64,
+    meters: Meters,
+}
+
+/// The cache's metrics: evictions, and its own accounting (estimated bytes
+/// and timelines held), published after every change.
+struct Meters {
     evictions: metrics::Counter,
+    bytes: metrics::Gauge,
+    timelines: metrics::Gauge,
+}
+
+impl Meters {
+    fn noop() -> Self {
+        Self {
+            evictions: metrics::Counter::noop(),
+            bytes: metrics::Gauge::noop(),
+            timelines: metrics::Gauge::noop(),
+        }
+    }
 }
 
 impl std::fmt::Debug for Caches {
@@ -218,32 +242,34 @@ impl Default for Caches {
         Self::with_limits(
             SELECTION_CACHE_ENTRIES,
             SELECTION_CACHE_BYTES,
-            metrics::Counter::noop(),
+            Meters::noop(),
         )
     }
 }
 
 impl Caches {
-    /// The source's caches, counting evictions under its labels.
+    /// The source's caches, metered under its labels.
     pub(crate) fn new(pipeline: &str, source: &str) -> Self {
         let (tables, bytes) = crate::stream_probe::selection_cache_limits()
             .unwrap_or((SELECTION_CACHE_ENTRIES, SELECTION_CACHE_BYTES));
-        Self::with_limits(
+        let labels = [
+            ("pipeline", pipeline.to_string()),
+            ("source", source.to_string()),
+        ];
+        let caches = Self::with_limits(
             tables,
             bytes,
-            metrics::counter!(
-                METRIC_EVICTIONS,
-                "pipeline" => pipeline.to_string(),
-                "source" => source.to_string()
-            ),
-        )
+            Meters {
+                evictions: metrics::counter!(METRIC_EVICTIONS, &labels),
+                bytes: metrics::gauge!(METRIC_BYTES, &labels),
+                timelines: metrics::gauge!(METRIC_TIMELINES, &labels),
+            },
+        );
+        caches.publish();
+        caches
     }
 
-    fn with_limits(
-        max_tables: usize,
-        max_bytes: u64,
-        evictions: metrics::Counter,
-    ) -> Self {
+    fn with_limits(max_tables: usize, max_bytes: u64, meters: Meters) -> Self {
         assert!(max_tables > 0, "a positive table bound");
         Self {
             entries: lru::LruCache::unbounded(),
@@ -252,8 +278,14 @@ impl Caches {
             bytes: 0,
             max_tables,
             max_bytes,
-            evictions,
+            meters,
         }
+    }
+
+    /// Publish the accounting (after every change to it).
+    fn publish(&self) {
+        self.meters.bytes.set(self.bytes as f64);
+        self.meters.timelines.set(self.timelines as f64);
     }
 
     /// The estimated bytes held: entries and barrier streams.
@@ -303,6 +335,7 @@ impl Caches {
                 }
             }
         }
+        self.publish();
     }
 
     /// Evict the least recently used entry; `false` when there is none.
@@ -311,7 +344,7 @@ impl Caches {
             return false;
         };
         self.forget(cached, b);
-        self.evictions.increment(1);
+        self.meters.evictions.increment(1);
         true
     }
 
@@ -326,6 +359,7 @@ impl Caches {
         }
         self.bytes += bytes;
         self.entries.push(key, (value, bytes));
+        self.publish();
     }
 
     /// The most tables one batched load brings in: never more than half
@@ -426,6 +460,7 @@ impl Caches {
             CacheKey::Timeline(key),
             (Cached::Timeline(Arc::new(shared), false), bytes),
         );
+        self.publish();
     }
 
     fn selection(
@@ -487,11 +522,7 @@ impl Caches {
 
     #[cfg(test)]
     pub(crate) fn with_budget_for_test(budget: usize) -> Self {
-        Self::with_limits(
-            budget,
-            SELECTION_CACHE_BYTES,
-            metrics::Counter::noop(),
-        )
+        Self::with_limits(budget, SELECTION_CACHE_BYTES, Meters::noop())
     }
 
     /// Change the bounds, keeping what is held (tests).
@@ -591,6 +622,7 @@ impl Caches {
         if let Some((s, _)) = self.barriers.remove(stream) {
             self.bytes -= stream_cost(&s);
         }
+        self.publish();
     }
 
     /// Everything is stale (a reload request without a table).
@@ -599,6 +631,7 @@ impl Caches {
         self.barriers.clear();
         self.timelines = 0;
         self.bytes = 0;
+        self.publish();
     }
 }
 
@@ -646,11 +679,8 @@ pub fn cache_memory_probe(
             bytes,
         })
     };
-    let mut caches = Caches::with_limits(
-        usize::MAX / 2,
-        u64::MAX / 2,
-        metrics::Counter::noop(),
-    );
+    let mut caches =
+        Caches::with_limits(usize::MAX / 2, u64::MAX / 2, Meters::noop());
     for t in 0..tables {
         let records: Vec<Stored> = (0..records)
             .map(|i| Stored {
@@ -1774,6 +1804,77 @@ mod tests {
             panic!("a counter")
         };
         assert!(*n > 0 && *n < puts);
+    }
+
+    /// The cache's own accounting (estimated bytes and timelines) is
+    /// exported under the source's labels after every change: puts,
+    /// evictions, a barrier append and a full invalidation.
+    #[test]
+    fn the_cache_accounting_is_exported() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let rec = DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        let gauge = |name: &str| -> (Vec<String>, f64) {
+            let found: Vec<_> = snap
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter(|(k, ..)| k.key().name() == name)
+                .collect();
+            assert_eq!(found.len(), 1, "one {name} series per source");
+            let (key, _, _, value) = &found[0];
+            let DebugValue::Gauge(v) = value else {
+                panic!("{name} is a gauge")
+            };
+            let labels = key.key().labels().map(|l| l.key().to_string());
+            (labels.collect(), v.into_inner())
+        };
+        metrics::with_local_recorder(&rec, || {
+            let mut caches = Caches::new("p", "s");
+            caches.max_tables = 8;
+            caches.max_bytes = 20 * 1024;
+            let stream = Arc::new(BarrierStream {
+                stream: "lineage/x".into(),
+                records: Vec::new(),
+                head: 0,
+                bytes: 512,
+            });
+            let timeline = Arc::new(Timeline {
+                table_head: 0,
+                streams: vec![stream],
+                ..Timeline::of(Vec::new(), Vec::new())
+            });
+            let loaded = Arc::new(LoadedSchema::new(
+                MySqlTableSchema::new(Vec::new()),
+                1,
+                "h".into(),
+                1,
+            ));
+            let check = |caches: &Caches| {
+                let (labels, bytes) = gauge(METRIC_BYTES);
+                assert_eq!(labels, ["pipeline", "source"], "no table label");
+                assert_eq!(bytes, caches.bytes() as f64);
+                let (_, timelines) = gauge(METRIC_TIMELINES);
+                assert_eq!(timelines, caches.timelines() as f64);
+            };
+            for i in 0..40 {
+                let table = format!("lineage/x/t{i}");
+                caches.put_timeline(table.clone(), timeline.clone());
+                caches.put_selection(
+                    (table, format!("d{i}"), "sig".into()),
+                    loaded.clone(),
+                );
+                check(&caches);
+            }
+            assert!(caches.timelines() > 0 && caches.bytes() > 0);
+            caches.barrier_appended("lineage/x");
+            check(&caches);
+            caches.put_timeline("lineage/y/t".into(), timeline.clone());
+            check(&caches);
+            caches.invalidate_all();
+            check(&caches);
+            assert_eq!(gauge(METRIC_BYTES).1, 0.0);
+        });
     }
 
     #[test]

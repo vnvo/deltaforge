@@ -3284,7 +3284,12 @@ async fn main() -> Result<()> {
         .collect::<Result<_>>()?;
     match (binaries.len(), layouts.len()) {
         (2, 0) | (0, 2) => {}
-        _ => bail!("exactly two --binary, or exactly two --layout"),
+        // The scaling study may run one system alone (stage 2's
+        // PostgreSQL-store arm runs DeltaForge only).
+        (1, 0) if !args.scale_tables.is_empty() => {}
+        _ => bail!(
+            "exactly two --binary, or exactly two --layout (the scaling study also takes one --binary)"
+        ),
     }
     std::fs::create_dir_all(&args.out)?;
     std::fs::write(

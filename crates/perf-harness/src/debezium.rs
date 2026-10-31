@@ -187,6 +187,16 @@ impl Connect {
         Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
     }
 
+    /// The connector's committed offsets (`GET /connectors/<name>/offsets`).
+    pub async fn offsets(&self, name: &str) -> Result<Value> {
+        self.call(
+            reqwest::Method::GET,
+            &format!("/connectors/{name}/offsets"),
+            None,
+        )
+        .await
+    }
+
     pub async fn create(&self, connector: &Value) -> Result<()> {
         self.call(reqwest::Method::POST, "/connectors", Some(connector))
             .await

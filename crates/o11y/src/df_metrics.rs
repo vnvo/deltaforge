@@ -316,6 +316,16 @@ pub fn describe_metrics() {
         "MySQL schema selection cache entries evicted by the per-source budget"
     );
     describe_gauge!(
+        "deltaforge_mysql_selection_cache_bytes",
+        Unit::Bytes,
+        "Estimated bytes held by a MySQL source's schema selection cache"
+    );
+    describe_gauge!(
+        "deltaforge_mysql_selection_cache_timelines",
+        Unit::Count,
+        "Validated timelines held by a MySQL source's schema selection cache"
+    );
+    describe_gauge!(
         "deltaforge_source_lag_seconds",
         Unit::Seconds,
         "Lag between the latest source event timestamp and wall clock time"
