@@ -143,13 +143,18 @@ The deadline governs all MySQL work of the proof:
 Store work under the deadline:
 
 - A commit starts only after a completed scan whose evidence proves its tables.
-- `commit_proofs` checks the deadline and the stop before planning each batch and before each replan (after a conflict or a repair). Past either, it starts no further batch or replan. It returns what it committed; the rest stay `Retrying` (deadline) or pending (stop).
+- `commit_proofs` checks the deadline and the stop before planning each batch and before each replan (after a conflict or a repair), and again after the plan is read: before each repair write and immediately before the atomic commit. Past either, it starts no further batch, replan or repair. It returns what it committed; the rest stay `Retrying` (deadline) or pending (stop).
+- A stop that arrives while the last batch resolves is still honored, though every table committed: the bindings stay, the proof ends `Cancelled`, the retrying incident is withdrawn, and the DDL is neither emitted nor checkpointed. The replay finds the bindings. The retry loop also checks the stop before it completes.
 - A batch already started is never cut: its `commit_atomic_counted`, with its storage retries (`BATCH_STORAGE_RETRIES`) and the commit-marker resolution of an ambiguous outcome, runs to its result.
 - Once the deadline has passed, the freshness reads are skipped: those tables are invalidated and reload, which is always safe.
 
-**The resulting bound:** no MySQL capture or scan of the proof starts after the deadline, and none starts a batch or replan after it. The proof can still outlast the deadline, by:
+**The resulting bound:** no MySQL capture or scan of the proof starts after the deadline, and no store batch, replan or repair write starts after it. Store work already in progress at the deadline is not cut, so the proof can still outlast the deadline, by:
 
-- the store batch in progress at the deadline: the rest of its planning reads, if planning had started, then its commit with up to `BATCH_STORAGE_RETRIES` storage retries and the commit-marker resolution;
+- planning reads in progress (after them, no batch starts);
+- a repair write in progress;
+- the store batch in progress: its commit with up to `BATCH_STORAGE_RETRIES` storage retries and the commit-marker resolution;
+- replay reads in progress (the check for an existing binding at the start of an attempt);
+- freshness reads in progress (none starts after the deadline);
 - the incident store write that records the outcome (§3.8);
 - in the background, after the proof has returned: the server-side kill of a dropped capture session (the existing detached kill, bounded by its own connect and statement), and the end of a dropped scan session (its abortive close makes the server's next write fail).
 
@@ -242,7 +247,7 @@ Metrics:
 ## 4. Invariants
 
 1. A retry never emits, checkpoints or registers anything that the same attempt would not prove as a first attempt.
-2. **Deadline:** no capture, scan, store batch or replan of a proof starts after its deadline or after its fourth attempt, and no capture or scan runs past the deadline by more than its cancellation cleanup. A store batch already started resolves (including its commit-marker resolution) before the proof ends; that, the outcome's incident write and the background cleanup (§3.4) are the only overrun, each bounded by its own limits.
+2. **Deadline:** no capture, scan, store batch, replan, repair write or freshness read of a proof starts after its deadline or after its fourth attempt, and no capture or scan runs past the deadline by more than its cancellation cleanup. Store work already in progress (planning, repair, a batch with its commit-marker resolution, replay and freshness reads), the outcome's incident write and the background cleanup (§3.4) can outlast it, each bounded only by its own limits.
 3. Identity is fixed at the start of `prove`. Any attempt that reaches another server, or cannot establish identity, stops the source without a retry.
 4. Invalid or untrusted evidence, deterministic bounds, evidence decisions and protocol failures are never retried. Authentication and authorization failures stop at the DDL boundary.
 5. A table is in exactly one of `Retrying`, `Proven` or `Deferred`. Only `Retrying` changes. Across attempts and replays a table is bound at most once.
@@ -252,7 +257,7 @@ Metrics:
 
 ## 5. Tests
 
-The live regressions (1 and 2 below) were written first and seen failing on the code before this change: the transient lock wait deferred the DDL instead of binding it, and the held lock let the DDL be emitted instead of stopping the source.
+The live regressions (1 and 2 below) were written first and seen failing on the code before this change; so were the four planning and last-batch regressions, on 44d5958c and d6d50ea7 (three proofs succeeded after the deadline or stop, and a repair wrote after the stop): the transient lock wait deferred the DDL instead of binding it, and the held lock let the DDL be emitted instead of stopping the source.
 
 **Docker-free** (`mysql_forward_proof::tests::store::retry`). These run the real retry loop (`prove_with`), `commit_proofs`, the store and the incident store, on a paused clock. Only the MySQL capture and scan are scripted (the `Probe` seam; the live probe calls the real `capture` and the shared scanner).
 
@@ -268,6 +273,10 @@ The live regressions (1 and 2 below) were written first and seen failing on the 
 | `a_free_table_commits_once_while_another_retries` | Multi-table: the free table commits once; after exhaustion the restart resolves it by its binding (not captured, no second version) and proves the other |
 | `no_batch_starts_after_the_deadline` | Expiry between batches: the first batch, started before the deadline, resolves after it; no second batch starts; the second table stays retrying |
 | `a_stop_during_commit_resolution_starts_no_further_batch` | A stop while the first batch's lost acknowledgement is resolved through its marker: one binding, no further batch or replan, `Cancelled`, withdrawn as `ended_cancelled` |
+| `no_batch_starts_when_the_deadline_passes_while_planning` | The deadline passes while the commit's plan is read: no write; nothing registered or bound; exhausted |
+| `no_batch_starts_after_a_stop_while_planning` | A stop while the plan is read: no write; `Cancelled` |
+| `no_repair_starts_after_a_stop_while_planning` | A plan that needs a repair (an entry without its indexes), stopped while read: no repair write |
+| `a_stop_during_the_last_batch_is_honored` | One batch, stopped while its lost acknowledgement is resolved: the binding stays, `Cancelled`, `ended_cancelled`; the replay captures nothing and keeps one binding |
 | `a_stop_ends_the_retries` | A stop in a backoff and in a lock wait ends the proof at that instant; `ended_cancelled`; nothing bound |
 | `an_authentication_failure_stops_without_a_retry` | After a transient failure: the operator-action draft of the same incident, cause `source_auth`, no further attempt |
 | `an_authorization_failure_stops_at_once` | No retry and no retrying incident |

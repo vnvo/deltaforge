@@ -233,11 +233,13 @@ is retried in place, with the stream paused at the DDL:
   DDL on the table in the scanned interval, a purged binlog, a scan bound)
   leaves the DDL pending as before; the table's next rows are then proven
   by its lazy proof, which can still succeed.
-- **Deadline:** no capture, scan, or store batch of the proof starts after
-  its deadline. A batch already started finishes (including the
-  resolution of an unacknowledged commit), so the proof can end shortly
-  after the deadline. A capture or scan cut at the deadline is ended on
-  the server.
+- **Deadline:** no capture, scan, store batch or repair of the proof starts
+  after its deadline. Store work already in progress is not cut: planning
+  reads, a repair, a batch (including the resolution of an unacknowledged
+  commit), and binding or freshness reads, so the proof can end after the
+  deadline by as long as those take. A capture or scan cut at the deadline
+  is ended on the server. A stop during the last batch keeps what it
+  committed and still stops the source before the DDL.
 
 `deltaforge_mysql_forward_proof_retries_total{class}` counts retried
 failures (`lock_wait_timeout`, `deadlock`, `capture_slots_busy`,

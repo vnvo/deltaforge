@@ -520,6 +520,11 @@ pub(crate) async fn prove_with<P: Probe>(
     let mut fresh = Vec::new();
     let end = loop {
         if run.retrying().is_empty() {
+            // Every table decided; a stop that arrived meanwhile still ends
+            // the proof (the DDL is not emitted).
+            if ctx.cancel.is_cancelled() {
+                break Some(Some(Stop::Cancelled));
+            }
             break None;
         }
         if run.attempts >= limits.attempts {
@@ -543,7 +548,7 @@ pub(crate) async fn prove_with<P: Probe>(
                 break Some(Some(stop));
             }
             if run.retrying().is_empty() {
-                break None;
+                continue;
             }
             let wait = limits
                 .backoff
@@ -1084,9 +1089,10 @@ fn group(
 /// it again (bounded); a batch that no longer fits is split. The pending
 /// `ddl` records stay as written; a stop leaves every table not yet
 /// committed pending. Past `halt` (the run's stop or the proof's deadline)
-/// no batch or replan starts: a batch already started resolves first
-/// (its commit-marker resolution included), and what was committed is
-/// returned with why it halted.
+/// no batch, replan or repair starts (checked again after the plan is
+/// read): a batch already started resolves first (its commit-marker
+/// resolution included), and what was committed is returned with why it
+/// halted. A stop during the last batch is reported too.
 async fn commit_proofs(
     ctx: &RunCtx,
     scope: &RegistryScope,
@@ -1242,6 +1248,14 @@ async fn commit_proofs(
                 } => (preconditions, registrations),
                 RegistrationPlanning::NeedsRepair(broken) => {
                     for k in &broken {
+                        // A repair writes: none starts past the stop or the
+                        // deadline (one arriving while the plan was read).
+                        if let Some(halted) = halt.check() {
+                            return Ok(CommitOutcome {
+                                committed: out,
+                                halted: Some(halted),
+                            });
+                        }
                         registry
                             .repair_key(k)
                             .await
@@ -1297,6 +1311,13 @@ async fn commit_proofs(
                         .map_err(SourceError::Other)?,
                 });
                 op_table.resize(batch.ops.len(), i);
+            }
+            // Nor the batch itself: the plan was read after the check above.
+            if let Some(halted) = halt.check() {
+                return Ok(CommitOutcome {
+                    committed: out,
+                    halted: Some(halted),
+                });
             }
             let commit_phase = crate::perf_phases::Phase::start("commit");
             let result = commit_atomic_counted(
@@ -1371,9 +1392,11 @@ async fn commit_proofs(
             break;
         }
     }
+    // A stop that arrived while the last batch resolved is reported, though
+    // every table committed: the proof ends there, the DDL not emitted.
     Ok(CommitOutcome {
         committed: out,
-        halted: None,
+        halted: halt.cancel.is_cancelled().then_some(Halted::Stopped),
     })
 }
 
@@ -2289,6 +2312,9 @@ mod tests {
                 captures: Mutex<HashMap<String, VecDeque<Step>>>,
                 scan_time: Mutex<Duration>,
                 calls: Mutex<Vec<(String, Instant)>>,
+                /// Run once when the next scan ends: the attempt then goes
+                /// straight to its commit.
+                after_scan: Mutex<Option<Box<dyn FnOnce() + Send>>>,
             }
 
             impl Script {
@@ -2354,6 +2380,9 @@ mod tests {
                 ) -> Result<ScanReport, ProofError> {
                     let t = *self.scan_time.lock().unwrap();
                     tokio::time::sleep(t).await;
+                    if let Some(f) = self.after_scan.lock().unwrap().take() {
+                        f();
+                    }
                     Ok(report())
                 }
             }
@@ -3045,6 +3074,162 @@ mod tests {
                     assert_eq!(durable(&ctx, "a", &id).await.1, Some(1));
                     assert_eq!(fresh.len(), usize::from(!late), "late: {late}");
                 }
+            }
+
+            /// Arm `hook` to run during the commit's planning reads: the
+            /// first `read_batch` after the scan is the plan's.
+            fn during_planning(
+                script: &Script,
+                st: &Store,
+                hook: impl FnOnce() -> std::pin::Pin<
+                    Box<dyn std::future::Future<Output = ()> + Send>,
+                > + Send
+                + 'static,
+            ) {
+                let fault = st.fault.clone();
+                *script.after_scan.lock().unwrap() =
+                    Some(Box::new(move || {
+                        *fault.before_next_read_batch.lock().unwrap() =
+                            Some(BatchHook(Box::new(move |_| hook())));
+                    }));
+            }
+
+            /// The schema writes made so far (batches and single writes).
+            fn writes(st: &Store) -> usize {
+                st.fault.write_calls.lock().unwrap().len()
+            }
+
+            /// The deadline passes while the commit's plan is read: the
+            /// batch is not started. Nothing of the table is registered or
+            /// bound; it stays retrying and the proof is exhausted.
+            #[tokio::test(start_paused = true)]
+            async fn no_batch_starts_when_the_deadline_passes_while_planning() {
+                let st = store();
+                let mut ctx = ctx_with(
+                    &st,
+                    deltaforge_config::ForwardProofRetry {
+                        deadline: Duration::from_secs(10),
+                        ..bounds()
+                    },
+                )
+                .await;
+                let p = tables(&mut ctx, &["a"]).await;
+                let id = p[0].ddl_id.clone();
+                let script = Script::default();
+                during_planning(&script, &st, || {
+                    Box::pin(tokio::time::sleep(Duration::from_secs(20)))
+                });
+                let before = writes(&st);
+                let err = prove_with(&ctx, &script, p).await.err().unwrap();
+                assert_eq!(writes(&st), before, "no write after the deadline");
+                assert_eq!(durable(&ctx, "a", &id).await, (vec![], None));
+                assert!(
+                    err.draft()
+                        .unwrap()
+                        .evidence
+                        .holds(EvidenceKey::ReasonClass, "deadline")
+                );
+            }
+
+            /// A stop while the commit's plan is read: the batch is not
+            /// started, nothing is written, the proof ends `Cancelled`.
+            #[tokio::test(start_paused = true)]
+            async fn no_batch_starts_after_a_stop_while_planning() {
+                let st = store();
+                let mut ctx = ctx_with(&st, bounds()).await;
+                let p = tables(&mut ctx, &["a"]).await;
+                let id = p[0].ddl_id.clone();
+                let script = Script::default();
+                let cancel = ctx.cancel.clone();
+                during_planning(&script, &st, move || {
+                    cancel.cancel();
+                    Box::pin(async {})
+                });
+                let before = writes(&st);
+                let err = prove_with(&ctx, &script, p).await.err().unwrap();
+                assert!(matches!(err, SourceError::Cancelled), "{err}");
+                assert_eq!(writes(&st), before, "no write after the stop");
+                assert_eq!(durable(&ctx, "a", &id).await, (vec![], None));
+            }
+
+            /// A plan that needs a repair first (an entry stored without its
+            /// indexes), with a stop while it is read: the repair's writes
+            /// do not start either.
+            #[tokio::test(start_paused = true)]
+            async fn no_repair_starts_after_a_stop_while_planning() {
+                let st = store();
+                let mut ctx = ctx_with(&st, bounds()).await;
+                let p = tables(&mut ctx, &["a"]).await;
+                let k = key(&ctx, "a");
+                // A registry entry as the registry stores it, without the
+                // indexes a completed registration writes.
+                let entry = serde_json::json!({
+                    "format_version": 1,
+                    "record_version": 1,
+                    "version": 1,
+                    "hash": "h0",
+                    "schema_json": {},
+                    "registered_at": chrono::Utc::now(),
+                    "checkpoint": null,
+                });
+                storage::StorageBackend::log_append(
+                    st.memory.as_ref(),
+                    storage::adapters::schema_registry::V1_NS,
+                    &k.backend_key(),
+                    &serde_json::to_vec(&entry).unwrap(),
+                )
+                .await
+                .unwrap();
+                let script = Script::default();
+                let cancel = ctx.cancel.clone();
+                during_planning(&script, &st, move || {
+                    cancel.cancel();
+                    Box::pin(async {})
+                });
+                let before = writes(&st);
+                let err = prove_with(&ctx, &script, p).await.err().unwrap();
+                assert!(matches!(err, SourceError::Cancelled), "{err}");
+                assert_eq!(
+                    st.fault.write_calls.lock().unwrap()[before..].to_vec(),
+                    Vec::<String>::new(),
+                    "no repair write after the stop"
+                );
+            }
+
+            /// A stop during the only batch, while its lost acknowledgement
+            /// is resolved through its marker: the binding stays, but the
+            /// proof ends `Cancelled` (the DDL is not emitted) and the
+            /// retrying incident is withdrawn. The replay finds the binding
+            /// and captures nothing.
+            #[tokio::test(start_paused = true)]
+            async fn a_stop_during_the_last_batch_is_honored() {
+                let st = store();
+                let mut ctx = ctx_with(&st, bounds()).await;
+                let p = tables(&mut ctx, &["a"]).await;
+                let id = p[0].ddl_id.clone();
+                let script = Script::with(&[("a", vec![contention(), ok()])]);
+                let cancel = ctx.cancel.clone();
+                let memory = st.memory.clone();
+                *st.fault.before_next_batch.lock().unwrap() =
+                    Some(BatchHook(Box::new(move |_| {
+                        cancel.cancel();
+                        memory.set_batch_fault(Some(BatchFault::AfterCommit));
+                        Box::pin(async {})
+                    })));
+                let err =
+                    prove_with(&ctx, &script, p.clone()).await.err().unwrap();
+                assert!(matches!(err, SourceError::Cancelled), "{err}");
+                let (versions, bound) = durable(&ctx, "a", &id).await;
+                assert_eq!((versions.len(), bound), (1, Some(1)));
+                let rec = only_incident(&ctx).await;
+                assert!(withdrawn(&rec, "ended_cancelled"), "{rec:?}");
+
+                ctx.cancel = CancellationToken::new();
+                let replay = Script::default();
+                prove_with(&ctx, &replay, p).await.unwrap();
+                assert!(replay.calls.lock().unwrap().is_empty());
+                let (versions, bound) = durable(&ctx, "a", &id).await;
+                assert_eq!((versions.len(), bound), (1, Some(1)));
             }
 
             /// Every failure has one decision; the transient ones (and only
