@@ -146,7 +146,7 @@ Store work under the deadline:
 - `commit_proofs` checks the deadline and the stop before planning each batch and before each replan (after a conflict or a repair), and again after the plan is read: before each repair write and immediately before the atomic commit. Past either, it starts no further batch, replan or repair. It returns what it committed; the rest stay `Retrying` (deadline) or pending (stop).
 - A stop that arrives while the last batch resolves is still honored, though every table committed: the bindings stay, the proof ends `Cancelled`, the retrying incident is withdrawn, and the DDL is neither emitted nor checkpointed. The replay finds the bindings. The retry loop also checks the stop before it completes.
 - A batch already started is never cut: its `commit_atomic_counted`, with its storage retries (`BATCH_STORAGE_RETRIES`) and the commit-marker resolution of an ambiguous outcome, runs to its result.
-- Once the deadline has passed, the freshness reads are skipped: those tables are invalidated and reload, which is always safe.
+- The freshness phase is skipped if the deadline or a stop is observed before it is entered: those tables are invalidated and reload, which is always safe. Once the phase is entered, its reads run under the existing store limits; there is no check before each read.
 
 **The resulting bound:** no MySQL capture or scan of the proof starts after the deadline, and no store batch, replan or repair write starts after it. Store work already in progress at the deadline is not cut, so the proof can still outlast the deadline, by:
 
@@ -154,7 +154,7 @@ Store work under the deadline:
 - a repair write in progress;
 - the store batch in progress: its commit with up to `BATCH_STORAGE_RETRIES` storage retries and the commit-marker resolution;
 - replay reads in progress (the check for an existing binding at the start of an attempt);
-- freshness reads in progress (none starts after the deadline);
+- freshness reads, once their phase is entered before the deadline or a stop is observed;
 - the incident store write that records the outcome (§3.8);
 - in the background, after the proof has returned: the server-side kill of a dropped capture session (the existing detached kill, bounded by its own connect and statement), and the end of a dropped scan session (its abortive close makes the server's next write fail).
 
@@ -247,7 +247,7 @@ Metrics:
 ## 4. Invariants
 
 1. A retry never emits, checkpoints or registers anything that the same attempt would not prove as a first attempt.
-2. **Deadline:** no capture, scan, store batch, replan, repair write or freshness read of a proof starts after its deadline or after its fourth attempt, and no capture or scan runs past the deadline by more than its cancellation cleanup. Store work already in progress (planning, repair, a batch with its commit-marker resolution, replay and freshness reads), the outcome's incident write and the background cleanup (§3.4) can outlast it, each bounded only by its own limits.
+2. **Deadline:** no capture, scan, store batch, replan or repair write of a proof starts after its deadline or after its fourth attempt, and no capture or scan runs past the deadline by more than its cancellation cleanup. The freshness phase is skipped if the deadline or a stop is observed before it is entered; once entered, its reads use the existing store limits. Store work already in progress (planning, repair, a batch with its commit-marker resolution, replay and freshness reads), the outcome's incident write and the background cleanup (§3.4) can outlast it, each bounded only by its own limits.
 3. Identity is fixed at the start of `prove`. Any attempt that reaches another server, or cannot establish identity, stops the source without a retry.
 4. Invalid or untrusted evidence, deterministic bounds, evidence decisions and protocol failures are never retried. Authentication and authorization failures stop at the DDL boundary.
 5. A table is in exactly one of `Retrying`, `Proven` or `Deferred`. Only `Retrying` changes. Across attempts and replays a table is bound at most once.
@@ -265,6 +265,7 @@ The live regressions (1 and 2 below) were written first and seen failing on the 
 |---|---|
 | `the_last_permitted_attempt_can_recover` | With the production bounds, attempts start at 0, 31, 65 and 111 s; the fourth proves the table; `verified_recovery` (`forward_proof_bound`) |
 | `four_failed_attempts_exhaust_the_proof` | Four attempts, nothing past 120 s; the operator-action draft is the retrying incident's identity; nothing bound |
+| `no_fifth_attempt_with_time_left` | With an hour's deadline, four failed attempts and no fifth: the attempt bound holds with time to spare |
 | `no_attempt_starts_after_the_deadline` | With 100 s, the fourth attempt (111 s) never starts: the backoff is cut to the 5 s left, then exhaustion after three |
 | `a_capture_needs_its_smallest_budget_left` | Within an attempt, tables 2 and 3 are not captured with 0.5 s left; they stay retrying (`deadline`) |
 | `a_scan_is_cut_at_the_deadline` | A scan still running at the deadline is dropped; the table stays retrying; exhausted at exactly 10 s |
@@ -277,6 +278,8 @@ The live regressions (1 and 2 below) were written first and seen failing on the 
 | `no_batch_starts_after_a_stop_while_planning` | A stop while the plan is read: no write; `Cancelled` |
 | `no_repair_starts_after_a_stop_while_planning` | A plan that needs a repair (an entry without its indexes), stopped while read: no repair write |
 | `a_stop_during_the_last_batch_is_honored` | One batch, stopped while its lost acknowledgement is resolved: the binding stays, `Cancelled`, `ended_cancelled`; the replay captures nothing and keeps one binding |
+| `freshness_is_skipped_past_the_deadline` | A batch that resolves after the deadline still binds the table, but the freshness phase is skipped and its timeline is not offered for install (it reloads); before the deadline the same proof offers it |
+| `a_stop_during_the_freshness_reads_is_honored` | A stop after the last batch committed, while the freshness phase reads: the binding stays and the proof ends `Cancelled`; the DDL is not emitted |
 | `a_stop_ends_the_retries` | A stop in a backoff and in a lock wait ends the proof at that instant; `ended_cancelled`; nothing bound |
 | `an_authentication_failure_stops_without_a_retry` | After a transient failure: the operator-action draft of the same incident, cause `source_auth`, no further attempt |
 | `an_authorization_failure_stops_at_once` | No retry and no retrying incident |
