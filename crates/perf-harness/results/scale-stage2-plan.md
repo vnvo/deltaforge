@@ -8,9 +8,11 @@ It also measures how the number of activation windows grows with the active
 set, which the 2026-10-30 ruling on the mass-invalidation diagnosis asked
 for: bounded work per window still produces more windows as fleets grow.
 
-- **Runner:** `b0adf611` (main after #190), release build.
-- **Harness:** `crates/perf-harness` at the merge of the harness changes
-  listed at the end, which are reviewed before the first measured run.
+- **Runner and harness:** one revision, `<M>`: the merge commit on main of
+  the harness changes listed at the end, which include the runner's cache
+  gauges. Both are release builds of `<M>`, and every arm uses the same two
+  builds (below). `b0adf611` (main after #190) lacks the gauges and is not
+  used.
 - **Decisions taken in review (2026-10-31):**
   - the main matrix uses a SQLite state store, as stage 1 did;
   - a PostgreSQL state store is its own arm (D), DeltaForge only;
@@ -251,11 +253,54 @@ not explain it.
 ## Evidence
 
 Each invocation is copied to
-`~/deltaforge-evidence/scale-stage2-<arm>-b0adf611/` (runs, raw rows,
+`~/deltaforge-evidence/scale-stage2-<arm>-<M>/` (runs, raw rows,
 phases, proof traces, monitor samples, fixture records) and verified against
 its manifest before any of its resources are removed. Containers and
 volumes left by an invocation are stopped, inventoried and removed only with
 approval.
+
+## Builds and commands
+
+`<M>` is written as its first 8 hex digits once the harness changes merge.
+Built once, before arm C, from a clean checkout of `<M>`:
+
+```bash
+git checkout --detach <M> && test -z "$(git status --porcelain)"
+cargo build --release -p runner -p perf-harness
+B=target/perf/stage2-builds-<M>
+mkdir -p $B && cp target/release/runner target/release/canonical-perf $B/
+( git rev-parse HEAD; sha256sum $B/runner $B/canonical-perf ) > $B/build-identity.txt
+```
+
+The copies in `$B` are what every arm runs; a rebuild between arms is not
+allowed. Each invocation records the harness executable's SHA-256 and the
+checkout's revision and cleanliness (`invocation.json`), and its evidence
+directory gets a copy of `build-identity.txt`. An arm whose recorded
+identity differs from it is not part of stage 2. Every arm runs with
+`PERF_RUST_LOG=warn,deltaforge::proof_trace=info`:
+
+```bash
+# C. Anchor
+$B/canonical-perf --binary df=$B/runner --binary dbz=debezium --debezium-profile tuned \
+    --out target/perf/scale-stage2-C-<M> --reps 3 --scale-tables 1000 \
+    --scale-active 1,20,50 --scale-workload steady,burst --scale-binlog-mib 0
+# A. Main matrix
+$B/canonical-perf --binary df=$B/runner --binary dbz=debezium --debezium-profile tuned \
+    --out target/perf/scale-stage2-A-<M> --reps 3 --scale-tables 10000,40000 \
+    --scale-active 1,20,50 --scale-workload steady,burst --scale-binlog-mib 0
+# B. Position
+$B/canonical-perf --binary df=$B/runner --binary dbz=debezium --debezium-profile tuned \
+    --out target/perf/scale-stage2-B-<M> --reps 3 --scale-tables 1000,10000,40000 \
+    --scale-active 20 --scale-workload steady --scale-binlog-mib 256 --scale-binlog-pad small
+# D. PostgreSQL store
+$B/canonical-perf --binary df=$B/runner --state-store postgres \
+    --out target/perf/scale-stage2-D-<M> --reps 3 --scale-tables 1000,10000,40000 \
+    --scale-active 1,20,50 --scale-workload burst --scale-binlog-mib 0
+```
+
+Smoke runs made while building the harness (on the branch, before review)
+checked it end to end. They are not measurements, and none of their numbers
+are stage 2 results.
 
 ## Harness changes before the first run
 
