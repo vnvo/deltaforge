@@ -145,8 +145,14 @@ is a lower bound on the true peak.
 
 A run's load ends, then:
 
-1. **Delivery and frontier.** Wait until every committed row has arrived and
-   the system's durable frontier covers MySQL's final `gtid_executed`:
+1. **Delivery and frontier.** Read MySQL's final `gtid_executed`, then commit
+   one marker row (outside the ledger). Debezium's committed offset stops
+   before the last transaction it processed (a restart repeats that
+   transaction with skip counts), so its offset can cover the last load
+   transaction only once a later one has been processed; the marker is that
+   transaction, in both systems' runs. Wait until every committed row and
+   the marker have arrived and the system's durable frontier covers the
+   final `gtid_executed`:
    - DeltaForge: every sink checkpoint's GTID set
      (`GET /pipelines/<name>/checkpoints`);
    - Debezium: the connector is stopped (its tasks commit their offsets),
@@ -159,7 +165,8 @@ A run's load ends, then:
    row exactly once, in commit order per table, and nothing else.
 
 A timeout in step 1 (300 s) or step 3 (60 s) fails the run. The fixed
-two-second wait for late duplicates is removed.
+two-second wait for late duplicates is removed. A load that ends while the
+catch-up phase has the system stopped resumes it before the drain.
 
 ## Resource controls
 
@@ -270,3 +277,4 @@ approval.
    evidence preservation.
 7. **Order, reset and contamination records** as above. A run's system is
    now stopped on every exit path, including errors.
+8. **One system:** the scaling study accepts a single `--binary` (arm D).

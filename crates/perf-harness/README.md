@@ -203,10 +203,13 @@ Each run records:
 
 Stage 2's rules (`results/scale-stage2-plan.md`) apply to every run:
 
-- **Drain:** every committed row arrived and the durable frontier covers
-  MySQL's final `gtid_executed` (DeltaForge's sink checkpoints; Debezium's
+- **Drain:** after MySQL's final `gtid_executed` is read, one marker row is
+  committed (Debezium's offset stops before the last transaction it
+  processed). Every committed row and the marker arrived and the durable
+  frontier covers that GTID set (DeltaForge's sink checkpoints; Debezium's
   committed offset, after the connector is stopped), then the system is
   shut down and the topic read to its end. A timeout fails the run.
+- **One system:** the scaling study also runs with a single `--binary`.
 - **Measured failures:** permit timeouts, saturation deferrals, window
   deferrals or overflows, failed proof rounds and capture-kill failures
   fail a run, which is kept with its cause.
