@@ -214,7 +214,7 @@ impl LoopControl {
 }
 
 /// Check if an error message indicates an authentication/authorization failure.
-fn is_auth_error(msg: &str) -> bool {
+pub(crate) fn is_auth_error(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     lower.contains("access denied")
         || lower.contains("authentication")

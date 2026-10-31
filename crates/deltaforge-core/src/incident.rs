@@ -119,11 +119,16 @@ pub enum ReasonCode {
     /// that apply) exceeds the per-timeline limit: it is never loaded
     /// whole, and the table's rows cannot be decoded.
     MysqlTimelineTooLarge,
+    /// A MySQL DDL's forward proof could not be completed: retried in place
+    /// while a transient failure lasts (auto retry), then the source stops
+    /// before the DDL is emitted or checkpointed (operator action), as it
+    /// does at once for an authentication or authorization failure.
+    MysqlForwardProofUnavailable,
 }
 
 impl ReasonCode {
     /// Every reason (bounded metric label values).
-    pub const ALL: [ReasonCode; 30] = [
+    pub const ALL: [ReasonCode; 31] = [
         Self::PgDifferentCluster,
         Self::PgContinuityUnproven,
         Self::PgFailoverSlotUnavailable,
@@ -154,6 +159,7 @@ impl ReasonCode {
         Self::MysqlTableRegistryTooLarge,
         Self::MysqlControlPlaneSaturated,
         Self::MysqlTimelineTooLarge,
+        Self::MysqlForwardProofUnavailable,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -194,6 +200,9 @@ impl ReasonCode {
             }
             Self::MysqlControlPlaneSaturated => "mysql_control_plane_saturated",
             Self::MysqlTimelineTooLarge => "mysql_timeline_too_large",
+            Self::MysqlForwardProofUnavailable => {
+                "mysql_forward_proof_unavailable"
+            }
         }
     }
 }
@@ -652,6 +661,15 @@ impl Evidence {
         self.0.get(&key)
     }
 
+    /// `update`'s entries replace theirs here; every other entry stays.
+    /// Bounded as every entry is.
+    pub fn overlay(&mut self, update: &Evidence) -> &mut Self {
+        for (k, v) in &update.0 {
+            self.put(*k, v.clone());
+        }
+        self
+    }
+
     /// Whether `key` holds `value`: as text, or as the digest it was stored
     /// as. A verifier recomputes a value and checks it here, so a digest
     /// still identifies exactly one value.
@@ -949,6 +967,19 @@ pub fn explain(
             ev.show(K::ReadItems),
             ev.show(K::StateBytes),
             ev.show(K::KeyDigest),
+            ev.show(K::CheckpointPosition),
+        ),
+        ReasonCode::MysqlForwardProofUnavailable => format!(
+            "{component} could not prove the schema of {} table(s) (first {}) \
+             after a DDL: {} attempt(s), last failure {}. It stopped before \
+             the DDL; the checkpoint stays at {}, and a restart replays the \
+             DDL and proves it again. For lock contention, \
+             performance_schema.metadata_locks names the session holding the \
+             table's metadata lock.",
+            ev.show(K::BlockingCount),
+            ev.show(K::Table),
+            ev.show(K::Attempts),
+            ev.show(K::ReasonClass),
             ev.show(K::CheckpointPosition),
         ),
         ReasonCode::SchemaDriftBlocked => format!(

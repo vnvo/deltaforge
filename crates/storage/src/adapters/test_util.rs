@@ -67,6 +67,9 @@ pub struct FaultBackend {
     /// the inner store (another writer acting between a plan and its
     /// commit).
     pub before_next_batch: std::sync::Mutex<Option<BatchHook>>,
+    /// One-shot: run before the next `read_batch` reaches the store, with
+    /// the inner store (something happening while a plan is read).
+    pub before_next_read_batch: std::sync::Mutex<Option<BatchHook>>,
 }
 
 /// What a [`BatchHook`] runs: given the inner store, a future to await.
@@ -124,6 +127,7 @@ impl FaultBackend {
             crash_after_writes_to: std::sync::Mutex::new(None),
             write_calls: std::sync::Mutex::new(Vec::new()),
             before_next_batch: std::sync::Mutex::new(None),
+            before_next_read_batch: std::sync::Mutex::new(None),
             yield_after_slot_reads: AtomicBool::new(false),
             pause_after_slot_list: std::sync::Mutex::new(None),
             write_after_batch_error: std::sync::Mutex::new(None),
@@ -195,6 +199,10 @@ impl StorageBackend for FaultBackend {
         &self,
         reads: &[crate::BatchRead],
     ) -> Result<Vec<crate::BatchReadResult>> {
+        let hook = self.before_next_read_batch.lock().unwrap().take();
+        if let Some(hook) = hook {
+            (hook.0)(self.inner.clone()).await;
+        }
         self.inner.read_batch(reads).await
     }
     /// `fail_log_read_meta` fails the whole read: nothing partial is

@@ -4,8 +4,9 @@ use std::collections::HashSet;
 
 use deltaforge_core::SourceError;
 use deltaforge_core::incident::{
-    ActionCode, CauseCode, Component, EvidenceKey as K, IncidentDraft,
-    IncidentId, ReasonCode, Retryability, SafetyState, scope_key,
+    ActionCode, CauseCode, Component, Evidence, EvidenceKey as K,
+    IncidentDraft, IncidentId, ReasonCode, Retryability, SafetyState,
+    scope_key,
 };
 use storage::ArcStorageBackend;
 use storage::adapters::incidents::{
@@ -240,6 +241,53 @@ pub(crate) fn mysql_timeline_too_large(
 }
 
 /// The checkpoint position a window stays before, as evidence text.
+/// What a `mysql_forward_proof_unavailable` incident says
+/// (`docs/design/mysql-forward-proof-retry.md`, section 3.8).
+pub(crate) struct ForwardProof<'a> {
+    pub source_id: &'a str,
+    /// The first table in the incident's scope, `db.table`.
+    pub table: &'a str,
+    /// The tables it counts (still retrying, or deferred when withdrawn).
+    pub tables: u64,
+    pub attempts: u32,
+    /// The last failure's class.
+    pub class: &'a str,
+    /// The DDL's position: the incident's boundary.
+    pub ddl: &'a crate::mysql::MySqlCheckpoint,
+    /// The checkpoint before the DDL, where the source stops.
+    pub before: &'a crate::mysql::MySqlCheckpoint,
+}
+
+/// The `mysql_forward_proof_unavailable` draft: `AutoRetry` while the proof
+/// retries in place, `OperatorAction` when the source stops on it. Its
+/// identity is the source and the DDL's position, so the stop's draft is the
+/// retrying incident's (reclassified by the supervisor).
+pub(crate) fn mysql_forward_proof_unavailable(
+    f: &ForwardProof<'_>,
+    retryability: Retryability,
+    cause: CauseCode,
+) -> IncidentDraft {
+    IncidentDraft::new(
+        ReasonCode::MysqlForwardProofUnavailable,
+        Component::Source {
+            id: f.source_id.to_string(),
+        },
+        retryability,
+        SafetyState::HaltedSafe,
+        cause,
+    )
+    .discriminate("boundary", window_position(f.ddl))
+    .with_evidence(|e| {
+        e.text(K::SourceId, f.source_id)
+            .text(K::Table, f.table)
+            .count(K::BlockingCount, f.tables)
+            .count(K::Attempts, u64::from(f.attempts))
+            .text(K::ReasonClass, f.class)
+            .text(K::CheckpointPosition, &window_position(f.before));
+    })
+    .with_actions(&[ActionCode::InspectLogs])
+}
+
 fn window_position(at: &crate::mysql::MySqlCheckpoint) -> String {
     match &at.gtid_set {
         Some(g) => g.clone(),
@@ -432,10 +480,20 @@ pub(crate) async fn cancel_retrying(
     store: &IncidentStore,
     retrying: Option<IncidentId>,
 ) {
+    cancel_retrying_with(store, retrying, &Evidence::new()).await
+}
+
+/// [`cancel_retrying`], recording why the retry ended: `update`'s entries
+/// replace theirs in the same transition, every other entry stays.
+pub(crate) async fn cancel_retrying_with(
+    store: &IncidentStore,
+    retrying: Option<IncidentId>,
+    update: &Evidence,
+) {
     let Some(id) = retrying else {
         return;
     };
-    if let Err(e) = store.cancel_auto_retry(&id).await {
+    if let Err(e) = store.cancel_auto_retry_with(&id, update).await {
         warn!(
             error = %format!("{e:#}"),
             "could not withdraw the retrying incident; a verified start \

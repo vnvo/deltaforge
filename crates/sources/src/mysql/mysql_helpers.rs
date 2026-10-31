@@ -230,7 +230,7 @@ async fn connect_binlog(
         Ok(Err(e @ SessionError::NoIdentity(_))) => {
             Err(e.into_source_error(expected_uuid))
         }
-        Ok(Err(SessionError::Connect(error_msg))) => {
+        Ok(Err(SessionError::Connect(_, error_msg))) => {
             error!(source_id = %source_id, error = %error_msg, "binlog connect failed");
 
             if error_msg.contains("mysql_native_password") {
@@ -289,7 +289,7 @@ pub(super) async fn resolve_binlog_tail(
             info!("connected to MySQL (identity verified)");
             conn
         }
-        Err(super::mysql_session::SessionError::Connect(e)) => {
+        Err(super::mysql_session::SessionError::Connect(_, e)) => {
             error!("failed to connect to MySQL: {}", e);
             return Err(MySqlSourceError::BinlogConnect(format!(
                 "MySQL connection failed: {e}"

@@ -451,7 +451,10 @@ impl ProofScanner {
         );
         let served = match served.await {
             Ok(r) => r,
-            Err(_) => Err(ProofError::Open("the proof scanner stopped".into())),
+            Err(_) => Err(ProofError::Open(
+                crate::mysql::mysql_failure::Failure::Other,
+                "the proof scanner stopped".into(),
+            )),
         };
         let served = match served {
             Ok(s) => s,
@@ -882,8 +885,8 @@ fn falls_back(e: &ProofError) -> bool {
         e,
         ProofError::AnchorMismatch(_)
             | ProofError::NotReached(_)
-            | ProofError::Open(_)
-            | ProofError::Read(_)
+            | ProofError::Open(..)
+            | ProofError::Read(..)
             | ProofError::SeekLimit(_)
     )
 }
@@ -1345,7 +1348,10 @@ mod tests {
             if std::mem::take(&mut *self.fail_next.lock().unwrap())
                 || *self.fail_at.lock().unwrap() == Some(a)
             {
-                return Err(ProofError::Open("purged".into()));
+                return Err(ProofError::Open(
+                    crate::mysql::mysql_failure::Failure::Retention,
+                    "purged".into(),
+                ));
             }
             if let Some(a) = anchor {
                 // An anchor is only ever one taken at the start.
@@ -1629,7 +1635,7 @@ mod tests {
             // The right extension fails after the left one succeeded.
             *syn.fail_at.lock().unwrap() = Some(20);
             let r = ask(&sc, &syn, 5, 30, Some(5)).await;
-            assert!(matches!(r, Err(ProofError::Open(_))), "{r:?}");
+            assert!(matches!(r, Err(ProofError::Open(..))), "{r:?}");
             assert!(sc.snapshot() == before, "{gtid}: right failed");
             *syn.fail_at.lock().unwrap() = None;
             // The left extension fails.
@@ -1641,7 +1647,10 @@ mod tests {
             // stops at its first failed extension.
             // With a stream anchor (GTID mode), the positioned attempt and
             // one unanchored attempt; never a third.
-            fail(Some(ProofError::Open("down".into())));
+            fail(Some(ProofError::Open(
+                crate::mysql::mysql_failure::Failure::Transport,
+                "down".into(),
+            )));
             let tried = syn.attempts.lock().unwrap().len();
             let anchor = gtid.then(|| syn.anchor(5, true));
             assert!(

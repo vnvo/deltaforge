@@ -37,6 +37,7 @@ pub mod mysql_connections;
 pub mod mysql_control;
 mod mysql_ddl_attribution;
 mod mysql_failover_drift;
+mod mysql_failure;
 mod mysql_forward_proof;
 mod mysql_helpers;
 mod mysql_history;
@@ -3004,7 +3005,7 @@ async fn fetch_identity_verified_as(
                 conn.release().await;
                 return Ok(mysql_identity(expected_uuid));
             }
-            Err(SessionError::Connect(e)) => {
+            Err(SessionError::Connect(_, e)) => {
                 attempt += 1;
                 if attempt >= IDENTITY_FETCH_ATTEMPTS {
                     return Err(SourceError::Connect {
@@ -3201,7 +3202,7 @@ async fn verify_gtid_position(
                     reason: format!("{e:#}"),
                 })
             }
-            Err(SessionError::Connect(e)) => PositionReachability::Unknown {
+            Err(SessionError::Connect(_, e)) => PositionReachability::Unknown {
                 transient: true,
                 reason: e,
             },
