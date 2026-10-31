@@ -1,0 +1,300 @@
+diff --git a/crates/runner/Cargo.toml b/crates/runner/Cargo.toml
+index fe48b3d9..368e4a64 100644
+--- a/crates/runner/Cargo.toml
++++ b/crates/runner/Cargo.toml
+@@ -6,6 +6,9 @@ license = "MIT OR Apache-2.0"
+ 
+ [features]
+ default = ["jemalloc"]
++# Phase timings of the MySQL DDL path and the store, for measurement builds
++# only (`docs/design/mysql-ddl-proof-transactions.md`, section 6).
++perf-phases = ["sources/perf-phases", "storage/perf-phases"]
+ jemalloc = ["tikv-jemallocator"]
+ # Native Vault-triggered credential rotation. Off by default; build the binary
+ # with `--features vault` to enable connecting to Vault. Without it a
+diff --git a/crates/sources/Cargo.toml b/crates/sources/Cargo.toml
+index df2e4cf0..9cebfc47 100644
+--- a/crates/sources/Cargo.toml
++++ b/crates/sources/Cargo.toml
+@@ -6,6 +6,8 @@ license = "MIT OR Apache-2.0"
+ 
+ [features]
+ default = []
++# Phase timings of the MySQL DDL path, for measurement builds only.
++perf-phases = ["storage/perf-phases"]
+ # Native Vault-triggered credential rotation. Enables the secrets crate's Vault
+ # provider so a `trigger: { type: vault }` rotation can connect and poll. Off by
+ # default; a Vault-configured rotation fails closed in a build without it.
+diff --git a/crates/sources/src/lib.rs b/crates/sources/src/lib.rs
+index 4d4853e0..82b33703 100644
+--- a/crates/sources/src/lib.rs
++++ b/crates/sources/src/lib.rs
+@@ -16,6 +16,7 @@ pub mod gtid_set;
+ pub mod identity_resolution;
+ pub(crate) mod incident_drafts;
+ pub mod mysql;
++pub(crate) mod perf_phases;
+ pub mod postgres;
+ pub mod registry_scope;
+ pub mod rotation;
+diff --git a/crates/sources/src/mysql/mysql_event.rs b/crates/sources/src/mysql/mysql_event.rs
+index 247e2c49..a93c172b 100644
+--- a/crates/sources/src/mysql/mysql_event.rs
++++ b/crates/sources/src/mysql/mysql_event.rs
+@@ -1178,6 +1178,7 @@ async fn handle_query(
+         let (db, mut payload) =
+             ddl_identity(&classified, ctx.lower_case_table_names, &q.schema);
+         payload.insert("sql".into(), q.query.clone().into());
++        let _phase = crate::perf_phases::Phase::start("emit");
+         emit_ddl_event(ctx, header, &db, payload.into()).await?;
+         return Ok(());
+     }
+@@ -1237,6 +1238,7 @@ async fn record_query(
+             (Vec::new(), Some(BarrierScope::Database { db: name(&db) }))
+         }
+     };
++    let _phase = crate::perf_phases::Phase::start("ddl_records");
+ 
+     // After a failover, a tracked table's first event may be this DDL: its
+     // drift policy applies before any record is written.
+@@ -1300,10 +1302,12 @@ async fn record_query(
+     for t in &tables {
+         let (db, table) = (name(&t.db), name(&t.table));
+         let key = scope.key(&db, &table);
+-        let ddl_id =
++        let recorded = {
++            let _phase = crate::perf_phases::Phase::start("pending_record");
+             record_ddl(backend, registry, &key, &event, position.clone())
+                 .await
+-                .map_err(|e| fail("ddl record", e))?;
++        };
++        let ddl_id = recorded.map_err(|e| fail("ddl record", e))?;
+         invalidated.push(key.clone());
+         if prove_after && ctx.allow.matches(&db, &table) {
+             pending.push(super::mysql_forward_proof::Pending {
+diff --git a/crates/sources/src/mysql/mysql_forward_proof.rs b/crates/sources/src/mysql/mysql_forward_proof.rs
+index cc2e5bd1..dca19d4a 100644
+--- a/crates/sources/src/mysql/mysql_forward_proof.rs
++++ b/crates/sources/src/mysql/mysql_forward_proof.rs
+@@ -88,6 +88,7 @@ pub(crate) async fn prove(
+     };
+ 
+     // Replay: a binding already recorded for the pending DDL is the proof.
++    let replay_phase = crate::perf_phases::Phase::start("replay_check");
+     let mut open = Vec::new();
+     for p in pending {
+         let key = scope.key(&p.db, &p.table);
+@@ -119,6 +120,7 @@ pub(crate) async fn prove(
+             }
+         }
+     }
++    drop(replay_phase);
+     if open.is_empty() {
+         return Ok(0);
+     }
+@@ -129,6 +131,7 @@ pub(crate) async fn prove(
+     };
+     let lctn = ctx.lower_case_table_names;
+     // 1. Captures, bound to their intervals by step 3.
++    let capture_phase = crate::perf_phases::Phase::start("capture");
+     let mut captured = Vec::new();
+     for p in open {
+         // A stop ends the proof (`?`): nothing is decided.
+@@ -186,6 +189,7 @@ pub(crate) async fn prove(
+             }
+         }
+     }
++    drop(capture_phase);
+     let Some(s_cp) = captured.last().map(|(_, cap)| cap.position.clone())
+     else {
+         return Ok(0);
+@@ -208,6 +212,7 @@ pub(crate) async fn prove(
+     }
+ 
+     // 3. One complete scan of (D, S].
++    let scan_phase = crate::perf_phases::Phase::start("scan");
+     let report = match super::mysql_proof_scanner::shared_interval(
+         &ctx.proof_scanner,
+         ctx.dsn.current().expose(),
+@@ -243,7 +248,9 @@ pub(crate) async fn prove(
+         }
+     };
+ 
++    drop(scan_phase);
+     // 4. Register, then bind.
++    let register_phase = crate::perf_phases::Phase::start("register_bind");
+     let checkpoint =
+         serde_json::to_vec(&d_cp).map_err(|e| SourceError::Other(e.into()))?;
+     let mut written = 0;
+@@ -278,10 +285,13 @@ pub(crate) async fn prove(
+             );
+             continue;
+         }
++        let register = crate::perf_phases::Phase::start("register");
+         let (version, schema_hash) = ctx
+             .schema
+             .register_captured(&p.db, &p.table, &cap.schema, &checkpoint)
+             .await?;
++        drop(register);
++        let bind = crate::perf_phases::Phase::start("bind");
+         let key = scope.key(&p.db, &p.table);
+         mysql_activation::record_forward_proof(
+             &ctx.registry_backend,
+@@ -301,6 +311,7 @@ pub(crate) async fn prove(
+         .map_err(|e| {
+             SourceError::Other(e.context("persist a forward-proof binding"))
+         })?;
++        drop(bind);
+         trace_proof(
+             &tag,
+             &p.db,
+@@ -312,6 +323,7 @@ pub(crate) async fn prove(
+         );
+         written += 1;
+     }
++    drop(register_phase);
+     info!(source_id = %ctx.source_id, bindings = written, "forward proof after DDL");
+     Ok(written)
+ }
+diff --git a/crates/sources/src/mysql/mysql_selection.rs b/crates/sources/src/mysql/mysql_selection.rs
+index e3eac245..e8ebe809 100644
+--- a/crates/sources/src/mysql/mysql_selection.rs
++++ b/crates/sources/src/mysql/mysql_selection.rs
+@@ -1045,6 +1045,7 @@ pub(crate) async fn timeline(
+             }
+         }
+     }
++    let _phase = crate::perf_phases::Phase::start("history_load");
+     let mine = install(ctx, &keys, |k| k == key).await?;
+     mine.expect("the missed table is read")
+ }
+diff --git a/crates/sources/src/perf_phases.rs b/crates/sources/src/perf_phases.rs
+new file mode 100644
+index 00000000..596e64ca
+--- /dev/null
++++ b/crates/sources/src/perf_phases.rs
+@@ -0,0 +1,37 @@
++//! Phase timings of the MySQL DDL path, for measurement builds only (the
++//! `perf-phases` feature; `docs/design/mysql-ddl-proof-transactions.md`,
++//! section 6). A [`Phase`] records its elapsed time when dropped, into the
++//! histogram `deltaforge_perf_phase_latency_seconds{phase}`: a distribution
++//! per phase over a run, not a trace of any one DDL. Without the feature it
++//! is empty and records nothing.
++
++/// A phase being timed; recorded when dropped.
++pub(crate) struct Phase {
++    #[cfg(feature = "perf-phases")]
++    name: &'static str,
++    #[cfg(feature = "perf-phases")]
++    started: std::time::Instant,
++}
++
++impl Phase {
++    #[cfg_attr(not(feature = "perf-phases"), allow(unused_variables))]
++    pub(crate) fn start(name: &'static str) -> Self {
++        Self {
++            #[cfg(feature = "perf-phases")]
++            name,
++            #[cfg(feature = "perf-phases")]
++            started: std::time::Instant::now(),
++        }
++    }
++}
++
++impl Drop for Phase {
++    fn drop(&mut self) {
++        #[cfg(feature = "perf-phases")]
++        metrics::histogram!(
++            "deltaforge_perf_phase_latency_seconds",
++            "phase" => self.name
++        )
++        .record(self.started.elapsed().as_secs_f64());
++    }
++}
+diff --git a/crates/storage/Cargo.toml b/crates/storage/Cargo.toml
+index 664bd3f9..e34dae70 100644
+--- a/crates/storage/Cargo.toml
++++ b/crates/storage/Cargo.toml
+@@ -7,6 +7,8 @@ description = "Unified durable storage abstraction for DeltaForge runtime state"
+ 
+ [features]
+ default = ["sqlite", "postgres"]
++# Phase timings of the store, for measurement builds only.
++perf-phases = []
+ sqlite = ["rusqlite"]
+ postgres = ["deadpool-postgres"]
+ # Exposes `adapters::test_util` (fault-injecting backend) to dependent crates' tests.
+diff --git a/crates/storage/src/lib.rs b/crates/storage/src/lib.rs
+index 3ba97c32..40aefd73 100644
+--- a/crates/storage/src/lib.rs
++++ b/crates/storage/src/lib.rs
+@@ -19,6 +19,7 @@ use async_trait::async_trait;
+ 
+ pub mod adapters;
+ pub mod memory;
++pub(crate) mod perf_phases;
+ pub mod postgres;
+ pub mod sqlite;
+ 
+diff --git a/crates/storage/src/perf_phases.rs b/crates/storage/src/perf_phases.rs
+new file mode 100644
+index 00000000..00d1b998
+--- /dev/null
++++ b/crates/storage/src/perf_phases.rs
+@@ -0,0 +1,35 @@
++//! Phase timings of the store, for measurement builds only (the
++//! `perf-phases` feature; `docs/design/mysql-ddl-proof-transactions.md`,
++//! section 6): see the sources crate's `perf_phases`. Without the feature a
++//! [`Phase`] is empty and records nothing.
++
++/// A phase being timed; recorded when dropped.
++pub(crate) struct Phase {
++    #[cfg(feature = "perf-phases")]
++    name: &'static str,
++    #[cfg(feature = "perf-phases")]
++    started: std::time::Instant,
++}
++
++impl Phase {
++    #[cfg_attr(not(feature = "perf-phases"), allow(unused_variables))]
++    pub(crate) fn start(name: &'static str) -> Self {
++        Self {
++            #[cfg(feature = "perf-phases")]
++            name,
++            #[cfg(feature = "perf-phases")]
++            started: std::time::Instant::now(),
++        }
++    }
++}
++
++impl Drop for Phase {
++    fn drop(&mut self) {
++        #[cfg(feature = "perf-phases")]
++        metrics::histogram!(
++            "deltaforge_perf_phase_latency_seconds",
++            "phase" => self.name
++        )
++        .record(self.started.elapsed().as_secs_f64());
++    }
++}
+diff --git a/crates/storage/src/postgres.rs b/crates/storage/src/postgres.rs
+index d62a629e..e96415dc 100644
+--- a/crates/storage/src/postgres.rs
++++ b/crates/storage/src/postgres.rs
+@@ -501,13 +501,14 @@ async fn pg_kv_put(
+ }
+ 
+ macro_rules! client {
+-    ($self:expr) => {
++    ($self:expr) => {{
++        let _wait = crate::perf_phases::Phase::start("store_pool_wait");
+         $self
+             .pool
+             .get()
+             .await
+             .map_err(|e| anyhow!("pool get: {e}"))?
+-    };
++    }};
+ }
+ 
+ // ── StorageBackend ────────────────────────────────────────────────────────────

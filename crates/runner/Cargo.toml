@@ -6,6 +6,9 @@ license = "MIT OR Apache-2.0"
 
 [features]
 default = ["jemalloc"]
+# Phase timings of the MySQL DDL path and the store, for measurement builds
+# only (`docs/design/mysql-ddl-proof-transactions.md`, section 6).
+perf-phases = ["sources/perf-phases", "storage/perf-phases"]
 jemalloc = ["tikv-jemallocator"]
 # Native Vault-triggered credential rotation. Off by default; build the binary
 # with `--features vault` to enable connecting to Vault. Without it a

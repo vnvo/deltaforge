@@ -16,6 +16,7 @@ pub mod gtid_set;
 pub mod identity_resolution;
 pub(crate) mod incident_drafts;
 pub mod mysql;
+pub(crate) mod perf_phases;
 pub mod postgres;
 pub mod registry_scope;
 pub mod rotation;

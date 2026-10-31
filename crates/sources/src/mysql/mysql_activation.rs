@@ -482,46 +482,30 @@ async fn validate_version(
 }
 
 /// Append the `ddl` record that `event` at `position` establishes for the
-/// table `key` (spec 7.5): the shape after it is pending.
+/// table `key` (spec 7.5): the shape after it is pending. Returns its capture
+/// identity and how it was stored (inserted now, or already present: a
+/// replay).
 pub(crate) async fn record_ddl(
     backend: &ArcStorageBackend,
     registry: &DurableSchemaRegistry,
     key: &SchemaKey,
     event: &EventIdentity,
     position: WmPos,
-) -> Result<String> {
+) -> Result<(String, storage::LogAppendOutcome)> {
     let record = Record::new(position, Kind::Ddl);
     let stream = table_stream(key);
     let id = capture_id(&key.lineage_hash, event, &stream, &record);
-    append(backend, registry, key, ACTIVATION_NS, &stream, &id, &record)
-        .await?;
-    Ok(id)
-}
-
-/// Append the forward-proof binding of the pending `ddl` record `ddl_id` at
-/// its position D: `version` (already registered) with its evidence.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn record_forward_proof(
-    backend: &ArcStorageBackend,
-    registry: &DurableSchemaRegistry,
-    key: &SchemaKey,
-    ddl_id: &str,
-    position: WmPos,
-    version: i32,
-    proof: ForwardProof,
-) -> Result<AppendStatus> {
-    let record = Record::new(
-        position,
-        Kind::Observed {
-            version,
-            binds: Some(ddl_id.to_string()),
-            proof: Some(proof),
-            full: None,
-        },
-    );
-    let stream = table_stream(key);
-    let id = forward_capture_id(&key.lineage_hash, &stream, &record)?;
-    append(backend, registry, key, ACTIVATION_NS, &stream, &id, &record).await
+    let out = append_outcome(
+        backend,
+        registry,
+        key,
+        ACTIVATION_NS,
+        &stream,
+        &id,
+        &record,
+    )
+    .await?;
+    Ok((id, out))
 }
 
 /// The validated forward binding of the `ddl` record `ddl_id` in `records`

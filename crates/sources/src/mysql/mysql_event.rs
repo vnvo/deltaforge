@@ -1178,6 +1178,7 @@ async fn handle_query(
         let (db, mut payload) =
             ddl_identity(&classified, ctx.lower_case_table_names, &q.schema);
         payload.insert("sql".into(), q.query.clone().into());
+        let _phase = crate::perf_phases::Phase::start("emit");
         emit_ddl_event(ctx, header, &db, payload.into()).await?;
         return Ok(());
     }
@@ -1237,6 +1238,7 @@ async fn record_query(
             (Vec::new(), Some(BarrierScope::Database { db: name(&db) }))
         }
     };
+    let _phase = crate::perf_phases::Phase::start("ddl_records");
 
     // After a failover, a tracked table's first event may be this DDL: its
     // drift policy applies before any record is written.
@@ -1287,7 +1289,7 @@ async fn record_query(
         },
     };
     let scope = ctx.registry_scope.current()?;
-    let backend = &ctx.registry_backend;
+    let backend = ctx.registry_backend.clone();
     let registry = ctx.schema.registry();
     // Tracked tables get a forward proof of their post-DDL shape (a DROP
     // gets none: a later CREATE is its own DDL).
@@ -1295,21 +1297,40 @@ async fn record_query(
         &q.query,
         ctx.binlog_server_version,
     );
+    // C3 (`docs/design/mysql-ddl-proof-transactions.md`): with the store
+    // gate's witness, a proven table's cached timeline may take its new
+    // records instead of reloading; its snapshot is taken before its `ddl`
+    // record.
+    let install = storage::adapters::store_gate::server_holds(&backend);
     let mut pending = Vec::new();
     let mut invalidated = Vec::new();
     for t in &tables {
         let (db, table) = (name(&t.db), name(&t.table));
         let key = scope.key(&db, &table);
-        let ddl_id =
-            record_ddl(backend, registry, &key, &event, position.clone())
-                .await
-                .map_err(|e| fail("ddl record", e))?;
+        let proves = prove_after && ctx.allow.matches(&db, &table);
+        let cached = if install && proves {
+            ctx.selection.timeline(&key.backend_key())
+        } else {
+            None
+        };
+        let recorded = {
+            let _phase = crate::perf_phases::Phase::start("pending_record");
+            record_ddl(&backend, registry, &key, &event, position.clone()).await
+        };
+        let (ddl_id, stored) = recorded.map_err(|e| fail("ddl record", e))?;
         invalidated.push(key.clone());
-        if prove_after && ctx.allow.matches(&db, &table) {
+        if proves {
+            let snapshot = cached
+                .filter(|_| stored.status == storage::AppendStatus::Inserted)
+                .map(|timeline| super::mysql_forward_proof::Snapshot {
+                    timeline,
+                    ddl_seq: stored.seq,
+                });
             pending.push(super::mysql_forward_proof::Pending {
                 db,
                 table,
                 ddl_id,
+                snapshot,
             });
         }
     }
@@ -1328,7 +1349,7 @@ async fn record_query(
         );
         let key = scope.key("", "");
         super::mysql_selection::append_barrier(
-            backend,
+            &backend,
             registry,
             &mut ctx.selection,
             &key,
@@ -1341,11 +1362,35 @@ async fn record_query(
     }
     // Paused at the DDL: prove before its event is emitted and before any
     // later event is read.
-    super::mysql_forward_proof::prove(ctx, pending).await?;
+    let fresh = super::mysql_forward_proof::prove(ctx, pending).await?;
     // Selections and validated timelines read before these records are
-    // stale (a barrier's were invalidated with its append).
+    // stale (a barrier's were invalidated with its append), except a proven
+    // table's timeline found current, installed with its new records while
+    // its cache still holds the snapshot (C3). No await between the proof's
+    // check and the install: the source's own task is the only writer here.
+    #[cfg(test)]
+    super::mysql_forward_proof::hooks::before_install(ctx);
+    let mut installed = std::collections::HashSet::new();
+    for f in fresh {
+        #[cfg(test)]
+        let probe = (f.key.backend_key(), f.snapshot.bytes, f.timeline.clone());
+        if ctx.selection.install_if_current(
+            &f.key,
+            &f.snapshot,
+            std::sync::Arc::new(f.timeline),
+        ) {
+            #[cfg(test)]
+            super::mysql_forward_proof::hooks::INSTALLED
+                .lock()
+                .unwrap()
+                .push(probe);
+            installed.insert(f.key.backend_key());
+        }
+    }
     for key in &invalidated {
-        ctx.selection.invalidate(key);
+        if !installed.contains(&key.backend_key()) {
+            ctx.selection.invalidate(key);
+        }
     }
     // The loader's cached shapes of what the statement may change are stale:
     // forgotten, never reloaded here (a new version enters the registry only
