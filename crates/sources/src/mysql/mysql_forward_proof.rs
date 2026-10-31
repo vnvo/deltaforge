@@ -2982,6 +2982,44 @@ mod tests {
                 assert_eq!(count(&rec.evidence, EvidenceKey::BlockingCount), 1);
             }
 
+            /// Past the deadline the freshness reads are skipped: a batch that
+            /// resolved after the deadline still binds the table, but its
+            /// timeline is not offered for install (it reloads). Before the
+            /// deadline the same proof offers it.
+            #[tokio::test(start_paused = true)]
+            async fn freshness_is_skipped_past_the_deadline() {
+                for late in [false, true] {
+                    let st = store();
+                    let mut ctx = ctx_with(
+                        &st,
+                        deltaforge_config::ForwardProofRetry {
+                            deadline: Duration::from_secs(10),
+                            ..bounds()
+                        },
+                    )
+                    .await;
+                    let p: Vec<Pending> =
+                        pending(&mut ctx, &[("a", "x")], true)
+                            .await
+                            .into_iter()
+                            .map(|(p, _)| p)
+                            .collect();
+                    let id = p[0].ddl_id.clone();
+                    if late {
+                        *st.fault.before_next_batch.lock().unwrap() =
+                            Some(BatchHook(Box::new(|_| {
+                                Box::pin(tokio::time::sleep(
+                                    Duration::from_secs(20),
+                                ))
+                            })));
+                    }
+                    let fresh =
+                        prove_with(&ctx, &Script::default(), p).await.unwrap();
+                    assert_eq!(durable(&ctx, "a", &id).await.1, Some(1));
+                    assert_eq!(fresh.len(), usize::from(!late), "late: {late}");
+                }
+            }
+
             /// Every failure has one decision; the transient ones (and only
             /// they) are retried, identity, saturation and credentials stop,
             /// and evidence, bounds, retention and protocol defer.
