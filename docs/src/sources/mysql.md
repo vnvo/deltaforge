@@ -205,6 +205,47 @@ connections by kind (`replication`, `control`, `cancellation`,
 `deltaforge_mysql_control_permit_timeouts_total{class, scope}` and
 `deltaforge_mysql_control_idle_evictions_total` report the waits.
 
+### A DDL's forward proof
+
+When the stream reads a DDL on a tracked table, the source proves the
+table's new shape (a capture of it and a scan of the binlog since the DDL)
+before the DDL event is emitted. A proof that fails for a transient reason
+is retried in place, with the stream paused at the DDL:
+
+- **Retried:** a metadata-lock wait timeout or deadlock (another session
+  holds or queues the table's lock), busy capture slots, and connection
+  failures (refused, reset, timed out, closed, server shutting down).
+- **Bounds:** at most 4 attempts within 120 s from the first, with 1, 4 and
+  16 s between them. A capture starts only with at least 1 s left, and
+  waits for the lock at most 30 s or the time left. Each attempt captures
+  and scans afresh; a table proven in one attempt is committed then and not
+  captured again.
+- **Exhausted:** the source stops before the DDL is emitted or
+  checkpointed, with a `mysql_forward_proof_unavailable` incident. A
+  restart replays the DDL and proves it again; tables proven earlier are
+  recognized by their recorded binding. While the proof retries, the same
+  incident is open as `auto_retry`; it is resolved when the proof
+  succeeds.
+- **Not retried:** an authentication or authorization failure stops the
+  source the same way at once (operator action). A connection to another
+  server stops it as a lineage error, and a saturated control plane as
+  `mysql_control_plane_saturated`, as before. A refusal on the evidence (a
+  DDL on the table in the scanned interval, a purged binlog, a scan bound)
+  leaves the DDL pending as before; the table's next rows are then proven
+  by its lazy proof, which can still succeed.
+- **Deadline:** no capture, scan, or store batch of the proof starts after
+  its deadline. A batch already started finishes (including the
+  resolution of an unacknowledged commit), so the proof can end shortly
+  after the deadline. A capture or scan cut at the deadline is ended on
+  the server.
+
+`deltaforge_mysql_forward_proof_retries_total{class}` counts retried
+failures (`lock_wait_timeout`, `deadlock`, `capture_slots_busy`,
+`transport`, `read`, `not_reached`, `deadline`), and
+`deltaforge_mysql_forward_proof_outcomes_total{outcome}` the ends of proofs
+that retried (`recovered`, `ended_deferred`, `exhausted`, `cancelled`,
+`ended_by_terminal`).
+
 ## Resume Behavior
 
 DeltaForge automatically checkpoints progress and resumes from the last position on restart. The resume strategy follows this priority:

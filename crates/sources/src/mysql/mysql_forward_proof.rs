@@ -2242,6 +2242,743 @@ mod tests {
                 );
             }
         }
+
+        /// The retry loop ([`prove_with`]) over scripted MySQL work, on the
+        /// real store and incident store, on a paused clock: the deadline,
+        /// the attempt bound, the table states and the incident's outcome
+        /// (`docs/design/mysql-forward-proof-retry.md`).
+        mod retry {
+            use super::*;
+            use crate::mysql::mysql_binlog_scan::Cancelled;
+            use crate::mysql::mysql_failure::Failure;
+            use deltaforge_core::incident::{
+                CauseCode, EvidenceKey, EvidenceValue, Retryability,
+            };
+            use std::collections::{HashMap, VecDeque};
+            use std::sync::Mutex;
+            use storage::adapters::incidents::{
+                IncidentRecord, IncidentStatus, Resolution,
+            };
+
+            /// One scripted capture: its outcome after its time (capped by
+            /// the capture's lock wait, as a real lock wait is).
+            #[derive(Clone)]
+            enum Step {
+                Ok(&'static str, Duration),
+                Fail(ProofError, Duration),
+            }
+
+            fn contention() -> Step {
+                Step::Fail(
+                    ProofError::Contention {
+                        code: 1205,
+                        why: "lock wait".into(),
+                    },
+                    Duration::MAX,
+                )
+            }
+
+            fn ok() -> Step {
+                Step::Ok("x", Duration::ZERO)
+            }
+
+            /// Each table's captures in turn (the last repeats); scans take
+            /// `scan_time` and succeed with an empty report.
+            #[derive(Default)]
+            struct Script {
+                captures: Mutex<HashMap<String, VecDeque<Step>>>,
+                scan_time: Mutex<Duration>,
+                calls: Mutex<Vec<(String, Instant)>>,
+            }
+
+            impl Script {
+                fn with(steps: &[(&str, Vec<Step>)]) -> Self {
+                    let s = Self::default();
+                    for (t, v) in steps {
+                        s.captures
+                            .lock()
+                            .unwrap()
+                            .insert(t.to_string(), v.iter().cloned().collect());
+                    }
+                    s
+                }
+
+                /// The captures so far: table and start, from `t0`.
+                fn calls(&self, t0: Instant) -> Vec<(String, u64)> {
+                    self.calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(t, at)| (t.clone(), (*at - t0).as_secs()))
+                        .collect()
+                }
+            }
+
+            impl Probe for Script {
+                async fn capture_table(
+                    &self,
+                    _db: &str,
+                    table: &str,
+                    lock_wait: Duration,
+                ) -> Result<Result<Captured, ProofError>, Cancelled>
+                {
+                    self.calls
+                        .lock()
+                        .unwrap()
+                        .push((table.to_string(), Instant::now()));
+                    let step = {
+                        let mut all = self.captures.lock().unwrap();
+                        let q = all.entry(table.to_string()).or_default();
+                        if q.len() > 1 {
+                            q.pop_front().unwrap()
+                        } else {
+                            q.front().cloned().unwrap_or_else(ok)
+                        }
+                    };
+                    match step {
+                        Step::Ok(col, t) => {
+                            tokio::time::sleep(t.min(lock_wait)).await;
+                            Ok(Ok(captured(col)))
+                        }
+                        Step::Fail(e, t) => {
+                            tokio::time::sleep(t.min(lock_wait)).await;
+                            Ok(Err(e))
+                        }
+                    }
+                }
+
+                async fn scan(
+                    &self,
+                    _d: &MySqlCheckpoint,
+                    _s: &MySqlCheckpoint,
+                ) -> Result<ScanReport, ProofError> {
+                    let t = *self.scan_time.lock().unwrap();
+                    tokio::time::sleep(t).await;
+                    Ok(report())
+                }
+            }
+
+            /// A context whose retries run within `retry`.
+            async fn ctx_with(
+                st: &Store,
+                retry: deltaforge_config::ForwardProofRetry,
+            ) -> RunCtx {
+                let mut ctx = ctx_on(st.fault.clone()).await;
+                ctx.proofs.forward_proof_retry = retry;
+                ctx
+            }
+
+            fn bounds() -> deltaforge_config::ForwardProofRetry {
+                Default::default()
+            }
+
+            async fn tables(ctx: &mut RunCtx, names: &[&str]) -> Vec<Pending> {
+                let named: Vec<(&str, &str)> =
+                    names.iter().map(|t| (*t, "x")).collect();
+                pending(ctx, &named, false)
+                    .await
+                    .into_iter()
+                    .map(|(p, _)| p)
+                    .collect()
+            }
+
+            async fn only_incident(ctx: &RunCtx) -> IncidentRecord {
+                let all = ctx.incidents.list().await.unwrap();
+                assert_eq!(all.len(), 1, "{all:?}");
+                all.into_iter().next().unwrap()
+            }
+
+            fn recovered(rec: &IncidentRecord) -> bool {
+                matches!(
+                    &rec.status,
+                    IncidentStatus::Resolved {
+                        by: Resolution::VerifiedRecovery { check },
+                        ..
+                    } if check == "forward_proof_bound"
+                )
+            }
+
+            fn withdrawn(rec: &IncidentRecord, why: &str) -> bool {
+                matches!(
+                    rec.status,
+                    IncidentStatus::Resolved {
+                        by: Resolution::OperationCancelled,
+                        ..
+                    }
+                ) && rec.evidence.holds(EvidenceKey::ReasonClass, why)
+            }
+
+            fn count(
+                e: &deltaforge_core::incident::Evidence,
+                k: EvidenceKey,
+            ) -> u64 {
+                match e.get(k) {
+                    Some(EvidenceValue::Count { value }) => *value,
+                    other => panic!("{k:?}: {other:?}"),
+                }
+            }
+
+            /// With the production bounds, attempts start at 0, 31, 65 and
+            /// 111 s (each 30 s lock wait, then 1, 4 and 16 s of backoff);
+            /// the fourth, the last the bounds permit, has 9 s and proves
+            /// the table. The retrying incident is a verified recovery.
+            #[tokio::test(start_paused = true)]
+            async fn the_last_permitted_attempt_can_recover() {
+                let st = store();
+                let mut ctx = ctx_with(&st, bounds()).await;
+                let p = tables(&mut ctx, &["a"]).await;
+                let id = p[0].ddl_id.clone();
+                let script = Script::with(&[(
+                    "a",
+                    vec![contention(), contention(), contention(), ok()],
+                )]);
+                let t0 = Instant::now();
+                prove_with(&ctx, &script, p).await.unwrap();
+                assert_eq!(
+                    script.calls(t0),
+                    [
+                        ("a".into(), 0),
+                        ("a".into(), 31),
+                        ("a".into(), 65),
+                        ("a".into(), 111)
+                    ]
+                );
+                assert_eq!(durable(&ctx, "a", &id).await.1, Some(1));
+                assert!(recovered(&only_incident(&ctx).await));
+            }
+
+            /// Every attempt fails: four, the last started at 111 s with the
+            /// 9 s left, then the stop's operator-action draft of the same
+            /// incident; nothing is bound and nothing ran past 120 s.
+            #[tokio::test(start_paused = true)]
+            async fn four_failed_attempts_exhaust_the_proof() {
+                let st = store();
+                let mut ctx = ctx_with(&st, bounds()).await;
+                let p = tables(&mut ctx, &["a"]).await;
+                let id = p[0].ddl_id.clone();
+                let script = Script::with(&[("a", vec![contention()])]);
+                let t0 = Instant::now();
+                let err = prove_with(&ctx, &script, p).await.err().unwrap();
+                assert!(t0.elapsed() <= Duration::from_secs(120));
+                assert_eq!(
+                    script.calls(t0).iter().map(|c| c.1).collect::<Vec<_>>(),
+                    [0, 31, 65, 111]
+                );
+                let draft = err.draft().unwrap();
+                assert_eq!(
+                    draft.reason_code,
+                    ReasonCode::MysqlForwardProofUnavailable
+                );
+                assert_eq!(draft.retryability, Retryability::OperatorAction);
+                assert_eq!(count(&draft.evidence, EvidenceKey::Attempts), 4);
+                assert_eq!(
+                    count(&draft.evidence, EvidenceKey::BlockingCount),
+                    1
+                );
+                assert!(
+                    draft
+                        .evidence
+                        .holds(EvidenceKey::ReasonClass, "lock_wait_timeout")
+                );
+                let rec = only_incident(&ctx).await;
+                assert_eq!(rec.retryability, Retryability::AutoRetry);
+                assert_eq!(rec.incident_id, draft.incident_id(&ctx.pipeline));
+                assert_eq!(durable(&ctx, "a", &id).await, (vec![], None));
+            }
+
+            /// No attempt starts after the deadline: with 100 s, the fourth
+            /// would start at 111 s; the backoff is cut to the 5 s left and
+            /// the proof is exhausted after three.
+            #[tokio::test(start_paused = true)]
+            async fn no_attempt_starts_after_the_deadline() {
+                let st = store();
+                let mut ctx = ctx_with(
+                    &st,
+                    deltaforge_config::ForwardProofRetry {
+                        deadline: Duration::from_secs(100),
+                        ..bounds()
+                    },
+                )
+                .await;
+                let p = tables(&mut ctx, &["a"]).await;
+                let script = Script::with(&[("a", vec![contention()])]);
+                let t0 = Instant::now();
+                let err = prove_with(&ctx, &script, p).await.err().unwrap();
+                assert_eq!(
+                    script.calls(t0).iter().map(|c| c.1).collect::<Vec<_>>(),
+                    [0, 31, 65]
+                );
+                assert_eq!((Instant::now() - t0).as_secs(), 100);
+                assert_eq!(
+                    count(
+                        &err.draft().unwrap().evidence,
+                        EvidenceKey::Attempts
+                    ),
+                    3
+                );
+            }
+
+            /// Within an attempt, a capture starts only with the smallest
+            /// useful budget left: after the first table's 9.5 s of a 10 s
+            /// deadline, the second and third are not captured and stay
+            /// retrying (`deadline`).
+            #[tokio::test(start_paused = true)]
+            async fn a_capture_needs_its_smallest_budget_left() {
+                let st = store();
+                let mut ctx = ctx_with(
+                    &st,
+                    deltaforge_config::ForwardProofRetry {
+                        deadline: Duration::from_secs(10),
+                        ..bounds()
+                    },
+                )
+                .await;
+                let p = tables(&mut ctx, &["a", "b", "c"]).await;
+                let script = Script::with(&[(
+                    "a",
+                    vec![Step::Fail(
+                        ProofError::Contention {
+                            code: 1205,
+                            why: "x".into(),
+                        },
+                        Duration::from_millis(9500),
+                    )],
+                )]);
+                let t0 = Instant::now();
+                let err = prove_with(&ctx, &script, p).await.err().unwrap();
+                assert_eq!(script.calls(t0), [("a".into(), 0)]);
+                let ev = &err.draft().unwrap().evidence;
+                assert_eq!(count(ev, EvidenceKey::BlockingCount), 3);
+                assert!(ev.holds(EvidenceKey::ReasonClass, "deadline"));
+                assert!(Instant::now() - t0 <= Duration::from_secs(10));
+            }
+
+            /// A scan still running at the deadline is dropped; its tables
+            /// stay retrying and the proof is exhausted, nothing bound.
+            #[tokio::test(start_paused = true)]
+            async fn a_scan_is_cut_at_the_deadline() {
+                let st = store();
+                let mut ctx = ctx_with(
+                    &st,
+                    deltaforge_config::ForwardProofRetry {
+                        deadline: Duration::from_secs(10),
+                        ..bounds()
+                    },
+                )
+                .await;
+                let p = tables(&mut ctx, &["a"]).await;
+                let id = p[0].ddl_id.clone();
+                let script = Script::default();
+                *script.scan_time.lock().unwrap() = Duration::from_secs(60);
+                let t0 = Instant::now();
+                let err = prove_with(&ctx, &script, p).await.err().unwrap();
+                assert_eq!((Instant::now() - t0).as_secs(), 10);
+                assert!(
+                    err.draft()
+                        .unwrap()
+                        .evidence
+                        .holds(EvidenceKey::ReasonClass, "deadline")
+                );
+                assert_eq!(durable(&ctx, "a", &id).await.1, None);
+            }
+
+            /// Recovery is not deferral: a table that failed transiently and
+            /// then is refused (untrusted evidence) ends deferred; the
+            /// retrying incident is withdrawn as `ended_deferred`, never
+            /// resolved as recovered, and the DDL goes on with it pending.
+            #[tokio::test(start_paused = true)]
+            async fn a_transient_failure_then_a_refusal_is_not_a_recovery() {
+                let st = store();
+                let mut ctx = ctx_with(&st, bounds()).await;
+                let p = tables(&mut ctx, &["a"]).await;
+                let id = p[0].ddl_id.clone();
+                let script = Script::with(&[(
+                    "a",
+                    vec![
+                        contention(),
+                        Step::Fail(
+                            ProofError::Positions("backwards".into()),
+                            Duration::ZERO,
+                        ),
+                    ],
+                )]);
+                prove_with(&ctx, &script, p).await.unwrap();
+                assert_eq!(durable(&ctx, "a", &id).await.1, None);
+                let rec = only_incident(&ctx).await;
+                assert!(withdrawn(&rec, "ended_deferred"), "{rec:?}");
+                assert!(!recovered(&rec));
+                assert_eq!(count(&rec.evidence, EvidenceKey::BlockingCount), 1);
+                assert!(
+                    rec.evidence.holds(EvidenceKey::Table, "d.a"),
+                    "the original evidence stays"
+                );
+            }
+
+            /// Mixed: `a` fails transiently and is then proven; `b` is
+            /// deferred without a transient failure, outside the incident's
+            /// scope. A verified recovery for `a`; `b` stays pending.
+            #[tokio::test(start_paused = true)]
+            async fn a_deferral_outside_the_scope_leaves_a_recovery() {
+                let st = store();
+                let mut ctx = ctx_with(&st, bounds()).await;
+                let p = tables(&mut ctx, &["a", "b"]).await;
+                let (ia, ib) = (p[0].ddl_id.clone(), p[1].ddl_id.clone());
+                let script = Script::with(&[
+                    ("a", vec![contention(), ok()]),
+                    (
+                        "b",
+                        vec![Step::Fail(
+                            ProofError::Capture("no such table".into()),
+                            Duration::ZERO,
+                        )],
+                    ),
+                ]);
+                prove_with(&ctx, &script, p).await.unwrap();
+                assert_eq!(durable(&ctx, "a", &ia).await.1, Some(1));
+                assert_eq!(durable(&ctx, "b", &ib).await.1, None);
+                assert_eq!(
+                    script
+                        .calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|c| c.0 == "b")
+                        .count(),
+                    1,
+                    "a deferred table is not captured again"
+                );
+                assert!(recovered(&only_incident(&ctx).await));
+            }
+
+            /// A table proven in the first attempt commits once while another
+            /// retries; after exhaustion the restart resolves it by its
+            /// binding (not captured again, no second version) and proves
+            /// the other.
+            #[tokio::test(start_paused = true)]
+            async fn a_free_table_commits_once_while_another_retries() {
+                let st = store();
+                let mut ctx = ctx_with(&st, bounds()).await;
+                let p = tables(&mut ctx, &["a", "b"]).await;
+                let (ia, ib) = (p[0].ddl_id.clone(), p[1].ddl_id.clone());
+                let script = Script::with(&[
+                    ("a", vec![ok()]),
+                    ("b", vec![contention()]),
+                ]);
+                prove_with(&ctx, &script, p.clone()).await.err().unwrap();
+                assert_eq!(
+                    script
+                        .calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|c| c.0 == "a")
+                        .count(),
+                    1
+                );
+                let (versions, bound) = durable(&ctx, "a", &ia).await;
+                assert_eq!((versions.len(), bound), (1, Some(1)));
+                assert_eq!(durable(&ctx, "b", &ib).await.1, None);
+
+                let restart = Script::default();
+                prove_with(&ctx, &restart, p).await.unwrap();
+                let t0 = Instant::now();
+                assert_eq!(
+                    restart
+                        .calls(t0)
+                        .into_iter()
+                        .map(|c| c.0)
+                        .collect::<Vec<_>>(),
+                    ["b"]
+                );
+                let (versions, bound) = durable(&ctx, "a", &ia).await;
+                assert_eq!((versions.len(), bound), (1, Some(1)));
+                assert_eq!(durable(&ctx, "b", &ib).await.1, Some(1));
+            }
+
+            /// An authentication failure after a transient one stops the
+            /// source on the same incident's operator-action draft (cause
+            /// `source_auth`), with no further attempt.
+            #[tokio::test(start_paused = true)]
+            async fn an_authentication_failure_stops_without_a_retry() {
+                let st = store();
+                let mut ctx = ctx_with(&st, bounds()).await;
+                let p = tables(&mut ctx, &["a"]).await;
+                let script = Script::with(&[(
+                    "a",
+                    vec![
+                        contention(),
+                        Step::Fail(
+                            ProofError::Open(
+                                Failure::Authentication,
+                                "denied".into(),
+                            ),
+                            Duration::ZERO,
+                        ),
+                    ],
+                )]);
+                let err = prove_with(&ctx, &script, p).await.err().unwrap();
+                assert_eq!(script.calls.lock().unwrap().len(), 2);
+                let draft = err.draft().unwrap();
+                assert_eq!(draft.retryability, Retryability::OperatorAction);
+                assert_eq!(draft.cause_code, CauseCode::SourceAuth);
+                assert!(
+                    draft
+                        .evidence
+                        .holds(EvidenceKey::ReasonClass, "authentication")
+                );
+                let rec = only_incident(&ctx).await;
+                assert_eq!(rec.incident_id, draft.incident_id(&ctx.pipeline));
+                assert!(matches!(
+                    err,
+                    SourceError::Incident { ref cause, .. }
+                        if matches!(**cause, SourceError::Auth { .. })
+                ));
+            }
+
+            /// Authorization, with no earlier failure: the same stop, and no
+            /// retrying incident was ever recorded.
+            #[tokio::test(start_paused = true)]
+            async fn an_authorization_failure_stops_at_once() {
+                let st = store();
+                let mut ctx = ctx_with(&st, bounds()).await;
+                let p = tables(&mut ctx, &["a"]).await;
+                let script = Script::with(&[(
+                    "a",
+                    vec![Step::Fail(
+                        ProofError::Open(Failure::Authorization, "1142".into()),
+                        Duration::ZERO,
+                    )],
+                )]);
+                let err = prove_with(&ctx, &script, p).await.err().unwrap();
+                assert_eq!(script.calls.lock().unwrap().len(), 1);
+                assert!(
+                    err.draft()
+                        .unwrap()
+                        .evidence
+                        .holds(EvidenceKey::ReasonClass, "authorization")
+                );
+                assert!(ctx.incidents.list().await.unwrap().is_empty());
+            }
+
+            /// Another server on a retry stops the source (lineage) with no
+            /// further attempt; the retrying incident is withdrawn
+            /// (`ended_by_lineage`).
+            #[tokio::test(start_paused = true)]
+            async fn another_server_stops_the_retries() {
+                let st = store();
+                let mut ctx = ctx_with(&st, bounds()).await;
+                let p = tables(&mut ctx, &["a"]).await;
+                let script = Script::with(&[(
+                    "a",
+                    vec![
+                        contention(),
+                        Step::Fail(
+                            ProofError::OtherServer("other".into()),
+                            Duration::ZERO,
+                        ),
+                    ],
+                )]);
+                let err = prove_with(&ctx, &script, p).await.err().unwrap();
+                assert!(matches!(err, SourceError::Lineage { .. }), "{err}");
+                assert_eq!(script.calls.lock().unwrap().len(), 2);
+                assert!(withdrawn(
+                    &only_incident(&ctx).await,
+                    "ended_by_lineage"
+                ));
+            }
+
+            /// A stop during a backoff (30.5 s, in the first one), or during
+            /// a capture's lock wait (40 s, in the second attempt), ends the
+            /// proof at once: `Cancelled`, the retrying incident withdrawn
+            /// (`ended_cancelled`), nothing bound.
+            #[tokio::test(start_paused = true)]
+            async fn a_stop_ends_the_retries() {
+                for (at, captures) in [(30_500, 1), (40_000, 2)] {
+                    let st = store();
+                    let mut ctx = ctx_with(&st, bounds()).await;
+                    let p = tables(&mut ctx, &["a"]).await;
+                    let id = p[0].ddl_id.clone();
+                    let script = Script::with(&[("a", vec![contention()])]);
+                    let cancel = ctx.cancel.clone();
+                    let stopper = tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(at)).await;
+                        cancel.cancel();
+                    });
+                    let t0 = Instant::now();
+                    let err = prove_with(&ctx, &script, p).await.err().unwrap();
+                    stopper.abort();
+                    assert!(matches!(err, SourceError::Cancelled), "{err}");
+                    assert_eq!(
+                        (Instant::now() - t0).as_millis(),
+                        u128::from(at),
+                        "at once"
+                    );
+                    assert_eq!(script.calls.lock().unwrap().len(), captures);
+                    assert!(withdrawn(
+                        &only_incident(&ctx).await,
+                        "ended_cancelled"
+                    ));
+                    assert_eq!(durable(&ctx, "a", &id).await.1, None);
+                }
+            }
+
+            /// Two tables whose registrations need about 10,000 reads each
+            /// (5,000 earlier lineages): one batch each.
+            async fn two_batches(ctx: &RunCtx) {
+                let backend = ctx.registry_backend.clone();
+                let mut lineage = storage::adapters::source_lineage::load(
+                    &backend,
+                    &ctx.tenant,
+                    &ctx.source_id,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                lineage.prior_lineage_hashes =
+                    (0..5000u64).map(|i| format!("{i:032x}")).collect();
+                backend
+                    .kv_put(
+                        "schema_lineage",
+                        &format!("{}/{}", ctx.tenant, ctx.source_id),
+                        &serde_json::to_vec(&lineage).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            /// The deadline between batches: the first batch, started before
+            /// it, resolves (here after it); no second batch starts. The
+            /// first table is bound once, the second not, and it stays
+            /// retrying: the proof is exhausted.
+            #[tokio::test(start_paused = true)]
+            async fn no_batch_starts_after_the_deadline() {
+                let st = store();
+                let mut ctx = ctx_with(
+                    &st,
+                    deltaforge_config::ForwardProofRetry {
+                        deadline: Duration::from_secs(10),
+                        ..bounds()
+                    },
+                )
+                .await;
+                let p = tables(&mut ctx, &["a", "b"]).await;
+                let (ia, ib) = (p[0].ddl_id.clone(), p[1].ddl_id.clone());
+                two_batches(&ctx).await;
+                *st.fault.before_next_batch.lock().unwrap() =
+                    Some(BatchHook(Box::new(|_| {
+                        Box::pin(tokio::time::sleep(Duration::from_secs(20)))
+                    })));
+                let batches = || {
+                    st.fault
+                        .write_calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|c| *c == "batch")
+                        .count()
+                };
+                let before = batches();
+                let err = prove_with(&ctx, &Script::default(), p)
+                    .await
+                    .err()
+                    .unwrap();
+                assert_eq!(batches() - before, 1, "no second batch");
+                assert_eq!(durable(&ctx, "a", &ia).await.1, Some(1));
+                assert_eq!(durable(&ctx, "b", &ib).await.1, None);
+                let ev = &err.draft().unwrap().evidence;
+                assert_eq!(count(ev, EvidenceKey::BlockingCount), 1);
+                assert!(ev.holds(EvidenceKey::Table, "d.b"));
+                assert!(ev.holds(EvidenceKey::ReasonClass, "deadline"));
+            }
+
+            /// A stop while a batch's outcome is being resolved: the commit
+            /// lands, its acknowledgement is lost, and the batch resolves
+            /// through its marker; then no further batch or replan starts.
+            /// `a` is bound once, `b` stays pending, the proof ends
+            /// `Cancelled` and the retrying incident is withdrawn.
+            #[tokio::test(start_paused = true)]
+            async fn a_stop_during_commit_resolution_starts_no_further_batch() {
+                let st = store();
+                let mut ctx = ctx_with(&st, bounds()).await;
+                let p = tables(&mut ctx, &["a", "b"]).await;
+                let (ia, ib) = (p[0].ddl_id.clone(), p[1].ddl_id.clone());
+                two_batches(&ctx).await;
+                let script = Script::with(&[
+                    ("a", vec![contention(), ok()]),
+                    ("b", vec![contention(), ok()]),
+                ]);
+                let cancel = ctx.cancel.clone();
+                let memory = st.memory.clone();
+                *st.fault.before_next_batch.lock().unwrap() =
+                    Some(BatchHook(Box::new(move |_| {
+                        cancel.cancel();
+                        memory.set_batch_fault(Some(BatchFault::AfterCommit));
+                        Box::pin(async {})
+                    })));
+                let err = prove_with(&ctx, &script, p).await.err().unwrap();
+                assert!(matches!(err, SourceError::Cancelled), "{err}");
+                let (versions, bound) = durable(&ctx, "a", &ia).await;
+                assert_eq!((versions.len(), bound), (1, Some(1)));
+                assert_eq!(durable(&ctx, "b", &ib).await, (vec![], None));
+                let rec = only_incident(&ctx).await;
+                assert!(withdrawn(&rec, "ended_cancelled"), "{rec:?}");
+                assert_eq!(count(&rec.evidence, EvidenceKey::BlockingCount), 1);
+            }
+
+            /// Every failure has one decision; the transient ones (and only
+            /// they) are retried, identity, saturation and credentials stop,
+            /// and evidence, bounds, retention and protocol defer.
+            #[test]
+            fn every_proof_error_is_decided() {
+                let retried =
+                    |e: ProofError| matches!(decide(&e), Decision::Retry(_));
+                let deferred =
+                    |e: ProofError| matches!(decide(&e), Decision::Defer(_));
+                let stopped =
+                    |e: ProofError| matches!(decide(&e), Decision::Stop(_));
+                let s = || String::from("x");
+                assert!(retried(ProofError::Contention {
+                    code: 1205,
+                    why: s()
+                }));
+                assert!(retried(ProofError::Contention { code: 0, why: s() }));
+                assert!(retried(ProofError::Open(Failure::Transport, s())));
+                assert!(retried(ProofError::Read(Failure::Transport, s())));
+                assert!(retried(ProofError::NotReached(s())));
+                for class in [Failure::Authentication, Failure::Authorization] {
+                    assert!(stopped(ProofError::Open(class, s())));
+                    assert!(stopped(ProofError::Read(class, s())));
+                }
+                assert!(stopped(ProofError::OtherServer(s())));
+                assert!(stopped(ProofError::Saturated {
+                    scope: "runner",
+                    why: s()
+                }));
+                for class in [
+                    Failure::Protocol,
+                    Failure::Retention,
+                    Failure::Absent,
+                    Failure::Other,
+                ] {
+                    assert!(deferred(ProofError::Open(class, s())));
+                    assert!(deferred(ProofError::Read(class, s())));
+                }
+                for e in [
+                    ProofError::Positions(s()),
+                    ProofError::Incident,
+                    ProofError::UnsupportedEvent(1),
+                    ProofError::Framing(s()),
+                    ProofError::Overshoot(s()),
+                    ProofError::AnchorMismatch(s()),
+                    ProofError::Limit(s()),
+                    ProofError::SeekLimit(s()),
+                    ProofError::Unstable(2),
+                    ProofError::Capture(s()),
+                ] {
+                    assert!(deferred(e));
+                }
+            }
+        }
     }
 
     /// Live MySQL 8.4 (Docker).
@@ -2360,9 +3097,20 @@ mod tests {
             tables: &[&str],
             retry: deltaforge_config::ForwardProofRetry,
         ) -> Run {
+            run_as(st, &dsn(port), id, tables, retry).await
+        }
+
+        /// [`run_with`] on `dsn`.
+        async fn run_as(
+            st: &State,
+            dsn: &str,
+            id: &str,
+            tables: &[&str],
+            retry: deltaforge_config::ForwardProofRetry,
+        ) -> Run {
             let src = MySqlSource {
                 id: id.into(),
-                dsn: dsn(port).as_str().into(),
+                dsn: dsn.into(),
                 tables: tables.iter().map(|t| t.to_string()).collect(),
                 tenant: "acme".into(),
                 pipeline: "test".into(),
@@ -3952,6 +4700,185 @@ mod tests {
                 incident.evidence.get(EvidenceKey::BlockingCount),
                 Some(&EvidenceValue::Count { value: 1 })
             );
+            stop(r.handle).await;
+        }
+
+        /// A stop while the proof's capture waits for the metadata lock:
+        /// the source ends at once, the capture's session is killed on the
+        /// server, nothing of the DDL is emitted, checkpointed or bound, and
+        /// the retrying incident is withdrawn (`ended_cancelled`). The
+        /// restart binds the DDL.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_stop_during_a_lock_wait_ends_the_proof() {
+            let port = server(true).await;
+            let db = "fwd_retry_stop";
+            prepare(port, db).await;
+            let st = state(Arc::new(MemoryStorageBackend::new())).await;
+            let t = format!("{db}.t");
+            let r = run(&st, port, db, &[&t]).await;
+            stop(r.handle).await;
+            let committed = st.ckpt.get_raw(db).await.unwrap();
+            let r = run_with(
+                &st,
+                port,
+                db,
+                &[&t],
+                deltaforge_config::ForwardProofRetry {
+                    lock_wait: Duration::from_secs(5),
+                    deadline: Duration::from_secs(60),
+                    ..limits()
+                },
+            )
+            .await;
+            let blocker = Blocker::alter(port, &t, "ADD COLUMN w INT").await;
+            // The first attempt fails after ~4 s (recorded as retrying);
+            // the stop lands in the second attempt's lock wait.
+            let waiting = Instant::now() + Duration::from_secs(30);
+            while lock_waiters(port).await == 0 {
+                assert!(Instant::now() < waiting, "no capture waits");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(7)).await;
+            assert_eq!(lock_waiters(port).await, 1, "the second attempt waits");
+            let stopped = Instant::now();
+            r.handle.stop();
+            let ended =
+                tokio::time::timeout(Duration::from_secs(10), r.handle.join)
+                    .await
+                    .expect("stops at once")
+                    .expect("task");
+            assert!(stopped.elapsed() < Duration::from_secs(3));
+            assert!(
+                matches!(
+                    ended,
+                    Err(deltaforge_core::SourceError::Cancelled) | Ok(())
+                ),
+                "{ended:?}"
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(lock_waiters(port).await, 0, "the session is killed");
+            assert_eq!(st.ckpt.get_raw(db).await.unwrap(), committed);
+            let recs = records(&st, db, "t").await;
+            assert_eq!(bound(&st, db, "t", &recs, ddls(&recs)[0]).await, None);
+            let incident = only_incident(&st).await;
+            assert!(
+                matches!(
+                    incident.status,
+                    IncidentStatus::Resolved {
+                        by: Resolution::OperationCancelled,
+                        ..
+                    }
+                ) && incident
+                    .evidence
+                    .holds(EvidenceKey::ReasonClass, "ended_cancelled"),
+                "{incident:?}"
+            );
+            blocker.release().await;
+            let mut r = run(&st, port, db, &[&t]).await;
+            assert!(
+                ddl_event_within(
+                    &mut r.rx,
+                    "ADD COLUMN w",
+                    Duration::from_secs(60)
+                )
+                .await
+            );
+            let recs = records(&st, db, "t").await;
+            assert!(bound(&st, db, "t", &recs, ddls(&recs)[0]).await.is_some());
+            stop(r.handle).await;
+        }
+
+        /// An authorization failure at the proof's capture (the account's
+        /// `SELECT` on the table revoked) is never retried: the source stops
+        /// before the DDL on the operator-action draft, cause `source_auth`,
+        /// with no retrying incident. With the grant back, the restart binds
+        /// the DDL.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn an_authorization_failure_stops_before_the_ddl() {
+            let port = server(true).await;
+            let db = "fwd_retry_denied";
+            prepare(port, db).await;
+            let user = "fwd_denied";
+            sql(
+                port,
+                &[
+                    &format!("DROP USER IF EXISTS '{user}'@'%'"),
+                    &format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'pw'"),
+                    &format!(
+                        "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* \
+                         TO '{user}'@'%'"
+                    ),
+                    &format!("GRANT SELECT ON {db}.t TO '{user}'@'%'"),
+                    &format!("GRANT SELECT ON {db}.other TO '{user}'@'%'"),
+                ],
+            )
+            .await;
+            let user_dsn = format!("mysql://{user}:pw@127.0.0.1:{port}/");
+            let st = state(Arc::new(MemoryStorageBackend::new())).await;
+            let t = format!("{db}.t");
+            let r = run_as(&st, &user_dsn, db, &[&t], limits()).await;
+            stop(r.handle).await;
+            let committed = st.ckpt.get_raw(db).await.unwrap();
+            let r = run_as(&st, &user_dsn, db, &[&t], limits()).await;
+            // Revoked before the DDL (MySQL checks the privilege before any
+            // metadata-lock wait): the proof's first capture is refused.
+            sql(
+                port,
+                &[
+                    &format!("REVOKE SELECT ON {db}.t FROM '{user}'@'%'"),
+                    &format!("ALTER TABLE {t} ADD COLUMN w INT"),
+                ],
+            )
+            .await;
+            let ended =
+                tokio::time::timeout(Duration::from_secs(30), r.handle.join)
+                    .await
+                    .expect("stops")
+                    .expect("task");
+            let err = ended.expect_err("the refused proof stops the source");
+            let draft = err.draft().expect("an incident");
+            assert_eq!(
+                draft.reason_code,
+                deltaforge_core::incident::ReasonCode::MysqlForwardProofUnavailable
+            );
+            assert_eq!(draft.retryability, Retryability::OperatorAction);
+            assert_eq!(
+                draft.cause_code,
+                deltaforge_core::incident::CauseCode::SourceAuth
+            );
+            assert!(
+                draft
+                    .evidence
+                    .holds(EvidenceKey::ReasonClass, "authorization"),
+                "{draft:?}"
+            );
+            assert!(matches!(
+                err.root(),
+                deltaforge_core::SourceError::Auth { .. }
+            ));
+            for text in [format!("{err}"), format!("{err:?}")] {
+                assert!(!text.contains(":pw@"), "{text}");
+            }
+            assert_eq!(st.ckpt.get_raw(db).await.unwrap(), committed);
+            let recs = records(&st, db, "t").await;
+            assert_eq!(bound(&st, db, "t", &recs, ddls(&recs)[0]).await, None);
+            assert!(incidents(&st).await.is_empty(), "never retried");
+
+            sql(port, &[&format!("GRANT SELECT ON {db}.t TO '{user}'@'%'")])
+                .await;
+            let mut r = run_as(&st, &user_dsn, db, &[&t], limits()).await;
+            assert!(
+                ddl_event_within(
+                    &mut r.rx,
+                    "ADD COLUMN w",
+                    Duration::from_secs(60)
+                )
+                .await
+            );
+            let recs = records(&st, db, "t").await;
+            assert!(bound(&st, db, "t", &recs, ddls(&recs)[0]).await.is_some());
             stop(r.handle).await;
         }
     }
