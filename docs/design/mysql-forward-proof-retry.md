@@ -1,6 +1,6 @@
 # Bounded retry of failed MySQL forward-proof captures: proposal for review
 
-Status: revision 2, for review before implementation (2026-10-31). Base: main at 57eff64a. Implementation, stage 2 execution, T1a and rc.1 remain held.
+Status: revision 2, approved for implementation (2026-10-31) with the clarifications of its review folded in (§0, last four rows). Base: main at 57eff64a. Stage 2 execution, T1a and rc.1 remain held.
 
 ## 0. Changes from revision 1
 
@@ -13,6 +13,10 @@ Status: revision 2, for review before implementation (2026-10-31). Base: main at
 | Limits accepted as initial constants; tests inject limits per run, with no shared mutable statics | §3.4 |
 | A different terminal stop withdraws the retry as `operation_cancelled`; the cause goes in existing fields; no store-format change | §3.8 |
 | Error typing approved, with transport failures retried explicitly and authentication, authorization and protocol failures classified separately | §3.3 |
+| Approval clarification 1: authentication and authorization stop before the DDL on an operator-action incident; transport failures, including those during TLS negotiation, stay transport; not every TLS error is bad credentials | §3.3, §3.8 |
+| Approval clarification 2: the withdrawal keeps the original evidence and updates only the terminal cause and count, in the same conditional transition; existing callers keep evidence with no read-and-replace; operator-action records are left unchanged | §3.8 |
+| Approval clarification 3: `commit_proofs` stops between batches and replans at the deadline or a stop, after resolving a batch already started; the remaining overrun is listed | §3.4, §3.5, invariant 2 |
+| Approval clarification 4: recovery advice stays precise (a later lazy proof can still succeed); the retry budget is bounded per run only | §3.7, §6 |
 
 ## 1. Problem
 
@@ -95,8 +99,8 @@ The classification is one function, `classify(&ProofError) -> Class`. It matches
 |---|---|---|
 | `contention` | 1205 lock wait timeout, 1213 deadlock, lock-holding slots busy | retried |
 | `transport` | `Io` errors of kind `ConnectionRefused`, `ConnectionReset`, `ConnectionAborted`, `BrokenPipe`, `TimedOut`, `UnexpectedEof`, `NotConnected`, `HostUnreachable` or `NetworkUnreachable`; `DriverError::ConnectionClosed`; server 1040 (too many connections), 1053 (server shutdown), 1927 (connection killed by another session); scan `Read`; `NotReached` after the scanner's own fallback | retried |
-| `authentication` | server 1045, 1251, 1820, 1862, 3118; `DriverError::UnknownAuthPlugin`, `MysqlOldPasswordDisabled`, `CleartextPluginDisabled`, `NoKeyFound`, `NoClientSslFlagFromServer`; any TLS error | **stop before the DDL** as `SourceError::Auth` (cause `source_auth`, operator action); not retried |
-| `authorization` | server 1044, 1142, 1143, 1227 | **stop before the DDL** as `SourceError::Auth`; not retried |
+| `authentication` | server 1045, 1251, 1820, 1862, 3118; `DriverError::UnknownAuthPlugin`, `MysqlOldPasswordDisabled`, `CleartextPluginDisabled`, `NoKeyFound`, `NoClientSslFlagFromServer`; on a scan session, the connector's authentication failure | **stop before the DDL** on the operator-action incident (§3.8, cause `source_auth`); not retried |
+| `authorization` | server 1044, 1142, 1143, 1227 | **stop before the DDL** on the operator-action incident (§3.8, cause `source_auth`); not retried |
 | `protocol` | `DriverError::PacketOutOfOrder`, `UnexpectedPacket`, `PacketTooLarge`, `BadCompressedPacketHeader`, `CantParseServerVersion`, `FromValue`, `FromRow` | not retried; deferred as today, as untrusted evidence |
 | `identity` | `OtherServer`, no identity | the source stops (`SourceError::Lineage`); unchanged |
 | `saturated` | `Saturated` | stop with `mysql_control_plane_saturated`; unchanged |
@@ -107,7 +111,11 @@ The classification is one function, `classify(&ProofError) -> Class`. It matches
 | `decision` | `not_covered`, `relevant_ddl`, S not at or after D, unparseable D | deferred as today |
 | `other` | any `Io` kind or server code not listed above | not retried; deferred as today |
 
-Authentication and authorization currently defer. Retrying them would not help, and a deferral leads to the late row-time stop with the wrong advice. They therefore stop at the DDL boundary, like exhaustion. During a credential rotation, the restart uses the rotated DSN. §7, question 1, asks the reviewer to confirm this change.
+Authentication and authorization currently defer. Retrying them would not help, and a deferral leads to the late row-time stop. They therefore stop at the DDL boundary, like exhaustion, without a retry and without checkpointing the DDL. During a credential rotation, the restart uses the rotated DSN.
+
+TLS: neither client in this build negotiates TLS (`mysql_async` is built without a TLS feature, and the vendored binlog connector has none), so no TLS error can arise. A transport failure during a handshake is an I/O error and classified by its kind (`transport` above), never as credentials. Enabling a TLS feature adds an error variant the exhaustive match does not cover, so it cannot compile until TLS errors are classified, separating transport failures from certificate and credential failures.
+
+The vendored binlog connector keeps no server error code: its server errors are `ConnectError` text. On scan sessions, its errors are classified once where they arise, with the same predicates the main stream already uses for them (`is_auth_error`, `is_purged_error`), plus the connector's own connect-timeout text as `transport`. Any other `ConnectError` is `other`. Every class is carried typed from there on.
 
 ### 3.4 Limits and the proof-wide deadline
 
@@ -132,20 +140,20 @@ The deadline governs all MySQL work of the proof:
 - **Attempts:** none starts after the fourth.
 - **Exhausted** means that at the point an attempt or a capture would start, some table is still `Retrying` and none of the above allows it.
 
-Store work is not cut by the deadline:
+Store work under the deadline:
 
-- the replay check;
-- `commit_proofs`, which runs to resolution under its existing bounds (`BATCH_CONFLICT_RETRIES`, the store's timeouts, and commit-marker resolution of an ambiguous outcome);
-- the C3 freshness reads.
+- A commit starts only after a completed scan whose evidence proves its tables.
+- `commit_proofs` checks the deadline and the stop before planning each batch and before each replan (after a conflict or a repair). Past either, it starts no further batch or replan. It returns what it committed; the rest stay `Retrying` (deadline) or pending (stop).
+- A batch already started is never cut: its `commit_atomic_counted`, with its storage retries (`BATCH_STORAGE_RETRIES`) and the commit-marker resolution of an ambiguous outcome, runs to its result.
+- Once the deadline has passed, the freshness reads are skipped: those tables are invalidated and reload, which is always safe.
 
-A commit starts only after a completed scan whose evidence proves its tables. Once the deadline has passed, the freshness reads are skipped: those tables are invalidated and reload, which is always safe.
+**The resulting bound:** no MySQL capture or scan of the proof starts after the deadline, and none starts a batch or replan after it. The proof can still outlast the deadline, by:
 
-**The resulting bound:** no MySQL capture or scan of the proof starts after the deadline, and none runs past it by more than its cancellation cleanup (§3.5). The proof as a whole can still outlast the deadline, by at most:
+- the store batch in progress at the deadline: the rest of its planning reads, if planning had started, then its commit with up to `BATCH_STORAGE_RETRIES` storage retries and the commit-marker resolution;
+- the incident store write that records the outcome (§3.8);
+- in the background, after the proof has returned: the server-side kill of a dropped capture session (the existing detached kill, bounded by its own connect and statement), and the end of a dropped scan session (its abortive close makes the server's next write fail).
 
-- the resolution of the one store commit in flight at the deadline;
-- the commit-marker resolution, if that commit's outcome was ambiguous.
-
-There is no hard 120-second completion bound while that resolution is outstanding.
+None of these is bounded by the deadline itself, so there is no hard 120-second completion claim. Each is bounded by its own existing limits.
 
 ### 3.5 Cancellation, and cleanup at expiry
 
@@ -183,7 +191,7 @@ The recovery boundary is the checkpoint before the DDL, named in the incident.
 - **The `ddl` record** is written once, before the first attempt, and never again.
 - **Commits** are the same atomic per-table batches as today (C1), with commit-marker resolution. An attempt resolves an earlier ambiguous batch through its marker, never by appending again. Before capturing, it moves any table whose binding the replay check finds valid to `Proven`.
 - **C3:** a snapshot taken before the `ddl` record stays valid across attempts. Only the source's own task writes in between, and the freshness reads still check that the table stream gained exactly the `ddl` record and the binding.
-- **The retry budget** lives in memory and restarts with the run. A crash loop cannot retry without bound: exhaustion is an operator-action stop, and restarts are supervised.
+- **The retry budget** lives in memory and is bounded per run only. Each run that replays the DDL gets a new budget. Nothing in this change bounds attempts across repeated restarts: how often a stopped source is restarted is decided outside it.
 
 ### 3.8 Incident
 
@@ -206,11 +214,18 @@ Reason code: `mysql_forward_proof_unavailable` (new).
 | Completed | at least one `Deferred` | withdrawn, `operation_cancelled`; `reason_class` = `ended_deferred`; `blocking_count` = the deferred count. Not a recovery. The DDL is emitted with those tables pending, as a deferral is today. |
 | Exhausted | at least one still `Retrying` | the source stops on the same draft as `operator_action`. The supervisor reclassifies the same incident (audited `reclassified`), with the last retry class and the count of tables still retrying. |
 | Stopped: cancelled | any | withdrawn, `operation_cancelled`; `reason_class` = `ended_cancelled` |
-| Stopped: another terminal cause | any | withdrawn, `operation_cancelled`; `reason_class` = `ended_by_<reason>`, for example `ended_by_mysql_control_plane_saturated`, `ended_by_lineage` or `ended_by_auth`. The terminal stop raises or carries its own incident, as today. A structured log line names both incident ids. |
+| Stopped: authentication or authorization | any | the source stops on this incident's draft as `operator_action`, with class `authentication` or `authorization` and cause `source_auth`. A retrying incident of the same boundary and epoch is the same incident, so the supervisor reclassifies it, as on exhaustion. |
+| Stopped: another terminal cause | any | withdrawn, `operation_cancelled`; `reason_class` = `ended_by_<reason>`, for example `ended_by_mysql_control_plane_saturated`, `ended_by_lineage` or `ended_by_store`. The terminal stop raises or carries its own incident, as today. A structured log line names both incident ids. |
 
 Tables deferred without any retryable failure are outside the incident's scope. They are handled exactly as today, with no incident, so a mixed proof can still resolve as `verified_recovery` for the tables that did fail transiently. If no table ever has a retryable failure, no incident is recorded.
 
-**Recording the cause on withdrawal.** The record's `evidence` is an existing field, and today `cancel_auto_retry` leaves it unchanged. The change is one store method parameter: `cancel_auto_retry(id, evidence)` replaces the evidence in the same `Resolved { by: OperationCancelled }` transition. This needs no new resolution, no new evidence key and no format change. Existing callers pass the record's current evidence.
+**Recording the cause on withdrawal.** The record's `evidence` is an existing field, and today `cancel_auto_retry` leaves it unchanged. The change: `cancel_auto_retry_with(id, update)`, where `update` holds only the terminal entries (`reason_class`, `blocking_count`, `attempts`).
+
+- Inside the same conditional transition that resolves the record, it overlays those entries on the record's current evidence. Every other entry, including the original diagnostics, is kept.
+- The transition's guard is unchanged: a resolved record or an operator-action record is left as it is, and nothing is written.
+- `cancel_auto_retry(id)` becomes `cancel_auto_retry_with(id, empty)`, so existing callers keep the evidence as stored. No caller reads and replaces evidence, so no newer evidence can be overwritten.
+
+This needs no new resolution, no new evidence key and no format change.
 
 Metrics:
 
@@ -227,7 +242,7 @@ Metrics:
 ## 4. Invariants
 
 1. A retry never emits, checkpoints or registers anything that the same attempt would not prove as a first attempt.
-2. **Deadline:** no capture or scan of a proof starts after its deadline or after its fourth attempt, and none runs past the deadline by more than its cancellation cleanup. Completion can exceed the deadline only by the resolution of a store commit already in flight, including its commit-marker resolution.
+2. **Deadline:** no capture, scan, store batch or replan of a proof starts after its deadline or after its fourth attempt, and no capture or scan runs past the deadline by more than its cancellation cleanup. A store batch already started resolves (including its commit-marker resolution) before the proof ends; that, the outcome's incident write and the background cleanup (§3.4) are the only overrun, each bounded by its own limits.
 3. Identity is fixed at the start of `prove`. Any attempt that reaches another server, or cannot establish identity, stops the source without a retry.
 4. Invalid or untrusted evidence, deterministic bounds, evidence decisions and protocol failures are never retried. Authentication and authorization failures stop at the DDL boundary.
 5. A table is in exactly one of `Retrying`, `Proven` or `Deferred`. Only `Retrying` changes. Across attempts and replays a table is bound at most once.
@@ -280,12 +295,7 @@ The live forward-proof suite runs in the gate's `sources/lib` command. Test 11 m
 
 ## 6. Out of scope
 
-- The row-time remediation text for `PendingDdl`. After this change it fires only after an evidence refusal or a non-retryable failure, where a re-snapshot or FULL metadata really is the remedy.
+- The row-time remediation text for `PendingDdl`. After this change, a deferral follows only an evidence refusal or a non-retryable failure. The row-time lazy proof can still succeed for the rows after it, so a deferral does not by itself mean a re-snapshot or FULL metadata is needed; the text is left as it is here.
 - Retrying in the activation window or the lazy baseline, which have their own bounds and incidents.
 - Persisting the retry budget across restarts.
 - Making the limits configurable.
-
-## 7. Questions for the reviewer
-
-1. Authentication and authorization failures on a forward-proof connection: stop at the DDL boundary as `SourceError::Auth` (proposed), instead of the deferral they get today?
-2. Recording the cause on withdrawal: the one store method parameter in §3.8 (the evidence replaced in the same transition, no format change). Accept, or keep the cause only in the log line and the terminal incident?
