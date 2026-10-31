@@ -2498,6 +2498,33 @@ mod tests {
                 assert_eq!(durable(&ctx, "a", &id).await, (vec![], None));
             }
 
+            /// The attempt bound holds with time to spare: with an hour's
+            /// deadline, four attempts and no fifth.
+            #[tokio::test(start_paused = true)]
+            async fn no_fifth_attempt_with_time_left() {
+                let st = store();
+                let mut ctx = ctx_with(
+                    &st,
+                    deltaforge_config::ForwardProofRetry {
+                        deadline: Duration::from_secs(3600),
+                        ..bounds()
+                    },
+                )
+                .await;
+                let p = tables(&mut ctx, &["a"]).await;
+                let script = Script::with(&[("a", vec![contention()])]);
+                let t0 = Instant::now();
+                let err = prove_with(&ctx, &script, p).await.err().unwrap();
+                assert_eq!(script.calls(t0).len(), 4);
+                assert_eq!(
+                    count(
+                        &err.draft().unwrap().evidence,
+                        EvidenceKey::Attempts
+                    ),
+                    4
+                );
+            }
+
             /// No attempt starts after the deadline: with 100 s, the fourth
             /// would start at 111 s; the backoff is cut to the 5 s left and
             /// the proof is exhausted after three.
