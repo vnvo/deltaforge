@@ -1853,7 +1853,7 @@ fn capture_failure(
                 at,
             )
         }
-        BatchCaptureError::Failed(ProofError::Open(why)) => {
+        BatchCaptureError::Failed(ProofError::Open(_, why)) => {
             SourceError::Connect {
                 details: format!(
                     "the activation window's capture of {} table(s) could not \
@@ -3001,6 +3001,7 @@ mod tests {
             Some("runner")
         );
         let e = fail(BatchCaptureError::Failed(ProofError::Open(
+            crate::mysql::mysql_failure::Failure::Transport,
             "refused".into(),
         )));
         assert!(matches!(e, SourceError::Connect { .. }), "{e:?}");

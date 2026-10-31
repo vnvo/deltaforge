@@ -888,6 +888,7 @@ async fn shape_at_failover(
         db,
         table,
         None,
+        super::mysql_binlog_scan::LOCK_WAIT,
     )
     .await?
     {

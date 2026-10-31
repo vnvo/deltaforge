@@ -51,6 +51,7 @@ use tokio_util::sync::CancellationToken;
 use super::MySqlCheckpoint;
 use super::mysql_activation::EventIdentity;
 use super::mysql_ddl_attribution::{BarrierScopeOf, DdlEffect, classify};
+use super::mysql_failure::{Failure, of_binlog, of_mysql};
 use super::mysql_schema_loader::{Live, fetch_table_schema_on};
 use super::mysql_session::{SessionError, open_replication_session_abortive};
 use super::mysql_table_schema::MySqlTableSchema;
@@ -253,12 +254,20 @@ pub(crate) enum ProofError {
     Positions(String),
     #[error("the server is not the verified lineage: {0}")]
     OtherServer(String),
+    /// A connection could not be made, set up or kept (or the interval's
+    /// binlog is purged), with the failure's class.
     #[error(
-        "the interval cannot be opened (retention loss or connection failure): {0}"
+        "the connection failed or the interval cannot be opened ({}): {1}",
+        .0.as_str()
     )]
-    Open(String),
-    #[error("reading the interval failed: {0}")]
-    Read(String),
+    Open(Failure, String),
+    #[error("reading the interval failed ({}): {1}", .0.as_str())]
+    Read(Failure, String),
+    /// A capture could not take its table's metadata lock: a lock wait
+    /// timeout (1205), a deadlock (1213), or every lock-holding capture slot
+    /// busy (code 0).
+    #[error("{why}")]
+    Contention { code: u16, why: String },
     #[error("binlog INCIDENT event: the binlog declares a gap")]
     Incident,
     #[error("unsupported binlog event type {0}")]
@@ -1145,7 +1154,7 @@ async fn scan(
     .map_err(|e| match e {
         SessionError::OtherServer { found } => ProofError::OtherServer(found),
         SessionError::NoIdentity(why) => ProofError::OtherServer(why),
-        SessionError::Connect(why) => ProofError::Open(why),
+        SessionError::Connect(class, why) => ProofError::Open(class, why),
     })?;
     let opened = Instant::now();
     trace.setup = opened - started;
@@ -1182,7 +1191,9 @@ async fn scan(
             let (header, data) = match tokio::time::timeout(left, stream.read())
                 .await
             {
-                Ok(r) => r.map_err(|e| ProofError::Read(e.to_string()))?,
+                Ok(r) => {
+                    r.map_err(|e| ProofError::Read(of_binlog(&e), e.to_string()))?
+                }
                 Err(_) if seeking && opened.elapsed() >= limits.max_seek => {
                     return Err(seek_limit(limits.max_seek));
                 }
@@ -1479,7 +1490,7 @@ async fn read_position(
             Err(_) => conn
                 .query_first("SHOW MASTER STATUS")
                 .await
-                .map_err(|e| ProofError::Capture(e.to_string()))?,
+                .map_err(|e| statement_error(&e, "SHOW MASTER STATUS"))?,
         };
     let mut row =
         row.ok_or_else(|| ProofError::Capture("binary logging is off".into()))?;
@@ -1583,8 +1594,14 @@ pub(crate) fn kill_failures() -> u64 {
     KILL_FAILURES.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// A capture's lock wait unless its caller has less time ([`LOCK_WAIT_SECS`]).
+pub(crate) const LOCK_WAIT: Duration =
+    Duration::from_secs(LOCK_WAIT_SECS as u64);
+
 /// Read `db.table`'s shape between two positions (module docs). Never
-/// requires the server to be quiet: the positions may differ.
+/// requires the server to be quiet: the positions may differ. `lock_wait`
+/// bounds the slot wait, the connect and the metadata-lock wait together
+/// (at least 1 s: MySQL's least `lock_wait_timeout`).
 pub(crate) async fn capture(
     cx: &CaptureCtx,
     server_uuid: &str,
@@ -1592,6 +1609,7 @@ pub(crate) async fn capture(
     db: &str,
     table: &str,
     between: Option<BetweenHook<'_>>,
+    lock_wait: Duration,
 ) -> Result<Result<Captured, ProofError>, Cancelled> {
     capture_with(
         &CAPTURE_SLOTS,
@@ -1601,11 +1619,13 @@ pub(crate) async fn capture(
         db,
         table,
         between,
+        lock_wait,
     )
     .await
 }
 
 /// [`capture`] under the given capture slots.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn capture_with(
     slots: &'static CaptureSlots,
     cx: &CaptureCtx,
@@ -1614,6 +1634,7 @@ pub(crate) async fn capture_with(
     db: &str,
     table: &str,
     between: Option<BetweenHook<'_>>,
+    lock_wait: Duration,
 ) -> Result<Result<Captured, ProofError>, Cancelled> {
     let dsn = &cx.dsn;
     let mut trace = CaptureTrace::default();
@@ -1632,14 +1653,16 @@ pub(crate) async fn capture_with(
         // waiting for one holds no connection. Then a connection of the
         // source's pool, proven to be the server, within what remains;
         // then the table's metadata lock, held until COMMIT (module docs).
-        let budget = Duration::from_secs(u64::from(LOCK_WAIT_SECS));
+        let budget = lock_wait.max(Duration::from_secs(1));
         let waited = Instant::now();
         let permit = tokio::time::timeout(budget, slots.holding.acquire())
             .await
-            .map_err(|_| {
-                ProofError::Capture(format!(
-                    "every lock-holding capture slot stayed busy for {LOCK_WAIT_SECS} s"
-                ))
+            .map_err(|_| ProofError::Contention {
+                code: 0,
+                why: format!(
+                    "every lock-holding capture slot stayed busy for {} s",
+                    budget.as_secs()
+                ),
             })?
             .expect("capture slots are never closed");
         guard.permit = Some(permit);
@@ -1658,7 +1681,7 @@ pub(crate) async fn capture_with(
         let mode: Option<String> = conn
             .query_first("SELECT @@GLOBAL.gtid_mode")
             .await
-            .map_err(|e| ProofError::Capture(e.to_string()))?;
+            .map_err(|e| statement_error(&e, "SELECT @@GLOBAL.gtid_mode"))?;
         let gtid_mode = mode.is_some_and(|m| m.eq_ignore_ascii_case("ON"));
         let remaining =
             budget.saturating_sub(waited.elapsed()).as_secs().max(1);
@@ -1668,14 +1691,14 @@ pub(crate) async fn capture_with(
         ] {
             conn.query_drop(&q)
                 .await
-                .map_err(|e| ProofError::Capture(format!("{q}: {e}")))?;
+                .map_err(|e| statement_error(&e, &q))?;
         }
         trace.connect = t0.elapsed();
         let t = Instant::now();
         let lock = format!("SELECT 1 FROM {} LIMIT 0", quoted(db, table));
         conn.query_drop(&lock)
             .await
-            .map_err(|e| ProofError::Capture(format!("{lock}: {e}")))?;
+            .map_err(|e| statement_error(&e, &lock))?;
         trace.lock_wait = t.elapsed();
         let t = Instant::now();
         let from = read_position(&mut conn, gtid_mode, lineage_hash).await?;
@@ -1693,7 +1716,7 @@ pub(crate) async fn capture_with(
             Ok(Live::OtherLineage(who)) => {
                 return Err(ProofError::OtherServer(who));
             }
-            Err(e) => return Err(ProofError::Capture(e.to_string())),
+            Err(e) => return Err(source_statement_error(&e, "schema read")),
         };
         trace.schema = t.elapsed();
         if let Some(hook) = between {
@@ -1713,7 +1736,7 @@ pub(crate) async fn capture_with(
         }
         conn.query_drop("COMMIT")
             .await
-            .map_err(|e| ProofError::Capture(format!("COMMIT: {e}")))?;
+            .map_err(|e| statement_error(&e, "COMMIT"))?;
         // Unarmed first: a returned connection is never killed.
         guard.id = 0;
         conn.release().await;
@@ -1916,6 +1939,42 @@ const ER_LOCK_WAIT_TIMEOUT: u16 = 1205;
 const ER_LOCK_DEADLOCK: u16 = 1213;
 const ER_NO_SUCH_TABLE: u16 = 1146;
 
+/// A failed statement of a single capture, by its failure's class: lock
+/// contention, a connection failure (`Open`), or anything else the server
+/// answered (`Capture`).
+fn statement_error(e: &mysql_async::Error, what: &str) -> ProofError {
+    let why = format!("{what}: {e}");
+    match of_mysql(e) {
+        Failure::Contention(code) => ProofError::Contention { code, why },
+        class @ (Failure::Transport
+        | Failure::Authentication
+        | Failure::Authorization
+        | Failure::Protocol
+        | Failure::Retention) => ProofError::Open(class, why),
+        Failure::Absent | Failure::Other => ProofError::Capture(why),
+    }
+}
+
+/// [`statement_error`] for a step that reports a [`SourceError`]: classified
+/// by the MySQL error it carries, if any.
+fn source_statement_error(
+    e: &deltaforge_core::SourceError,
+    what: &str,
+) -> ProofError {
+    match e {
+        deltaforge_core::SourceError::Other(a) => {
+            match a
+                .chain()
+                .find_map(|c| c.downcast_ref::<mysql_async::Error>())
+            {
+                Some(m) => statement_error(m, what),
+                None => ProofError::Capture(format!("{what}: {e}")),
+            }
+        }
+        _ => ProofError::Capture(format!("{what}: {e}")),
+    }
+}
+
 fn server_code(e: &mysql_async::Error) -> Option<u16> {
     match e {
         mysql_async::Error::Server(s) => Some(s.code),
@@ -1956,8 +2015,8 @@ fn control_error(e: super::mysql_control::ControlError) -> ProofError {
             scope,
             why: e.to_string(),
         },
-        ControlError::Session(SessionError::Connect(why)) => {
-            ProofError::Open(format!("connect: {why}"))
+        ControlError::Session(SessionError::Connect(class, why)) => {
+            ProofError::Open(class, format!("connect: {why}"))
         }
         ControlError::Session(SessionError::OtherServer { found }) => {
             ProofError::OtherServer(format!("{found:?}"))
@@ -1971,7 +2030,7 @@ fn control_error(e: super::mysql_control::ControlError) -> ProofError {
 fn batch_error(e: mysql_async::Error, what: &str) -> BatchCaptureError {
     BatchCaptureError::Failed(match e {
         mysql_async::Error::Io(_) | mysql_async::Error::Driver(_) => {
-            ProofError::Open(format!("{what}: {e}"))
+            ProofError::Open(of_mysql(&e), format!("{what}: {e}"))
         }
         _ => ProofError::Capture(format!("{what}: {e}")),
     })
@@ -2393,10 +2452,17 @@ pub(crate) async fn capture_proven(
     let proven = async {
         let mut retries = Vec::new();
         for attempt in 1..=attempts.max(1) {
-            let mut cap =
-                capture(cx, server_uuid, lineage_hash, db, table, between)
-                    .await
-                    .map_err(|Cancelled| Ended::Stopped)??;
+            let mut cap = capture(
+                cx,
+                server_uuid,
+                lineage_hash,
+                db,
+                table,
+                between,
+                LOCK_WAIT,
+            )
+            .await
+            .map_err(|Cancelled| Ended::Stopped)??;
             cap.attempts = attempt;
             let report = match &shared {
                 Some(sp) => {
@@ -3968,6 +4034,7 @@ pub(crate) mod tests {
                         db,
                         "t",
                         None,
+                        LOCK_WAIT,
                     )
                     .await
                     .expect("not cancelled")
@@ -4037,6 +4104,7 @@ pub(crate) mod tests {
                             db,
                             "t",
                             Some(&hook),
+                            LOCK_WAIT,
                         )
                         .await
                         .map(|r| r.map(|_| ()).map_err(|e| format!("{e:?}")))
@@ -4335,7 +4403,7 @@ pub(crate) mod tests {
                                 release.acquire().await.unwrap().forget();
                             })
                         };
-                        capture_with(slots, &CaptureCtx::detached(d.as_str()), &u, LINEAGE, db, &format!("t{i}"), Some(&hook)).await.expect("not cancelled")
+                        capture_with(slots, &CaptureCtx::detached(d.as_str()), &u, LINEAGE, db, &format!("t{i}"), Some(&hook), LOCK_WAIT).await.expect("not cancelled")
                     }));
                 }
                 tokio::time::sleep(Duration::from_secs(3)).await;
@@ -5646,7 +5714,7 @@ pub(crate) mod tests {
             assert!(
                 matches!(
                     r,
-                    Err(ProofError::Open(_)) | Err(ProofError::Read(_))
+                    Err(ProofError::Open(..)) | Err(ProofError::Read(..))
                 ),
                 "{r:?}"
             );
@@ -6340,6 +6408,7 @@ pub(crate) mod tests {
                     db,
                     "t",
                     Some(&hook),
+                    LOCK_WAIT,
                 )
                 .await
                 .expect("not cancelled")
@@ -6580,7 +6649,7 @@ pub(crate) mod tests {
             assert!(
                 matches!(
                     r,
-                    Err(ProofError::Open(_)) | Err(ProofError::Read(_))
+                    Err(ProofError::Open(..)) | Err(ProofError::Read(..))
                 ),
                 "{r:?}"
             );
@@ -6622,6 +6691,7 @@ pub(crate) mod tests {
                 "cap_fail",
                 "t",
                 None,
+                LOCK_WAIT,
             )
             .await
             .expect("not cancelled");
@@ -6633,6 +6703,7 @@ pub(crate) mod tests {
                 "cap_fail",
                 "missing",
                 None,
+                LOCK_WAIT,
             )
             .await
             .expect("not cancelled");
@@ -6729,6 +6800,7 @@ pub(crate) mod tests {
                     db,
                     "t",
                     Some(&hook),
+                    LOCK_WAIT,
                 )
                 .await
                 .expect("not cancelled")
@@ -6822,6 +6894,7 @@ pub(crate) mod tests {
                 "cap_cover",
                 "t",
                 Some(&hook),
+                LOCK_WAIT,
             )
             .await
             .expect("not cancelled")

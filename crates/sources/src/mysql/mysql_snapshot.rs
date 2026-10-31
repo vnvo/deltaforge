@@ -300,7 +300,7 @@ async fn binlog_finding(
         .map_err(super::mysql_control::ControlError::into_session)
     {
         Ok(c) => c,
-        Err(super::mysql_session::SessionError::Connect(e)) => {
+        Err(super::mysql_session::SessionError::Connect(_, e)) => {
             warn!(error = %e, "snapshot guard: connect error, retrying");
             return Ok(GuardFinding::Ok);
         }

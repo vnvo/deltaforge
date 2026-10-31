@@ -34,8 +34,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use deltaforge_core::incident::{
-    ActionCode, CauseCode, Component, EvidenceKey, IncidentDraft, IncidentId,
-    ReasonCode, Retryability, SafetyState,
+    ActionCode, CauseCode, Component, Evidence, EvidenceKey, IncidentDraft,
+    IncidentId, ReasonCode, Retryability, SafetyState,
 };
 use metrics::{counter, gauge};
 use serde::{Deserialize, Serialize};
@@ -622,6 +622,20 @@ impl IncidentStore {
     /// and `auto_retry` (a stop that needs an operator is never withdrawn).
     /// Returns whether it was resolved.
     pub async fn cancel_auto_retry(&self, id: &IncidentId) -> Result<bool> {
+        self.cancel_auto_retry_with(id, &Evidence::new()).await
+    }
+
+    /// [`cancel_auto_retry`](Self::cancel_auto_retry), recording why the
+    /// retry ended: in the same conditional transition, `update`'s entries
+    /// replace theirs in the record's evidence and every other entry stays.
+    /// Nothing is read and written back outside the transition, so newer
+    /// evidence is never overwritten; a resolved or operator-action record
+    /// is left unchanged.
+    pub async fn cancel_auto_retry_with(
+        &self,
+        id: &IncidentId,
+        update: &Evidence,
+    ) -> Result<bool> {
         let rec = self
             .transition(id, |r| {
                 if r.status.is_resolved()
@@ -630,6 +644,7 @@ impl IncidentStore {
                     return None;
                 }
                 let mut next = r.clone();
+                next.evidence.overlay(update);
                 next.status = IncidentStatus::Resolved {
                     by: Resolution::OperationCancelled,
                     at_ms: now_ms(),
@@ -1474,6 +1489,65 @@ mod tests {
         let operator = id_of(&store, &draft(2)).await;
         assert!(!store.cancel_auto_retry(&operator).await.unwrap());
         assert!(store.get(&operator).await.unwrap().unwrap().is_blocking());
+    }
+
+    /// A withdrawal records its terminal entries in the same transition: the
+    /// given entries replace theirs, every other entry (the original
+    /// diagnostics) stays. Without entries, the evidence stays as stored.
+    /// An operator-action record is left exactly as it is.
+    #[tokio::test]
+    async fn a_withdrawal_updates_only_its_terminal_evidence() {
+        let store = IncidentStore::new(backend(), "p");
+        let mut retrying = draft(1);
+        retrying.retryability = Retryability::AutoRetry;
+        retrying
+            .evidence
+            .text(EvidenceKey::ReasonClass, "lock_wait_timeout");
+        retrying.evidence.count(EvidenceKey::Attempts, 1);
+        let id = id_of(&store, &retrying).await;
+        let mut update = deltaforge_core::incident::Evidence::new();
+        update
+            .text(EvidenceKey::ReasonClass, "ended_deferred")
+            .count(EvidenceKey::BlockingCount, 2);
+        assert!(store.cancel_auto_retry_with(&id, &update).await.unwrap());
+        let rec = store.get(&id).await.unwrap().unwrap();
+        assert!(matches!(
+            rec.status,
+            IncidentStatus::Resolved {
+                by: Resolution::OperationCancelled,
+                ..
+            }
+        ));
+        assert!(rec.evidence.holds(EvidenceKey::Slot, "s"), "original kept");
+        assert!(
+            rec.evidence
+                .holds(EvidenceKey::ReasonClass, "ended_deferred")
+        );
+        assert_eq!(
+            rec.evidence.get(EvidenceKey::BlockingCount),
+            Some(&deltaforge_core::incident::EvidenceValue::Count { value: 2 })
+        );
+        assert_eq!(
+            rec.evidence.get(EvidenceKey::Attempts),
+            Some(&deltaforge_core::incident::EvidenceValue::Count { value: 1 })
+        );
+
+        let mut plain = draft(3);
+        plain.retryability = Retryability::AutoRetry;
+        let id = id_of(&store, &plain).await;
+        let stored = store.get(&id).await.unwrap().unwrap().evidence;
+        assert!(store.cancel_auto_retry(&id).await.unwrap());
+        assert_eq!(store.get(&id).await.unwrap().unwrap().evidence, stored);
+
+        let operator = id_of(&store, &draft(2)).await;
+        let before = store.get(&operator).await.unwrap().unwrap();
+        assert!(
+            !store
+                .cancel_auto_retry_with(&operator, &update)
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.get(&operator).await.unwrap().unwrap(), before);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

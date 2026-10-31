@@ -109,7 +109,10 @@ impl ControlError {
     pub(crate) fn into_session(self) -> SessionError {
         match self {
             Self::Session(e) => e,
-            saturated => SessionError::Connect(saturated.to_string()),
+            saturated => SessionError::Connect(
+                crate::mysql::mysql_failure::Failure::Transport,
+                saturated.to_string(),
+            ),
         }
     }
 
@@ -870,13 +873,20 @@ impl ControlPool {
         wait: Duration,
     ) -> Result<ControlConn, ControlError> {
         self.checkout(class, UNVERIFIED, wait, |t| async move {
-            let opts = mysql_async::Opts::from_url(dsn)
-                .map_err(|e| SessionError::Connect(e.to_string()))?;
+            use crate::mysql::mysql_failure::{Failure, of_mysql};
+            let opts = mysql_async::Opts::from_url(dsn).map_err(|e| {
+                SessionError::Connect(Failure::Other, e.to_string())
+            })?;
             tokio::time::timeout(t, mysql_async::Conn::new(opts))
                 .await
-                .map_err(|_| SessionError::Connect("connect timed out".into()))?
+                .map_err(|_| {
+                    SessionError::Connect(
+                        Failure::Transport,
+                        "connect timed out".into(),
+                    )
+                })?
                 .map(MySqlLink)
-                .map_err(|e| SessionError::Connect(e.to_string()))
+                .map_err(|e| SessionError::Connect(of_mysql(&e), e.to_string()))
         })
         .await
     }
@@ -951,7 +961,10 @@ mod tests {
             let s = self.clone();
             move |_| {
                 std::future::ready(if s.fail.load(Ordering::SeqCst) {
-                    Err(SessionError::Connect("refused".into()))
+                    Err(SessionError::Connect(
+                        crate::mysql::mysql_failure::Failure::Transport,
+                        "refused".into(),
+                    ))
                 } else {
                     s.opened.fetch_add(1, Ordering::SeqCst);
                     Ok(Fake {

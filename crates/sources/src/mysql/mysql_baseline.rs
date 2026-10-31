@@ -814,6 +814,7 @@ async fn establish_per_table(
             &c.db,
             &c.table,
             None,
+            super::mysql_binlog_scan::LOCK_WAIT,
         )
         .await?
         {
@@ -1031,6 +1032,7 @@ pub(crate) async fn establish_at(
         db,
         table,
         None,
+        super::mysql_binlog_scan::LOCK_WAIT,
     )
     .await?
     {

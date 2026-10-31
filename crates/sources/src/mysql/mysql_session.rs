@@ -16,6 +16,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use deltaforge_core::SourceError;
+
+use super::mysql_failure::{Failure, of_binlog, of_mysql};
 use mysql_async::prelude::Queryable;
 use mysql_binlog_connector_rust::binlog_client::BinlogClient;
 use mysql_binlog_connector_rust::binlog_parser::BinlogParser;
@@ -30,8 +32,9 @@ pub(crate) enum SessionError {
     OtherServer { found: String },
     /// The connection's identity could not be established.
     NoIdentity(String),
-    /// Connecting or setting up the session failed (network, auth, server).
-    Connect(String),
+    /// Connecting or setting up the session failed (network, auth,
+    /// server), with the failure's class.
+    Connect(Failure, String),
 }
 
 impl SessionError {
@@ -52,7 +55,7 @@ impl SessionError {
                 )
                 .into(),
             },
-            Self::Connect(why) => SourceError::Connect {
+            Self::Connect(_, why) => SourceError::Connect {
                 details: why.into(),
             },
         }
@@ -146,13 +149,14 @@ async fn open_session(
     // production client sets it, and silently dropping it is not an option.
     if client.keepalive_idle_secs != 0 || client.keepalive_interval_secs != 0 {
         return Err(SessionError::Connect(
+            Failure::Other,
             "TCP keepalive is not supported on verified replication sessions"
                 .into(),
         ));
     }
     let connect =
         |e: mysql_binlog_connector_rust::binlog_error::BinlogError| {
-            SessionError::Connect(e.to_string())
+            SessionError::Connect(of_binlog(&e), e.to_string())
         };
     let timeout_secs = if client.timeout_secs > 0 {
         client.timeout_secs
@@ -166,9 +170,10 @@ async fn open_session(
         .map_err(connect)?;
     if abortive {
         channel.abort_on_drop().map_err(|e| {
-            SessionError::Connect(format!(
-                "cannot arm the session's abortive close: {e}"
-            ))
+            SessionError::Connect(
+                Failure::Other,
+                format!("cannot arm the session's abortive close: {e}"),
+            )
         })?;
     }
 
@@ -262,12 +267,17 @@ pub(crate) async fn open_control_connection(
     connect_timeout: Duration,
 ) -> Result<mysql_async::Conn, SessionError> {
     let opts = mysql_async::Opts::from_url(dsn)
-        .map_err(|e| SessionError::Connect(e.to_string()))?;
+        .map_err(|e| SessionError::Connect(Failure::Other, e.to_string()))?;
     let mut conn =
         tokio::time::timeout(connect_timeout, mysql_async::Conn::new(opts))
             .await
-            .map_err(|_| SessionError::Connect("connect timed out".into()))?
-            .map_err(|e| SessionError::Connect(e.to_string()))?;
+            .map_err(|_| {
+                SessionError::Connect(
+                    Failure::Transport,
+                    "connect timed out".into(),
+                )
+            })?
+            .map_err(|e| SessionError::Connect(of_mysql(&e), e.to_string()))?;
     if let Err(e) = verify_connection(&mut conn, expected_uuid).await {
         let _ = conn.disconnect().await;
         return Err(e);
@@ -310,7 +320,8 @@ mod tests {
             SourceError::Lineage { .. }
         ));
         assert!(matches!(
-            SessionError::Connect("x".into()).into_source_error(A),
+            SessionError::Connect(Failure::Other, "x".into())
+                .into_source_error(A),
             SourceError::Connect { .. }
         ));
     }

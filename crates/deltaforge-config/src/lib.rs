@@ -576,6 +576,43 @@ pub struct MysqlProofCfg {
     /// for captures, catalog reads, position queries and health checks,
     /// within the runner-wide `--max-mysql-control-connections`.
     pub control_connections: usize,
+    /// The bounds of a DDL's forward-proof retries. Fixed constants, never
+    /// read from configuration: a test sets them per run.
+    #[serde(skip)]
+    pub forward_proof_retry: ForwardProofRetry,
+}
+
+/// The bounds of a MySQL DDL's forward-proof retries
+/// (`docs/design/mysql-forward-proof-retry.md`, section 3.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardProofRetry {
+    /// Attempts in total.
+    pub attempts: u32,
+    /// From the start of the first attempt, over every attempt and backoff.
+    pub deadline: std::time::Duration,
+    /// The wait before each attempt after the first (the last repeats).
+    pub backoff: Vec<std::time::Duration>,
+    /// No capture starts with less than this left before the deadline.
+    pub min_capture: std::time::Duration,
+    /// A capture's longest lock wait (less when less is left).
+    pub lock_wait: std::time::Duration,
+}
+
+impl Default for ForwardProofRetry {
+    fn default() -> Self {
+        use std::time::Duration;
+        Self {
+            attempts: 4,
+            deadline: Duration::from_secs(120),
+            backoff: vec![
+                Duration::from_secs(1),
+                Duration::from_secs(4),
+                Duration::from_secs(16),
+            ],
+            min_capture: Duration::from_secs(1),
+            lock_wait: Duration::from_secs(30),
+        }
+    }
 }
 
 /// `activation_window_ms`: at least 1 (no window would mean a capture per
@@ -665,6 +702,7 @@ impl TryFrom<MysqlProofCfgRaw> for MysqlProofCfg {
                 r.control_connections,
                 &MYSQL_PROOF_CONTROL_CONNECTIONS,
             )?,
+            forward_proof_retry: ForwardProofRetry::default(),
         })
     }
 }
@@ -699,6 +737,7 @@ impl Default for MysqlProofCfg {
             max_seek_ms: Self::default_max_seek_ms(),
             capture_lock_wait_secs: Self::default_lock_wait_secs(),
             control_connections: Self::default_control_connections(),
+            forward_proof_retry: ForwardProofRetry::default(),
         }
     }
 }

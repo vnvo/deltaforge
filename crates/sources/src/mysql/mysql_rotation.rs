@@ -155,7 +155,7 @@ async fn preflight_on(
         }
         // Unreachable, saturated, or no uuid reported yet: transient,
         // retryable.
-        Err(SessionError::Connect(_) | SessionError::NoIdentity(_)) => {
+        Err(SessionError::Connect(..) | SessionError::NoIdentity(_)) => {
             return Err(RotationReject::PreflightFailed);
         }
     };
