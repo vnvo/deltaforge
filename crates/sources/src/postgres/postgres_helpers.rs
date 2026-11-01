@@ -1178,8 +1178,11 @@ pub(super) async fn ensure_slot_and_publication(
             .transpose()?
             .unwrap_or(get_current_wal_lsn(&client).await?)
     } else {
-        // Auto-create slot (safe - only requires REPLICATION privilege)
-        super::postgres_slot_owner::create_logical_slot(&client, slot)
+        // Auto-create slot (safe - only requires REPLICATION privilege). The
+        // capture boundary is the slot's consistent point: changes committed
+        // after it are decoded. A WAL position sampled afterwards could be
+        // later, and starting there would skip what committed in between.
+        let consistent_point = super::postgres_slot_owner::create_logical_slot(&client, slot)
             .await
             .map_err(|e| {
                 // The server's message (e.g. every replication slot in use),
@@ -1198,8 +1201,11 @@ pub(super) async fn ensure_slot_and_publication(
                 LoopControl::from_tokio_postgres_error(&e)
             })?;
 
-        info!(slot = %slot, "created replication slot");
-        get_current_wal_lsn(&client).await?
+        info!(slot = %slot, %consistent_point, "created replication slot");
+        Lsn::parse(&consistent_point).map_err(|e| {
+            error!(error = %e, lsn = %consistent_point, "failed to parse LSN");
+            LoopControl::Fail(SourceError::Other(e.into()))
+        })?
     };
 
     Ok(start_lsn)

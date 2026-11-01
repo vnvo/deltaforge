@@ -28,6 +28,12 @@ pub enum MySqlSourceError {
     #[error("source lineage error: {0}")]
     Lineage(String),
 
+    #[error("missing privilege: {0}")]
+    Permission(String),
+
+    #[error("incompatible server: {0}")]
+    Incompatible(String),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -58,6 +64,12 @@ impl From<MySqlSourceError> for SourceError {
                 details: msg.into(),
             },
             MySqlSourceError::Lineage(msg) => SourceError::Lineage {
+                details: msg.into(),
+            },
+            MySqlSourceError::Permission(msg) => SourceError::Permission {
+                details: msg.into(),
+            },
+            MySqlSourceError::Incompatible(msg) => SourceError::Incompatible {
                 details: msg.into(),
             },
             MySqlSourceError::Io(e) => SourceError::Io(e),

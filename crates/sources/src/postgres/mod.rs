@@ -22,8 +22,8 @@ use deltaforge_core::incident::{
     ReasonCode, Retryability, SafetyState,
 };
 use deltaforge_core::{
-    CheckpointOrder, Source, SourceError, SourceHandle, SourceItem,
-    SourceResult,
+    CaptureOrigin, CaptureStart, CheckpointOrder, Source, SourceError,
+    SourceHandle, SourceItem, SourceResult,
 };
 use storage::adapters::incidents::IncidentStore;
 
@@ -1379,13 +1379,8 @@ impl PostgresSource {
         crate::snapshot_probe::after_terminal().await;
 
         // 9. Completion, in the background, once the frozen policy's
-        // frontier covers the terminal.
-        crate::snapshot_driver::spawn_completion_watch(
-            inputs.clone(),
-            self.incidents(),
-            Arc::clone(&self.snapshot_cohort),
-            cancel.clone(),
-        );
+        // frontier covers the terminal: spawned by the run once its stream
+        // start is durable (`run_inner`).
         Ok(anchor_lsn)
     }
 }
@@ -1474,6 +1469,7 @@ impl PostgresSource {
         paused: Arc<AtomicBool>,
         pause_notify: Arc<Notify>,
         ready: deltaforge_core::SourceReady,
+        boundary: deltaforge_core::CaptureBoundary,
     ) -> SourceResult<()> {
         // Verify the physical lineage (cluster system_identifier + database OID)
         // and establish the schema-registry scope BEFORE any registry access:
@@ -1514,6 +1510,10 @@ impl PostgresSource {
                 .or(*completed_anchor),
         };
 
+        crate::stream_probe::before_capture_boundary().await;
+        // A first start's capture boundary is the slot's consistent point:
+        // the slot holds it durably on the server, so a retry or restart
+        // before the start checkpoint exists starts there again.
         let start_lsn = if let Some(resume) = resume {
             // Resuming from a checkpoint: the saved LSN is trusted only once
             // the slot is verified to hold it. Fails closed: replication never
@@ -1586,6 +1586,13 @@ impl PostgresSource {
                 }
             }
         };
+        if crate::stream_probe::take_fail_after_capture_boundary() {
+            return Err(SourceError::Connect {
+                details: "stream open failed after the capture boundary was \
+                          established (test seam)"
+                    .into(),
+            });
+        }
 
         // Complete rows, before anything is snapshotted or streamed: a sink of
         // the pipeline needs every value, so every captured table with
@@ -1627,6 +1634,7 @@ impl PostgresSource {
             },
         )
         .await?;
+        let maintenance = admitted.abandon_to.is_some();
         let start_lsn = admitted.abandon_to.map(Lsn::from).unwrap_or(start_lsn);
 
         let schema_loader = PostgresSchemaLoader::new(
@@ -1849,6 +1857,42 @@ impl PostgresSource {
                 .into(),
             })?;
 
+        // The capture boundary: durable (the slot, and the start checkpoint
+        // for every sink). A generation's anchor is published only once the
+        // generation is durably completed; until then a failure replaces it.
+        let capture_start = CaptureStart::Postgres {
+            origin: if needs_snapshot {
+                CaptureOrigin::Snapshot
+            } else if maintenance {
+                CaptureOrigin::Maintenance
+            } else if last_checkpoint.is_some() {
+                CaptureOrigin::Resume
+            } else if resume.is_some() {
+                CaptureOrigin::Snapshot
+            } else {
+                CaptureOrigin::FirstStart
+            },
+            lineage: self
+                .registry_scope
+                .current()
+                .ok()
+                .map(|s| s.lineage().lineage_hash.clone()),
+            system_identifier,
+            slot: self.slot.clone(),
+            lsn: start_lsn.to_string(),
+        };
+        if needs_snapshot {
+            crate::snapshot_driver::spawn_completion_watch(
+                generation_inputs
+                    .clone()
+                    .expect("a generation has its inputs"),
+                self.incidents(),
+                Arc::clone(&self.snapshot_cohort),
+                ctx.cancel.clone(),
+                (boundary.clone(), capture_start.clone()),
+            );
+        }
+
         // Controlled credential rotation (opt-in, file-backed credentials only).
         // The runtime owns the watcher/manager task (a child of the source cancel
         // token); it is cancelled and joined after the loop on every exit path
@@ -1871,6 +1915,11 @@ impl PostgresSource {
         // Startup checks passed and the stream is open on the verified
         // server: the source half of the verified-running barrier.
         ready.mark();
+        // A stream start's boundary is durable and its stream open: the
+        // pipeline may report running. No data event is awaited.
+        if !needs_snapshot {
+            boundary.publish(capture_start);
+        }
         info!("entering replication loop");
         // Durable delivery frontier (separate from `ctx.last_lsn`, the read position):
         // the acknowledged LSN reported to PostgreSQL as flushed, sourced only from the
@@ -2686,6 +2735,8 @@ impl Source for PostgresSource {
         let pause_notify_for_task = pause_notify.clone();
         let ready = deltaforge_core::SourceReady::new();
         let ready_for_task = ready.clone();
+        let boundary = deltaforge_core::CaptureBoundary::new();
+        let boundary_for_task = boundary.clone();
 
         let join = tokio::spawn(async move {
             let res = this
@@ -2696,6 +2747,7 @@ impl Source for PostgresSource {
                     paused_for_task,
                     pause_notify_for_task,
                     ready_for_task,
+                    boundary_for_task,
                 )
                 .await;
             if let Err(e) = &res {
@@ -2710,6 +2762,7 @@ impl Source for PostgresSource {
             pause_notify,
             join,
             ready,
+            boundary,
         }
     }
 

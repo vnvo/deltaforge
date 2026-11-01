@@ -196,6 +196,7 @@ mod tests {
         PipeInfo {
             name: "demo".to_string(),
             status: "running".to_string(),
+            capture_start: None,
             spec: deltaforge_config::PipelineSpec {
                 metadata: Metadata {
                     name: "demo".to_string(),
@@ -569,6 +570,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(StatusCode::OK, resp.status());
+    }
+
+    /// A starting pipeline (capture boundary not yet published) holds
+    /// readiness back and is named; paused and stopped ones do not.
+    #[tokio::test]
+    async fn ready_returns_503_while_a_pipeline_is_starting() {
+        let ready = |status: &str| {
+            let mut info = sample_pipe_info();
+            info.status = status.to_string();
+            router(AppState {
+                controller: Arc::new(HappyController { info }),
+            })
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+        let resp = ready("starting").await.unwrap();
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, resp.status());
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["starting_pipelines"], json!(["demo"]));
+        assert_eq!(v["blocked_pipelines"][0]["status"], "starting");
+        for status in ["paused", "stopped", "running"] {
+            assert_eq!(
+                StatusCode::OK,
+                ready(status).await.unwrap().status(),
+                "{status}"
+            );
+        }
     }
 
     #[tokio::test]

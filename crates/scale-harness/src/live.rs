@@ -409,7 +409,8 @@ async fn prepare(
             for q in [
                 "CREATE DATABASE app",
                 "CREATE USER 'df'@'%' IDENTIFIED BY 'dfpw'",
-                "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'df'@'%'",
+                "GRANT REPLICATION SLAVE, REPLICATION CLIENT, BACKUP_ADMIN ON *.* TO 'df'@'%'",
+                "GRANT SELECT ON performance_schema.log_status TO 'df'@'%'",
                 "GRANT SELECT ON app.* TO 'df'@'%'",
                 "FLUSH PRIVILEGES",
                 "CREATE TABLE app.app_events (id BIGINT PRIMARY KEY, v VARCHAR(64))",

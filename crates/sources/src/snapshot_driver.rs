@@ -1873,11 +1873,19 @@ impl<E: EngineOrder> GenerationInputs<E> {
 /// generation's terminal (design section 6.2), then report the sinks behind
 /// it and leave them out of the resume fold. Ends with the source, or on
 /// anything but `rows_produced`.
+///
+/// Durable completion is when the generation's anchor becomes the run's
+/// capture boundary (`docs/design/startup-capture-boundary.md`): before it, a
+/// failed run replaces the generation, so `capture` is published only then.
 pub fn spawn_completion_watch<E>(
     inputs: GenerationInputs<E>,
     incidents: storage::adapters::incidents::IncidentStore,
     shared: crate::SnapshotCohortSlot,
     cancel: tokio_util::sync::CancellationToken,
+    capture: (
+        deltaforge_core::CaptureBoundary,
+        deltaforge_core::CaptureStart,
+    ),
 ) where
     E: EngineOrder + Clone + Send + Sync + 'static,
     E::Anchor: Send + Sync,
@@ -1899,6 +1907,7 @@ pub fn spawn_completion_watch<E>(
                                 generation = done.generation,
                                 "snapshot generation completed"
                             );
+                            capture.0.publish(capture.1.clone());
                             let behind = lagging(&input, &done)
                                 .await
                                 .unwrap_or_default();

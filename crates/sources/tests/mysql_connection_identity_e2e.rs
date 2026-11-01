@@ -1545,8 +1545,8 @@ async fn replication_user(ports: &[u16], user: &str) {
                 format!("DROP USER IF EXISTS '{user}'@'%'"),
                 format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'pw_{user}'"),
                 format!(
-                    "GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* \
-                     TO '{user}'@'%'"
+                    "GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT, \
+                     BACKUP_ADMIN ON *.* TO '{user}'@'%'"
                 ),
             ],
         )

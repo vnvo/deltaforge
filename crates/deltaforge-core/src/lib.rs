@@ -22,6 +22,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+pub mod capture;
+pub use capture::{CaptureBoundary, CaptureOrigin, CaptureStart};
 pub mod encoding;
 pub mod envelope;
 pub mod errors;
@@ -950,6 +952,9 @@ pub struct SourceHandle {
     pub join: JoinHandle<SourceResult<()>>,
     /// Marked when the source's startup checks passed and its stream is open.
     pub ready: SourceReady,
+    /// Published once this run's capture boundary is fixed and protected
+    /// against start-up retries; the pipeline is `running` only after it.
+    pub boundary: CaptureBoundary,
 }
 
 impl SourceHandle {
