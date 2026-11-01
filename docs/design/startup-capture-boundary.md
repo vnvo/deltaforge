@@ -43,7 +43,7 @@ A source becomes ready at the published point above whether or not any data arri
 - **Status** (`PipeInfo.status`): `starting` while the operator intent is run and the current runtime's boundary is not yet published; then `running`. `paused`, `stopped`, `deleting` and `failed` are unchanged; `failed` wins over every other state. A pipeline paused while starting reports `paused` and returns to `starting` or `running` on resume.
 - **Gauge** `deltaforge_pipeline_status`: `1` running, `0.25` starting, `0.5` paused, `0` stopped, `-1` failed. It moves to `1` only when the current runtime publishes its boundary.
 - **`/ready`**: `503` while any pipeline is failed, has a blocking incident, has a pending recovery, or is `starting`; `200` otherwise. Paused and stopped pipelines do not hold readiness back (they are operator intent). The body lists the pipelines holding it back with their status. A snapshot-mode pipeline is `starting` until its generation completes, so `/ready` stays `503` for that whole time.
-- **Liveness** `/health`: unchanged (process alive).
+- **Liveness** `/health`: unchanged (process alive). In Kubernetes a `503` from `/ready` removes the pod from the Service's endpoints (for the whole of an initial snapshot) and never restarts it; the chart has no startup probe, and its liveness probe stays on `/health` (`helm_probe_config`).
 
 ## 4. `capture_start`
 
@@ -65,6 +65,8 @@ Meaning: changes to the pipeline's configured tables committed after this positi
 Verified on 8.4.9 under 4 concurrent writers (evidence `mysql-log-status-verification-20261101`): `log_status` 0/400 inconsistent pairs; `SHOW BINARY LOG STATUS` 394/400 (position up to 4 transactions past its own GTID set); GTID off: `gtid_executed` is `""` and 400/400 positions fall on transaction boundaries.
 
 Privileges, needed only at a first start without a checkpoint: `BACKUP_ADMIN` and `SELECT ON performance_schema.log_status`. Without them the source stops with a typed error naming both (MySQL errors 1227 and 1142); there is no fallback. The server UUID must match the verified server.
+
+Outstanding qualification: the consistency and privilege behaviour are verified on MySQL 8.4.9 only. Other supported versions and managed services (whether `BACKUP_ADMIN` and `performance_schema.log_status` are available to the CDC user) remain to be qualified.
 
 ## 6. Lifecycle
 

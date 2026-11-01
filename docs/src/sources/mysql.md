@@ -259,7 +259,14 @@ DeltaForge automatically checkpoints progress and resumes from the last position
 
 1. **GTID**: Preferred if the MySQL server has GTID enabled. Provides the most reliable resume across binlog rotations and failovers.
 2. **File:position**: Used when GTID is not available. Resumes from the exact binlog file and byte offset.
-3. **Capture boundary**: On first run with no checkpoint and no snapshot, the source reads the binlog position and executed GTID set together in one `performance_schema.log_status` query (MySQL documents them as consistent with each other) and persists it before the stream opens. The pipeline reports `running` only after that, with the position as `capture_start`: changes committed after it are captured, earlier ones are not (no historical replay). Every retry and restart resumes from it, never from a newer tail. Reading it needs `BACKUP_ADMIN` and `SELECT` on `performance_schema.log_status`; without them the start fails closed with a permission error, with no fallback.
+3. **Capture boundary**: On first run with no checkpoint and no snapshot, the source reads the binlog position and executed GTID set together in one `performance_schema.log_status` query (MySQL documents them as consistent with each other) and persists it before the stream opens. The pipeline reports `running` only after that, with the position as `capture_start`: changes committed after it are captured, earlier ones are not (no historical replay). Every retry and restart resumes from it, never from a newer tail. Reading it needs `BACKUP_ADMIN` and `SELECT` on `performance_schema.log_status` (both, only for this first start; a start with a checkpoint or a snapshot does not read it); without them the start fails closed with a permission error naming both grants, with no fallback:
+
+```sql
+GRANT BACKUP_ADMIN ON *.* TO 'deltaforge'@'%';
+GRANT SELECT ON performance_schema.log_status TO 'deltaforge'@'%';
+```
+
+`performance_schema.log_status` exists from MySQL 8.0.14. The requirement is validated on MySQL 8.4 only; other versions and managed services (where `BACKUP_ADMIN` may not be grantable) are not yet qualified.
 
 Checkpoints are stored using the `id` field as the key.
 

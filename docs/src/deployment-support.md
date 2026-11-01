@@ -119,7 +119,7 @@ Schema history written by earlier releases is kept but not used automatically: a
 ### MySQL
 
 - `REPLICATION SLAVE, REPLICATION CLIENT ON *.*` (always).
-- `BACKUP_ADMIN ON *.*` and `SELECT ON performance_schema.log_status` for a first start without a checkpoint and without a snapshot: the capture boundary (binlog position and GTID set) is read there in one consistent query. Without them that start fails closed.
+- `BACKUP_ADMIN ON *.*` and `SELECT ON performance_schema.log_status` for a first start without a checkpoint and without a snapshot: the capture boundary (binlog position and GTID set) is read there in one consistent query. Without them that start fails closed. Validated on MySQL 8.4; managed services are not yet qualified for these grants.
 - `SELECT, SHOW VIEW` on the captured database(s) for reads and introspection.
 - `RELOAD ON *.*` **only when an initial snapshot runs** (needed for the brief `FLUSH TABLES WITH READ LOCK` that anchors the snapshot). A CDC-only pipeline (`snapshot.mode = never`) does not need `RELOAD`.
 - Server settings enforced fail-closed at snapshot preflight: `gtid_mode = ON`, `enforce_gtid_consistency = ON`, `binlog_format = ROW`, and captured tables on InnoDB. `binlog_row_image = FULL` is recommended.

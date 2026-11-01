@@ -35,7 +35,7 @@ Liveness only: returns `200` while the process and its API are running, and repo
 GET /ready
 ```
 
-Use for Kubernetes readiness probes. Returns `503` while any pipeline has failed, carries a blocking incident that is open or only acknowledged (acknowledging an incident does not clear it), has a pending recovery operation, or is `starting`, and names them (`starting_pipelines` lists the starting ones). Paused and stopped pipelines are operator intent and do not hold readiness back. A pipeline whose initial snapshot runs is `starting` until its snapshot generation completes, so `/ready` stays `503` for that whole time.
+Use for Kubernetes readiness probes. Returns `503` while any pipeline has failed, carries a blocking incident that is open or only acknowledged (acknowledging an incident does not clear it), has a pending recovery operation, or is `starting`, and names them (`starting_pipelines` lists the starting ones). Paused and stopped pipelines are operator intent and do not hold readiness back. A pipeline whose initial snapshot runs is `starting` until its snapshot generation completes, so `/ready` stays `503` for that whole time: in Kubernetes the pod is out of the Service's endpoints while it snapshots. Liveness (`/health`) stays `200`, so the pod is not restarted.
 
 **Response:** `503 Service Unavailable`
 ```json
