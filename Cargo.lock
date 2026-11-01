@@ -4994,6 +4994,7 @@ dependencies = [
  "axum",
  "chrono",
  "deltaforge-config",
+ "deltaforge-core",
  "parking_lot",
  "serde",
  "serde_json",

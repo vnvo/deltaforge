@@ -35,13 +35,14 @@ Liveness only: returns `200` while the process and its API are running, and repo
 GET /ready
 ```
 
-Use for Kubernetes readiness probes. Returns `503` while any pipeline has failed or carries a blocking incident that is open or only acknowledged (acknowledging an incident does not clear it), and names them with their incidents.
+Use for Kubernetes readiness probes. Returns `503` while any pipeline has failed, carries a blocking incident that is open or only acknowledged (acknowledging an incident does not clear it), has a pending recovery operation, or is `starting`, and names them (`starting_pipelines` lists the starting ones). Paused and stopped pipelines are operator intent and do not hold readiness back. A pipeline whose initial snapshot runs is `starting` until its snapshot generation completes, so `/ready` stays `503` for that whole time: in Kubernetes the pod is out of the Service's endpoints while it snapshots. Liveness (`/health`) stays `200`, so the pod is not restarted.
 
 **Response:** `503 Service Unavailable`
 ```json
 {
   "status": "not_ready",
   "failed_pipelines": ["orders-cdc"],
+  "starting_pipelines": [],
   "blocked_pipelines": [
     {
       "name": "orders-cdc",
@@ -107,6 +108,16 @@ GET /pipelines/{name}
 ```
 
 Returns a single pipeline by name with operational status.
+
+`status` is `starting`, `running`, `paused`, `stopped`, `deleting` or `failed`. A started pipeline is `starting` until its current run's capture boundary is fixed and durable, then `running`, and `capture_start` names that boundary: changes to the configured tables committed after it are captured. It says nothing about delivery latency, tables excluded by configuration, or delivery while paused. Its `origin` is `first_start` (no checkpoint, no snapshot: the server's position when it was read), `resume` (the committed resume position), `snapshot` (a snapshot generation's anchor, once the generation is durably completed) or `maintenance` (a PostgreSQL resume moved by a recorded publication maintenance decision). A restart reports `starting` again until its run publishes its boundary. See [design](../design/startup-capture-boundary.md).
+
+```json
+"capture_start": {"source": "mysql", "origin": "first_start", "lineage": "…",
+                  "server_uuid": "…", "file": "mysql-bin.000007", "pos": 685,
+                  "gtid_set": "…:1-721031"}
+"capture_start": {"source": "postgres", "origin": "resume", "lineage": "…",
+                  "system_identifier": 7412…, "slot": "df_slot", "lsn": "0/16B3780"}
+```
 
 **Response:** `200 OK`
 ```json

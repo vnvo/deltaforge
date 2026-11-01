@@ -73,6 +73,7 @@ parallel   runner/metric_cardinality_e2e    -p runner --test metric_cardinality_
 # The fleet qualification harness's own machinery, at toy scale.
 parallel   fleet-harness/harness_smoke      -p fleet-harness --test harness_smoke
 parallel   fleet-harness/run_identity       -p fleet-harness --test run_identity
+parallel   runner/capture_boundary_e2e        -p runner --test capture_boundary_e2e
 parallel   runner/snapshot_restart_e2e        -p runner --test snapshot_restart_e2e
 parallel   runner/publication_contract_e2e  -p runner --test publication_contract_e2e
 parallel   runner/kafka_outage_restart_e2e  -p runner --test kafka_outage_restart_e2e

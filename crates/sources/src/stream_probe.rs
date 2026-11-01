@@ -67,6 +67,51 @@ pub(crate) async fn after_slot_proof() {
 }
 
 // ---------------------------------------------------------------------------
+// Start-up capture boundary (`docs/design/startup-capture-boundary.md`): a
+// hold just before a source fixes its boundary, and a failure just after the
+// boundary is durable and before the stream opens. One-shot, process-wide:
+// suites arming them run one pipeline at a time.
+// ---------------------------------------------------------------------------
+
+/// One armed hold before a source fixes its capture boundary:
+/// `(reached, release)`.
+static BEFORE_BOUNDARY: Mutex<Option<(Arc<Notify>, Arc<Notify>)>> =
+    Mutex::new(None);
+
+/// Arm a one-shot hold in the real start path: the next source start
+/// notifies `reached` just before it fixes its capture boundary (MySQL: the
+/// boundary read or the resume decision; PostgreSQL: the slot), then waits
+/// for `release`. Returns `(reached, release)`.
+pub fn hold_before_capture_boundary() -> (Arc<Notify>, Arc<Notify>) {
+    let gate = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    *BEFORE_BOUNDARY.lock().expect("boundary hold") = Some(gate.clone());
+    gate
+}
+
+/// The hold point; a no-op unless a test armed it.
+pub(crate) async fn before_capture_boundary() {
+    let gate = BEFORE_BOUNDARY.lock().expect("boundary hold").take();
+    if let Some((reached, release)) = gate {
+        reached.notify_one();
+        release.notified().await;
+    }
+}
+
+static FAIL_AFTER_BOUNDARY: AtomicBool = AtomicBool::new(false);
+
+/// Arm a one-shot failure: the next source start fails as a lost connection
+/// right after its capture boundary is durable (MySQL: the start checkpoint
+/// is persisted; PostgreSQL: the slot exists), before its stream opens.
+pub fn fail_after_capture_boundary() {
+    FAIL_AFTER_BOUNDARY.store(true, Ordering::SeqCst);
+}
+
+/// Whether the armed failure fires here (consumed).
+pub(crate) fn take_fail_after_capture_boundary() -> bool {
+    FAIL_AFTER_BOUNDARY.swap(false, Ordering::SeqCst)
+}
+
+// ---------------------------------------------------------------------------
 // Binlog event-boundary hooks (MySQL): after the Nth event of a kind, hold
 // the source there (to kill its connection or apply backpressure for real)
 // or make its next read fail as a dropped connection. Disarmed: one atomic

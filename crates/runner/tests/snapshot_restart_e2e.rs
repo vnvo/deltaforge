@@ -440,8 +440,9 @@ async fn start_mysql() -> (ContainerAsync<GenericImage>, u16) {
     for sql in [
         "CREATE DATABASE shop".to_string(),
         "CREATE USER 'df'@'%' IDENTIFIED BY 'dfpw'".to_string(),
-        "GRANT REPLICATION SLAVE, REPLICATION CLIENT, RELOAD ON *.* TO 'df'@'%'"
+        "GRANT REPLICATION SLAVE, REPLICATION CLIENT, RELOAD, BACKUP_ADMIN ON *.* TO 'df'@'%'"
             .to_string(),
+        "GRANT SELECT ON performance_schema.log_status TO 'df'@'%'".to_string(),
         "GRANT SELECT ON shop.* TO 'df'@'%'".to_string(),
         "CREATE TABLE shop.orders (id INT PRIMARY KEY, sku VARCHAR(64))"
             .to_string(),

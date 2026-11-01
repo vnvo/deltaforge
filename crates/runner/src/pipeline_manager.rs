@@ -786,15 +786,39 @@ impl PipelineRuntime {
         self.status != PipelineStatus::Deleting && self.health.is_failed()
     }
 
-    pub(crate) fn info(&self) -> PipeInfo {
-        let status = if self.is_failed() {
+    /// This run's capture boundary, once its source published it
+    /// (`docs/design/startup-capture-boundary.md`).
+    pub(crate) fn capture_start(
+        &self,
+    ) -> Option<deltaforge_core::CaptureStart> {
+        self.sources.first().and_then(|s| s.boundary.get().cloned())
+    }
+
+    /// The status reported by the API: `failed` wins; an operator intent to
+    /// run is `starting` until the current run publishes its capture
+    /// boundary, then `running`.
+    pub(crate) fn status_str(&self) -> &'static str {
+        if self.is_failed() {
             "failed"
+        } else if self.status == PipelineStatus::Running
+            && self.capture_start().is_none()
+        {
+            "starting"
         } else {
             self.status.as_str()
-        };
+        }
+    }
+
+    /// `deltaforge_pipeline_status` for [`Self::status_str`].
+    pub(crate) fn status_gauge(&self) -> f64 {
+        status_gauge_value(self.status_str())
+    }
+
+    pub(crate) fn info(&self) -> PipeInfo {
         PipeInfo {
             name: self.spec.metadata.name.clone(),
-            status: status.to_string(),
+            status: self.status_str().to_string(),
+            capture_start: self.capture_start(),
             // PipeInfo holds the real spec; its serialization is sanitized at the
             // boundary (see PipeInfo's serialize_with), so status/API output never
             // exposes an inline DSN password.
@@ -803,6 +827,51 @@ impl PipelineRuntime {
             incidents: None, // populated async by the controller
             recovery: None,  // populated async by the controller
         }
+    }
+}
+
+/// Publish `name`'s status gauge on behalf of `run` (a run's capture
+/// boundary is its identity): the value is computed from the runtime's
+/// current state and handed to `set` inside the manager's exclusive lock,
+/// and only while `run` is the pipeline's current run. Every writer acting
+/// for a run (its boundary watcher, its source and coordinator monitors,
+/// registration, the operator's lifecycle calls) holds this lock while it
+/// computes and sets, and a failure transition completes before its writer
+/// takes the lock, so the last write is computed after every earlier
+/// transition: a value read while the run looked healthy can never be
+/// published after its failure, and an old run never writes its
+/// replacement's gauge. Returns the value set, if any.
+pub(crate) fn publish_run_status(
+    pipelines: &RwLock<HashMap<String, PipelineRuntime>>,
+    name: &str,
+    run: &deltaforge_core::CaptureBoundary,
+    set: impl FnOnce(f64),
+) -> Option<f64> {
+    let guard = pipelines.write();
+    let v = guard
+        .get(name)
+        .filter(|rt| {
+            rt.sources.first().is_some_and(|s| s.boundary.same_run(run))
+        })
+        .map(PipelineRuntime::status_gauge)?;
+    set(v);
+    Some(v)
+}
+
+/// Set `name`'s status gauge to `v`.
+fn set_status_gauge(name: &str, v: f64) {
+    gauge!("deltaforge_pipeline_status", "pipeline" => name.to_string()).set(v);
+}
+
+/// `deltaforge_pipeline_status` per reported status: 1 running, 0.25
+/// starting, 0.5 paused, 0 stopped (or deleting), -1 failed.
+pub(crate) fn status_gauge_value(status: &str) -> f64 {
+    match status {
+        "running" => 1.0,
+        "starting" => 0.25,
+        "paused" => 0.5,
+        "failed" => -1.0,
+        _ => 0.0,
     }
 }
 
@@ -861,6 +930,27 @@ pub struct PipelineManager {
 }
 
 impl PipelineManager {
+    /// Register `runtime` as `name`'s runtime and set its status gauge under
+    /// the same lock the boundary watcher reads, so whichever of the two
+    /// runs last leaves the gauge matching the reported status.
+    fn register(&self, name: String, runtime: PipelineRuntime) -> PipeInfo {
+        let mut guard = self.pipelines.write();
+        set_status_gauge(&name, runtime.status_gauge());
+        let info = runtime.info();
+        guard.insert(name, runtime);
+        info
+    }
+
+    /// Set `name`'s status gauge from its current runtime (0 without one),
+    /// under the lock every run-scoped writer uses ([`publish_run_status`]).
+    fn refresh_status_gauge(&self, name: &str) {
+        let guard = self.pipelines.write();
+        set_status_gauge(
+            name,
+            guard.get(name).map_or(0.0, PipelineRuntime::status_gauge),
+        );
+    }
+
     /// Get the DLQ writer for a pipeline. Clones the Arc so the RwLock guard
     /// is released before any async calls.
     fn get_dlq_writer(
@@ -1180,7 +1270,13 @@ impl PipelineManager {
             pause_notify: src_pause_notify,
             join: raw_join,
             ready: src_ready,
+            boundary: src_boundary,
         } = src_handle;
+        let (pipelines_for_src, run_for_src, name_for_src) = (
+            Arc::clone(&self.pipelines),
+            src_boundary.clone(),
+            pipeline_name.clone(),
+        );
         let monitored_join = tokio::spawn(async move {
             let res = raw_join.await;
             let exit = if cancel_for_src.is_cancelled() {
@@ -1202,7 +1298,14 @@ impl PipelineManager {
                     ),
                 })
             };
+            // The transition first, then the gauge, computed from it.
             health_for_src.exit(crate::incidents::Task::Source, exit);
+            publish_run_status(
+                &pipelines_for_src,
+                &name_for_src,
+                &run_for_src,
+                |v| set_status_gauge(&name_for_src, v),
+            );
             match res {
                 Ok(r) => r,
                 Err(e) => Err(SourceError::Other(anyhow::anyhow!(
@@ -1225,12 +1328,32 @@ impl PipelineManager {
                 }
             });
         }
+        // The capture boundary: once this run's source publishes it, the
+        // pipeline reports running. Applied only to the runtime this run
+        // belongs to (pointer identity), so a late publication from a
+        // stopped, failed or replaced run never marks its replacement.
+        {
+            let pipelines = Arc::clone(&self.pipelines);
+            let boundary = src_boundary.clone();
+            let cancel = cancel.clone();
+            let name = pipeline_name.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = boundary.wait() => {}
+                    _ = cancel.cancelled() => return,
+                }
+                publish_run_status(&pipelines, &name, &boundary, |v| {
+                    set_status_gauge(&name, v)
+                });
+            });
+        }
         let src_handle = SourceHandle {
             cancel: src_cancel,
             paused: src_paused,
             pause_notify: src_pause_notify,
             join: monitored_join,
             ready: src_ready,
+            boundary: src_boundary,
         };
 
         // Keep a processor handle + a by-id sink map for the replay delivery, which runs
@@ -1526,6 +1649,8 @@ impl PipelineManager {
         let pname = pipeline_name.clone();
 
         let health_for_task = Arc::clone(&health);
+        let (pipelines_for_coord, run_for_coord) =
+            (Arc::clone(&self.pipelines), src_handle.boundary.clone());
 
         let join = tokio::spawn(async move {
             let result = coord.run(event_rx, cancel_for_task, pause_rx).await;
@@ -1538,8 +1663,6 @@ impl PipelineManager {
                 &result,
                 cancel_check.is_cancelled(),
             ) {
-                gauge!("deltaforge_pipeline_status", "pipeline" => pname.clone())
-                    .set(-1.0);
                 match &result {
                     Err(e) => crate::incidents::TaskExit::Failed(
                         crate::incidents::classify_coordinator_exit(
@@ -1554,13 +1677,20 @@ impl PipelineManager {
             } else {
                 crate::incidents::TaskExit::Clean
             };
+            // The transition first, then the gauge, computed from it.
             health_for_task.exit(crate::incidents::Task::Coordinator, exit);
+            publish_run_status(
+                &pipelines_for_coord,
+                &pname,
+                &run_for_coord,
+                |v| set_status_gauge(&pname, v),
+            );
             info!(pipeline = %pname, "pipeline coordinator exited");
             result
         });
 
-        gauge!("deltaforge_pipeline_status", "pipeline" => pipeline_name.clone())
-            .set(1.0);
+        // The status gauge is set when the runtime is registered (`register`),
+        // under the lock every writer for this run uses.
 
         // Resume an in-flight replay job across a restart: if the durable job is still
         // active, spawn a controller to drive it to completion (the startup barrier above
@@ -1656,9 +1786,7 @@ impl PipelineManager {
         // A pipeline with an unfinished recovery operation is registered
         // stopped and never started (`docs/design/recovery-cli.md`).
         if let Some(held) = self.held_for_recovery(&spec).await? {
-            let info = held.info();
-            self.pipelines.write().insert(name, held);
-            return Ok(info);
+            return Ok(self.register(name, held));
         }
 
         // Reject impossible commit-policy configurations up front (e.g. a
@@ -1705,9 +1833,7 @@ impl PipelineManager {
                 return Err(PipelineAPIError::Failed(e));
             }
         };
-        let info = runtime.info();
-        self.pipelines.write().insert(name, runtime);
-        Ok(info)
+        Ok(self.register(name, runtime))
     }
 
     /// Claim `source_id` for `pipeline_name` before the pipeline starts.
@@ -1863,8 +1989,7 @@ impl PipelineManager {
         for src in sources {
             let _ = src.join.await;
         }
-        gauge!("deltaforge_pipeline_status", "pipeline" => name.to_string())
-            .set(0.0);
+        self.refresh_status_gauge(name);
     }
 
     fn health_of(
@@ -2501,8 +2626,7 @@ impl PipelineController for PipelineManager {
             .get_mut(name)
             .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?;
         runtime.pause();
-        gauge!("deltaforge_pipeline_status", "pipeline" => name.to_string())
-            .set(0.5);
+        set_status_gauge(name, runtime.status_gauge());
         Ok(runtime.info())
     }
 
@@ -2561,8 +2685,7 @@ impl PipelineController for PipelineManager {
                     PipelineAPIError::NotFound(name.to_string())
                 })?;
                 runtime.resume();
-                gauge!("deltaforge_pipeline_status", "pipeline" => name.to_string())
-                    .set(1.0);
+                set_status_gauge(name, runtime.status_gauge());
                 Ok(runtime.info())
             }
             PipelineStatus::Stopped => {
@@ -2584,9 +2707,7 @@ impl PipelineController for PipelineManager {
                     .spawn_pipeline_carrying(spec, carried)
                     .await
                     .map_err(PipelineAPIError::Failed)?;
-                let info = new_runtime.info();
-                self.pipelines.write().insert(name.to_string(), new_runtime);
-                Ok(info)
+                Ok(self.register(name.to_string(), new_runtime))
             }
             PipelineStatus::Running => Ok(self
                 .pipelines
@@ -2642,8 +2763,7 @@ impl PipelineController for PipelineManager {
             runtime.info()
         };
 
-        gauge!("deltaforge_pipeline_status", "pipeline" => name.to_string())
-            .set(0.0);
+        self.refresh_status_gauge(name);
         Ok(info)
     }
 
@@ -3577,6 +3697,259 @@ mod tests {
             replay_controller: None,
             started_at: std::time::Instant::now(),
         }
+    }
+
+    /// A source handle of one run, its capture boundary `boundary`.
+    fn run_handle(boundary: deltaforge_core::CaptureBoundary) -> SourceHandle {
+        SourceHandle {
+            cancel: CancellationToken::new(),
+            paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pause_notify: Arc::new(tokio::sync::Notify::new()),
+            join: tokio::spawn(async { Ok(()) }),
+            ready: deltaforge_core::SourceReady::new(),
+            boundary,
+        }
+    }
+
+    fn mysql_start(pos: u64) -> deltaforge_core::CaptureStart {
+        deltaforge_core::CaptureStart::Mysql {
+            origin: deltaforge_core::CaptureOrigin::FirstStart,
+            lineage: None,
+            server_uuid: "u".into(),
+            file: "mysql-bin.000001".into(),
+            pos,
+            gtid_set: None,
+        }
+    }
+
+    /// `running` only once the current run published its boundary; paused
+    /// and failed win; the gauge follows the reported status.
+    #[tokio::test]
+    async fn a_pipeline_is_starting_until_its_run_publishes_its_boundary() {
+        let boundary = deltaforge_core::CaptureBoundary::new();
+        let mut rt = bare_runtime(sample_spec("p"), None);
+        rt.sources.push(run_handle(boundary.clone()));
+        assert_eq!(rt.info().status, "starting");
+        assert_eq!(rt.info().capture_start, None);
+        assert_eq!(rt.status_gauge(), 0.25);
+
+        rt.pause();
+        assert_eq!(rt.info().status, "paused");
+        assert_eq!(rt.status_gauge(), 0.5);
+        rt.resume();
+        assert_eq!(rt.info().status, "starting");
+
+        assert!(boundary.publish(mysql_start(4)));
+        assert_eq!(rt.info().status, "running");
+        assert_eq!(rt.info().capture_start, Some(mysql_start(4)));
+        assert_eq!(rt.status_gauge(), 1.0);
+    }
+
+    /// A manager over a memory store, with one registered run of `name`:
+    /// its boundary (identity) and health.
+    async fn manager_with_run(
+        name: &str,
+    ) -> (
+        Arc<PipelineManager>,
+        deltaforge_core::CaptureBoundary,
+        Arc<crate::incidents::PipelineHealth>,
+    ) {
+        let mgr = Arc::new(
+            PipelineManager::with_backend(Arc::new(
+                storage::MemoryStorageBackend::new(),
+            ))
+            .await
+            .unwrap(),
+        );
+        let (boundary, health) = replace_run(&mgr, name);
+        (mgr, boundary, health)
+    }
+
+    /// Register a new run of `name`, replacing any earlier one.
+    fn replace_run(
+        mgr: &PipelineManager,
+        name: &str,
+    ) -> (
+        deltaforge_core::CaptureBoundary,
+        Arc<crate::incidents::PipelineHealth>,
+    ) {
+        let boundary = deltaforge_core::CaptureBoundary::new();
+        let mut rt = bare_runtime(sample_spec(name), None);
+        rt.sources.push(run_handle(boundary.clone()));
+        let health = Arc::clone(&rt.health);
+        mgr.pipelines.write().insert(name.to_string(), rt);
+        (boundary, health)
+    }
+
+    /// The gauge values a run's writers set, in order.
+    #[derive(Clone, Default)]
+    struct Gauge(Arc<std::sync::Mutex<Vec<f64>>>);
+
+    impl Gauge {
+        fn set(&self) -> impl FnOnce(f64) + use<> {
+            let g = self.0.clone();
+            move |v| g.lock().unwrap().push(v)
+        }
+        fn last(&self) -> Option<f64> {
+            self.0.lock().unwrap().last().copied()
+        }
+        fn all(&self) -> Vec<f64> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// `/ready`'s status code, served by the real API router.
+    async fn ready_code(mgr: Arc<PipelineManager>) -> u16 {
+        let app = rest_api::router(rest_api::AppState { controller: mgr });
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/ready", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(l, app).await.ok();
+        });
+        reqwest::get(url).await.unwrap().status().as_u16()
+    }
+
+    fn source_failure() -> crate::incidents::TaskExit {
+        crate::incidents::TaskExit::Failed(
+            crate::incidents::classify_source_exit(
+                "src",
+                Err(&SourceError::Connect {
+                    details: "lost".into(),
+                }),
+                false,
+                0,
+            ),
+        )
+    }
+
+    fn coordinator_failure() -> crate::incidents::TaskExit {
+        crate::incidents::TaskExit::Failed(
+            crate::incidents::classify_coordinator_exit(
+                &anyhow::anyhow!("required sink failed"),
+                0,
+            ),
+        )
+    }
+
+    /// The reviewed race: the boundary watcher computes `running` while the
+    /// run is healthy and the run fails inside that critical section. The
+    /// failure's writer (another thread) can only publish after the
+    /// watcher, computing from the failed state; a late watcher computes
+    /// `failed` too. Gauge -1, API `failed`, `/ready` 503.
+    async fn a_failure_racing_the_boundary_leaves_the_run_failed(
+        task: crate::incidents::Task,
+        exit: fn() -> crate::incidents::TaskExit,
+    ) {
+        let (mgr, run, health) = manager_with_run("p").await;
+        assert!(run.publish(mysql_start(4)));
+        let gauge = Gauge::default();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let watcher = publish_run_status(&mgr.pipelines, "p", &run, |v| {
+            // Computed while healthy (running); the run fails now, between
+            // the watcher's computation and its write.
+            health.exit(task, exit());
+            let (mgr, run, set) = (Arc::clone(&mgr), run.clone(), gauge.set());
+            let tx = done_tx.clone();
+            std::thread::spawn(move || {
+                tx.send(publish_run_status(&mgr.pipelines, "p", &run, set))
+                    .unwrap()
+            });
+            // The failure's writer cannot get in while the watcher holds
+            // the lock (a shared lock would let it write -1 here, and the
+            // watcher's 1 below would then be the last value).
+            assert!(
+                done.recv_timeout(std::time::Duration::from_millis(300))
+                    .is_err(),
+                "the failure's writer ran inside the watcher's critical section"
+            );
+            gauge.set()(v);
+        });
+        assert_eq!(watcher, Some(1.0));
+        assert_eq!(
+            done.recv().unwrap(),
+            Some(-1.0),
+            "the failure's writer runs after the watcher, from the failed state"
+        );
+        // A watcher arriving late computes from the failed state as well.
+        assert_eq!(
+            publish_run_status(&mgr.pipelines, "p", &run, gauge.set()),
+            Some(-1.0)
+        );
+        assert_eq!(gauge.all(), vec![1.0, -1.0, -1.0]);
+        assert_eq!(gauge.last(), Some(-1.0));
+        assert_eq!(
+            PipelineController::get(mgr.as_ref(), "p")
+                .await
+                .unwrap()
+                .status,
+            "failed"
+        );
+        assert_eq!(ready_code(mgr).await, 503);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_source_failure_racing_the_boundary_leaves_the_run_failed() {
+        a_failure_racing_the_boundary_leaves_the_run_failed(
+            crate::incidents::Task::Source,
+            source_failure,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_coordinator_failure_racing_the_boundary_leaves_the_run_failed() {
+        a_failure_racing_the_boundary_leaves_the_run_failed(
+            crate::incidents::Task::Coordinator,
+            coordinator_failure,
+        )
+        .await;
+    }
+
+    /// An old run (replaced) that publishes its boundary or fails later
+    /// writes neither the status nor the gauge of its replacement.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_old_run_never_writes_its_replacements_status() {
+        let (mgr, old, old_health) = manager_with_run("p").await;
+        let (current, _) = replace_run(&mgr, "p");
+        let gauge = Gauge::default();
+
+        assert!(old.publish(mysql_start(4)));
+        assert_eq!(
+            publish_run_status(&mgr.pipelines, "p", &old, gauge.set()),
+            None
+        );
+        old_health.exit(crate::incidents::Task::Source, source_failure());
+        assert_eq!(
+            publish_run_status(&mgr.pipelines, "p", &old, gauge.set()),
+            None
+        );
+        assert_eq!(gauge.all(), Vec::<f64>::new(), "the old run wrote nothing");
+        assert_eq!(
+            PipelineController::get(mgr.as_ref(), "p")
+                .await
+                .unwrap()
+                .status,
+            "starting"
+        );
+        assert_eq!(ready_code(Arc::clone(&mgr)).await, 503);
+
+        assert_eq!(
+            publish_run_status(&mgr.pipelines, "p", &current, gauge.set()),
+            Some(0.25)
+        );
+        assert!(current.publish(mysql_start(9)));
+        assert_eq!(
+            publish_run_status(&mgr.pipelines, "p", &current, gauge.set()),
+            Some(1.0)
+        );
+        assert_eq!(
+            PipelineController::get(mgr.as_ref(), "p")
+                .await
+                .unwrap()
+                .status,
+            "running"
+        );
+        assert_eq!(ready_code(mgr).await, 200);
     }
 
     /// Checkpoint store with injectable list/delete failures; other ops succeed.

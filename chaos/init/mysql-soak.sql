@@ -160,5 +160,5 @@ CREATE TABLE IF NOT EXISTS soak_event_20 (id INT AUTO_INCREMENT PRIMARY KEY, tag
 
 -- CDC replication user (idempotent — already exists in mysql-chaos.sql if both are loaded)
 CREATE USER IF NOT EXISTS 'cdc_user'@'%' IDENTIFIED BY 'cdc_password';
-GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'cdc_user'@'%';
+GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT, BACKUP_ADMIN ON *.* TO 'cdc_user'@'%';
 FLUSH PRIVILEGES;

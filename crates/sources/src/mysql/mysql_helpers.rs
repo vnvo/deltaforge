@@ -1,6 +1,6 @@
 use crc32fast::Hasher;
 use deltaforge_core::{CheckpointMeta, SourceError, SourceResult};
-use mysql_async::{Row, prelude::Queryable};
+use mysql_async::prelude::Queryable;
 use mysql_binlog_connector_rust::binlog_client::BinlogClient;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -73,32 +73,18 @@ pub(super) async fn prepare_client(
             );
         }
     } else {
-        info!("no previous checkpoint, reading the binlog tail ..");
-        match resolve_binlog_tail(control, dsn, expected_uuid).await {
-            Ok((file, pos)) => {
-                info!(source_id = %source_id, %file, %pos, "start from end (first run)");
-                client.binlog_filename = file;
-                client.binlog_position = pos as u32;
-                // Also fetch the full executed GTID set so reconnects resume
-                // from here rather than replaying the full binlog history.
-                match fetch_executed_gtid_set(control, dsn, expected_uuid).await
-                {
-                    // With GTID off the executed set is '' (not NULL): no
-                    // GTID resume position, stay on the file/position tail.
-                    Ok(Some(gtid_set)) if !gtid_set.trim().is_empty() => {
-                        client.gtid_enabled = true;
-                        client.gtid_set = gtid_set;
-                    }
-                    Err(SourceError::Lineage { details }) => {
-                        return Err(MySqlSourceError::Lineage(details.into()));
-                    }
-                    Ok(_) | Err(_) => {}
-                }
-            }
-            Err(e) => {
-                error!(source_id = %source_id, error = %e, "failed to resolve binlog tail");
-                return Err(e);
-            }
+        info!("no previous checkpoint, reading the capture boundary ..");
+        let b = read_capture_boundary(control, dsn, expected_uuid).await?;
+        info!(
+            source_id = %source_id, file = %b.file, pos = b.pos,
+            gtid_set = ?b.gtid_set, "start from the capture boundary (first run)"
+        );
+        client.binlog_filename = b.file;
+        client.binlog_position = b.pos as u32;
+        // GTID mode: the set is the boundary, consistent with the position.
+        if let Some(set) = b.gtid_set {
+            client.gtid_enabled = true;
+            client.gtid_set = set;
         }
     }
 
@@ -268,226 +254,131 @@ pub(super) fn derive_server_id(id: &str) -> u64 {
     1 + ((h.finalize() as u64) % 4_000_000_000u64)
 }
 
-/// Resolve end-of-binlog with comprehensive diagnostics.
-///
-/// The position is read on a control connection verified as `expected_uuid`:
-/// it is a fact about that server only.
-pub(super) async fn resolve_binlog_tail(
+/// A first start's capture boundary: the binlog position and executed GTID
+/// set read together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LogStatus {
+    pub(super) file: String,
+    pub(super) pos: u64,
+    /// `None` with GTID mode off: the position alone is the boundary.
+    pub(super) gtid_set: Option<String>,
+}
+
+/// The privileges [`read_capture_boundary`] needs.
+pub(super) const LOG_STATUS_GRANTS: &str = "reading the capture boundary of a \
+     first start needs BACKUP_ADMIN and SELECT on performance_schema.log_status: \
+     GRANT BACKUP_ADMIN ON *.* TO <user>; GRANT SELECT ON \
+     performance_schema.log_status TO <user>;";
+
+/// A first start's capture boundary (no checkpoint), read in ONE
+/// `performance_schema.log_status` query on a control connection verified
+/// as `expected_uuid`. MySQL documents its `gtid_executed` as consistent with
+/// its `binary_log_file` and `binary_log_position` (the server blocks logging
+/// while it populates the table); `SHOW BINARY LOG STATUS` makes no such
+/// guarantee (`docs/design/startup-capture-boundary.md`, section 5). There
+/// is no fallback to positions sampled separately: a server that cannot
+/// answer it stops the start.
+pub(super) async fn read_capture_boundary(
     control: &super::mysql_control::ControlPool,
     dsn: &str,
     expected_uuid: &str,
-) -> MySqlSourceResult<(String, u64)> {
+) -> MySqlSourceResult<LogStatus> {
     use super::mysql_control::Class;
-    info!("connecting to MySQL for binlog tail resolution");
-
     let mut conn = match control
         .connect(Class::Position, dsn, expected_uuid, Class::Position.wait())
         .await
         .map_err(super::mysql_control::ControlError::into_session)
     {
-        Ok(conn) => {
-            info!("connected to MySQL (identity verified)");
-            conn
-        }
+        Ok(conn) => conn,
         Err(super::mysql_session::SessionError::Connect(_, e)) => {
-            error!("failed to connect to MySQL: {}", e);
             return Err(MySqlSourceError::BinlogConnect(format!(
                 "MySQL connection failed: {e}"
             )));
         }
         Err(e) => {
             return Err(MySqlSourceError::Lineage(format!(
-                "binlog tail resolution: {e:?} (expected {expected_uuid})"
+                "capture boundary: {e:?} (expected {expected_uuid})"
             )));
         }
     };
-
-    // Who am I?
-    info!("checking user privileges");
-    match conn.query_first::<Row, _>("SELECT CURRENT_USER()").await {
-        Ok(Some(mut row)) => {
-            let current_user: String = row.take(0).unwrap_or_default();
-            info!("connected as user: {}", current_user);
-        }
-        Ok(None) => warn!("could not determine current user"),
-        Err(e) => {
-            error!("failed to check current user: {}", e);
-            drop(conn);
-            return Err(MySqlSourceError::BinlogConnect(format!(
-                "failed to check current user: {e}"
-            )));
-        }
-    }
-
-    // Preferred status command
-    info!("trying SHOW BINARY LOG STATUS");
-    match tokio::time::timeout(
-        Duration::from_secs(5),
-        conn.query_first::<Row, _>("SHOW BINARY LOG STATUS"),
-    )
-    .await
-    {
-        Ok(Ok(Some(mut row))) => {
-            if let (Some(file), Some(pos)) =
-                (row.take::<String, _>(0), row.take::<u64, _>(1))
-            {
-                info!(
-                    "successfully got binlog position: file={}, pos={}",
-                    file, pos
-                );
-                conn.release().await;
-                return Ok((file, pos));
-            } else {
-                warn!("SHOW BINARY LOG STATUS returned incomplete data");
-            }
-        }
-        Ok(Ok(None)) => warn!(
-            "SHOW BINARY LOG STATUS returned no rows - binlog might be disabled"
-        ),
-        Ok(Err(e)) => warn!(
-            "SHOW BINARY LOG STATUS failed: {} - trying legacy syntax",
-            e
-        ),
-        Err(_) => {
-            warn!("SHOW BINARY LOG STATUS timed out - trying legacy syntax")
-        }
-    }
-
-    // Legacy fallback
-    info!("trying SHOW MASTER STATUS (legacy syntax)");
-    match tokio::time::timeout(
-        Duration::from_secs(5),
-        conn.query_first::<Row, _>("SHOW MASTER STATUS"),
-    )
-    .await
-    {
-        Ok(Ok(Some(mut row))) => {
-            if let (Some(file), Some(pos)) =
-                (row.take::<String, _>(0), row.take::<u64, _>(1))
-            {
-                info!(
-                    "successfully got binlog position via legacy command: file={}, pos={}",
-                    file, pos
-                );
-                conn.release().await;
-                return Ok((file, pos));
-            } else {
-                warn!("SHOW MASTER STATUS returned incomplete data");
-            }
-        }
-        Ok(Ok(None)) => warn!("SHOW MASTER STATUS returned no rows"),
-        Ok(Err(e)) => warn!("SHOW MASTER STATUS failed: {}", e),
-        Err(_) => warn!("SHOW MASTER STATUS timed out"),
-    }
-
-    // Diagnostics
-    info!("running diagnostics to determine the issue");
-    let mut diagnostics = Vec::new();
-
-    // log_bin
-    match conn
-        .exec_first::<(String, String), _, _>(
-            "SHOW VARIABLES LIKE 'log_bin'",
-            (),
+    let row: Result<Option<(String, String)>, _> = conn
+        .query_first(
+            "SELECT SERVER_UUID, CAST(LOCAL AS CHAR) \
+             FROM performance_schema.log_status",
         )
-        .await
-    {
-        Ok(Some((_, value))) => {
-            if value.eq_ignore_ascii_case("OFF") {
-                diagnostics
-                    .push("FAIL: Binary logging is DISABLED".to_string());
-                diagnostics.push(
-                    "   Fix: Add --log-bin to MySQL startup command"
-                        .to_string(),
-                );
-            } else {
-                diagnostics.push("OK: Binary logging is enabled".to_string());
-            }
-        }
-        Ok(None) => diagnostics
-            .push("WARN: Could not check log_bin variable".to_string()),
-        Err(e) => {
-            diagnostics.push(format!("FAIL: Failed to check log_bin: {}", e))
-        }
-    }
-
-    // binlog_format
-    match conn
-        .exec_first::<(String, String), _, _>(
-            "SHOW VARIABLES LIKE 'binlog_format'",
-            (),
-        )
-        .await
-    {
-        Ok(Some((_, value))) => {
-            if value.eq_ignore_ascii_case("ROW") {
-                diagnostics.push("OK: Binlog format is ROW".to_string());
-            } else {
-                diagnostics.push(format!(
-                    "WARN: Binlog format is '{}' (should be ROW)",
-                    value
-                ));
-            }
-        }
-        Ok(None) => {
-            diagnostics.push("WARN: Could not check binlog_format".to_string())
-        }
-        Err(e) => diagnostics
-            .push(format!("FAIL: Failed to check binlog_format: {}", e)),
-    }
-
-    // grants
-    match conn.query::<Row, _>("SHOW GRANTS").await {
-        Ok(rows) => {
-            let grants: Vec<String> = rows
-                .into_iter()
-                .map(|mut row| row.take::<String, _>(0).unwrap_or_default())
-                .collect();
-            let has_replication = grants.iter().any(|g| {
-                g.contains("REPLICATION SLAVE")
-                    || g.contains("REPLICATION REPLICA")
-                    || g.contains("ALL PRIVILEGES")
-            });
-            if has_replication {
-                diagnostics
-                    .push("OK: User has replication privileges".to_string());
-            } else {
-                diagnostics.extend(missing_replication_grant());
-            }
-            debug!("user grants: {:?}", grants);
-        }
-        Err(e) => {
-            diagnostics
-                .push(format!("FAIL: Could not check user grants: {}", e));
-            diagnostics.push(
-                "   This usually means insufficient privileges".to_string(),
-            );
-        }
-    }
-
-    // version
-    match conn.query_first::<Row, _>("SELECT VERSION()").await {
-        Ok(Some(mut row)) => {
-            let version: String = row.take(0).unwrap_or_default();
-            diagnostics.push(format!("INFO: MySQL version: {}", version));
-        }
-        Ok(None) => diagnostics
-            .push("WARN: Could not determine MySQL version".to_string()),
-        Err(e) => diagnostics
-            .push(format!("FAIL: Failed to get MySQL version: {}", e)),
-    }
-
+        .await;
     conn.release().await;
-
-    // Print diagnostics and bail
-    error!("could not resolve binlog end position. Diagnostics:");
-    for diag in &diagnostics {
-        error!("  {}", diag);
+    match row {
+        Ok(Some((uuid, local))) => {
+            parse_log_status(&uuid, &local, expected_uuid)
+        }
+        Ok(None) => Err(MySqlSourceError::Incompatible(
+            "performance_schema.log_status returned no row".into(),
+        )),
+        // ER_TABLEACCESS_DENIED_ERROR, ER_SPECIFIC_ACCESS_DENIED_ERROR.
+        Err(mysql_async::Error::Server(e)) if matches!(e.code, 1142 | 1227) => {
+            Err(MySqlSourceError::Permission(format!(
+                "{LOG_STATUS_GRANTS} (server error {}: {})",
+                e.code, e.message
+            )))
+        }
+        Err(e) => Err(MySqlSourceError::Driver(e)),
     }
+}
 
-    Err(MySqlSourceError::BinlogConnect(
-        BINLOG_POSITION_FIXES.to_string(),
-    ))
+/// Parse one `log_status` row. The server must be the verified one; the
+/// binary log must be on; an empty `gtid_executed` means GTID mode is off.
+pub(super) fn parse_log_status(
+    server_uuid: &str,
+    local: &str,
+    expected_uuid: &str,
+) -> MySqlSourceResult<LogStatus> {
+    if !server_uuid.eq_ignore_ascii_case(expected_uuid) {
+        return Err(MySqlSourceError::Lineage(format!(
+            "capture boundary read on server {server_uuid}, expected \
+             {expected_uuid}"
+        )));
+    }
+    #[derive(serde::Deserialize)]
+    struct Local {
+        binary_log_file: Option<String>,
+        binary_log_position: Option<u64>,
+        gtid_executed: Option<String>,
+    }
+    let l: Local = serde_json::from_str(local).map_err(|e| {
+        MySqlSourceError::Incompatible(format!(
+            "unparseable performance_schema.log_status LOCAL {local:?}: {e}"
+        ))
+    })?;
+    let (file, pos) = match (l.binary_log_file, l.binary_log_position) {
+        (Some(f), Some(p)) if !f.is_empty() => (f, p),
+        _ => {
+            return Err(MySqlSourceError::Incompatible(
+                "binary logging is disabled: no binary log position in \
+                 performance_schema.log_status (start the server with \
+                 --log-bin and binlog_format=ROW)"
+                    .into(),
+            ));
+        }
+    };
+    let gtid_set = match l.gtid_executed.as_deref().map(str::trim) {
+        None | Some("") => None,
+        // The server's text, in the one canonical form.
+        Some(t) => Some(
+            crate::gtid_set::GtidSet::parse(t)
+                .ok_or_else(|| {
+                    MySqlSourceError::Incompatible(format!(
+                        "unparseable gtid_executed {t:?}"
+                    ))
+                })?
+                .to_string(),
+        ),
+    };
+    Ok(LogStatus {
+        file,
+        pos,
+        gtid_set,
+    })
 }
 
 /// The account a binlog connection needs, as hints. The user takes the
@@ -498,24 +389,10 @@ fn auth_hints(db: &str) -> Vec<String> {
         "  1) CREATE USER 'df'@'%' IDENTIFIED BY 'dfpw';  (or ALTER USER ... IDENTIFIED BY ... to move an existing user to the server's default plugin)".to_string(),
         "  2) GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'df'@'%';".to_string(),
         format!("  3) GRANT SELECT, SHOW VIEW ON {db}.* TO 'df'@'%';"),
-        "  4) FLUSH PRIVILEGES;".to_string(),
+        "  4) GRANT BACKUP_ADMIN ON *.* TO 'df'@'%'; GRANT SELECT ON performance_schema.log_status TO 'df'@'%';  (a first start without a checkpoint reads its capture boundary there)".to_string(),
+        "  5) FLUSH PRIVILEGES;".to_string(),
     ]
 }
-
-/// The diagnostics for a user without the replication privilege.
-fn missing_replication_grant() -> [String; 2] {
-    [
-        "FAIL: User lacks the REPLICATION SLAVE privilege".to_string(),
-        "   Fix: GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO user;"
-            .to_string(),
-    ]
-}
-
-/// The error when the binlog position cannot be resolved.
-const BINLOG_POSITION_FIXES: &str = "Failed to resolve binlog position. Common fixes:\n\
-     1) Enable binary logging: --log-bin --binlog-format=ROW\n\
-     2) Grant privileges: GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO ...;\n\
-     3) Ensure user exists: CREATE USER '..'@'%' IDENTIFIED BY 'password';";
 
 /// Shorten SQL for logs
 pub(crate) fn short_sql(s: &str, max: usize) -> String {
@@ -523,40 +400,6 @@ pub(crate) fn short_sql(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", &s[..max])
-    }
-}
-
-/// `@@GLOBAL.gtid_executed`, read on a control connection verified as
-/// `expected_uuid`.
-pub(super) async fn fetch_executed_gtid_set(
-    control: &super::mysql_control::ControlPool,
-    dsn: &str,
-    expected_uuid: &str,
-) -> SourceResult<Option<String>> {
-    use super::mysql_control::Class;
-    let mut conn = control
-        .connect(Class::Position, dsn, expected_uuid, Class::Position.wait())
-        .await
-        .map_err(|e| e.into_source_error(expected_uuid))?;
-
-    // Returns NULL if GTID is disabled
-    let row: Option<(Option<String>,)> = conn
-        .query_first("SELECT @@GLOBAL.gtid_executed")
-        .await
-        .map_err(|e| SourceError::Other(e.into()))?;
-
-    conn.release().await;
-
-    // The server's text (it prints newlines), in the one canonical form.
-    match row.and_then(|(s,)| s) {
-        Some(t) => crate::gtid_set::GtidSet::parse(&t)
-            .map(|set| Some(set.to_string()))
-            .ok_or_else(|| {
-                SourceError::Other(anyhow::anyhow!(
-                    "unparseable gtid_executed {t:?}"
-                ))
-            }),
-        None => Ok(None),
     }
 }
 
@@ -599,9 +442,10 @@ mod tests {
     use super::*;
 
     /// The account remediation MySQL 8.4 accepts: `REPLICATION SLAVE` (8.4
-    /// rejects `REPLICATION REPLICA` with a syntax error) and a user on the
+    /// rejects `REPLICATION REPLICA` with a syntax error), a user on the
     /// server's default authentication plugin (8.4 disables
-    /// `mysql_native_password`).
+    /// `mysql_native_password`), and the grants a first start reads its
+    /// capture boundary with.
     #[test]
     fn account_remediation_is_valid_on_mysql_8_4() {
         assert_eq!(
@@ -610,22 +454,64 @@ mod tests {
                 "  1) CREATE USER 'df'@'%' IDENTIFIED BY 'dfpw';  (or ALTER USER ... IDENTIFIED BY ... to move an existing user to the server's default plugin)",
                 "  2) GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'df'@'%';",
                 "  3) GRANT SELECT, SHOW VIEW ON shop.* TO 'df'@'%';",
-                "  4) FLUSH PRIVILEGES;",
+                "  4) GRANT BACKUP_ADMIN ON *.* TO 'df'@'%'; GRANT SELECT ON performance_schema.log_status TO 'df'@'%';  (a first start without a checkpoint reads its capture boundary there)",
+                "  5) FLUSH PRIVILEGES;",
             ]
         );
+    }
+
+    const UUID: &str = "37b3bf36-d624-11f1-a18e-0242ac110003";
+
+    /// GTID on (MySQL 8.4.9's row): the position and the canonical set.
+    #[test]
+    fn log_status_gives_the_position_and_its_gtid_set() {
+        let b = parse_log_status(
+            UUID,
+            r#"{"gtid_executed": "37b3bf36-d624-11f1-a18e-0242ac110003:1-5", "binary_log_file": "mysql-bin.000003", "binary_log_position": 198}"#,
+            &UUID.to_uppercase(),
+        )
+        .unwrap();
         assert_eq!(
-            missing_replication_grant(),
-            [
-                "FAIL: User lacks the REPLICATION SLAVE privilege",
-                "   Fix: GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO user;",
-            ]
+            b,
+            LogStatus {
+                file: "mysql-bin.000003".into(),
+                pos: 198,
+                gtid_set: Some(format!("{UUID}:1-5")),
+            }
         );
-        assert_eq!(
-            BINLOG_POSITION_FIXES,
-            "Failed to resolve binlog position. Common fixes:\n\
-             1) Enable binary logging: --log-bin --binlog-format=ROW\n\
-             2) Grant privileges: GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO ...;\n\
-             3) Ensure user exists: CREATE USER '..'@'%' IDENTIFIED BY 'password';"
-        );
+    }
+
+    /// GTID off (8.4.9): `gtid_executed` is empty; the position alone.
+    #[test]
+    fn gtid_off_gives_the_position_alone() {
+        let b = parse_log_status(
+            UUID,
+            r#"{"gtid_executed": "", "binary_log_file": "mysql-bin.000003", "binary_log_position": 158}"#,
+            UUID,
+        )
+        .unwrap();
+        assert_eq!(b.gtid_set, None);
+        assert_eq!((b.file.as_str(), b.pos), ("mysql-bin.000003", 158));
+    }
+
+    #[test]
+    fn another_server_or_no_binary_log_fails_closed() {
+        let local = r#"{"gtid_executed": "", "binary_log_file": "b.1", "binary_log_position": 4}"#;
+        assert!(matches!(
+            parse_log_status(
+                "00000000-0000-0000-0000-000000000000",
+                local,
+                UUID
+            ),
+            Err(MySqlSourceError::Lineage(_))
+        ));
+        assert!(matches!(
+            parse_log_status(UUID, r#"{"gtid_executed": ""}"#, UUID),
+            Err(MySqlSourceError::Incompatible(_))
+        ));
+        assert!(matches!(
+            parse_log_status(UUID, "not json", UUID),
+            Err(MySqlSourceError::Incompatible(_))
+        ));
     }
 }

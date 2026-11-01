@@ -22,8 +22,8 @@ use crate::gtid_set::GtidSet;
 use crate::snapshot_generation::PersistedLineage;
 use deltaforge_core::incident::{CauseCode, IncidentDraft, Retryability};
 use deltaforge_core::{
-    CheckpointOrder, Source, SourceError, SourceHandle, SourceItem,
-    SourceResult,
+    CaptureOrigin, CaptureStart, CheckpointOrder, Source, SourceError,
+    SourceHandle, SourceItem, SourceResult,
 };
 mod mysql_errors;
 pub use mysql_errors::{LoopControl, MySqlSourceError, MySqlSourceResult};
@@ -77,9 +77,7 @@ pub use mysql_identity::{
 
 mod mysql_table_schema;
 use crate::mysql::mysql_control::Class;
-use crate::mysql::mysql_helpers::{
-    Opened, connect_binlog_with_retries, resolve_binlog_tail,
-};
+use crate::mysql::mysql_helpers::{Opened, connect_binlog_with_retries};
 use crate::mysql::mysql_session::SessionError;
 pub use mysql_table_schema::{MySqlColumn, MySqlTableSchema};
 
@@ -1439,6 +1437,7 @@ impl MySqlSource {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_inner(
         &self,
         tx: mpsc::Sender<SourceItem>,
@@ -1447,6 +1446,7 @@ impl MySqlSource {
         paused: Arc<AtomicBool>,
         pause_notify: Arc<Notify>,
         ready: deltaforge_core::SourceReady,
+        boundary: deltaforge_core::CaptureBoundary,
     ) -> SourceResult<()> {
         // The run's one authoritative DSN, shared by every connection
         // factory of the run (see `SharedDsn`).
@@ -1701,8 +1701,11 @@ impl MySqlSource {
             }
         }
 
+        crate::stream_probe::before_capture_boundary().await;
         // binlog streaming - retry prepare_client on transient connection errors
-        // (MySQL or toxiproxy may not be ready yet during startup).
+        // (MySQL or toxiproxy may not be ready yet during startup). A first
+        // start reads its capture boundary here; nothing is promised until
+        // it is durable below, so a retry may read a newer one.
         let (host, default_db, server_id, mut client) = {
             let mut retry = common::retry::RetryPolicy::default();
             loop {
@@ -1909,6 +1912,35 @@ impl MySqlSource {
             record_stream_start(&mut ctx).await?;
         }
         initialize_sink_checkpoints(&ctx).await?;
+        // The capture boundary is durable from here: every later attempt and
+        // every restart resumes from it (or from a later committed position),
+        // never from a newer tail. A generation's anchor is published only
+        // once the generation is durably completed (the completion watch):
+        // until then a failure replaces it.
+        let capture_start = {
+            let (file, pos, gtid_set) = ctx.resume_point();
+            CaptureStart::Mysql {
+                origin: if committed_resume {
+                    CaptureOrigin::Resume
+                } else if snapshot_start.is_some() {
+                    CaptureOrigin::Snapshot
+                } else {
+                    CaptureOrigin::FirstStart
+                },
+                lineage: checkpoint_lineage(&self.registry_scope),
+                server_uuid: server_uuid.clone(),
+                file,
+                pos,
+                gtid_set,
+            }
+        };
+        if crate::stream_probe::take_fail_after_capture_boundary() {
+            return Err(SourceError::Connect {
+                details: "stream open failed after the capture boundary was \
+                          persisted (test seam)"
+                    .into(),
+            });
+        }
 
         info!(source_id=%self.id, "connecting for binlog stream ..");
         let mut stream = connect_first_stream(&ctx, client).await?;
@@ -1958,6 +1990,7 @@ impl MySqlSource {
                 self.incidents(),
                 Arc::clone(&self.snapshot_cohort),
                 ctx.cancel.clone(),
+                (boundary.clone(), capture_start.clone()),
             );
         }
 
@@ -1991,6 +2024,11 @@ impl MySqlSource {
         // Startup checks passed and the stream is open on the verified
         // server: the source half of the verified-running barrier.
         ready.mark();
+        // A stream start's boundary is durable and its stream open: the
+        // pipeline may report running. No data event is awaited.
+        if generation_run.is_none() {
+            boundary.publish(capture_start);
+        }
         info!("entering binlog read loop");
         // The loop runs inside an async block so its result can be captured and the
         // rotation runtime cancelled+joined before teardown, on both the normal and
@@ -2324,6 +2362,8 @@ impl Source for MySqlSource {
         let pause_notify_for_task = pause_notify.clone();
         let ready = deltaforge_core::SourceReady::new();
         let ready_for_task = ready.clone();
+        let boundary = deltaforge_core::CaptureBoundary::new();
+        let boundary_for_task = boundary.clone();
 
         let join = tokio::spawn(async move {
             let res = this
@@ -2334,6 +2374,7 @@ impl Source for MySqlSource {
                     paused_for_task,
                     pause_notify_for_task,
                     ready_for_task,
+                    boundary_for_task,
                 )
                 .await;
             if let Err(e) = &res {
@@ -2348,6 +2389,7 @@ impl Source for MySqlSource {
             pause_notify,
             join,
             ready,
+            boundary,
         }
     }
 
@@ -2510,26 +2552,12 @@ async fn reconnect_stream(
     } else if !ctx.last_file.is_empty() && ctx.last_pos > 0 {
         (None, Some(ctx.last_file.clone()), Some(ctx.last_pos as u32))
     } else {
-        match resolve_binlog_tail(
-            ctx.capture.control(),
-            ctx.dsn.current().expose(),
-            &expected,
-        )
-        .await
-        {
-            Ok((f, p)) => (None, Some(f), Some(p as u32)),
-            Err(MySqlSourceError::Lineage(details)) => {
-                return Err(SourceError::Lineage {
-                    details: details.into(),
-                });
-            }
-            Err(_) => {
-                return Err(SourceError::Connect {
-                    details: "could not resolve binlog tail during reconnect"
-                        .into(),
-                });
-            }
-        }
+        // A run always holds its durable capture boundary: reopening at a
+        // newer tail would skip changes after it. Fail closed.
+        return Err(SourceError::Checkpoint {
+            details: "no resume position to reopen the binlog stream from"
+                .into(),
+        });
     };
 
     // The exact position the replacement stream starts from: what any

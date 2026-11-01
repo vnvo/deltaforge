@@ -20,7 +20,16 @@ pub struct AppState {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PipeInfo {
     pub name: String,
+    /// `starting`, `running`, `paused`, `stopped`, `deleting` or `failed`.
+    /// `running` means the current run's capture boundary is published
+    /// (`capture_start`); `starting` that it is not yet.
     pub status: String,
+    /// Where the current run captures from, once published: changes to the
+    /// configured tables committed after it are captured. Not a promise of
+    /// delivery latency, of tables excluded by configuration, or of delivery
+    /// while paused (`docs/design/startup-capture-boundary.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_start: Option<deltaforge_core::CaptureStart>,
     /// Serialized through the sanitized view so no public response exposes an inline
     /// DSN password; secret references are preserved. Deserialization (rarely used;
     /// input uses `PipelineSpec` directly) reads the field normally.
@@ -679,6 +688,7 @@ mod tests {
         PipeInfo {
             name: "demo".to_string(),
             status: "running".to_string(),
+            capture_start: None,
             spec: deltaforge_config::PipelineSpec {
                 metadata: Metadata {
                     name: "demo".to_string(),

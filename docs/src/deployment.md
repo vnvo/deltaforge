@@ -62,8 +62,8 @@ secrets:
 
 The chart configures liveness and readiness probes automatically:
 
-- **Liveness** (`/health`): returns 200 when healthy, 503 when a pipeline has failed. Triggers pod restart on prolonged failure.
-- **Readiness** (`/ready`): returns 200 with pipeline status JSON. Controls traffic routing.
+- **Liveness** (`/health`): returns 200 while the process and its API are alive, whatever the pipelines' state (a failed or starting pipeline is a readiness concern). Kubernetes restarts the pod only when this fails.
+- **Readiness** (`/ready`): returns 200 with pipeline status JSON; 503 while a pipeline is failed, blocked by an incident, held by a recovery, or `starting` (its capture boundary not yet fixed, including for the whole of an initial snapshot). A 503 removes the pod from the Service's endpoints and never restarts it: while an initial snapshot runs, the API and metrics are not reachable through the Service (use the pod directly, for example `kubectl port-forward`). The chart defines no startup probe, so readiness staying false never leads to a restart.
 
 ### Monitoring
 

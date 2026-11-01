@@ -427,7 +427,12 @@ async fn mysql_to_kafka_backlog_drain_throughput() -> Result<()> {
         )
         .await?;
         root.query_drop(
-            "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'df'@'%'",
+            "GRANT REPLICATION SLAVE, REPLICATION CLIENT, BACKUP_ADMIN ON *.* \
+             TO 'df'@'%'",
+        )
+        .await?;
+        root.query_drop(
+            "GRANT SELECT ON performance_schema.log_status TO 'df'@'%'",
         )
         .await?;
         root.query_drop("GRANT SELECT ON orders.* TO 'df'@'%'")

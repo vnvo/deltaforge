@@ -210,7 +210,7 @@ Set `spec.source.type` to `postgres` and provide a config object:
 | `slot` | string | Yes | — | Replication slot name |
 | `publication` | string | Yes | — | Publication name |
 | `tables` | array | Yes | — | Table patterns to capture |
-| `start_position` | string/object | No | — | ⚠️ Parsed but not yet implemented — a new slot always starts at the current WAL LSN |
+| `start_position` | string/object | No | — | ⚠️ Parsed but not yet implemented — a new slot always starts at its consistent point (the current WAL LSN when it is created) |
 | `max_message_bytes` | integer | No | 1 GiB | Largest replication message accepted, 1 to 1073741824 bytes (see [Message size limit](#message-size-limit)) |
 
 ### Message size limit
@@ -254,7 +254,7 @@ System schemas (`pg_catalog`, `information_schema`, `pg_toast`) are always exclu
 
 ### Start Position
 
-> ⚠️ **Not yet implemented.** `start_position` is accepted by the config parser but currently ignored — a new slot always starts from the current WAL position (`pg_current_wal_lsn()`). The forms below are aspirational.
+> ⚠️ **Not yet implemented.** `start_position` is accepted by the config parser but currently ignored — a new slot always starts from its consistent point (the current WAL position when it is created). The forms below are aspirational.
 
 Intended to control where replication begins when no checkpoint exists:
 
@@ -291,7 +291,9 @@ DeltaForge checkpoints progress using PostgreSQL's LSN (Log Sequence Number):
 
 1. **With checkpoint**: Resumes from the stored LSN
 2. **Without checkpoint**: Uses the slot's `confirmed_flush_lsn` or `restart_lsn`
-3. **New slot**: Starts from `pg_current_wal_lsn()` (current WAL position)
+3. **New slot**: Starts from the slot's consistent point (the LSN its creation returns): changes committed after it are captured.
+
+The pipeline reports `running` only once the slot exists, the start position is persisted for every sink and the stream is open, with that position as `capture_start`. A retry or restart before then starts from the slot again, never from a newer position.
 
 Checkpoints are stored using the `id` field as the key.
 

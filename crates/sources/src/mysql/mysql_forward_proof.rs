@@ -5187,7 +5187,11 @@ mod tests {
                     &format!("DROP USER IF EXISTS '{user}'@'%'"),
                     &format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'pw'"),
                     &format!(
-                        "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* \
+                        "GRANT REPLICATION SLAVE, REPLICATION CLIENT, \
+                         BACKUP_ADMIN ON *.* TO '{user}'@'%'"
+                    ),
+                    &format!(
+                        "GRANT SELECT ON performance_schema.log_status \
                          TO '{user}'@'%'"
                     ),
                     &format!("GRANT SELECT ON {db}.t TO '{user}'@'%'"),

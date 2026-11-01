@@ -17,7 +17,9 @@ GRANT ALL PRIVILEGES ON users.* TO 'df'@'%';
 GRANT ALL PRIVILEGES ON analytics.* TO 'df'@'%';
 
 -- Grant replication privileges (needed for binlog reading)
-GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'df'@'%';
+GRANT REPLICATION SLAVE, REPLICATION CLIENT, BACKUP_ADMIN ON *.* TO 'df'@'%';
+-- A first start without a checkpoint reads its capture boundary here.
+GRANT SELECT ON performance_schema.log_status TO 'df'@'%';
 
 -- Apply changes
 FLUSH PRIVILEGES;

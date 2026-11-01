@@ -123,6 +123,7 @@ impl Source for FakeSource {
             pause_notify,
             join,
             ready: deltaforge_core::SourceReady::new(),
+            boundary: deltaforge_core::CaptureBoundary::new(),
         }
     }
 

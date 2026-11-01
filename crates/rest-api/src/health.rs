@@ -43,17 +43,26 @@ async fn readyz(State(st): State<AppState>) -> impl IntoResponse {
     // endpoints. Otherwise 200 with the current pipeline states.
     // A pipeline also keeps the instance not-ready while it has a blocking
     // incident that is open or only acknowledged: an acknowledgement means an
-    // operator has seen it, not that it is safe.
+    // operator has seen it, not that it is safe; while a recovery is pending;
+    // and while it is `starting` (its capture boundary is not yet published,
+    // so changes committed now may not be captured). Paused and stopped
+    // pipelines are operator intent and do not hold readiness back.
     let pipelines = st.controller.list().await;
     let failed: Vec<_> = pipelines
         .iter()
         .filter(|p| p.status == "failed")
         .map(|p| p.name.clone())
         .collect();
+    let starting: Vec<_> = pipelines
+        .iter()
+        .filter(|p| p.status == "starting")
+        .map(|p| p.name.clone())
+        .collect();
     let blocked: Vec<_> = pipelines
         .iter()
         .filter(|p| {
             p.status == "failed"
+                || p.status == "starting"
                 || p.incidents.as_ref().is_some_and(|i| i.blocks_readiness())
                 || p.recovery.is_some()
         })
@@ -81,6 +90,7 @@ async fn readyz(State(st): State<AppState>) -> impl IntoResponse {
         let body = serde_json::json!({
             "status": "not_ready",
             "failed_pipelines": failed,
+            "starting_pipelines": starting,
             "blocked_pipelines": blocked,
         });
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();

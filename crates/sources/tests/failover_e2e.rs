@@ -90,7 +90,10 @@ async fn provision_mysql_cdc_user(port: u16) {
         "CREATE USER IF NOT EXISTS '{MYSQL_CDC_USER}'@'%' IDENTIFIED BY '{MYSQL_CDC_PASSWORD}'"
     )).await.unwrap();
     conn.query_drop(format!(
-        "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{MYSQL_CDC_USER}'@'%'"
+        "GRANT REPLICATION SLAVE, REPLICATION CLIENT, BACKUP_ADMIN ON *.* TO '{MYSQL_CDC_USER}'@'%'"
+    )).await.unwrap();
+    conn.query_drop(format!(
+        "GRANT SELECT ON performance_schema.log_status TO '{MYSQL_CDC_USER}'@'%'"
     )).await.unwrap();
     conn.query_drop("FLUSH PRIVILEGES").await.unwrap();
 }

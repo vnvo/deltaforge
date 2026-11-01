@@ -114,7 +114,8 @@ The gauge uses a numeric encoding so operators can alert on any non-running stat
 
 | Value | State | Meaning |
 |-------|-------|---------|
-| `1.0` | **running** | Pipeline is active and processing events |
+| `1.0` | **running** | The current run's capture boundary is fixed and durable (`capture_start`): changes committed from now on are captured |
+| `0.25` | **starting** | Started, but the capture boundary is not fixed yet (start-up checks, retries, or a snapshot whose generation is not yet completed); changes committed now may not be captured |
 | `0.5` | **paused** | Source connection alive; event processing suspended |
 | `0.0` | **stopped** | Disconnected from source; checkpoint saved; resumable |
 | `< 0` | **failed** | Unrecoverable error (position lost, server changed, etc.) |
@@ -124,6 +125,7 @@ Example PromQL:
 ```promql
 # Count pipelines in each state
 count(deltaforge_pipeline_status == 1)    # running
+count(deltaforge_pipeline_status == 0.25) # starting
 count(deltaforge_pipeline_status == 0.5) # paused
 count(deltaforge_pipeline_status == 0)   # stopped
 count(deltaforge_pipeline_status < 0)    # failed

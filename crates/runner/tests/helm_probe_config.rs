@@ -1,8 +1,9 @@
 //! Config regression: the Helm chart must keep `/health` as the liveness probe and
-//! `/ready` as the readiness probe. These endpoints now both return 503 when a pipeline
-//! has failed (liveness -> pod restart by Kubernetes; readiness -> removal from Service
-//! endpoints), so a chart edit that repoints or drops either probe would silently break
-//! failure surfacing. Hermetic: reads the chart file, no cluster.
+//! `/ready` as the readiness probe. `/health` returns 200 while the process is alive;
+//! `/ready` returns 503 while a pipeline is failed, blocked or starting (removal from
+//! Service endpoints, never a restart), so a chart edit that repoints, drops or adds a
+//! probe would silently break failure surfacing or restart a snapshotting pod.
+//! Hermetic: reads the chart file, no cluster.
 
 use std::path::PathBuf;
 
@@ -34,4 +35,20 @@ fn helm_readiness_probe_targets_ready() {
         Some("/ready"),
         "readiness probe must GET /ready (values.yaml probes.readiness.httpGet.path)"
     );
+}
+
+/// Readiness may stay false for a whole initial snapshot (a starting
+/// pipeline): no probe may turn that into a restart. Only liveness restarts a
+/// pod, and it must not use `/ready`; a startup probe on `/ready` would kill
+/// a pod that is snapshotting.
+#[test]
+fn helm_no_restarting_probe_targets_ready() {
+    let v = values_yaml();
+    for probe in ["liveness", "startup"] {
+        assert_ne!(
+            v["probes"][probe]["httpGet"]["path"].as_str(),
+            Some("/ready"),
+            "{probe} probe must not GET /ready"
+        );
+    }
 }

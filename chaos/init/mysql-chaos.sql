@@ -26,5 +26,5 @@ INSERT INTO customers (name, email, balance) VALUES
 
 -- CDC replication user
 CREATE USER IF NOT EXISTS 'cdc_user'@'%' IDENTIFIED BY 'cdc_password';
-GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'cdc_user'@'%';
+GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT, BACKUP_ADMIN ON *.* TO 'cdc_user'@'%';
 FLUSH PRIVILEGES;
