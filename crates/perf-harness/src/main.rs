@@ -174,6 +174,13 @@ struct Args {
     /// point of the grid.
     #[arg(long, value_delimiter = ',')]
     scale_points: Vec<String>,
+    /// Scaling study: run each DeltaForge run once per selection-cache table
+    /// bound given here, interleaved within each repetition (the order
+    /// alternates), on a measurement build (`perf-phases`) that must report
+    /// the bound before the run measures
+    /// (`docs/design/selection-cache-diagnosis.md`).
+    #[arg(long, value_delimiter = ',')]
+    scale_cache_tables: Vec<usize>,
     /// Count the DeltaForge runner's user-space instructions and cycles
     /// with `perf stat` for 30 s from 15 s into each scale run's load
     /// (hybrid CPUs: the scaled per-core-type counts are summed).
@@ -1288,6 +1295,8 @@ struct Process {
     binary: PathBuf,
     dir: PathBuf,
     state_dsn: Option<String>,
+    /// Extra environment (a measurement build's settings).
+    env: Vec<(String, String)>,
     /// The running launch (none while down).
     child: tokio::sync::Mutex<Option<tokio::process::Child>>,
     /// The runner's own process: the one listening on the API address (the
@@ -1393,6 +1402,7 @@ async fn launch(
     dir: &Path,
     state_dsn: Option<&str>,
     stderr: &Path,
+    env: &[(String, String)],
 ) -> Result<(tokio::process::Child, u32, PathBuf)> {
     std::fs::create_dir_all(dir)?;
     ports_free().await?;
@@ -1414,6 +1424,7 @@ async fn launch(
                 .unwrap_or_else(|| "warn".into()),
         )
         .env("_RJEM_MALLOC_CONF", "stats_print:true")
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .stdout(std::fs::File::create(stderr.with_extension("out"))?)
         .stderr(std::fs::File::create(stderr)?)
         .kill_on_drop(true)
@@ -1460,12 +1471,24 @@ impl Process {
         dir: &Path,
         state_dsn: Option<&str>,
     ) -> Result<Process> {
+        Self::start_with_env(binary, dir, state_dsn, Vec::new()).await
+    }
+
+    /// [`Self::start`] with extra environment, kept for every relaunch.
+    async fn start_with_env(
+        binary: &Path,
+        dir: &Path,
+        state_dsn: Option<&str>,
+        env: Vec<(String, String)>,
+    ) -> Result<Process> {
         let stderr = dir.join("stderr.log");
-        let (child, pid, exe) = launch(binary, dir, state_dsn, &stderr).await?;
+        let (child, pid, exe) =
+            launch(binary, dir, state_dsn, &stderr, &env).await?;
         Ok(Process {
             binary: binary.to_path_buf(),
             dir: dir.to_path_buf(),
             state_dsn: state_dsn.map(str::to_string),
+            env,
             child: tokio::sync::Mutex::new(Some(child)),
             pid: AtomicU32::new(pid),
             exe: std::sync::Mutex::new(exe),
@@ -1577,9 +1600,14 @@ impl Process {
     async fn up(&self) -> Result<()> {
         let n = self.launches.fetch_add(1, Ordering::SeqCst) + 1;
         let stderr = self.dir.join(format!("stderr-{n}.log"));
-        let (child, pid, exe) =
-            launch(&self.binary, &self.dir, self.state_dsn.as_deref(), &stderr)
-                .await?;
+        let (child, pid, exe) = launch(
+            &self.binary,
+            &self.dir,
+            self.state_dsn.as_deref(),
+            &stderr,
+            &self.env,
+        )
+        .await?;
         *self.child.lock().await = Some(child);
         self.pid.store(pid, Ordering::SeqCst);
         *self.exe.lock().unwrap() = exe;
@@ -3333,6 +3361,7 @@ async fn main() -> Result<()> {
                 warmup: args.warmup,
                 catchup: args.scale_catchup,
                 only: args.scale_points.clone(),
+                cache_tables: args.scale_cache_tables.clone(),
             };
             scale::study(
                 &plan,
@@ -3798,6 +3827,18 @@ mod tests {
         ])
         .unwrap();
         assert!(none.scale_points.is_empty());
+        assert!(none.scale_cache_tables.is_empty());
+        let caches = super::Args::try_parse_from([
+            "canonical-perf",
+            "--out",
+            "o",
+            "--scale-tables",
+            "10000",
+            "--scale-cache-tables",
+            "4096,8192",
+        ])
+        .unwrap();
+        assert_eq!(caches.scale_cache_tables, [4096, 8192]);
     }
 
     #[test]
