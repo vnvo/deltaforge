@@ -119,6 +119,7 @@ Schema history written by earlier releases is kept but not used automatically: a
 ### MySQL
 
 - `REPLICATION SLAVE, REPLICATION CLIENT ON *.*` (always).
+- `BACKUP_ADMIN ON *.*` and `SELECT ON performance_schema.log_status` for a first start without a checkpoint and without a snapshot: the capture boundary (binlog position and GTID set) is read there in one consistent query. Without them that start fails closed.
 - `SELECT, SHOW VIEW` on the captured database(s) for reads and introspection.
 - `RELOAD ON *.*` **only when an initial snapshot runs** (needed for the brief `FLUSH TABLES WITH READ LOCK` that anchors the snapshot). A CDC-only pipeline (`snapshot.mode = never`) does not need `RELOAD`.
 - Server settings enforced fail-closed at snapshot preflight: `gtid_mode = ON`, `enforce_gtid_consistency = ON`, `binlog_format = ROW`, and captured tables on InnoDB. `binlog_row_image = FULL` is recommended.
@@ -170,7 +171,7 @@ These are documented in full on [Guarantees & Correctness](guarantees.md); the s
 - **Optional sinks (`required: false`) have no in-session retry.** A failed optional sink is re-delivered only on the next restart via source replay; a chronic optional-sink outage accumulates a growing replay gap.
 - **S3 sink is at-least-once at file granularity** and requires an `AbortIncompleteMultipartUpload` bucket lifecycle policy in production to reclaim orphaned multiparts.
 - **DLQ must be enabled** (`journal.enabled: true`) to isolate poison events; without it a single unprocessable event blocks the pipeline.
-- **PostgreSQL `start_position` is not implemented** - a newly created slot always starts at the current WAL position.
+- **PostgreSQL `start_position` is not implemented** - a newly created slot always starts at its consistent point (the current WAL position when it is created).
 - **Changing a pipeline's sink set via `PATCH` is disabled.** Adding or removing a sink changes the per-sink checkpoint keys, which is not crash-safe; a `PATCH` that alters the sink set is rejected. Patches that leave the sink set unchanged are allowed. To change sinks, delete and recreate the pipeline.
 - **Deleting a pipeline is fail-closed.** Delete stops the source, cleans up its checkpoints, and only then releases the source-id claim; if checkpoint cleanup fails, the delete fails and the source id stays locked (safe: it blocks reuse rather than exposing stale checkpoints). Retry the delete once the store is reachable.
 - Cross-primary position safety at failover depends on GTID (MySQL) and slot-aware HA (PostgreSQL); see [Failover Handling](failover.md).

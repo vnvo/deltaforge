@@ -1461,6 +1461,7 @@ impl PostgresSource {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_inner(
         &self,
         tx: mpsc::Sender<SourceItem>,

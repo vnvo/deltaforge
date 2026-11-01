@@ -41,6 +41,11 @@ CREATE USER 'deltaforge'@'%' IDENTIFIED BY 'your_password';
 -- Replication privileges (required)
 GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'deltaforge'@'%';
 
+-- The capture boundary of a first start without a checkpoint and without a
+-- snapshot: the binlog position and GTID set, read together
+GRANT BACKUP_ADMIN ON *.* TO 'deltaforge'@'%';
+GRANT SELECT ON performance_schema.log_status TO 'deltaforge'@'%';
+
 -- Global RELOAD (required only when the initial snapshot runs; used for the
 -- brief FLUSH TABLES WITH READ LOCK that brackets the consistent anchor)
 GRANT RELOAD ON *.* TO 'deltaforge'@'%';
@@ -254,7 +259,7 @@ DeltaForge automatically checkpoints progress and resumes from the last position
 
 1. **GTID**: Preferred if the MySQL server has GTID enabled. Provides the most reliable resume across binlog rotations and failovers.
 2. **File:position**: Used when GTID is not available. Resumes from the exact binlog file and byte offset.
-3. **Binlog tail**: On first run with no checkpoint, starts from the current end of the binlog (no historical replay).
+3. **Capture boundary**: On first run with no checkpoint and no snapshot, the source reads the binlog position and executed GTID set together in one `performance_schema.log_status` query (MySQL documents them as consistent with each other) and persists it before the stream opens. The pipeline reports `running` only after that, with the position as `capture_start`: changes committed after it are captured, earlier ones are not (no historical replay). Every retry and restart resumes from it, never from a newer tail. Reading it needs `BACKUP_ADMIN` and `SELECT` on `performance_schema.log_status`; without them the start fails closed with a permission error, with no fallback.
 
 Checkpoints are stored using the `id` field as the key.
 
@@ -562,4 +567,4 @@ Verify grants for your user:
 SHOW GRANTS FOR 'deltaforge'@'%';
 ```
 
-Required grants include `REPLICATION SLAVE` and `REPLICATION CLIENT`.
+Required grants include `REPLICATION SLAVE` and `REPLICATION CLIENT`, plus `BACKUP_ADMIN` and `SELECT` on `performance_schema.log_status` for a first start without a checkpoint and without a snapshot.

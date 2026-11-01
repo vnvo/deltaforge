@@ -63,7 +63,7 @@ secrets:
 The chart configures liveness and readiness probes automatically:
 
 - **Liveness** (`/health`): returns 200 when healthy, 503 when a pipeline has failed. Triggers pod restart on prolonged failure.
-- **Readiness** (`/ready`): returns 200 with pipeline status JSON. Controls traffic routing.
+- **Readiness** (`/ready`): returns 200 with pipeline status JSON; 503 while a pipeline is failed, blocked by an incident, held by a recovery, or `starting` (its capture boundary not yet fixed, including for the whole of an initial snapshot). Controls traffic routing.
 
 ### Monitoring
 
