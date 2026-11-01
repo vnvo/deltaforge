@@ -70,11 +70,12 @@ Outstanding qualification: the consistency and privilege behaviour are verified 
 
 ## 6. Lifecycle
 
-- One boundary signal per runtime, created with the source handle. The manager's watcher applies it only if the runtime it was created for is still the pipeline's runtime (pointer identity) and still runs: a late signal from a stopped, failed or replaced runtime is ignored.
+- One boundary signal per runtime, created with the source handle; it is also the run's identity. The manager's watcher applies it only if the runtime it was created for is still the pipeline's runtime (pointer identity): a late signal from a stopped, failed or replaced runtime is ignored.
+- The status gauge is never written from a value computed outside the manager's exclusive lock. Every writer acting for a run (the boundary watcher, the source and coordinator monitors, registration) computes the value from the runtime's current state and sets it inside that lock, gated by the run's identity (`publish_run_status`); a failure transition (`PipelineHealth::exit`) completes before its writer takes the lock. The last writer therefore computes after every earlier transition: a `running` computed before a failure can never land after the failure's `-1`, and an old run never writes its replacement's gauge. Operator calls (pause, resume, stop) recompute from the current runtime under the same lock.
 - Cancellation during start-up leaves the boundary unpublished; the pipeline reports `stopped`.
 - A source that fails after persisting the boundary but before the stream opens reports `failed`; the next start resumes from the persisted boundary (`origin: resume`).
 
 ## 7. Tests
 
-- Core: the boundary signal (publish once, wait, idle); the status derivation; the stale-signal rule; `/ready` aggregation.
+- Core: the boundary signal (publish once, wait, idle); the status derivation; the stale-signal rule; `/ready` aggregation; a source or coordinator failure inside the boundary watcher's critical section (gauge -1, API `failed`, `/ready` 503) and an old run's writes after its replacement (none reach it).
 - End to end (MySQL and PostgreSQL, through `PipelineManager`): a one-shot hold before the boundary shows `starting`; a row written immediately after `running` is delivered; start-up retries keep `starting`; a stop while starting gives `stopped` and no late `running`; a failure between persisting the boundary and opening the stream resumes at the persisted boundary, with rows written meanwhile delivered; an idle source becomes `running`; a snapshot-mode pipeline is `starting` until its generation completes; MySQL with GTID off; a MySQL user without the `log_status` privileges fails with the typed error.
