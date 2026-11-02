@@ -408,30 +408,45 @@ const DF_COUNTERS: [&str; 25] = [
     "deltaforge_mysql_capture_kill_failures_total",
 ];
 
-async fn df_counters() -> Option<HashMap<&'static str, f64>> {
+/// DeltaForge's study counters, each summed over its label sets, and the
+/// names the runner exported. A counter is exported from its first increment
+/// on: one not exported reads 0 here, a value not read from the runner.
+type DfCounters = (HashMap<&'static str, f64>, Vec<&'static str>);
+
+async fn df_counters() -> Option<DfCounters> {
     let text = reqwest::get(format!("http://{METRICS}/metrics"))
         .await
         .ok()?
         .text()
         .await
         .ok()?;
-    Some(
-        DF_COUNTERS
-            .iter()
-            .map(|name| {
-                let v = text
-                    .lines()
-                    .filter(|l| {
-                        l.strip_prefix(name).is_some_and(|rest| {
-                            rest.starts_with('{') || rest.starts_with(' ')
-                        })
+    Some(counters_of(&text))
+}
+
+fn counters_of(text: &str) -> DfCounters {
+    let mut exported = Vec::new();
+    let values = DF_COUNTERS
+        .iter()
+        .map(|name| {
+            let lines: Vec<&str> = text
+                .lines()
+                .filter(|l| {
+                    l.strip_prefix(name).is_some_and(|rest| {
+                        rest.starts_with('{') || rest.starts_with(' ')
                     })
-                    .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
-                    .sum();
-                (*name, v)
-            })
-            .collect(),
-    )
+                })
+                .collect();
+            if !lines.is_empty() {
+                exported.push(*name);
+            }
+            let v = lines
+                .iter()
+                .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+                .sum();
+            (*name, v)
+        })
+        .collect();
+    (values, exported)
 }
 
 /// MySQL's global counters of the study.
@@ -829,7 +844,7 @@ pub async fn run(
         Sys::Dbz(c, _) => c.scale_counters(),
         Sys::Df(_) => None,
     };
-    let df0 = df_counters().await;
+    let (df0, _) = df_counters().await.unzip();
 
     // First event: a marker row (in the first active table) until one
     // arrives. Markers use the load writers' user.
@@ -1167,7 +1182,7 @@ pub async fn run(
         },
         None => Value::Null,
     };
-    let df1 = df_counters().await;
+    let (df1, df_exported) = df_counters().await.unzip();
     let (dbz1, history) = match sys {
         Sys::Dbz(c, _) => (
             c.scale_counters(),
@@ -1524,6 +1539,10 @@ pub async fn run(
         "binlog_written_bytes": binlog_written, "binlog_retained_bytes": binlog1, "binlog_peak_bytes": binlog_peak,
         "kafka_bytes_consumed": s.bytes,
         "deltaforge": df_delta, "proof_amplification": proof_amplification,
+        // The study counters the runner exported at the end (null when that
+        // scrape failed): a counter in `deltaforge` but not here was never
+        // read from the runner, so its 0 is not a measured value.
+        "deltaforge_exported": df_exported,
         "debezium": dbz_delta, "schema_history": history,
         "capacity_steps": step_results, "capacity_failed_step": capacity_stop,
     }))
@@ -2864,6 +2883,27 @@ deltaforge_mysql_connections_other{kind=\"control\"} 99
         assert_eq!(s["cuts"], 1);
         assert_eq!(s["bytes_max"], 9100.0);
         assert_eq!(window_summary(&[])["windows"], 0);
+    }
+
+    /// A counter the runner did not export reads 0 but is not listed as
+    /// exported; one it exported is, with its label sets summed.
+    #[test]
+    fn counters_name_what_the_runner_exported() {
+        let (values, exported) = counters_of(
+            "deltaforge_mysql_activation_window_deferred_total{source=\"a\"} 4\n\
+             deltaforge_mysql_activation_window_deferred_total{source=\"b\"} 6\n\
+             deltaforge_mysql_activation_window_deferred_total_extra 9\n",
+        );
+        assert_eq!(
+            exported,
+            ["deltaforge_mysql_activation_window_deferred_total"]
+        );
+        assert_eq!(
+            values["deltaforge_mysql_activation_window_deferred_total"],
+            10.0
+        );
+        assert_eq!(values["deltaforge_mysql_proof_rounds_failed_total"], 0.0);
+        assert_eq!(values.len(), DF_COUNTERS.len());
     }
 
     /// Any increase of a failure counter fails the run, named with it.
