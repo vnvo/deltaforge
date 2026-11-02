@@ -1031,14 +1031,21 @@ pub async fn run(
         conns_max =
             conns_max.max(system_connections(&mut mon).await.unwrap_or(0));
         rss_max = rss_max.max(sys_rss(sys, process.as_ref()));
-        if is_df && let Some(text) = df_metrics().await {
-            keep_peaks(&mut gauge_peaks, parse_gauges(&text));
+        if is_df {
+            let start = t_load.elapsed();
+            let text = df_metrics().await;
+            let end = t_load.elapsed();
+            if let Some(text) = &text {
+                keep_peaks(&mut gauge_peaks, parse_gauges(text));
+            }
             write_sample(
                 &mut samples,
-                t_load,
-                "load",
-                sys_cpu(sys, process.as_ref()),
-                &text,
+                sample_line(
+                    (start, end),
+                    "load",
+                    sys_cpu(sys, process.as_ref()),
+                    text.as_deref(),
+                ),
             );
         }
         binlog_peak =
@@ -1130,14 +1137,21 @@ pub async fn run(
         conns_max =
             conns_max.max(system_connections(&mut mon).await.unwrap_or(0));
         rss_max = rss_max.max(sys_rss(sys, process.as_ref()));
-        if is_df && let Some(text) = df_metrics().await {
-            keep_peaks(&mut gauge_peaks, parse_gauges(&text));
+        if is_df {
+            let start = t_load.elapsed();
+            let text = df_metrics().await;
+            let end = t_load.elapsed();
+            if let Some(text) = &text {
+                keep_peaks(&mut gauge_peaks, parse_gauges(text));
+            }
             write_sample(
                 &mut samples,
-                t_load,
-                "drain",
-                sys_cpu(sys, process.as_ref()),
-                &text,
+                sample_line(
+                    (start, end),
+                    "drain",
+                    sys_cpu(sys, process.as_ref()),
+                    text.as_deref(),
+                ),
             );
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -2061,33 +2075,44 @@ fn metric_lines(text: &str) -> Vec<(String, f64)> {
     out
 }
 
-/// One line of `samples.jsonl`: when (ms on the load clock, and the run's
-/// phase), the runner's CPU seconds so far, and the sampled series. A
-/// scrape takes time: a value is as of some moment within its sampling
-/// interval (250 ms).
-fn write_sample(
-    w: &mut Option<std::io::BufWriter<std::fs::File>>,
-    t_load: Instant,
+/// One line of `samples.jsonl`. `scrape` is when the scrape started and
+/// ended on the load clock: a value is as of some moment between the two,
+/// and consecutive scrapes are 250 ms plus the loop's other work apart, so
+/// an interval's uncertainty comes from these times, not a fixed period.
+/// `cpu_s` (the runner's CPU seconds so far) is read after the scrape. A
+/// failed scrape is a line with `scrape_failed` and no values, so a gap is
+/// recorded, not hidden.
+fn sample_line(
+    scrape: (Duration, Duration),
     phase: &str,
     cpu_s: f64,
-    text: &str,
+    text: Option<&str>,
+) -> Value {
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    let mut line = json!({"t_start_ms": ms(scrape.0), "t_end_ms": ms(scrape.1),
+                          "phase": phase, "cpu_s": cpu_s});
+    match text {
+        Some(text) => {
+            let values: serde_json::Map<String, Value> = metric_lines(text)
+                .into_iter()
+                .filter(|(k, _)| SAMPLED.iter().any(|p| k.starts_with(p)))
+                .map(|(k, v)| (k, json!(v)))
+                .collect();
+            line["values"] = Value::Object(values);
+        }
+        None => line["scrape_failed"] = json!(true),
+    }
+    line
+}
+
+fn write_sample(
+    w: &mut Option<std::io::BufWriter<std::fs::File>>,
+    line: Value,
 ) {
     use std::io::Write;
-    let Some(w) = w.as_mut() else {
-        return;
-    };
-    let values: serde_json::Map<String, Value> = metric_lines(text)
-        .into_iter()
-        .filter(|(k, _)| SAMPLED.iter().any(|p| k.starts_with(p)))
-        .map(|(k, v)| (k, json!(v)))
-        .collect();
-    writeln!(
-        w,
-        "{}",
-        json!({"t_ms": t_load.elapsed().as_secs_f64() * 1e3, "phase": phase,
-               "cpu_s": cpu_s, "values": values})
-    )
-    .ok();
+    if let Some(w) = w.as_mut() {
+        writeln!(w, "{line}").ok();
+    }
 }
 
 /// Keep each gauge's largest sample.
@@ -2588,6 +2613,26 @@ mod tests {
             cache_limits("deltaforge_mysql_selection_cache_timelines 40\n"),
             None,
             "a default build reports no bounds"
+        );
+    }
+
+    /// A sample carries its scrape's start and end; a failed scrape is a
+    /// recorded gap, without values.
+    #[test]
+    fn samples_record_their_scrape_times_and_failures() {
+        let scrape = (Duration::from_millis(1000), Duration::from_millis(1012));
+        let text = "deltaforge_perf_selection_lookups_total{entry=\"timeline\",result=\"miss\"} 12\n\
+            deltaforge_pipeline_status{pipeline=\"p\"} 1\n";
+        assert_eq!(
+            sample_line(scrape, "load", 2.5, Some(text)),
+            json!({"t_start_ms": 1000.0, "t_end_ms": 1012.0, "phase": "load",
+                   "cpu_s": 2.5, "values": {
+                       "deltaforge_perf_selection_lookups_total{entry=\"timeline\",result=\"miss\"}": 12.0}})
+        );
+        assert_eq!(
+            sample_line(scrape, "drain", 2.5, None),
+            json!({"t_start_ms": 1000.0, "t_end_ms": 1012.0, "phase": "drain",
+                   "cpu_s": 2.5, "scrape_failed": true})
         );
     }
 

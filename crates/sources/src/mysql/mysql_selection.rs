@@ -1234,13 +1234,12 @@ async fn install(
     }
     if !wanted.is_empty() {
         crate::perf_phases::store_read("versions", wanted.len() as u64, 0);
-    }
-    if !wanted.is_empty()
-        && let Ok(read) = registry.get_versions(&wanted).await
-    {
-        for ((key, _), v) in wanted.iter().zip(read) {
-            if let Some(v) = v {
-                ctx.selection.put_version(key.backend_key(), v);
+        let _phase = crate::perf_phases::Phase::start("version_prefetch");
+        if let Ok(read) = registry.get_versions(&wanted).await {
+            for ((key, _), v) in wanted.iter().zip(read) {
+                if let Some(v) = v {
+                    ctx.selection.put_version(key.backend_key(), v);
+                }
             }
         }
     }
@@ -3015,6 +3014,105 @@ mod tests {
             assert_eq!(z.barriers().count(), 1, "the lineage barrier only");
         }
 
+        /// A timeline read reads ahead, in one batch, the version its last
+        /// proof names; a measurement build times that read
+        /// (`version_prefetch`, inside the row's `history_load`) and counts
+        /// it as one `versions` read.
+        #[cfg(feature = "perf-phases")]
+        #[test]
+        fn perf_the_version_read_ahead_is_timed_and_counted() {
+            use crate::mysql::mysql_activation::{
+                ACTIVATION_NS, append, baseline_capture_id,
+            };
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let seen =
+                crate::mysql::mysql_selection::perf_tests::perf_metrics(|| {
+                    rt.block_on(async {
+                        let backend: ArcStorageBackend =
+                            Arc::new(storage::MemoryStorageBackend::new());
+                        let mut ctx = ctx_on(backend).await;
+                        let key =
+                            ctx.registry_scope.current().unwrap().key("d", "x");
+                        let registry = ctx.schema.registry_arc();
+                        let schema =
+                            MySqlTableSchema::new(vec![MySqlColumn::new(
+                                "a", "int", "int", true, 1,
+                            )]);
+                        let version = registry
+                            .register_with_checkpoint(
+                                &key,
+                                "h1",
+                                &serde_json::to_value(&schema).unwrap(),
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                        let record = Record::new(
+                            WmPos::MysqlGtid {
+                                gtid_set: format!("{U}:1-3"),
+                            },
+                            Kind::Baseline {
+                                version,
+                                schema_hash: "h1".into(),
+                                to: WmPos::MysqlGtid {
+                                    gtid_set: format!("{U}:1-4"),
+                                },
+                                scan_digest: "s".into(),
+                                binds: None,
+                                classifier_version: CLASSIFIER_VERSION.into(),
+                            },
+                        );
+                        let stream = table_stream(&key);
+                        append(
+                            &ctx.registry_backend,
+                            &registry,
+                            &key,
+                            ACTIVATION_NS,
+                            &stream,
+                            &baseline_capture_id(
+                                &key.lineage_hash,
+                                &stream,
+                                &record,
+                            )
+                            .unwrap(),
+                            &record,
+                        )
+                        .await
+                        .unwrap();
+                        timeline(&mut ctx, &key).await.unwrap();
+                        assert!(
+                            ctx.selection
+                                .version(&key.backend_key(), version)
+                                .is_some(),
+                            "the version is read ahead"
+                        );
+                    })
+                });
+            let of = |prefix: &str| {
+                seen.iter()
+                    .filter(|l| l.starts_with(prefix))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                of("deltaforge_perf_phase_latency_seconds"),
+                [
+                    "deltaforge_perf_phase_latency_seconds phase=history_load 1",
+                    "deltaforge_perf_phase_latency_seconds phase=version_prefetch 1",
+                ]
+            );
+            assert_eq!(
+                of("deltaforge_perf_selection_store_reads_total"),
+                [
+                    "deltaforge_perf_selection_store_reads_total read=history 1",
+                    "deltaforge_perf_selection_store_reads_total read=versions 1",
+                ]
+            );
+        }
+
         /// A record naming a version the registry does not have fails its
         /// table exactly as the table's own read does, and caches nothing;
         /// the batch's other tables are unaffected.
@@ -3149,9 +3247,10 @@ mod perf_tests {
         );
     }
 
-    /// The counters a measurement build exports, as `name labels value`.
+    /// The counters a measurement build exports, as `name labels value`
+    /// (a phase timing's value is its number of samples).
     #[cfg(feature = "perf-phases")]
-    fn perf_metrics(f: impl FnOnce()) -> Vec<String> {
+    pub(super) fn perf_metrics(f: impl FnOnce()) -> Vec<String> {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
         let rec = DebuggingRecorder::new();
         let snap = rec.snapshotter();
@@ -3159,7 +3258,9 @@ mod perf_tests {
         let mut seen = Vec::new();
         for (key, _, _, value) in snap.snapshot().into_vec() {
             let name = key.key().name().to_string();
-            if !name.starts_with("deltaforge_perf_selection_") {
+            if !name.starts_with("deltaforge_perf_selection_")
+                && name != "deltaforge_perf_phase_latency_seconds"
+            {
                 continue;
             }
             let labels: Vec<String> = key
@@ -3170,7 +3271,7 @@ mod perf_tests {
             let v = match value {
                 DebugValue::Counter(c) => c as f64,
                 DebugValue::Gauge(g) => g.0,
-                DebugValue::Histogram(_) => continue,
+                DebugValue::Histogram(h) => h.len() as f64,
             };
             seen.push(format!("{name} {} {v}", labels.join(",")));
         }
