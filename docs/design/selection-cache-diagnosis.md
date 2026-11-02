@@ -89,9 +89,9 @@ Every invocation below uses the harness built at `<M>`, SQLite store unless stat
 
 Tolerances, fixed now. Each metric compares the median of the five `diag` runs with the median of the five `default` runs, at each point:
 
-| Metric | Tolerance (diag minus default) | Stage 2 range over 5 reps at these points (775c6ec3) |
+| Metric | Tolerance (diag minus default) | Stage 2 range over 5 reps (775c6ec3): t10000-a50-steady, then t1000-a20-burst |
 |---|---|---|
-| Post-activation p50 (after last activation, outside catch-up) | at most +3% or +1 ms, whichever is larger | 0.2 ms (27.9-28.1) and 0.4 ms (27.9-28.3) |
+| Post-activation p50 (after last activation, outside catch-up) | at most +3% or +1 ms, whichever is larger | 0.2 ms (51.9-52.1) and 0.4 ms (27.9-28.3) |
 | Post-activation p99 | at most +3% or +2 ms, whichever is larger | 0.3 ms (87.8-88.1) and 0.4 ms (46.9-47.3) |
 | Runner CPU seconds | at most +5% | 4.9% (22.56-23.67 s) and 1.7% (9.22-9.38 s) |
 | Selection-cache evictions | within 2% (both zero at t1000-a20) | 1.1% (119,643-120,974) and 0 |
