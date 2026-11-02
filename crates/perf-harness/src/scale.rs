@@ -2023,14 +2023,22 @@ fn cache_limits(text: &str) -> Option<(f64, f64)> {
 }
 
 /// The series a run samples: the measurement build's selection-cache
-/// instrumentation and phase timings, and the cache, window and proof
-/// counters every build has.
-const SAMPLED: [&str; 5] = [
+/// instrumentation and phase timings, the cache, window and proof counters
+/// every build has, the measured-failure counters ([`DF_FAILURES`]) and the
+/// pipeline's status, so a run that exits early keeps its last values.
+const SAMPLED: [&str; 12] = [
     "deltaforge_perf_selection_",
     "deltaforge_perf_phase_latency_seconds",
     "deltaforge_mysql_selection_cache_",
     "deltaforge_mysql_activation_windows_total",
     "deltaforge_mysql_proof_requests_total",
+    DF_FAILURES[0],
+    DF_FAILURES[1],
+    DF_FAILURES[2],
+    DF_FAILURES[3],
+    DF_FAILURES[4],
+    DF_FAILURES[5],
+    "deltaforge_pipeline_status",
 ];
 
 /// The metrics text's samples as `(name{labels}, value)`: comments,
@@ -2298,6 +2306,10 @@ pub async fn study(
         .create(true)
         .append(true)
         .open(out.join("fixtures.jsonl"))?;
+    let mut warmups = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out.join("warmups.jsonl"))?;
     let base = Duration::from_secs(plan.seconds);
     let unix_s = || {
         std::time::SystemTime::now()
@@ -2418,9 +2430,7 @@ pub async fn study(
                 }
                 let (disk_low, mem_low) = monitor.take_low();
                 let failed = !matches!(&r, Ok(v) if v["ok"] == json!(true));
-                let result = r.unwrap_or_else(
-                    |e| json!({"ok": false, "error": format!("{e:#}")}),
-                );
+                let result = r.unwrap_or_else(|e| exited_early(&dir, &e));
                 let order_record = json!({
                     "seq": seq, "index": index,
                     "started_unix_s": started_unix_s, "ended_unix_s": unix_s(),
@@ -2432,7 +2442,10 @@ pub async fn study(
                     "{} {label}{cache_name} {rep_name}: {}",
                     point.id(),
                     if failed {
-                        format!("FAILED {}", result["error"])
+                        format!(
+                            "FAILED {} (measured failures: {})",
+                            result["error"], result["measured_failures"]
+                        )
                     } else {
                         format!(
                             "ready {:.2} s, first event {:.2} s, steady p99 {} ms, cpu {:.1} s",
@@ -2447,12 +2460,12 @@ pub async fn study(
                 );
                 let worker = matches!(system, crate::System::Debezium(_))
                     .then_some(generation);
-                if rep.is_some() {
-                    writeln!(
-                        runs,
-                        "{}",
-                        json!({"point": point.id(), "version": label, "rep": rep, "cache_tables": cache_tables, "worker": worker, "order": order_record, "result": result})
-                    )?;
+                // A warm-up's result is kept, in its own file: never a
+                // measured result, never in the summary or the run counts.
+                let record = json!({"point": point.id(), "version": label, "rep": rep, "cache_tables": cache_tables, "worker": worker, "order": order_record, "result": result});
+                match rep {
+                    Some(_) => writeln!(runs, "{record}")?,
+                    None => writeln!(warmups, "{}", warmup_record(record))?,
                 }
                 if failed
                     && matches!(system, crate::System::Debezium(_))
@@ -2474,6 +2487,28 @@ pub async fn study(
     }
     summary(out)?;
     outcome
+}
+
+/// A warm-up's line of `warmups.jsonl`: its full record, marked.
+fn warmup_record(mut record: Value) -> Value {
+    record["warmup"] = json!(true);
+    record
+}
+
+/// The result of a run that exited early (its system is stopped by then):
+/// the error, and the run's last sample (`samples.jsonl`, with the
+/// measured-failure counters and the pipeline status), or `null` when it
+/// failed before sampling. The run's directory keeps the runner's log.
+fn exited_early(dir: &Path, e: &anyhow::Error) -> Value {
+    let last_sample = std::fs::read_to_string(dir.join("samples.jsonl"))
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .rev()
+                .find_map(|l| serde_json::from_str::<Value>(l).ok())
+        });
+    json!({"ok": false, "error": format!("{e:#}"), "exited_early": true,
+           "last_sample": last_sample})
 }
 
 /// `scale-summary.md`: per point and system, the medians of the main
@@ -2617,23 +2652,84 @@ mod tests {
     }
 
     /// A sample carries its scrape's start and end; a failed scrape is a
-    /// recorded gap, without values.
+    /// recorded gap, without values. Samples carry the measured-failure
+    /// counters and the pipeline's status, not other series.
     #[test]
     fn samples_record_their_scrape_times_and_failures() {
         let scrape = (Duration::from_millis(1000), Duration::from_millis(1012));
         let text = "deltaforge_perf_selection_lookups_total{entry=\"timeline\",result=\"miss\"} 12\n\
-            deltaforge_pipeline_status{pipeline=\"p\"} 1\n";
+            deltaforge_mysql_activation_window_deferred_total{pipeline=\"p\",source=\"s\"} 10\n\
+            deltaforge_pipeline_status{pipeline=\"p\"} 1\n\
+            deltaforge_events_total{pipeline=\"p\"} 99\n";
         assert_eq!(
             sample_line(scrape, "load", 2.5, Some(text)),
             json!({"t_start_ms": 1000.0, "t_end_ms": 1012.0, "phase": "load",
                    "cpu_s": 2.5, "values": {
-                       "deltaforge_perf_selection_lookups_total{entry=\"timeline\",result=\"miss\"}": 12.0}})
+                       "deltaforge_perf_selection_lookups_total{entry=\"timeline\",result=\"miss\"}": 12.0,
+                       "deltaforge_mysql_activation_window_deferred_total": 10.0,
+                       "deltaforge_pipeline_status": 1.0}})
         );
         assert_eq!(
             sample_line(scrape, "drain", 2.5, None),
             json!({"t_start_ms": 1000.0, "t_end_ms": 1012.0, "phase": "drain",
                    "cpu_s": 2.5, "scrape_failed": true})
         );
+    }
+
+    /// A scratch directory for one test.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir()
+            .join(format!("perf-harness-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A run that exits early keeps its error and its last sample (with the
+    /// failure counters); one that failed before sampling keeps its error.
+    #[test]
+    fn an_early_exit_keeps_its_error_and_last_sample() {
+        let dir = scratch("early-exit");
+        let e = anyhow!("drain lost").context("the run");
+        assert_eq!(
+            exited_early(&dir, &e),
+            json!({"ok": false, "error": "the run: drain lost",
+                   "exited_early": true, "last_sample": null})
+        );
+        std::fs::write(
+            dir.join("samples.jsonl"),
+            "{\"t_start_ms\": 1.0, \"values\": {}}\n\
+             {\"t_start_ms\": 251.0, \"values\": {\"deltaforge_pipeline_status\": -1.0}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            exited_early(&dir, &e)["last_sample"],
+            json!({"t_start_ms": 251.0, "values": {"deltaforge_pipeline_status": -1.0}})
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A warm-up's record is kept whole and marked; the summary and its run
+    /// counts take only `runs.jsonl`, never a warm-up.
+    #[test]
+    fn warm_ups_are_kept_but_never_measured() {
+        let record = json!({"point": "t1-a1-steady-o0", "version": "diag",
+                            "rep": null, "result": {"ok": false, "missing": 0}});
+        let marked = warmup_record(record.clone());
+        assert_eq!(marked["warmup"], json!(true));
+        assert_eq!(marked["result"], record["result"]);
+        let dir = scratch("warm-ups");
+        let measured = json!({"point": "t1-a1-steady-o0", "version": "diag",
+                              "rep": 0, "result": {"ok": true}});
+        std::fs::write(dir.join("runs.jsonl"), format!("{measured}\n"))
+            .unwrap();
+        std::fs::write(dir.join("warmups.jsonl"), format!("{marked}\n"))
+            .unwrap();
+        summary(&dir).unwrap();
+        let md = std::fs::read_to_string(dir.join("scale-summary.md")).unwrap();
+        assert!(md.contains("| t1-a1-steady-o0 | diag | 1/1 |"), "{md}");
+        assert!(md.contains("Failed runs:\n\n- none\n"), "{md}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
