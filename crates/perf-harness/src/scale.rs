@@ -691,6 +691,7 @@ pub async fn run(
     dir: &Path,
     base: Duration,
     catchup_phase: bool,
+    cache_tables: Option<usize>,
 ) -> Result<Value> {
     std::fs::create_dir_all(dir)?;
     let name = format!("s-{tag}");
@@ -751,12 +752,18 @@ pub async fn run(
         Some(db) => infra.state_dsn(db).await,
         None => None,
     };
+    // A measurement build's selection-cache bounds, as it reports them.
+    let mut cache_limit: Option<(f64, f64)> = None;
     let process = match sys {
         Sys::Df(binary) => {
-            let p = Process::start(
+            let env = cache_tables
+                .map(|c| vec![(ENV_CACHE_TABLES.to_string(), c.to_string())])
+                .unwrap_or_default();
+            let p = Process::start_with_env(
                 binary,
                 &dir.join("state"),
                 state_dsn.as_deref(),
+                env,
             )
             .await?;
             let spec = json!({
@@ -780,6 +787,17 @@ pub async fn run(
             )?;
             api(reqwest::Method::POST, "/pipelines", Some(&spec)).await?;
             wait_status(&name, "running").await?;
+            cache_limit = df_metrics().await.and_then(|t| cache_limits(&t));
+            // A bound asked for is measured only once the runner reports it:
+            // a default build ignores the setting.
+            if let Some(want) = cache_tables
+                && cache_limit.map(|(tables, _)| tables) != Some(want as f64)
+            {
+                bail!(
+                    "asked for a selection-cache table bound of {want}, the runner \
+                     reports {cache_limit:?}: a measurement build (perf-phases) is required"
+                );
+            }
             Some(p)
         }
         Sys::Dbz(c, profile) => {
@@ -847,6 +865,9 @@ pub async fn run(
     let offered = Arc::new(AtomicU64::new(0));
     let duration = point.duration(base);
     let t_load = Instant::now();
+    let t_load_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
     let load_end = t_load + duration;
     let counters = match (sys, process.as_ref()) {
         (Sys::Df(_), Some(p))
@@ -955,6 +976,13 @@ pub async fn run(
     // DeltaForge's sampled gauges, each at its largest sample.
     let mut gauge_peaks: HashMap<String, f64> = HashMap::new();
     let is_df = matches!(sys, Sys::Df(_));
+    // DeltaForge's sampled series, one line per metrics scrape.
+    let mut samples = match is_df {
+        true => Some(std::io::BufWriter::new(std::fs::File::create(
+            dir.join("samples.jsonl"),
+        )?)),
+        false => None,
+    };
     let mut binlog_peak = binlog0;
     let mut step_results = Vec::new();
     let mut capacity_stop = None;
@@ -1003,8 +1031,22 @@ pub async fn run(
         conns_max =
             conns_max.max(system_connections(&mut mon).await.unwrap_or(0));
         rss_max = rss_max.max(sys_rss(sys, process.as_ref()));
-        if is_df && let Some(g) = df_gauges().await {
-            keep_peaks(&mut gauge_peaks, g);
+        if is_df {
+            let start = t_load.elapsed();
+            let text = df_metrics().await;
+            let end = t_load.elapsed();
+            if let Some(text) = &text {
+                keep_peaks(&mut gauge_peaks, parse_gauges(text));
+            }
+            write_sample(
+                &mut samples,
+                sample_line(
+                    (start, end),
+                    "load",
+                    sys_cpu(sys, process.as_ref()),
+                    text.as_deref(),
+                ),
+            );
         }
         binlog_peak =
             binlog_peak.max(binlog_bytes(&mut mon).await.unwrap_or(0));
@@ -1095,8 +1137,22 @@ pub async fn run(
         conns_max =
             conns_max.max(system_connections(&mut mon).await.unwrap_or(0));
         rss_max = rss_max.max(sys_rss(sys, process.as_ref()));
-        if is_df && let Some(g) = df_gauges().await {
-            keep_peaks(&mut gauge_peaks, g);
+        if is_df {
+            let start = t_load.elapsed();
+            let text = df_metrics().await;
+            let end = t_load.elapsed();
+            if let Some(text) = &text {
+                keep_peaks(&mut gauge_peaks, parse_gauges(text));
+            }
+            write_sample(
+                &mut samples,
+                sample_line(
+                    (start, end),
+                    "drain",
+                    sys_cpu(sys, process.as_ref()),
+                    text.as_deref(),
+                ),
+            );
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -1219,6 +1275,7 @@ pub async fn run(
             dir.join("phases.json"),
             serde_json::to_vec_pretty(&json!({
                 "load_s": t_load_end.duration_since(t_load).as_secs_f64(),
+                "load_start_unix_ms": t_load_unix_ms,
                 "stopped_ms": markers(stopped_at), "resumed_ms": markers(resumed_at),
                 "activated_ms": activated.iter().map(|(t, at)| (t.to_string(), json!(ms(*at)))).collect::<serde_json::Map<_, _>>(),
             }))?,
@@ -1446,6 +1503,7 @@ pub async fn run(
         "gtid_start": gtid_start,
         "datadir_bytes_before": datadir_before, "datadir_bytes_after": datadir_after,
         "gauge_peaks": gauge_peaks,
+        "cache_limit": cache_limit.map(|(tables, bytes)| json!({"tables": tables, "bytes": bytes})),
         "store_statements": store_statements,
         "latency_steady_ms": quantiles(steady),
         "latency_activation_ms": quantiles(activation),
@@ -1934,14 +1992,127 @@ fn parse_gauges(text: &str) -> HashMap<String, f64> {
     out
 }
 
-async fn df_gauges() -> Option<HashMap<String, f64>> {
-    let text = reqwest::get(format!("http://{METRICS}/metrics"))
+/// The runner's metrics text.
+async fn df_metrics() -> Option<String> {
+    reqwest::get(format!("http://{METRICS}/metrics"))
         .await
         .ok()?
         .text()
         .await
-        .ok()?;
-    Some(parse_gauges(&text))
+        .ok()
+}
+
+/// A measurement build's selection-cache bounds (tables, bytes), from
+/// `deltaforge_perf_selection_cache_limit{bound}`; `None` from a default
+/// build.
+fn cache_limits(text: &str) -> Option<(f64, f64)> {
+    let mut tables = None;
+    let mut bytes = None;
+    for (key, v) in metric_lines(text) {
+        match key.as_str() {
+            "deltaforge_perf_selection_cache_limit{bound=\"tables\"}" => {
+                tables = Some(v)
+            }
+            "deltaforge_perf_selection_cache_limit{bound=\"bytes\"}" => {
+                bytes = Some(v)
+            }
+            _ => {}
+        }
+    }
+    Some((tables?, bytes?))
+}
+
+/// The series a run samples: the measurement build's selection-cache
+/// instrumentation and phase timings, and the cache, window and proof
+/// counters every build has.
+const SAMPLED: [&str; 5] = [
+    "deltaforge_perf_selection_",
+    "deltaforge_perf_phase_latency_seconds",
+    "deltaforge_mysql_selection_cache_",
+    "deltaforge_mysql_activation_windows_total",
+    "deltaforge_mysql_proof_requests_total",
+];
+
+/// The metrics text's samples as `(name{labels}, value)`: comments,
+/// histogram buckets and quantiles left out, and the `pipeline` and
+/// `source` labels dropped (a run has one of each).
+fn metric_lines(text: &str) -> Vec<(String, f64)> {
+    let mut out = Vec::new();
+    for l in text.lines() {
+        if l.starts_with('#')
+            || l.contains("_bucket")
+            || l.contains("quantile=")
+        {
+            continue;
+        }
+        let Some((series, v)) = l.rsplit_once(' ') else {
+            continue;
+        };
+        let Ok(v) = v.parse::<f64>() else {
+            continue;
+        };
+        let key = match series.split_once('{') {
+            Some((name, labels)) => {
+                let kept: Vec<&str> = labels
+                    .trim_end_matches('}')
+                    .split(',')
+                    .filter(|l| {
+                        !l.is_empty()
+                            && !l.starts_with("pipeline=")
+                            && !l.starts_with("source=")
+                    })
+                    .collect();
+                if kept.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{name}{{{}}}", kept.join(","))
+                }
+            }
+            None => series.to_string(),
+        };
+        out.push((key, v));
+    }
+    out
+}
+
+/// One line of `samples.jsonl`. `scrape` is when the scrape started and
+/// ended on the load clock: a value is as of some moment between the two,
+/// and consecutive scrapes are 250 ms plus the loop's other work apart, so
+/// an interval's uncertainty comes from these times, not a fixed period.
+/// `cpu_s` (the runner's CPU seconds so far) is read after the scrape. A
+/// failed scrape is a line with `scrape_failed` and no values, so a gap is
+/// recorded, not hidden.
+fn sample_line(
+    scrape: (Duration, Duration),
+    phase: &str,
+    cpu_s: f64,
+    text: Option<&str>,
+) -> Value {
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    let mut line = json!({"t_start_ms": ms(scrape.0), "t_end_ms": ms(scrape.1),
+                          "phase": phase, "cpu_s": cpu_s});
+    match text {
+        Some(text) => {
+            let values: serde_json::Map<String, Value> = metric_lines(text)
+                .into_iter()
+                .filter(|(k, _)| SAMPLED.iter().any(|p| k.starts_with(p)))
+                .map(|(k, v)| (k, json!(v)))
+                .collect();
+            line["values"] = Value::Object(values);
+        }
+        None => line["scrape_failed"] = json!(true),
+    }
+    line
+}
+
+fn write_sample(
+    w: &mut Option<std::io::BufWriter<std::fs::File>>,
+    line: Value,
+) {
+    use std::io::Write;
+    if let Some(w) = w.as_mut() {
+        writeln!(w, "{line}").ok();
+    }
 }
 
 /// Keep each gauge's largest sample.
@@ -1990,6 +2161,28 @@ pub struct Plan {
     pub catchup: bool,
     /// When not empty, only the grid's points with these ids run.
     pub only: Vec<String>,
+    /// When not empty, each DeltaForge run runs once per selection-cache
+    /// table bound here (a measurement build's), interleaved within each
+    /// repetition: the order alternates between repetitions.
+    pub cache_tables: Vec<usize>,
+}
+
+/// The selection cache's table bound a measurement build (`perf-phases`)
+/// takes from its environment (`sources::perf_phases`).
+const ENV_CACHE_TABLES: &str = "DELTAFORGE_PERF_SELECTION_CACHE_TABLES";
+
+/// The table bounds of one repetition, in its order (`[None]` without a
+/// sweep): ascending in even repetitions, descending in odd ones.
+fn cache_order(cache_tables: &[usize], rep: usize) -> Vec<Option<usize>> {
+    if cache_tables.is_empty() {
+        return vec![None];
+    }
+    let mut v: Vec<Option<usize>> =
+        cache_tables.iter().map(|&c| Some(c)).collect();
+    if rep % 2 == 1 {
+        v.reverse();
+    }
+    v
 }
 
 impl Plan {
@@ -2111,6 +2304,17 @@ pub async fn study(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0.0, |d| d.as_secs_f64())
     };
+    // Each DeltaForge binary's identity, recorded with every run.
+    let shas: HashMap<&str, Option<String>> = binaries
+        .iter()
+        .map(|(label, system)| {
+            let sha = match system {
+                crate::System::DeltaForge(b) => crate::sha256(b),
+                _ => None,
+            };
+            (label.as_str(), sha)
+        })
+        .collect();
     let mut seq = 0u64;
     // The runs' place in the invocation (warm-ups included).
     let mut index = 0u64;
@@ -2156,7 +2360,18 @@ pub async fn study(
                 } else {
                     binaries.iter().rev().collect()
                 };
-            for (label, system) in order {
+            let caches = cache_order(&plan.cache_tables, rep.unwrap_or(0));
+            let order: Vec<(&String, &crate::System, Option<usize>)> = order
+                .into_iter()
+                .flat_map(|(label, system)| match system {
+                    crate::System::DeltaForge(_) => caches
+                        .iter()
+                        .map(|&c| (label, system, c))
+                        .collect::<Vec<_>>(),
+                    _ => vec![(label, system, None)],
+                })
+                .collect();
+            for (label, system, cache_tables) in order {
                 if let Some(b) = monitor.breached() {
                     outcome = Err(anyhow!(b));
                     break 'tables;
@@ -2165,7 +2380,12 @@ pub async fn study(
                 index += 1;
                 let rep_name =
                     rep.map_or("warmup".to_string(), |r| format!("r{r}"));
-                let tag = format!("{}-{label}-{rep_name}-{seq}", point.id());
+                let cache_name =
+                    cache_tables.map_or(String::new(), |c| format!("-c{c}"));
+                let tag = format!(
+                    "{}-{label}{cache_name}-{rep_name}-{seq}",
+                    point.id()
+                );
                 let dir = out.join("runs").join(&tag);
                 let sys = match system {
                     crate::System::DeltaForge(b) => Sys::Df(b),
@@ -2187,6 +2407,7 @@ pub async fn study(
                         &dir,
                         base,
                         plan.catchup,
+                        cache_tables,
                     ),
                 )
                 .await;
@@ -2205,9 +2426,10 @@ pub async fn study(
                     "started_unix_s": started_unix_s, "ended_unix_s": unix_s(),
                     "disk_low_gib": disk_low, "mem_low_gib": mem_low,
                     "connect_worker_idle": matches!(system, crate::System::DeltaForge(_)) && connect.is_some(),
+                    "binary_sha256": shas.get(label.as_str()).cloned().flatten(),
                 });
                 eprintln!(
-                    "{} {label} {rep_name}: {}",
+                    "{} {label}{cache_name} {rep_name}: {}",
                     point.id(),
                     if failed {
                         format!("FAILED {}", result["error"])
@@ -2229,7 +2451,7 @@ pub async fn study(
                     writeln!(
                         runs,
                         "{}",
-                        json!({"point": point.id(), "version": label, "rep": rep, "worker": worker, "order": order_record, "result": result})
+                        json!({"point": point.id(), "version": label, "rep": rep, "cache_tables": cache_tables, "worker": worker, "order": order_record, "result": result})
                     )?;
                 }
                 if failed
@@ -2347,6 +2569,73 @@ fn summary(out: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Table bounds interleave within each repetition: the order
+    /// alternates, so neither bound always runs first.
+    #[test]
+    fn cache_bounds_alternate_their_order_between_repetitions() {
+        assert_eq!(cache_order(&[], 0), [None]);
+        assert_eq!(cache_order(&[4096, 8192], 0), [Some(4096), Some(8192)]);
+        assert_eq!(cache_order(&[4096, 8192], 1), [Some(8192), Some(4096)]);
+        assert_eq!(cache_order(&[4096, 8192], 2), [Some(4096), Some(8192)]);
+    }
+
+    /// The sampled series keep their own labels, drop the run's pipeline
+    /// and source, and leave out comments, buckets and quantiles; the
+    /// bounds come only from a measurement build.
+    #[test]
+    fn metrics_lines_and_bounds_parse() {
+        let text = "# TYPE x counter\n\
+            deltaforge_perf_selection_lookups_total{entry=\"timeline\",result=\"miss\"} 12\n\
+            deltaforge_mysql_selection_cache_evictions_total{pipeline=\"p\",source=\"s\"} 3\n\
+            deltaforge_perf_phase_latency_seconds{phase=\"history_load\",quantile=\"0.5\"} 0.1\n\
+            deltaforge_perf_phase_latency_seconds_sum{phase=\"history_load\"} 1.5\n\
+            deltaforge_perf_selection_cache_limit{bound=\"tables\"} 8192\n\
+            deltaforge_perf_selection_cache_limit{bound=\"bytes\"} 268435456\n";
+        let lines = metric_lines(text);
+        assert_eq!(
+            lines,
+            [
+                (
+                    "deltaforge_perf_selection_lookups_total{entry=\"timeline\",result=\"miss\"}".to_string(),
+                    12.0
+                ),
+                ("deltaforge_mysql_selection_cache_evictions_total".to_string(), 3.0),
+                (
+                    "deltaforge_perf_phase_latency_seconds_sum{phase=\"history_load\"}".to_string(),
+                    1.5
+                ),
+                ("deltaforge_perf_selection_cache_limit{bound=\"tables\"}".to_string(), 8192.0),
+                ("deltaforge_perf_selection_cache_limit{bound=\"bytes\"}".to_string(), 268435456.0),
+            ]
+        );
+        assert_eq!(cache_limits(text), Some((8192.0, 268435456.0)));
+        assert_eq!(
+            cache_limits("deltaforge_mysql_selection_cache_timelines 40\n"),
+            None,
+            "a default build reports no bounds"
+        );
+    }
+
+    /// A sample carries its scrape's start and end; a failed scrape is a
+    /// recorded gap, without values.
+    #[test]
+    fn samples_record_their_scrape_times_and_failures() {
+        let scrape = (Duration::from_millis(1000), Duration::from_millis(1012));
+        let text = "deltaforge_perf_selection_lookups_total{entry=\"timeline\",result=\"miss\"} 12\n\
+            deltaforge_pipeline_status{pipeline=\"p\"} 1\n";
+        assert_eq!(
+            sample_line(scrape, "load", 2.5, Some(text)),
+            json!({"t_start_ms": 1000.0, "t_end_ms": 1012.0, "phase": "load",
+                   "cpu_s": 2.5, "values": {
+                       "deltaforge_perf_selection_lookups_total{entry=\"timeline\",result=\"miss\"}": 12.0}})
+        );
+        assert_eq!(
+            sample_line(scrape, "drain", 2.5, None),
+            json!({"t_start_ms": 1000.0, "t_end_ms": 1012.0, "phase": "drain",
+                   "cpu_s": 2.5, "scrape_failed": true})
+        );
+    }
+
     #[test]
     fn a_point_list_selects_exactly_its_points() {
         let plan = |only: &[&str]| Plan {
@@ -2361,6 +2650,7 @@ mod tests {
             warmup: true,
             catchup: true,
             only: only.iter().map(|s| s.to_string()).collect(),
+            cache_tables: Vec::new(),
         };
         let ids = |p: &Plan, t| -> Vec<String> {
             p.points(t).iter().map(|p| p.id()).collect()

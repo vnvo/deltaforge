@@ -37,6 +37,9 @@ serial     scale-harness/ci_tier            -p scale-harness --test ci_tier
 serial     scale-harness/live_ttfce         -p scale-harness --test live_ttfce
 
 # Live suites, run concurrently
+# The measurement build's selection-cache override and instrumentation
+# (`perf-phases`; default builds are covered by the workspace step).
+parallel   sources/lib-perf-phases          -p sources --lib --features perf-phases -- --test-threads=1 perf_
 # The PostgreSQL queue contract needs the serial-pg lane's DSN.
 parallel   sources/lib                      -p sources --lib -- --include-ignored --test-threads=1 --skip pg_queue_
 # The S3 behavior DeltaForge depends on, against the pinned S3 test server.

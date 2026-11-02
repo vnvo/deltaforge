@@ -250,8 +250,27 @@ impl Default for Caches {
 impl Caches {
     /// The source's caches, metered under its labels.
     pub(crate) fn new(pipeline: &str, source: &str) -> Self {
+        Self::new_with(pipeline, source, |name| std::env::var(name).ok())
+    }
+
+    /// [`Self::new`] with `var` for the process environment. Bounds: a
+    /// test's, else a measurement build's from `var` (perf-phases; a default
+    /// build ignores it), else the code's.
+    fn new_with(
+        pipeline: &str,
+        source: &str,
+        var: impl Fn(&str) -> Option<String>,
+    ) -> Self {
         let (tables, bytes) = crate::stream_probe::selection_cache_limits()
+            .or_else(|| {
+                crate::perf_phases::cache_limits_override(
+                    var,
+                    SELECTION_CACHE_ENTRIES,
+                    SELECTION_CACHE_BYTES,
+                )
+            })
             .unwrap_or((SELECTION_CACHE_ENTRIES, SELECTION_CACHE_BYTES));
+        crate::perf_phases::cache_limits(tables, bytes);
         let labels = [
             ("pipeline", pipeline.to_string()),
             ("source", source.to_string()),
@@ -343,6 +362,11 @@ impl Caches {
         let Some((_, (cached, b))) = self.entries.pop_lru() else {
             return false;
         };
+        crate::perf_phases::cache_eviction(match &cached {
+            Cached::Timeline(..) => "timeline",
+            Cached::Selection(_) => "selection",
+            Cached::Version(_) => "version",
+        });
         self.forget(cached, b);
         self.meters.evictions.increment(1);
         true
@@ -1078,8 +1102,10 @@ pub(crate) async fn timeline(
 ) -> SourceResult<Arc<Timeline>> {
     let k = key.backend_key();
     if let Some(t) = ctx.selection.timeline(&k) {
+        crate::perf_phases::cache_lookup("timeline", true);
         return Ok(t);
     }
+    crate::perf_phases::cache_lookup("timeline", false);
     let mut keys = vec![key.clone()];
     if let Ok(scope) = ctx.registry_scope.current() {
         let room = ctx.selection.batch_room();
@@ -1097,7 +1123,7 @@ pub(crate) async fn timeline(
         }
     }
     let _phase = crate::perf_phases::Phase::start("history_load");
-    let mine = install(ctx, &keys, |k| k == key).await?;
+    let mine = install(ctx, &keys, |k| k == key, "history").await?;
     mine.expect("the missed table is read")
 }
 
@@ -1119,7 +1145,8 @@ pub(crate) async fn load_timelines(ctx: &mut RunCtx, keys: &[SchemaKey]) {
     if missing.is_empty() {
         return;
     }
-    let _ = install(ctx, &missing, |_| false).await;
+    let _phase = crate::perf_phases::Phase::start("history_prefetch");
+    let _ = install(ctx, &missing, |_| false, "history_prefetch").await;
 }
 
 /// Read `keys`' histories (those `alone` names read alone if their batch
@@ -1129,6 +1156,7 @@ async fn install(
     ctx: &mut RunCtx,
     keys: &[SchemaKey],
     alone: impl Fn(&SchemaKey) -> bool,
+    read_kind: &'static str,
 ) -> SourceResult<Option<SourceResult<Arc<Timeline>>>> {
     use super::mysql_history::Loaded;
     let registry = ctx.schema.registry_arc();
@@ -1142,6 +1170,16 @@ async fn install(
     )
     .await
     .map_err(timeline_error)?;
+    crate::perf_phases::store_read(
+        read_kind,
+        keys.len() as u64,
+        read.iter()
+            .map(|l| match l {
+                Loaded::Ok { table, .. } => table.bytes,
+                _ => 0,
+            })
+            .sum(),
+    );
     let mut mine = None;
     for (key, loaded) in keys.iter().zip(read) {
         let outcome = match loaded {
@@ -1194,12 +1232,14 @@ async fn install(
             wanted.push((key.clone(), v));
         }
     }
-    if !wanted.is_empty()
-        && let Ok(read) = registry.get_versions(&wanted).await
-    {
-        for ((key, _), v) in wanted.iter().zip(read) {
-            if let Some(v) = v {
-                ctx.selection.put_version(key.backend_key(), v);
+    if !wanted.is_empty() {
+        crate::perf_phases::store_read("versions", wanted.len() as u64, 0);
+        let _phase = crate::perf_phases::Phase::start("version_prefetch");
+        if let Ok(read) = registry.get_versions(&wanted).await {
+            for ((key, _), v) in wanted.iter().zip(read) {
+                if let Some(v) = v {
+                    ctx.selection.put_version(key.backend_key(), v);
+                }
             }
         }
     }
@@ -1303,8 +1343,16 @@ async fn loaded_cached(
     version: i32,
 ) -> SourceResult<(Arc<LoadedSchema>, MySqlTableSchema)> {
     match ctx.selection.version(&key.backend_key(), version) {
-        Some(v) => loaded_from(&v, version),
-        None => loaded(ctx.schema.registry(), key, version).await,
+        Some(v) => {
+            crate::perf_phases::cache_lookup("version", true);
+            loaded_from(&v, version)
+        }
+        None => {
+            crate::perf_phases::cache_lookup("version", false);
+            crate::perf_phases::store_read("version", 1, 0);
+            let _phase = crate::perf_phases::Phase::start("version_load");
+            loaded(ctx.schema.registry(), key, version).await
+        }
     }
 }
 
@@ -1405,8 +1453,10 @@ pub(crate) async fn select_for_rows(
             let decisive = decisive.unwrap_or_default();
             let cache_key = (key.backend_key(), decisive, sig_digest);
             if let Some(hit) = ctx.selection.selection(&cache_key) {
+                crate::perf_phases::cache_lookup("selection", true);
                 return Ok(hit);
             }
+            crate::perf_phases::cache_lookup("selection", false);
             let (loaded, schema) = loaded_cached(ctx, &key, version).await?;
             // The proven version comes from authoritative complete-schema
             // evidence; it must not contradict the TableMap.
@@ -2964,6 +3014,105 @@ mod tests {
             assert_eq!(z.barriers().count(), 1, "the lineage barrier only");
         }
 
+        /// A timeline read reads ahead, in one batch, the version its last
+        /// proof names; a measurement build times that read
+        /// (`version_prefetch`, inside the row's `history_load`) and counts
+        /// it as one `versions` read.
+        #[cfg(feature = "perf-phases")]
+        #[test]
+        fn perf_the_version_read_ahead_is_timed_and_counted() {
+            use crate::mysql::mysql_activation::{
+                ACTIVATION_NS, append, baseline_capture_id,
+            };
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let seen =
+                crate::mysql::mysql_selection::perf_tests::perf_metrics(|| {
+                    rt.block_on(async {
+                        let backend: ArcStorageBackend =
+                            Arc::new(storage::MemoryStorageBackend::new());
+                        let mut ctx = ctx_on(backend).await;
+                        let key =
+                            ctx.registry_scope.current().unwrap().key("d", "x");
+                        let registry = ctx.schema.registry_arc();
+                        let schema =
+                            MySqlTableSchema::new(vec![MySqlColumn::new(
+                                "a", "int", "int", true, 1,
+                            )]);
+                        let version = registry
+                            .register_with_checkpoint(
+                                &key,
+                                "h1",
+                                &serde_json::to_value(&schema).unwrap(),
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                        let record = Record::new(
+                            WmPos::MysqlGtid {
+                                gtid_set: format!("{U}:1-3"),
+                            },
+                            Kind::Baseline {
+                                version,
+                                schema_hash: "h1".into(),
+                                to: WmPos::MysqlGtid {
+                                    gtid_set: format!("{U}:1-4"),
+                                },
+                                scan_digest: "s".into(),
+                                binds: None,
+                                classifier_version: CLASSIFIER_VERSION.into(),
+                            },
+                        );
+                        let stream = table_stream(&key);
+                        append(
+                            &ctx.registry_backend,
+                            &registry,
+                            &key,
+                            ACTIVATION_NS,
+                            &stream,
+                            &baseline_capture_id(
+                                &key.lineage_hash,
+                                &stream,
+                                &record,
+                            )
+                            .unwrap(),
+                            &record,
+                        )
+                        .await
+                        .unwrap();
+                        timeline(&mut ctx, &key).await.unwrap();
+                        assert!(
+                            ctx.selection
+                                .version(&key.backend_key(), version)
+                                .is_some(),
+                            "the version is read ahead"
+                        );
+                    })
+                });
+            let of = |prefix: &str| {
+                seen.iter()
+                    .filter(|l| l.starts_with(prefix))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                of("deltaforge_perf_phase_latency_seconds"),
+                [
+                    "deltaforge_perf_phase_latency_seconds phase=history_load 1",
+                    "deltaforge_perf_phase_latency_seconds phase=version_prefetch 1",
+                ]
+            );
+            assert_eq!(
+                of("deltaforge_perf_selection_store_reads_total"),
+                [
+                    "deltaforge_perf_selection_store_reads_total read=history 1",
+                    "deltaforge_perf_selection_store_reads_total read=versions 1",
+                ]
+            );
+        }
+
         /// A record naming a version the registry does not have fails its
         /// table exactly as the table's own read does, and caches nothing;
         /// the batch's other tables are unaffected.
@@ -3065,5 +3214,131 @@ mod tests {
             assert_eq!(calls.len(), 1, "{calls:?}");
             assert!(calls[0].starts_with("mysql_selection.rs"), "{calls:?}");
         }
+    }
+}
+
+/// The measurement-build cache override and instrumentation
+/// (`docs/design/selection-cache-diagnosis.md`).
+#[cfg(test)]
+mod perf_tests {
+    use super::*;
+    use crate::perf_phases::{ENV_CACHE_BYTES, ENV_CACHE_TABLES};
+
+    /// An environment holding `tables` and `bytes` for the override.
+    fn env(
+        tables: Option<&'static str>,
+        bytes: Option<&'static str>,
+    ) -> impl Fn(&str) -> Option<String> {
+        move |name| match name {
+            n if n == ENV_CACHE_TABLES => tables.map(str::to_string),
+            n if n == ENV_CACHE_BYTES => bytes.map(str::to_string),
+            _ => None,
+        }
+    }
+
+    /// A default build ignores the variables: the code's bounds.
+    #[cfg(not(feature = "perf-phases"))]
+    #[test]
+    fn perf_default_builds_ignore_the_cache_override() {
+        let c = Caches::new_with("p", "s", env(Some("8"), Some("1024")));
+        assert_eq!(
+            (c.max_tables, c.max_bytes),
+            (SELECTION_CACHE_ENTRIES, SELECTION_CACHE_BYTES)
+        );
+    }
+
+    /// The counters a measurement build exports, as `name labels value`
+    /// (a phase timing's value is its number of samples).
+    #[cfg(feature = "perf-phases")]
+    pub(super) fn perf_metrics(f: impl FnOnce()) -> Vec<String> {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let rec = DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        metrics::with_local_recorder(&rec, f);
+        let mut seen = Vec::new();
+        for (key, _, _, value) in snap.snapshot().into_vec() {
+            let name = key.key().name().to_string();
+            if !name.starts_with("deltaforge_perf_selection_")
+                && name != "deltaforge_perf_phase_latency_seconds"
+            {
+                continue;
+            }
+            let labels: Vec<String> = key
+                .key()
+                .labels()
+                .map(|l| format!("{}={}", l.key(), l.value()))
+                .collect();
+            let v = match value {
+                DebugValue::Counter(c) => c as f64,
+                DebugValue::Gauge(g) => g.0,
+                DebugValue::Histogram(h) => h.len() as f64,
+            };
+            seen.push(format!("{name} {} {v}", labels.join(",")));
+        }
+        seen.sort();
+        seen
+    }
+
+    /// A measurement build takes the table bound from its environment (the
+    /// byte bound left out keeps its default), publishes both, and counts
+    /// what it evicts by entry kind.
+    #[cfg(feature = "perf-phases")]
+    #[test]
+    fn perf_a_measurement_build_takes_the_cache_override() {
+        let seen = {
+            perf_metrics(|| {
+                let mut c = Caches::new_with("p", "s", env(Some("2"), None));
+                assert_eq!(
+                    (c.max_tables, c.max_bytes),
+                    (2, SELECTION_CACHE_BYTES)
+                );
+                for t in ["a", "b", "c"] {
+                    c.seed_for_test(&SchemaKey::new(
+                        "acme",
+                        "s",
+                        "f".repeat(32),
+                        "db",
+                        t,
+                    ));
+                }
+                assert_eq!(c.timelines(), 2);
+            })
+        };
+        assert_eq!(
+            seen,
+            [
+                "deltaforge_perf_selection_cache_limit bound=bytes 268435456",
+                "deltaforge_perf_selection_cache_limit bound=tables 2",
+                "deltaforge_perf_selection_evictions_total entry=timeline 1",
+            ]
+        );
+    }
+
+    /// Lookups by entry and result, and store reads by kind (reads, tables
+    /// asked for, stored bytes installed).
+    #[cfg(feature = "perf-phases")]
+    #[test]
+    fn perf_lookups_and_store_reads_are_counted() {
+        let seen = perf_metrics(|| {
+            crate::perf_phases::cache_lookup("timeline", true);
+            crate::perf_phases::cache_lookup("timeline", false);
+            crate::perf_phases::cache_lookup("selection", false);
+            crate::perf_phases::store_read("history", 5, 4096);
+            crate::perf_phases::store_read("version", 1, 0);
+        });
+        assert_eq!(
+            seen,
+            [
+                "deltaforge_perf_selection_lookups_total entry=selection,result=miss 1",
+                "deltaforge_perf_selection_lookups_total entry=timeline,result=hit 1",
+                "deltaforge_perf_selection_lookups_total entry=timeline,result=miss 1",
+                "deltaforge_perf_selection_store_bytes_total read=history 4096",
+                "deltaforge_perf_selection_store_bytes_total read=version 0",
+                "deltaforge_perf_selection_store_reads_total read=history 1",
+                "deltaforge_perf_selection_store_reads_total read=version 1",
+                "deltaforge_perf_selection_store_tables_total read=history 5",
+                "deltaforge_perf_selection_store_tables_total read=version 1",
+            ]
+        );
     }
 }
