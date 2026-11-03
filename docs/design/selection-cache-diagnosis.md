@@ -127,3 +127,43 @@ Every run is reported with its usable post-activation seconds and rows: traffic 
 - **Conclusions:** if fewer than three runs of a point and bound are sufficient, the step reports that and draws no conclusion for that pair.
 
 **Runs:** step 1: 20; step 1b: 20; step 2: 40; step 3: 20.
+
+## 6. Fix validation plan (for review; nothing has run)
+
+The fix (branch `selection-cache-byte-budget`) removes the 4,096-timeline bound: the cache is bounded by 256 MiB of estimated memory alone, the estimate counts what entries hold at the allocator's sizes, and a load admits at most half the bound without evicting its own entries. Its measurement build takes only the byte bound (`DELTAFORGE_PERF_SELECTION_CACHE_BYTES`); the table variable of section 3 applies to `df89d2d0` builds only.
+
+**Arms**, interleaved within each repetition (order alternating), fresh state, 5 repetitions, 240 s load, the `perf-phases` builds (instrumentation overhead was within tolerance at `df89d2d0`, section 5 step 1; the fix does not change it):
+- **B:** `df89d2d0` measurement runner (`97767855`), default bounds (4,096 tables, 256 MiB).
+- **B-L:** the same runner with a table bound of 32,768 (above every active set here): the no-eviction reference, measured in the same invocation.
+- **F:** the fix's measurement runner, built once at the PR head and recorded, default bound.
+- **F-64:** F with a 64 MiB bound (byte-pressure point only).
+
+**Points:**
+| Point | Store | Active | Arms | Role |
+|---|---|---|---|---|
+| t10000-a50-steady-o0 | SQLite | 5,000 | B, B-L, F | count-limited before |
+| t40000-a20-steady-o0 | SQLite | 8,000 | B, B-L, F | count-limited before |
+| t40000-a50-burst-o0 | SQLite | 20,000 | B, B-L, F, F-64 | count-limited before; F-64 exceeds its budget |
+| t10000-a50-burst-o0 | PostgreSQL | 5,000 | B, B-L, F | the store's amplification |
+| t1000-a20-burst-o0 | SQLite | 200 | B, F | control: never count-limited |
+| t10000-a20-burst-o0 | SQLite | 2,000 | B, F | control: never count-limited |
+
+85 runs plus warm-ups. Harness change needed first (measurement tooling only): a per-arm environment and bound check, so B-L, F and F-64 run in one invocation, each arm's published bound verified before it measures.
+
+**Metrics**, per run, with the interval rules of section 4.1 and the 80-second sufficiency rule (a pair with fewer than three sufficient runs gets no conclusion):
+- post-activation latency p50 and p99 (outside catch-up), CPU cores;
+- evictions, timeline reloads, single version loads and read-ahead time per 1,000 delivered rows;
+- cold fill: time to the last activation, activation-period non-first-row p99, store statements and tables read before the last activation;
+- memory: the runner's peak RSS, and the cache's bytes and timelines gauges (maximum per run);
+- correctness, frontier, resource and deferral classification as in steps 2 and 3.
+
+**Acceptance**, fixed before running (medians of sufficient runs):
+1. **Count-limited points, F against B-L:** p50 within +3% or +1 ms, p99 within +3% or +2 ms, CPU within +5% (the step 1 tolerances). Evictions per 1,000 rows at most B-L's plus 1. A point where F still evicts at the default bound fails this rule and is reported as remaining churn, with its counters.
+2. **Count-limited points, F against B:** F's evictions and post-activation p50 are lower. (A sanity check of direction; rule 1 decides.)
+3. **Controls, F against B:** p50, p99 and CPU within the rule 1 tolerances; evictions zero in both.
+4. **Cold fill, F against B:** time to the last activation and activation-period non-first-row p99 within +5%; store statements before the last activation at most B's. Activation interference itself stays a separate open limitation; this rule only requires that the fix does not worsen it.
+5. **Memory:** F's cache bytes gauge never exceeds 256 MiB in any sample (F-64: 64 MiB). F's peak RSS is within B-L's plus 10% (both hold every active table; B-L's accounting undercounted, its memory is the reference). F-64's peak RSS is at most F's.
+6. **Byte pressure (F-64):** no latency threshold. Reported against B: its evictions, loads, latency and CPU, as the churn that remains when the active set exceeds the budget.
+7. **Invalidation:** the harness cannot inject barriers; covered by the unit and memory tests on the branch (a database barrier, a lineage barrier and a full clear at 120,000 entries, timings recorded, accounting exact, memory released after a full clear), not by these runs.
+
+Any rule that fails is reported with its data; no acceptance is claimed from a partial result.
