@@ -211,12 +211,16 @@ struct Entry {
 pub(crate) struct Admission {
     left: u64,
     first: bool,
+    /// An entry after the first did not fit.
+    refused: bool,
 }
 
 impl Admission {
-    /// Nothing more fits.
+    /// Nothing more is admitted: its room is used up, or an entry after the
+    /// first did not fit (what the load has not read yet is left for when
+    /// it is reached).
     fn spent(&self) -> bool {
-        !self.first && self.left == 0
+        self.refused || (!self.first && self.left == 0)
     }
 }
 
@@ -481,6 +485,7 @@ impl Caches {
         Admission {
             left: self.max_bytes / 2,
             first: true,
+            refused: false,
         }
     }
 
@@ -494,6 +499,8 @@ impl Caches {
         if ok {
             adm.left = adm.left.saturating_sub(cost);
             adm.first = false;
+        } else if !adm.first {
+            adm.refused = true;
         }
         ok
     }
@@ -3747,6 +3754,11 @@ mod tests {
                 "a version without its timeline's predecessors: {held:?}"
             );
             assert!(ctx.selection.bytes() <= 6 * one);
+            // The load took at most half: the older tables kept theirs.
+            for i in 0..3 {
+                let old = scope.key("old", &format!("{i}"));
+                assert_eq!(ctx.selection.held_for(&old), 1, "{i} evicted");
+            }
         }
 
         /// Nothing fits the cache: the requested table's timeline is still
@@ -3824,6 +3836,31 @@ mod tests {
                 three.len()
             );
             assert!(p3 <= p1 + p1 / 2, "{p3} bytes > 1.5 x {p1}");
+        }
+
+        /// Once a read-ahead load admits nothing more, it reads no further
+        /// statements: the rest is read when the stream reaches it.
+        #[tokio::test]
+        async fn a_read_ahead_stops_reading_once_nothing_fits() {
+            use std::sync::atomic::Ordering;
+            use storage::adapters::test_util::FaultBackend;
+            let fault = Arc::new(FaultBackend::new());
+            let backend: ArcStorageBackend = fault.clone();
+            let mut ctx = ctx_on(backend).await;
+            let batch = crate::mysql::mysql_history::BATCH_MAX_TABLES;
+            let keys = tables(&ctx, "a", 3 * batch, 2).await;
+            ctx.selection = Caches::default();
+            ctx.selection.set_limit_for_test(16 << 10);
+            let before = fault.batched_stream_reads.load(Ordering::SeqCst);
+            load_timelines(&mut ctx, &keys).await;
+            let reads =
+                fault.batched_stream_reads.load(Ordering::SeqCst) - before;
+            let cached = keys
+                .iter()
+                .filter(|k| ctx.selection.held_for(k) > 0)
+                .count();
+            assert!(cached > 0 && cached < batch, "{cached} cached");
+            assert_eq!(reads, 1, "statements read for {} tables", keys.len());
         }
 
         /// The peak of this thread's allocations while `key`'s oversized
@@ -4113,6 +4150,75 @@ mod tests {
             // A linear pass: far below this even unoptimized.
             for d in [one_db, all, cleared] {
                 assert!(d < Duration::from_secs(30), "{d:?}");
+            }
+        }
+
+        /// While a load admits, what it admitted is never evicted to make
+        /// room: an entry that would need that is left uncached. Older
+        /// entries make room first.
+        #[test]
+        fn a_load_never_evicts_its_own_entries() {
+            let mut c = Caches::default();
+            let mut read = HashMap::new();
+            let older = key(0, 99);
+            c.put_timeline(
+                older.backend_key(),
+                timeline_of(&older, 1000, &mut read),
+            );
+            let one = c.bytes();
+            let probe = key(0, 98);
+            c.put_timeline(
+                probe.backend_key(),
+                timeline_of(&probe, 1000, &mut read),
+            );
+            let each = c.bytes() - one;
+            c.invalidate(&probe);
+            // Room for the older timeline and two more.
+            c.set_limit_for_test(one + 2 * each);
+            let keys: Vec<SchemaKey> = (0..5).map(|t| key(0, t)).collect();
+            let _load = c.begin_load();
+            let admitted: Vec<bool> = keys
+                .iter()
+                .map(|k| {
+                    c.put_timeline(
+                        k.backend_key(),
+                        timeline_of(k, 1000, &mut read),
+                    )
+                    .is_some()
+                })
+                .collect();
+            c.end_load();
+            assert_eq!(c.held_for(&older), 0, "the older one made room");
+            let n = admitted.iter().take_while(|a| **a).count();
+            assert!(n >= 1 && n < keys.len(), "{admitted:?}");
+            assert!(admitted[n..].iter().all(|a| !a), "{admitted:?}");
+            for k in &keys[..n] {
+                assert_eq!(
+                    c.held_for(k),
+                    1,
+                    "evicted by its own load: {admitted:?}"
+                );
+            }
+            c.audit();
+        }
+
+        /// The bound holds whenever an insert grows the maps' buckets:
+        /// across many bounds, every insert leaves the estimate within it.
+        #[test]
+        fn the_bound_holds_when_the_maps_grow() {
+            let mut read = HashMap::new();
+            for kib in 2..160u64 {
+                let max = kib * 1024 + 37 * kib;
+                let mut c = Caches::default();
+                c.set_limit_for_test(max);
+                for t in 0..400 {
+                    let k = key(0, t);
+                    c.put_timeline(
+                        k.backend_key(),
+                        timeline_of(&k, 100, &mut read),
+                    );
+                    assert!(c.bytes() <= max, "{} > {max} at {t}", c.bytes());
+                }
             }
         }
 
