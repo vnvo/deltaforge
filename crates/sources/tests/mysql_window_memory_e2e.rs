@@ -245,24 +245,63 @@ async fn a_windows_memory_is_bounded_by_its_plan() {
 }
 
 /// The selection cache's byte estimate (what its 256 MiB bound counts)
-/// covers the memory its timelines hold, for timelines of 1, 100 and
-/// 10,000 records per table (`docs/design/mysql-mass-invalidation.md`,
-/// section 6): resident memory never exceeds the estimate, and the estimate
-/// stays within twice resident memory.
+/// covers the memory it holds (`docs/design/mysql-mass-invalidation.md`,
+/// section 6), for mixtures of timelines of 1, 100 and 10,000 records per
+/// table, shared barrier streams, selected schemas and read-ahead versions,
+/// up to 70,000 tables: resident memory never exceeds the estimate, and the
+/// estimate stays within twice resident memory. Also after a barrier
+/// invalidates half the databases and after eviction (the maps keep their
+/// buckets), and after a full clear (nothing is left).
 #[test]
 fn the_cache_estimate_covers_resident_memory() {
-    for (tables, records) in [(4096, 1), (1000, 100), (10, 10_000)] {
+    use sources::mysql::{CacheProbe, ProbeMix};
+    let mixes = [
+        (40_000, 40, 1, 12, true, true),
+        (70_000, 70, 1, 6, true, true),
+        (4_096, 1, 1, 0, false, false),
+        (1_000, 10, 100, 40, true, true),
+        (10, 1, 10_000, 12, true, true),
+    ];
+    for (tables, databases, records, columns, selections, versions) in mixes {
+        let mix = ProbeMix {
+            tables,
+            databases,
+            records,
+            columns,
+            selections,
+            versions,
+        };
         let before = held();
-        let (estimate, cache) =
-            sources::mysql::cache_memory_probe(tables, records);
-        let resident = (held() - before) as u64;
-        drop(cache);
-        let ratio = resident as f64 / estimate as f64;
+        let mut probe = CacheProbe::fill(mix);
+        let check = |probe: &CacheProbe, when: &str| {
+            let estimate = probe.estimate();
+            let resident = (held() - before).max(0) as u64;
+            let ratio = resident as f64 / estimate.max(1) as f64;
+            eprintln!(
+                "{mix:?} {when}: estimate {estimate} bytes, resident \
+                 {resident} bytes, ratio {ratio:.2}"
+            );
+            assert!(resident <= estimate, "{when}: {resident} > {estimate}");
+            assert!(
+                estimate <= 2 * resident,
+                "{when}: {estimate} > 2 x {resident}"
+            );
+        };
+        check(&probe, "filled");
+        probe.invalidate_databases(databases / 2);
+        if databases > 1 {
+            check(&probe, "after a barrier on half the databases");
+        }
+        probe.evict_to(probe.estimate() / 4);
+        check(&probe, "after eviction to a quarter");
+        probe.invalidate_all();
+        let left = (held() - before).max(0) as u64;
         eprintln!(
-            "{tables} tables of {records} records: estimate {estimate} bytes, \
-             resident {resident} bytes, ratio {ratio:.2}"
+            "{mix:?} cleared: estimate {}, resident {left}",
+            probe.estimate()
         );
-        assert!(resident <= estimate, "{resident} > {estimate}");
-        assert!(estimate <= 2 * resident, "{estimate} > 2 x {resident}");
+        assert_eq!(probe.estimate(), 0);
+        assert!(left <= 4096, "{left} bytes left after a full clear");
+        drop(probe);
     }
 }

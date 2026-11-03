@@ -32,6 +32,8 @@ pub mod snapshot_plan;
 pub mod snapshot_position;
 pub mod snapshot_probe;
 pub mod snapshot_publish;
+#[cfg(test)]
+pub(crate) mod test_alloc;
 
 /// A source's state shared with the runner: the commit policy and sink
 /// cohort the runner set before the source runs

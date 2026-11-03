@@ -32,6 +32,7 @@ mod mysql_activation;
 mod mysql_activation_window;
 mod mysql_baseline;
 mod mysql_binlog_scan;
+mod mysql_cache_cost;
 mod mysql_checkpoint_lineage;
 pub mod mysql_connections;
 pub mod mysql_control;
@@ -59,7 +60,7 @@ pub(crate) use mysql_history::{
 };
 pub use mysql_schema_loader::{LoadedSchema, MySqlSchemaLoader};
 #[doc(hidden)]
-pub use mysql_selection::cache_memory_probe;
+pub use mysql_selection::{CacheProbe, ProbeMix};
 pub(crate) use mysql_window_budget::Invalid as WindowInvalid;
 
 pub mod mysql_rotation;

@@ -44,64 +44,42 @@ impl Drop for Phase {
 // one source.
 // ---------------------------------------------------------------------------
 
-/// `DELTAFORGE_PERF_SELECTION_CACHE_TABLES`: the selection cache's table
+/// `DELTAFORGE_PERF_SELECTION_CACHE_BYTES`: the selection cache's byte
 /// bound for a measurement build.
-#[cfg_attr(not(feature = "perf-phases"), allow(dead_code))]
-pub(crate) const ENV_CACHE_TABLES: &str =
-    "DELTAFORGE_PERF_SELECTION_CACHE_TABLES";
-/// `DELTAFORGE_PERF_SELECTION_CACHE_BYTES`: its byte bound.
 #[cfg_attr(not(feature = "perf-phases"), allow(dead_code))]
 pub(crate) const ENV_CACHE_BYTES: &str =
     "DELTAFORGE_PERF_SELECTION_CACHE_BYTES";
 
-/// The selection cache's bounds a measurement build was given in its
-/// environment (`var` reads a variable; either bound may be left out: its
-/// default stays), or `None`. Always `None` without the feature: a default
-/// build ignores the variables.
+/// The selection cache's byte bound a measurement build was given in its
+/// environment (`var` reads a variable), or `None`. Always `None` without
+/// the feature: a default build ignores the variable.
 #[cfg_attr(not(feature = "perf-phases"), allow(unused_variables))]
-pub(crate) fn cache_limits_override(
+pub(crate) fn cache_bytes_override(
     var: impl Fn(&str) -> Option<String>,
-    default_tables: usize,
-    default_bytes: u64,
-) -> Option<(usize, u64)> {
+) -> Option<u64> {
     #[cfg(feature = "perf-phases")]
     {
-        let read = |name: &str| -> Option<u64> {
-            let v = var(name)?;
-            match v.trim().parse::<u64>() {
-                Ok(n) if n > 0 => Some(n),
-                _ => {
-                    tracing::error!(%name, value = %v, "ignored: not a positive number");
-                    None
-                }
+        let v = var(ENV_CACHE_BYTES)?;
+        match v.trim().parse::<u64>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => {
+                tracing::error!(name = ENV_CACHE_BYTES, value = %v, "ignored: not a positive number");
+                None
             }
-        };
-        let tables = read(ENV_CACHE_TABLES).map(|n| n as usize);
-        let bytes = read(ENV_CACHE_BYTES);
-        if tables.is_none() && bytes.is_none() {
-            return None;
         }
-        Some((
-            tables.unwrap_or(default_tables),
-            bytes.unwrap_or(default_bytes),
-        ))
     }
     #[cfg(not(feature = "perf-phases"))]
     None
 }
 
-/// Publish the bounds a cache was built with:
-/// `deltaforge_perf_selection_cache_limit{bound="tables"|"bytes"}`. A
-/// measurement harness checks them before it measures.
+/// Publish the bound a cache was built with:
+/// `deltaforge_perf_selection_cache_limit{bound="bytes"}`. A measurement
+/// harness checks it before it measures.
 #[cfg_attr(not(feature = "perf-phases"), allow(unused_variables))]
-pub(crate) fn cache_limits(tables: usize, bytes: u64) {
+pub(crate) fn cache_limit(bytes: u64) {
     #[cfg(feature = "perf-phases")]
-    {
-        metrics::gauge!("deltaforge_perf_selection_cache_limit", "bound" => "tables")
-            .set(tables as f64);
-        metrics::gauge!("deltaforge_perf_selection_cache_limit", "bound" => "bytes")
-            .set(bytes as f64);
-    }
+    metrics::gauge!("deltaforge_perf_selection_cache_limit", "bound" => "bytes")
+        .set(bytes as f64);
 }
 
 /// One lookup of a cache entry: `entry` is `timeline` (a table's validated

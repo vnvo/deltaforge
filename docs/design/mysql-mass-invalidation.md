@@ -951,13 +951,23 @@ Today it takes about 30 statements per table, about 61,000.
   - a restart (empty cache, rebuilt from the store);
   - a test that fails if a new barrier writer is added without going through
     `record_barrier`.
-- **Selection cache bounds:**
-  - 4,096 tables and 256 MiB of estimated bytes, whichever comes first;
-  - estimated bytes are the sum of encoded record sizes, the shared barrier
-    streams once each, and each loaded schema's encoded size;
-  - the defaults are validated by measuring resident memory against the
-    estimate (jemalloc) for timelines of 1, 100 and 10,000 records per
-    table.
+- **Selection cache bounds** (amended by the selection-cache fix,
+  `docs/design/selection-cache-diagnosis.md`; it was 4,096 tables and
+  256 MiB, whichever came first, and the table count capped the cache far
+  below its bytes):
+  - 256 MiB of estimated bytes, with no count of tables;
+  - estimated bytes count what each entry holds in memory at the
+    allocator's sizes (`mysql_cache_cost`): records (their stored size and
+    their vectors), the shared barrier streams once each, selected schemas
+    with their decoders, read-ahead versions' JSON trees, keys and list
+    nodes, and the maps' buckets (kept after eviction until a full clear);
+  - validated by measuring resident memory against the estimate (jemalloc)
+    for mixtures of up to 70,000 tables with selections, versions and
+    shared barrier streams, after filling, invalidation and eviction;
+  - a load (one batched read of many tables) admits at most half the bound
+    (its first timeline may take all of it), never evicts what it
+    admitted (read-ahead versions included), and reads and admits one
+    statement's tables before reading the next.
 - **Per-timeline hard limit, fail closed for rc.1:** 64 MiB of estimated
   bytes and 100,000 records per timeline. This covers the table's stream plus
   its shared barrier streams, each accounted once.
@@ -977,10 +987,12 @@ Today it takes about 30 statements per table, about 61,000.
     limit before upgrading.
 - **The cache bound, stated exactly:**
   - the cache holds at most 256 MiB of estimated bytes;
-  - transiently, one timeline load in flight adds at most 64 MiB plus one
-    record, because it stops at the limit;
-  - so the peak is at most 256 MiB + 64 MiB + one record, never an unbounded
-    oversized timeline.
+  - transiently, a load in flight adds at most one statement's read (64 MiB
+    plus one record, because it stops at the limit) and, for the table the
+    stream needs now, one read of it alone (the same limit);
+  - so the peak is at most 256 MiB + 2 x (64 MiB + one record), never an
+    unbounded oversized timeline. (Stated before the fix as 64 MiB plus one
+    record: the read alone was left out.)
   - Admission evicts least-recently-used entries until the new entry fits,
     before inserting it.
   - A test loads timelines just under and just over the limit into a full

@@ -69,7 +69,7 @@ These are hypotheses from reading the code (cited), to be measured by the harnes
 
 - **R8 Connections.** Each source's schema loader uses a `mysql_async` pool with the library default of 10 to 100 connections (no limit is set, `mysql_schema_loader.rs:118`; `mysql_async` `DEFAULT_POOL_CONSTRAINTS`), plus short-lived pools for lineage capture, health checks and binlog scans, and extra replication sessions for proofs. Twenty-five sources could open up to 2,500 control connections. Exposed by S2, S3, S6.
 - **R9 State store.** The SQLite backend serializes every operation of all 25 pipelines on one connection mutex (`crates/storage/src/sqlite.rs:3, 79`); the PostgreSQL backend is beta ([Deployment Support](../src/deployment-support.md)) and registered schemas at about 250 per second in the registry measurement (about 27 minutes for 400,000 first registrations). Schema registration also takes a process-global high-water lock (`schema_registry.rs:1162-1171`). Exposed by S1, S3, S4, S6.
-- **R10 Shared registry cache.** The process-wide registry cache (default 50,000 entries, 64 MiB) is shared by all sources; each source also keeps its resident schema cache (4,096 tables or 64 MiB) and the selection caches (4,096 entries). Hit rates under a fleet change profile are unmeasured. Exposed by S2.
+- **R10 Shared registry cache.** The process-wide registry cache (default 50,000 entries, 64 MiB) is shared by all sources; each source also keeps its resident schema cache (4,096 tables or 64 MiB) and the selection cache (256 MiB of estimated memory, no table count). Hit rates under a fleet change profile are unmeasured. Exposed by S2.
 - **R11 Server settings.** The documentation does not cover MySQL settings that matter at 400,000 tables per server (`table_open_cache`, `table_definition_cache`, `open_files_limit`, `information_schema_stats_expiry`). The harness records them and the qualification states the values used.
 
 ### 3.4 Static resource inventory
@@ -91,7 +91,7 @@ From the code on main (cited), for the reference pipeline: one MySQL source, one
 | Batches | 1 building + `max_inflight` (default 1) queued + 1 in delivery; each up to 2,000 events / 16 MiB, a whole source transaction up to 512 MiB when `respect_source_tx` | `deltaforge-config/src/lib.rs:652-664`, `coordinator.rs:1499` | yes (bytes per batch) |
 | Kafka producer | 1 per sink; librdkafka threads: main, internal, 1 per broker, plus rdkafka's polling thread (about `3 + B`); queue default 100,000 messages / 1 GiB (not set by DeltaForge), effectively one in-flight batch since each batch is awaited | `kafka.rs:249`, librdkafka defaults | yes (large default ceiling) |
 | Resident schema cache | 4,096 entries or 64 MiB **per loader**; 1 loader in use for a JSON Kafka sink, up to 3 (runner, run loop, snapshot) | `registry_scope.rs:199-209` | yes, per loader |
-| Selection cache | 4,096 entries (timelines and selections) | `mysql_selection.rs:74` | yes |
+| Selection cache | 256 MiB of estimated memory (timelines, selections, versions; no table count) | `mysql_selection.rs` (`SELECTION_CACHE_BYTES`) | yes |
 | Schema pins | about 100 B per table resolved in the lineage generation | `registry_scope.rs:195-197` | **no** |
 | `table_map` | one `TableMapEvent` per binlog table id seen in the run (ids change when MySQL reopens tables); the binlog parser keeps its own map per stream | `mysql_event.rs:191`, vendored `binlog_parser.rs:22` | **no** |
 | `drift_checked` | one entry per table checked after a failover | `mysql_failover_drift.rs:689` | by tracked tables |

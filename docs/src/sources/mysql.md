@@ -134,17 +134,26 @@ A table's schema version at its rows is chosen from its activation
 timeline: the records of its own stream and the barriers that apply to it
 (its lineage's and its database's), kept in the state store.
 
-- **Cached and bounded:** a source caches at most 4,096 tables' timelines
-  and 256 MiB of them (records, barrier streams once each, and the schemas
-  it read), whichever comes first. The bytes cover resident memory.
-  Admission evicts the least recently used entries first; an evicted table
-  is read again exactly from the store.
+- **Cached and bounded:** a source caches its tables' timelines, the
+  schemas it selected for their rows and the versions it read ahead
+  within 256 MiB of estimated memory, with no fixed number of tables: as
+  many as fit. The estimate counts what they hold in memory (records,
+  barrier streams once each, schemas with their decoders, versions' JSON,
+  keys and the maps' buckets) and covers resident memory. A table with a
+  12-column schema, its selection and its version takes about 27 KB; a
+  narrow table a few KB. Admission evicts the least recently used entries
+  first; an evicted table is read again exactly from the store.
 - **Read in batches:** a table the cache does not hold is read with the
   other uncached tables the stream is about to reach (the events an
   activation window read ahead or holds, or a short read-ahead within the
-  window's bounds), at most 256 tables per statement, each barrier stream
-  once. Known tables returning after eviction cost a few store calls per
-  batch, not per table.
+  window's bounds), at most 256 tables per statement and as many as half
+  the cache holds at the tables' average size, each barrier stream once.
+  A load reads and admits one statement's tables before it reads the
+  next, admits at most half the cache (its first table may take all of
+  it), and never evicts what it admitted. A table that does not fit is
+  still served, and read again when it is next needed. Known tables
+  returning after eviction cost a few store calls per batch, not per
+  table.
 - **Barriers:** a barrier invalidates only the cached timelines and
   selections of the tables it applies to: a database barrier, that
   database's; a lineage barrier, every table's.

@@ -2476,21 +2476,23 @@ pub(crate) mod tests {
             table_name: "items".into(),
             ..orders.clone()
         };
-        ctx.selection = Caches::with_budget_for_test(1);
+        ctx.selection = Caches::default();
         let first = select_for_rows(&mut ctx, &orders).await.unwrap();
-        // Room for one table's timeline and selection.
-        let one = ctx.selection.bytes();
-        ctx.selection.set_limits_for_test(1, one);
-        assert!(Arc::ptr_eq(
-            &first,
-            &select_for_rows(&mut ctx, &orders).await.unwrap()
-        ));
-        select_for_rows(&mut ctx, &items).await.unwrap();
         let orders_key = ctx
             .registry_scope
             .current()
             .unwrap()
             .key(&orders.database_name, &orders.table_name);
+        // Room for one table's timeline and selection (not its read-ahead
+        // version).
+        let one = ctx.selection.bytes()
+            - ctx.selection.version_bytes_for(&orders_key);
+        ctx.selection.set_limit_for_test(one);
+        assert!(Arc::ptr_eq(
+            &first,
+            &select_for_rows(&mut ctx, &orders).await.unwrap()
+        ));
+        select_for_rows(&mut ctx, &items).await.unwrap();
         assert_eq!(
             ctx.selection.held_for(&orders_key),
             0,
@@ -2509,6 +2511,28 @@ pub(crate) mod tests {
             )
         };
         assert_eq!(bytes(&first), bytes(&rebuilt));
+    }
+
+    /// Nothing fits the cache: a table's rows still select their schema,
+    /// each time from the durable records, byte-equivalently.
+    #[tokio::test]
+    async fn rows_select_their_schema_when_nothing_fits_the_cache() {
+        use crate::mysql::mysql_selection::{Caches, select_for_rows};
+        let (tx, _rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        prove_orders(&mut ctx).await;
+        let orders = ctx.table_map[&TABLE_ID].clone();
+        ctx.selection = Caches::default();
+        ctx.selection.set_limit_for_test(1);
+        let first = select_for_rows(&mut ctx, &orders).await.unwrap();
+        let again = select_for_rows(&mut ctx, &orders).await.unwrap();
+        assert_eq!(ctx.selection.len(), 0, "nothing cached");
+        assert!(!Arc::ptr_eq(&first, &again), "read again");
+        assert_eq!(
+            serde_json::to_vec(&first.schema).unwrap(),
+            serde_json::to_vec(&again.schema).unwrap()
+        );
+        assert_eq!(first.registry_version, again.registry_version);
     }
 
     #[tokio::test]

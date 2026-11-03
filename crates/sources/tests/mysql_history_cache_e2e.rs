@@ -220,10 +220,11 @@ async fn evicted_tables_return_in_batched_reads() {
     sql(port, &ddl).await;
     let counting =
         Arc::new(CountingBackend::new(Arc::new(MemoryStorageBackend::new())));
-    // A cache of 64 tables: most of them are evicted between the bursts.
-    sources::stream_probe::set_selection_cache_limits(Some((64, 256 << 20)));
+    // A cache of about 64 tables (512 KiB): most of them are evicted
+    // between the bursts.
+    sources::stream_probe::set_selection_cache_bytes(Some(512 << 10));
     let (handle, rows) = run(port, "hist-evict", &counting).await;
-    sources::stream_probe::set_selection_cache_limits(None);
+    sources::stream_probe::set_selection_cache_bytes(None);
     let burst = |id: usize| -> Vec<String> {
         (0..N)
             .map(|i| format!("INSERT INTO {DB}.t{i:03} VALUES ({id}, {id})"))
@@ -237,7 +238,7 @@ async fn evicted_tables_return_in_batched_reads() {
     delivered(&rows, N, 2).await;
     let (total, reads) = calls(&counting);
     eprintln!(
-        "{N} tables returning to a 64-table cache: {total} store calls, \
+        "{N} tables returning to a 512 KiB cache: {total} store calls, \
          {reads} stream reads"
     );
     handle.stop();
