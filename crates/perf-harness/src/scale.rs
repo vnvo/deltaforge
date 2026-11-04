@@ -706,7 +706,7 @@ pub async fn run(
     dir: &Path,
     base: Duration,
     catchup_phase: bool,
-    cache_tables: Option<usize>,
+    bounds: CacheBounds,
 ) -> Result<Value> {
     std::fs::create_dir_all(dir)?;
     let name = format!("s-{tag}");
@@ -768,17 +768,14 @@ pub async fn run(
         None => None,
     };
     // A measurement build's selection-cache bounds, as it reports them.
-    let mut cache_limit: Option<(f64, f64)> = None;
+    let mut cache_limit: Option<CacheLimits> = None;
     let process = match sys {
         Sys::Df(binary) => {
-            let env = cache_tables
-                .map(|c| vec![(ENV_CACHE_TABLES.to_string(), c.to_string())])
-                .unwrap_or_default();
             let p = Process::start_with_env(
                 binary,
                 &dir.join("state"),
                 state_dsn.as_deref(),
-                env,
+                bounds.env(),
             )
             .await?;
             let spec = json!({
@@ -803,16 +800,8 @@ pub async fn run(
             api(reqwest::Method::POST, "/pipelines", Some(&spec)).await?;
             wait_status(&name, "running").await?;
             cache_limit = df_metrics().await.and_then(|t| cache_limits(&t));
-            // A bound asked for is measured only once the runner reports it:
-            // a default build ignores the setting.
-            if let Some(want) = cache_tables
-                && cache_limit.map(|(tables, _)| tables) != Some(want as f64)
-            {
-                bail!(
-                    "asked for a selection-cache table bound of {want}, the runner \
-                     reports {cache_limit:?}: a measurement build (perf-phases) is required"
-                );
-            }
+            // A bound asked for is measured only once the runner reports it.
+            bounds.check(cache_limit)?;
             Some(p)
         }
         Sys::Dbz(c, profile) => {
@@ -988,6 +977,8 @@ pub async fn run(
     let (mut stopped_at, mut resumed_at) = (None, None);
     let mut conns_max = 0u64;
     let mut rss_max = 0u64;
+    // DeltaForge's anonymous resident memory (the allocator's heap).
+    let mut rss_anon_max = 0u64;
     // DeltaForge's sampled gauges, each at its largest sample.
     let mut gauge_peaks: HashMap<String, f64> = HashMap::new();
     let is_df = matches!(sys, Sys::Df(_));
@@ -1046,6 +1037,8 @@ pub async fn run(
         conns_max =
             conns_max.max(system_connections(&mut mon).await.unwrap_or(0));
         rss_max = rss_max.max(sys_rss(sys, process.as_ref()));
+        rss_anon_max =
+            rss_anon_max.max(process.as_ref().map_or(0, |p| p.rss_anon_kib()));
         if is_df {
             let start = t_load.elapsed();
             let text = df_metrics().await;
@@ -1152,6 +1145,8 @@ pub async fn run(
         conns_max =
             conns_max.max(system_connections(&mut mon).await.unwrap_or(0));
         rss_max = rss_max.max(sys_rss(sys, process.as_ref()));
+        rss_anon_max =
+            rss_anon_max.max(process.as_ref().map_or(0, |p| p.rss_anon_kib()));
         if is_df {
             let start = t_load.elapsed();
             let text = df_metrics().await;
@@ -1518,7 +1513,7 @@ pub async fn run(
         "gtid_start": gtid_start,
         "datadir_bytes_before": datadir_before, "datadir_bytes_after": datadir_after,
         "gauge_peaks": gauge_peaks,
-        "cache_limit": cache_limit.map(|(tables, bytes)| json!({"tables": tables, "bytes": bytes})),
+        "cache_limit": cache_limit.map(|l| json!({"tables": l.tables, "bytes": l.bytes})),
         "store_statements": store_statements,
         "latency_steady_ms": quantiles(steady),
         "latency_activation_ms": quantiles(activation),
@@ -1528,6 +1523,7 @@ pub async fn run(
         "cpu_s": cpu, "cpu_cores": cpu / (load_secs + drain_s.unwrap_or(0.0)),
         "perf_counters": perf,
         "rss_peak_mib": rss_max as f64 / 1024.0,
+        "rss_anon_peak_mib": is_df.then(|| rss_anon_max as f64 / 1024.0),
         "allocations": allocs,
         "mysql_connections_max": conns_max,
         "state_store_connections": match sys { Sys::Df(_) if infra.state.is_some() => json!("PostgreSQL"), Sys::Df(_) => json!("none (SQLite)"), Sys::Dbz(..) => json!("Kafka (offsets topic)") },
@@ -2021,24 +2017,30 @@ async fn df_metrics() -> Option<String> {
         .ok()
 }
 
-/// A measurement build's selection-cache bounds (tables, bytes), from
-/// `deltaforge_perf_selection_cache_limit{bound}`; `None` from a default
-/// build.
-fn cache_limits(text: &str) -> Option<(f64, f64)> {
-    let mut tables = None;
-    let mut bytes = None;
+/// The selection-cache bounds a measurement build reports.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct CacheLimits {
+    tables: Option<f64>,
+    bytes: Option<f64>,
+}
+
+/// A measurement build's selection-cache bounds, from
+/// `deltaforge_perf_selection_cache_limit{bound}` (a build bounded by bytes
+/// alone reports no table bound); `None` from a default build.
+fn cache_limits(text: &str) -> Option<CacheLimits> {
+    let mut l = CacheLimits::default();
     for (key, v) in metric_lines(text) {
         match key.as_str() {
             "deltaforge_perf_selection_cache_limit{bound=\"tables\"}" => {
-                tables = Some(v)
+                l.tables = Some(v)
             }
             "deltaforge_perf_selection_cache_limit{bound=\"bytes\"}" => {
-                bytes = Some(v)
+                l.bytes = Some(v)
             }
             _ => {}
         }
     }
-    Some((tables?, bytes?))
+    (l != CacheLimits::default()).then_some(l)
 }
 
 /// The series a run samples: the measurement build's selection-cache
@@ -2192,22 +2194,224 @@ pub struct Plan {
     /// table bound here (a measurement build's), interleaved within each
     /// repetition: the order alternates between repetitions.
     pub cache_tables: Vec<usize>,
+    /// When not empty, the DeltaForge runs are these arms: each once per
+    /// repetition, interleaved, the order alternating between repetitions.
+    pub arms: Vec<Arm>,
 }
 
 /// The selection cache's table bound a measurement build (`perf-phases`)
-/// takes from its environment (`sources::perf_phases`).
+/// takes from its environment (`sources::perf_phases`; `df89d2d0` builds).
 const ENV_CACHE_TABLES: &str = "DELTAFORGE_PERF_SELECTION_CACHE_TABLES";
+/// Its byte bound (every measurement build since `df89d2d0`).
+const ENV_CACHE_BYTES: &str = "DELTAFORGE_PERF_SELECTION_CACHE_BYTES";
 
-/// The table bounds of one repetition, in its order (`[None]` without a
-/// sweep): ascending in even repetitions, descending in odd ones.
-fn cache_order(cache_tables: &[usize], rep: usize) -> Vec<Option<usize>> {
-    if cache_tables.is_empty() {
-        return vec![None];
+/// The selection-cache bounds a run sets on its runner and verifies before
+/// it measures (none: the build's own).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CacheBounds {
+    pub tables: Option<u64>,
+    pub bytes: Option<u64>,
+}
+
+impl CacheBounds {
+    /// The runner's environment that sets them.
+    fn env(&self) -> Vec<(String, String)> {
+        let mut v = Vec::new();
+        if let Some(t) = self.tables {
+            v.push((ENV_CACHE_TABLES.to_string(), t.to_string()));
+        }
+        if let Some(b) = self.bytes {
+            v.push((ENV_CACHE_BYTES.to_string(), b.to_string()));
+        }
+        v
     }
-    let mut v: Vec<Option<usize>> =
-        cache_tables.iter().map(|&c| Some(c)).collect();
-    if rep % 2 == 1 {
-        v.reverse();
+
+    /// Refuse to measure unless the runner reports every bound set here: a
+    /// default build ignores the variables, and a build bounded by bytes
+    /// alone has no table bound.
+    fn check(&self, reported: Option<CacheLimits>) -> Result<()> {
+        let got = reported.unwrap_or_default();
+        let wrong = |want: Option<u64>, got: Option<f64>| {
+            want.is_some_and(|w| got != Some(w as f64))
+        };
+        if wrong(self.tables, got.tables) || wrong(self.bytes, got.bytes) {
+            bail!(
+                "asked for selection-cache bounds {self:?}, the runner reports \
+                 {reported:?}: a measurement build (perf-phases) with these bounds is required"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// One arm of a comparison: a DeltaForge `--binary` (by label) run with
+/// selection-cache bounds of its own, `NAME=BINARY[:tables=N][:bytes=N]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Arm {
+    pub name: String,
+    pub binary: String,
+    pub bounds: CacheBounds,
+}
+
+impl Arm {
+    pub fn parse(s: &str) -> Result<Arm> {
+        let usage =
+            || anyhow!("--scale-arm {s}: NAME=BINARY[:tables=N][:bytes=N]");
+        let (name, rest) = s.split_once('=').ok_or_else(usage)?;
+        let mut parts = rest.split(':');
+        let binary = parts.next().unwrap_or_default();
+        if name.is_empty() || binary.is_empty() {
+            return Err(usage());
+        }
+        let mut bounds = CacheBounds::default();
+        for part in parts {
+            let (key, value) = part.split_once('=').ok_or_else(usage)?;
+            let n: u64 =
+                value.parse().ok().filter(|n| *n > 0).ok_or_else(|| {
+                    anyhow!("--scale-arm {s}: {key} must be a positive number")
+                })?;
+            let slot = match key {
+                "tables" => &mut bounds.tables,
+                "bytes" => &mut bounds.bytes,
+                _ => bail!(
+                    "--scale-arm {s}: {key} is not a bound (tables, bytes)"
+                ),
+            };
+            if slot.replace(n).is_some() {
+                bail!("--scale-arm {s}: {key} given twice");
+            }
+        }
+        Ok(Arm {
+            name: name.to_string(),
+            binary: binary.to_string(),
+            bounds,
+        })
+    }
+}
+
+/// Refuse arms unless each names a DeltaForge `--binary`, every DeltaForge
+/// binary runs through at least one arm, every run's label is distinct and
+/// no table sweep is asked for beside them.
+fn check_arms(
+    binaries: &[(String, crate::System)],
+    arms: &[Arm],
+    cache_tables: &[usize],
+) -> Result<()> {
+    if arms.is_empty() {
+        return Ok(());
+    }
+    if !cache_tables.is_empty() {
+        bail!("--scale-arm and --scale-cache-tables cannot be combined");
+    }
+    let mut labels: Vec<&str> = binaries
+        .iter()
+        .filter(|(_, s)| !matches!(s, crate::System::DeltaForge(_)))
+        .map(|(l, _)| l.as_str())
+        .collect();
+    for arm in arms {
+        match binaries.iter().find(|(l, _)| *l == arm.binary) {
+            None => bail!("arm {}: {} is not a --binary", arm.name, arm.binary),
+            Some((_, crate::System::DeltaForge(_))) => {}
+            Some(_) => bail!(
+                "arm {}: {} is not a DeltaForge binary",
+                arm.name,
+                arm.binary
+            ),
+        }
+        if labels.contains(&arm.name.as_str()) {
+            bail!("{} is named twice", arm.name);
+        }
+        labels.push(&arm.name);
+    }
+    for (label, system) in binaries {
+        if matches!(system, crate::System::DeltaForge(_))
+            && !arms.iter().any(|a| a.binary == *label)
+        {
+            bail!("{label} runs through no arm");
+        }
+    }
+    Ok(())
+}
+
+/// One run in a repetition's order: its label (an arm's name, or the
+/// binary's), its binary's label, its system and the bounds it sets.
+struct Unit<'a> {
+    label: String,
+    binary: &'a str,
+    system: &'a crate::System,
+    bounds: CacheBounds,
+    arm: Option<&'a Arm>,
+}
+
+/// One repetition's runs in order. With arms: each arm, then each other
+/// system, reversed in odd repetitions. Without: each binary (reversed in
+/// odd repetitions), a DeltaForge one once per table bound of the sweep
+/// (ascending in even repetitions, descending in odd ones).
+fn run_order<'a>(
+    binaries: &'a [(String, crate::System)],
+    arms: &'a [Arm],
+    cache_tables: &[usize],
+    rep: usize,
+) -> Vec<Unit<'a>> {
+    let odd = rep % 2 == 1;
+    let mut v: Vec<Unit<'a>> = Vec::new();
+    if !arms.is_empty() {
+        for arm in arms {
+            if let Some((label, system)) =
+                binaries.iter().find(|(l, _)| *l == arm.binary)
+            {
+                v.push(Unit {
+                    label: arm.name.clone(),
+                    binary: label,
+                    system,
+                    bounds: arm.bounds,
+                    arm: Some(arm),
+                });
+            }
+        }
+        for (label, system) in binaries {
+            if !matches!(system, crate::System::DeltaForge(_)) {
+                v.push(Unit {
+                    label: label.clone(),
+                    binary: label,
+                    system,
+                    bounds: CacheBounds::default(),
+                    arm: None,
+                });
+            }
+        }
+        if odd {
+            v.reverse();
+        }
+        return v;
+    }
+    let mut caches: Vec<Option<u64>> = if cache_tables.is_empty() {
+        vec![None]
+    } else {
+        cache_tables.iter().map(|&c| Some(c as u64)).collect()
+    };
+    let mut order: Vec<&(String, crate::System)> = binaries.iter().collect();
+    if odd {
+        caches.reverse();
+        order.reverse();
+    }
+    for (label, system) in order {
+        let tables: &[Option<u64>] = match system {
+            crate::System::DeltaForge(_) => &caches,
+            _ => &[None],
+        };
+        for &t in tables {
+            v.push(Unit {
+                label: label.clone(),
+                binary: label,
+                system,
+                bounds: CacheBounds {
+                    tables: t,
+                    bytes: None,
+                },
+                arm: None,
+            });
+        }
     }
     v
 }
@@ -2351,6 +2555,7 @@ pub async fn study(
     let mut index = 0u64;
     let mut outcome = Ok(());
     plan.check_points()?;
+    check_arms(binaries, &plan.arms, &plan.cache_tables)?;
     'tables: for &tables in &plan.tables {
         if plan.points(tables).is_empty() {
             continue;
@@ -2385,24 +2590,17 @@ pub async fn study(
             }
         }
         for (point, rep) in todo {
-            let order: Vec<&(String, crate::System)> =
-                if rep.unwrap_or(0) % 2 == 0 {
-                    binaries.iter().collect()
-                } else {
-                    binaries.iter().rev().collect()
-                };
-            let caches = cache_order(&plan.cache_tables, rep.unwrap_or(0));
-            let order: Vec<(&String, &crate::System, Option<usize>)> = order
-                .into_iter()
-                .flat_map(|(label, system)| match system {
-                    crate::System::DeltaForge(_) => caches
-                        .iter()
-                        .map(|&c| (label, system, c))
-                        .collect::<Vec<_>>(),
-                    _ => vec![(label, system, None)],
-                })
-                .collect();
-            for (label, system, cache_tables) in order {
+            let order = run_order(
+                binaries,
+                &plan.arms,
+                &plan.cache_tables,
+                rep.unwrap_or(0),
+            );
+            for unit in order {
+                let (label, system) = (&unit.label, unit.system);
+                // A sweep's bound names its runs; an arm's name is its label.
+                let cache_tables =
+                    unit.bounds.tables.filter(|_| unit.arm.is_none());
                 if let Some(b) = monitor.breached() {
                     outcome = Err(anyhow!(b));
                     break 'tables;
@@ -2413,6 +2611,10 @@ pub async fn study(
                     rep.map_or("warmup".to_string(), |r| format!("r{r}"));
                 let cache_name =
                     cache_tables.map_or(String::new(), |c| format!("-c{c}"));
+                let arm_record = unit.arm.map(|a| {
+                    json!({"name": a.name, "binary": a.binary,
+                           "tables": a.bounds.tables, "bytes": a.bounds.bytes})
+                });
                 let tag = format!(
                     "{}-{label}{cache_name}-{rep_name}-{seq}",
                     point.id()
@@ -2438,7 +2640,7 @@ pub async fn study(
                         &dir,
                         base,
                         plan.catchup,
-                        cache_tables,
+                        unit.bounds,
                     ),
                 )
                 .await;
@@ -2455,7 +2657,7 @@ pub async fn study(
                     "started_unix_s": started_unix_s, "ended_unix_s": unix_s(),
                     "disk_low_gib": disk_low, "mem_low_gib": mem_low,
                     "connect_worker_idle": matches!(system, crate::System::DeltaForge(_)) && connect.is_some(),
-                    "binary_sha256": shas.get(label.as_str()).cloned().flatten(),
+                    "binary_sha256": shas.get(unit.binary).cloned().flatten(),
                 });
                 eprintln!(
                     "{} {label}{cache_name} {rep_name}: {}",
@@ -2481,7 +2683,7 @@ pub async fn study(
                     .then_some(generation);
                 // A warm-up's result is kept, in its own file: never a
                 // measured result, never in the summary or the run counts.
-                let record = json!({"point": point.id(), "version": label, "rep": rep, "cache_tables": cache_tables, "worker": worker, "order": order_record, "result": result});
+                let record = json!({"point": point.id(), "version": label, "binary": unit.binary, "arm": arm_record, "rep": rep, "cache_tables": cache_tables, "worker": worker, "order": order_record, "result": result});
                 match rep {
                     Some(_) => writeln!(runs, "{record}")?,
                     None => writeln!(warmups, "{}", warmup_record(record))?,
@@ -2623,16 +2825,6 @@ fn summary(out: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Table bounds interleave within each repetition: the order
-    /// alternates, so neither bound always runs first.
-    #[test]
-    fn cache_bounds_alternate_their_order_between_repetitions() {
-        assert_eq!(cache_order(&[], 0), [None]);
-        assert_eq!(cache_order(&[4096, 8192], 0), [Some(4096), Some(8192)]);
-        assert_eq!(cache_order(&[4096, 8192], 1), [Some(8192), Some(4096)]);
-        assert_eq!(cache_order(&[4096, 8192], 2), [Some(4096), Some(8192)]);
-    }
-
     /// The sampled series keep their own labels, drop the run's pipeline
     /// and source, and leave out comments, buckets and quantiles; the
     /// bounds come only from a measurement build.
@@ -2662,12 +2854,201 @@ mod tests {
                 ("deltaforge_perf_selection_cache_limit{bound=\"bytes\"}".to_string(), 268435456.0),
             ]
         );
-        assert_eq!(cache_limits(text), Some((8192.0, 268435456.0)));
+        assert_eq!(
+            cache_limits(text),
+            Some(CacheLimits {
+                tables: Some(8192.0),
+                bytes: Some(268435456.0)
+            })
+        );
+        assert_eq!(
+            cache_limits(
+                "deltaforge_perf_selection_cache_limit{bound=\"bytes\"} 67108864\n"
+            ),
+            Some(CacheLimits {
+                tables: None,
+                bytes: Some(67108864.0)
+            }),
+            "a build bounded by bytes alone reports its byte bound"
+        );
         assert_eq!(
             cache_limits("deltaforge_mysql_selection_cache_timelines 40\n"),
             None,
             "a default build reports no bounds"
         );
+    }
+
+    fn bounds(tables: Option<u64>, bytes: Option<u64>) -> CacheBounds {
+        CacheBounds { tables, bytes }
+    }
+
+    /// An arm names a `--binary` and the selection-cache bounds set for its
+    /// runs alone.
+    #[test]
+    fn arms_parse_their_bounds() {
+        assert_eq!(
+            Arm::parse("B-L=base:tables=32768:bytes=268435456").unwrap(),
+            Arm {
+                name: "B-L".into(),
+                binary: "base".into(),
+                bounds: bounds(Some(32768), Some(268435456)),
+            }
+        );
+        assert_eq!(Arm::parse("F=fix").unwrap().bounds, CacheBounds::default());
+        for bad in [
+            "F",
+            "=fix",
+            "F=",
+            "F=fix:size=1",
+            "F=fix:bytes",
+            "F=fix:bytes=0",
+            "F=fix:bytes=x",
+            "F=fix:bytes=1:bytes=2",
+        ] {
+            assert!(Arm::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// An arm's bounds reach its runner as the measurement build's
+    /// variables, and nothing else does.
+    #[test]
+    fn an_arms_bounds_are_its_runners_environment() {
+        assert_eq!(
+            bounds(Some(32768), None).env(),
+            [(ENV_CACHE_TABLES.to_string(), "32768".to_string())]
+        );
+        assert_eq!(
+            bounds(None, Some(67108864)).env(),
+            [(ENV_CACHE_BYTES.to_string(), "67108864".to_string())]
+        );
+        assert!(CacheBounds::default().env().is_empty());
+    }
+
+    /// A run measures only once its runner reports every bound it set; a
+    /// bound it did not set is recorded as reported.
+    #[test]
+    fn a_run_measures_only_on_the_bounds_it_set() {
+        let both = Some(CacheLimits {
+            tables: Some(4096.0),
+            bytes: Some(268435456.0),
+        });
+        let bytes_only = Some(CacheLimits {
+            tables: None,
+            bytes: Some(67108864.0),
+        });
+        assert!(bounds(Some(4096), Some(268435456)).check(both).is_ok());
+        assert!(bounds(None, Some(268435456)).check(both).is_ok());
+        assert!(bounds(Some(32768), None).check(both).is_err());
+        assert!(bounds(None, Some(67108864)).check(bytes_only).is_ok());
+        assert!(
+            bounds(Some(4096), None).check(bytes_only).is_err(),
+            "a build without a table bound cannot run a table arm"
+        );
+        assert!(
+            bounds(None, Some(67108864)).check(None).is_err(),
+            "a default build ignores the bound"
+        );
+        assert!(CacheBounds::default().check(None).is_ok());
+    }
+
+    fn df(label: &str, path: &str) -> (String, crate::System) {
+        (label.into(), crate::System::DeltaForge(path.into()))
+    }
+
+    /// Arms run once each per repetition, interleaved, their order
+    /// alternating between repetitions; each on its binary with its own
+    /// bounds. Without arms, each binary runs once per table bound.
+    #[test]
+    fn arms_interleave_and_alternate_their_order() {
+        let binaries = [df("base", "b"), df("fix", "f")];
+        let arms: Vec<Arm> = [
+            "B=base:tables=4096:bytes=268435456",
+            "B-L=base:tables=32768:bytes=268435456",
+            "F=fix:bytes=268435456",
+            "F-64=fix:bytes=67108864",
+        ]
+        .iter()
+        .map(|a| Arm::parse(a).unwrap())
+        .collect();
+        let order = |rep| -> Vec<(String, String, CacheBounds)> {
+            run_order(&binaries, &arms, &[], rep)
+                .into_iter()
+                .map(|u| {
+                    let crate::System::DeltaForge(p) = u.system else {
+                        panic!("{} is not DeltaForge", u.label)
+                    };
+                    (u.label, p.display().to_string(), u.bounds)
+                })
+                .collect()
+        };
+        let labels = |rep| -> Vec<String> {
+            order(rep).into_iter().map(|(l, _, _)| l).collect()
+        };
+        assert_eq!(labels(0), ["B", "B-L", "F", "F-64"]);
+        assert_eq!(labels(1), ["F-64", "F", "B-L", "B"]);
+        assert_eq!(labels(2), labels(0));
+        assert_eq!(
+            order(0)[3],
+            ("F-64".into(), "f".into(), bounds(None, Some(67108864)))
+        );
+        assert_eq!(
+            order(0)[1],
+            (
+                "B-L".into(),
+                "b".into(),
+                bounds(Some(32768), Some(268435456))
+            )
+        );
+
+        let sweep = |rep| -> Vec<(String, Option<u64>)> {
+            run_order(&binaries, &[], &[4096, 8192], rep)
+                .into_iter()
+                .map(|u| (u.label, u.bounds.tables))
+                .collect()
+        };
+        assert_eq!(
+            sweep(0),
+            [
+                ("base".into(), Some(4096)),
+                ("base".into(), Some(8192)),
+                ("fix".into(), Some(4096)),
+                ("fix".into(), Some(8192)),
+            ]
+        );
+        assert_eq!(
+            sweep(1),
+            [
+                ("fix".into(), Some(8192)),
+                ("fix".into(), Some(4096)),
+                ("base".into(), Some(8192)),
+                ("base".into(), Some(4096)),
+            ]
+        );
+    }
+
+    /// Arms are refused unless each names a `--binary`, every DeltaForge
+    /// binary runs through an arm, names are distinct, and no table sweep
+    /// is asked for beside them.
+    #[test]
+    fn arms_must_match_the_binaries() {
+        let binaries = [df("base", "b"), df("fix", "f")];
+        let arms = |list: &[&str]| -> Vec<Arm> {
+            list.iter().map(|a| Arm::parse(a).unwrap()).collect()
+        };
+        let check = |list: &[&str], sweep: &[usize]| {
+            check_arms(&binaries, &arms(list), sweep)
+        };
+        assert!(check(&["B=base", "F=fix"], &[]).is_ok());
+        assert!(check(&[], &[4096]).is_ok());
+        for (list, sweep, why) in [
+            (&["B=base", "F=other"][..], &[][..], "is not a --binary"),
+            (&["B=base"], &[], "fix runs through no arm"),
+            (&["B=base", "B=fix"], &[], "named twice"),
+            (&["B=base", "F=fix"], &[4096], "--scale-cache-tables"),
+        ] {
+            let e = check(list, sweep).unwrap_err().to_string();
+            assert!(e.contains(why), "{list:?}: {e}");
+        }
     }
 
     /// A sample carries its scrape's start and end; a failed scrape is a
@@ -2766,6 +3147,7 @@ mod tests {
             catchup: true,
             only: only.iter().map(|s| s.to_string()).collect(),
             cache_tables: Vec::new(),
+            arms: Vec::new(),
         };
         let ids = |p: &Plan, t| -> Vec<String> {
             p.points(t).iter().map(|p| p.id()).collect()
