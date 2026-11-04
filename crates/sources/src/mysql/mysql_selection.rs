@@ -4241,10 +4241,11 @@ mod tests {
             }
             let names = ["database barrier", "lineage barrier", "full clear"];
             for (name, t) in names.iter().zip(&mut times) {
+                let runs = format!("{t:?}");
                 t.sort();
                 eprintln!(
                     "{held} entries at {SELECTION_CACHE_BYTES} bytes: {name} \
-                     median {:?}, max {:?}",
+                     median {:?}, max {:?}, runs in order {runs}",
                     t[t.len() / 2],
                     t[t.len() - 1]
                 );
