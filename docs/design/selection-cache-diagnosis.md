@@ -149,10 +149,13 @@ Accurate accounting changes what fits. The fully accounted working set of a poin
 
 The 20,000-table burst is at the bound, and its burst load (about 232 MB) exceeds what one load may admit (128 MiB), so part of a burst window is left uncached and read again when reached, without any eviction. Evictions and rereads at the default bound where the working set does not fit are remaining capacity pressure, not an implementation defect: they are reported (rule 6), not judged against the no-eviction reference. No-eviction latency is required only where the working set fits with room for any single load (rule 1).
 
-The working set is measured, not assumed, where it decides the rule: at the 20,000-table point by an arm with a bound above it (F-L, 4 GiB), whose peak cache-bytes gauge (with zero evictions) is the fully accounted working set W. At the other points W is F's own peak gauge, checked against the estimate; if it exceeds 128 MiB the point's classification returns for review before any rule is applied.
+The working set is measured, not assumed, where it decides the rule. A measurement of W counts only when it is complete and churn-free: the arm that measured it shows zero evictions and zero timeline reloads after the last activation. A peak gauge alone can understate a working set that is already churning, so a churning arm never classifies a point.
+- At the 20,000-table point, W is measured by an arm with a bound above it (F-L, 4 GiB): its peak cache-bytes gauge.
+- At the other points, W is F's own peak gauge, valid only if F is churn-free there.
+- If no churn-free measurement exists, or W exceeds 128 MiB, the point's classification returns for review before any rule is applied.
 
-Classes, by W:
-- **Fits** (W at most 128 MiB, half the budget): the working set and any single load fit. Rule 1 applies.
+Classes, by W. The 128 MiB line is a conservative classification for these tests, not a general guarantee that every load fits:
+- **Fits** (a complete, churn-free W of at most 128 MiB, half the budget): in these tests the working set and every load fit. Rule 1 applies.
 - **At the bound** (128 MiB < W at most 256 MiB): it fits at rest but not in one load. Rule 6 reports it; whether F's post-activation evictions stay within B-L's plus 1 per 1,000 rows (fits at rest) is reported as a capacity finding, not a pass or fail.
 - **Over the budget** (W above 256 MiB, and F-64 everywhere it runs): byte pressure, reported by rule 6.
 
@@ -167,7 +170,7 @@ The overhead result of section 5 step 1 was measured at `df89d2d0` and does not 
 - t10000-a50-steady-o0 (5,000 active: no evictions expected now);
 - t40000-a50-burst-o0 (20,000 active: at the bound, so admission refusals and possibly evictions occur).
 
-30 runs. Tolerances as in section 5 step 1 (P minus D: post-activation p50 at most +3% or +1 ms, p99 at most +3% or +2 ms, CPU at most +5%, evictions within 2%), plus timeline reloads within 2%. The same one-sided and anomaly rules apply. Outside tolerance at any point: the overhead is reported and the plan returns for review before any run of step F1.
+30 runs. Overhead is compared only on metrics both builds export: post-activation p50 and p99, CPU, and evictions (the default build's `deltaforge_mysql_selection_cache_evictions_total`). The default build has none of the diagnostic counters (timeline reloads, store reads, phase timings); their absence there is not zero, and they are not compared. Tolerances as in section 5 step 1 (P minus D: p50 at most +3% or +1 ms, p99 at most +3% or +2 ms, CPU at most +5%, evictions within 2%). The same one-sided and anomaly rules apply. Outside tolerance at any point: the overhead is reported and the plan returns for review before any run of step F1.
 
 ### 6.4 Step F1: comparison
 
@@ -206,7 +209,7 @@ The overhead result of section 5 step 1 was measured at `df89d2d0` and does not 
 2. **Fits, direction:** F's evictions and post-activation p50 are lower than B's (a sanity check; rule 1 decides).
 3. **Controls, F against B:** p50, p99 and CPU within the rule 1 tolerances; evictions zero in both.
 4. **Cold fill, F against B, every point except F-64's:** time to the last activation within +5% or +1 s, whichever is larger; activation-period non-first-row p99 within +5% or +5 ms, whichever is larger; store reads before the last activation at most B's, tables requested at most B's plus 2%. Activation interference stays a separate open limitation; this rule only requires that the fix does not worsen cold fill.
-5. **Memory:** F's cache-bytes gauge never exceeds its bound in any sample (F-L 4 GiB, F-64 64 MiB). At every point F's peak anonymous resident memory is at most B-L's plus 10%: B-L holds every active table, so its memory is what holding them costs, whatever its gauge says. F-64's is at most F's. Process RSS is reported for every arm.
+5. **Memory:** F's cache-bytes gauge never exceeds its bound in any sample (F-L 4 GiB, F-64 64 MiB). At every point with a B-L arm, F's peak anonymous resident memory is at most B-L's plus 10%: B-L holds every active table, so its memory is what holding them costs, whatever its gauge says. The two control points have no B-L arm: there B is the memory reference (no evictions occur in either build), and F's peak is at most B's plus 10%. F-64's is at most F's. Process RSS is reported for every arm.
 6. **At the bound and over the budget** (t40000-a50-burst-o0: F against F-L and B; F-64 against F-L, F and B): no latency threshold. Reported: W, evictions, timeline reloads, rereads of tables a burst left uncached, latency, CPU and memory, as the churn that remains when the working set exceeds what the budget or one load holds.
 7. **Invalidation:** section 6.5.
 
@@ -214,13 +217,15 @@ Any rule that fails is reported with its data; no acceptance is claimed from a p
 
 ### 6.5 Invalidation cost (release build)
 
-Debug-build timings (a database barrier 13 ms, a lineage barrier 405 ms, at 120,000 entries) establish nothing about operational cost. The cost is measured in a release build of `<H>` on the measurement host with nothing else running, by `invalidation_cost_at_the_default_bound` (`cargo test --release -p sources --lib -- --ignored --nocapture invalidation_cost_at_the_default_bound`). The test fills the default bound with the most entries it holds: 191,571 entries, which is 63,857 of the smallest real tables over 100 databases, each with a one-record timeline and a one-column selection and version. It then times each operation on a full cache, five times.
+Debug-build timings (a database barrier 13 ms, a lineage barrier 405 ms, at 120,000 entries) establish nothing about operational cost. The cost is measured in a release build of `<H>` on the measurement host with nothing else running, by `invalidation_cost_at_the_default_bound` (`cargo test --release -p sources --lib -- --ignored --nocapture invalidation_cost_at_the_default_bound`). The test fills the default bound with its population of the smallest real tables: 191,571 entries, which is 63,857 tables over 100 databases, each with a one-record timeline and a one-column selection and version. That is the tested population, not a universal maximum: other entry mixtures hold other counts. It then times each operation on a full cache, five times.
 
 Criteria, fixed before measuring: a database barrier at most 5 ms median; a lineage barrier at most 50 ms median; a full clear at most 50 ms median; each maximum at most 1.5 times its median. A barrier runs on the source's task and delays its stream once.
 - A database barrier follows DDL in one database, which is frequent across a fleet, so it must stay an order of magnitude below the no-eviction post-activation p99 (46 ms at t40000-a20-steady).
 - A lineage barrier (a stream start or lineage change) and a full clear (a restart or failover) are rare, and each must stay within about one such p99.
 
-Exactness is covered by the unit and memory tests: the accounting, the shared streams, and memory released after a full clear. A failed criterion is reported and the plan returns for review.
+All five timings of each operation are reported, with any scheduling anomaly (such as one timing far above the others, with the host's load at the time). A failure is reported as measured and never rerun away; the plan returns for review.
+
+Exactness is covered by the unit and memory tests: the accounting, the shared streams, and memory released after a full clear.
 
 ### 6.6 Order, time and disk
 
