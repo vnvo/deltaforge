@@ -139,7 +139,8 @@ timeline: the records of its own stream and the barriers that apply to it
   within 256 MiB of estimated memory, with no fixed number of tables: as
   many as fit. The estimate counts what they hold in memory (records,
   barrier streams once each, schemas with their decoders, versions' JSON,
-  keys and the maps' buckets) and covers resident memory. A table with a
+  keys and the maps' buckets) and covers the memory they allocate (not
+  pages the allocator keeps after they are freed). A table with a
   12-column schema, its selection and its version takes about 27 KB; a
   narrow table a few KB. Admission evicts the least recently used entries
   first; an evicted table is read again exactly from the store.

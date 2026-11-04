@@ -961,7 +961,9 @@ Today it takes about 30 statements per table, about 61,000.
     their vectors), the shared barrier streams once each, selected schemas
     with their decoders, read-ahead versions' JSON trees, keys and list
     nodes, and the maps' buckets (kept after eviction until a full clear);
-  - validated by measuring resident memory against the estimate (jemalloc)
+  - validated by measuring the memory the entries allocate against the
+    estimate (jemalloc's allocated bytes; not the allocator's resident
+    pages or the process's RSS)
     for mixtures of up to 70,000 tables with selections, versions and
     shared barrier streams, after filling, invalidation and eviction;
   - a load (one batched read of many tables) admits at most half the bound
@@ -1023,6 +1025,15 @@ Today it takes about 30 statements per table, about 61,000.
   resident 0.66 to 0.75 of the estimate for timelines of 1, 100 and 10,000
   records per table). Selections and read-ahead versions are bounded by
   bytes; timelines by tables and bytes.
+  **Correction (selection-cache fix):** this held for timelines alone. The
+  measurement filled no selections or versions, and the estimate counted
+  each by its encoded size plus 512 bytes, while a version keeps its
+  schema as a JSON tree and a selection its columns and decoder. At 40,000
+  tables with 12-column schemas the estimate was 208 MB against 876 MB
+  allocated (4.2 times more), so the 256 MiB bound did not bound the
+  cache's memory. What was measured was jemalloc's allocated bytes, not
+  resident memory. The estimate and its measurement are replaced as
+  stated in the cache bounds above.
 - **Barriers:** `append_barrier` is the only writer; it invalidates the
   stream and the timelines and selections of every table under the
   stream's key prefix. A structural test fails on a new writer.

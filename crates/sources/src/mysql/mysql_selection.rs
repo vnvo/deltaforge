@@ -943,7 +943,7 @@ pub struct ProbeMix {
 }
 
 /// A selection cache built as a loaded cache holds its entries, for
-/// measuring its estimate against resident memory
+/// measuring its estimate against the memory its entries allocate
 /// (`tests/mysql_window_memory_e2e.rs`): a measurement seam.
 #[doc(hidden)]
 pub struct CacheProbe {
@@ -1579,7 +1579,7 @@ async fn install_load(
 ) -> SourceResult<Option<SourceResult<Arc<Timeline>>>> {
     use super::mysql_history::Loaded;
     let registry = ctx.schema.registry_arc();
-    let (mut read_any, mut read_bytes) = (false, 0u64);
+    let (mut requested, mut read_bytes) = (0u64, 0u64);
     let mut mine = None;
     for chunk in keys.chunks(super::mysql_history::BATCH_MAX_TABLES) {
         if adm.spent() && !chunk.iter().any(alone) {
@@ -1595,7 +1595,7 @@ async fn install_load(
         )
         .await
         .map_err(timeline_error)?;
-        read_any = true;
+        requested += chunk.len() as u64;
         read_bytes += read
             .iter()
             .map(|l| match l {
@@ -1671,12 +1671,8 @@ async fn install_load(
             }
         }
     }
-    if read_any {
-        crate::perf_phases::store_read(
-            read_kind,
-            keys.len() as u64,
-            read_bytes,
-        );
+    if requested > 0 {
+        crate::perf_phases::store_read(read_kind, requested, read_bytes);
     }
     Ok(mine)
 }
@@ -3861,6 +3857,40 @@ mod tests {
                 .count();
             assert!(cached > 0 && cached < batch, "{cached} cached");
             assert_eq!(reads, 1, "statements read for {} tables", keys.len());
+        }
+
+        /// A load that stops early counts only the tables it asked the
+        /// store for (one statement's), not every table it was given; still
+        /// one read per load.
+        #[cfg(feature = "perf-phases")]
+        #[test]
+        fn perf_a_stopped_load_counts_the_tables_it_requested() {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let backend: ArcStorageBackend =
+                Arc::new(storage::MemoryStorageBackend::new());
+            let mut ctx = rt.block_on(ctx_on(backend));
+            let batch = crate::mysql::mysql_history::BATCH_MAX_TABLES;
+            let keys = rt.block_on(tables(&ctx, "a", 3 * batch, 2));
+            ctx.selection = Caches::default();
+            ctx.selection.set_limit_for_test(16 << 10);
+            let seen =
+                crate::mysql::mysql_selection::perf_tests::perf_metrics(|| {
+                    rt.block_on(load_timelines(&mut ctx, &keys))
+                });
+            let read = |name: &str| {
+                let prefix = format!(
+                    "deltaforge_perf_selection_{name} read=history_prefetch "
+                );
+                seen.iter()
+                    .find_map(|l| l.strip_prefix(&prefix))
+                    .unwrap_or_else(|| panic!("no {name} in {seen:?}"))
+                    .to_string()
+            };
+            assert_eq!(read("store_reads_total"), "1");
+            assert_eq!(read("store_tables_total"), batch.to_string());
         }
 
         /// The peak of this thread's allocations while `key`'s oversized

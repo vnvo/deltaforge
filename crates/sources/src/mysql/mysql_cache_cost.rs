@@ -6,8 +6,23 @@
 //! strings and vectors at capacity, the `Arc` headers, a selected schema's
 //! decoder, a read-ahead version's JSON tree, and the maps' buckets. A
 //! record's own heap is taken from its stored size (what was read for it),
-//! which covers the strings it decodes into. Resident memory is measured
-//! against this estimate in `tests/mysql_window_memory_e2e.rs`.
+//! which covers the strings it decodes into. The memory the cache's entries
+//! allocate is measured against this estimate in
+//! `tests/mysql_window_memory_e2e.rs`.
+//!
+//! The rounding is jemalloc's (the runner's default allocator, feature
+//! `jemalloc`) in its default configuration: an 8-byte tiny class, a
+//! 16-byte quantum and four classes per doubling; the hash tables are
+//! hashbrown's (std, `lru` and `indexmap`). Both are checked against the
+//! libraries themselves below, on the platform the tests run on (x86_64
+//! here); a jemalloc built with another quantum or page-size layout needs
+//! the check to pass there before the estimate is relied on. Under another
+//! allocator (a build without
+//! `jemalloc`, glibc's malloc) the estimate is an approximation: glibc adds
+//! an 8-byte header and gives at least 32 bytes, so small strings can take
+//! more than counted. The estimate counts allocated bytes, not the
+//! allocator's resident pages (fragmentation, retained free pages) nor the
+//! process's RSS.
 
 use std::mem::size_of;
 use std::sync::Arc;
@@ -204,32 +219,64 @@ pub(crate) fn version(v: &schema_registry::SchemaVersion) -> u64 {
 mod tests {
     use super::*;
 
-    /// Size classes: never below the request, at most a quarter above it
-    /// past the smallest classes.
+    /// The size classes are jemalloc's own (`nallocx`): every request up
+    /// to 64 KiB, and the classes around each power of two up to 2 GiB.
     #[test]
-    fn a_size_class_covers_its_request() {
-        assert_eq!(allocated(0), 0);
-        assert_eq!(allocated(1), 8);
-        assert_eq!(allocated(17), 32);
-        assert_eq!(allocated(65), 80);
-        assert_eq!(allocated(1025), 1280);
-        for n in 1..100_000u64 {
-            let a = allocated(n);
-            assert!(a >= n);
-            if n > 64 {
-                assert!(a <= n + n / 4, "{n} -> {a}");
+    fn the_size_classes_are_jemallocs() {
+        use crate::test_alloc::size_class;
+        let mut sizes: Vec<u64> = (1..=65_536).collect();
+        for k in 17..31 {
+            let p = 1u64 << k;
+            for d in [p / 8, p / 16, 1] {
+                sizes.extend([p - d, p, p + d]);
             }
+        }
+        for n in sizes {
+            assert_eq!(allocated(n), size_class(n as usize) as u64, "{n}");
         }
     }
 
-    /// A map's buckets give it at least the slots asked for.
+    /// A hash map grown entry by entry allocates the table its estimate
+    /// counts (hashbrown's buckets, at jemalloc's size class).
     #[test]
-    fn buckets_hold_their_capacity() {
-        for n in 1..10_000 {
-            let b = buckets_for(n);
-            assert!(b.is_power_of_two());
-            let usable = if b < 8 { b - 1 } else { b / 8 * 7 };
-            assert!(usable >= n, "{n} -> {b}");
+    fn a_grown_map_allocates_its_estimated_table() {
+        use crate::test_alloc::held;
+        // Every size to 300, and each side of every growth up to 2^17
+        // buckets (seven eighths of them usable).
+        let edges = (4..18).flat_map(|k| {
+            let usable = (1usize << k) / 8 * 7;
+            [usable, usable + 1]
+        });
+        for n in (1..=300).chain(edges) {
+            let before = held();
+            let mut m = std::collections::HashMap::<u64, u64>::new();
+            for i in 0..n as u64 {
+                m.insert(i, i);
+            }
+            let got = (held() - before) as u64;
+            let slot = size_of::<(u64, u64)>();
+            assert_eq!(got, table(buckets_for(n), slot), "{n}");
+            drop(m);
+        }
+    }
+
+    /// A parsed JSON object allocates what [`json`] counts for it: its
+    /// entries, its index table and its keys.
+    #[test]
+    fn a_parsed_object_allocates_its_estimate() {
+        use crate::test_alloc::held;
+        for keys in 1..=60 {
+            let text = serde_json::to_string(
+                &(0..keys)
+                    .map(|i| (format!("key_{i}"), serde_json::Value::from(i)))
+                    .collect::<serde_json::Map<_, _>>(),
+            )
+            .unwrap();
+            let before = held();
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let got = (held() - before) as u64;
+            assert_eq!(got, json(&v), "{keys} keys");
+            drop(v);
         }
     }
 }

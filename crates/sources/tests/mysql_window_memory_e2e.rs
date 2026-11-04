@@ -244,16 +244,60 @@ async fn a_windows_memory_is_bounded_by_its_plan() {
     container.rm().await.ok();
 }
 
+/// jemalloc's resident bytes for the whole process (pages it holds,
+/// fragmentation and retained free pages included).
+fn allocator_resident() -> u64 {
+    let mut epoch: u64 = 1;
+    // SAFETY: writing `epoch` refreshes the statistics; one u64 in.
+    let rc = unsafe {
+        tikv_jemalloc_sys::mallctl(
+            c"epoch".as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            (&mut epoch as *mut u64).cast(),
+            std::mem::size_of::<u64>(),
+        )
+    };
+    assert_eq!(rc, 0, "epoch");
+    let mut value: usize = 0;
+    let mut len = std::mem::size_of::<usize>();
+    // SAFETY: `stats.resident` writes one size_t into `value`.
+    let rc = unsafe {
+        tikv_jemalloc_sys::mallctl(
+            c"stats.resident".as_ptr(),
+            (&mut value as *mut usize).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    assert_eq!(rc, 0, "stats.resident");
+    value as u64
+}
+
+/// The process's resident set (`VmRSS`), where `/proc` has it.
+fn process_rss() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
+}
+
 /// The selection cache's byte estimate (what its 256 MiB bound counts)
-/// covers the memory it holds (`docs/design/mysql-mass-invalidation.md`,
-/// section 6), for mixtures of timelines of 1, 100 and 10,000 records per
-/// table, shared barrier streams, selected schemas and read-ahead versions,
-/// up to 70,000 tables: resident memory never exceeds the estimate, and the
-/// estimate stays within twice resident memory. Also after a barrier
-/// invalidates half the databases and after eviction (the maps keep their
-/// buckets), and after a full clear (nothing is left).
+/// covers the memory its entries allocate
+/// (`docs/design/mysql-mass-invalidation.md`, section 6), for mixtures of
+/// timelines of 1, 100 and 10,000 records per table, shared barrier
+/// streams, selected schemas and read-ahead versions, up to 70,000 tables:
+/// the bytes this thread allocated for the cache (jemalloc's
+/// `thread.allocated` less `thread.deallocated`, each allocation at its
+/// size class) never exceed the estimate, and the estimate stays within
+/// twice them. Also after a barrier invalidates half the databases and
+/// after eviction (the maps keep their buckets), and after a full clear
+/// (nothing is left). The allocator's resident memory and the process's
+/// RSS are reported beside them, not asserted: they include pages the
+/// allocator keeps after frees and everything else the process holds.
 #[test]
-fn the_cache_estimate_covers_resident_memory() {
+fn the_cache_estimate_covers_its_allocated_memory() {
     use sources::mysql::{CacheProbe, ProbeMix};
     let mixes = [
         (40_000, 40, 1, 12, true, true),
@@ -272,19 +316,26 @@ fn the_cache_estimate_covers_resident_memory() {
             versions,
         };
         let before = held();
+        let (resident_before, rss_before) =
+            (allocator_resident(), process_rss());
         let mut probe = CacheProbe::fill(mix);
         let check = |probe: &CacheProbe, when: &str| {
             let estimate = probe.estimate();
-            let resident = (held() - before).max(0) as u64;
-            let ratio = resident as f64 / estimate.max(1) as f64;
+            let allocated = (held() - before).max(0) as u64;
+            let ratio = allocated as f64 / estimate.max(1) as f64;
+            let resident = allocator_resident() as i64 - resident_before as i64;
+            let rss = process_rss()
+                .zip(rss_before)
+                .map(|(now, was)| now as i64 - was as i64);
             eprintln!(
-                "{mix:?} {when}: estimate {estimate} bytes, resident \
-                 {resident} bytes, ratio {ratio:.2}"
+                "{mix:?} {when}: estimate {estimate} bytes, cache allocated \
+                 {allocated} bytes (ratio {ratio:.2}); allocator resident \
+                 {resident:+} bytes, process RSS {rss:+?} bytes"
             );
-            assert!(resident <= estimate, "{when}: {resident} > {estimate}");
+            assert!(allocated <= estimate, "{when}: {allocated} > {estimate}");
             assert!(
-                estimate <= 2 * resident,
-                "{when}: {estimate} > 2 x {resident}"
+                estimate <= 2 * allocated,
+                "{when}: {estimate} > 2 x {allocated}"
             );
         };
         check(&probe, "filled");
@@ -297,7 +348,7 @@ fn the_cache_estimate_covers_resident_memory() {
         probe.invalidate_all();
         let left = (held() - before).max(0) as u64;
         eprintln!(
-            "{mix:?} cleared: estimate {}, resident {left}",
+            "{mix:?} cleared: estimate {}, cache allocated {left}",
             probe.estimate()
         );
         assert_eq!(probe.estimate(), 0);

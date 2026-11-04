@@ -26,6 +26,18 @@ fn stat(name: &std::ffi::CStr) -> u64 {
     value
 }
 
+/// The bytes this thread holds now (allocated less deallocated, each
+/// allocation at its size class).
+pub(crate) fn held() -> i64 {
+    stat(c"thread.allocated") as i64 - stat(c"thread.deallocated") as i64
+}
+
+/// The bytes jemalloc gives a request of `n` bytes (its size class).
+pub(crate) fn size_class(n: usize) -> usize {
+    // SAFETY: `nallocx` only computes a size; it allocates nothing.
+    unsafe { tikv_jemalloc_sys::nallocx(n, 0) }
+}
+
 /// Reset this thread's allocation peak.
 pub(crate) fn reset_peak() {
     // SAFETY: a documented write-only mallctl with no argument.

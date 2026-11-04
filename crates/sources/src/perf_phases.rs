@@ -109,8 +109,10 @@ pub(crate) fn cache_eviction(entry: &'static str) {
 /// One state-store read a miss caused: `read` is `history` (timelines a row
 /// needed), `history_prefetch` (timelines an activation window read ahead),
 /// `versions` (versions read ahead with them) or `version` (one version a
-/// selection needed). Counts the reads, the tables asked for and the stored
-/// bytes of the timelines installed:
+/// selection needed). Counts the reads (one per load, which may issue
+/// several statements), the tables the store was asked for (a load that
+/// stops once nothing more fits leaves the rest unread and uncounted) and
+/// the stored bytes of the timelines read:
 /// `deltaforge_perf_selection_store_reads_total{read}`,
 /// `deltaforge_perf_selection_store_tables_total{read}`,
 /// `deltaforge_perf_selection_store_bytes_total{read}`.
