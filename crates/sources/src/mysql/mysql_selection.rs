@@ -4183,6 +4183,74 @@ mod tests {
             }
         }
 
+        /// What invalidation costs at the default bound filled with the
+        /// most entries it can hold: the smallest real tables (a one-record
+        /// timeline, a one-column selection and version) over 100
+        /// databases. Times a database barrier, a lineage barrier and a
+        /// full clear, each on a full cache, five times. A measurement for
+        /// a release build (`docs/design/selection-cache-diagnosis.md`,
+        /// section 6): `cargo test --release -p sources --lib --
+        /// --ignored --nocapture invalidation_cost_at_the_default_bound`.
+        #[test]
+        #[ignore = "timing: run in a release build"]
+        fn invalidation_cost_at_the_default_bound() {
+            const DBS: usize = 100;
+            let selection = loaded(1);
+            let fill = |c: &mut Caches, tables: usize| {
+                let mut read = HashMap::new();
+                for t in 0..tables {
+                    let k = key(t % DBS, t / DBS);
+                    let bk = k.backend_key();
+                    c.put_timeline(bk.clone(), timeline_of(&k, 64, &mut read));
+                    c.put_selection(
+                        (bk.clone(), "d".into(), "sig".into()),
+                        selection.clone(),
+                    );
+                    c.put_version(bk, version(1, 1));
+                }
+            };
+            let full = || {
+                let mut c = Caches::default();
+                assert_eq!(c.max_bytes, SELECTION_CACHE_BYTES);
+                fill(&mut c, 1);
+                let per = c.entries_bytes_for_test().max(1);
+                fill(&mut c, (SELECTION_CACHE_BYTES / per) as usize * 11 / 10);
+                c
+            };
+            let mut times: [Vec<Duration>; 3] = Default::default();
+            let mut held = 0;
+            for _ in 0..5 {
+                let mut c = full();
+                held = c.len();
+                let t0 = Instant::now();
+                c.barrier_appended(&database(7));
+                times[0].push(t0.elapsed());
+                assert_eq!(c.held_for(&key(7, 3)), 0);
+
+                let mut c = full();
+                let t0 = Instant::now();
+                c.barrier_appended(&lineage());
+                times[1].push(t0.elapsed());
+                assert_eq!(c.len(), 0);
+
+                let mut c = full();
+                let t0 = Instant::now();
+                c.invalidate_all();
+                times[2].push(t0.elapsed());
+                assert_eq!(c.bytes(), 0);
+            }
+            let names = ["database barrier", "lineage barrier", "full clear"];
+            for (name, t) in names.iter().zip(&mut times) {
+                t.sort();
+                eprintln!(
+                    "{held} entries at {SELECTION_CACHE_BYTES} bytes: {name} \
+                     median {:?}, max {:?}",
+                    t[t.len() / 2],
+                    t[t.len() - 1]
+                );
+            }
+        }
+
         /// While a load admits, what it admitted is never evicted to make
         /// room: an entry that would need that is left uncached. Older
         /// entries make room first.
