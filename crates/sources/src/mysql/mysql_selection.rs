@@ -143,14 +143,15 @@ const LRU_SLOT: usize = 2 * std::mem::size_of::<usize>();
 const BARRIER_SLOT: usize =
     std::mem::size_of::<(String, (Arc<BarrierStream>, usize))>();
 
-/// What an entry costs beyond its value: its node and its key's strings.
+/// What an entry costs beyond its value: its node and its key's own
+/// strings (the table's string is shared by the table's keys and counted
+/// once, by the index).
 fn key_cost(key: &CacheKey) -> u64 {
-    use super::mysql_cache_cost::allocated;
-    let s = |s: &String| allocated(s.capacity() as u64);
+    use super::mysql_cache_cost::{allocated, shared_str};
     allocated(NODE)
         + match key {
-            CacheKey::Timeline(t) | CacheKey::Version(t, _) => s(t),
-            CacheKey::Selection(t, d, g) => s(t) + s(d) + s(g),
+            CacheKey::Timeline(_) | CacheKey::Version(..) => 0,
+            CacheKey::Selection(_, d, g) => shared_str(d) + shared_str(g),
         }
 }
 
@@ -164,24 +165,46 @@ pub(crate) const METRIC_BYTES: &str = "deltaforge_mysql_selection_cache_bytes";
 pub(crate) const METRIC_TIMELINES: &str =
     "deltaforge_mysql_selection_cache_timelines";
 
+/// A cache key. Its strings are shared: a cached key's table string is the
+/// one its table's other keys and the index hold.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum CacheKey {
+pub(super) enum CacheKey {
     /// A validated timeline, by table key.
-    Timeline(String),
+    Timeline(Arc<str>),
     /// A selected schema by (table key, decisive record, TableMap
     /// signature). The key carries the lineage; the decisive record carries
     /// the row position's effective proof.
-    Selection(String, String, String),
+    Selection(Arc<str>, Arc<str>, Arc<str>),
     /// A registered version of a table, read ahead with its timeline.
-    Version(String, i32),
+    Version(Arc<str>, i32),
 }
 
 impl CacheKey {
-    fn table(&self) -> &str {
+    pub(super) fn table(&self) -> &str {
         match self {
             CacheKey::Timeline(t)
             | CacheKey::Selection(t, _, _)
             | CacheKey::Version(t, _) => t,
+        }
+    }
+
+    /// The key with `table` (the same string) as its table's.
+    pub(super) fn with_table(self, table: Arc<str>) -> Self {
+        debug_assert_eq!(*table, *self.table());
+        match self {
+            CacheKey::Timeline(_) => CacheKey::Timeline(table),
+            CacheKey::Selection(_, d, g) => CacheKey::Selection(table, d, g),
+            CacheKey::Version(_, v) => CacheKey::Version(table, v),
+        }
+    }
+
+    /// Whether the key holds `table` itself as its table's string (tests).
+    #[cfg(test)]
+    pub(super) fn shares_table(&self, table: &Arc<str>) -> bool {
+        match self {
+            CacheKey::Timeline(t)
+            | CacheKey::Selection(t, _, _)
+            | CacheKey::Version(t, _) => Arc::ptr_eq(t, table),
         }
     }
 }
@@ -195,13 +218,14 @@ enum Cached {
     Version(Arc<schema_registry::SchemaVersion>),
 }
 
-/// An entry: its value, its estimated bytes (key and node included), and
-/// the load that admitted it (0: none).
+/// An entry: its value, its estimated bytes (key and node included), the
+/// load that admitted it (0: none) and its key's slot in the index.
 #[derive(Debug, Clone)]
 struct Entry {
     cached: Cached,
     bytes: u64,
     load: u64,
+    slot: u32,
 }
 
 /// What one load ([`install`]) may still admit: half the byte bound, so a
@@ -238,6 +262,9 @@ pub(crate) struct Caches {
     /// Barrier streams, by stream key, with the cached timelines holding
     /// each.
     barriers: std::collections::HashMap<String, (Arc<BarrierStream>, usize)>,
+    /// The entries' keys by database and table: what a barrier or a
+    /// table's invalidation visits.
+    index: super::mysql_cache_index::Index,
     timelines: usize,
     /// The estimated bytes of the entries and barrier streams held.
     held: u64,
@@ -325,6 +352,7 @@ impl Caches {
         Self {
             entries: lru::LruCache::unbounded(),
             barriers: Default::default(),
+            index: Default::default(),
             timelines: 0,
             held: 0,
             table_bytes: 0,
@@ -348,10 +376,12 @@ impl Caches {
         lru + table(buckets_for(barriers), BARRIER_SLOT)
     }
 
-    /// The estimated bytes held: entries, barrier streams and the maps'
-    /// buckets.
+    /// The estimated bytes held: entries, barrier streams, the index and
+    /// the maps' buckets.
     pub(crate) fn bytes(&self) -> u64 {
-        self.held + self.maps_at(self.peak, self.barriers.capacity())
+        self.held
+            + self.index.bytes()
+            + self.maps_at(self.peak, self.barriers.capacity())
     }
 
     /// What one more entry, and `streams` more barrier streams, add to the
@@ -389,7 +419,18 @@ impl Caches {
     /// Remove `key`'s entry, with its accounting.
     fn remove(&mut self, key: &CacheKey) {
         if let Some(e) = self.entries.pop(key) {
+            self.unindex(key, e.slot);
             self.forget(e);
+        }
+    }
+
+    /// Unindex `key`, held at `slot`; the key moved into that slot is told.
+    fn unindex(&mut self, key: &CacheKey, slot: u32) {
+        if let Some(moved) = self.index.remove(key, slot) {
+            self.entries
+                .peek_mut(&moved)
+                .expect("an indexed key is cached")
+                .slot = slot;
         }
     }
 
@@ -432,9 +473,10 @@ impl Caches {
         {
             return false;
         }
-        let Some((_, e)) = self.entries.pop_lru() else {
+        let Some((key, e)) = self.entries.pop_lru() else {
             return false;
         };
+        self.unindex(&key, e.slot);
         crate::perf_phases::cache_eviction(match &e.cached {
             Cached::Timeline(..) => "timeline",
             Cached::Selection(_) => "selection",
@@ -450,7 +492,9 @@ impl Caches {
     fn put(&mut self, key: CacheKey, value: Cached, bytes: u64) -> bool {
         self.remove(&key);
         let bytes = bytes + key_cost(&key);
-        while self.bytes() + bytes + self.growth(0) > self.max_bytes {
+        while self.bytes() + bytes + self.growth(0) + self.index.growth(&key)
+            > self.max_bytes
+        {
             if !self.evict_one() {
                 return false;
             }
@@ -466,12 +510,14 @@ impl Caches {
             self.table_bytes += bytes;
         }
         let load = if self.loading { self.load } else { 0 };
+        let (key, slot) = self.index.insert(key);
         self.entries.push(
             key,
             Entry {
                 cached,
                 bytes,
                 load,
+                slot,
             },
         );
         self.peak = self.peak.max(self.entries.len());
@@ -519,7 +565,7 @@ impl Caches {
     }
 
     pub(crate) fn timeline(&mut self, key: &str) -> Option<Arc<Timeline>> {
-        match self.entries.get(&CacheKey::Timeline(key.to_string()))? {
+        match self.entries.get(&CacheKey::Timeline(key.into()))? {
             Entry {
                 cached: Cached::Timeline(t, _),
                 ..
@@ -535,7 +581,7 @@ impl Caches {
             .iter()
             .filter_map(|(k, e)| match (k, &e.cached) {
                 (CacheKey::Timeline(key), Cached::Timeline(_, true)) => {
-                    Some(key.clone())
+                    Some(key.to_string())
                 }
                 _ => None,
             })
@@ -546,7 +592,8 @@ impl Caches {
     /// timeline last changed.
     pub(crate) fn is_proven(&mut self, key: &SchemaKey) -> bool {
         matches!(
-            self.entries.peek(&CacheKey::Timeline(key.backend_key())),
+            self.entries
+                .peek(&CacheKey::Timeline(key.backend_key().into())),
             Some(Entry {
                 cached: Cached::Timeline(_, true),
                 ..
@@ -562,7 +609,7 @@ impl Caches {
             ..
         }) = self
             .entries
-            .peek_mut(&CacheKey::Timeline(key.backend_key()))
+            .peek_mut(&CacheKey::Timeline(key.backend_key().into()))
         {
             *proven = true;
         }
@@ -581,11 +628,12 @@ impl Caches {
         })
     }
 
-    /// What caching `timeline` for `key` adds: the entry, and the barrier
-    /// streams of it not held.
+    /// What caching `timeline` for `key` adds: the entry, its indexing,
+    /// and the barrier streams of it not held.
     fn timeline_cost(&self, key: &CacheKey, timeline: &Timeline) -> u64 {
         super::mysql_cache_cost::timeline(timeline)
             + key_cost(key)
+            + self.index.growth(key)
             + self
                 .unheld(timeline)
                 .map(|s| super::mysql_cache_cost::stream(s))
@@ -601,7 +649,7 @@ impl Caches {
         key: String,
         timeline: Arc<Timeline>,
     ) -> Option<Arc<Timeline>> {
-        self.put_timeline_as(CacheKey::Timeline(key), timeline)
+        self.put_timeline_as(CacheKey::Timeline(key.into()), timeline)
     }
 
     fn put_timeline_as(
@@ -656,7 +704,7 @@ impl Caches {
         key: String,
         timeline: Arc<Timeline>,
     ) -> Arc<Timeline> {
-        let key = CacheKey::Timeline(key);
+        let key = CacheKey::Timeline(key.into());
         let cost = self.timeline_cost(&key, &timeline);
         if !self.admit(adm, cost) {
             return timeline;
@@ -672,9 +720,9 @@ impl Caches {
         (table, decisive, signature): &(String, String, String),
     ) -> Option<Arc<LoadedSchema>> {
         let key = CacheKey::Selection(
-            table.clone(),
-            decisive.clone(),
-            signature.clone(),
+            table.as_str().into(),
+            decisive.as_str().into(),
+            signature.as_str().into(),
         );
         match self.entries.get(&key)? {
             Entry {
@@ -692,7 +740,7 @@ impl Caches {
     ) -> Option<Arc<schema_registry::SchemaVersion>> {
         match self
             .entries
-            .get(&CacheKey::Version(table.to_string(), version))?
+            .get(&CacheKey::Version(table.into(), version))?
         {
             Entry {
                 cached: Cached::Version(v),
@@ -709,7 +757,7 @@ impl Caches {
     ) -> bool {
         let bytes = super::mysql_cache_cost::version(&v);
         self.put(
-            CacheKey::Version(table, v.version),
+            CacheKey::Version(table.into(), v.version),
             Cached::Version(Arc::new(v)),
             bytes,
         )
@@ -723,9 +771,9 @@ impl Caches {
         table: String,
         v: schema_registry::SchemaVersion,
     ) {
-        let key = CacheKey::Version(table, v.version);
+        let key = CacheKey::Version(table.into(), v.version);
         let bytes = super::mysql_cache_cost::version(&v);
-        if self.admit(adm, bytes + key_cost(&key)) {
+        if self.admit(adm, bytes + key_cost(&key) + self.index.growth(&key)) {
             self.put(key, Cached::Version(Arc::new(v)), bytes);
         }
     }
@@ -737,7 +785,11 @@ impl Caches {
     ) {
         let bytes = super::mysql_cache_cost::loaded(&loaded);
         self.put(
-            CacheKey::Selection(table, decisive, signature),
+            CacheKey::Selection(
+                table.into(),
+                decisive.into(),
+                signature.into(),
+            ),
             Cached::Selection(loaded),
             bytes,
         );
@@ -774,7 +826,7 @@ impl Caches {
         let k = key.backend_key();
         self.entries
             .iter()
-            .filter(|(e, _)| matches!(e, CacheKey::Version(t, _) if *t == k))
+            .filter(|(e, _)| matches!(e, CacheKey::Version(t, _) if **t == *k))
             .map(|(_, e)| e.bytes)
             .sum()
     }
@@ -840,25 +892,15 @@ impl Caches {
         }
         assert_eq!(held, self.held, "bytes held");
         assert_eq!(table_bytes, self.table_bytes, "tables' bytes");
+        self.index
+            .audit(self.entries.iter().map(|(k, e)| (k, e.slot)));
         assert!(self.peak >= self.entries.len(), "peak");
         assert!(self.bytes() <= self.max_bytes || self.held == 0, "bound");
     }
 
     /// A record was appended for `key`.
     pub(crate) fn invalidate(&mut self, key: &SchemaKey) {
-        let k = key.backend_key();
-        self.invalidate_where(|t| t == k);
-    }
-
-    fn invalidate_where(&mut self, stale: impl Fn(&str) -> bool) {
-        let keys: Vec<CacheKey> = self
-            .entries
-            .iter()
-            .map(|(key, _)| key)
-            .filter(|key| stale(key.table()))
-            .cloned()
-            .collect();
-        for key in keys {
+        for key in self.index.of_table(&key.backend_key()) {
             self.remove(&key);
         }
     }
@@ -892,7 +934,7 @@ impl Caches {
         timeline: Arc<Timeline>,
     ) -> bool {
         let current = matches!(
-            self.entries.peek(&CacheKey::Timeline(key.backend_key())),
+            self.entries.peek(&CacheKey::Timeline(key.backend_key().into())),
             Some(Entry { cached: Cached::Timeline(t, _), .. })
                 if Arc::ptr_eq(t, snapshot)
         );
@@ -903,10 +945,19 @@ impl Caches {
     }
 
     /// A barrier was appended to `stream` (a lineage's or a database's):
-    /// the stream, and every timeline and selection of a table it applies
-    /// to, are stale. Every other table stays cached.
+    /// the stream, and every entry of a table it applies to (whose key
+    /// starts with it), are stale. Every other table stays cached. The
+    /// index finds those entries without visiting the others. A barrier
+    /// that applies to every entry is a full clear: barrier streams are
+    /// held only by cached timelines, so none is left either way.
     pub(crate) fn barrier_appended(&mut self, stream: &str) {
-        self.invalidate_where(|t| t.starts_with(stream));
+        if self.index.covers_all(stream) {
+            self.invalidate_all();
+            return;
+        }
+        for key in self.index.reached(stream) {
+            self.remove(&key);
+        }
         if let Some((s, _)) = self.barriers.remove(stream) {
             self.held -= super::mysql_cache_cost::stream(&s);
         }
@@ -918,6 +969,7 @@ impl Caches {
     pub(crate) fn invalidate_all(&mut self) {
         self.entries = lru::LruCache::unbounded();
         self.barriers = Default::default();
+        self.index = Default::default();
         self.timelines = 0;
         self.held = 0;
         self.table_bytes = 0;
@@ -3367,16 +3419,11 @@ mod tests {
             assert!(held > 4 * (54 << 20) + (10 << 20), "{held}");
             assert_eq!(caches.barrier_streams().len(), 1);
             caches.audit();
-            // The last timeline holding the stream takes it with it; the
-            // map's buckets stay counted until a full clear.
+            // A barrier over every entry clears the cache: the stream goes
+            // with its last timeline, and the maps' buckets are released.
             caches.barrier_appended("lineage/");
-            assert_eq!(
-                (caches.timelines(), caches.entries_bytes_for_test()),
-                (0, 0)
-            );
+            assert_eq!((caches.timelines(), caches.bytes()), (0, 0));
             caches.audit();
-            caches.invalidate_all();
-            assert_eq!(caches.bytes(), 0);
         }
 
         /// A barrier invalidates exactly what it applies to: a database's,
@@ -4078,7 +4125,8 @@ mod tests {
         }
 
         /// The buckets the cache's maps keep after evictions and
-        /// invalidations are counted until a full clear releases them.
+        /// invalidations are counted until a full clear (or a barrier over
+        /// every entry) releases them.
         #[test]
         fn retained_map_capacity_is_counted_until_a_full_clear() {
             let mut c = Caches::default();
@@ -4103,6 +4151,147 @@ mod tests {
             c.audit();
             c.invalidate_all();
             assert_eq!(c.bytes(), 0);
+            c.audit();
+        }
+
+        /// A barrier that applies to every cached entry releases them, and
+        /// the maps' buckets, before it returns, as a full clear does: the
+        /// cache counts nothing, and the thread holds again exactly what it
+        /// held before they were cached.
+        #[test]
+        fn a_barrier_over_every_entry_releases_them_and_the_maps() {
+            let selection = loaded(4);
+            let mut c = Caches::default();
+            let before = crate::test_alloc::held();
+            {
+                let mut read = HashMap::new();
+                for t in 0..2_000 {
+                    let k = key(t % 20, t);
+                    let bk = k.backend_key();
+                    c.put_timeline(bk.clone(), timeline_of(&k, 300, &mut read));
+                    c.put_selection(
+                        (bk.clone(), "d".into(), "sig".into()),
+                        selection.clone(),
+                    );
+                    c.put_version(bk, version(1, 4));
+                }
+            }
+            c.barrier_appended(&lineage());
+            assert_eq!((c.len(), c.timelines(), c.bytes()), (0, 0, 0));
+            assert!(c.barrier_streams().is_empty());
+            c.audit();
+            assert_eq!(crate::test_alloc::held(), before);
+        }
+
+        /// A barrier over an empty cache leaves it empty; over one whose
+        /// entries were all invalidated already, it releases the buckets
+        /// they left.
+        #[test]
+        fn a_barrier_over_an_empty_cache_releases_its_buckets() {
+            let mut c = Caches::default();
+            c.barrier_appended(&lineage());
+            assert_eq!((c.len(), c.bytes()), (0, 0));
+            c.audit();
+            let mut read = HashMap::new();
+            let keys: Vec<SchemaKey> = (0..500).map(|t| key(0, t)).collect();
+            for k in &keys {
+                c.put_timeline(k.backend_key(), timeline_of(k, 300, &mut read));
+            }
+            for k in &keys {
+                c.invalidate(k);
+            }
+            assert_eq!(c.len(), 0);
+            assert!(c.bytes() > 0, "the emptied buckets are counted");
+            c.barrier_appended(&database(1));
+            assert_eq!(c.bytes(), 0);
+            c.audit();
+        }
+
+        /// Selections and versions held without their tables' timelines go
+        /// with a barrier over them and with a full clear; another
+        /// lineage's stay until a barrier over theirs.
+        #[test]
+        fn selections_and_versions_without_timelines_are_invalidated() {
+            let selection = loaded(4);
+            let other = SchemaKey::new(
+                "acme",
+                "s",
+                "fedcba9876543210fedcba9876543210",
+                "db0",
+                "t0",
+            );
+            let sel =
+                |k: &SchemaKey| (k.backend_key(), "d".into(), "sig".into());
+            let put = |c: &mut Caches, k: &SchemaKey| {
+                c.put_selection(sel(k), selection.clone());
+                c.put_version(k.backend_key(), version(1, 4));
+            };
+            let mut c = Caches::default();
+            for t in 0..100 {
+                put(&mut c, &key(t % 3, t));
+            }
+            put(&mut c, &other);
+            c.barrier_appended(&lineage());
+            assert_eq!(c.len(), 2, "the other lineage's selection and version");
+            assert!(c.selection(&sel(&other)).is_some());
+            assert!(c.version(&other.backend_key(), 1).is_some());
+            assert!(c.selection(&sel(&key(0, 0))).is_none());
+            assert!(c.version(&key(0, 0).backend_key(), 1).is_none());
+            c.audit();
+            for t in 0..100 {
+                put(&mut c, &key(t % 3, t));
+            }
+            c.barrier_appended(&barrier_stream(&other, &BarrierScope::Lineage));
+            assert_eq!(c.len(), 200);
+            assert!(c.selection(&sel(&other)).is_none());
+            c.audit();
+            c.barrier_appended(&lineage());
+            assert_eq!((c.len(), c.timelines(), c.bytes()), (0, 0, 0));
+            c.audit();
+            for t in 0..100 {
+                put(&mut c, &key(t % 3, t));
+            }
+            c.invalidate_all();
+            assert_eq!((c.len(), c.bytes()), (0, 0));
+            c.audit();
+        }
+
+        /// A barrier over one lineage of a cache holding two keeps every
+        /// entry of the other, with the barrier streams its timelines
+        /// share; the first lineage's shared streams go with its last
+        /// timeline.
+        #[test]
+        fn a_lineage_barrier_keeps_another_lineages_entries() {
+            let selection = loaded(4);
+            let other = SchemaKey::new(
+                "acme",
+                "s",
+                "fedcba9876543210fedcba9876543210",
+                "db0",
+                "t0",
+            );
+            let mut c = Caches::default();
+            let mut read = HashMap::new();
+            for k in (0..200).map(|t| key(t % 4, t)).chain([other.clone()]) {
+                let bk = k.backend_key();
+                c.put_timeline(bk.clone(), timeline_of(&k, 300, &mut read));
+                c.put_selection(
+                    (bk.clone(), "d".into(), "sig".into()),
+                    selection.clone(),
+                );
+                c.put_version(bk, version(1, 4));
+            }
+            assert_eq!(c.barrier_streams().len(), 4 + 1 + 2);
+            c.barrier_appended(&lineage());
+            assert_eq!((c.len(), c.timelines()), (3, 1));
+            assert!(c.timeline(&other.backend_key()).is_some());
+            let mut held: Vec<String> =
+                c.barrier_streams().into_keys().collect();
+            held.sort();
+            let mut want =
+                crate::mysql::mysql_activation::barrier_streams(&other);
+            want.sort();
+            assert_eq!(held, want);
             c.audit();
         }
 
@@ -4187,7 +4376,10 @@ mod tests {
         /// most entries it can hold: the smallest real tables (a one-record
         /// timeline, a one-column selection and version) over 100
         /// databases. Times a database barrier, a lineage barrier and a
-        /// full clear, each on a full cache, five times. A measurement for
+        /// full clear, each on a full cache, five times: in the order the
+        /// entries were cached, and with the LRU order reshuffled first (as
+        /// reuse reshuffles it; every entry used once in a random order) for
+        /// five fixed seeds, each reported. A measurement for
         /// a release build (`docs/design/selection-cache-diagnosis.md`,
         /// section 6): `cargo test --release -p sources --lib --
         /// --ignored --nocapture invalidation_cost_at_the_default_bound`.
@@ -4217,35 +4409,140 @@ mod tests {
                 fill(&mut c, (SELECTION_CACHE_BYTES / per) as usize * 11 / 10);
                 c
             };
-            let mut times: [Vec<Duration>; 3] = Default::default();
-            let mut held = 0;
-            for _ in 0..5 {
+            let reordered = |seed: u64| {
+                use rand::{SeedableRng, seq::SliceRandom};
                 let mut c = full();
-                held = c.len();
-                let t0 = Instant::now();
-                c.barrier_appended(&database(7));
-                times[0].push(t0.elapsed());
-                assert_eq!(c.held_for(&key(7, 3)), 0);
+                let mut keys: Vec<CacheKey> =
+                    c.entries.iter().map(|(k, _)| k.clone()).collect();
+                keys.shuffle(&mut rand::rngs::StdRng::seed_from_u64(seed));
+                for k in &keys {
+                    c.entries.get(k);
+                }
+                c
+            };
+            let populations =
+                std::iter::once(("insertion order".to_string(), None)).chain(
+                    (1..=5).map(|seed| (format!("seed {seed}"), Some(seed))),
+                );
+            for (population, seed) in populations {
+                let fill = || seed.map_or_else(full, reordered);
+                let mut times: [Vec<Duration>; 3] = Default::default();
+                let mut held = 0;
+                for _ in 0..5 {
+                    let mut c = fill();
+                    held = c.len();
+                    let t0 = Instant::now();
+                    c.barrier_appended(&database(7));
+                    times[0].push(t0.elapsed());
+                    assert_eq!(c.held_for(&key(7, 3)), 0);
 
-                let mut c = full();
-                let t0 = Instant::now();
-                c.barrier_appended(&lineage());
-                times[1].push(t0.elapsed());
-                assert_eq!(c.len(), 0);
+                    let mut c = fill();
+                    let t0 = Instant::now();
+                    c.barrier_appended(&lineage());
+                    times[1].push(t0.elapsed());
+                    assert_eq!(c.len(), 0);
 
-                let mut c = full();
-                let t0 = Instant::now();
-                c.invalidate_all();
-                times[2].push(t0.elapsed());
-                assert_eq!(c.bytes(), 0);
+                    let mut c = fill();
+                    let t0 = Instant::now();
+                    c.invalidate_all();
+                    times[2].push(t0.elapsed());
+                    assert_eq!(c.bytes(), 0);
+                }
+                let names =
+                    ["database barrier", "lineage barrier", "full clear"];
+                for (name, t) in names.iter().zip(&mut times) {
+                    let runs = format!("{t:?}");
+                    t.sort();
+                    eprintln!(
+                        "{held} entries at {SELECTION_CACHE_BYTES} bytes, \
+                         {population}: {name} median {:?}, max {:?}, runs in \
+                         order {runs}",
+                        t[t.len() / 2],
+                        t[t.len() - 1]
+                    );
+                }
             }
-            let names = ["database barrier", "lineage barrier", "full clear"];
-            for (name, t) in names.iter().zip(&mut times) {
+        }
+
+        /// What keeping the cache costs per operation at the default bound
+        /// (index upkeep included): filling it with small tables, admitting
+        /// tables that evict, invalidating single tables, and a table with
+        /// a long history (20,000 versions) cached, evicted one version at
+        /// a time and invalidated. Five runs each; a measurement for a
+        /// release build (`cargo test --release -p sources --lib --
+        /// --ignored --nocapture upkeep_at_the_default_bound`).
+        #[test]
+        #[ignore = "timing: run in a release build"]
+        fn upkeep_at_the_default_bound() {
+            const DBS: usize = 100;
+            let selection = loaded(1);
+            let put = |c: &mut Caches, t: usize, v: i32| {
+                let k = key(t % DBS, t / DBS);
+                let bk = k.backend_key();
+                let mut read = HashMap::new();
+                c.put_timeline(bk.clone(), timeline_of(&k, 64, &mut read));
+                c.put_selection(
+                    (bk.clone(), "d".into(), "sig".into()),
+                    selection.clone(),
+                );
+                c.put_version(bk, version(v, 1));
+            };
+            let per = |d: Duration, n: usize| {
+                Duration::from_nanos((d.as_nanos() / n as u128) as u64)
+            };
+            let mut times: Vec<(&str, Vec<Duration>)> = vec![
+                ("fill, per table (3 entries)", vec![]),
+                ("admit evicting, per table", vec![]),
+                ("invalidate a table", vec![]),
+                ("long history: cache, per version", vec![]),
+                ("long history: evict, per version", vec![]),
+                ("long history: invalidate the table", vec![]),
+            ];
+            let tables = 60_000;
+            for _ in 0..5 {
+                let mut c = Caches::default();
+                let t0 = Instant::now();
+                for t in 0..tables {
+                    put(&mut c, t, 1);
+                }
+                times[0].1.push(per(t0.elapsed(), tables));
+                let t0 = Instant::now();
+                for t in tables..tables + 20_000 {
+                    put(&mut c, t, 1);
+                }
+                times[1].1.push(per(t0.elapsed(), 20_000));
+                let t0 = Instant::now();
+                for t in (tables..tables + 20_000).step_by(2) {
+                    c.invalidate(&key(t % DBS, t / DBS));
+                }
+                times[2].1.push(per(t0.elapsed(), 10_000));
+
+                let long = key(0, 1_000_000);
+                let bk = long.backend_key();
+                let mut c = Caches::default();
+                let t0 = Instant::now();
+                for v in 0..20_000 {
+                    c.put_version(bk.clone(), version(v, 1));
+                }
+                times[3].1.push(per(t0.elapsed(), 20_000));
+                let held = c.bytes();
+                c.set_limit_for_test(held);
+                let t0 = Instant::now();
+                for v in 20_000..30_000 {
+                    c.put_version(bk.clone(), version(v, 1));
+                }
+                times[4].1.push(per(t0.elapsed(), 10_000));
+                let t0 = Instant::now();
+                c.invalidate(&long);
+                times[5].1.push(t0.elapsed());
+                assert_eq!(c.held_for(&long), 0);
+            }
+            for (name, t) in &mut times {
                 let runs = format!("{t:?}");
                 t.sort();
                 eprintln!(
-                    "{held} entries at {SELECTION_CACHE_BYTES} bytes: {name} \
-                     median {:?}, max {:?}, runs in order {runs}",
+                    "upkeep: {name} median {:?}, max {:?}, runs in order \
+                     {runs}",
                     t[t.len() / 2],
                     t[t.len() - 1]
                 );

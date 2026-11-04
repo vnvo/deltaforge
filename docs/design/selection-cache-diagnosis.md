@@ -217,7 +217,9 @@ Any rule that fails is reported with its data; no acceptance is claimed from a p
 
 ### 6.5 Invalidation cost (release build)
 
-Debug-build timings (a database barrier 13 ms, a lineage barrier 405 ms, at 120,000 entries) establish nothing about operational cost. The cost is measured in a release build of `<H>` on the measurement host with nothing else running, by `invalidation_cost_at_the_default_bound` (`cargo test --release -p sources --lib -- --ignored --nocapture invalidation_cost_at_the_default_bound`). The test fills the default bound with its population of the smallest real tables: 191,571 entries, which is 63,857 tables over 100 databases, each with a one-record timeline and a one-column selection and version. That is the tested population, not a universal maximum: other entry mixtures hold other counts. It then times each operation on a full cache, five times.
+Debug-build timings (a database barrier 13 ms, a lineage barrier 405 ms, at 120,000 entries) establish nothing about operational cost. The cost is measured in a release build of `<H>` on the measurement host with nothing else running, by `invalidation_cost_at_the_default_bound` (`cargo test --release -p sources --lib -- --ignored --nocapture invalidation_cost_at_the_default_bound`). The test fills the default bound with its population of the smallest real tables, each with a one-record timeline and a one-column selection and version, over 100 databases: 191,571 entries (63,857 tables) before the index (section 7), 201,324 entries (67,108 tables) with it, since a table's string is now held once for its entries. That is the tested population, not a universal maximum: other entry mixtures hold other counts. It then times each operation on a full cache, five times, in each of six populations: the entries in the order they were cached, and the same entries with the LRU order reshuffled first (every entry used once in a random order, as reuse reshuffles it) for the fixed seeds 1 to 5. The criteria apply to each population, and every population's timings are reported.
+
+The insertion-order population alone, as first planned, missed reordered reuse. Measured on scratch builds of the code before the index (`~/deltaforge-evidence/invalidation-optionA-4294cf99`), a reshuffled LRU order took a database barrier from about 4 ms to about 22 ms and a lineage barrier from about 67 ms to about 150 ms: their per-entry path walked the whole LRU list. The baseline already failed there.
 
 Criteria, fixed before measuring: a database barrier at most 5 ms median; a lineage barrier at most 50 ms median; a full clear at most 50 ms median; each maximum at most 1.5 times its median. A barrier runs on the source's task and delays its stream once.
 - A database barrier follows DDL in one database, which is frequent across a fleet, so it must stay an order of magnitude below the no-eviction post-activation p99 (46 ms at t40000-a20-steady).
@@ -226,6 +228,8 @@ Criteria, fixed before measuring: a database barrier at most 5 ms median; a line
 All five timings of each operation are reported, with any scheduling anomaly (such as one timing far above the others, with the host's load at the time). A failure is reported as measured and never rerun away; the plan returns for review.
 
 Exactness is covered by the unit and memory tests: the accounting, the shared streams, and memory released after a full clear.
+
+Results so far: at `df726153` and `f4d2141c` (insertion order only), a database barrier passed (4.0 and 4.3 ms) and a lineage barrier (66.5, 67.5 ms) and a full clear (61.6, 63.5 ms) failed (`~/deltaforge-evidence/invalidation-cost-df726153`, `-f4d2141c`). Both are recorded as a failed operational-cost check; the criteria are unchanged.
 
 ### 6.6 Order, time and disk
 
@@ -239,3 +243,15 @@ Disk, measured on the step 3 outputs:
 - The release test build needs about 3 GB in the fix worktree.
 
 Each invocation starts with at least 50 GiB free and runs under the harness's 25 GiB floor.
+
+## 7. The barrier index
+
+A barrier on stream `s` invalidates every entry whose table key starts with `s`. Before the index, it found them by walking every entry of the cache, and a table's invalidation (at every install) did too. The cache now keeps its keys by database and table (`mysql_cache_index.rs`):
+- A table key is `v/tenant/source/lineage/db/table` with every segment percent-encoded, so its database's barrier stream is the key up to its last `/`. Under database stream `d`, a barrier on `s` applies to every entry when `d` starts with `s`, to those whose table key starts with `s` when `s` starts with `d`, and to none otherwise. Visiting the databases (one map entry each) therefore finds exactly what a scan finds; a randomized test checks this against a scan, with deeper and segment-cutting prefixes.
+- A barrier that applies to every entry is a full clear.
+- Each table's keys are a vector, and each entry keeps its position there, so a removal swaps the last key into its slot and tells the moved key's entry: a table with a long history costs no more per removal than a small one. A vector a quarter full or less (of at least 16) is shrunk to twice its keys.
+- A table's string is held once, shared by its keys and the index.
+
+The index's memory is in the estimate and the bound: the databases' and tables' strings (once each), the maps' buckets (tracked from their capacity after each insert; they shrink only when dropped) and the tables' vectors at capacity. Admission counts what indexing an entry may add (an upper bound: a map with no room left is taken to resize). `the_index_allocates_its_estimate` checks the estimate against jemalloc exactly, through fills and removals, and the cache's memory probe stays at 0.78 to 0.99 of the estimate with the index.
+
+Its upkeep is measured by `upkeep_at_the_default_bound` (release build): filling, admitting with eviction, single-table invalidation, and a table with 20,000 versions cached, evicted one at a time and invalidated.

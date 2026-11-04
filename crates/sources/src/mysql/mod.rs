@@ -33,6 +33,7 @@ mod mysql_activation_window;
 mod mysql_baseline;
 mod mysql_binlog_scan;
 mod mysql_cache_cost;
+mod mysql_cache_index;
 mod mysql_checkpoint_lineage;
 pub mod mysql_connections;
 pub mod mysql_control;

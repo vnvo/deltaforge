@@ -64,6 +64,11 @@ fn string(s: &str, capacity: usize) -> u64 {
     allocated(capacity as u64)
 }
 
+/// A shared string (`Arc<str>`): its counts and bytes in one allocation.
+pub(crate) fn shared_str(s: &str) -> u64 {
+    allocated((ARC_HEADER + s.len() as u64).next_multiple_of(8))
+}
+
 fn owned(s: &String) -> u64 {
     string(s, s.capacity())
 }
