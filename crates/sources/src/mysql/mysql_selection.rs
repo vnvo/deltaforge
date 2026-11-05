@@ -126,26 +126,12 @@ impl Timeline {
 }
 
 /// The cache's bound: at most this many estimated bytes
-/// ([`mysql_cache_cost`]) charged at once: entries (timelines, selected
-/// schemas and read-ahead versions, with their keys and list nodes),
-/// current or stale, barrier streams (each once), the index, the maps'
-/// buckets, values awaiting a step, and a cache handed to the reclamation
-/// thread until it is freed. No count of tables: as many as fit.
+/// ([`mysql_cache_cost`]) of entries (timelines, selected schemas and
+/// read-ahead versions, with their keys and list nodes), barrier streams
+/// (each once) and the maps' buckets. No count of tables: as many as fit.
 ///
 /// [`mysql_cache_cost`]: super::mysql_cache_cost
 pub(crate) const SELECTION_CACHE_BYTES: u64 = 256 * 1024 * 1024;
-
-/// A value charged more than this is never freed by a cache operation
-/// itself, only by a step ([`Caches::step`]) or the reclamation thread;
-/// and one top-level operation frees at most this much inline in total: a
-/// put, or everything inside a load or a batch of installs
-/// ([`Caches::begin_operation`]), which share one allowance.
-pub(crate) const INLINE_BYTES: u64 = 16 * 1024;
-/// Values detached by an operation and awaiting a step: a fixed ring.
-const DEFERRED: usize = 16;
-/// What one step aims to stay within: a target (a step overruns it by at
-/// most the item it is freeing).
-const STEP: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// One entry's node in the LRU list: its key, its value and two links.
 const NODE: u64 = (std::mem::size_of::<CacheKey>()
@@ -154,9 +140,8 @@ const NODE: u64 = (std::mem::size_of::<CacheKey>()
 /// One bucket of the LRU's map: a key reference and the node's pointer.
 const LRU_SLOT: usize = 2 * std::mem::size_of::<usize>();
 /// One bucket of the barrier streams' map.
-const BARRIER_SLOT: usize = std::mem::size_of::<(String, Held)>();
-/// One bucket of the map of stale barrier streams still held.
-const STALE_SLOT: usize = std::mem::size_of::<(usize, Held)>();
+const BARRIER_SLOT: usize =
+    std::mem::size_of::<(String, (Arc<BarrierStream>, usize))>();
 
 /// What an entry costs beyond its value: its node and its key's own
 /// strings (the table's string is shared by the table's keys and counted
@@ -170,44 +155,15 @@ fn key_cost(key: &CacheKey) -> u64 {
         }
 }
 
-/// `deltaforge_mysql_selection_cache_evictions_total{pipeline,source}`:
-/// entries evicted to make room, current or stale.
+/// `deltaforge_mysql_selection_cache_evictions_total{pipeline,source}`.
 pub(crate) const METRIC_EVICTIONS: &str =
     "deltaforge_mysql_selection_cache_evictions_total";
-/// `..._stale_evictions_total{pipeline,source}`: of which stale.
-pub(crate) const METRIC_STALE_EVICTIONS: &str =
-    "deltaforge_mysql_selection_cache_stale_evictions_total";
 /// `deltaforge_mysql_selection_cache_bytes{pipeline,source}`: the
-/// estimated bytes charged against the bound ([`SELECTION_CACHE_BYTES`]).
+/// estimated bytes held (entries, barrier streams and the maps' buckets).
 pub(crate) const METRIC_BYTES: &str = "deltaforge_mysql_selection_cache_bytes";
-/// `deltaforge_mysql_selection_cache_timelines{pipeline,source}`: the
-/// timelines held, current or stale.
+/// `deltaforge_mysql_selection_cache_timelines{pipeline,source}`.
 pub(crate) const METRIC_TIMELINES: &str =
     "deltaforge_mysql_selection_cache_timelines";
-/// `..._live_bytes{pipeline,source}`: the current entries' bytes.
-pub(crate) const METRIC_LIVE_BYTES: &str =
-    "deltaforge_mysql_selection_cache_live_bytes";
-/// `..._stale_bytes{pipeline,source}`: stale entries' bytes, awaiting a
-/// sweep, an eviction or a replacement.
-pub(crate) const METRIC_STALE_BYTES: &str =
-    "deltaforge_mysql_selection_cache_stale_bytes";
-/// `..._deferred_bytes{pipeline,source}`: detached values awaiting a step.
-pub(crate) const METRIC_DEFERRED_BYTES: &str =
-    "deltaforge_mysql_selection_cache_deferred_bytes";
-/// `..._handed_bytes{pipeline,source}`: a cache handed to the reclamation
-/// thread and not yet freed.
-pub(crate) const METRIC_HANDED_BYTES: &str =
-    "deltaforge_mysql_selection_cache_handed_bytes";
-/// `..._reclaimed_total{pipeline,source,mode}`: values freed, by where:
-/// `inline` (within an operation's budget), `step`, `thread`.
-pub(crate) const METRIC_RECLAIMED: &str =
-    "deltaforge_mysql_selection_cache_reclaimed_total";
-/// `..._refused_total{pipeline,source,why}`: values not cached: `bound`
-/// (no room could be made), `deferred` (the room is in values awaiting the
-/// next step), `deferred_full` (making room would need a deferred slot and
-/// none is free), `exhausted` (the stamps are).
-pub(crate) const METRIC_REFUSED: &str =
-    "deltaforge_mysql_selection_cache_refused_total";
 
 /// A cache key. Its strings are shared: a cached key's table string is the
 /// one its table's other keys and the index hold.
@@ -263,169 +219,13 @@ enum Cached {
 }
 
 /// An entry: its value, its estimated bytes (key and node included), the
-/// load that admitted it (0: none), its key's slot in the index and its
-/// stamp (what decides whether it is current; see
-/// [`super::mysql_cache_index`]).
+/// load that admitted it (0: none) and its key's slot in the index.
 #[derive(Debug, Clone)]
 struct Entry {
     cached: Cached,
     bytes: u64,
     load: u64,
     slot: u32,
-    stamp: u64,
-}
-
-/// A barrier stream held for the cached timelines sharing it: how many
-/// do, the stamp of the admission that first held it, and whether a
-/// barrier was appended to it since. Current while not cut and stamped
-/// after the last full clear in place.
-#[derive(Debug)]
-struct Held {
-    stream: Arc<BarrierStream>,
-    refs: usize,
-    stamp: u64,
-    cut: bool,
-}
-
-/// A stale stream's key among those still held: its allocation's address
-/// (unique while held).
-fn addr(s: &Arc<BarrierStream>) -> usize {
-    Arc::as_ptr(s) as usize
-}
-
-/// Values detached from the cache and awaiting a step, with what each
-/// still charges: a fixed ring, part of the cache itself.
-#[derive(Debug, Default)]
-struct Ring {
-    slots: [Option<(Cached, u64)>; DEFERRED],
-    head: usize,
-    len: usize,
-    bytes: u64,
-}
-
-impl Ring {
-    fn full(&self) -> bool {
-        self.len == DEFERRED
-    }
-
-    fn push(&mut self, value: Cached, charge: u64) {
-        assert!(!self.full(), "a deferred slot was reserved");
-        self.slots[(self.head + self.len) % DEFERRED] = Some((value, charge));
-        self.len += 1;
-        self.bytes += charge;
-    }
-
-    fn pop(&mut self) -> Option<(Cached, u64)> {
-        if self.len == 0 {
-            return None;
-        }
-        let (value, charge) =
-            self.slots[self.head].take().expect("a deferred value");
-        self.head = (self.head + 1) % DEFERRED;
-        self.len -= 1;
-        self.bytes -= charge;
-        Some((value, charge))
-    }
-}
-
-/// How a detached entry's value is freed.
-#[derive(Clone, Copy)]
-enum Fate {
-    /// Now, within the operation's inline budget.
-    Inline,
-    /// By a later step: it stays charged in the ring until then.
-    Defer,
-    /// Now, by a step.
-    Step,
-}
-
-/// Making room for one more entry.
-enum Evicted {
-    One,
-    /// Nothing evictable is left (or only the current load's entries).
-    Nothing,
-    /// The next entry would need a deferred slot, and none is free.
-    Full,
-}
-
-/// Every structure a cache held, handed to the reclamation thread by a
-/// full clear.
-struct Unit {
-    entries: lru::LruCache<CacheKey, Entry>,
-    barriers: std::collections::HashMap<String, Held>,
-    stale_streams: std::collections::HashMap<usize, Held>,
-    index: super::mysql_cache_index::Index,
-    ring: Ring,
-}
-
-/// A unit and what it charges its cache until it is freed.
-pub(crate) struct Job {
-    unit: Unit,
-    charge: u64,
-    values: u64,
-    handed: Arc<std::sync::atomic::AtomicU64>,
-    reclaimed: metrics::Counter,
-    labels: Arc<(String, String)>,
-}
-
-/// Free a handed-off unit, then release its charge. A panic while freeing
-/// it aborts the process: its memory could no longer be accounted, and a
-/// pipeline restarted in this process would add to it. The values freed
-/// (strings, vectors, `Arc`s, JSON trees) do not panic when dropped; this
-/// guards against a bug here.
-fn reclaim(job: Job) {
-    let Job {
-        unit,
-        charge,
-        values,
-        handed,
-        reclaimed,
-        labels,
-    } = job;
-    let freed =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            drop(unit)
-        }));
-    if freed.is_err() {
-        tracing::error!(
-            pipeline = %labels.0,
-            source = %labels.1,
-            charge,
-            "freeing a selection cache handed to the reclamation thread \
-             panicked; aborting: its memory could no longer be accounted"
-        );
-        std::process::abort();
-    }
-    reclaimed.increment(values);
-    handed.fetch_sub(charge, std::sync::atomic::Ordering::AcqRel);
-}
-
-/// The process's reclamation thread (a queue of two units), started on
-/// first use; `None` when it could not start (then every full clear is
-/// made in place).
-fn reclaimer() -> Option<std::sync::mpsc::SyncSender<Job>> {
-    static THREAD: std::sync::OnceLock<
-        Option<std::sync::mpsc::SyncSender<Job>>,
-    > = std::sync::OnceLock::new();
-    THREAD
-        .get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<Job>(2);
-            match std::thread::Builder::new()
-                .name("selection-reclaim".into())
-                .spawn(move || rx.into_iter().for_each(reclaim))
-            {
-                Ok(_) => Some(tx),
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "the selection cache reclamation thread did not \
-                         start: full clears are made in place"
-                    );
-                    None
-                }
-            }
-        })
-        .clone()
 }
 
 /// What one load ([`install`]) may still admit: half the byte bound, so a
@@ -450,44 +250,24 @@ impl Admission {
 
 /// Per-run caches of timelines, selections and read-ahead versions,
 /// bounded together by their estimated bytes
-/// (`docs/design/mysql-mass-invalidation.md`, section 6, and
-/// `docs/design/selection-cache-diagnosis.md`, section 8): admission
-/// evicts the least recently used entries until the new one fits, before
-/// inserting it. Barrier streams are held once, shared by the timelines
-/// they apply to, and dropped with the last of them. Only this process
-/// appends activation records and barriers for this source (the store
-/// gate), so invalidating on every append keeps them exact; an evicted
-/// entry is rebuilt exactly from the durable records.
-///
-/// Invalidating destroys nothing on the source's loop: a table's
-/// invalidation and a barrier make entries stale (O(1) per table or
-/// database reached), and a full clear hands every structure to the
-/// reclamation thread, or, when that is busy with this cache's last one
-/// or full, makes everything stale in place (O(1)). A stale entry is never
-/// returned. It stays charged until a step ([`Self::step`], once per loop
-/// iteration) sweeps it, or an eviction or replacement detaches it. A
-/// detached value larger than [`INLINE_BYTES`], or past an operation's
-/// inline budget, waits in a fixed ring of [`DEFERRED`] for a step, still
-/// charged; with the ring full, the operation refuses instead (the value is
-/// served uncached).
+/// (`docs/design/mysql-mass-invalidation.md`, section 6): admission evicts
+/// the least recently used entries until the new one fits, before inserting
+/// it. Barrier streams are held once, shared by the timelines they apply
+/// to, and dropped with the last of them. Only this process appends
+/// activation records and barriers for this source (the store gate), so
+/// invalidating on every append keeps them exact; an evicted entry is
+/// rebuilt exactly from the durable records.
 pub(crate) struct Caches {
     entries: lru::LruCache<CacheKey, Entry>,
     /// Barrier streams, by stream key, with the cached timelines holding
     /// each.
-    barriers: std::collections::HashMap<String, Held>,
-    /// Streams no longer current that stale timelines still hold, by
-    /// address.
-    stale_streams: std::collections::HashMap<usize, Held>,
-    /// The entries' keys by database and table, and their currency.
+    barriers: std::collections::HashMap<String, (Arc<BarrierStream>, usize)>,
+    /// The entries' keys by database and table: what a barrier or a
+    /// table's invalidation visits.
     index: super::mysql_cache_index::Index,
-    stamps: super::mysql_cache_index::Stamps,
-    ring: Ring,
     timelines: usize,
-    /// The estimated bytes of the entries and barrier streams held
-    /// (current or stale).
+    /// The estimated bytes of the entries and barrier streams held.
     held: u64,
-    /// Of which the barrier streams'.
-    streams: u64,
     /// Of which the timelines' and versions' (a batch's size per table).
     table_bytes: u64,
     /// The most entries held since the LRU's map was last replaced: its
@@ -497,88 +277,23 @@ pub(crate) struct Caches {
     /// The current load, if one is admitting ([`Admission`]).
     load: u64,
     loading: bool,
-    /// What the current top-level operation may still free inline.
-    inline_left: u64,
-    /// Open operations ([`Self::begin_operation`]): while any is, puts
-    /// share its inline allowance.
-    operations: u32,
-    /// Bytes freed inline so far (tests).
-    #[cfg(test)]
-    freed_inline: u64,
-    reclaim: Reclaim,
-    /// A unit was handed off and its release not yet published.
-    handing: bool,
     meters: Meters,
 }
 
-/// Where a full clear's structures go, and what they still charge.
-struct Reclaim {
-    thread: Option<std::sync::mpsc::SyncSender<Job>>,
-    handed: Arc<std::sync::atomic::AtomicU64>,
-    labels: Arc<(String, String)>,
-}
-
-/// The cache's metrics: evictions, reclamation and refusals, and its own
-/// accounting, published after every change.
+/// The cache's metrics: evictions, and its own accounting (estimated bytes
+/// and timelines held), published after every change.
 struct Meters {
     evictions: metrics::Counter,
-    stale_evictions: metrics::Counter,
     bytes: metrics::Gauge,
     timelines: metrics::Gauge,
-    live: metrics::Gauge,
-    stale: metrics::Gauge,
-    deferred: metrics::Gauge,
-    handed: metrics::Gauge,
-    /// By mode: inline, step, thread.
-    reclaimed: [metrics::Counter; 3],
-    /// By reason: bound, deferred, deferred_full, exhausted.
-    refused: [metrics::Counter; 4],
 }
-
-const RECLAIMED: [&str; 3] = ["inline", "step", "thread"];
-const REFUSED: [&str; 4] = ["bound", "deferred", "deferred_full", "exhausted"];
-const BOUND: usize = 0;
-const ROOM_DEFERRED: usize = 1;
-const DEFERRED_FULL: usize = 2;
-const EXHAUSTED: usize = 3;
 
 impl Meters {
     fn noop() -> Self {
         Self {
             evictions: metrics::Counter::noop(),
-            stale_evictions: metrics::Counter::noop(),
             bytes: metrics::Gauge::noop(),
             timelines: metrics::Gauge::noop(),
-            live: metrics::Gauge::noop(),
-            stale: metrics::Gauge::noop(),
-            deferred: metrics::Gauge::noop(),
-            handed: metrics::Gauge::noop(),
-            reclaimed: std::array::from_fn(|_| metrics::Counter::noop()),
-            refused: std::array::from_fn(|_| metrics::Counter::noop()),
-        }
-    }
-
-    fn labelled(pipeline: &str, source: &str) -> Self {
-        let labels = [
-            ("pipeline", pipeline.to_string()),
-            ("source", source.to_string()),
-        ];
-        let with = |name: &'static str, what: &'static str, v: &str| {
-            let mut l = labels.to_vec();
-            l.push((what, v.to_string()));
-            metrics::counter!(name, &l)
-        };
-        Self {
-            evictions: metrics::counter!(METRIC_EVICTIONS, &labels),
-            stale_evictions: metrics::counter!(METRIC_STALE_EVICTIONS, &labels),
-            bytes: metrics::gauge!(METRIC_BYTES, &labels),
-            timelines: metrics::gauge!(METRIC_TIMELINES, &labels),
-            live: metrics::gauge!(METRIC_LIVE_BYTES, &labels),
-            stale: metrics::gauge!(METRIC_STALE_BYTES, &labels),
-            deferred: metrics::gauge!(METRIC_DEFERRED_BYTES, &labels),
-            handed: metrics::gauge!(METRIC_HANDED_BYTES, &labels),
-            reclaimed: RECLAIMED.map(|m| with(METRIC_RECLAIMED, "mode", m)),
-            refused: REFUSED.map(|w| with(METRIC_REFUSED, "why", w)),
         }
     }
 }
@@ -595,13 +310,12 @@ impl std::fmt::Debug for Caches {
 
 impl Default for Caches {
     fn default() -> Self {
-        Self::with_bytes(SELECTION_CACHE_BYTES, Meters::noop(), None)
+        Self::with_bytes(SELECTION_CACHE_BYTES, Meters::noop())
     }
 }
 
 impl Caches {
-    /// The source's caches, metered under its labels, with the process's
-    /// reclamation thread.
+    /// The source's caches, metered under its labels.
     pub(crate) fn new(pipeline: &str, source: &str) -> Self {
         Self::new_with(pipeline, source, |name| std::env::var(name).ok())
     }
@@ -618,61 +332,41 @@ impl Caches {
             .or_else(|| crate::perf_phases::cache_bytes_override(var))
             .unwrap_or(SELECTION_CACHE_BYTES);
         crate::perf_phases::cache_limit(bytes);
-        let mut caches = Self::with_bytes(
+        let labels = [
+            ("pipeline", pipeline.to_string()),
+            ("source", source.to_string()),
+        ];
+        let caches = Self::with_bytes(
             bytes,
-            Meters::labelled(pipeline, source),
-            reclaimer(),
+            Meters {
+                evictions: metrics::counter!(METRIC_EVICTIONS, &labels),
+                bytes: metrics::gauge!(METRIC_BYTES, &labels),
+                timelines: metrics::gauge!(METRIC_TIMELINES, &labels),
+            },
         );
-        caches.reclaim.labels =
-            Arc::new((pipeline.to_string(), source.to_string()));
         caches.publish();
         caches
     }
 
-    fn with_bytes(
-        max_bytes: u64,
-        meters: Meters,
-        thread: Option<std::sync::mpsc::SyncSender<Job>>,
-    ) -> Self {
+    fn with_bytes(max_bytes: u64, meters: Meters) -> Self {
         Self {
             entries: lru::LruCache::unbounded(),
             barriers: Default::default(),
-            stale_streams: Default::default(),
             index: Default::default(),
-            stamps: Default::default(),
-            ring: Ring::default(),
             timelines: 0,
             held: 0,
-            streams: 0,
             table_bytes: 0,
             peak: 0,
             max_bytes,
             load: 0,
             loading: false,
-            inline_left: INLINE_BYTES,
-            operations: 0,
-            #[cfg(test)]
-            freed_inline: 0,
-            reclaim: Reclaim {
-                thread,
-                handed: Default::default(),
-                labels: Default::default(),
-            },
-            handing: false,
             meters,
         }
     }
 
-    /// A cache whose full clears go to `thread` (tests: a queue the test
-    /// drains with [`reclaim`]).
-    #[cfg(test)]
-    fn with_thread(thread: std::sync::mpsc::SyncSender<Job>) -> Self {
-        Self::with_bytes(SELECTION_CACHE_BYTES, Meters::noop(), Some(thread))
-    }
-
     /// The maps' buckets at `entries` entries held at most: the LRU's
-    /// (with its two sentinel nodes) and the barrier streams' two maps.
-    fn maps_at(&self, entries: usize, barriers: usize, stale: usize) -> u64 {
+    /// (with its two sentinel nodes) and the barrier streams'.
+    fn maps_at(&self, entries: usize, barriers: usize) -> u64 {
         use super::mysql_cache_cost::{allocated, buckets_for, table};
         let lru = if entries == 0 {
             0
@@ -680,71 +374,30 @@ impl Caches {
             table(buckets_for(entries), LRU_SLOT) + 2 * allocated(NODE)
         };
         lru + table(buckets_for(barriers), BARRIER_SLOT)
-            + table(buckets_for(stale), STALE_SLOT)
     }
 
-    /// What the cache's own structures charge (all but a handed-off unit).
-    fn local(&self) -> u64 {
+    /// The estimated bytes held: entries, barrier streams, the index and
+    /// the maps' buckets.
+    pub(crate) fn bytes(&self) -> u64 {
         self.held
             + self.index.bytes()
-            + self.maps_at(
-                self.peak,
-                self.barriers.capacity(),
-                self.stale_streams.capacity(),
-            )
-            + self.ring.bytes
+            + self.maps_at(self.peak, self.barriers.capacity())
     }
 
-    /// A handed-off unit's charge, until the thread has freed it.
-    fn handed(&self) -> u64 {
-        self.reclaim
-            .handed
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// The estimated bytes charged against the bound: entries (current or
-    /// stale), barrier streams, the index, the maps' buckets, deferred
-    /// values and a handed-off unit.
-    pub(crate) fn bytes(&self) -> u64 {
-        self.local() + self.handed()
-    }
-
-    /// What one more entry, `streams` more barrier streams, and `moved`
-    /// streams moved to the stale map add to the maps' buckets.
-    fn growth(&self, streams: usize, moved: usize) -> u64 {
+    /// What one more entry, and `streams` more barrier streams, add to the
+    /// maps' buckets.
+    fn growth(&self, streams: usize) -> u64 {
         let entries = self.peak.max(self.entries.len() + 1);
         let barriers =
             self.barriers.capacity().max(self.barriers.len() + streams);
-        let stale = self
-            .stale_streams
-            .capacity()
-            .max(self.stale_streams.len() + moved);
-        self.maps_at(entries, barriers, stale)
-            - self.maps_at(
-                self.peak,
-                self.barriers.capacity(),
-                self.stale_streams.capacity(),
-            )
+        self.maps_at(entries, barriers)
+            - self.maps_at(self.peak, self.barriers.capacity())
     }
 
     /// Publish the accounting (after every change to it).
     fn publish(&self) {
-        let live = self.index.live();
         self.meters.bytes.set(self.bytes() as f64);
         self.meters.timelines.set(self.timelines as f64);
-        self.meters.live.set(live as f64);
-        self.meters
-            .stale
-            .set((self.held - self.streams - live) as f64);
-        self.meters.deferred.set(self.ring.bytes as f64);
-        self.meters.handed.set(self.handed() as f64);
-    }
-
-    /// A value not cached (`why`), after whatever was detached making
-    /// room: counted, and the accounting published.
-    fn refuse(&self, why: usize) {
-        self.meters.refused[why].increment(1);
-        self.publish();
     }
 
     /// Timelines held.
@@ -753,82 +406,27 @@ impl Caches {
         self.timelines
     }
 
-    /// Whether the entry of `key` is current.
-    fn current(&self, key: &CacheKey, e: &Entry) -> bool {
-        self.index.is_current(key, e.stamp)
-    }
-
-    /// Whether a held stream is current (may be shared by a new read).
-    fn held_current(&self, h: &Held) -> bool {
-        !h.cut && h.stamp > self.index.since()
-    }
-
-    /// The barrier streams held and current: those a load may reuse.
+    /// The barrier streams held.
     pub(crate) fn barrier_streams(
         &self,
     ) -> std::collections::HashMap<String, Arc<BarrierStream>> {
         self.barriers
             .iter()
-            .filter(|(_, h)| self.held_current(h))
-            .map(|(k, h)| (k.clone(), h.stream.clone()))
+            .map(|(k, (s, _))| (k.clone(), s.clone()))
             .collect()
     }
 
-    /// The current entry of `key`, marked used. A stale one is a miss: it
-    /// is neither returned nor freed here.
-    fn get(&mut self, key: &CacheKey) -> Option<&Entry> {
-        let e = self.entries.peek(key)?;
-        if !self.current(key, e) {
-            return None;
-        }
-        self.entries.get(key)
-    }
-
-    /// The holder of `s` among the held streams.
-    fn holder(&self, s: &Arc<BarrierStream>) -> Option<&Held> {
-        self.barriers
-            .get(&s.stream)
-            .filter(|h| Arc::ptr_eq(&h.stream, s))
-            .or_else(|| self.stale_streams.get(&addr(s)))
-    }
-
-    /// What freeing `e` releases: its bytes, and those of the barrier
-    /// streams it is the last holder of.
-    fn release_of(&self, e: &Entry) -> u64 {
-        let Cached::Timeline(t, _) = &e.cached else {
-            return e.bytes;
-        };
-        e.bytes
-            + t.streams
-                .iter()
-                .filter_map(|s| self.holder(s))
-                .filter(|h| h.refs == 1)
-                .map(|h| super::mysql_cache_cost::stream(&h.stream))
-                .sum::<u64>()
-    }
-
-    /// How an operation frees a value releasing `release` bytes: inline
-    /// within its budget, else in a deferred slot; `None` when that would
-    /// need a slot and none is free (the caller then leaves the entry).
-    fn fate(&self, release: u64) -> Option<Fate> {
-        if release <= INLINE_BYTES && release <= self.inline_left {
-            Some(Fate::Inline)
-        } else if !self.ring.full() {
-            Some(Fate::Defer)
-        } else {
-            None
+    /// Remove `key`'s entry, with its accounting.
+    fn remove(&mut self, key: &CacheKey) {
+        if let Some(e) = self.entries.pop(key) {
+            self.unindex(key, e.slot);
+            self.forget(e);
         }
     }
 
     /// Unindex `key`, held at `slot`; the key moved into that slot is told.
-    fn unindex(
-        &mut self,
-        key: &CacheKey,
-        slot: u32,
-        bytes: u64,
-        current: bool,
-    ) {
-        if let Some(moved) = self.index.remove(key, slot, bytes, current) {
+    fn unindex(&mut self, key: &CacheKey, slot: u32) {
+        if let Some(moved) = self.index.remove(key, slot) {
             self.entries
                 .peek_mut(&moved)
                 .expect("an indexed key is cached")
@@ -836,244 +434,98 @@ impl Caches {
         }
     }
 
-    /// Unlink `key`'s entry (already taken from the LRU) from the index
-    /// and the accounting, then free its value as `fate` says.
-    fn detach(&mut self, key: &CacheKey, e: Entry, fate: Fate) {
-        let current = self.current(key, &e);
-        self.unindex(key, e.slot, e.bytes, current);
-        let released = self.forget(&e);
-        match fate {
-            Fate::Inline => {
-                self.inline_left = self.inline_left.saturating_sub(released);
-                #[cfg(test)]
-                {
-                    self.freed_inline += released;
-                }
-                drop(e);
-                self.meters.reclaimed[0].increment(1);
-            }
-            Fate::Step => {
-                drop(e);
-                self.meters.reclaimed[1].increment(1);
-            }
-            Fate::Defer => self.ring.push(e.cached, released),
-        }
-    }
-
-    /// Take `e`'s accounting out (its value is freed by the caller, or
-    /// deferred): what freeing it releases.
-    fn forget(&mut self, e: &Entry) -> u64 {
+    fn forget(&mut self, e: Entry) {
         self.held -= e.bytes;
-        let mut released = e.bytes;
-        match &e.cached {
+        match e.cached {
             Cached::Timeline(t, _) => {
                 self.timelines -= 1;
                 self.table_bytes -= e.bytes;
                 // Its barrier streams go with the last timeline holding
                 // them.
                 for s in &t.streams {
-                    released += self.unhold(s);
+                    if let Some((held, refs)) = self.barriers.get_mut(&s.stream)
+                        && Arc::ptr_eq(held, s)
+                    {
+                        *refs -= 1;
+                        if *refs == 0 {
+                            let gone = super::mysql_cache_cost::stream(held);
+                            self.barriers.remove(&s.stream);
+                            self.held -= gone;
+                        }
+                    }
                 }
             }
             Cached::Version(_) => self.table_bytes -= e.bytes,
             Cached::Selection(_) => {}
         }
-        released
+        self.publish();
     }
 
-    /// One holder of `s` fewer; the bytes released when it was the last.
-    fn unhold(&mut self, s: &Arc<BarrierStream>) -> u64 {
-        let mut last = |h: &mut Held| {
-            h.refs -= 1;
-            h.refs == 0
-        };
-        let gone = match self
-            .barriers
-            .get_mut(&s.stream)
-            .filter(|h| Arc::ptr_eq(&h.stream, s))
-            .map(&mut last)
+    /// Evict the least recently used entry; `false` when there is none, or
+    /// when it is one the current load admitted (a load never evicts what
+    /// it admitted).
+    fn evict_one(&mut self) -> bool {
+        if self.loading
+            && self
+                .entries
+                .peek_lru()
+                .is_some_and(|(_, e)| e.load == self.load)
         {
-            Some(true) => self.barriers.remove(&s.stream),
-            Some(false) => None,
-            None => match self.stale_streams.get_mut(&addr(s)).map(last) {
-                Some(true) => self.stale_streams.remove(&addr(s)),
-                Some(false) => None,
-                None => {
-                    debug_assert!(false, "{} not held", s.stream);
-                    None
-                }
-            },
-        };
-        gone.map_or(0, |h| {
-            let b = super::mysql_cache_cost::stream(&h.stream);
-            self.held -= b;
-            self.streams -= b;
-            b
-        })
-    }
-
-    /// Make way for `key`'s new entry: an entry held under it, current or
-    /// stale, is detached (its value freed inline or deferred). `false`
-    /// when that would need a deferred slot and none is free: it stays,
-    /// and the new value is not cached.
-    fn replace(&mut self, key: &CacheKey) -> bool {
-        let Some(e) = self.entries.peek(key) else {
-            return true;
-        };
-        let Some(fate) = self.fate(self.release_of(e)) else {
+            return false;
+        }
+        let Some((key, e)) = self.entries.pop_lru() else {
             return false;
         };
-        let (k, e) = self.entries.pop_entry(key).expect("peeked");
-        self.detach(&k, e, fate);
-        true
-    }
-
-    /// Evict the least recently used entry (a stale one too). A load never
-    /// evicts what it admitted.
-    fn evict_one(&mut self) -> Evicted {
-        let Some((key, e)) = self.entries.peek_lru() else {
-            return Evicted::Nothing;
-        };
-        if self.loading && e.load == self.load {
-            return Evicted::Nothing;
-        }
-        let Some(fate) = self.fate(self.release_of(e)) else {
-            return Evicted::Full;
-        };
-        let stale = !self.current(key, e);
-        let (key, e) = self.entries.pop_lru().expect("peeked");
+        self.unindex(&key, e.slot);
         crate::perf_phases::cache_eviction(match &e.cached {
             Cached::Timeline(..) => "timeline",
             Cached::Selection(_) => "selection",
             Cached::Version(_) => "version",
         });
+        self.forget(e);
         self.meters.evictions.increment(1);
-        if stale {
-            self.meters.stale_evictions.increment(1);
-        }
-        self.detach(&key, e, fate);
-        Evicted::One
-    }
-
-    /// Evict until `need` more bytes fit; `false` (counted) when they
-    /// cannot. Values awaiting a step count as room to come: eviction stops
-    /// once they cover what is missing (evicting more would not make room
-    /// any sooner), and the value is refused until a step has freed them.
-    fn make_room(&mut self, need: impl Fn(&Self) -> u64) -> bool {
-        loop {
-            let need = need(self);
-            if self.bytes() + need <= self.max_bytes {
-                return true;
-            }
-            if self.bytes() - self.ring.bytes + need <= self.max_bytes {
-                self.refuse(ROOM_DEFERRED);
-                return false;
-            }
-            match self.evict_one() {
-                Evicted::One => {}
-                Evicted::Nothing => {
-                    self.refuse(BOUND);
-                    return false;
-                }
-                Evicted::Full => {
-                    self.refuse(DEFERRED_FULL);
-                    return false;
-                }
-            }
-        }
-    }
-
-    /// Open a top-level operation: every put until it is closed
-    /// ([`Self::end_operation`]), nested ones included, shares one inline
-    /// allowance of [`INLINE_BYTES`]. A load is one; so is a batch of
-    /// installs. A put outside any is its own.
-    pub(crate) fn begin_operation(&mut self) {
-        if self.operations == 0 {
-            self.inline_left = INLINE_BYTES;
-        }
-        self.operations += 1;
-    }
-
-    pub(crate) fn end_operation(&mut self) {
-        self.operations -= 1;
-    }
-
-    /// Start a put: its inline allowance (its own, or its operation's), and
-    /// whether it may admit at all (the stamps are not exhausted) and
-    /// replace what `key` holds.
-    fn begin_put(&mut self, key: &CacheKey) -> bool {
-        if self.operations == 0 {
-            self.inline_left = INLINE_BYTES;
-        }
-        if self.stamps.exhausted() {
-            self.refuse(EXHAUSTED);
-            return false;
-        }
-        if !self.replace(key) {
-            self.refuse(DEFERRED_FULL);
-            return false;
-        }
         true
-    }
-
-    /// The next stamp; on exhaustion the cache fails closed (nothing is
-    /// current or admitted until it holds nothing).
-    fn stamp(&mut self) -> Option<u64> {
-        let s = self.stamps.next();
-        if s.is_none() {
-            self.index.fail_closed();
-            warn!(
-                "the selection cache's stamps are exhausted: nothing is \
-                 cached until it is empty"
-            );
-        }
-        s
     }
 
     /// Insert `key`'s entry of `bytes` (its value's), evicting until it
     /// fits; one that cannot fit is not cached. Whether it was.
     fn put(&mut self, key: CacheKey, value: Cached, bytes: u64) -> bool {
-        if !self.begin_put(&key) {
-            return false;
-        }
+        self.remove(&key);
         let bytes = bytes + key_cost(&key);
-        if !self.make_room(|c| bytes + c.growth(0, 0) + c.index.growth(&key)) {
-            return false;
+        while self.bytes() + bytes + self.growth(0) + self.index.growth(&key)
+            > self.max_bytes
+        {
+            if !self.evict_one() {
+                return false;
+            }
         }
-        let Some(stamp) = self.stamp() else {
-            self.refuse(EXHAUSTED);
-            return false;
-        };
-        self.push(key, value, bytes, stamp);
+        self.push(key, value, bytes);
         true
     }
 
-    /// Insert an entry that fits, stamped `stamp`.
-    fn push(&mut self, key: CacheKey, cached: Cached, bytes: u64, stamp: u64) {
+    /// Insert an entry that fits.
+    fn push(&mut self, key: CacheKey, cached: Cached, bytes: u64) {
         self.held += bytes;
         if !matches!(cached, Cached::Selection(_)) {
             self.table_bytes += bytes;
         }
         let load = if self.loading { self.load } else { 0 };
-        let (key, slot) = self.index.insert(key, bytes, stamp);
-        let replaced = self.entries.push(
+        let (key, slot) = self.index.insert(key);
+        self.entries.push(
             key,
             Entry {
                 cached,
                 bytes,
                 load,
                 slot,
-                stamp,
             },
         );
-        debug_assert!(replaced.is_none(), "replaced before");
         self.peak = self.peak.max(self.entries.len());
         self.publish();
     }
 
     /// Start a load: what it may admit ([`Admission`]).
     fn begin_load(&mut self) -> Admission {
-        self.begin_operation();
         self.load += 1;
         self.loading = true;
         Admission {
@@ -1085,7 +537,6 @@ impl Caches {
 
     fn end_load(&mut self) {
         self.loading = false;
-        self.end_operation();
     }
 
     /// Whether a load may admit `cost` more bytes; if so, they are spent.
@@ -1101,9 +552,9 @@ impl Caches {
     }
 
     /// The most tables one batched load brings in: as many as half the
-    /// bound holds at the held tables' average cost (timeline and version,
-    /// current or stale), at most one statement's, at least one. Before
-    /// anything is held: one statement's.
+    /// bound holds at the held tables' average cost (timeline and version),
+    /// at most one statement's, at least one. Before anything is held: one
+    /// statement's.
     pub(crate) fn batch_room(&self) -> usize {
         let max = super::mysql_history::BATCH_MAX_TABLES;
         if self.timelines == 0 {
@@ -1114,7 +565,7 @@ impl Caches {
     }
 
     pub(crate) fn timeline(&mut self, key: &str) -> Option<Arc<Timeline>> {
-        match self.get(&CacheKey::Timeline(key.into()))? {
+        match self.entries.get(&CacheKey::Timeline(key.into()))? {
             Entry {
                 cached: Cached::Timeline(t, _),
                 ..
@@ -1123,15 +574,13 @@ impl Caches {
         }
     }
 
-    /// The backend keys of every current table flagged proven, read
-    /// without touching recency (a speculative window's candidate filter).
+    /// The backend keys of every table flagged proven, read without
+    /// touching recency (a speculative window's candidate filter).
     pub(crate) fn proven_keys(&self) -> std::collections::HashSet<String> {
         self.entries
             .iter()
             .filter_map(|(k, e)| match (k, &e.cached) {
-                (CacheKey::Timeline(key), Cached::Timeline(_, true))
-                    if self.current(k, e) =>
-                {
+                (CacheKey::Timeline(key), Cached::Timeline(_, true)) => {
                     Some(key.to_string())
                 }
                 _ => None,
@@ -1140,53 +589,43 @@ impl Caches {
     }
 
     /// Whether the table's last selection proved a version since its
-    /// timeline last changed (its current timeline is flagged).
+    /// timeline last changed.
     pub(crate) fn is_proven(&mut self, key: &SchemaKey) -> bool {
-        let k = CacheKey::Timeline(key.backend_key().into());
         matches!(
-            self.entries.peek(&k),
-            Some(e @ Entry {
+            self.entries
+                .peek(&CacheKey::Timeline(key.backend_key().into())),
+            Some(Entry {
                 cached: Cached::Timeline(_, true),
                 ..
-            }) if self.current(&k, e)
+            })
         )
     }
 
     /// The table's last selection proved a version over its cached
-    /// timeline (no extra entry: a flag on that timeline's, if current).
+    /// timeline (no extra entry: a flag on that timeline's).
     fn mark_proven(&mut self, key: &SchemaKey) {
-        let k = CacheKey::Timeline(key.backend_key().into());
-        if !self.entries.peek(&k).is_some_and(|e| self.current(&k, e)) {
-            return;
-        }
         if let Some(Entry {
             cached: Cached::Timeline(_, proven),
             ..
-        }) = self.entries.peek_mut(&k)
+        }) = self
+            .entries
+            .peek_mut(&CacheKey::Timeline(key.backend_key().into()))
         {
             *proven = true;
         }
     }
 
-    /// The barrier streams of `timeline` the cache does not hold current
-    /// (this read of them).
+    /// The barrier streams of `timeline` the cache does not hold (this
+    /// read of them).
     fn unheld<'a>(
-        &'a self,
+        &self,
         timeline: &'a Timeline,
     ) -> impl Iterator<Item = &'a Arc<BarrierStream>> {
         timeline.streams.iter().filter(|s| {
             self.barriers
                 .get(&s.stream)
-                .is_none_or(|h| !self.held_current(h) || *h.stream != ***s)
+                .is_none_or(|(held, _)| held != *s)
         })
-    }
-
-    /// Of those, how many replace a held read of the same stream (which
-    /// moves to the stale streams).
-    fn displaced(&self, timeline: &Timeline) -> usize {
-        self.unheld(timeline)
-            .filter(|s| self.barriers.contains_key(&s.stream))
-            .count()
     }
 
     /// What caching `timeline` for `key` adds: the entry, its indexing,
@@ -1202,9 +641,9 @@ impl Caches {
     }
 
     /// Cache `timeline`, holding its barrier streams once: a stream already
-    /// held and current is shared, a new one is held (and accounted) from
-    /// here. The timeline as cached (sharing the held streams), or `None`
-    /// when it does not fit.
+    /// held is shared, a new one is held (and accounted) from here. The
+    /// timeline as cached (sharing the held streams), or `None` when it
+    /// does not fit.
     fn put_timeline(
         &mut self,
         key: String,
@@ -1218,57 +657,42 @@ impl Caches {
         key: CacheKey,
         timeline: Arc<Timeline>,
     ) -> Option<Arc<Timeline>> {
-        if !self.begin_put(&key) {
-            return None;
-        }
+        self.remove(&key);
         // Evict until the timeline, and those of its streams not held, fit
         // (an eviction may drop a stream it would have shared).
-        if !self.make_room(|c| {
-            c.timeline_cost(&key, &timeline)
-                + c.growth(c.unheld(&timeline).count(), c.displaced(&timeline))
-        }) {
-            return None;
+        loop {
+            let cost = self.timeline_cost(&key, &timeline);
+            let streams = self.unheld(&timeline).count();
+            if self.bytes() + cost + self.growth(streams) <= self.max_bytes {
+                break;
+            }
+            if !self.evict_one() {
+                return None;
+            }
         }
-        let Some(stamp) = self.stamp() else {
-            self.refuse(EXHAUSTED);
-            return None;
-        };
         let mut shared =
             Arc::try_unwrap(timeline).unwrap_or_else(|t| (*t).clone());
         for s in shared.streams.iter_mut() {
-            let share = self
-                .barriers
-                .get(&s.stream)
-                .is_some_and(|h| self.held_current(h) && *h.stream == **s);
-            if share {
-                let h = self.barriers.get_mut(&s.stream).expect("held");
-                *s = h.stream.clone();
-                h.refs += 1;
-                continue;
+            match self.barriers.get_mut(&s.stream) {
+                Some((held, refs)) if *held == *s => {
+                    *s = held.clone();
+                    *refs += 1;
+                }
+                // Another read of the stream: the newer one is held (an
+                // append invalidates every timeline of the older).
+                _ => {
+                    if let Some((old, _)) = self.barriers.remove(&s.stream) {
+                        self.held -= super::mysql_cache_cost::stream(&old);
+                    }
+                    self.barriers.insert(s.stream.clone(), (s.clone(), 1));
+                    self.held += super::mysql_cache_cost::stream(s);
+                }
             }
-            // Another read of the stream, or one a barrier or a full
-            // clear made stale: this one is held; the old one stays,
-            // charged, with the stale timelines holding it.
-            if let Some(old) = self.barriers.remove(&s.stream) {
-                self.stale_streams.insert(addr(&old.stream), old);
-            }
-            self.barriers.insert(
-                s.stream.clone(),
-                Held {
-                    stream: s.clone(),
-                    refs: 1,
-                    stamp,
-                    cut: false,
-                },
-            );
-            let b = super::mysql_cache_cost::stream(s);
-            self.held += b;
-            self.streams += b;
         }
         self.timelines += 1;
         let shared = Arc::new(shared);
         let bytes = super::mysql_cache_cost::timeline(&shared) + key_cost(&key);
-        self.push(key, Cached::Timeline(shared.clone(), false), bytes, stamp);
+        self.push(key, Cached::Timeline(shared.clone(), false), bytes);
         Some(shared)
     }
 
@@ -1300,7 +724,7 @@ impl Caches {
             decisive.as_str().into(),
             signature.as_str().into(),
         );
-        match self.get(&key)? {
+        match self.entries.get(&key)? {
             Entry {
                 cached: Cached::Selection(s),
                 ..
@@ -1314,7 +738,10 @@ impl Caches {
         table: &str,
         version: i32,
     ) -> Option<Arc<schema_registry::SchemaVersion>> {
-        match self.get(&CacheKey::Version(table.into(), version))? {
+        match self
+            .entries
+            .get(&CacheKey::Version(table.into(), version))?
+        {
             Entry {
                 cached: Cached::Version(v),
                 ..
@@ -1387,7 +814,6 @@ impl Caches {
         );
     }
 
-    /// Entries held, current or stale (tests).
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
@@ -1405,7 +831,7 @@ impl Caches {
             .sum()
     }
 
-    /// The entries held for the table `key`, current or stale (tests).
+    /// The entries held for the table `key` (tests).
     #[cfg(test)]
     pub(crate) fn held_for(&self, key: &SchemaKey) -> usize {
         let k = key.backend_key();
@@ -1419,35 +845,14 @@ impl Caches {
         self.held
     }
 
-    /// Make every later full clear in place (tests).
-    #[cfg(test)]
-    pub(crate) fn without_thread_for_test(&mut self) {
-        self.reclaim.thread = None;
-    }
-
-    /// Continue the stamps from `last` (tests: exhaustion).
-    #[cfg(test)]
-    fn set_stamp_for_test(&mut self, last: u64) {
-        self.stamps.set_last_for_test(last);
-    }
-
-    /// Step until nothing is left to reclaim, without a time limit (tests).
-    #[cfg(test)]
-    pub(crate) fn settle(&mut self) {
-        while self.step_one() {}
-        self.reset_if_exhausted();
-        self.publish();
-    }
-
     /// Recount what the cache holds and check its running accounting: the
-    /// bytes (each entry's from its value and key, each held stream's,
-    /// current or stale, the deferred values', the maps' buckets), the
-    /// timelines, each held stream's holders, and the index (slots, live
-    /// bytes, queues) (tests).
+    /// bytes (each entry's from its value and key, each held stream's, the
+    /// maps' buckets), the timelines, and each barrier stream's holders
+    /// (tests).
     #[cfg(test)]
     pub(crate) fn audit(&self) {
         use super::mysql_cache_cost as cost;
-        let mut holders: std::collections::HashMap<usize, usize> =
+        let mut holders: std::collections::HashMap<&str, usize> =
             Default::default();
         let (mut timelines, mut held, mut table_bytes) = (0, 0, 0);
         for (key, e) in self.entries.iter() {
@@ -1456,12 +861,13 @@ impl Caches {
                     Cached::Timeline(t, _) => {
                         timelines += 1;
                         for s in &t.streams {
+                            let (h, _) = &self.barriers[&s.stream];
                             assert!(
-                                self.holder(s).is_some(),
-                                "{} not held",
+                                Arc::ptr_eq(h, s),
+                                "{} not shared",
                                 s.stream
                             );
-                            *holders.entry(addr(s)).or_default() += 1;
+                            *holders.entry(s.stream.as_str()).or_default() += 1;
                         }
                         cost::timeline(t)
                     }
@@ -1474,63 +880,29 @@ impl Caches {
                 table_bytes += bytes;
             }
         }
-        let mut streams = 0;
-        for (name, h) in &self.barriers {
-            assert_eq!(*name, h.stream.stream);
-            assert_eq!(holders.get(&addr(&h.stream)), Some(&h.refs), "{name}");
-            streams += cost::stream(&h.stream);
-        }
-        for (a, h) in &self.stale_streams {
-            assert_eq!(*a, addr(&h.stream));
-            assert!(
-                !self.held_current(h)
-                    || self
-                        .barriers
-                        .get(&h.stream.stream)
-                        .is_some_and(|c| !Arc::ptr_eq(&c.stream, &h.stream)),
-                "a stale stream"
-            );
-            assert_eq!(holders.get(a), Some(&h.refs), "{}", h.stream.stream);
-            streams += cost::stream(&h.stream);
-        }
-        assert_eq!(
-            holders.len(),
-            self.barriers.len() + self.stale_streams.len(),
-            "streams held"
-        );
+        held += self
+            .barriers
+            .values()
+            .map(|(s, _)| cost::stream(s))
+            .sum::<u64>();
         assert_eq!(timelines, self.timelines, "timelines");
-        assert_eq!(streams, self.streams, "streams' bytes");
-        assert_eq!(held + streams, self.held, "bytes held");
+        assert_eq!(holders.len(), self.barriers.len(), "streams held");
+        for (name, (_, refs)) in &self.barriers {
+            assert_eq!(holders.get(name.as_str()), Some(refs), "{name}");
+        }
+        assert_eq!(held, self.held, "bytes held");
         assert_eq!(table_bytes, self.table_bytes, "tables' bytes");
-        let deferred: u64 = (0..self.ring.len)
-            .map(|i| {
-                self.ring.slots[(self.ring.head + i) % DEFERRED]
-                    .as_ref()
-                    .expect("a deferred value")
-                    .1
-            })
-            .sum();
-        assert_eq!(deferred, self.ring.bytes, "deferred bytes");
-        self.index.audit(
-            self.entries
-                .iter()
-                .map(|(k, e)| (k, e.slot, e.stamp, e.bytes)),
-        );
+        self.index
+            .audit(self.entries.iter().map(|(k, e)| (k, e.slot)));
         assert!(self.peak >= self.entries.len(), "peak");
         assert!(self.bytes() <= self.max_bytes || self.held == 0, "bound");
     }
 
-    /// A record was appended for `key`: the table's entries are stale (a
-    /// sweep removes them; none is freed here).
+    /// A record was appended for `key`.
     pub(crate) fn invalidate(&mut self, key: &SchemaKey) {
-        let t = key.backend_key();
-        if !self.index.holds(&t) {
-            return;
+        for key in self.index.of_table(&key.backend_key()) {
+            self.remove(&key);
         }
-        if let Some(s) = self.stamp() {
-            self.index.advance_table(&t, s);
-        }
-        self.publish();
     }
 
     /// The record admitted into `timeline` was appended durably, and
@@ -1551,22 +923,20 @@ impl Caches {
     }
 
     /// Install `timeline` for `key` only while the cache still holds
-    /// `snapshot` itself (the same `Arc`) as the table's current timeline:
-    /// an eviction, a barrier, a full clear or any invalidation since the
-    /// snapshot wins (the entry is gone or stale), and the table reloads.
-    /// Whether it was installed (an install that does not fit the bound
-    /// leaves the table uncached, never stale).
+    /// `snapshot` itself (the same `Arc`): an eviction, a barrier or any
+    /// invalidation since the snapshot wins, and the table reloads. Whether
+    /// it was installed (an install that does not fit the bound leaves the
+    /// table uncached, never stale).
     pub(crate) fn install_if_current(
         &mut self,
         key: &SchemaKey,
         snapshot: &Arc<Timeline>,
         timeline: Arc<Timeline>,
     ) -> bool {
-        let k = CacheKey::Timeline(key.backend_key().into());
         let current = matches!(
-            self.entries.peek(&k),
-            Some(e @ Entry { cached: Cached::Timeline(t, _), .. })
-                if Arc::ptr_eq(t, snapshot) && self.current(&k, e)
+            self.entries.peek(&CacheKey::Timeline(key.backend_key().into())),
+            Some(Entry { cached: Cached::Timeline(t, _), .. })
+                if Arc::ptr_eq(t, snapshot)
         );
         if current {
             self.install(key, timeline);
@@ -1576,214 +946,35 @@ impl Caches {
 
     /// A barrier was appended to `stream` (a lineage's or a database's):
     /// the stream, and every entry of a table it applies to (whose key
-    /// starts with it), are stale. Every other table stays current. The
-    /// index reaches those entries through their databases (O(databases))
-    /// without visiting the others. A barrier that applies to every entry
-    /// is a full clear.
+    /// starts with it), are stale. Every other table stays cached. The
+    /// index finds those entries without visiting the others. A barrier
+    /// that applies to every entry is a full clear: barrier streams are
+    /// held only by cached timelines, so none is left either way.
     pub(crate) fn barrier_appended(&mut self, stream: &str) {
         if self.index.covers_all(stream) {
             self.invalidate_all();
             return;
         }
-        if let Some(h) = self.barriers.get_mut(stream) {
-            h.cut = true;
+        for key in self.index.reached(stream) {
+            self.remove(&key);
         }
-        if let Some(s) = self.stamp() {
-            self.index.barrier(stream, s);
+        if let Some((s, _)) = self.barriers.remove(stream) {
+            self.held -= super::mysql_cache_cost::stream(&s);
         }
         self.publish();
     }
 
-    /// Everything is stale (a reload request without a table, or a
-    /// barrier over every entry). Every structure is handed to the
-    /// reclamation thread, charged until it is freed there; when the
-    /// thread is unavailable, this cache's last unit is still there, or
-    /// its queue is full, everything is made stale in place instead (O(1))
-    /// and swept by steps. Nothing is freed here.
+    /// Everything is stale (a reload request without a table). The maps
+    /// are replaced, so their buckets are released too.
     pub(crate) fn invalidate_all(&mut self) {
-        if self.local() == 0 {
-            return;
-        }
-        if !self.hand_off() {
-            if let Some(s) = self.stamp() {
-                self.index.clear(s);
-            }
-        }
+        self.entries = lru::LruCache::unbounded();
+        self.barriers = Default::default();
+        self.index = Default::default();
+        self.timelines = 0;
+        self.held = 0;
+        self.table_bytes = 0;
+        self.peak = 0;
         self.publish();
-    }
-
-    /// Hand every structure to the reclamation thread, if it is there,
-    /// holds no unit of this cache and has room (never waits). Whether it
-    /// took them: when it does not, they are back in place, intact.
-    fn hand_off(&mut self) -> bool {
-        use std::sync::atomic::Ordering;
-        let Some(thread) = &self.reclaim.thread else {
-            return false;
-        };
-        if self.handed() != 0 {
-            return false;
-        }
-        let charge = self.local();
-        let values = (self.entries.len() + self.ring.len) as u64;
-        let unit = Unit {
-            entries: std::mem::replace(
-                &mut self.entries,
-                lru::LruCache::unbounded(),
-            ),
-            barriers: std::mem::take(&mut self.barriers),
-            stale_streams: std::mem::take(&mut self.stale_streams),
-            index: std::mem::take(&mut self.index),
-            ring: std::mem::take(&mut self.ring),
-        };
-        self.reclaim.handed.store(charge, Ordering::Release);
-        let job = Job {
-            unit,
-            charge,
-            values,
-            handed: self.reclaim.handed.clone(),
-            reclaimed: self.meters.reclaimed[2].clone(),
-            labels: self.reclaim.labels.clone(),
-        };
-        match thread.try_send(job) {
-            Ok(()) => {
-                self.handing = true;
-                self.timelines = 0;
-                self.held = 0;
-                self.streams = 0;
-                self.table_bytes = 0;
-                self.peak = 0;
-                true
-            }
-            Err(
-                std::sync::mpsc::TrySendError::Full(job)
-                | std::sync::mpsc::TrySendError::Disconnected(job),
-            ) => {
-                // Not taken: everything back where it was.
-                self.reclaim.handed.store(0, Ordering::Release);
-                let Unit {
-                    entries,
-                    barriers,
-                    stale_streams,
-                    index,
-                    ring,
-                } = job.unit;
-                self.entries = entries;
-                self.barriers = barriers;
-                self.stale_streams = stale_streams;
-                self.index = index;
-                self.ring = ring;
-                false
-            }
-        }
-    }
-
-    /// Reclaim for up to [`STEP`] (once per source-loop iteration): values
-    /// deferred first, then the stale entries the sweeps find (queued
-    /// tables, then queued databases), then those a full clear in place
-    /// left at the LRU's end, then the buckets of emptied maps. Each item
-    /// is freed whole, so a step overruns its target by at most one item.
-    /// A source without events runs no steps: what is pending stays
-    /// charged, within the bound, with no completion deadline.
-    pub(crate) fn step(&mut self) {
-        // Between iterations no operation is open; one left open (a path
-        // that returned early) would only defer more, so it is closed.
-        debug_assert_eq!(self.operations, 0, "an operation left open");
-        self.operations = 0;
-        if self.handing {
-            // Its release is published once the thread has freed it.
-            self.handing = self.handed() != 0;
-            self.publish();
-        }
-        if !self.pending() {
-            return;
-        }
-        let deadline = std::time::Instant::now() + STEP;
-        while self.step_one() {
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-        }
-        self.reset_if_exhausted();
-        self.publish();
-    }
-
-    /// Whether a step has anything to do (O(1)).
-    fn pending(&self) -> bool {
-        self.ring.len > 0
-            || self.index.dirty()
-            || self.stale_at_end()
-            || self.emptied()
-            || (self.stamps.exhausted() && self.is_empty())
-    }
-
-    /// The LRU's last entry is stale by a full clear (every such entry is
-    /// behind every later one: a stale entry is never moved up).
-    fn stale_at_end(&self) -> bool {
-        self.entries
-            .peek_lru()
-            .is_some_and(|(_, e)| e.stamp <= self.index.since())
-    }
-
-    /// No entry is held, but the maps keep buckets.
-    fn emptied(&self) -> bool {
-        self.entries.is_empty()
-            && (self.peak > 0
-                || self.barriers.capacity() > 0
-                || self.stale_streams.capacity() > 0)
-    }
-
-    /// Nothing held at all (a handed-off unit aside).
-    fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-            && self.ring.len == 0
-            && self.index.is_empty()
-            && self.barriers.is_empty()
-            && self.stale_streams.is_empty()
-    }
-
-    /// Exhausted stamps start again once nothing is held: no entry can
-    /// carry an earlier stamp.
-    fn reset_if_exhausted(&mut self) {
-        if self.stamps.exhausted() && self.is_empty() {
-            self.stamps.reset();
-            self.index.reset_since();
-        }
-    }
-
-    /// Free one item; `false` when there is none.
-    fn step_one(&mut self) -> bool {
-        use super::mysql_cache_index::Sweep;
-        if let Some((value, _)) = self.ring.pop() {
-            drop(value);
-            self.meters.reclaimed[1].increment(1);
-            return true;
-        }
-        let entries = &self.entries;
-        match self
-            .index
-            .sweep(|k| entries.peek(k).expect("an indexed key is cached").stamp)
-        {
-            Sweep::Stale(key, _) => {
-                let (k, e) = self.entries.pop_entry(&key).expect("swept");
-                self.detach(&k, e, Fate::Step);
-                return true;
-            }
-            Sweep::Checked => return true,
-            Sweep::Idle => {}
-        }
-        if self.stale_at_end() {
-            let (k, e) = self.entries.pop_lru().expect("stale");
-            self.detach(&k, e, Fate::Step);
-            return true;
-        }
-        if self.emptied() {
-            self.entries = lru::LruCache::unbounded();
-            self.peak = 0;
-            self.barriers = Default::default();
-            self.stale_streams = Default::default();
-            return true;
-        }
-        false
     }
 }
 
@@ -1814,7 +1005,7 @@ pub struct CacheProbe {
 impl CacheProbe {
     /// An unbounded cache filled with `mix`.
     pub fn fill(mix: ProbeMix) -> Self {
-        let mut caches = Caches::with_bytes(u64::MAX / 2, Meters::noop(), None);
+        let mut caches = Caches::with_bytes(u64::MAX / 2, Meters::noop());
         probe_fill(&mut caches, mix);
         Self { caches }
     }
@@ -1824,41 +1015,22 @@ impl CacheProbe {
         self.caches.bytes()
     }
 
-    /// A barrier appended to each of the first `n` databases' streams,
-    /// and what it made stale reclaimed.
+    /// A barrier appended to each of the first `n` databases' streams.
     pub fn invalidate_databases(&mut self, n: usize) {
         for db in 0..n {
             self.caches.barrier_appended(&probe_key(db, 0).0);
         }
-        self.settle();
     }
 
     /// Evict the least recently used entries until the estimate is at most
-    /// `bytes` (as admission does under a lower bound, with steps between
-    /// when deferred values fill the ring).
+    /// `bytes` (as admission does under a lower bound).
     pub fn evict_to(&mut self, bytes: u64) {
-        while self.caches.bytes() > bytes {
-            self.caches.inline_left = INLINE_BYTES;
-            match self.caches.evict_one() {
-                Evicted::One => {}
-                Evicted::Full => self.settle(),
-                Evicted::Nothing => break,
-            }
-        }
-        self.settle();
+        while self.caches.bytes() > bytes && self.caches.evict_one() {}
     }
 
-    /// Everything invalidated (in place: the probe has no thread) and
-    /// reclaimed.
+    /// Everything invalidated.
     pub fn invalidate_all(&mut self) {
         self.caches.invalidate_all();
-        self.settle();
-    }
-
-    /// Step until nothing is left to reclaim.
-    fn settle(&mut self) {
-        while self.caches.step_one() {}
-        self.caches.publish();
     }
 }
 
@@ -3190,9 +2362,6 @@ mod tests {
         metrics::with_local_recorder(&rec, || {
             let mut caches = Caches::new("p", "s");
             caches.max_bytes = 20 * 1024;
-            // Full clears go to a thread this test drives.
-            let (thread, units) = std::sync::mpsc::sync_channel(2);
-            caches.reclaim.thread = Some(thread);
             let stream = Arc::new(BarrierStream {
                 stream: "lineage/x".into(),
                 records: Vec::new(),
@@ -3227,24 +2396,13 @@ mod tests {
                 check(&caches);
             }
             assert!(caches.timelines() > 0 && caches.bytes() > 0);
-            // A barrier over every entry: handed off, charged until freed.
-            let held = caches.bytes();
             caches.barrier_appended("lineage/x");
             check(&caches);
-            assert_eq!(gauge(METRIC_HANDED_BYTES).1, held as f64);
-            reclaim(units.try_recv().unwrap());
-            caches.step();
-            check(&caches);
-            assert_eq!(gauge(METRIC_BYTES).1, 0.0);
             caches.put_timeline("lineage/y/t".into(), timeline.clone());
             check(&caches);
             caches.invalidate_all();
             check(&caches);
-            reclaim(units.try_recv().unwrap());
-            caches.step();
-            check(&caches);
             assert_eq!(gauge(METRIC_BYTES).1, 0.0);
-            assert_eq!(gauge(METRIC_HANDED_BYTES).1, 0.0);
         });
     }
 
@@ -3280,18 +2438,11 @@ mod tests {
             .put_selection((key.backend_key(), "d".into(), "s".into()), loaded);
         assert_eq!(caches.len(), 6);
         caches.invalidate(&key);
-        // Stale at once, freed by the steps.
-        assert!(caches.timeline(&key.backend_key()).is_none());
-        assert_eq!(caches.len(), 6);
-        caches.settle();
         assert_eq!(caches.len(), 4);
         assert!(caches.timeline("a").is_some());
-        caches.audit();
+        assert!(caches.timeline(&key.backend_key()).is_none());
         caches.invalidate_all();
-        assert!(caches.timeline("a").is_none());
-        caches.settle();
-        assert_eq!((caches.len(), caches.bytes()), (0, 0));
-        caches.audit();
+        assert_eq!(caches.len(), 0);
     }
 
     #[test]
@@ -4245,8 +3396,6 @@ mod tests {
             });
             let mut caches = Caches::default();
             for i in 0..20 {
-                // Each a loop iteration: its step frees what was evicted.
-                caches.step();
                 caches.put_timeline(
                     format!("lineage/d/t{i}"),
                     Arc::new(Timeline {
@@ -4273,8 +3422,6 @@ mod tests {
             // A barrier over every entry clears the cache: the stream goes
             // with its last timeline, and the maps' buckets are released.
             caches.barrier_appended("lineage/");
-            assert!(caches.timeline("lineage/d/t19").is_none());
-            caches.settle();
             assert_eq!((caches.timelines(), caches.bytes()), (0, 0));
             caches.audit();
         }
@@ -4341,8 +3488,8 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(cached(&mut ctx), [false, false, false]);
-            ctx.selection.settle();
-            assert_eq!(ctx.selection.bytes(), 0);
+            // Only the maps' buckets stay counted, until a full clear.
+            assert_eq!(ctx.selection.entries_bytes_for_test(), 0);
             load(&mut ctx, &keys).await;
             let z = timeline(&mut ctx, &keys[2]).await.unwrap();
             assert_eq!(z.barriers().count(), 1, "the lineage barrier only");
@@ -4994,7 +4141,6 @@ mod tests {
             for db in 0..19 {
                 c.barrier_appended(&database(db));
             }
-            c.settle();
             assert_eq!(c.timelines(), 1_000);
             assert!(
                 c.bytes() > c.entries_bytes_for_test(),
@@ -5004,61 +4150,42 @@ mod tests {
             );
             c.audit();
             c.invalidate_all();
-            c.settle();
             assert_eq!(c.bytes(), 0);
             c.audit();
         }
 
-        /// A barrier that applies to every cached entry is a full clear:
-        /// handed to the reclamation thread, or, without one, made stale in
-        /// place and swept by steps. Either way nothing is current at once,
-        /// the cache counts nothing once it is reclaimed, and memory is
-        /// back to exactly what it was before the entries were cached.
+        /// A barrier that applies to every cached entry releases them, and
+        /// the maps' buckets, before it returns, as a full clear does: the
+        /// cache counts nothing, and the thread holds again exactly what it
+        /// held before they were cached.
         #[test]
         fn a_barrier_over_every_entry_releases_them_and_the_maps() {
             let selection = loaded(4);
-            for thread in [false, true] {
-                let (tx, units) = std::sync::mpsc::sync_channel(2);
-                let mut c = if thread {
-                    Caches::with_thread(tx)
-                } else {
-                    Caches::default()
-                };
-                let before = crate::test_alloc::held();
-                {
-                    let mut read = HashMap::new();
-                    for t in 0..2_000 {
-                        let k = key(t % 20, t);
-                        let bk = k.backend_key();
-                        c.put_timeline(
-                            bk.clone(),
-                            timeline_of(&k, 300, &mut read),
-                        );
-                        c.put_selection(
-                            (bk.clone(), "d".into(), "sig".into()),
-                            selection.clone(),
-                        );
-                        c.put_version(bk, version(1, 4));
-                    }
+            let mut c = Caches::default();
+            let before = crate::test_alloc::held();
+            {
+                let mut read = HashMap::new();
+                for t in 0..2_000 {
+                    let k = key(t % 20, t);
+                    let bk = k.backend_key();
+                    c.put_timeline(bk.clone(), timeline_of(&k, 300, &mut read));
+                    c.put_selection(
+                        (bk.clone(), "d".into(), "sig".into()),
+                        selection.clone(),
+                    );
+                    c.put_version(bk, version(1, 4));
                 }
-                c.barrier_appended(&lineage());
-                assert!(c.timeline(&key(3, 3).backend_key()).is_none());
-                assert!(c.barrier_streams().is_empty());
-                if thread {
-                    assert_eq!(c.len(), 0, "handed off");
-                    assert!(c.bytes() > 0, "charged until freed");
-                    reclaim(units.try_recv().unwrap());
-                }
-                c.settle();
-                assert_eq!((c.len(), c.timelines(), c.bytes()), (0, 0, 0));
-                c.audit();
-                assert_eq!(crate::test_alloc::held(), before, "{thread}");
             }
+            c.barrier_appended(&lineage());
+            assert_eq!((c.len(), c.timelines(), c.bytes()), (0, 0, 0));
+            assert!(c.barrier_streams().is_empty());
+            c.audit();
+            assert_eq!(crate::test_alloc::held(), before);
         }
 
-        /// A barrier over an empty cache leaves it empty. Entries all
-        /// invalidated are stale at once, swept by steps, and once none is
-        /// left a step releases the buckets they left.
+        /// A barrier over an empty cache leaves it empty; over one whose
+        /// entries were all invalidated already, it releases the buckets
+        /// they left.
         #[test]
         fn a_barrier_over_an_empty_cache_releases_its_buckets() {
             let mut c = Caches::default();
@@ -5073,13 +4200,8 @@ mod tests {
             for k in &keys {
                 c.invalidate(k);
             }
-            assert!(
-                keys.iter().all(|k| c.timeline(&k.backend_key()).is_none())
-            );
-            assert_eq!(c.len(), 500, "stale until swept");
-            c.audit();
-            c.settle();
-            assert_eq!((c.len(), c.bytes()), (0, 0));
+            assert_eq!(c.len(), 0);
+            assert!(c.bytes() > 0, "the emptied buckets are counted");
             c.barrier_appended(&database(1));
             assert_eq!(c.bytes(), 0);
             c.audit();
@@ -5110,8 +4232,6 @@ mod tests {
             }
             put(&mut c, &other);
             c.barrier_appended(&lineage());
-            assert!(c.selection(&sel(&key(1, 1))).is_none());
-            c.settle();
             assert_eq!(c.len(), 2, "the other lineage's selection and version");
             assert!(c.selection(&sel(&other)).is_some());
             assert!(c.version(&other.backend_key(), 1).is_some());
@@ -5122,20 +4242,16 @@ mod tests {
                 put(&mut c, &key(t % 3, t));
             }
             c.barrier_appended(&barrier_stream(&other, &BarrierScope::Lineage));
-            assert!(c.selection(&sel(&other)).is_none());
-            c.settle();
             assert_eq!(c.len(), 200);
+            assert!(c.selection(&sel(&other)).is_none());
             c.audit();
             c.barrier_appended(&lineage());
-            c.settle();
             assert_eq!((c.len(), c.timelines(), c.bytes()), (0, 0, 0));
             c.audit();
             for t in 0..100 {
                 put(&mut c, &key(t % 3, t));
             }
             c.invalidate_all();
-            assert!(c.version(&key(1, 1).backend_key(), 1).is_none());
-            c.settle();
             assert_eq!((c.len(), c.bytes()), (0, 0));
             c.audit();
         }
@@ -5167,11 +4283,6 @@ mod tests {
             }
             assert_eq!(c.barrier_streams().len(), 4 + 1 + 2);
             c.barrier_appended(&lineage());
-            // Only the other lineage's streams may be reused at once.
-            assert_eq!(c.barrier_streams().len(), 2 + 4);
-            assert!(!c.barrier_streams().contains_key(&lineage()));
-            c.audit();
-            c.settle();
             assert_eq!((c.len(), c.timelines()), (3, 1));
             assert!(c.timeline(&other.backend_key()).is_some());
             let mut held: Vec<String> =
@@ -5226,12 +4337,6 @@ mod tests {
             let t0 = Instant::now();
             c.barrier_appended(&database(7));
             let one_db = t0.elapsed();
-            assert!(c.timeline(&key(7, 3).backend_key()).is_none());
-            assert!(c.timeline(&key(8, 3).backend_key()).is_some());
-            c.audit();
-            let t0 = Instant::now();
-            c.settle();
-            let one_db_swept = t0.elapsed();
             assert_eq!(c.timelines(), (DBS - 1) * PER);
             assert_eq!(c.held_for(&key(7, 3)), 0);
             assert_eq!(c.held_for(&key(8, 3)), 3);
@@ -5243,9 +4348,6 @@ mod tests {
             let t0 = Instant::now();
             c.barrier_appended(&lineage());
             let all = t0.elapsed();
-            let t0 = Instant::now();
-            c.settle();
-            let all_swept = t0.elapsed();
             assert_eq!((c.timelines(), c.len()), (0, 0));
             assert!(c.barrier_streams().is_empty());
             c.audit();
@@ -5255,459 +4357,110 @@ mod tests {
             let t0 = Instant::now();
             c.invalidate_all();
             let cleared = t0.elapsed();
-            let t0 = Instant::now();
-            c.settle();
-            let cleared_swept = t0.elapsed();
             assert_eq!((c.timelines(), c.len(), c.bytes()), (0, 0, 0));
             c.audit();
             eprintln!(
                 "{} entries: filled in {filled:?}; a database barrier \
-                 {one_db:?} (swept {one_db_swept:?}), a lineage barrier \
-                 {all:?} (swept {all_swept:?}), a full clear of {} entries \
-                 {cleared:?} (swept {cleared_swept:?})",
+                 {one_db:?}, a lineage barrier {all:?}, a full clear of \
+                 {} entries {cleared:?}",
                 3 * DBS * PER,
                 3 * 10 * PER
             );
             // A linear pass: far below this even unoptimized.
-            for d in
-                [one_db, all, cleared, one_db_swept, all_swept, cleared_swept]
-            {
+            for d in [one_db, all, cleared] {
                 assert!(d < Duration::from_secs(30), "{d:?}");
             }
         }
 
-        /// This thread's CPU time (Linux: `/proc/thread-self/schedstat`).
-        fn thread_cpu() -> Duration {
-            let s = std::fs::read_to_string("/proc/thread-self/schedstat")
-                .expect("schedstat");
-            Duration::from_nanos(
-                s.split_whitespace().next().unwrap().parse().unwrap(),
-            )
-        }
-
-        /// Median, max and count of `t`.
-        fn summary(mut t: Vec<Duration>) -> String {
-            if t.is_empty() {
-                return "none".into();
-            }
-            t.sort();
-            format!(
-                "median {:?}, max {:?}, n {}",
-                t[t.len() / 2],
-                t[t.len() - 1],
-                t.len()
-            )
-        }
-
-        /// Steps as the source's loop runs them, until nothing is pending:
-        /// each step's time.
-        fn run_steps(c: &mut Caches) -> Vec<Duration> {
-            let mut v = Vec::new();
-            while c.pending() {
-                let t0 = Instant::now();
-                c.step();
-                v.push(t0.elapsed());
-            }
-            v
-        }
-
-        /// Each item reclaimed, one at a time, until none is left: its
-        /// time.
-        fn run_items(c: &mut Caches) -> Vec<Duration> {
-            let mut v = Vec::new();
-            loop {
-                let t0 = Instant::now();
-                if !c.step_one() {
-                    return v;
-                }
-                v.push(t0.elapsed());
-            }
-        }
-
-        /// Where the timing populations put table `t`: over 100 databases
-        /// evenly, or 90% of them in database 0 and the rest over the
-        /// other 99.
-        #[derive(Clone, Copy, PartialEq)]
-        enum Spread {
-            Even,
-            Concentrated,
-        }
-
-        const DBS: usize = 100;
-
-        fn placed(spread: Spread, t: usize) -> SchemaKey {
-            match spread {
-                Spread::Even => key(t % DBS, t / DBS),
-                Spread::Concentrated if t % 10 < 9 => key(0, t),
-                Spread::Concentrated => key(1 + t % (DBS - 1), t),
-            }
-        }
-
-        /// The smallest real tables (a one-record timeline, a one-column
-        /// selection and version), `tables` of them.
-        fn fill_small(
-            c: &mut Caches,
-            spread: Spread,
-            tables: std::ops::Range<usize>,
-        ) {
+        /// What invalidation costs at the default bound filled with the
+        /// most entries it can hold: the smallest real tables (a one-record
+        /// timeline, a one-column selection and version) over 100
+        /// databases. Times a database barrier, a lineage barrier and a
+        /// full clear, each on a full cache, five times: in the order the
+        /// entries were cached, and with the LRU order reshuffled first (as
+        /// reuse reshuffles it; every entry used once in a random order) for
+        /// five fixed seeds, each reported. A measurement for
+        /// a release build (`docs/design/selection-cache-diagnosis.md`,
+        /// section 6): `cargo test --release -p sources --lib --
+        /// --ignored --nocapture invalidation_cost_at_the_default_bound`.
+        #[test]
+        #[ignore = "timing: run in a release build"]
+        fn invalidation_cost_at_the_default_bound() {
+            const DBS: usize = 100;
             let selection = loaded(1);
-            let mut read = HashMap::new();
-            for t in tables {
-                let k = placed(spread, t);
-                let bk = k.backend_key();
-                c.put_timeline(bk.clone(), timeline_of(&k, 64, &mut read));
-                c.put_selection(
-                    (bk.clone(), "d".into(), "sig".into()),
-                    selection.clone(),
-                );
-                c.put_version(bk, version(1, 1));
-            }
-        }
-
-        /// The tables that fill the default bound (with a tenth more
-        /// offered, so it is full).
-        fn tables_at_the_bound(spread: Spread) -> usize {
-            let mut c = Caches::default();
-            fill_small(&mut c, spread, 0..1);
-            let per = c.entries_bytes_for_test().max(1);
-            (SELECTION_CACHE_BYTES / per) as usize * 11 / 10
-        }
-
-        /// `c` filled to the bound, its LRU order as cached or reshuffled
-        /// by `seed` (every entry used once in a random order).
-        fn fill_full(c: &mut Caches, spread: Spread, seed: Option<u64>) {
-            assert_eq!(c.max_bytes, SELECTION_CACHE_BYTES);
-            fill_small(
-                c,
-                spread,
-                1_000_000..1_000_000 + tables_at_the_bound(spread),
-            );
-            if let Some(seed) = seed {
+            let fill = |c: &mut Caches, tables: usize| {
+                let mut read = HashMap::new();
+                for t in 0..tables {
+                    let k = key(t % DBS, t / DBS);
+                    let bk = k.backend_key();
+                    c.put_timeline(bk.clone(), timeline_of(&k, 64, &mut read));
+                    c.put_selection(
+                        (bk.clone(), "d".into(), "sig".into()),
+                        selection.clone(),
+                    );
+                    c.put_version(bk, version(1, 1));
+                }
+            };
+            let full = || {
+                let mut c = Caches::default();
+                assert_eq!(c.max_bytes, SELECTION_CACHE_BYTES);
+                fill(&mut c, 1);
+                let per = c.entries_bytes_for_test().max(1);
+                fill(&mut c, (SELECTION_CACHE_BYTES / per) as usize * 11 / 10);
+                c
+            };
+            let reordered = |seed: u64| {
                 use rand::{SeedableRng, seq::SliceRandom};
+                let mut c = full();
                 let mut keys: Vec<CacheKey> =
                     c.entries.iter().map(|(k, _)| k.clone()).collect();
                 keys.shuffle(&mut rand::rngs::StdRng::seed_from_u64(seed));
                 for k in &keys {
                     c.entries.get(k);
                 }
-            }
-        }
-
-        /// What invalidation costs at the default bound filled with the
-        /// most entries it can hold, on the source's loop and as it is
-        /// reclaimed (`docs/design/selection-cache-diagnosis.md`, sections
-        /// 6.5 and 8). Populations: tables over 100 databases, in the order
-        /// cached and reshuffled by five fixed seeds; and 90% of them in
-        /// one database (in the order cached, and one seed). Operations: a
-        /// database barrier (a small database, and in the concentrated
-        /// population the 90% one), a lineage barrier and a full clear (both
-        /// full clears), each five times on a full cache. A full clear in
-        /// three modes, each made certain: the thread available (a thread
-        /// this test runs takes the unit, timing its wall and CPU), the
-        /// thread busy with this cache's earlier unit (in place), and
-        /// repeated clears in place during a refill. Reports the time on
-        /// the loop, the steps that reclaim (median, max, those over the 1
-        /// ms target, how far past it each ended, their total) and the
-        /// thread's time. A measurement for
-        /// a release build: `cargo test --release -p sources --lib --
-        /// --ignored --nocapture invalidation_cost_at_the_default_bound`.
-        #[test]
-        #[ignore = "timing: run in a release build"]
-        fn invalidation_cost_at_the_default_bound() {
+                c
+            };
             let populations =
-                std::iter::once((
-                    "even, insertion order".to_string(),
-                    Spread::Even,
-                    None,
-                ))
-                .chain((1..=5).map(|s| {
-                    (format!("even, seed {s}"), Spread::Even, Some(s))
-                }))
-                .chain([
-                    (
-                        "concentrated, insertion order".to_string(),
-                        Spread::Concentrated,
-                        None,
-                    ),
-                    (
-                        "concentrated, seed 1".to_string(),
-                        Spread::Concentrated,
-                        Some(1),
-                    ),
-                ]);
-            let report =
-                |population: &str,
-                 held: usize,
-                 name: &str,
-                 on_loop: Vec<Duration>,
-                 steps: Vec<Duration>,
-                 thread: Vec<(Duration, Duration)>| {
-                    // A step ends once past its target: how far past.
-                    let over: Vec<Duration> =
-                        steps.iter().map(|d| d.saturating_sub(STEP)).collect();
-                    let total: Duration = steps.iter().sum();
-                    let runs = format!("{on_loop:?}");
+                std::iter::once(("insertion order".to_string(), None)).chain(
+                    (1..=5).map(|seed| (format!("seed {seed}"), Some(seed))),
+                );
+            for (population, seed) in populations {
+                let fill = || seed.map_or_else(full, reordered);
+                let mut times: [Vec<Duration>; 3] = Default::default();
+                let mut held = 0;
+                for _ in 0..5 {
+                    let mut c = fill();
+                    held = c.len();
+                    let t0 = Instant::now();
+                    c.barrier_appended(&database(7));
+                    times[0].push(t0.elapsed());
+                    assert_eq!(c.held_for(&key(7, 3)), 0);
+
+                    let mut c = fill();
+                    let t0 = Instant::now();
+                    c.barrier_appended(&lineage());
+                    times[1].push(t0.elapsed());
+                    assert_eq!(c.len(), 0);
+
+                    let mut c = fill();
+                    let t0 = Instant::now();
+                    c.invalidate_all();
+                    times[2].push(t0.elapsed());
+                    assert_eq!(c.bytes(), 0);
+                }
+                let names =
+                    ["database barrier", "lineage barrier", "full clear"];
+                for (name, t) in names.iter().zip(&mut times) {
+                    let runs = format!("{t:?}");
+                    t.sort();
                     eprintln!(
                         "{held} entries at {SELECTION_CACHE_BYTES} bytes, \
-                     {population}: {name}: on the loop {}, runs in order \
-                     {runs}; steps {}, past {STEP:?} by {}, total {total:?}; \
-                     thread wall {}, cpu {}",
-                        summary(on_loop),
-                        summary(steps),
-                        summary(over),
-                        summary(thread.iter().map(|t| t.0).collect()),
-                        summary(thread.iter().map(|t| t.1).collect()),
+                         {population}: {name} median {:?}, max {:?}, runs in \
+                         order {runs}",
+                        t[t.len() / 2],
+                        t[t.len() - 1]
                     );
-                };
-            for (population, spread, seed) in populations {
-                let mut held = 0;
-                // Database barriers: always in place.
-                let mut barriers =
-                    vec![("database barrier, a small database", 7)];
-                if spread == Spread::Concentrated {
-                    barriers.push(("database barrier, the 90% database", 0));
                 }
-                for (name, db) in barriers {
-                    let (mut on_loop, mut steps) = (vec![], vec![]);
-                    for _ in 0..5 {
-                        let mut c = Caches::default();
-                        fill_full(&mut c, spread, seed);
-                        held = c.len();
-                        let t0 = Instant::now();
-                        c.barrier_appended(&database(db));
-                        on_loop.push(t0.elapsed());
-                        assert_eq!(c.len(), held, "in place");
-                        steps.extend(run_steps(&mut c));
-                        assert!(c.len() < held);
-                        c.audit();
-                    }
-                    report(&population, held, name, on_loop, steps, vec![]);
-                }
-                type Op = (&'static str, fn(&mut Caches));
-                let ops: [Op; 2] = [
-                    ("lineage barrier", |c| c.barrier_appended(&lineage())),
-                    ("full clear", |c| c.invalidate_all()),
-                ];
-                for (op, run) in ops {
-                    // The thread available.
-                    let (mut on_loop, mut steps, mut thread) =
-                        (vec![], vec![], vec![]);
-                    for _ in 0..5 {
-                        let (tx, rx) = std::sync::mpsc::sync_channel::<Job>(2);
-                        let mut c = Caches::with_thread(tx);
-                        fill_full(&mut c, spread, seed);
-                        let reclaimer = std::thread::spawn(move || {
-                            let job = rx.recv().expect("a unit");
-                            let (w0, c0) = (Instant::now(), thread_cpu());
-                            reclaim(job);
-                            (w0.elapsed(), thread_cpu() - c0)
-                        });
-                        let t0 = Instant::now();
-                        run(&mut c);
-                        on_loop.push(t0.elapsed());
-                        assert_eq!(c.len(), 0, "handed off");
-                        thread.push(reclaimer.join().expect("reclaimed"));
-                        assert_eq!(c.handed(), 0);
-                        steps.extend(run_steps(&mut c));
-                        assert_eq!(c.bytes(), 0);
-                    }
-                    report(
-                        &population,
-                        held,
-                        &format!("{op} [thread available]"),
-                        on_loop,
-                        steps,
-                        thread,
-                    );
-                    // The thread busy with this cache's earlier unit: in
-                    // place; then repeated clears during a refill.
-                    for repeated in [false, true] {
-                        let (mut on_loop, mut steps) = (vec![], vec![]);
-                        for _ in 0..5 {
-                            let (tx, rx) =
-                                std::sync::mpsc::sync_channel::<Job>(2);
-                            let mut c = Caches::with_thread(tx);
-                            fill_small(&mut c, spread, 0..1);
-                            c.invalidate_all();
-                            assert!(c.handed() > 0, "the earlier unit");
-                            fill_full(&mut c, spread, seed);
-                            let len = c.len();
-                            let t0 = Instant::now();
-                            run(&mut c);
-                            on_loop.push(t0.elapsed());
-                            assert_eq!(c.len(), len, "in place");
-                            if repeated {
-                                let tenth = len / 30;
-                                for round in 0..5 {
-                                    for _ in 0..50 {
-                                        let t0 = Instant::now();
-                                        c.step();
-                                        steps.push(t0.elapsed());
-                                    }
-                                    let at = 2_000_000 + round * tenth;
-                                    fill_small(&mut c, spread, at..at + tenth);
-                                    assert!(c.bytes() <= c.max_bytes);
-                                    let t0 = Instant::now();
-                                    run(&mut c);
-                                    on_loop.push(t0.elapsed());
-                                    assert!(c.handed() > 0, "still in place");
-                                }
-                            }
-                            steps.extend(run_steps(&mut c));
-                            assert_eq!(c.len(), 0);
-                            reclaim(rx.recv().expect("the earlier unit"));
-                            c.step();
-                            assert_eq!(c.bytes(), 0);
-                            c.audit();
-                        }
-                        let mode = if repeated {
-                            "repeated in place during a refill"
-                        } else {
-                            "thread busy: in place"
-                        };
-                        report(
-                            &population,
-                            held,
-                            &format!("{op} [{mode}]"),
-                            on_loop,
-                            steps,
-                            vec![],
-                        );
-                    }
-                }
-            }
-        }
-
-        /// A timeline whose records really hold about `bytes` (a 1 KiB
-        /// capture id each).
-        fn populated(bytes: usize) -> Arc<Timeline> {
-            let n = bytes / 1_100;
-            let records: Vec<Stored> = (0..n)
-                .map(|i| Stored {
-                    capture_id: format!("{i:01024}"),
-                    record: Record::new(
-                        WmPos::MysqlGtid {
-                            gtid_set: format!("u:1-{i}"),
-                        },
-                        Kind::Barrier {
-                            scope: BarrierScope::Lineage,
-                        },
-                    ),
-                })
-                .collect();
-            Arc::new(Timeline {
-                records,
-                table_head: 1,
-                streams: Vec::new(),
-                bytes: (n * 1_024) as u64,
-            })
-        }
-
-        /// What the largest single items cost, on the loop and as a step
-        /// frees each (a step overruns by at most one item): a 64 MiB
-        /// timeline whose records really hold that much, replaced and
-        /// evicted (deferred, freed by a step); the same value refused by
-        /// admission, dropped synchronously by its caller (outside the
-        /// cache's retirement, measured separately); the widest version
-        /// (4,096 columns); a 50,000-key history swept; and the LRU's
-        /// bucket array at the default bound released after a full clear
-        /// in place. Five runs each; a measurement for a release build
-        /// (`cargo test --release -p sources --lib -- --ignored
-        /// --nocapture reclamation_items_at_the_default_bound`).
-        #[test]
-        #[ignore = "timing: run in a release build"]
-        fn reclamation_items_at_the_default_bound() {
-            const BIG: usize = 64 << 20;
-            let mut rows: Vec<(&str, Vec<Duration>)> = vec![
-                ("64 MiB timeline: replaced, on the loop", vec![]),
-                ("64 MiB timeline: replaced, the step freeing it", vec![]),
-                ("64 MiB timeline: evicted, on the loop", vec![]),
-                ("64 MiB timeline: evicted, the step freeing it", vec![]),
-                ("64 MiB timeline: refused, the put", vec![]),
-                ("64 MiB timeline: refused, dropped by its caller", vec![]),
-                (
-                    "widest version (4,096 columns): the step freeing it",
-                    vec![],
-                ),
-                ("50,000-key history: largest item swept", vec![]),
-                ("50,000-key history: all its steps", vec![]),
-                ("full bound, cleared in place: largest item", vec![]),
-                ("full bound, cleared in place: the LRU's buckets", vec![]),
-            ];
-            let (a, b) = (key(0, 1).backend_key(), key(0, 2).backend_key());
-            for _ in 0..5 {
-                let mut c = Caches::default();
-                c.put_timeline(a.clone(), populated(BIG));
-                let next = populated(BIG);
-                let t0 = Instant::now();
-                assert!(c.put_timeline(a.clone(), next).is_some());
-                rows[0].1.push(t0.elapsed());
-                assert_eq!(c.ring.len, 1);
-                let t0 = Instant::now();
-                c.step();
-                rows[1].1.push(t0.elapsed());
-                assert_eq!(c.ring.len, 0);
-
-                c.set_limit_for_test(c.bytes() + c.bytes() / 2);
-                // The caller keeps the refused value (dropping it is
-                // measured below).
-                let next = populated(BIG);
-                let t0 = Instant::now();
-                assert!(c.put_timeline(b.clone(), next.clone()).is_none());
-                rows[2].1.push(t0.elapsed());
-                drop(next);
-                assert_eq!(c.ring.len, 1, "evicted and deferred");
-                let t0 = Instant::now();
-                c.step();
-                rows[3].1.push(t0.elapsed());
-
-                let mut c = Caches::default();
-                c.set_limit_for_test(1 << 20);
-                let value = populated(BIG);
-                let t0 = Instant::now();
-                assert!(c.put_timeline(a.clone(), value.clone()).is_none());
-                rows[4].1.push(t0.elapsed());
-                let t0 = Instant::now();
-                drop(value);
-                rows[5].1.push(t0.elapsed());
-
-                let mut c = Caches::default();
-                c.put_version(a.clone(), version(1, 4_096));
-                c.invalidate(&key(0, 1));
-                let t0 = Instant::now();
-                c.step();
-                rows[6].1.push(t0.elapsed());
-                assert_eq!(c.len(), 0);
-
-                let mut c = Caches::default();
-                for v in 0..50_000 {
-                    c.put_version(a.clone(), version(v, 1));
-                }
-                assert_eq!(c.len(), 50_000);
-                c.invalidate(&key(0, 1));
-                let items = run_items(&mut c);
-                rows[7].1.push(*items.iter().max().unwrap());
-                c.put_version(b.clone(), version(1, 1));
-                for v in 0..50_000 {
-                    c.put_version(a.clone(), version(v, 1));
-                }
-                c.invalidate(&key(0, 1));
-                rows[8].1.extend(run_steps(&mut c));
-
-                let mut c = Caches::default();
-                fill_full(&mut c, Spread::Even, None);
-                c.invalidate_all();
-                let items = run_items(&mut c);
-                rows[9].1.push(*items.iter().max().unwrap());
-                rows[10].1.push(*items.last().unwrap());
-                assert_eq!(c.bytes(), 0);
-            }
-            for (name, t) in rows {
-                let runs = format!("{t:?}");
-                eprintln!(
-                    "reclamation item: {name}: {}; runs {runs}",
-                    summary(t)
-                );
             }
         }
 
@@ -5744,8 +4497,6 @@ mod tests {
                 ("long history: cache, per version", vec![]),
                 ("long history: evict, per version", vec![]),
                 ("long history: invalidate the table", vec![]),
-                ("long history: reclaimed", vec![]),
-                ("lookup hit, per lookup", vec![]),
             ];
             let tables = 60_000;
             for _ in 0..5 {
@@ -5765,34 +4516,6 @@ mod tests {
                     c.invalidate(&key(t % DBS, t / DBS));
                 }
                 times[2].1.push(per(t0.elapsed(), 10_000));
-                // Batch sizing over every held table (stale ones too)
-                // against the current ones alone: batching only.
-                let (mut n, mut b) = (0u64, 0u64);
-                for (k, e) in c.entries.iter() {
-                    if c.current(k, e)
-                        && !matches!(e.cached, Cached::Selection(_))
-                    {
-                        b += e.bytes;
-                        n += matches!(e.cached, Cached::Timeline(..)) as u64;
-                    }
-                }
-                let live = ((c.max_bytes / 2 / (b / n).max(1)) as usize)
-                    .clamp(1, crate::mysql::mysql_history::BATCH_MAX_TABLES);
-                eprintln!(
-                    "upkeep: batch room {} counting stale tables, {live} \
-                     current ones alone",
-                    c.batch_room()
-                );
-                // The currency checks on the read path.
-                let hits: Vec<String> = (tables + 1..tables + 20_000)
-                    .step_by(2)
-                    .map(|t| key(t % DBS, t / DBS).backend_key())
-                    .collect();
-                let t0 = Instant::now();
-                for k in &hits {
-                    assert!(c.timeline(k).is_some());
-                }
-                times[7].1.push(per(t0.elapsed(), hits.len()));
 
                 let long = key(0, 1_000_000);
                 let bk = long.backend_key();
@@ -5812,9 +4535,6 @@ mod tests {
                 let t0 = Instant::now();
                 c.invalidate(&long);
                 times[5].1.push(t0.elapsed());
-                let t0 = Instant::now();
-                c.settle();
-                times[6].1.push(t0.elapsed());
                 assert_eq!(c.held_for(&long), 0);
             }
             for (name, t) in &mut times {
@@ -5827,665 +4547,6 @@ mod tests {
                     t[t.len() - 1]
                 );
             }
-        }
-
-        /// A timeline that allocates about `bytes` (its records' vector,
-        /// reserved), without barrier streams.
-        fn heavy(bytes: usize) -> Arc<Timeline> {
-            Arc::new(Timeline {
-                records: Vec::with_capacity(
-                    bytes / std::mem::size_of::<Stored>(),
-                ),
-                table_head: 1,
-                streams: Vec::new(),
-                bytes: 0,
-            })
-        }
-
-        /// The allocator's bytes held by this thread.
-        fn held() -> i64 {
-            crate::test_alloc::held()
-        }
-
-        /// A stale entry is a miss for every reader (timeline, selection,
-        /// version, proven flags) and is neither returned nor freed by
-        /// the read: its memory stays allocated, and charged, until a
-        /// step sweeps it.
-        #[test]
-        fn a_stale_entry_is_a_miss_and_nothing_is_freed_with_it() {
-            let mut c = Caches::default();
-            let k = key(0, 1);
-            let bk = k.backend_key();
-            let sel = (bk.clone(), "d".to_string(), "sig".to_string());
-            c.put_timeline(bk.clone(), heavy(1 << 20));
-            c.put_selection(sel.clone(), loaded(4));
-            c.put_version(bk.clone(), version(1, 4));
-            c.mark_proven(&k);
-            assert!(c.is_proven(&k) && c.proven_keys().contains(&bk));
-            c.invalidate(&k);
-            let (before, charged) = (held(), c.bytes());
-            assert!(c.timeline(&bk).is_none());
-            assert!(c.selection(&sel).is_none());
-            assert!(c.version(&bk, 1).is_none());
-            assert!(!c.is_proven(&k) && c.proven_keys().is_empty());
-            c.mark_proven(&k);
-            assert_eq!((held(), c.bytes(), c.len()), (before, charged, 3));
-            assert_eq!(c.index.live(), 0);
-            c.audit();
-            c.settle();
-            assert!(held() < before - (1 << 20), "freed by the sweep");
-            assert_eq!((c.len(), c.bytes()), (0, 0));
-        }
-
-        /// Replacing or evicting a 64 MiB timeline frees nothing in the
-        /// operation: the value waits, charged, for the next step. An
-        /// admission that needs that room is refused until the step has
-        /// freed it (counted as `deferred`), and evicts nothing more.
-        #[test]
-        fn replacement_and_eviction_never_free_a_large_value_inline() {
-            const BIG: usize = 64 << 20;
-            let mut c = Caches::default();
-            let a = key(0, 1).backend_key();
-            let b = key(0, 2).backend_key();
-            c.put_timeline(a.clone(), heavy(BIG));
-            let one = c.bytes();
-            let before = held();
-            // Replacement: the old value is deferred.
-            assert!(c.put_timeline(a.clone(), heavy(BIG)).is_some());
-            assert!(held() >= before + BIG as i64, "nothing freed inline");
-            assert_eq!(c.ring.len, 1);
-            assert!(c.bytes() >= 2 * one - 4096 && c.bytes() <= c.max_bytes);
-            c.audit();
-            let t0 = Instant::now();
-            c.step();
-            eprintln!("a step freeing a 64 MiB timeline: {:?}", t0.elapsed());
-            assert_eq!(c.ring.len, 0);
-            assert!(held() < before + 4096, "freed by the step");
-            // Eviction: room for one, so caching B evicts A, which waits.
-            c.set_limit_for_test(one + one / 2);
-            let before = held();
-            assert!(c.put_timeline(b.clone(), heavy(BIG)).is_none());
-            assert!(c.timeline(&a).is_none() && c.timeline(&b).is_none());
-            assert_eq!(c.ring.len, 1, "A evicted and deferred");
-            assert!(held() >= before - 4096, "nothing freed inline");
-            c.audit();
-            // Before the step: refused again, evicting nothing more.
-            assert!(c.put_timeline(b.clone(), heavy(BIG)).is_none());
-            assert_eq!(c.ring.len, 1);
-            c.step();
-            assert!(c.put_timeline(b.clone(), heavy(BIG)).is_some());
-            c.audit();
-        }
-
-        /// An operation frees small values inline only up to its budget;
-        /// past it they are deferred, charged.
-        #[test]
-        fn an_operation_frees_at_most_its_inline_budget() {
-            let mut c = Caches::default();
-            let small = loaded(12);
-            let each = super::super::super::mysql_cache_cost::loaded(&small);
-            for t in 0..400 {
-                let bk = key(0, t).backend_key();
-                c.put_selection((bk, "d".into(), "sig".into()), small.clone());
-            }
-            let full = c.bytes();
-            // Room for a timeline of 40 such selections' bytes.
-            c.set_limit_for_test(full);
-            let before = held();
-            let reclaimed_before = c.ring.len;
-            assert_eq!(reclaimed_before, 0);
-            let want = (40 * each) as usize;
-            let _ = c.put_timeline(key(1, 1).backend_key(), heavy(want));
-            let freed = before - held();
-            eprintln!(
-                "freed inline {freed} bytes of {each}-byte selections; \
-                 deferred {}",
-                c.ring.len
-            );
-            assert!(c.ring.len > 0, "past the budget: deferred");
-            assert!(
-                freed <= (INLINE_BYTES + c.ring.len as u64 * 512) as i64,
-                "{freed}"
-            );
-            c.audit();
-        }
-
-        /// A load, or a batch of installs, is one operation: its puts share
-        /// one inline allowance, so many small evictions inside it free at
-        /// most that much inline, and the rest wait for a step. The same
-        /// puts made separately each have their own.
-        #[test]
-        fn an_operation_shares_one_inline_allowance() {
-            let small = loaded(12);
-            for how in ["separate", "load", "batch"] {
-                let mut c = Caches::default();
-                // Each its own value: evicting one frees it.
-                for t in 0..400 {
-                    let bk = key(0, t).backend_key();
-                    c.put_selection((bk, "d".into(), "sig".into()), loaded(12));
-                }
-                c.set_limit_for_test(c.bytes());
-                let each =
-                    super::super::super::mysql_cache_cost::loaded(&small);
-                // Each needs about one selection's room (two evictions at
-                // most): within one put's own allowance.
-                assert!(2 * each < INLINE_BYTES);
-                let values: Vec<_> =
-                    (0..10).map(|_| heavy(each as usize)).collect();
-                let before = c.freed_inline;
-                let _load = match how {
-                    "load" => Some(c.begin_load()),
-                    "batch" => {
-                        c.begin_operation();
-                        None
-                    }
-                    _ => None,
-                };
-                // Ten tables.
-                for (t, v) in values.into_iter().enumerate() {
-                    let _ = c.put_timeline(key(1, t).backend_key(), v);
-                }
-                match how {
-                    "load" => c.end_load(),
-                    "batch" => c.end_operation(),
-                    _ => {}
-                }
-                let freed = c.freed_inline - before;
-                eprintln!(
-                    "{how}: freed inline {freed}, deferred {}, entries {}",
-                    c.ring.len,
-                    c.len()
-                );
-                if how == "separate" {
-                    // Each put has its own allowance: far more freed inline.
-                    assert_eq!(c.ring.len, 0, "{how}");
-                    assert!(freed > 4 * INLINE_BYTES, "{freed}");
-                } else {
-                    assert!(c.ring.len > 0, "{how}: past the shared allowance");
-                    assert!(freed <= INLINE_BYTES, "{how}: {freed}");
-                }
-                c.audit();
-            }
-        }
-
-        /// Every capacity eviction is counted, stale entries' too (and
-        /// those also by themselves).
-        #[test]
-        fn stale_evictions_are_counted_with_all_evictions() {
-            use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-            let rec = DebuggingRecorder::new();
-            let left = metrics::with_local_recorder(&rec, || {
-                let mut c = Caches::new("p", "s");
-                let mut read = HashMap::new();
-                for t in 0..10 {
-                    let k = key(0, t);
-                    c.put_timeline(
-                        k.backend_key(),
-                        timeline_of(&k, 300, &mut read),
-                    );
-                }
-                c.invalidate(&key(0, 0));
-                c.invalidate(&key(0, 1));
-                // Room for nine: two puts evict the two stale ones, then a
-                // current one.
-                c.set_limit_for_test(c.bytes());
-                for t in 10..13 {
-                    let k = key(0, t);
-                    c.put_timeline(
-                        k.backend_key(),
-                        timeline_of(&k, 300, &mut read),
-                    );
-                }
-                assert!(c.timeline(&key(0, 12).backend_key()).is_some());
-                c.len()
-            });
-            let count = |name: &str| {
-                rec.snapshotter()
-                    .snapshot()
-                    .into_vec()
-                    .into_iter()
-                    .find(|(k, ..)| k.key().name() == name)
-                    .map(|(.., v)| match v {
-                        DebugValue::Counter(n) => n,
-                        _ => panic!("a counter"),
-                    })
-                    .unwrap_or(0)
-            };
-            // Nothing else removed an entry (no step ran).
-            assert_eq!(count(METRIC_EVICTIONS), 13 - left as u64);
-            assert!(count(METRIC_EVICTIONS) > 2, "a current one too");
-            assert_eq!(count(METRIC_STALE_EVICTIONS), 2);
-        }
-
-        /// With every deferred slot taken, an operation that would need one
-        /// refuses before it detaches anything: the entry it would have
-        /// replaced or evicted stays, with its value and accounting, and
-        /// one step later it goes ahead.
-        #[test]
-        fn a_full_ring_leaves_everything_in_place_and_refuses() {
-            const BIG: usize = 64 << 10;
-            let mut c = Caches::default();
-            let keys: Vec<String> =
-                (0..DEFERRED + 2).map(|t| key(0, t).backend_key()).collect();
-            for k in &keys {
-                c.put_timeline(k.clone(), heavy(BIG));
-            }
-            for k in &keys[..DEFERRED] {
-                assert!(c.put_timeline(k.clone(), heavy(BIG)).is_some());
-            }
-            assert!(c.ring.full());
-            let held_at = c.timeline(&keys[DEFERRED]).unwrap();
-            let (len, bytes, mem) = (c.len(), c.bytes(), held());
-            // Replacement refused: the old entry stays current.
-            assert!(
-                c.put_timeline(keys[DEFERRED].clone(), heavy(BIG)).is_none()
-            );
-            assert!(Arc::ptr_eq(
-                &c.timeline(&keys[DEFERRED]).unwrap(),
-                &held_at
-            ));
-            assert_eq!((c.len(), c.bytes()), (len, bytes));
-            assert!(held() <= mem, "nothing new held");
-            c.audit();
-            // Eviction refused: nothing is evicted.
-            c.set_limit_for_test(bytes);
-            let other = key(1, 1).backend_key();
-            assert!(c.put_timeline(other.clone(), heavy(BIG)).is_none());
-            assert_eq!((c.len(), c.bytes()), (len, bytes));
-            assert!(c.timeline(&keys[DEFERRED + 1]).is_some());
-            c.audit();
-            c.step();
-            assert!(c.ring.len < DEFERRED);
-            assert!(
-                c.put_timeline(keys[DEFERRED].clone(), heavy(BIG)).is_some()
-            );
-            c.audit();
-        }
-
-        /// The cache with `tables` small tables cached (timeline, selection
-        /// and version each).
-        fn filled(c: &mut Caches, tables: std::ops::Range<usize>) {
-            let mut read = HashMap::new();
-            for t in tables {
-                let k = key(t % 4, t);
-                let bk = k.backend_key();
-                c.put_timeline(bk.clone(), timeline_of(&k, 300, &mut read));
-                c.put_selection(
-                    (bk.clone(), "d".into(), "sig".into()),
-                    loaded(4),
-                );
-                c.put_version(bk, version(1, 4));
-            }
-        }
-
-        /// A full clear hands everything to the thread without waiting or
-        /// freeing anything, charged until the thread has freed it. While
-        /// that unit is there, clears are made in place: repeated clears
-        /// during a refill allocate nothing, stay within the bound, and
-        /// leave nothing current.
-        #[test]
-        fn clears_while_a_unit_is_on_the_thread_are_made_in_place() {
-            let (tx, units) = std::sync::mpsc::sync_channel(2);
-            let mut c = Caches::with_thread(tx);
-            let base = held();
-            filled(&mut c, 0..500);
-            let (charged, mem) = (c.bytes(), held());
-            c.invalidate_all();
-            // Nothing freed; the one allocation is the new empty list's two
-            // sentinel nodes (uncounted while empty, as in a new cache).
-            assert_eq!(
-                held() - mem,
-                2 * super::super::super::mysql_cache_cost::allocated(NODE)
-                    as i64,
-                "nothing freed"
-            );
-            assert_eq!((c.len(), c.bytes(), c.handed()), (0, charged, charged));
-            for round in 0..5 {
-                filled(&mut c, 0..200);
-                assert!(c.bytes() <= c.max_bytes);
-                let (len, bytes, mem) = (c.len(), c.bytes(), held());
-                c.invalidate_all();
-                assert_eq!(held(), mem, "round {round}: nothing allocated");
-                assert_eq!((c.len(), c.bytes()), (len, bytes), "in place");
-                assert!(c.timeline(&key(1, 1).backend_key()).is_none());
-                assert!(c.barrier_streams().is_empty());
-                c.audit();
-                for _ in 0..50 {
-                    c.step();
-                }
-            }
-            assert!(units.try_recv().is_ok_and(|u| {
-                reclaim(u);
-                true
-            }));
-            assert!(units.try_recv().is_err(), "one unit per cache");
-            assert_eq!(c.handed(), 0);
-            c.settle();
-            assert_eq!(c.bytes(), 0);
-            c.audit();
-            assert_eq!(held(), base);
-        }
-
-        /// A handoff the queue rejects (full, or the thread gone) leaves
-        /// every structure in place, intact and unfreed, and the clear is
-        /// made in place; without a thread every clear is.
-        #[test]
-        fn a_rejected_handoff_keeps_everything_and_clears_in_place() {
-            for case in ["full", "gone", "none"] {
-                let (tx, units) = std::sync::mpsc::sync_channel(2);
-                let mut others: Vec<Caches> = Vec::new();
-                let mut c = match case {
-                    "none" => Caches::default(),
-                    _ => Caches::with_thread(tx.clone()),
-                };
-                if case == "full" {
-                    for _ in 0..2 {
-                        let mut o = Caches::with_thread(tx.clone());
-                        filled(&mut o, 0..10);
-                        o.invalidate_all();
-                        assert!(o.handed() > 0);
-                        others.push(o);
-                    }
-                }
-                if case == "gone" {
-                    drop(units);
-                } else {
-                    std::mem::forget(units);
-                }
-                filled(&mut c, 0..300);
-                let k = key(1, 1).backend_key();
-                let t = c.timeline(&k).unwrap();
-                let (len, bytes, mem) = (c.len(), c.bytes(), held());
-                c.invalidate_all();
-                assert_eq!(held(), mem, "{case}: nothing freed");
-                assert_eq!((c.len(), c.bytes(), c.handed()), (len, bytes, 0));
-                assert!(c.timeline(&k).is_none(), "{case}: stale");
-                let kept = c
-                    .entries
-                    .peek(&CacheKey::Timeline(k.as_str().into()))
-                    .unwrap();
-                assert!(
-                    matches!(&kept.cached, Cached::Timeline(x, _) if Arc::ptr_eq(x, &t)),
-                    "{case}: the same value, back in place"
-                );
-                c.audit();
-                c.settle();
-                assert_eq!(c.bytes(), 0, "{case}");
-            }
-        }
-
-        /// install_if_current installs only over the snapshot as the
-        /// table's current timeline: after a database barrier, a lineage
-        /// barrier, a full clear (in place or handed off), an invalidation
-        /// or an eviction between the snapshot and the install it refuses,
-        /// also while the stale entry still holds the snapshot itself.
-        #[test]
-        fn an_install_needs_its_snapshot_current() {
-            for case in [
-                "nothing",
-                "database barrier",
-                "lineage barrier",
-                "clear in place",
-                "clear handed off",
-                "invalidation",
-                "eviction",
-            ] {
-                let (tx, _units) = std::sync::mpsc::sync_channel(2);
-                let mut c = Caches::with_thread(tx);
-                let mut read = HashMap::new();
-                let k = key(1, 1);
-                let bk = k.backend_key();
-                // Another lineage's table, so a lineage barrier is not a
-                // full clear.
-                let other = SchemaKey::new(
-                    "acme",
-                    "s",
-                    "fedcba9876543210fedcba9876543210",
-                    "db0",
-                    "t0",
-                );
-                c.put_timeline(
-                    other.backend_key(),
-                    timeline_of(&other, 300, &mut read),
-                );
-                let snap = c
-                    .put_timeline(bk.clone(), timeline_of(&k, 300, &mut read))
-                    .unwrap();
-                match case {
-                    "database barrier" => c.barrier_appended(&database(1)),
-                    "lineage barrier" => c.barrier_appended(&lineage()),
-                    "clear in place" => {
-                        c.reclaim.thread = None;
-                        c.invalidate_all();
-                    }
-                    "clear handed off" => c.invalidate_all(),
-                    "invalidation" => c.invalidate(&k),
-                    "eviction" => {
-                        // The table is the least recently used.
-                        c.timeline(&other.backend_key());
-                        c.set_limit_for_test(c.bytes());
-                        let n = key(2, 2);
-                        c.put_timeline(
-                            n.backend_key(),
-                            timeline_of(&n, 300, &mut read),
-                        );
-                    }
-                    _ => {}
-                }
-                let still_held = c
-                    .entries
-                    .peek(&CacheKey::Timeline(bk.as_str().into()))
-                    .is_some_and(|e| matches!(&e.cached, Cached::Timeline(t, _) if Arc::ptr_eq(t, &snap)));
-                let installed = c.install_if_current(
-                    &k,
-                    &snap,
-                    timeline_of(&k, 400, &mut read),
-                );
-                assert_eq!(installed, case == "nothing", "{case}");
-                if matches!(
-                    case,
-                    "database barrier"
-                        | "lineage barrier"
-                        | "clear in place"
-                        | "invalidation"
-                ) {
-                    assert!(
-                        still_held,
-                        "{case}: the stale entry holds the snapshot"
-                    );
-                    assert!(c.timeline(&bk).is_none(), "{case}");
-                }
-                c.audit();
-            }
-        }
-
-        /// A table's record dropped and created again, or a database's,
-        /// never makes a retained snapshot current: the new entries are
-        /// new values under new stamps.
-        #[test]
-        fn a_recreated_record_does_not_revive_a_snapshot() {
-            let mut c = Caches::default();
-            let mut read = HashMap::new();
-            let k = key(1, 1);
-            let bk = k.backend_key();
-            let snap = c
-                .put_timeline(bk.clone(), timeline_of(&k, 300, &mut read))
-                .unwrap();
-            for scope in [None, Some(database(1))] {
-                match &scope {
-                    None => c.invalidate(&k),
-                    Some(s) => {
-                        // Keep another database, so this is no full clear.
-                        let o = key(2, 2);
-                        c.put_timeline(
-                            o.backend_key(),
-                            timeline_of(&o, 300, &mut read),
-                        );
-                        c.barrier_appended(s);
-                    }
-                }
-                c.settle();
-                assert_eq!(c.held_for(&k), 0, "{scope:?}: record dropped");
-                c.put_timeline(bk.clone(), timeline_of(&k, 300, &mut read));
-                assert!(c.timeline(&bk).is_some());
-                assert!(!c.install_if_current(
-                    &k,
-                    &snap,
-                    timeline_of(&k, 400, &mut read)
-                ));
-                c.audit();
-            }
-        }
-
-        /// Exhausted stamps fail closed: with stale entries, deferred
-        /// values and a handed-off unit present, nothing is current or
-        /// admitted, and no snapshot installs. Once the cache holds nothing
-        /// the stamps start again; the unit is still freed by the thread
-        /// and released; no snapshot from before becomes current, though
-        /// stamps and records are created again.
-        #[test]
-        fn exhausted_stamps_fail_closed_until_the_cache_is_empty() {
-            for path in ["put", "invalidate", "barrier", "clear"] {
-                let (tx, units) = std::sync::mpsc::sync_channel(2);
-                let mut c = Caches::with_thread(tx);
-                let mut read = HashMap::new();
-                let base = held();
-                filled(&mut c, 0..100);
-                let a = key(1, 1);
-                let snap_a = c.timeline(&a.backend_key()).unwrap();
-                c.invalidate_all();
-                assert!(c.handed() > 0, "{path}: a unit on the thread");
-                filled(&mut c, 0..100);
-                c.barrier_appended(&database(2));
-                c.put_timeline(key(3, 3).backend_key(), heavy(1 << 20));
-                c.put_timeline(key(3, 3).backend_key(), heavy(1 << 20));
-                assert_eq!(c.ring.len, 1, "{path}: a deferred value");
-                let snap_b = c.timeline(&a.backend_key()).unwrap();
-                c.set_stamp_for_test(u64::MAX);
-                match path {
-                    "put" => assert!(
-                        c.put_timeline(
-                            key(0, 999).backend_key(),
-                            timeline_of(&key(0, 999), 300, &mut read)
-                        )
-                        .is_none()
-                    ),
-                    "invalidate" => c.invalidate(&key(0, 4)),
-                    "barrier" => c.barrier_appended(&database(0)),
-                    _ => c.invalidate_all(),
-                }
-                assert!(c.stamps.exhausted(), "{path}");
-                assert!(c.timeline(&a.backend_key()).is_none(), "{path}");
-                assert!(
-                    c.barrier_streams().is_empty()
-                        && c.proven_keys().is_empty()
-                );
-                assert!(!c.install_if_current(
-                    &a,
-                    &snap_b,
-                    timeline_of(&a, 400, &mut read)
-                ));
-                assert!(
-                    c.put_timeline(
-                        a.backend_key(),
-                        timeline_of(&a, 300, &mut read)
-                    )
-                    .is_none(),
-                    "{path}: nothing admitted"
-                );
-                assert_eq!(c.index.live(), 0);
-                c.audit();
-                c.settle();
-                assert!(!c.stamps.exhausted(), "{path}: empty, so reset");
-                assert_eq!(c.bytes() - c.handed(), 0);
-                // Records and stamps start again: the old snapshots stay
-                // dead.
-                let fresh = c
-                    .put_timeline(
-                        a.backend_key(),
-                        timeline_of(&a, 300, &mut read),
-                    )
-                    .unwrap();
-                assert!(
-                    c.timeline(&a.backend_key())
-                        .is_some_and(|t| Arc::ptr_eq(&t, &fresh))
-                );
-                for snap in [&snap_a, &snap_b] {
-                    assert!(!c.install_if_current(
-                        &a,
-                        snap,
-                        timeline_of(&a, 400, &mut read)
-                    ));
-                }
-                c.audit();
-                reclaim(units.try_recv().unwrap());
-                assert_eq!(c.handed(), 0);
-                c.invalidate_all();
-                reclaim(units.try_recv().unwrap());
-                c.settle();
-                assert_eq!(c.bytes(), 0, "{path}");
-                // The test's own key and reads of the barrier streams too.
-                drop((snap_a, snap_b, fresh, read, a));
-                assert_eq!(held(), base, "{path}: everything released");
-            }
-        }
-
-        /// A barrier cuts its stream: the stream is no longer offered for
-        /// reuse, a new read of it is held for the timelines read after,
-        /// and the old read stays held, and charged, for the stale
-        /// timelines holding it until they go.
-        #[test]
-        fn a_cut_stream_stays_held_for_its_stale_timelines_only() {
-            let mut c = Caches::default();
-            let mut read = HashMap::new();
-            let (a, b, z) = (key(0, 1), key(0, 2), key(1, 3));
-            c.put_timeline(a.backend_key(), timeline_of(&a, 300, &mut read));
-            c.put_timeline(z.backend_key(), timeline_of(&z, 300, &mut read));
-            let old = read[&database(0)].clone();
-            c.barrier_appended(&database(0));
-            assert!(!c.barrier_streams().contains_key(&database(0)));
-            assert!(c.barrier_streams().contains_key(&database(1)));
-            // A new read of the stream, appended to since.
-            read.insert(
-                database(0),
-                Arc::new(BarrierStream {
-                    stream: database(0),
-                    records: Vec::new(),
-                    head: 2,
-                    bytes: 256,
-                }),
-            );
-            c.put_timeline(b.backend_key(), timeline_of(&b, 300, &mut read));
-            assert_eq!(c.stale_streams.len(), 1);
-            assert!(Arc::ptr_eq(&c.stale_streams[&addr(&old)].stream, &old));
-            assert!(c.barrier_streams()[&database(0)].head == 2);
-            c.audit();
-            c.settle();
-            assert!(c.stale_streams.is_empty(), "gone with its last holder");
-            c.audit();
-        }
-
-        /// A step stops near its target with work left, and resumes where
-        /// it stopped; a source without work runs none.
-        #[test]
-        fn a_step_is_bounded_and_resumes() {
-            let mut c = Caches::default();
-            c.set_limit_for_test(1 << 30);
-            filled(&mut c, 0..20_000);
-            assert!(!c.pending());
-            c.barrier_appended(&database(1));
-            let len = c.len();
-            let t0 = Instant::now();
-            c.step();
-            let took = t0.elapsed();
-            let after = c.len();
-            assert!(after < len && c.pending(), "progress, with work left");
-            eprintln!("a step: {took:?}, {} entries freed", len - after);
-            while c.pending() {
-                c.step();
-            }
-            assert_eq!(c.len(), 3 * 15_000);
-            c.audit();
         }
 
         /// While a load admits, what it admitted is never evicted to make

@@ -1371,8 +1371,6 @@ async fn record_query(
     #[cfg(test)]
     super::mysql_forward_proof::hooks::before_install(ctx);
     let mut installed = std::collections::HashSet::new();
-    // One operation: the installs share one inline allowance.
-    ctx.selection.begin_operation();
     for f in fresh {
         #[cfg(test)]
         let probe = (f.key.backend_key(), f.snapshot.bytes, f.timeline.clone());
@@ -1389,7 +1387,6 @@ async fn record_query(
             installed.insert(f.key.backend_key());
         }
     }
-    ctx.selection.end_operation();
     for key in &invalidated {
         if !installed.contains(&key.backend_key()) {
             ctx.selection.invalidate(key);
@@ -2338,19 +2335,13 @@ pub(crate) mod tests {
             storage::adapters::LineageDescriptor::mysql(UUID).unwrap(),
         );
         let scope = ctx.registry_scope.current().unwrap();
-        let keys = [scope.key("shop", "orders"), scope.key("shop", "items")];
-        for k in &keys {
-            ctx.selection.seed_for_test(k);
-        }
+        ctx.selection.seed_for_test(&scope.key("shop", "orders"));
+        ctx.selection.seed_for_test(&scope.key("shop", "items"));
         assert_eq!(ctx.selection.len(), 2);
         super::super::apply_reload_request(&mut ctx, None, None)
             .await
             .unwrap();
-        for k in &keys {
-            assert!(ctx.selection.timeline(&k.backend_key()).is_none());
-        }
-        ctx.selection.settle();
-        assert_eq!((ctx.selection.len(), ctx.selection.bytes()), (0, 0));
+        assert_eq!(ctx.selection.len(), 0);
     }
 
     /// Give the fixture's `shop.orders` a proven schema at the rows'

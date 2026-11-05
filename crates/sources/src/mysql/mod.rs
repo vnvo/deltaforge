@@ -2050,9 +2050,6 @@ impl MySqlSource {
                     info!(source_id=%ctx.source_id, "resuming ..");
                     break;
                 }
-                // The selection cache's reclamation: one bounded step per
-                // iteration, its only call site.
-                ctx.selection.step();
 
                 // Rotation: schedule Stage-A preflight concurrently with the stream,
                 // and apply the Stage-B swap only at a whole-transaction GTID boundary
