@@ -172,6 +172,16 @@ The overhead result of section 5 step 1 was measured at `df89d2d0` and does not 
 
 30 runs. Overhead is compared only on metrics both builds export: post-activation p50 and p99, CPU, and evictions (the default build's `deltaforge_mysql_selection_cache_evictions_total`). The default build has none of the diagnostic counters (timeline reloads, store reads, phase timings); their absence there is not zero, and they are not compared. Tolerances as in section 5 step 1 (P minus D: p50 at most +3% or +1 ms, p99 at most +3% or +2 ms, CPU at most +5%, evictions within 2%). The same one-sided and anomaly rules apply. Outside tolerance at any point: the overhead is reported and the plan returns for review before any run of step F1.
 
+**Result at `84dfd735` (2026-11-05): F0 failed.** All 30 runs completed with no missing or duplicate rows. At t40000-a50-burst-o0, the deferral-only runs passed under the earlier ruling. Two metrics fell outside tolerance:
+- At t40000-a50-burst-o0, p99 was +2.34 ms (tolerance 2.0).
+- At t40000-a50-burst-o0, evictions were 190 for D against 218 for P (tolerance 3.8). Every P run was above every D run.
+
+Everything else was within tolerance. A read-only analysis of the retained runs (`~/deltaforge-evidence/f0-review-84dfd735`) found that the measurement build changes behavior:
+- At t10000-a50-steady-o0, in 4 of 5 runs, it activates tables 40 to 60% later, forms about a third fewer windows, and roughly triples the activation-period p99.
+- At the bound, its eviction total is higher with no shared observable of occupancy, admission or windowing to explain it.
+
+The verdict stands. Step F1 is therefore split (section 6.4.1): acceptance is judged on default builds, and the measurement builds only attribute.
+
 ### 6.4 Step F1: comparison
 
 **Arms** (`--scale-arm`; each sets its bounds explicitly, so every bound is verified before a run measures):
@@ -215,6 +225,38 @@ The overhead result of section 5 step 1 was measured at `df89d2d0` and does not 
 
 Any rule that fails is reported with its data; no acceptance is claimed from a partial result.
 
+#### 6.4.1 Split after F0 (revised 2026-11-05; supersedes the arms and rules above where they differ)
+
+The F0 result (section 6.3) shows the measurement build is not a faithful stand-in for the default build during activation or at the bound. Cache-bound overrides exist only in measurement builds, so a default build runs only at its code's bounds. Step F1 is therefore two parts, and no comparison crosses them.
+
+**Activation** is when a table's first row arrives (section 4.1). The harness's `activated_ms` in `phases.json` is when the workload started writing to the table. The analysis loads it under the name `workload_start_ms` and never uses it for an activation boundary.
+
+**Part A, acceptance, default builds only.**
+- **Arms:** `B=base` (the base's default runner, at its code bounds of 4,096 tables and 256 MiB) and `F=fix` (the fix's default runner, at 256 MiB). No overrides.
+- **Points:** the six points above, one invocation each, 5 repetitions, 240 s load, one warm-up per arm, order alternating. 60 runs plus 12 warm-ups.
+- **Rule 1:** unavailable in Part A. A default build has no no-eviction reference, and F improving on the count-limited B does not establish equivalence to one.
+- **Rule 2 (direction)** at the three fits points: F's post-activation evictions per 1,000 delivered rows and its post-activation p50 are each lower than B's.
+- **Rule 3 (controls)** as above.
+- **Rule 4 (cold fill), every point:** the time to the last activation, and the activation-period non-first-row p99, against the thresholds above. The activation-period p99 covers non-first rows committed at or before the last activation, outside catch-up. Store reads and tables requested are unavailable in default builds and move to Part B.
+- **Rule 5 (memory):** F's cache-bytes gauge never exceeds 256 MiB in any sample. The cache-owned allocation budget is validated by that gauge together with the accounting and memory tests.
+  - B at its default holds fewer tables than F, so it is not the same-working-set reference that the +10% criterion needs.
+  - B's and F's process RSS and peak anonymous RSS are reported, with no threshold applied.
+  - Process-memory acceptance stays open pending review.
+- **Rule 6** as above, for t40000-a50-burst-o0 (F against B only).
+- **Sufficiency and intervals:** section 4.1 and the 80-second rule apply to the post-activation metrics. Cold-fill metrics use every completed run. Failures, rejected intervals and insufficient runs are reported with their values, never dropped.
+
+**Part B, attribution, measurement builds only.**
+- **Arms:** the arms above on the measurement builds (the base's `97767855`, the fix's perf-phases runner), compared only with each other.
+- **Rule 1** is judged here, F against B-L, explicitly as a result about the measurement builds. It cannot establish default-build performance near capacity.
+- **Loader calls** move here: store reads, tables requested, timeline reloads and version loads, before and after the last activation. Each result states F0's instrumentation limitation.
+- **Version reads:** the one single version read per activated table (seen at every F0 point) is reported separately from recurring post-activation loads.
+- Part B does not repair or supersede F0's verdict.
+- **Arms per point** (14 arm-points, 5 repetitions, one warm-up per arm: 70 runs plus 14 warm-ups): B-L and F at the three fits points; B-L, F, F-L and F-64 at t40000-a50-burst-o0; B and F at the two controls. Every arm sets its bounds explicitly, as in section 6.4.
+- **Definitions:** timeline reloads are timeline lookup misses after the last activation. Store reads count every loader call (history, history_prefetch, versions, version); tables requested count the history and history_prefetch tables. "Before the last activation" is each counter's cumulative value at the first sample after it.
+- **Catch-up:** the steady workload's stop and resume restarts the source, and its restart path reloads what it needs. That span is reported on its own, so restart reloads are not counted as post-activation churn.
+- **Rule 4's loader criteria** (store reads before the last activation at most B's; tables requested at most B's plus 2%) are judged at the two controls, where Part B has a B arm. At the other points Part B has no B arm, and F against B-L is reported with the same criteria, not judged.
+- **Rule 5:** each F arm's gauge stays within its bound in every sample. Process RSS and peak anonymous RSS are reported for every arm, with F against B-L, and no threshold is applied while process-memory acceptance stays open.
+
 ### 6.5 Invalidation cost (release build)
 
 Debug-build timings (a database barrier 13 ms, a lineage barrier 405 ms, at 120,000 entries) establish nothing about operational cost. The cost is measured in a release build of `<H>` on the measurement host with nothing else running, by `invalidation_cost_at_the_default_bound` (`cargo test --release -p sources --lib -- --ignored --nocapture invalidation_cost_at_the_default_bound`). The test fills the default bound with its population of the smallest real tables, each with a one-record timeline and a one-column selection and version, over 100 databases: 191,571 entries (63,857 tables) before the index (section 7), 201,324 entries (67,108 tables) with it, since a table's string is now held once for its entries. That is the tested population, not a universal maximum: other entry mixtures hold other counts. It then times each operation on a full cache, five times, in each of six populations: the entries in the order they were cached, and the same entries with the LRU order reshuffled first (every entry used once in a random order, as reuse reshuffles it) for the fixed seeds 1 to 5. The criteria apply to each population, and every population's timings are reported. Two more populations put 90% of the tables in one database (in insertion order, and seed 1). They also time a barrier on that database, and are reported for review, not judged against the criteria. `large_values_at_the_default_bound` times one 64 MiB timeline (the per-timeline limit, with records that really hold that much) being replaced, evicted, and refused by admission, together with the drop of a refused value. Those pauses are reported separately.
@@ -231,9 +273,16 @@ Exactness is covered by the unit and memory tests: the accounting, the shared st
 
 Results so far: at `df726153` and `f4d2141c` (insertion order only), a database barrier passed (4.0 and 4.3 ms) and a lineage barrier (66.5, 67.5 ms) and a full clear (61.6, 63.5 ms) failed (`~/deltaforge-evidence/invalidation-cost-df726153`, `-f4d2141c`). Both are recorded as a failed operational-cost check; the criteria are unchanged.
 
+At `84dfd735`, under the revised criteria, every population passed (`~/deltaforge-evidence/selection-cache-timing-84dfd735`):
+- database barrier medians 1.38 to 1.75 ms, with each maximum at most 1.08 times its median;
+- lineage barrier medians 69.5 to 70.4 ms, maximum 71.0 ms;
+- full clear medians 68.5 to 70.6 ms, maximum 71.4 ms.
+
+The concentrated 90% database barrier took 121.4 and 123.9 ms (medians). It is a documented limitation at a nearly full cache, provisionally accepted: it does not meet the ordinary 5 ms database-barrier target, and frequent broad invalidations remain unqualified.
+
 ### 6.6 Order, time and disk
 
-Order: the release-build invalidation measurement, then F0, then F1 only if F0 is within tolerance.
+Order: the release-build invalidation measurement, then F0, then F1 only if F0 is within tolerance. F0 failed (section 6.3). After review, F1 runs as Part A (section 6.4.1), whose results return before Part B.
 
 Time: about 4 minutes per run, start to start (step 3: 242 s), so F0 (30 runs and 6 warm-ups) takes about 2 hours and F1 (90 runs and 18 warm-ups) about 7 hours, plus the fixture builds.
 
