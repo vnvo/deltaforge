@@ -137,7 +137,9 @@ pub(crate) const SELECTION_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// A value charged more than this is never freed by a cache operation
 /// itself, only by a step ([`Caches::step`]) or the reclamation thread;
-/// and one operation frees at most this much inline in total.
+/// and one top-level operation frees at most this much inline in total: a
+/// put, or everything inside a load or a batch of installs
+/// ([`Caches::begin_operation`]), which share one allowance.
 pub(crate) const INLINE_BYTES: u64 = 16 * 1024;
 /// Values detached by an operation and awaiting a step: a fixed ring.
 const DEFERRED: usize = 16;
@@ -169,9 +171,12 @@ fn key_cost(key: &CacheKey) -> u64 {
 }
 
 /// `deltaforge_mysql_selection_cache_evictions_total{pipeline,source}`:
-/// current entries evicted to make room.
+/// entries evicted to make room, current or stale.
 pub(crate) const METRIC_EVICTIONS: &str =
     "deltaforge_mysql_selection_cache_evictions_total";
+/// `..._stale_evictions_total{pipeline,source}`: of which stale.
+pub(crate) const METRIC_STALE_EVICTIONS: &str =
+    "deltaforge_mysql_selection_cache_stale_evictions_total";
 /// `deltaforge_mysql_selection_cache_bytes{pipeline,source}`: the
 /// estimated bytes charged against the bound ([`SELECTION_CACHE_BYTES`]).
 pub(crate) const METRIC_BYTES: &str = "deltaforge_mysql_selection_cache_bytes";
@@ -492,8 +497,14 @@ pub(crate) struct Caches {
     /// The current load, if one is admitting ([`Admission`]).
     load: u64,
     loading: bool,
-    /// What the current operation may still free inline.
+    /// What the current top-level operation may still free inline.
     inline_left: u64,
+    /// Open operations ([`Self::begin_operation`]): while any is, puts
+    /// share its inline allowance.
+    operations: u32,
+    /// Bytes freed inline so far (tests).
+    #[cfg(test)]
+    freed_inline: u64,
     reclaim: Reclaim,
     /// A unit was handed off and its release not yet published.
     handing: bool,
@@ -511,6 +522,7 @@ struct Reclaim {
 /// accounting, published after every change.
 struct Meters {
     evictions: metrics::Counter,
+    stale_evictions: metrics::Counter,
     bytes: metrics::Gauge,
     timelines: metrics::Gauge,
     live: metrics::Gauge,
@@ -534,6 +546,7 @@ impl Meters {
     fn noop() -> Self {
         Self {
             evictions: metrics::Counter::noop(),
+            stale_evictions: metrics::Counter::noop(),
             bytes: metrics::Gauge::noop(),
             timelines: metrics::Gauge::noop(),
             live: metrics::Gauge::noop(),
@@ -557,6 +570,7 @@ impl Meters {
         };
         Self {
             evictions: metrics::counter!(METRIC_EVICTIONS, &labels),
+            stale_evictions: metrics::counter!(METRIC_STALE_EVICTIONS, &labels),
             bytes: metrics::gauge!(METRIC_BYTES, &labels),
             timelines: metrics::gauge!(METRIC_TIMELINES, &labels),
             live: metrics::gauge!(METRIC_LIVE_BYTES, &labels),
@@ -636,6 +650,9 @@ impl Caches {
             load: 0,
             loading: false,
             inline_left: INLINE_BYTES,
+            operations: 0,
+            #[cfg(test)]
+            freed_inline: 0,
             reclaim: Reclaim {
                 thread,
                 handed: Default::default(),
@@ -828,6 +845,10 @@ impl Caches {
         match fate {
             Fate::Inline => {
                 self.inline_left = self.inline_left.saturating_sub(released);
+                #[cfg(test)]
+                {
+                    self.freed_inline += released;
+                }
                 drop(e);
                 self.meters.reclaimed[0].increment(1);
             }
@@ -919,15 +940,16 @@ impl Caches {
         let Some(fate) = self.fate(self.release_of(e)) else {
             return Evicted::Full;
         };
-        let current = self.current(key, e);
+        let stale = !self.current(key, e);
         let (key, e) = self.entries.pop_lru().expect("peeked");
-        if current {
-            crate::perf_phases::cache_eviction(match &e.cached {
-                Cached::Timeline(..) => "timeline",
-                Cached::Selection(_) => "selection",
-                Cached::Version(_) => "version",
-            });
-            self.meters.evictions.increment(1);
+        crate::perf_phases::cache_eviction(match &e.cached {
+            Cached::Timeline(..) => "timeline",
+            Cached::Selection(_) => "selection",
+            Cached::Version(_) => "version",
+        });
+        self.meters.evictions.increment(1);
+        if stale {
+            self.meters.stale_evictions.increment(1);
         }
         self.detach(&key, e, fate);
         Evicted::One
@@ -961,11 +983,28 @@ impl Caches {
         }
     }
 
-    /// Start a top-level operation that may free values: its inline
-    /// budget, and whether it may admit at all (the stamps are not
-    /// exhausted) and replace what `key` holds.
+    /// Open a top-level operation: every put until it is closed
+    /// ([`Self::end_operation`]), nested ones included, shares one inline
+    /// allowance of [`INLINE_BYTES`]. A load is one; so is a batch of
+    /// installs. A put outside any is its own.
+    pub(crate) fn begin_operation(&mut self) {
+        if self.operations == 0 {
+            self.inline_left = INLINE_BYTES;
+        }
+        self.operations += 1;
+    }
+
+    pub(crate) fn end_operation(&mut self) {
+        self.operations -= 1;
+    }
+
+    /// Start a put: its inline allowance (its own, or its operation's), and
+    /// whether it may admit at all (the stamps are not exhausted) and
+    /// replace what `key` holds.
     fn begin_put(&mut self, key: &CacheKey) -> bool {
-        self.inline_left = INLINE_BYTES;
+        if self.operations == 0 {
+            self.inline_left = INLINE_BYTES;
+        }
         if self.stamps.exhausted() {
             self.refuse(EXHAUSTED);
             return false;
@@ -1034,6 +1073,7 @@ impl Caches {
 
     /// Start a load: what it may admit ([`Admission`]).
     fn begin_load(&mut self) -> Admission {
+        self.begin_operation();
         self.load += 1;
         self.loading = true;
         Admission {
@@ -1045,6 +1085,7 @@ impl Caches {
 
     fn end_load(&mut self) {
         self.loading = false;
+        self.end_operation();
     }
 
     /// Whether a load may admit `cost` more bytes; if so, they are spent.
@@ -1644,6 +1685,10 @@ impl Caches {
     /// A source without events runs no steps: what is pending stays
     /// charged, within the bound, with no completion deadline.
     pub(crate) fn step(&mut self) {
+        // Between iterations no operation is open; one left open (a path
+        // that returned early) would only defer more, so it is closed.
+        debug_assert_eq!(self.operations, 0, "an operation left open");
+        self.operations = 0;
         if self.handing {
             // Its release is published once the thread has freed it.
             self.handing = self.handed() != 0;
@@ -5231,111 +5276,438 @@ mod tests {
             }
         }
 
-        /// What invalidation costs at the default bound filled with the
-        /// most entries it can hold: the smallest real tables (a one-record
-        /// timeline, a one-column selection and version) over 100
-        /// databases. Times a database barrier, a lineage barrier and a
-        /// full clear, each on a full cache, five times: in the order the
-        /// entries were cached, and with the LRU order reshuffled first (as
-        /// reuse reshuffles it; every entry used once in a random order) for
-        /// five fixed seeds, each reported. A measurement for
-        /// a release build (`docs/design/selection-cache-diagnosis.md`,
-        /// section 6): `cargo test --release -p sources --lib --
-        /// --ignored --nocapture invalidation_cost_at_the_default_bound`.
-        #[test]
-        #[ignore = "timing: run in a release build"]
-        fn invalidation_cost_at_the_default_bound() {
-            const DBS: usize = 100;
-            let selection = loaded(1);
-            let fill = |c: &mut Caches, tables: usize| {
-                let mut read = HashMap::new();
-                for t in 0..tables {
-                    let k = key(t % DBS, t / DBS);
-                    let bk = k.backend_key();
-                    c.put_timeline(bk.clone(), timeline_of(&k, 64, &mut read));
-                    c.put_selection(
-                        (bk.clone(), "d".into(), "sig".into()),
-                        selection.clone(),
-                    );
-                    c.put_version(bk, version(1, 1));
+        /// This thread's CPU time (Linux: `/proc/thread-self/schedstat`).
+        fn thread_cpu() -> Duration {
+            let s = std::fs::read_to_string("/proc/thread-self/schedstat")
+                .expect("schedstat");
+            Duration::from_nanos(
+                s.split_whitespace().next().unwrap().parse().unwrap(),
+            )
+        }
+
+        /// Median, max and count of `t`.
+        fn summary(mut t: Vec<Duration>) -> String {
+            if t.is_empty() {
+                return "none".into();
+            }
+            t.sort();
+            format!(
+                "median {:?}, max {:?}, n {}",
+                t[t.len() / 2],
+                t[t.len() - 1],
+                t.len()
+            )
+        }
+
+        /// Steps as the source's loop runs them, until nothing is pending:
+        /// each step's time.
+        fn run_steps(c: &mut Caches) -> Vec<Duration> {
+            let mut v = Vec::new();
+            while c.pending() {
+                let t0 = Instant::now();
+                c.step();
+                v.push(t0.elapsed());
+            }
+            v
+        }
+
+        /// Each item reclaimed, one at a time, until none is left: its
+        /// time.
+        fn run_items(c: &mut Caches) -> Vec<Duration> {
+            let mut v = Vec::new();
+            loop {
+                let t0 = Instant::now();
+                if !c.step_one() {
+                    return v;
                 }
-            };
-            let full = || {
-                let mut c = Caches::default();
-                assert_eq!(c.max_bytes, SELECTION_CACHE_BYTES);
-                fill(&mut c, 1);
-                let per = c.entries_bytes_for_test().max(1);
-                fill(&mut c, (SELECTION_CACHE_BYTES / per) as usize * 11 / 10);
-                c
-            };
-            let reordered = |seed: u64| {
+                v.push(t0.elapsed());
+            }
+        }
+
+        /// Where the timing populations put table `t`: over 100 databases
+        /// evenly, or 90% of them in database 0 and the rest over the
+        /// other 99.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Spread {
+            Even,
+            Concentrated,
+        }
+
+        const DBS: usize = 100;
+
+        fn placed(spread: Spread, t: usize) -> SchemaKey {
+            match spread {
+                Spread::Even => key(t % DBS, t / DBS),
+                Spread::Concentrated if t % 10 < 9 => key(0, t),
+                Spread::Concentrated => key(1 + t % (DBS - 1), t),
+            }
+        }
+
+        /// The smallest real tables (a one-record timeline, a one-column
+        /// selection and version), `tables` of them.
+        fn fill_small(
+            c: &mut Caches,
+            spread: Spread,
+            tables: std::ops::Range<usize>,
+        ) {
+            let selection = loaded(1);
+            let mut read = HashMap::new();
+            for t in tables {
+                let k = placed(spread, t);
+                let bk = k.backend_key();
+                c.put_timeline(bk.clone(), timeline_of(&k, 64, &mut read));
+                c.put_selection(
+                    (bk.clone(), "d".into(), "sig".into()),
+                    selection.clone(),
+                );
+                c.put_version(bk, version(1, 1));
+            }
+        }
+
+        /// The tables that fill the default bound (with a tenth more
+        /// offered, so it is full).
+        fn tables_at_the_bound(spread: Spread) -> usize {
+            let mut c = Caches::default();
+            fill_small(&mut c, spread, 0..1);
+            let per = c.entries_bytes_for_test().max(1);
+            (SELECTION_CACHE_BYTES / per) as usize * 11 / 10
+        }
+
+        /// `c` filled to the bound, its LRU order as cached or reshuffled
+        /// by `seed` (every entry used once in a random order).
+        fn fill_full(c: &mut Caches, spread: Spread, seed: Option<u64>) {
+            assert_eq!(c.max_bytes, SELECTION_CACHE_BYTES);
+            fill_small(
+                c,
+                spread,
+                1_000_000..1_000_000 + tables_at_the_bound(spread),
+            );
+            if let Some(seed) = seed {
                 use rand::{SeedableRng, seq::SliceRandom};
-                let mut c = full();
                 let mut keys: Vec<CacheKey> =
                     c.entries.iter().map(|(k, _)| k.clone()).collect();
                 keys.shuffle(&mut rand::rngs::StdRng::seed_from_u64(seed));
                 for k in &keys {
                     c.entries.get(k);
                 }
-                c
-            };
+            }
+        }
+
+        /// What invalidation costs at the default bound filled with the
+        /// most entries it can hold, on the source's loop and as it is
+        /// reclaimed (`docs/design/selection-cache-diagnosis.md`, sections
+        /// 6.5 and 8). Populations: tables over 100 databases, in the order
+        /// cached and reshuffled by five fixed seeds; and 90% of them in
+        /// one database (in the order cached, and one seed). Operations: a
+        /// database barrier (a small database, and in the concentrated
+        /// population the 90% one), a lineage barrier and a full clear (both
+        /// full clears), each five times on a full cache. A full clear in
+        /// three modes, each made certain: the thread available (a thread
+        /// this test runs takes the unit, timing its wall and CPU), the
+        /// thread busy with this cache's earlier unit (in place), and
+        /// repeated clears in place during a refill. Reports the time on
+        /// the loop, the steps that reclaim (median, max, those over the 1
+        /// ms target, how far past it each ended, their total) and the
+        /// thread's time. A measurement for
+        /// a release build: `cargo test --release -p sources --lib --
+        /// --ignored --nocapture invalidation_cost_at_the_default_bound`.
+        #[test]
+        #[ignore = "timing: run in a release build"]
+        fn invalidation_cost_at_the_default_bound() {
             let populations =
-                std::iter::once(("insertion order".to_string(), None)).chain(
-                    (1..=5).map(|seed| (format!("seed {seed}"), Some(seed))),
-                );
-            // On the source's loop, then reclaimed by steps (a full clear
-            // in place: this cache has no thread).
-            let reclaimed = |c: &mut Caches| {
-                let t0 = Instant::now();
-                c.settle();
-                t0.elapsed()
-            };
-            for (population, seed) in populations {
-                let fill = || seed.map_or_else(full, reordered);
-                let mut times: [Vec<Duration>; 6] = Default::default();
-                let mut held = 0;
-                for _ in 0..5 {
-                    let mut c = fill();
-                    held = c.len();
-                    let t0 = Instant::now();
-                    c.barrier_appended(&database(7));
-                    times[0].push(t0.elapsed());
-                    times[3].push(reclaimed(&mut c));
-                    assert_eq!(c.held_for(&key(7, 3)), 0);
-
-                    let mut c = fill();
-                    let t0 = Instant::now();
-                    c.barrier_appended(&lineage());
-                    times[1].push(t0.elapsed());
-                    times[4].push(reclaimed(&mut c));
-                    assert_eq!(c.len(), 0);
-
-                    let mut c = fill();
-                    let t0 = Instant::now();
-                    c.invalidate_all();
-                    times[2].push(t0.elapsed());
-                    times[5].push(reclaimed(&mut c));
-                    assert_eq!(c.bytes(), 0);
-                }
-                let names = [
-                    "database barrier",
-                    "lineage barrier",
-                    "full clear",
-                    "database barrier reclaimed",
-                    "lineage barrier reclaimed",
-                    "full clear reclaimed",
-                ];
-                for (name, t) in names.iter().zip(&mut times) {
-                    let runs = format!("{t:?}");
-                    t.sort();
+                std::iter::once((
+                    "even, insertion order".to_string(),
+                    Spread::Even,
+                    None,
+                ))
+                .chain((1..=5).map(|s| {
+                    (format!("even, seed {s}"), Spread::Even, Some(s))
+                }))
+                .chain([
+                    (
+                        "concentrated, insertion order".to_string(),
+                        Spread::Concentrated,
+                        None,
+                    ),
+                    (
+                        "concentrated, seed 1".to_string(),
+                        Spread::Concentrated,
+                        Some(1),
+                    ),
+                ]);
+            let report =
+                |population: &str,
+                 held: usize,
+                 name: &str,
+                 on_loop: Vec<Duration>,
+                 steps: Vec<Duration>,
+                 thread: Vec<(Duration, Duration)>| {
+                    // A step ends once past its target: how far past.
+                    let over: Vec<Duration> =
+                        steps.iter().map(|d| d.saturating_sub(STEP)).collect();
+                    let total: Duration = steps.iter().sum();
+                    let runs = format!("{on_loop:?}");
                     eprintln!(
                         "{held} entries at {SELECTION_CACHE_BYTES} bytes, \
-                         {population}: {name} median {:?}, max {:?}, runs in \
-                         order {runs}",
-                        t[t.len() / 2],
-                        t[t.len() - 1]
+                     {population}: {name}: on the loop {}, runs in order \
+                     {runs}; steps {}, past {STEP:?} by {}, total {total:?}; \
+                     thread wall {}, cpu {}",
+                        summary(on_loop),
+                        summary(steps),
+                        summary(over),
+                        summary(thread.iter().map(|t| t.0).collect()),
+                        summary(thread.iter().map(|t| t.1).collect()),
                     );
+                };
+            for (population, spread, seed) in populations {
+                let mut held = 0;
+                // Database barriers: always in place.
+                let mut barriers =
+                    vec![("database barrier, a small database", 7)];
+                if spread == Spread::Concentrated {
+                    barriers.push(("database barrier, the 90% database", 0));
                 }
+                for (name, db) in barriers {
+                    let (mut on_loop, mut steps) = (vec![], vec![]);
+                    for _ in 0..5 {
+                        let mut c = Caches::default();
+                        fill_full(&mut c, spread, seed);
+                        held = c.len();
+                        let t0 = Instant::now();
+                        c.barrier_appended(&database(db));
+                        on_loop.push(t0.elapsed());
+                        assert_eq!(c.len(), held, "in place");
+                        steps.extend(run_steps(&mut c));
+                        assert!(c.len() < held);
+                        c.audit();
+                    }
+                    report(&population, held, name, on_loop, steps, vec![]);
+                }
+                type Op = (&'static str, fn(&mut Caches));
+                let ops: [Op; 2] = [
+                    ("lineage barrier", |c| c.barrier_appended(&lineage())),
+                    ("full clear", |c| c.invalidate_all()),
+                ];
+                for (op, run) in ops {
+                    // The thread available.
+                    let (mut on_loop, mut steps, mut thread) =
+                        (vec![], vec![], vec![]);
+                    for _ in 0..5 {
+                        let (tx, rx) = std::sync::mpsc::sync_channel::<Job>(2);
+                        let mut c = Caches::with_thread(tx);
+                        fill_full(&mut c, spread, seed);
+                        let reclaimer = std::thread::spawn(move || {
+                            let job = rx.recv().expect("a unit");
+                            let (w0, c0) = (Instant::now(), thread_cpu());
+                            reclaim(job);
+                            (w0.elapsed(), thread_cpu() - c0)
+                        });
+                        let t0 = Instant::now();
+                        run(&mut c);
+                        on_loop.push(t0.elapsed());
+                        assert_eq!(c.len(), 0, "handed off");
+                        thread.push(reclaimer.join().expect("reclaimed"));
+                        assert_eq!(c.handed(), 0);
+                        steps.extend(run_steps(&mut c));
+                        assert_eq!(c.bytes(), 0);
+                    }
+                    report(
+                        &population,
+                        held,
+                        &format!("{op} [thread available]"),
+                        on_loop,
+                        steps,
+                        thread,
+                    );
+                    // The thread busy with this cache's earlier unit: in
+                    // place; then repeated clears during a refill.
+                    for repeated in [false, true] {
+                        let (mut on_loop, mut steps) = (vec![], vec![]);
+                        for _ in 0..5 {
+                            let (tx, rx) =
+                                std::sync::mpsc::sync_channel::<Job>(2);
+                            let mut c = Caches::with_thread(tx);
+                            fill_small(&mut c, spread, 0..1);
+                            c.invalidate_all();
+                            assert!(c.handed() > 0, "the earlier unit");
+                            fill_full(&mut c, spread, seed);
+                            let len = c.len();
+                            let t0 = Instant::now();
+                            run(&mut c);
+                            on_loop.push(t0.elapsed());
+                            assert_eq!(c.len(), len, "in place");
+                            if repeated {
+                                let tenth = len / 30;
+                                for round in 0..5 {
+                                    for _ in 0..50 {
+                                        let t0 = Instant::now();
+                                        c.step();
+                                        steps.push(t0.elapsed());
+                                    }
+                                    let at = 2_000_000 + round * tenth;
+                                    fill_small(&mut c, spread, at..at + tenth);
+                                    assert!(c.bytes() <= c.max_bytes);
+                                    let t0 = Instant::now();
+                                    run(&mut c);
+                                    on_loop.push(t0.elapsed());
+                                    assert!(c.handed() > 0, "still in place");
+                                }
+                            }
+                            steps.extend(run_steps(&mut c));
+                            assert_eq!(c.len(), 0);
+                            reclaim(rx.recv().expect("the earlier unit"));
+                            c.step();
+                            assert_eq!(c.bytes(), 0);
+                            c.audit();
+                        }
+                        let mode = if repeated {
+                            "repeated in place during a refill"
+                        } else {
+                            "thread busy: in place"
+                        };
+                        report(
+                            &population,
+                            held,
+                            &format!("{op} [{mode}]"),
+                            on_loop,
+                            steps,
+                            vec![],
+                        );
+                    }
+                }
+            }
+        }
+
+        /// A timeline whose records really hold about `bytes` (a 1 KiB
+        /// capture id each).
+        fn populated(bytes: usize) -> Arc<Timeline> {
+            let n = bytes / 1_100;
+            let records: Vec<Stored> = (0..n)
+                .map(|i| Stored {
+                    capture_id: format!("{i:01024}"),
+                    record: Record::new(
+                        WmPos::MysqlGtid {
+                            gtid_set: format!("u:1-{i}"),
+                        },
+                        Kind::Barrier {
+                            scope: BarrierScope::Lineage,
+                        },
+                    ),
+                })
+                .collect();
+            Arc::new(Timeline {
+                records,
+                table_head: 1,
+                streams: Vec::new(),
+                bytes: (n * 1_024) as u64,
+            })
+        }
+
+        /// What the largest single items cost, on the loop and as a step
+        /// frees each (a step overruns by at most one item): a 64 MiB
+        /// timeline whose records really hold that much, replaced and
+        /// evicted (deferred, freed by a step); the same value refused by
+        /// admission, dropped synchronously by its caller (outside the
+        /// cache's retirement, measured separately); the widest version
+        /// (4,096 columns); a 50,000-key history swept; and the LRU's
+        /// bucket array at the default bound released after a full clear
+        /// in place. Five runs each; a measurement for a release build
+        /// (`cargo test --release -p sources --lib -- --ignored
+        /// --nocapture reclamation_items_at_the_default_bound`).
+        #[test]
+        #[ignore = "timing: run in a release build"]
+        fn reclamation_items_at_the_default_bound() {
+            const BIG: usize = 64 << 20;
+            let mut rows: Vec<(&str, Vec<Duration>)> = vec![
+                ("64 MiB timeline: replaced, on the loop", vec![]),
+                ("64 MiB timeline: replaced, the step freeing it", vec![]),
+                ("64 MiB timeline: evicted, on the loop", vec![]),
+                ("64 MiB timeline: evicted, the step freeing it", vec![]),
+                ("64 MiB timeline: refused, the put", vec![]),
+                ("64 MiB timeline: refused, dropped by its caller", vec![]),
+                (
+                    "widest version (4,096 columns): the step freeing it",
+                    vec![],
+                ),
+                ("50,000-key history: largest item swept", vec![]),
+                ("50,000-key history: all its steps", vec![]),
+                ("full bound, cleared in place: largest item", vec![]),
+                ("full bound, cleared in place: the LRU's buckets", vec![]),
+            ];
+            let (a, b) = (key(0, 1).backend_key(), key(0, 2).backend_key());
+            for _ in 0..5 {
+                let mut c = Caches::default();
+                c.put_timeline(a.clone(), populated(BIG));
+                let next = populated(BIG);
+                let t0 = Instant::now();
+                assert!(c.put_timeline(a.clone(), next).is_some());
+                rows[0].1.push(t0.elapsed());
+                assert_eq!(c.ring.len, 1);
+                let t0 = Instant::now();
+                c.step();
+                rows[1].1.push(t0.elapsed());
+                assert_eq!(c.ring.len, 0);
+
+                c.set_limit_for_test(c.bytes() + c.bytes() / 2);
+                // The caller keeps the refused value (dropping it is
+                // measured below).
+                let next = populated(BIG);
+                let t0 = Instant::now();
+                assert!(c.put_timeline(b.clone(), next.clone()).is_none());
+                rows[2].1.push(t0.elapsed());
+                drop(next);
+                assert_eq!(c.ring.len, 1, "evicted and deferred");
+                let t0 = Instant::now();
+                c.step();
+                rows[3].1.push(t0.elapsed());
+
+                let mut c = Caches::default();
+                c.set_limit_for_test(1 << 20);
+                let value = populated(BIG);
+                let t0 = Instant::now();
+                assert!(c.put_timeline(a.clone(), value.clone()).is_none());
+                rows[4].1.push(t0.elapsed());
+                let t0 = Instant::now();
+                drop(value);
+                rows[5].1.push(t0.elapsed());
+
+                let mut c = Caches::default();
+                c.put_version(a.clone(), version(1, 4_096));
+                c.invalidate(&key(0, 1));
+                let t0 = Instant::now();
+                c.step();
+                rows[6].1.push(t0.elapsed());
+                assert_eq!(c.len(), 0);
+
+                let mut c = Caches::default();
+                for v in 0..50_000 {
+                    c.put_version(a.clone(), version(v, 1));
+                }
+                assert_eq!(c.len(), 50_000);
+                c.invalidate(&key(0, 1));
+                let items = run_items(&mut c);
+                rows[7].1.push(*items.iter().max().unwrap());
+                c.put_version(b.clone(), version(1, 1));
+                for v in 0..50_000 {
+                    c.put_version(a.clone(), version(v, 1));
+                }
+                c.invalidate(&key(0, 1));
+                rows[8].1.extend(run_steps(&mut c));
+
+                let mut c = Caches::default();
+                fill_full(&mut c, Spread::Even, None);
+                c.invalidate_all();
+                let items = run_items(&mut c);
+                rows[9].1.push(*items.iter().max().unwrap());
+                rows[10].1.push(*items.last().unwrap());
+                assert_eq!(c.bytes(), 0);
+            }
+            for (name, t) in rows {
+                let runs = format!("{t:?}");
+                eprintln!(
+                    "reclamation item: {name}: {}; runs {runs}",
+                    summary(t)
+                );
             }
         }
 
@@ -5393,6 +5765,24 @@ mod tests {
                     c.invalidate(&key(t % DBS, t / DBS));
                 }
                 times[2].1.push(per(t0.elapsed(), 10_000));
+                // Batch sizing over every held table (stale ones too)
+                // against the current ones alone: batching only.
+                let (mut n, mut b) = (0u64, 0u64);
+                for (k, e) in c.entries.iter() {
+                    if c.current(k, e)
+                        && !matches!(e.cached, Cached::Selection(_))
+                    {
+                        b += e.bytes;
+                        n += matches!(e.cached, Cached::Timeline(..)) as u64;
+                    }
+                }
+                let live = ((c.max_bytes / 2 / (b / n).max(1)) as usize)
+                    .clamp(1, crate::mysql::mysql_history::BATCH_MAX_TABLES);
+                eprintln!(
+                    "upkeep: batch room {} counting stale tables, {live} \
+                     current ones alone",
+                    c.batch_room()
+                );
                 // The currency checks on the read path.
                 let hits: Vec<String> = (tables + 1..tables + 20_000)
                     .step_by(2)
@@ -5558,6 +5948,113 @@ mod tests {
                 "{freed}"
             );
             c.audit();
+        }
+
+        /// A load, or a batch of installs, is one operation: its puts share
+        /// one inline allowance, so many small evictions inside it free at
+        /// most that much inline, and the rest wait for a step. The same
+        /// puts made separately each have their own.
+        #[test]
+        fn an_operation_shares_one_inline_allowance() {
+            let small = loaded(12);
+            for how in ["separate", "load", "batch"] {
+                let mut c = Caches::default();
+                // Each its own value: evicting one frees it.
+                for t in 0..400 {
+                    let bk = key(0, t).backend_key();
+                    c.put_selection((bk, "d".into(), "sig".into()), loaded(12));
+                }
+                c.set_limit_for_test(c.bytes());
+                let each =
+                    super::super::super::mysql_cache_cost::loaded(&small);
+                // Each needs about one selection's room (two evictions at
+                // most): within one put's own allowance.
+                assert!(2 * each < INLINE_BYTES);
+                let values: Vec<_> =
+                    (0..10).map(|_| heavy(each as usize)).collect();
+                let before = c.freed_inline;
+                let _load = match how {
+                    "load" => Some(c.begin_load()),
+                    "batch" => {
+                        c.begin_operation();
+                        None
+                    }
+                    _ => None,
+                };
+                // Ten tables.
+                for (t, v) in values.into_iter().enumerate() {
+                    let _ = c.put_timeline(key(1, t).backend_key(), v);
+                }
+                match how {
+                    "load" => c.end_load(),
+                    "batch" => c.end_operation(),
+                    _ => {}
+                }
+                let freed = c.freed_inline - before;
+                eprintln!(
+                    "{how}: freed inline {freed}, deferred {}, entries {}",
+                    c.ring.len,
+                    c.len()
+                );
+                if how == "separate" {
+                    // Each put has its own allowance: far more freed inline.
+                    assert_eq!(c.ring.len, 0, "{how}");
+                    assert!(freed > 4 * INLINE_BYTES, "{freed}");
+                } else {
+                    assert!(c.ring.len > 0, "{how}: past the shared allowance");
+                    assert!(freed <= INLINE_BYTES, "{how}: {freed}");
+                }
+                c.audit();
+            }
+        }
+
+        /// Every capacity eviction is counted, stale entries' too (and
+        /// those also by themselves).
+        #[test]
+        fn stale_evictions_are_counted_with_all_evictions() {
+            use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+            let rec = DebuggingRecorder::new();
+            let left = metrics::with_local_recorder(&rec, || {
+                let mut c = Caches::new("p", "s");
+                let mut read = HashMap::new();
+                for t in 0..10 {
+                    let k = key(0, t);
+                    c.put_timeline(
+                        k.backend_key(),
+                        timeline_of(&k, 300, &mut read),
+                    );
+                }
+                c.invalidate(&key(0, 0));
+                c.invalidate(&key(0, 1));
+                // Room for nine: two puts evict the two stale ones, then a
+                // current one.
+                c.set_limit_for_test(c.bytes());
+                for t in 10..13 {
+                    let k = key(0, t);
+                    c.put_timeline(
+                        k.backend_key(),
+                        timeline_of(&k, 300, &mut read),
+                    );
+                }
+                assert!(c.timeline(&key(0, 12).backend_key()).is_some());
+                c.len()
+            });
+            let count = |name: &str| {
+                rec.snapshotter()
+                    .snapshot()
+                    .into_vec()
+                    .into_iter()
+                    .find(|(k, ..)| k.key().name() == name)
+                    .map(|(.., v)| match v {
+                        DebugValue::Counter(n) => n,
+                        _ => panic!("a counter"),
+                    })
+                    .unwrap_or(0)
+            };
+            // Nothing else removed an entry (no step ran).
+            assert_eq!(count(METRIC_EVICTIONS), 13 - left as u64);
+            assert!(count(METRIC_EVICTIONS) > 2, "a current one too");
+            assert_eq!(count(METRIC_STALE_EVICTIONS), 2);
         }
 
         /// With every deferred slot taken, an operation that would need one

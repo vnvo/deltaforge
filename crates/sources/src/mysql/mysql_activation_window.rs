@@ -1738,6 +1738,8 @@ async fn admit_batch(
                 );
             }
         }
+        // One operation: the batch's installs share one inline allowance.
+        ctx.selection.begin_operation();
         for (i, (((db, table), at, report), key)) in
             tables.iter().zip(&keys).enumerate()
         {
@@ -1783,6 +1785,7 @@ async fn admit_batch(
                 why,
             );
         }
+        ctx.selection.end_operation();
         // Drift-checked for this run once committed.
         let checked: Vec<(String, String)> =
             tables.iter().map(|(k, ..)| k.clone()).collect();

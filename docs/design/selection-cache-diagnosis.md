@@ -269,7 +269,12 @@ An entry is current when its stamp is after all three, checked on every read (tw
 
 **Exhaustion.** When the counter is exhausted the cache fails closed: nothing is current or admitted (`refused_total{why="exhausted"}`). Once it holds nothing, the stamps start again, which is safe because no entry can carry an earlier stamp.
 
-**Bounded destruction.** A value charged more than 16 KiB is never freed by a cache operation, and one operation (one put, with its replacement and evictions) frees at most 16 KiB inline in total. Past that, a replaced or evicted value goes to a fixed ring of 16 deferred values, still charged. Its slot is checked before the entry is detached. With the ring full, the operation refuses (`why="deferred_full"`): the entry it would have replaced or evicted stays, and the new value is served uncached.
+**Bounded destruction.** A value charged more than 16 KiB is never freed by a cache operation. One top-level operation frees at most 16 KiB inline in total. A put outside any operation is its own operation, and some sequences of puts open one operation (`begin_operation`) that all their puts share, with every replacement and eviction:
+- a load, with its timelines and read-ahead versions;
+- an activation window's batch of committed installs;
+- a DDL's forward-proof installs.
+
+A step closes any operation left open. Past that, a replaced or evicted value goes to a fixed ring of 16 deferred values, still charged. Its slot is checked before the entry is detached. With the ring full, the operation refuses (`why="deferred_full"`): the entry it would have replaced or evicted stays, and the new value is served uncached.
 
 Values awaiting a step count as room to come. Eviction stops once they cover what is missing, and the value is refused until the next step frees them (`why="deferred"`), so eviction behind a large value never empties the cache. This is scoped to the cache's own retirement: a newly loaded value that admission refuses is dropped by its caller, measured separately.
 
@@ -284,13 +289,33 @@ Values awaiting a step count as room to come. Eviction stops once they cover wha
 
 A step overruns its target by at most one item. A source without events runs no steps: what is pending stays charged, within the bound, with no completion deadline. The sweep queues hold the records' own names, never allocate when pushed (their room is reserved, and counted, when a record is created), and keep a dropped record's name, counted, until its turn.
 
-**Accounting and metrics.** `deltaforge_mysql_selection_cache_bytes` is the charged total. The design named it the live bytes; it keeps its meaning for the harness, and the live bytes are a new gauge. The other new gauges are `..._live_bytes`, `..._stale_bytes`, `..._deferred_bytes` and `..._handed_bytes`. The counters are `..._reclaimed_total{mode="inline"|"step"|"thread"}` and `..._refused_total{why}`. Evictions count current entries only. A table's invalidation queues it, and a database barrier queues the database; neither allocates.
+**Accounting and metrics.** `deltaforge_mysql_selection_cache_bytes` is the charged total, what the bound counts. It is the sum of these parts:
+
+| Part | What it holds | Gauge |
+|---|---|---|
+| Live | current entries (value, key and node) | `..._live_bytes` |
+| Stale | stale entries not yet removed | `..._stale_bytes` |
+| Deferred | detached values in the ring | `..._deferred_bytes` |
+| Handed off | a unit on the thread, until it is freed | `..._handed_bytes` |
+| Structures | barrier streams (current or stale), the index with its queues, the maps' buckets | none (the total less the four above) |
+
+The counters:
+- `..._reclaimed_total{mode="inline"|"step"|"thread"}`;
+- `..._refused_total{why="bound"|"deferred"|"deferred_full"|"exhausted"}`;
+- `..._evictions_total`, which keeps its meaning: every capacity eviction, of stale entries too;
+- `..._stale_evictions_total`, the stale ones among them.
+
+A table's invalidation queues it, and a database barrier queues the database; neither allocates.
+
+**Batch sizing.** `batch_room` averages the held tables' timeline and version bytes over all held timelines, stale ones included: a conservative estimate. It sizes batches only; currency and admission never use it. Its effect is reported by `upkeep_at_the_default_bound`, against the current tables alone.
 
 **Tests** (`mysql_selection.rs`, `byte_budget`; `mysql_cache_index.rs`):
 - staleness against a scan-and-remove reference model;
 - no inline free of a 64 MiB value at replacement or eviction;
 - the inline budget;
 - a full ring refusing with everything left in place;
+- a load and a batch sharing one inline allowance, against the same puts made separately;
+- stale evictions counted among all evictions;
 - clears made in place while a unit is on the thread, and repeated during a refill, allocating nothing;
 - rejected handoffs (queue full, thread gone, no thread) restored intact;
 - an install refused after each kind of invalidation;
@@ -298,5 +323,19 @@ A step overruns its target by at most one item. A source without events runs no 
 
 `the_index_allocates_its_estimate` stays exact through invalidations and orphaned queue entries. The memory probe stays at 0.78 to 0.99 of the estimate after barrier, eviction and full clear with reclamation.
 
-**Not yet measured:** release timings of the operations on the loop and of their reclamation, steps (median, max, overruns), single-item maxima, the thread's wall and CPU time, refusals under churn, and upkeep with the currency checks. Acceptance (section 6.5's limits on the combined implementation) is measured on pinned builds after review.
+**Timing** (release builds, ignored tests):
+- `invalidation_cost_at_the_default_bound`: populations over 100 databases (in insertion order and five seeds) and with 90% of tables in one database (insertion order and one seed).
+  - Database barriers: a small database, and the 90% one.
+  - Lineage barrier and full clear, each in three modes, each made certain by the test:
+    - the thread available (a thread the test runs takes the unit; its wall and CPU time are reported);
+    - the thread busy with this cache's earlier unit (in place);
+    - repeated clears in place during a refill.
+  - Each reports the time on the loop and the steps that reclaim (median, max, those over 1 ms, total).
+- `reclamation_items_at_the_default_bound`, the largest single items:
+  - a 64 MiB populated timeline replaced and evicted, on the loop and in its step;
+  - the same value refused by admission and dropped by its caller;
+  - the widest version;
+  - a 50,000-key history swept;
+  - the LRU's buckets after a full clear.
+- `upkeep_at_the_default_bound` adds the read path's currency checks and batch sizing.
 

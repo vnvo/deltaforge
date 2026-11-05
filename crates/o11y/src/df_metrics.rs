@@ -315,6 +315,11 @@ pub fn describe_metrics() {
         Unit::Count,
         "MySQL schema selection cache entries evicted by the per-source budget"
     );
+    describe_counter!(
+        "deltaforge_mysql_selection_cache_stale_evictions_total",
+        Unit::Count,
+        "Of the selection cache's evictions, those of stale entries"
+    );
     describe_gauge!(
         "deltaforge_mysql_selection_cache_bytes",
         Unit::Bytes,

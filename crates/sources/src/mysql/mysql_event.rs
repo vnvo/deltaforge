@@ -1371,6 +1371,8 @@ async fn record_query(
     #[cfg(test)]
     super::mysql_forward_proof::hooks::before_install(ctx);
     let mut installed = std::collections::HashSet::new();
+    // One operation: the installs share one inline allowance.
+    ctx.selection.begin_operation();
     for f in fresh {
         #[cfg(test)]
         let probe = (f.key.backend_key(), f.snapshot.bytes, f.timeline.clone());
@@ -1387,6 +1389,7 @@ async fn record_query(
             installed.insert(f.key.backend_key());
         }
     }
+    ctx.selection.end_operation();
     for key in &invalidated {
         if !installed.contains(&key.backend_key()) {
             ctx.selection.invalidate(key);
