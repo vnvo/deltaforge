@@ -4567,8 +4567,10 @@ mod tests {
             }
         }
 
-        /// An in-process barrier or eviction between the check and the
-        /// install: the cache no longer holds the snapshot, and nothing is
+        /// An in-process barrier (the lineage's or the database's) or a
+        /// full clear (handed off, or in place) between the check and the
+        /// install: the cache no longer holds the snapshot as current (in
+        /// place, the stale entry still holds it), and nothing is
         /// installed.
         #[tokio::test]
         #[ignore = "requires docker"]
@@ -4576,21 +4578,31 @@ mod tests {
             use crate::mysql::mysql_activation::{
                 BarrierScope, barrier_stream,
             };
-            for evict in [false, true] {
-                let db = if evict {
-                    "fwd_post_evict"
-                } else {
-                    "fwd_post_barrier"
-                };
+            for (case, db) in [
+                ("lineage barrier", "fwd_post_barrier"),
+                ("database barrier", "fwd_post_db_barrier"),
+                ("full clear", "fwd_post_evict"),
+                ("full clear in place", "fwd_post_in_place"),
+            ] {
                 let (_fault, st, mut r, port) = cached_table(db, true).await;
                 let key = st.scope.current().unwrap().key(db, "t");
                 let lineage = barrier_stream(&key, &BarrierScope::Lineage);
+                let database = barrier_stream(
+                    &key,
+                    &BarrierScope::Database { db: db.into() },
+                );
                 *super::super::hooks::BEFORE_INSTALL.lock().unwrap() =
-                    Some(Box::new(move |ctx| {
-                        if evict {
+                    Some(Box::new(move |ctx| match case {
+                        "lineage barrier" => {
+                            ctx.selection.barrier_appended(&lineage)
+                        }
+                        "database barrier" => {
+                            ctx.selection.barrier_appended(&database)
+                        }
+                        "full clear" => ctx.selection.invalidate_all(),
+                        _ => {
+                            ctx.selection.without_thread_for_test();
                             ctx.selection.invalidate_all();
-                        } else {
-                            ctx.selection.barrier_appended(&lineage);
                         }
                     }));
                 sql(port, &[&format!("ALTER TABLE {db}.t ADD COLUMN w INT")])

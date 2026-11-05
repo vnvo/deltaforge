@@ -318,12 +318,42 @@ pub fn describe_metrics() {
     describe_gauge!(
         "deltaforge_mysql_selection_cache_bytes",
         Unit::Bytes,
-        "Estimated bytes held by a MySQL source's schema selection cache"
+        "Estimated bytes charged against a MySQL source's schema selection cache bound"
     );
     describe_gauge!(
         "deltaforge_mysql_selection_cache_timelines",
         Unit::Count,
         "Validated timelines held by a MySQL source's schema selection cache"
+    );
+    describe_gauge!(
+        "deltaforge_mysql_selection_cache_live_bytes",
+        Unit::Bytes,
+        "Estimated bytes of a MySQL schema selection cache's current entries"
+    );
+    describe_gauge!(
+        "deltaforge_mysql_selection_cache_stale_bytes",
+        Unit::Bytes,
+        "Estimated bytes of stale entries awaiting reclamation"
+    );
+    describe_gauge!(
+        "deltaforge_mysql_selection_cache_deferred_bytes",
+        Unit::Bytes,
+        "Estimated bytes of detached values awaiting a reclamation step"
+    );
+    describe_gauge!(
+        "deltaforge_mysql_selection_cache_handed_bytes",
+        Unit::Bytes,
+        "Estimated bytes handed to the reclamation thread and not yet freed"
+    );
+    describe_counter!(
+        "deltaforge_mysql_selection_cache_reclaimed_total",
+        Unit::Count,
+        "Selection cache values freed, by mode (inline, step, thread)"
+    );
+    describe_counter!(
+        "deltaforge_mysql_selection_cache_refused_total",
+        Unit::Count,
+        "Selection cache values left uncached, by reason"
     );
     describe_gauge!(
         "deltaforge_source_lag_seconds",

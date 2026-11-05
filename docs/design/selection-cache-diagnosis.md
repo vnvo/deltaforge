@@ -255,3 +255,48 @@ A barrier on stream `s` invalidates every entry whose table key starts with `s`.
 The index's memory is in the estimate and the bound: the databases' and tables' strings (once each), the maps' buckets (tracked from their capacity after each insert; they shrink only when dropped) and the tables' vectors at capacity. Admission counts what indexing an entry may add (an upper bound: a map with no room left is taken to resize). `the_index_allocates_its_estimate` checks the estimate against jemalloc exactly, through fills and removals, and the cache's memory probe stays at 0.78 to 0.99 of the estimate with the index.
 
 Its upkeep is measured by `upkeep_at_the_default_bound` (release build): filling, admitting with eviction, single-table invalidation, and a table with 20,000 versions cached, evicted one at a time and invalidated.
+
+## 8. Reclamation
+
+Invalidation destroys nothing on the source's loop. The design and its reviews are in `selection-cache-reclamation-design-r3` (evidence); this section records what the code does.
+
+**Currency.** Every admission takes the cache's next stamp, a checked `u64` that is never taken twice. The index, each database record and each table record hold a stamp at or before which their entries are stale:
+- a table's invalidation (every install) advances its table's;
+- a barrier advances each database it covers (O(databases)), or each table it covers below a database;
+- a full clear made in place advances the index's (O(1)).
+
+An entry is current when its stamp is after all three, checked on every read (two hash lookups beyond the LRU's). A stale entry is a miss and is neither returned nor freed by the read. It stays charged until a sweep, an eviction or a replacement removes it. The design proposed separate epochs per scope (`u64`, `u32`, `u32`); one cache-wide counter replaces them, so a record dropped and created again cannot repeat a stamp its old entries carried. `install_if_current` requires the snapshot to be the table's current timeline, not only the same value: a barrier or an in-place clear leaves the stale entry holding the snapshot.
+
+**Exhaustion.** When the counter is exhausted the cache fails closed: nothing is current or admitted (`refused_total{why="exhausted"}`). Once it holds nothing, the stamps start again, which is safe because no entry can carry an earlier stamp.
+
+**Bounded destruction.** A value charged more than 16 KiB is never freed by a cache operation, and one operation (one put, with its replacement and evictions) frees at most 16 KiB inline in total. Past that, a replaced or evicted value goes to a fixed ring of 16 deferred values, still charged. Its slot is checked before the entry is detached. With the ring full, the operation refuses (`why="deferred_full"`): the entry it would have replaced or evicted stays, and the new value is served uncached.
+
+Values awaiting a step count as room to come. Eviction stops once they cover what is missing, and the value is refused until the next step frees them (`why="deferred"`), so eviction behind a large value never empties the cache. This is scoped to the cache's own retirement: a newly loaded value that admission refuses is dropped by its caller, measured separately.
+
+**Full clear.** Every structure (LRU, barrier streams, index with its sweep queues, deferred ring) is handed to the process's reclamation thread through a queue of two, never waiting (`try_send`). The cache stays charged with the unit until the thread has dropped it. When the thread could not start, holds this cache's previous unit, or has a full queue, the clear is made in place (O(1)). A rejected handoff puts every structure back unchanged; nothing is freed inline. A panic while the thread frees a unit aborts the process after logging: its memory could no longer be accounted. Queue pressure and a thread that could not start never abort.
+
+**Steps.** `Caches::step` runs once per binlog-loop iteration (its only call site) for a 1 ms target. It frees whole items in this order:
+1. deferred values;
+2. stale entries of queued tables;
+3. queued databases' tables (queued one at a time);
+4. entries an in-place clear left at the LRU's end (a stale entry is never moved up, so they are all behind the current ones);
+5. emptied maps' buckets.
+
+A step overruns its target by at most one item. A source without events runs no steps: what is pending stays charged, within the bound, with no completion deadline. The sweep queues hold the records' own names, never allocate when pushed (their room is reserved, and counted, when a record is created), and keep a dropped record's name, counted, until its turn.
+
+**Accounting and metrics.** `deltaforge_mysql_selection_cache_bytes` is the charged total. The design named it the live bytes; it keeps its meaning for the harness, and the live bytes are a new gauge. The other new gauges are `..._live_bytes`, `..._stale_bytes`, `..._deferred_bytes` and `..._handed_bytes`. The counters are `..._reclaimed_total{mode="inline"|"step"|"thread"}` and `..._refused_total{why}`. Evictions count current entries only. A table's invalidation queues it, and a database barrier queues the database; neither allocates.
+
+**Tests** (`mysql_selection.rs`, `byte_budget`; `mysql_cache_index.rs`):
+- staleness against a scan-and-remove reference model;
+- no inline free of a 64 MiB value at replacement or eviction;
+- the inline budget;
+- a full ring refusing with everything left in place;
+- clears made in place while a unit is on the thread, and repeated during a refill, allocating nothing;
+- rejected handoffs (queue full, thread gone, no thread) restored intact;
+- an install refused after each kind of invalidation;
+- recreated records and exhausted stamps (with stale entries, deferred values and a handed-off unit present), with no snapshot made current again.
+
+`the_index_allocates_its_estimate` stays exact through invalidations and orphaned queue entries. The memory probe stays at 0.78 to 0.99 of the estimate after barrier, eviction and full clear with reclamation.
+
+**Not yet measured:** release timings of the operations on the loop and of their reclamation, steps (median, max, overruns), single-item maxima, the thread's wall and CPU time, refusals under churn, and upkeep with the currency checks. Acceptance (section 6.5's limits on the combined implementation) is measured on pinned builds after review.
+

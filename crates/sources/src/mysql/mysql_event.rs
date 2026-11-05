@@ -2335,13 +2335,19 @@ pub(crate) mod tests {
             storage::adapters::LineageDescriptor::mysql(UUID).unwrap(),
         );
         let scope = ctx.registry_scope.current().unwrap();
-        ctx.selection.seed_for_test(&scope.key("shop", "orders"));
-        ctx.selection.seed_for_test(&scope.key("shop", "items"));
+        let keys = [scope.key("shop", "orders"), scope.key("shop", "items")];
+        for k in &keys {
+            ctx.selection.seed_for_test(k);
+        }
         assert_eq!(ctx.selection.len(), 2);
         super::super::apply_reload_request(&mut ctx, None, None)
             .await
             .unwrap();
-        assert_eq!(ctx.selection.len(), 0);
+        for k in &keys {
+            assert!(ctx.selection.timeline(&k.backend_key()).is_none());
+        }
+        ctx.selection.settle();
+        assert_eq!((ctx.selection.len(), ctx.selection.bytes()), (0, 0));
     }
 
     /// Give the fixture's `shop.orders` a proven schema at the rows'
