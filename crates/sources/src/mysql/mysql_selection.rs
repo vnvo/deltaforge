@@ -4379,8 +4379,10 @@ mod tests {
         /// full clear, each on a full cache, five times: in the order the
         /// entries were cached, and with the LRU order reshuffled first (as
         /// reuse reshuffles it; every entry used once in a random order) for
-        /// five fixed seeds, each reported. A measurement for
-        /// a release build (`docs/design/selection-cache-diagnosis.md`,
+        /// five fixed seeds, each reported; and with 90% of the tables in
+        /// one database (in the order cached, and one seed), where the
+        /// database barrier of that database is timed too. A measurement
+        /// for a release build (`docs/design/selection-cache-diagnosis.md`,
         /// section 6): `cargo test --release -p sources --lib --
         /// --ignored --nocapture invalidation_cost_at_the_default_bound`.
         #[test]
@@ -4388,10 +4390,17 @@ mod tests {
         fn invalidation_cost_at_the_default_bound() {
             const DBS: usize = 100;
             let selection = loaded(1);
-            let fill = |c: &mut Caches, tables: usize| {
+            // Over 100 databases evenly, or 90% in database 0 and the rest
+            // over the other 99.
+            let placed = |concentrated: bool, t: usize| match concentrated {
+                false => key(t % DBS, t / DBS),
+                true if t % 10 < 9 => key(0, t),
+                true => key(1 + t % (DBS - 1), t),
+            };
+            let fill = |c: &mut Caches, tables: usize, concentrated: bool| {
                 let mut read = HashMap::new();
                 for t in 0..tables {
-                    let k = key(t % DBS, t / DBS);
+                    let k = placed(concentrated, t);
                     let bk = k.backend_key();
                     c.put_timeline(bk.clone(), timeline_of(&k, 64, &mut read));
                     c.put_selection(
@@ -4401,17 +4410,21 @@ mod tests {
                     c.put_version(bk, version(1, 1));
                 }
             };
-            let full = || {
+            let full = |concentrated: bool| {
                 let mut c = Caches::default();
                 assert_eq!(c.max_bytes, SELECTION_CACHE_BYTES);
-                fill(&mut c, 1);
+                fill(&mut c, 1, concentrated);
                 let per = c.entries_bytes_for_test().max(1);
-                fill(&mut c, (SELECTION_CACHE_BYTES / per) as usize * 11 / 10);
+                fill(
+                    &mut c,
+                    (SELECTION_CACHE_BYTES / per) as usize * 11 / 10,
+                    concentrated,
+                );
                 c
             };
-            let reordered = |seed: u64| {
+            let reordered = |seed: u64, concentrated: bool| {
                 use rand::{SeedableRng, seq::SliceRandom};
-                let mut c = full();
+                let mut c = full(concentrated);
                 let mut keys: Vec<CacheKey> =
                     c.entries.iter().map(|(k, _)| k.clone()).collect();
                 keys.shuffle(&mut rand::rngs::StdRng::seed_from_u64(seed));
@@ -4421,12 +4434,24 @@ mod tests {
                 c
             };
             let populations =
-                std::iter::once(("insertion order".to_string(), None)).chain(
-                    (1..=5).map(|seed| (format!("seed {seed}"), Some(seed))),
-                );
-            for (population, seed) in populations {
-                let fill = || seed.map_or_else(full, reordered);
-                let mut times: [Vec<Duration>; 3] = Default::default();
+                std::iter::once(("insertion order".to_string(), None, false))
+                    .chain((1..=5).map(|seed| {
+                        (format!("seed {seed}"), Some(seed), false)
+                    }))
+                    .chain([
+                        (
+                            "concentrated, insertion order".to_string(),
+                            None,
+                            true,
+                        ),
+                        ("concentrated, seed 1".to_string(), Some(1), true),
+                    ]);
+            for (population, seed, concentrated) in populations {
+                let fill = || match seed {
+                    None => full(concentrated),
+                    Some(seed) => reordered(seed, concentrated),
+                };
+                let mut times: [Vec<Duration>; 4] = Default::default();
                 let mut held = 0;
                 for _ in 0..5 {
                     let mut c = fill();
@@ -4434,7 +4459,23 @@ mod tests {
                     let t0 = Instant::now();
                     c.barrier_appended(&database(7));
                     times[0].push(t0.elapsed());
-                    assert_eq!(c.held_for(&key(7, 3)), 0);
+                    assert_eq!(
+                        c.entries
+                            .iter()
+                            .filter(|(k, _)| k
+                                .table()
+                                .starts_with(&database(7)))
+                            .count(),
+                        0
+                    );
+
+                    if concentrated {
+                        let mut c = fill();
+                        let t0 = Instant::now();
+                        c.barrier_appended(&database(0));
+                        times[3].push(t0.elapsed());
+                        assert!(c.len() < held / 5);
+                    }
 
                     let mut c = fill();
                     let t0 = Instant::now();
@@ -4448,9 +4489,16 @@ mod tests {
                     times[2].push(t0.elapsed());
                     assert_eq!(c.bytes(), 0);
                 }
-                let names =
-                    ["database barrier", "lineage barrier", "full clear"];
+                let names = [
+                    "database barrier",
+                    "lineage barrier",
+                    "full clear",
+                    "database barrier, the 90% database",
+                ];
                 for (name, t) in names.iter().zip(&mut times) {
+                    if t.is_empty() {
+                        continue;
+                    }
                     let runs = format!("{t:?}");
                     t.sort();
                     eprintln!(
@@ -4461,6 +4509,89 @@ mod tests {
                         t[t.len() - 1]
                     );
                 }
+            }
+        }
+
+        /// A timeline whose records really hold about `bytes` (a 1 KiB
+        /// capture id each).
+        fn populated(bytes: usize) -> Arc<Timeline> {
+            let n = bytes / 1_100;
+            let records: Vec<Stored> = (0..n)
+                .map(|i| Stored {
+                    capture_id: format!("{i:01024}"),
+                    record: Record::new(
+                        WmPos::MysqlGtid {
+                            gtid_set: format!("u:1-{i}"),
+                        },
+                        Kind::Barrier {
+                            scope: BarrierScope::Lineage,
+                        },
+                    ),
+                })
+                .collect();
+            Arc::new(Timeline {
+                records,
+                table_head: 1,
+                streams: Vec::new(),
+                bytes: (n * 1_024) as u64,
+            })
+        }
+
+        /// What one large value costs on the source's loop when the cache
+        /// frees it synchronously: a 64 MiB timeline (the per-timeline
+        /// limit) whose records really hold that much, replaced by a new
+        /// read (the old one freed in the put), evicted by another table's
+        /// (freed in that put), and refused by admission (the put, and the
+        /// caller dropping the value it kept: an install hands its value
+        /// over, so there the drop happens inside the call). Five runs
+        /// each; a measurement for a release build (`cargo test --release
+        /// -p sources --lib -- --ignored --nocapture
+        /// large_values_at_the_default_bound`).
+        #[test]
+        #[ignore = "timing: run in a release build"]
+        fn large_values_at_the_default_bound() {
+            const BIG: usize = 64 << 20;
+            let mut rows: Vec<(&str, Vec<Duration>)> = vec![
+                ("64 MiB timeline replaced (the old one freed)", vec![]),
+                ("64 MiB timeline evicted by another table's", vec![]),
+                ("64 MiB timeline refused: the put", vec![]),
+                ("64 MiB timeline refused: dropped by its caller", vec![]),
+            ];
+            let (a, b) = (key(0, 1).backend_key(), key(0, 2).backend_key());
+            for _ in 0..5 {
+                let mut c = Caches::default();
+                c.put_timeline(a.clone(), populated(BIG));
+                let next = populated(BIG);
+                let t0 = Instant::now();
+                assert!(c.put_timeline(a.clone(), next).is_some());
+                rows[0].1.push(t0.elapsed());
+                // Room for one: caching B evicts A.
+                c.set_limit_for_test(c.bytes() + c.bytes() / 2);
+                let next = populated(BIG);
+                let t0 = Instant::now();
+                assert!(c.put_timeline(b.clone(), next).is_some());
+                rows[1].1.push(t0.elapsed());
+                assert!(c.timeline(&a).is_none());
+
+                let mut c = Caches::default();
+                c.set_limit_for_test(1 << 20);
+                let value = populated(BIG);
+                let t0 = Instant::now();
+                assert!(c.put_timeline(a.clone(), value.clone()).is_none());
+                rows[2].1.push(t0.elapsed());
+                let t0 = Instant::now();
+                drop(value);
+                rows[3].1.push(t0.elapsed());
+            }
+            for (name, mut t) in rows {
+                let runs = format!("{t:?}");
+                t.sort();
+                eprintln!(
+                    "large value: {name} median {:?}, max {:?}, runs in order \
+                     {runs}",
+                    t[t.len() / 2],
+                    t[t.len() - 1]
+                );
             }
         }
 
