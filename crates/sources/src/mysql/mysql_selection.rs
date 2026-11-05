@@ -277,6 +277,10 @@ pub(crate) struct Caches {
     /// The current load, if one is admitting ([`Admission`]).
     load: u64,
     loading: bool,
+    /// The largest charge (a table with its version) the current load
+    /// admitted, and the last finished load's: what a batch is sized by.
+    load_charge: u64,
+    pair_charge: u64,
     meters: Meters,
 }
 
@@ -360,6 +364,8 @@ impl Caches {
             max_bytes,
             load: 0,
             loading: false,
+            load_charge: 0,
+            pair_charge: 0,
             meters,
         }
     }
@@ -528,6 +534,7 @@ impl Caches {
     fn begin_load(&mut self) -> Admission {
         self.load += 1;
         self.loading = true;
+        self.load_charge = 0;
         Admission {
             left: self.max_bytes / 2,
             first: true,
@@ -537,6 +544,9 @@ impl Caches {
 
     fn end_load(&mut self) {
         self.loading = false;
+        if self.load_charge > 0 {
+            self.pair_charge = self.load_charge;
+        }
     }
 
     /// Whether a load may admit `cost` more bytes; if so, they are spent.
@@ -552,15 +562,21 @@ impl Caches {
     }
 
     /// The most tables one batched load brings in: as many as half the
-    /// bound holds at the held tables' average cost (timeline and version),
-    /// at most one statement's, at least one. Before anything is held: one
-    /// statement's.
+    /// bound holds at the larger of the held tables' average cost (timeline
+    /// and version) and the largest charge the last load admitted (which
+    /// adds keys, indexing and barrier streams), so a batch is not read
+    /// larger than a load can cache; at most one statement's, at least one.
+    /// Before anything is held or admitted: one statement's.
     pub(crate) fn batch_room(&self) -> usize {
         let max = super::mysql_history::BATCH_MAX_TABLES;
-        if self.timelines == 0 {
+        let held = match self.timelines {
+            0 => 0,
+            n => self.table_bytes / n as u64,
+        };
+        let each = held.max(self.pair_charge);
+        if each == 0 {
             return max;
         }
-        let each = (self.table_bytes / self.timelines as u64).max(1);
         ((self.max_bytes / 2 / each) as usize).clamp(1, max)
     }
 
@@ -640,6 +656,13 @@ impl Caches {
                 .sum::<u64>()
     }
 
+    /// What caching any timeline adds at least: its value and its node
+    /// (no indexing or barrier streams), at most [`Self::timeline_cost`].
+    fn timeline_floor(timeline: &Timeline) -> u64 {
+        super::mysql_cache_cost::timeline(timeline)
+            + super::mysql_cache_cost::allocated(NODE)
+    }
+
     /// Cache `timeline`, holding its barrier streams once: a stream already
     /// held is shared, a new one is held (and accounted) from here. The
     /// timeline as cached (sharing the held streams), or `None` when it
@@ -696,23 +719,47 @@ impl Caches {
         Some(shared)
     }
 
-    /// A load's [`Self::put_timeline`]: admitted only while the load may
-    /// admit it. The timeline to use (cached or not).
-    fn admit_timeline(
+    /// A load's admission of a table's timeline together with the version
+    /// its selection needs (`None` when that is cached or unavailable): one
+    /// charge for both (the entries, their keys and indexing, the barrier
+    /// streams not held), reserved before either is cached, so a load never
+    /// caches a timeline without room for its version. The charge, whether
+    /// both were cached, and the timeline to use (cached or not).
+    fn admit_pair(
         &mut self,
         adm: &mut Admission,
-        key: String,
+        key: &str,
         timeline: Arc<Timeline>,
-    ) -> Arc<Timeline> {
-        let key = CacheKey::Timeline(key.into());
-        let cost = self.timeline_cost(&key, &timeline);
-        if !self.admit(adm, cost) {
-            return timeline;
+        version: Option<schema_registry::SchemaVersion>,
+    ) -> (u64, bool, Arc<Timeline>) {
+        let tkey = CacheKey::Timeline(key.into());
+        let version = version.map(|v| {
+            let vkey = CacheKey::Version(key.into(), v.version);
+            let bytes = super::mysql_cache_cost::version(&v);
+            (vkey, bytes, v)
+        });
+        // The version's index growth is taken before the timeline indexes
+        // the table: an upper bound (the table's string counted twice).
+        let charge = self.timeline_cost(&tkey, &timeline)
+            + version.as_ref().map_or(0, |(vkey, bytes, _)| {
+                bytes + key_cost(vkey) + self.index.growth(vkey)
+            });
+        if !self.admit(adm, charge) {
+            return (charge, false, timeline);
         }
-        match self.put_timeline_as(key, timeline.clone()) {
-            Some(cached) => cached,
-            None => timeline,
+        let Some(cached) = self.put_timeline_as(tkey, timeline.clone()) else {
+            return (charge, false, timeline);
+        };
+        if let Some((vkey, bytes, v)) = version
+            && !self.put(vkey, Cached::Version(Arc::new(v)), bytes)
+        {
+            // Never a timeline without its version: the table is served
+            // uncached.
+            self.remove(&CacheKey::Timeline(key.into()));
+            return (charge, false, cached);
         }
+        self.load_charge = self.load_charge.max(charge);
+        (charge, true, cached)
     }
 
     fn selection(
@@ -761,21 +808,6 @@ impl Caches {
             Cached::Version(Arc::new(v)),
             bytes,
         )
-    }
-
-    /// A load's [`Self::put_version`]: admitted only while the load may
-    /// admit it.
-    fn admit_version(
-        &mut self,
-        adm: &mut Admission,
-        table: String,
-        v: schema_registry::SchemaVersion,
-    ) {
-        let key = CacheKey::Version(table.into(), v.version);
-        let bytes = super::mysql_cache_cost::version(&v);
-        if self.admit(adm, bytes + key_cost(&key) + self.index.growth(&key)) {
-            self.put(key, Cached::Version(Arc::new(v)), bytes);
-        }
     }
 
     fn put_selection(
@@ -1600,14 +1632,17 @@ pub(crate) async fn load_timelines(ctx: &mut RunCtx, keys: &[SchemaKey]) {
 
 /// Read `keys`' histories (those `alone` names read alone if their batch
 /// could not take them) and install every valid timeline within its limit,
-/// with the versions their last proofs name read ahead. One load
-/// ([`Admission`]): what it admits never exceeds half the cache (its first
-/// timeline may take all of it) and is never evicted by itself. A
-/// statement's tables ([`BATCH_MAX_TABLES`]) are read and admitted before
-/// the next statement's are read, so a load holds one statement's histories
-/// at a time; once nothing more fits, the rest is left unread (read when
-/// reached). The outcome for the key `alone` names, if any: its timeline
-/// whether or not it was cached.
+/// each with the version its last proof names. One load ([`Admission`]):
+/// what it admits never exceeds half the cache (its first table may take
+/// all of it) and is never evicted by itself. A statement's tables
+/// ([`BATCH_MAX_TABLES`]) are read, their versions read in one batch, and
+/// admitted before the next statement's are read, so a load holds one
+/// statement's histories at a time. A table is admitted with its version
+/// as one charge, in order; at the first that does not fit, it and the
+/// rest of its statement are read but not cached (each is read again, in a
+/// batch, when reached), and later statements are not read. The outcome
+/// for the key `alone` names, if any: its timeline whether or not it was
+/// cached.
 ///
 /// [`BATCH_MAX_TABLES`]: super::mysql_history::BATCH_MAX_TABLES
 async fn install(
@@ -1655,9 +1690,11 @@ async fn install_load(
                 _ => 0,
             })
             .sum::<u64>();
-        let mut installed = Vec::new();
+        // The tables read whole and valid, in order; a failure is the
+        // outcome of the table asked for.
+        let mut valid: Vec<(&SchemaKey, Timeline)> = Vec::new();
         for (key, loaded) in chunk.iter().zip(read) {
-            let outcome = match loaded {
+            let failed = match loaded {
                 Loaded::Ok {
                     table,
                     streams,
@@ -1671,62 +1708,104 @@ async fn install_load(
                     };
                     match validate_planned(&registry, key, &t, &hashes).await {
                         Ok(()) => {
-                            let t = ctx.selection.admit_timeline(
-                                adm,
-                                key.backend_key(),
-                                Arc::new(t),
-                            );
-                            installed.push(key);
-                            Ok(t)
+                            valid.push((key, t));
+                            continue;
                         }
-                        Err(e) => Err(timeline_error(e)),
+                        Err(e) => timeline_error(e),
                     }
                 }
-                Loaded::Invalid(e) => Err(timeline_error(e.into())),
-                Loaded::TooLarge(e) => Err(timeline_too_large(ctx, &e)),
+                Loaded::Invalid(e) => timeline_error(e.into()),
+                Loaded::TooLarge(e) => timeline_too_large(ctx, &e),
                 Loaded::Unread => continue,
             };
             if alone(key) {
-                mine = Some(outcome);
+                mine = Some(Err(failed));
             }
         }
-        // The versions the cached tables' last proofs name, read ahead in
-        // one batch and admitted in the tables' order: a returning table's
-        // selection then reads nothing more.
+        // The version each table's last proof names, when not cached, for
+        // the tables whose timelines alone still fit what the load may
+        // admit (a floor of each pair's charge, so every table that can be
+        // admitted is among them): read in one batch, so a returning
+        // table's selection reads nothing more.
+        let (mut room, mut first) = (adm.left, adm.first);
+        let mut needs: Vec<Option<i32>> = Vec::with_capacity(valid.len());
         let mut wanted = Vec::new();
-        for key in installed {
-            let bk = key.backend_key();
-            let Some(t) = ctx.selection.timeline(&bk) else {
-                continue;
+        for (key, t) in &valid {
+            let floor = Caches::timeline_floor(t);
+            let fits =
+                floor <= room || (first && floor <= ctx.selection.max_bytes);
+            let need = if fits {
+                room = room.saturating_sub(floor);
+                first = false;
+                named_version(t).filter(|v| {
+                    ctx.selection.version(&key.backend_key(), *v).is_none()
+                })
+            } else {
+                None
             };
-            let last =
-                t.records.iter().rev().find_map(|r| match &r.record.kind {
-                    Kind::Observed { version, .. }
-                    | Kind::Baseline { version, .. } => Some(*version),
-                    _ => None,
-                });
-            if let Some(v) = last
-                && ctx.selection.version(&bk, v).is_none()
-            {
-                wanted.push((key.clone(), v));
+            if let Some(v) = need {
+                wanted.push(((*key).clone(), v));
             }
+            needs.push(need);
         }
-        if !wanted.is_empty() && !adm.spent() {
+        let mut fetched = if wanted.is_empty() {
+            Vec::new()
+        } else {
             crate::perf_phases::store_read("versions", wanted.len() as u64, 0);
             let _phase = crate::perf_phases::Phase::start("version_prefetch");
-            if let Ok(read) = registry.get_versions(&wanted).await {
-                for ((key, _), v) in wanted.iter().zip(read) {
-                    if let Some(v) = v {
-                        ctx.selection.admit_version(adm, key.backend_key(), v);
-                    }
+            // A failed read caches no version: each is read when selected.
+            registry.get_versions(&wanted).await.unwrap_or_default()
+        }
+        .into_iter();
+        // Admitted in order, each table with its version, until one does
+        // not fit.
+        let (start_left, mut admitted, mut largest) = (adm.left, 0usize, 0u64);
+        let mut stopped = false;
+        for ((key, t), need) in valid.into_iter().zip(needs) {
+            let version = need.and_then(|v| {
+                fetched.next().flatten().filter(|sv| sv.version == v)
+            });
+            let mut t = Arc::new(t);
+            if !stopped {
+                let (charge, ok, used) = ctx.selection.admit_pair(
+                    adm,
+                    &key.backend_key(),
+                    t,
+                    version,
+                );
+                largest = largest.max(charge);
+                t = used;
+                if ok {
+                    admitted += 1;
+                } else {
+                    stopped = true;
                 }
             }
+            if alone(key) {
+                mine = Some(Ok(t));
+            }
         }
+        crate::stream_probe::history_batch(
+            chunk.len(),
+            admitted,
+            largest,
+            start_left,
+        );
     }
     if requested > 0 {
         crate::perf_phases::store_read(read_kind, requested, read_bytes);
     }
     Ok(mine)
+}
+
+/// The version a timeline's last proof names, if any.
+fn named_version(t: &Timeline) -> Option<i32> {
+    t.records.iter().rev().find_map(|r| match &r.record.kind {
+        Kind::Observed { version, .. } | Kind::Baseline { version, .. } => {
+            Some(*version)
+        }
+        _ => None,
+    })
 }
 
 /// Append a barrier for `scope` and invalidate what it makes stale: the
@@ -4772,6 +4851,69 @@ mod tests {
             assert!((20..=32).contains(&room), "{room}");
             c.set_limit_for_test(1 << 20);
             assert_eq!(c.batch_room(), 1);
+        }
+
+        /// A load caches a table's timeline only with room for the version
+        /// its selection needs: one charge for both. Room for the timeline
+        /// alone caches neither (its version would be read table by table).
+        #[test]
+        fn a_load_caches_a_timeline_only_with_room_for_its_version() {
+            let mut c = Caches::default();
+            let mut read = HashMap::new();
+            let k = key(0, 1);
+            let bk = k.backend_key();
+            let t = timeline_of(&k, 2000, &mut read);
+            let alone =
+                c.timeline_cost(&CacheKey::Timeline(bk.as_str().into()), &t);
+            let mut adm = c.begin_load();
+            adm.first = false;
+            adm.left = alone;
+            let (charge, ok, _) =
+                c.admit_pair(&mut adm, &bk, t.clone(), Some(version(1, 12)));
+            c.end_load();
+            assert!(!ok && charge > alone, "{charge} vs {alone}");
+            assert!(
+                c.timeline(&bk).is_none(),
+                "a timeline without its version"
+            );
+            assert!(c.version(&bk, 1).is_none());
+            let mut adm = c.begin_load();
+            adm.first = false;
+            adm.left = charge;
+            let (again, ok, _) =
+                c.admit_pair(&mut adm, &bk, t, Some(version(1, 12)));
+            c.end_load();
+            assert_eq!((again, ok, adm.left), (charge, true, 0));
+            assert!(c.timeline(&bk).is_some() && c.version(&bk, 1).is_some());
+            c.audit();
+        }
+
+        /// A batch is sized by the charges a load admitted (a table with
+        /// its version, keys, indexing and barrier streams), not only the
+        /// held entries' bytes, so a load caches every table it reads.
+        #[test]
+        fn a_batch_is_sized_by_the_charges_a_load_admitted() {
+            let mut c = Caches::default();
+            c.set_limit_for_test(4 << 20);
+            let mut read = HashMap::new();
+            let mut adm = c.begin_load();
+            let mut largest = 0;
+            for t in 0..8 {
+                let k = key(t % 3, t);
+                let (charge, ok, _) = c.admit_pair(
+                    &mut adm,
+                    &k.backend_key(),
+                    timeline_of(&k, 2000, &mut read),
+                    Some(version(1, 12)),
+                );
+                assert!(ok);
+                largest = largest.max(charge);
+            }
+            c.end_load();
+            let held = c.table_bytes / c.timelines as u64;
+            assert!(largest > held, "{largest} vs {held}");
+            assert_eq!(c.batch_room(), ((2 << 20) / largest) as usize);
+            c.audit();
         }
     }
 }

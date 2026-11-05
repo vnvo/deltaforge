@@ -265,3 +265,19 @@ Freeing invalidated entries away from the source's loop was designed (three revi
 
 What stays is the synchronous design: an invalidation removes and frees its entries before it returns, so no entry is ever stale, the bound counts only what the cache holds, and the install check (the same cached value) is sufficient. The work is kept on the local branch `reclamation-preserved-622c88c9`, bundled in `selection-cache-reclamation-preserved`, with the red gate in `gate-selection-cache-622c88c9`.
 
+
+## 9. Returning tables: a table is admitted with its version
+
+The core gate on `9b6045b1` (the code of `6b0ac60f`) failed `evicted_tables_return_in_batched_reads`: 119 store reads for 300 tables returning to a 512 KiB cache, where at most 75 were allowed. The same test, run alone and alternating on `f4d2141c` (before the index) and `9b6045b1`, gave 17 to 70 and 21 to 78 reads: the count depended on how much of the burst the stream had read ahead when the first table was reached. Those runs do not establish that the index caused no regression.
+
+The test now holds the source (the same run and cache) at the first event of the burst until all of it is in the binlog, then releases it, so every load can read as many tables as its batch allows. Held that way, both revisions read history in a few batches but each table's version alone: 277 single-version reads on `f4d2141c` and 242 on `9b6045b1`, an index lookup and a log read each. The cause predates the index:
+- A load admitted its timelines first and read the versions they name afterwards, only if the load could still admit something.
+- Batches were sized from the held entries' table bytes. Under a backlog a batch's timelines filled the load's half of the cache, so the versions were never read, and each table's selection then read its own.
+
+The fix:
+- A load reads a batch's histories, then the versions their last proofs name in one batch, for the tables whose timelines alone still fit what the load may admit (a floor of each charge, so every table that can be admitted is among them).
+- Each table is admitted with its version as one charge, reserved before either is cached: the entries, their keys and indexing (the version's index growth is taken before the timeline indexes the table, an upper bound) and the barrier streams not held. A timeline is never cached without room for its version.
+- At the first table that does not fit, it and the rest of the batch are read but not cached; each is read again, in a batch, when reached. Later statements of the load are not read. A table asked for is served whether or not it was cached.
+- A batch is sized by the larger of the held tables' average bytes and the largest charge the last load admitted, so a load caches every table it reads. Without that, batches of 37 cached 34 tables and each left 3 to a batch of their own (17 batches for 300 tables).
+
+On `9b6045b1` with the fix, the held burst takes 9 batched history reads and 36 store calls (from 500 to 566), every batch caches every table it reads, and no version is read alone. The test derives its ceiling from the largest charge any batch weighed: a load filling half the bound caches at least `fill = floor(bound / 2 / largest) - 1` tables, so the burst needs at most `ceil(300 / fill)` batches (10). It checks the assumptions behind that instead of trusting them: every batch but the last read at least `fill` tables, a batch that left tables uncached cached at least its room over the largest charge less one, every history read is a batch's, and no version is read alone. With batching disabled (a batch room of 1) the test fails with 300 single-table reads. A live burst after the held one is checked for exact delivery and the bound only.

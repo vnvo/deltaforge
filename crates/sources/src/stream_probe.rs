@@ -265,3 +265,47 @@ pub fn set_selection_cache_bytes(bytes: Option<u64>) {
 pub(crate) fn selection_cache_bytes() -> Option<u64> {
     *SELECTION_CACHE_BYTES.lock().expect("cache bytes")
 }
+
+/// One batched history read of a load, as the selection cache admitted
+/// it (MySQL): the tables it read, how many it cached with their versions,
+/// the largest single charge it weighed (admitted or the one refused), and
+/// what the load could still admit when the batch began.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryBatch {
+    pub read: usize,
+    pub admitted: usize,
+    pub largest_charge: u64,
+    pub room: u64,
+}
+
+static BATCHES_ARMED: AtomicBool = AtomicBool::new(false);
+static BATCHES: Mutex<Vec<HistoryBatch>> = Mutex::new(Vec::new());
+
+/// Record (or stop recording) every batched history read, from empty.
+/// Test seam: what each batch admitted, against the charges it weighed.
+pub fn record_history_batches(on: bool) {
+    BATCHES.lock().unwrap().clear();
+    BATCHES_ARMED.store(on, Ordering::SeqCst);
+}
+
+/// The batched history reads recorded since [`record_history_batches`].
+pub fn history_batches() -> Vec<HistoryBatch> {
+    BATCHES.lock().unwrap().clone()
+}
+
+/// Called after a load admitted a batch. Disarmed: one atomic load.
+pub(crate) fn history_batch(
+    read: usize,
+    admitted: usize,
+    largest_charge: u64,
+    room: u64,
+) {
+    if BATCHES_ARMED.load(Ordering::Relaxed) {
+        BATCHES.lock().unwrap().push(HistoryBatch {
+            read,
+            admitted,
+            largest_charge,
+            room,
+        });
+    }
+}
