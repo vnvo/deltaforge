@@ -1050,6 +1050,139 @@ fn row_bytes(row: &Row) -> u64 {
         + 16
 }
 
+/// One read of the schema capture from INFORMATION_SCHEMA: its statement
+/// and bound parameters.
+pub(crate) struct CatalogRead {
+    pub sql: String,
+    pub params: Vec<mysql_async::Value>,
+}
+
+/// `tables` as a derived table `r (s, n)` of bound parameters, each pair
+/// once (its first occurrence), for a join on `TABLE_SCHEMA = r.s AND
+/// TABLE_NAME = r.n`: the server reads each requested table by name. A
+/// row-constructor `(TABLE_SCHEMA, TABLE_NAME) IN (...)` filter read every
+/// table of the catalog first
+/// (`docs/design/mysql-activation-capture-cost.md`). `VALUES ROW` needs
+/// MySQL 8.0.19 (`mysql_health::MIN_SERVER_VERSION`). `tables` is not
+/// empty.
+fn requested(tables: &[(&str, &str)]) -> (String, Vec<mysql_async::Value>) {
+    debug_assert!(!tables.is_empty());
+    let mut seen = std::collections::HashSet::new();
+    let mut params = Vec::with_capacity(tables.len() * 2);
+    for &(db, table) in tables {
+        if seen.insert((db, table)) {
+            params.push(db.into());
+            params.push(table.into());
+        }
+    }
+    let rows = vec!["ROW(?, ?)"; params.len() / 2].join(", ");
+    (format!("(VALUES {rows}) AS r (s, n)"), params)
+}
+
+/// Which of `tables` exist (`mysql_binlog_scan::capture_batch_with`).
+pub(crate) fn existence_read(tables: &[(&str, &str)]) -> CatalogRead {
+    let (r, params) = requested(tables);
+    CatalogRead {
+        sql: format!(
+            "SELECT TABLE_SCHEMA, TABLE_NAME FROM {r} \
+             JOIN INFORMATION_SCHEMA.TABLES t \
+             ON t.TABLE_SCHEMA = r.s AND t.TABLE_NAME = r.n"
+        ),
+        params,
+    }
+}
+
+/// The columns of `tables`, in rank order (`RK`, the table's first position
+/// in `tables`, from 1) and ordinal order.
+pub(crate) fn columns_read(tables: &[(&str, &str)]) -> CatalogRead {
+    let ranks = vec!["?"; tables.len()].join(", ");
+    // A database name never holds a `.`, so `db.table` names one table.
+    let mut params: Vec<mysql_async::Value> = tables
+        .iter()
+        .map(|(db, table)| format!("{db}.{table}").into())
+        .collect();
+    let (r, pairs) = requested(tables);
+    params.extend(pairs);
+    CatalogRead {
+        sql: format!(
+            r#"
+            SELECT
+                FIELD(CONCAT(TABLE_SCHEMA, '.', TABLE_NAME), {ranks}) AS RK,
+                TABLE_SCHEMA,
+                TABLE_NAME,
+                COLUMN_NAME,
+                COLUMN_TYPE,
+                DATA_TYPE,
+                IS_NULLABLE,
+                ORDINAL_POSITION,
+                COLUMN_DEFAULT,
+                EXTRA,
+                COLUMN_COMMENT,
+                CHARACTER_MAXIMUM_LENGTH,
+                NUMERIC_PRECISION,
+                NUMERIC_SCALE,
+                CHARACTER_OCTET_LENGTH,
+                DATETIME_PRECISION,
+                (SELECT co.ID FROM INFORMATION_SCHEMA.COLLATIONS co
+                 WHERE co.COLLATION_NAME = c.COLLATION_NAME) AS COLLATION_ID
+            FROM {r} JOIN INFORMATION_SCHEMA.COLUMNS c
+              ON c.TABLE_SCHEMA = r.s AND c.TABLE_NAME = r.n
+            ORDER BY RK, ORDINAL_POSITION
+            "#
+        ),
+        params,
+    }
+}
+
+/// The primary-key columns of `tables`, in key order.
+pub(crate) fn primary_key_read(tables: &[(&str, &str)]) -> CatalogRead {
+    let (r, params) = requested(tables);
+    CatalogRead {
+        sql: format!(
+            r#"
+            SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME
+            FROM {r} JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE k
+              ON k.TABLE_SCHEMA = r.s AND k.TABLE_NAME = r.n
+            WHERE CONSTRAINT_NAME = 'PRIMARY'
+            ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
+            "#
+        ),
+        params,
+    }
+}
+
+/// The primary-key prefix lengths of `tables` (a prefixed key part, e.g. a
+/// BLOB prefix).
+pub(crate) fn key_prefix_read(tables: &[(&str, &str)]) -> CatalogRead {
+    let (r, params) = requested(tables);
+    CatalogRead {
+        sql: format!(
+            r#"
+            SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, SUB_PART
+            FROM {r} JOIN INFORMATION_SCHEMA.STATISTICS st
+              ON st.TABLE_SCHEMA = r.s AND st.TABLE_NAME = r.n
+            WHERE INDEX_NAME = 'PRIMARY' AND SUB_PART IS NOT NULL
+            "#
+        ),
+        params,
+    }
+}
+
+/// The engine and collation of `tables`.
+pub(crate) fn table_metadata_read(tables: &[(&str, &str)]) -> CatalogRead {
+    let (r, params) = requested(tables);
+    CatalogRead {
+        sql: format!(
+            r#"
+            SELECT TABLE_SCHEMA, TABLE_NAME, ENGINE, TABLE_COLLATION
+            FROM {r} JOIN INFORMATION_SCHEMA.TABLES t
+              ON t.TABLE_SCHEMA = r.s AND t.TABLE_NAME = r.n
+            "#
+        ),
+        params,
+    }
+}
+
 /// [`fetch_table_schemas_on`] for `tables` in rank order, within a budget
 /// (`docs/design/mysql-mass-invalidation.md`, "Schema capture"): the
 /// column rows, by far the largest read, are consumed one at a time in rank
@@ -1072,52 +1205,13 @@ pub(crate) async fn fetch_table_schemas_within(
             oversized: None,
         });
     }
-    let all_pairs = vec!["(?, ?)"; tables.len()].join(", ");
-    let ranks = vec!["?"; tables.len()].join(", ");
-    // A database name never holds a `.`, so `db.table` names one table.
-    let mut col_params: Vec<mysql_async::Value> = tables
-        .iter()
-        .map(|(db, table)| format!("{db}.{table}").into())
-        .collect();
-    col_params.extend(
-        tables
-            .iter()
-            .flat_map(|(db, table)| [(*db).into(), (*table).into()]),
-    );
-
     // Fetch columns, in rank order, one row at a time.
+    let columns = columns_read(tables);
     let mut rows = conn
-        .exec_iter(
-            format!(
-                r#"
-            SELECT
-                FIELD(CONCAT(TABLE_SCHEMA, '.', TABLE_NAME), {ranks}) AS RK,
-                TABLE_SCHEMA,
-                TABLE_NAME,
-                COLUMN_NAME,
-                COLUMN_TYPE,
-                DATA_TYPE,
-                IS_NULLABLE,
-                ORDINAL_POSITION,
-                COLUMN_DEFAULT,
-                EXTRA,
-                COLUMN_COMMENT,
-                CHARACTER_MAXIMUM_LENGTH,
-                NUMERIC_PRECISION,
-                NUMERIC_SCALE,
-                CHARACTER_OCTET_LENGTH,
-                DATETIME_PRECISION,
-                (SELECT co.ID FROM INFORMATION_SCHEMA.COLLATIONS co
-                 WHERE co.COLLATION_NAME = c.COLLATION_NAME) AS COLLATION_ID
-            FROM INFORMATION_SCHEMA.COLUMNS c
-            WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({all_pairs})
-            ORDER BY RK, ORDINAL_POSITION
-            "#
-            ),
-            col_params,
-        )
+        .exec_iter(columns.sql, columns.params)
         .await
         .map_err(query_error)?;
+
     // The table being read: its rank, key, schema so far and bytes.
     let mut current: Option<(usize, (String, String), MySqlTableSchema, u64)> =
         None;
@@ -1208,31 +1302,14 @@ pub(crate) async fn fetch_table_schemas_within(
             oversized,
         });
     }
-    let pairs = vec!["(?, ?)"; tables.len()].join(", ");
-    let params: Vec<mysql_async::Value> = tables
-        .iter()
-        .flat_map(|(db, table)| [(*db).into(), (*table).into()])
-        .collect();
 
     #[cfg(test)]
     read_hook::after(tables, 1).await;
 
     // Fetch primary key
-    let pk_rows: Vec<Row> = conn
-        .exec(
-            format!(
-                r#"
-            SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME
-            FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-            WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({pairs})
-              AND CONSTRAINT_NAME = 'PRIMARY'
-            ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
-            "#
-            ),
-            params.clone(),
-        )
-        .await
-        .map_err(query_error)?;
+    let pk = primary_key_read(tables);
+    let pk_rows: Vec<Row> =
+        conn.exec(pk.sql, pk.params).await.map_err(query_error)?;
     for mut row in pk_rows {
         let key: (String, String) = (
             row.take("TABLE_SCHEMA").unwrap(),
@@ -1247,18 +1324,9 @@ pub(crate) async fn fetch_table_schemas_within(
     read_hook::after(tables, 2).await;
 
     // Primary-key prefix lengths (a prefixed key part, e.g. a BLOB prefix).
+    let prefix = key_prefix_read(tables);
     let prefix_rows: Vec<Row> = conn
-        .exec(
-            format!(
-                r#"
-            SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, SUB_PART
-            FROM INFORMATION_SCHEMA.STATISTICS
-            WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({pairs})
-              AND INDEX_NAME = 'PRIMARY' AND SUB_PART IS NOT NULL
-            "#
-            ),
-            params.clone(),
-        )
+        .exec(prefix.sql, prefix.params)
         .await
         .map_err(query_error)?;
     for mut row in prefix_rows {
@@ -1280,17 +1348,9 @@ pub(crate) async fn fetch_table_schemas_within(
     read_hook::after(tables, 3).await;
 
     // Fetch table metadata
+    let meta = table_metadata_read(tables);
     let table_rows: Vec<Row> = conn
-        .exec(
-            format!(
-                r#"
-            SELECT TABLE_SCHEMA, TABLE_NAME, ENGINE, TABLE_COLLATION
-            FROM INFORMATION_SCHEMA.TABLES
-            WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({pairs})
-            "#
-            ),
-            params,
-        )
+        .exec(meta.sql, meta.params)
         .await
         .map_err(query_error)?;
     for mut row in table_rows {

@@ -8,6 +8,10 @@ DeltaForge tails the MySQL binlog to capture row-level changes with automatic ch
 
 ## Prerequisites
 
+### MySQL Server Version
+
+**MySQL 8.0.19 or later is required**; only MySQL 8.4 is validated (see [Deployment support](../deployment-support.md)). The source reads table definitions with `VALUES ROW` derived tables, added in 8.0.19, so it refuses an older server, and MariaDB, with an `Incompatible` error naming the reported version. The version is checked with `log_replica_updates` below: before anything durable is written or any table is read, and again each time a binlog stream opens.
+
 ### MySQL Server Configuration
 
 Ensure your MySQL server has binary logging enabled with row-based format:

@@ -15,7 +15,7 @@ The delivery and correctness guarantees referenced below are defined in [Guarant
 | Component | Validated version | Notes |
 |-----------|------------------------|-------|
 | PostgreSQL (source) | **17** | Logical replication (`wal_level = logical`). There is no hard server-version gate in code; other recent majors likely work but are not part of the validated envelope. Validate before relying on a different major. |
-| MySQL (source) | **8.4** | Native binlog CDC. **MariaDB is not supported.** |
+| MySQL (source) | **8.4** | Native binlog CDC. **Minimum MySQL 8.0.19**: the source refuses an older server, and MariaDB, before it reads anything (its schema capture uses `VALUES ROW`, added in 8.0.19). The minimum is what the source's statements need; only 8.4 is validated. **MariaDB is not supported.** |
 | Kafka (sink) | Tested on **Confluent Platform 7.5 and 7.7** (`cp-kafka`) | The transactional producer (`exactly_once: true`) needs a broker with transaction support (the Kafka 2.5+ protocol floor). Other broker versions and distributions are untested - validate during onboarding. |
 
 Other sinks (Redis, NATS, HTTP, S3-compatible object storage, ClickHouse, Elasticsearch) are supported as documented on their per-sink pages; run your target versions through a disposable pipeline during onboarding.
