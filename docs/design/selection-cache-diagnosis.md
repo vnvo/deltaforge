@@ -1,6 +1,6 @@
 # Selection-Cache Diagnosis - Measurement Instrumentation
 
-**Status:** Implemented on branch `perf-cache-diagnosis` (instrumentation only). No measurement has run with it; the plan in section 5 is for review.
+**Status:** Instrumentation implemented on branch `perf-cache-diagnosis`. The fix's validation (section 6) ran at `84dfd735` and its scoped performance validation is accepted with qualifications (section 6.7; results in `crates/perf-harness/results/2026-11-selection-cache-byte-budget.md`).
 **Date:** 2026-11-02
 **Scope:** the residual post-activation latency seen in stage 2 at every DeltaForge point whose active set exceeds the selection cache's 4,096-timeline bound (`crates/perf-harness/results/scale-stage2-plan.md`; evidence `scale-stage2-review-775c6ec3*`). Stage 2 showed the correlation (evictions are zero below the bound and 119k to 547k above it), not the cause: history reads were not observable in the release build and the counters were whole-run totals. Activation interference (stream-wide blocking behind the activation-window chain) is a separate problem and is not instrumented here.
 
@@ -131,7 +131,9 @@ Every run is reported with its usable post-activation seconds and rows: traffic 
 
 **Runs:** step 1: 20; step 1b: 20; step 2: 40; step 3: 20.
 
-## 6. Fix validation plan (for review; nothing has run)
+## 6. Fix validation plan and results
+
+Sections 6.1 to 6.6 are the plan as fixed before each step ran; section 6.7 records the outcome.
 
 The fix (branch `selection-cache-byte-budget`, PR #195) removes the 4,096-timeline bound. The cache is bounded by 256 MiB of estimated memory alone, the estimate counts what entries allocate at jemalloc's size classes, and a load admits at most half the bound (its first timeline may take all of it) without evicting its own entries. Its measurement build takes only the byte bound (`DELTAFORGE_PERF_SELECTION_CACHE_BYTES`); the table variable of section 3 applies to `df89d2d0` builds only.
 
@@ -293,6 +295,26 @@ Disk, measured on the step 3 outputs:
 - The release test build needs about 3 GB in the fix worktree.
 
 Each invocation starts with at least 50 GiB free and runs under the harness's 25 GiB floor.
+
+### 6.7 Results and acceptance (2026-11-06)
+
+The scoped performance validation of `84dfd735` is accepted with the qualifications below. It is not a release acceptance. The full report, with every point's figures, is `crates/perf-harness/results/2026-11-selection-cache-byte-budget.md`.
+
+**Results.**
+- **Invalidation (section 6.5):** passed the revised budget in every population.
+- **F0 (section 6.3):** failed, and the verdict stands. Measurement-build results do not transfer to default builds.
+- **Part A, default builds (60 runs):** no failure under the frozen verdict, with every run complete and correct. Where the active set exceeded 4,096 tables, evictions fell to zero or near it. At t40000-a50-burst-o0: 195 against 1,113,493 evictions, p50 28.7 against 73.6 ms, p99 78.4 against 141.1 ms, activation-period p99 7.4 against 22.7 s. At the controls F matched B. Rule 1 was unavailable.
+- **Part B, measurement builds (70 runs):** rule 1 (F against B-L) passed at the three fits points under both the frozen and the corrected reload definitions, and rule 5 passed everywhere. Rule 4's loader criterion passed at t1000-a20-burst-o0 and failed at t10000-a20-burst-o0. The frozen W criterion was not met at t40000-a50-burst-o0.
+
+**Exceptions accepted for this validation.**
+- **E1, cold-fill loader calls at t10000-a20-burst-o0.** F made 2,387 logical loader calls before the last activation against B's 2,349 (medians, +38, 1.6%), with the same 2,000 tables requested in every run. The runs differ in how the tables split between read-ahead and on-demand loads, in the same two patterns in both arms; F's on-demand calls carried more tables. The extra 8.7 ms of measured loader time per cold span produced no observed cold-fill latency or CPU regression: last activation -15 ms, activation-period p99 -27.5 ms, cold-span CPU -0.02 s. The frozen failure stays recorded, and no code is changed to make the counter pass. Future plans should judge cold loading by tables requested and loader time with a tolerance, not by a zero increase in logical calls.
+- **E2, the working set at 20,000 tables.** F-L had zero evictions after the last activation, but requested 1 to 29 timelines per run (B-L 4 to 24), nearly all by read-ahead. That supports no capacity churn but does not meet the frozen criterion, and the suggested cause (invalidation and reload) is not proven. W is not established, and no sizing claim depends on it.
+
+**Memory limitation.** Acceptance covers the validated cache-owned allocation accounting: the cache-bytes gauge within its bound in every sample, checked against the allocator by the accounting and memory tests. It does not cover process RSS. In default builds at 20,000 active tables, the fix's peak RSS was about 150 MiB higher than the base's (1,034.8 against 885.1 MiB). The base retained at most 4,096 timelines and the fix 20,000; that is context, not a proven attribution of the whole increase.
+
+**Provisional limitation.** A database barrier over 90% of a nearly full cache takes about 121 to 124 ms (section 6.5). It is provisionally accepted, and frequent broad invalidations remain unqualified.
+
+**Open.** F0's failed verdict. An unexplained SIGBUS of the sources library test binary in one CI coverage run at `df726153` (passed on rerun and on later revisions). Activation interference (see Scope).
 
 ## 7. The barrier index
 
