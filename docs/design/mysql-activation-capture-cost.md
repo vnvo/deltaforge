@@ -1,10 +1,9 @@
 # MySQL activation: schema-capture cost
 
-Status: **step 1 done; step 2 authorized; validation criteria final
-(2026-11-06).** The probe's findings are below. The query change (step 2)
-is authorized; step 3, the product A/B, is held until the implementation is
-reviewed, and runs against the criteria fixed here. Deeper speculation,
-reordered delivery and release acceptance are held.
+Status: **steps 1 to 3 done (2026-11-07).** The A/B missed its frozen
+criteria; the performance result was accepted by explicit review exception
+(see Results). The miss stands and is not relabelled as a pass. Deeper
+speculation, reordered delivery and release acceptance are held.
 
 ## Problem
 
@@ -134,7 +133,7 @@ Equivalence is proven by the existing capture and schema-loader tests plus
 a live test comparing every statement's rows and result metadata with the
 previous row-constructor statements.
 
-## Step 3: validation (provisional)
+## Step 3: validation
 
 Default builds only, so the failed instrumentation check (F0 of PR #195)
 does not apply. Arms: B = `7724ff08`, F = the change. Five repetitions per
@@ -191,3 +190,64 @@ a rerun or a revised threshold.
 
 The probe's gain is statement time. Window overlap and locking determine
 how much of it reaches activation latency; only criterion 3 measures that.
+
+### Results (2026-11-07)
+
+Evidence: `~/deltaforge-evidence/capture-ab-<point>-279ee777` (one per
+point), the frozen verdict in `capture-ab-review-279ee777`, and the
+supplemental analysis in `capture-ab-supplement-279ee777`. Pinned default
+runners: B `ff2929ec`, F `55b793c2`; one harness, `f4d00701`, identical at
+both revisions.
+
+**Frozen verdict: MISS.** All 50 runs were correct and sufficient.
+
+| Criterion | Result |
+|---|---|
+| 1. Correctness | pass |
+| 2. Capture cost per table | pass: 78.3% lower at t10000-a50-steady, 81.8% at t40000-a20-steady, 64.9% at t40000-a50-burst |
+| 3. Outcome | fail at all three improvement points: last activation 5.7%, 4.9%, 14.1% better; already-active p99 79.7%, 98.1%, 73.2% better |
+| 4. Controls | pass at both |
+| 5. Guard | fail at both 40,000-table points: post-activation p99 +3.99 ms (steady), +18.66 ms (burst), against +2 ms; p50 and CPU within tolerance |
+
+**Supplemental analysis** (retained data only, written after the verdict):
+
+- The guard failures cluster at the start of the post-activation
+  interval, where both arms carry the same post-restart and eviction
+  recovery at the same clock time. Over a late interval common to all ten
+  runs of a point, post-activation p99 differs by +0.08 ms (steady) and
+  +0.14 ms (burst), and p99.9 is lower in F.
+- Last activation does not measure the pipeline under this protocol. The
+  generator is open loop, with a table order seeded by the run's sequence
+  number, so the arms differ in when each table first receives a row. At
+  the burst point every run's last activation falls 0.1 to 0.2 s after its
+  last first-row commit. At the steady 40,000-table point that commit falls
+  inside the scheduled stop in 9 of 10 runs, which puts last activation
+  after the resume.
+- The activation lag (first row's arrival minus its commit, outside the
+  catch-up) is pipeline-attributable: its median p99 fell 70% at
+  t10000-a50-steady, 96% at t40000-a20-steady and 55% at t40000-a50-burst.
+- Unexplained and kept visible: at the steady 40,000-table point, F's p99
+  is higher at 60 to 70 s after load start (49.1 against 46.2 ms) and
+  equal from 70 s; at the burst point it is 2 to 4 ms higher at 110 to
+  130 s.
+- The deferral counter counts table deferrals: a table cut from several
+  windows counts once per cut. Cut windows were 0 to 4 per run, all in the
+  load's first burst, in both arms. Distinct deferred tables are not
+  recorded.
+
+**Decision.** The performance result was accepted by explicit review
+exception: capture is 65 to 82% cheaper, activation lag falls 55 to 96%,
+and the common late intervals show no sustained latency penalty. No
+further benchmark runs for this change.
+
+**Protocol limitations**, for any later validation:
+
+- Arms get different generator seeds, so table first-commit times differ
+  between arms.
+- The scheduled stop falls inside activation at the large points.
+- The post-activation interval starts at each run's own last activation
+  and catch-up end, so it begins at different clock times in the two arms.
+- Activation lag was not a frozen metric.
+
+A delivery stall seen in these runs, which predates this change, is
+tracked separately as a release blocker.
