@@ -1,10 +1,10 @@
 # MySQL activation: schema-capture cost
 
-Status: **provisional plan (2026-11-06).** Only step 1, the offline query
-probe, is authorized. The query-change PR and any product A/B run wait for
-the probe's findings and for the numerical criteria below to be finalized
-and reviewed. Deeper speculation, reordered delivery and release acceptance
-are held.
+Status: **step 1 done; step 2 authorized; validation criteria final
+(2026-11-06).** The probe's findings are below. The query change (step 2)
+is authorized; step 3, the product A/B, is held until the implementation is
+reviewed, and runs against the criteria fixed here. Deeper speculation,
+reordered delivery and release acceptance are held.
 
 ## Problem
 
@@ -85,20 +85,62 @@ harness's image, digest and settings. No product code changes.
   stops the probe. The program, fixture definitions, server version and raw
   results are retained with a manifest.
 
-## Step 2: query-change PR (not authorized)
+### Findings (2026-11-06)
 
-Only if the probe shows a material gain with complete equivalence: the
-query forms change, nothing else. The window, speculation and commit code
-is untouched. Equivalence is proven by the existing capture and
-schema-loader tests plus a test comparing result rows across the forms.
+Evidence: `~/deltaforge-evidence/capture-probe-7724ff08` (manifest
+`f499c1a5`), MySQL 8.4.9.
+
+- **Cause.** The row-constructor filter is never used for a lookup: each
+  statement reads every table of the catalog (or of the database, when all
+  tables share one) and filters afterwards. Each statement costs about the
+  same at any batch size: about 30 ms at 40,000 tables, 55 ms under the
+  steady load. At 64 tables that is 4.3 ms per table, as in the Part A
+  traces.
+- **The derived-table join** (`FROM (VALUES ROW(?, ?), ...) AS r (s, n)
+  JOIN <view> ON TABLE_SCHEMA = r.s AND TABLE_NAME = r.n`) reads tables by
+  name in every plan, at every size and in every catalog. Non-lock capture
+  time at 64 tables, steady load: 57 to 15 ms at 10,000 tables, 274 to 22
+  ms at 40,000 (3.0 to 3.7 and 11.4 to 12.5 times). No gain at one table.
+- **Equivalence.** Values, types, nulls, order, keys, prefixes, collations
+  and result metadata identical to the current statements in every
+  comparison, including case and accent pairs, missing tables and
+  databases, a view, MyISAM, partitioned tables and prefix, composite and
+  descending keys. The per-database and per-pair `UNION` forms change
+  result metadata and are slower; a join instead of the collation subquery
+  gains nothing. Neither is used.
+- **Locks are separate.** A batch's first capture opens its tables while
+  locking (about 0.25 to 0.6 ms per table) in every form.
+- **The existence query** costs 1 to 2 ms warm under the join (9 to 14 ms
+  cold). It stays: removing it would turn a dropped table into a failed
+  batch (1146 on its lock) instead of a missing one.
+- **Limits.** One capture at a time (production overlaps windows and runs
+  up to four capture slots); the host page cache stayed warm; 8.4.9 only.
+
+## Step 2: query change (authorized)
+
+The five capture statements (existence, columns, primary key, key prefixes,
+table metadata) filter by the derived-table join, with bound parameters.
+Unchanged: the existence query, the collation subquery, `FIELD` rank order
+and every `ORDER BY`, the transaction, the sorted lock order and failure
+handling. The window, speculation and commit code is untouched. The
+requested pairs are deduplicated (first occurrence kept), so every caller
+gets the rows it got from `IN`.
+
+`VALUES ROW` needs MySQL 8.0.19: the source refuses an older server, and
+MariaDB, before it reads anything. That is the minimum the statements need;
+qualification remains MySQL 8.4 (the probe measured 8.4.9 only).
+
+Equivalence is proven by the existing capture and schema-loader tests plus
+a live test comparing every statement's rows and result metadata with the
+previous row-constructor statements.
 
 ## Step 3: validation (provisional)
 
 Default builds only, so the failed instrumentation check (F0 of PR #195)
 does not apply. Arms: B = `7724ff08`, F = the change. Five repetitions per
-arm and point, one warm-up per arm, arms alternating, fresh state per run,
-240 s of load, the Part A sufficiency rule (at least 80 usable
-post-activation seconds).
+arm at each of the five points below: 50 measured runs, plus one warm-up per
+arm and point. Arms alternate, state is fresh per run, 240 s of load, the
+Part A sufficiency rule (at least 80 usable post-activation seconds).
 
 Points:
 
@@ -126,25 +168,26 @@ Definitions:
 - **Post-activation latency:** as in Part A, excluding the restart
   catch-up.
 
-Criteria. The structure is fixed now; the numbers are set from the probe's
-results and reviewed before any run:
+Criteria, fixed before any run. Percentages apply to the medians of the
+five runs per arm. A miss returns the result for review: it never triggers
+a rerun or a revised threshold.
 
 1. **Correctness, every run:** no missing, duplicate or out-of-order row,
    no run error. Any failure fails the validation.
-2. **Mechanism, improvement points:** capture cost per table falls by at
-   least a set fraction, informed by the probe's measured statement gain.
+2. **Mechanism, improvement points:** capture cost per table at least 50%
+   lower at t40000-a20-steady-o0 and t40000-a50-burst-o0, and at least 30%
+   lower at t10000-a50-steady-o0.
 3. **Outcome, improvement points:** the last activation and the
-   activation-period already-active p99 each improve by at least a set
-   fraction, and beyond the base's run-to-run spread (the rule for that is
-   set with the numbers).
-4. **No regression, controls:** the last activation and the
-   activation-period already-active p99 within the Part A cold-fill
-   tolerances (+5% or +1 s, and +5% or +5 ms, whichever is larger); capture
-   cost per table not above the base's by more than a set tolerance.
-5. **Guard, every point:** post-activation p50 and p99 and CPU within the
-   Part A tolerances (+3% or +1 ms, +3% or +2 ms, +5%); deferrals and MySQL
-   connections reported.
+   activation-period already-active p99 each at least 20% better at both
+   40,000-table points and at least 10% better at t10000-a50-steady-o0;
+   and every F run better than B's median on both.
+4. **No regression, controls:** the last activation within +5% or +1 s,
+   and the activation-period already-active p99 within +5% or +5 ms,
+   whichever is larger (the Part A cold-fill tolerances); capture cost per
+   table at most B's plus 10% or 0.2 ms, whichever is larger.
+5. **Guard, every point:** post-activation p50 within +3% or +1 ms, p99
+   within +3% or +2 ms, CPU within +5% (the Part A tolerances); deferrals
+   and MySQL connections reported.
 
-The projected effect is a hypothesis. Phases overlap, so a lower capture
-cost need not shorten activation in proportion; only criterion 3 measures
-that.
+The probe's gain is statement time. Window overlap and locking determine
+how much of it reaches activation latency; only criterion 3 measures that.
