@@ -7,12 +7,16 @@
 //! `cargo test -p sources --test mysql_history_cache_e2e -- --include-ignored --test-threads=1`
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use checkpoints::{CheckpointStore, MemCheckpointStore};
-use deltaforge_config::{OnSchemaDrift, SnapshotCfg, SnapshotMode};
+use deltaforge_config::{
+    MysqlProofCfg, OnSchemaDrift, SnapshotCfg, SnapshotMode,
+};
 use deltaforge_core::{Source, SourceItem};
 use gate_ownership::GateOwned;
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use mysql_async::prelude::Queryable;
 use scale_harness::counting::CountingBackend;
 use sources::MySqlSource;
@@ -74,6 +78,7 @@ async fn run(
     port: u16,
     id: &str,
     counting: &Arc<CountingBackend>,
+    proofs: MysqlProofCfg,
 ) -> (deltaforge_core::SourceHandle, Delivered) {
     let backend: ArcStorageBackend = counting.clone();
     let src = MySqlSource {
@@ -94,7 +99,7 @@ async fn run(
         table_options: Default::default(),
         rotation: None,
         snapshot_cohort: Default::default(),
-        proofs: Default::default(),
+        proofs,
         type_mapping: deltaforge_core::TypeMapping::V2,
     };
     let ckpt: Arc<dyn CheckpointStore> =
@@ -144,6 +149,71 @@ async fn delivered(rows: &Delivered, tables: usize, each: usize) {
     }
 }
 
+/// Every table delivered exactly `each` rows: none lost, none twice.
+fn exactly(rows: &Delivered, tables: usize, each: usize) {
+    let rows = rows.lock().unwrap();
+    assert_eq!(rows.len(), tables, "every table delivered");
+    let off: Vec<_> = rows.iter().filter(|(_, n)| **n != each).collect();
+    assert!(off.is_empty(), "not {each} row(s) each: {off:?}");
+}
+
+/// The process's metrics, recorded for reading back (installed once).
+fn recorded() -> &'static Snapshotter {
+    static SNAP: OnceLock<Snapshotter> = OnceLock::new();
+    SNAP.get_or_init(|| {
+        let rec = DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        metrics::set_global_recorder(rec).expect("no other recorder");
+        snap
+    })
+}
+
+/// The selection cache's published bytes and timelines for source `id`.
+fn cache_gauges(snap: &Snapshotter, id: &str) -> (u64, u64) {
+    let (mut bytes, mut timelines) = (None, None);
+    for (key, _, _, value) in snap.snapshot().into_vec() {
+        let key = key.key();
+        if !key.labels().any(|l| l.key() == "source" && l.value() == id) {
+            continue;
+        }
+        let DebugValue::Gauge(v) = value else {
+            continue;
+        };
+        match key.name() {
+            "deltaforge_mysql_selection_cache_bytes" => {
+                bytes = Some(v.into_inner() as u64)
+            }
+            "deltaforge_mysql_selection_cache_timelines" => {
+                timelines = Some(v.into_inner() as u64)
+            }
+            _ => {}
+        }
+    }
+    (
+        bytes.expect("cache bytes published"),
+        timelines.expect("cache timelines published"),
+    )
+}
+
+/// Sample `id`'s published cache bytes every few milliseconds until
+/// stopped; the highest sample.
+fn sample_cache_bytes(
+    snap: &'static Snapshotter,
+    id: &'static str,
+) -> (Arc<AtomicBool>, tokio::task::JoinHandle<u64>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = stop.clone();
+    let task = tokio::spawn(async move {
+        let mut peak = 0;
+        while !stopped.load(Ordering::SeqCst) {
+            peak = peak.max(cache_gauges(snap, id).0);
+            sleep(Duration::from_millis(5)).await;
+        }
+        peak.max(cache_gauges(snap, id).0)
+    });
+    (stop, task)
+}
+
 /// Every store call, and the stream reads among them.
 fn calls(counting: &CountingBackend) -> (u64, u64) {
     let ops = counting.ops();
@@ -174,7 +244,8 @@ async fn a_barrier_elsewhere_keeps_cached_histories() {
     sql(port, &ddl).await;
     let counting =
         Arc::new(CountingBackend::new(Arc::new(MemoryStorageBackend::new())));
-    let (handle, rows) = run(port, "hist-barrier", &counting).await;
+    let (handle, rows) =
+        run(port, "hist-barrier", &counting, MysqlProofCfg::default()).await;
     let burst = |id: usize| -> Vec<String> {
         (0..N)
             .map(|i| format!("INSERT INTO {DB}.t{i:03} VALUES ({id}, {id})"))
@@ -205,13 +276,23 @@ async fn a_barrier_elsewhere_keeps_cached_histories() {
     assert!(total <= 20, "{total} store calls for {N} cached tables");
 }
 
-/// Known tables the cache evicted return in batches: a burst of their next
-/// rows (separate transactions) costs the store a few calls per batch, not
-/// a series of reads per table.
+/// Known tables the cache evicted return in batches. The source is held at
+/// the first event of a burst of their next rows (separate transactions)
+/// until the whole burst is in the binlog, on the same run and cache, so
+/// every history load can take as many returning tables as the cache's
+/// batch room allows: one bounded store read each, a few calls per batch,
+/// every row delivered once, within the cache's bound. A further burst
+/// arriving live is checked for delivery and bound only (how it batches
+/// depends on how much of it has arrived when a table is reached).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires docker"]
 async fn evicted_tables_return_in_batched_reads() {
+    use sources::stream_probe::{Point, hold_after, reset_event_hooks};
     const N: usize = 300;
+    const ID: &str = "hist-evict";
+    // A cache of about 64 tables: most of them are evicted between bursts.
+    const BOUND: u64 = 512 << 10;
+    let snap = recorded();
     let (container, port) = start().await;
     let mut ddl = vec![format!("CREATE DATABASE {DB}")];
     ddl.extend((0..N).map(|i| {
@@ -220,10 +301,15 @@ async fn evicted_tables_return_in_batched_reads() {
     sql(port, &ddl).await;
     let counting =
         Arc::new(CountingBackend::new(Arc::new(MemoryStorageBackend::new())));
-    // A cache of 64 tables: most of them are evicted between the bursts.
-    sources::stream_probe::set_selection_cache_limits(Some((64, 256 << 20)));
-    let (handle, rows) = run(port, "hist-evict", &counting).await;
-    sources::stream_probe::set_selection_cache_limits(None);
+    sources::stream_probe::set_selection_cache_bytes(Some(BOUND));
+    // A read-ahead bounded by its tables, events and bytes, not by time:
+    // the held burst is read from what the stream already holds.
+    let proofs = MysqlProofCfg {
+        activation_window_ms: *deltaforge_config::MYSQL_PROOF_WINDOW_MS.end(),
+        ..Default::default()
+    };
+    let (handle, rows) = run(port, ID, &counting, proofs).await;
+    sources::stream_probe::set_selection_cache_bytes(None);
     let burst = |id: usize| -> Vec<String> {
         (0..N)
             .map(|i| format!("INSERT INTO {DB}.t{i:03} VALUES ({id}, {id})"))
@@ -231,31 +317,110 @@ async fn evicted_tables_return_in_batched_reads() {
     };
     sql(port, &burst(1)).await;
     delivered(&rows, N, 1).await;
+    exactly(&rows, N, 1);
     sleep(Duration::from_secs(1)).await;
-    counting.reset();
-    sql(port, &burst(2)).await;
-    delivered(&rows, N, 2).await;
-    let (total, reads) = calls(&counting);
-    eprintln!(
-        "{N} tables returning to a 64-table cache: {total} store calls, \
-         {reads} stream reads"
+
+    let (bytes, timelines) = cache_gauges(snap, ID);
+    assert!(bytes <= BOUND, "{bytes} cached bytes over {BOUND}");
+    assert!(
+        (timelines as usize) < N / 2,
+        "{timelines} of {N} tables cached: most are evicted"
     );
+
+    // Held after the burst's first event until all of it is in the binlog.
+    let (reached, release) = hold_after(Point::AfterGtid, 1);
+    counting.reset();
+    sources::stream_probe::record_history_batches(true);
+    let (stop, peak) = sample_cache_bytes(snap, ID);
+    sql(port, &burst(2)).await;
+    tokio::time::timeout(Duration::from_secs(60), reached.notified())
+        .await
+        .expect("held at the burst's first transaction");
+    release.notify_one();
+    delivered(&rows, N, 2).await;
+    reset_event_hooks();
+    let batches = sources::stream_probe::history_batches();
+    sources::stream_probe::record_history_batches(false);
+    let ops: BTreeMap<&str, u64> = counting
+        .ops()
+        .into_iter()
+        .map(|(p, s)| (p, s.calls))
+        .collect();
+    let (total, reads) = calls(&counting);
+    exactly(&rows, N, 2);
+
+    // The constraint every batch works under: a load admits at most half
+    // the bound, each table with its version as one charge. With the
+    // largest charge any batch weighed, a load that fills its half caches
+    // at least `fill` tables; the burst then needs at most `ceiling`
+    // batches, each one batched history read, provided every batch reads
+    // at least `fill` tables (checked below, not assumed).
+    let largest = batches.iter().map(|b| b.largest_charge).max().unwrap_or(1);
+    let fill = (BOUND / 2 / largest).saturating_sub(1) as usize;
+    assert!(fill >= 4, "{fill} tables per half bound at {largest} bytes");
+    let ceiling = N.div_ceil(fill) as u64;
+    eprintln!(
+        "{N} held tables returning to a {BOUND}-byte cache ({timelines} \
+         cached in {bytes} bytes): {total} store calls, {reads} stream reads; \
+         largest charge {largest}, {fill} tables per half bound, ceiling \
+         {ceiling}; by operation {ops:?}; batches (read, admitted, largest, \
+         room), first 12 of {}: {:?}",
+        batches.len(),
+        batches
+            .iter()
+            .take(12)
+            .map(|b| (b.read, b.admitted, b.largest_charge, b.room))
+            .collect::<Vec<_>>()
+    );
+
+    // A live burst: delivered once each, within the bound.
+    sql(port, &burst(3)).await;
+    delivered(&rows, N, 3).await;
+    exactly(&rows, N, 3);
+    stop.store(true, Ordering::SeqCst);
+    let peak = peak.await.unwrap();
+    eprintln!("highest sampled cache bytes {peak}");
+
     handle.stop();
     let _ = tokio::time::timeout(Duration::from_secs(30), handle.join).await;
     container.rm().await.ok();
-    // How many batches the returning tables form depends on how many of
-    // their events the stream has read ahead when the first is reached (it
-    // varies with scheduling: 10 batches alone, up to 31 under concurrent
-    // load). What does not vary is the shape: every batch costs a few store
-    // calls, and the tables are read in batches, not one by one. It used to
-    // be 7 serial calls per returning table (2,100 calls, 300 reads here).
+    assert!(peak <= BOUND, "{peak} cached bytes over {BOUND}");
+    // No table's version read alone (an index lookup and a log read each).
+    for op in ["kv_get", "log_read_meta_since"] {
+        assert_eq!(ops.get(op), None, "{op}: versions read table by table");
+    }
+    // Every history read is a batch's, and a batch costs a few calls.
+    let batched = ops.get("log_read_streams_bounded").copied().unwrap_or(0);
+    assert_eq!(reads, batched, "only batched history reads: {ops:?}");
+    assert_eq!(batched, batches.len() as u64, "one read per batch");
     assert!(reads > 0, "the returning tables were read: {total} calls");
     assert!(
         total <= 5 * reads,
         "{total} store calls in {reads} batched reads: a few per batch"
     );
+    // The accounting: a batch that left tables uncached stopped at a charge
+    // that did not fit what was left, so it cached at least its room over
+    // the largest charge, less the one refused.
+    for b in &batches {
+        if b.admitted < b.read {
+            let least = (b.room / b.largest_charge).saturating_sub(1) as usize;
+            assert!(
+                b.admitted >= least,
+                "{b:?}: cached {} of a room for {least}",
+                b.admitted
+            );
+        }
+    }
+    // Batches large enough for the ceiling: every batch but the last read
+    // at least a half bound's worth of tables.
+    if let Some((_, rest)) = batches.split_last() {
+        for b in rest {
+            assert!(b.read >= fill, "{b:?}: read fewer than {fill} tables");
+        }
+    }
     assert!(
-        reads <= (N / 4) as u64,
-        "{reads} stream reads for {N} tables: not batched"
+        reads <= ceiling,
+        "{reads} batched reads for {N} tables at {fill} per batch: \
+         not batched (ceiling {ceiling})"
     );
 }

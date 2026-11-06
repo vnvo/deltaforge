@@ -181,6 +181,14 @@ struct Args {
     /// (`docs/design/selection-cache-diagnosis.md`).
     #[arg(long, value_delimiter = ',')]
     scale_cache_tables: Vec<usize>,
+    /// Scaling study: run the DeltaForge binaries as these arms,
+    /// `NAME=BINARY[:tables=N][:bytes=N]` (repeated): each arm once per
+    /// repetition, interleaved (the order alternates), on its `--binary`
+    /// with only its own selection-cache bounds, which the measurement
+    /// build must report before the run measures. Every DeltaForge binary
+    /// must run through an arm; not with `--scale-cache-tables`.
+    #[arg(long)]
+    scale_arm: Vec<String>,
     /// Count the DeltaForge runner's user-space instructions and cycles
     /// with `perf stat` for 30 s from 15 s into each scale run's load
     /// (hybrid CPUs: the scaled per-core-type counts are summed).
@@ -1381,6 +1389,14 @@ fn descends_from(mut pid: u32, ancestor: u32) -> bool {
     false
 }
 
+/// A `/proc/<pid>/status` field in KiB.
+fn status_kib(status: &str, field: &str) -> Option<u64> {
+    status.lines().find_map(|l| {
+        let v = l.strip_prefix(field)?.strip_prefix(':')?;
+        v.trim().trim_end_matches("kB").trim().parse().ok()
+    })
+}
+
 /// The SHA-256 of a file, as `sha256sum` prints it.
 fn sha256(path: &Path) -> Option<String> {
     let out = std::process::Command::new("sha256sum")
@@ -1394,18 +1410,20 @@ fn sha256(path: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Launch a runner on `dir`'s state store (or `state_dsn`) and wait until
-/// it serves its API; the API must be served by the process just started
-/// (or one it runs). Its standard error goes to `stderr`.
-async fn launch(
+/// The prefix of measurement builds' settings (`DELTAFORGE_PERF_*`): a
+/// runner gets only those its run sets, never the harness's own.
+const PERF_ENV_PREFIX: &str = "DELTAFORGE_PERF_";
+
+/// A runner's command on `dir`'s state store (or `state_dsn`): its
+/// addresses and log level, every inherited measurement setting (of the
+/// variable names `inherited`) removed, then the run's own (`env`) set.
+fn runner_command(
     binary: &Path,
     dir: &Path,
     state_dsn: Option<&str>,
-    stderr: &Path,
     env: &[(String, String)],
-) -> Result<(tokio::process::Child, u32, PathBuf)> {
-    std::fs::create_dir_all(dir)?;
-    ports_free().await?;
+    inherited: impl IntoIterator<Item = String>,
+) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(binary);
     cmd.args(["--api-addr", API, "--metrics-addr", METRICS]);
     match state_dsn {
@@ -1414,7 +1432,12 @@ async fn launch(
         }
         None => cmd.arg("--storage-path").arg(dir.join("state.db")),
     };
-    let mut child = cmd
+    for name in inherited {
+        if name.starts_with(PERF_ENV_PREFIX) {
+            cmd.env_remove(name);
+        }
+    }
+    cmd
         // `PERF_RUST_LOG` (diagnostics, e.g. the proof trace) or warnings.
         .env(
             "RUST_LOG",
@@ -1424,7 +1447,22 @@ async fn launch(
                 .unwrap_or_else(|| "warn".into()),
         )
         .env("_RJEM_MALLOC_CONF", "stats_print:true")
-        .envs(env.iter().map(|(k, v)| (k, v)))
+        .envs(env.iter().map(|(k, v)| (k, v)));
+    cmd
+}
+
+/// Launch a runner's command (its `binary`, in `dir`) and wait until it
+/// serves its API; the API must be served by the process just started (or
+/// one it runs). Its standard error goes to `stderr`.
+async fn launch(
+    mut cmd: tokio::process::Command,
+    binary: &Path,
+    dir: &Path,
+    stderr: &Path,
+) -> Result<(tokio::process::Child, u32, PathBuf)> {
+    std::fs::create_dir_all(dir)?;
+    ports_free().await?;
+    let mut child = cmd
         .stdout(std::fs::File::create(stderr.with_extension("out"))?)
         .stderr(std::fs::File::create(stderr)?)
         .kill_on_drop(true)
@@ -1481,20 +1519,52 @@ impl Process {
         state_dsn: Option<&str>,
         env: Vec<(String, String)>,
     ) -> Result<Process> {
-        let stderr = dir.join("stderr.log");
-        let (child, pid, exe) =
-            launch(binary, dir, state_dsn, &stderr, &env).await?;
-        Ok(Process {
+        let p = Self::unlaunched(binary, dir, state_dsn, env);
+        p.up().await?;
+        Ok(p)
+    }
+
+    /// A runner not launched yet: [`Self::up`] launches it.
+    fn unlaunched(
+        binary: &Path,
+        dir: &Path,
+        state_dsn: Option<&str>,
+        env: Vec<(String, String)>,
+    ) -> Process {
+        Process {
             binary: binary.to_path_buf(),
             dir: dir.to_path_buf(),
             state_dsn: state_dsn.map(str::to_string),
             env,
-            child: tokio::sync::Mutex::new(Some(child)),
-            pid: AtomicU32::new(pid),
-            exe: std::sync::Mutex::new(exe),
-            stderr: std::sync::Mutex::new(stderr),
-            launches: AtomicU32::new(1),
-        })
+            child: tokio::sync::Mutex::new(None),
+            pid: AtomicU32::new(0),
+            exe: std::sync::Mutex::new(PathBuf::new()),
+            stderr: std::sync::Mutex::new(dir.join("stderr.log")),
+            launches: AtomicU32::new(0),
+        }
+    }
+
+    /// Launch `n`'s command (the first is 1) and its standard error: every
+    /// launch runs the same binary on the same state store with the same
+    /// environment ([`runner_command`], the harness's own measurement
+    /// settings, named in `inherited`, removed).
+    fn command(
+        &self,
+        n: u32,
+        inherited: impl IntoIterator<Item = String>,
+    ) -> (tokio::process::Command, PathBuf) {
+        let stderr = match n {
+            1 => self.dir.join("stderr.log"),
+            n => self.dir.join(format!("stderr-{n}.log")),
+        };
+        let cmd = runner_command(
+            &self.binary,
+            &self.dir,
+            self.state_dsn.as_deref(),
+            &self.env,
+            inherited,
+        );
+        (cmd, stderr)
     }
 
     fn pid(&self) -> u32 {
@@ -1595,19 +1665,16 @@ impl Process {
         Ok(owner)
     }
 
-    /// Launch the runner again, as it was first launched (the same binary
-    /// and state store), with the same checks.
+    /// Launch the runner: first, or again as it was first launched (the
+    /// same binary, state store and environment), with the same checks.
     async fn up(&self) -> Result<()> {
         let n = self.launches.fetch_add(1, Ordering::SeqCst) + 1;
-        let stderr = self.dir.join(format!("stderr-{n}.log"));
-        let (child, pid, exe) = launch(
-            &self.binary,
-            &self.dir,
-            self.state_dsn.as_deref(),
-            &stderr,
-            &self.env,
-        )
-        .await?;
+        let (cmd, stderr) = self.command(
+            n,
+            std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()),
+        );
+        let (child, pid, exe) =
+            launch(cmd, &self.binary, &self.dir, &stderr).await?;
         *self.child.lock().await = Some(child);
         self.pid.store(pid, Ordering::SeqCst);
         *self.exe.lock().unwrap() = exe;
@@ -1675,15 +1742,20 @@ impl Process {
     }
 
     fn rss_kib(&self) -> u64 {
+        self.status_kib("VmRSS")
+    }
+
+    /// Its anonymous resident memory (`RssAnon`): the heap the allocator
+    /// holds, freed pages it keeps included, and the threads' stacks;
+    /// not the mapped binary and files.
+    fn rss_anon_kib(&self) -> u64 {
+        self.status_kib("RssAnon")
+    }
+
+    fn status_kib(&self, field: &str) -> u64 {
         std::fs::read_to_string(format!("/proc/{}/status", self.pid()))
             .ok()
-            .and_then(|s| {
-                s.lines()
-                    .find_map(|l| l.strip_prefix("VmRSS:"))
-                    .and_then(|v| {
-                        v.trim().trim_end_matches("kB").trim().parse().ok()
-                    })
-            })
+            .and_then(|s| status_kib(&s, field))
             .unwrap_or(0)
     }
 
@@ -3362,6 +3434,11 @@ async fn main() -> Result<()> {
                 catchup: args.scale_catchup,
                 only: args.scale_points.clone(),
                 cache_tables: args.scale_cache_tables.clone(),
+                arms: args
+                    .scale_arm
+                    .iter()
+                    .map(|a| scale::Arm::parse(a))
+                    .collect::<Result<_>>()?,
             };
             scale::study(
                 &plan,
@@ -3801,6 +3878,98 @@ async fn measure(
 
 #[cfg(test)]
 mod tests {
+    /// The environment a command sets (`Some`) and removes (`None`).
+    fn envs(
+        cmd: &tokio::process::Command,
+    ) -> std::collections::BTreeMap<String, Option<String>> {
+        cmd.as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    /// Status fields are read by their exact name.
+    #[test]
+    fn status_fields_parse_in_kib() {
+        let status =
+            "VmRSS:\t  2048 kB\nRssAnon:\t  1536 kB\nRssFile:\t 512 kB\n";
+        assert_eq!(super::status_kib(status, "VmRSS"), Some(2048));
+        assert_eq!(super::status_kib(status, "RssAnon"), Some(1536));
+        assert_eq!(super::status_kib(status, "Rss"), None);
+    }
+
+    /// A runner never inherits the harness's measurement settings: every
+    /// inherited `DELTAFORGE_PERF_*` variable is removed and only the run's
+    /// own are set; other variables are left alone.
+    #[test]
+    fn a_runner_gets_only_its_runs_measurement_settings() {
+        let dir = std::path::Path::new("/nonexistent");
+        let cmd = super::runner_command(
+            std::path::Path::new("runner"),
+            dir,
+            None,
+            &[(
+                "DELTAFORGE_PERF_SELECTION_CACHE_BYTES".into(),
+                "67108864".into(),
+            )],
+            [
+                "DELTAFORGE_PERF_SELECTION_CACHE_TABLES".to_string(),
+                "DELTAFORGE_PERF_SELECTION_CACHE_BYTES".to_string(),
+                "HOME".to_string(),
+            ],
+        );
+        let e = envs(&cmd);
+        assert_eq!(
+            e.get("DELTAFORGE_PERF_SELECTION_CACHE_TABLES"),
+            Some(&None),
+            "an inherited setting is removed"
+        );
+        assert_eq!(
+            e.get("DELTAFORGE_PERF_SELECTION_CACHE_BYTES"),
+            Some(&Some("67108864".into())),
+            "the run's own setting is set"
+        );
+        assert!(!e.contains_key("HOME"), "other variables are inherited");
+    }
+
+    /// A relaunch launches what the first launch did: the same binary,
+    /// arguments and environment, with its own standard error.
+    #[test]
+    fn a_relaunch_keeps_the_runs_settings() {
+        let p = super::Process::unlaunched(
+            std::path::Path::new("runner"),
+            std::path::Path::new("/nonexistent"),
+            Some("postgres://state"),
+            vec![(
+                "DELTAFORGE_PERF_SELECTION_CACHE_TABLES".into(),
+                "32768".into(),
+            )],
+        );
+        let inherited =
+            || ["DELTAFORGE_PERF_SELECTION_CACHE_BYTES".to_string()];
+        let (first, e1) = p.command(1, inherited());
+        let (again, e2) = p.command(2, inherited());
+        assert_eq!(envs(&first), envs(&again));
+        assert_eq!(
+            envs(&again).get("DELTAFORGE_PERF_SELECTION_CACHE_TABLES"),
+            Some(&Some("32768".into()))
+        );
+        let args = |c: &tokio::process::Command| {
+            c.as_std()
+                .get_args()
+                .map(|a| a.to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(args(&first), args(&again));
+        assert_eq!(first.as_std().get_program(), again.as_std().get_program());
+        assert_ne!(e1, e2, "each launch has its own standard error");
+    }
+
     #[test]
     fn scale_points_parse_as_a_comma_separated_list() {
         use clap::Parser;
@@ -3839,6 +4008,23 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(caches.scale_cache_tables, [4096, 8192]);
+        let arms = super::Args::try_parse_from([
+            "canonical-perf",
+            "--out",
+            "o",
+            "--scale-tables",
+            "40000",
+            "--scale-arm",
+            "B-L=base:tables=32768",
+            "--scale-arm",
+            "F-64=fix:bytes=67108864",
+        ])
+        .unwrap();
+        assert_eq!(
+            arms.scale_arm,
+            ["B-L=base:tables=32768", "F-64=fix:bytes=67108864"]
+        );
+        assert!(none.scale_arm.is_empty());
     }
 
     #[test]
