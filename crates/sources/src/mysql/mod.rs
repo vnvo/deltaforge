@@ -375,6 +375,10 @@ pub(crate) struct RunCtx {
     /// Proofs an activation window prepared, by table, consumed by the lazy
     /// baseline of the table's rows.
     prepared: HashMap<(String, String), mysql_activation_window::Prepared>,
+    /// Tables an activation window deferred because its capture started
+    /// behind their rows: the rows' start and how many windows in a row
+    /// did so (`mysql_activation_window::BEHIND_CAPTURE_RETRIES`).
+    behind_capture: HashMap<(String, String), (MySqlCheckpoint, usize)>,
     /// Schema-proof bounds.
     proofs: deltaforge_config::MysqlProofCfg,
     /// The source's shared proof scanner (`mysql_proof_scanner`), shared
@@ -1874,6 +1878,7 @@ impl MySqlSource {
             prefetch_error: None,
             last_received: std::time::Instant::now(),
             prepared: Default::default(),
+            behind_capture: Default::default(),
             proofs: self.proofs.clone(),
             proof_scanner: Arc::new(proof_scanner),
             selection: mysql_selection::Caches::new(&self.pipeline, &self.id),

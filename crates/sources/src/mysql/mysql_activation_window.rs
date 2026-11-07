@@ -1175,6 +1175,10 @@ async fn decide_and_commit(
 pub(crate) const BATCH_CONFLICT_RETRIES: usize = 3;
 /// Retries of a batch whose outcome a storage error left unknown.
 pub(crate) const BATCH_STORAGE_RETRIES: usize = 3;
+/// Windows that may defer a table because their capture started before
+/// its rows, without the table being decided in between, before the next
+/// such window fails closed.
+pub(crate) const BEHIND_CAPTURE_RETRIES: usize = 3;
 
 /// One table's decision before the batch: refused (and why), or a
 /// candidate whose shape is registered and whose baseline is proposed.
@@ -1324,6 +1328,65 @@ async fn admit_batch(
     let (tables, gone): (Vec<_>, Vec<_>) = tables
         .into_iter()
         .partition(|((db, table), _, _)| cap.table(db, table).is_some());
+    // A table whose rows start after the capture's start (ordered, so the
+    // stream had a transaction that the capture's first position read did
+    // not yet show as executed) is not contained by the capture, but its
+    // outcome is not uncertain: it stays undecided, deferred like a cut
+    // table, nothing of it decided or written, its rows back to the stream
+    // for a later window, whose capture starts later. A table deferred so
+    // in more than `BEHIND_CAPTURE_RETRIES` windows without being decided
+    // fails the window closed. An unordered start stays uncertain (below).
+    let from = mysql_checkpoint_position(
+        &cap.from.file,
+        cap.from.pos,
+        cap.from.gtid_set.as_deref(),
+    );
+    let (tables, behind): (Vec<_>, Vec<_>) =
+        tables.into_iter().partition(|(_, at, _)| {
+            let row = mysql_checkpoint_position(
+                &at.file,
+                at.pos,
+                at.gtid_set.as_deref(),
+            );
+            !matches!(
+                (&row, &from),
+                (Some(r), Some(f))
+                    if matches!(order_positions(r, f), CheckpointOrder::After)
+            )
+        });
+    for ((db, table), at, _) in &behind {
+        let k = (db.clone(), table.clone());
+        let n = match ctx.behind_capture.get(&k) {
+            Some((a, n))
+                if (&a.file, a.pos, &a.gtid_set)
+                    == (&at.file, at.pos, &at.gtid_set) =>
+            {
+                n + 1
+            }
+            _ => 1,
+        };
+        if n > BEHIND_CAPTURE_RETRIES {
+            ctx.behind_capture.remove(&k);
+            return Err(SourceError::Schema {
+                details: format!(
+                    "the activation window's capture of {db}.{table} started \
+                     before its rows' position in {n} windows: an uncertain \
+                     outcome; nothing of the window was admitted or \
+                     dispatched and the checkpoint stays before it"
+                )
+                .into(),
+            });
+        }
+        warn!(source_id = %ctx.source_id, %db, %table, windows = n, "activation window: the capture started before the table's rows; deferred");
+        ctx.behind_capture.insert(k, (at.clone(), n));
+    }
+    if !behind.is_empty() {
+        metrics::counter!(
+            "deltaforge_mysql_activation_window_behind_capture_total",
+            "source" => ctx.source_id.clone(),
+        )
+        .increment(behind.len() as u64);
+    }
     // Its rows are covered up to the statement that dropped or renamed it.
     // With no such statement in its proof answer the outcome is uncertain:
     // the window fails closed, before anything is written.
@@ -1787,8 +1850,19 @@ async fn admit_batch(
         let checked: Vec<(String, String)> =
             tables.iter().map(|(k, ..)| k.clone()).collect();
         super::mysql_failover_drift::window_checked(ctx, &checked).await?;
+        for (k, ..) in &governs {
+            ctx.behind_capture.remove(k);
+        }
         for ((db, table), at, _) in &deferred {
             trace_proof(&tag, db, table, None, None, lctn, "deferred");
+            governs.push((
+                (db.clone(), table.clone()),
+                at.clone(),
+                Governs::Deferred,
+            ));
+        }
+        for ((db, table), at, _) in &behind {
+            trace_proof(&tag, db, table, None, None, lctn, "behind_capture");
             governs.push((
                 (db.clone(), table.clone()),
                 at.clone(),
@@ -2883,6 +2957,94 @@ mod tests {
             assert_eq!(seqs(&ctx, "t1").await, (None, None), "nothing written");
             assert!(ctx.take_prepared("d", "t1", &wm(51), &at(51)).is_none());
             assert!(seqs(&ctx, "t2").await.1.is_some(), "t2 admitted");
+        }
+
+        /// A table deferred because the capture started before its rows is
+        /// deferred by at most `BEHIND_CAPTURE_RETRIES` windows; the next
+        /// such window fails closed with nothing written. Deciding the
+        /// table forgets its count.
+        #[tokio::test]
+        async fn a_capture_behind_a_tables_rows_is_retried_a_bounded_number_of_times()
+         {
+            let mut ctx = ctx_on(std::sync::Arc::new(
+                storage::MemoryStorageBackend::new(),
+            ))
+            .await;
+            for _ in 0..BEHIND_CAPTURE_RETRIES {
+                let (_, governs) =
+                    admit(&mut ctx, &["t1"], vec![entry("t1", 51)])
+                        .await
+                        .unwrap();
+                assert_eq!(governs[0].2, Governs::Deferred);
+            }
+            let err = admit(&mut ctx, &["t1"], vec![entry("t1", 51)])
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains(&format!(
+                    "started before its rows' position in {} windows",
+                    BEHIND_CAPTURE_RETRIES + 1
+                )),
+                "{err:#}"
+            );
+            assert_eq!(seqs(&ctx, "t1").await, (None, None), "nothing written");
+
+            let lineage = ctx
+                .registry_scope
+                .current()
+                .unwrap()
+                .lineage()
+                .lineage_hash
+                .clone();
+            let mut later = capture(&ctx, &["t1"]);
+            later.from = MySqlCheckpoint {
+                lineage: later.from.lineage.clone(),
+                ..at(55)
+            };
+            let (_, governs) = admit(&mut ctx, &["t1"], vec![entry("t1", 51)])
+                .await
+                .unwrap();
+            assert_eq!(governs[0].2, Governs::Deferred, "counting again");
+            let (_, governs) =
+                admit_batch(&mut ctx, &lineage, &later, vec![entry("t1", 51)])
+                    .await
+                    .unwrap();
+            assert_eq!(governs[0].2, Governs::Admitted);
+            assert!(ctx.behind_capture.is_empty(), "decided: count forgotten");
+        }
+
+        /// A table whose rows' position cannot be ordered against the
+        /// capture's start (another server's transactions) is still an
+        /// uncertain outcome: the window fails closed.
+        #[tokio::test]
+        async fn an_unordered_capture_start_still_fails_closed() {
+            let mut ctx = ctx_on(std::sync::Arc::new(
+                storage::MemoryStorageBackend::new(),
+            ))
+            .await;
+            let other = MySqlCheckpoint {
+                gtid_set: Some(format!(
+                    "{U}:1-49,4e11fa47-71ca-11e1-9e33-c80aa9429562:1-2"
+                )),
+                ..at(49)
+            };
+            let err = admit(
+                &mut ctx,
+                &["t1", "t2"],
+                vec![
+                    entry("t2", 5),
+                    (("d".into(), "t1".into()), other, report(Vec::new())),
+                ],
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                format!("{err:#}")
+                    .contains("does not contain its rows' position"),
+                "{err:#}"
+            );
+            assert_eq!(seqs(&ctx, "t2").await, (None, None), "nothing written");
+            assert!(ctx.behind_capture.is_empty());
         }
 
         /// A store that cannot commit: the window fails closed, nothing of it
