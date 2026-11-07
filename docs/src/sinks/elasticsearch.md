@@ -31,7 +31,7 @@ sinks:
 | `id_separator` | no | `_` | Separator joining composite `_id` values |
 | `version_source` | no | `source_position` | External `version`: `source_position` (LSN/binlog) or `ts_ms` |
 | `auth` | no | none | `basic` (`username`/`password`) or `api_key` (`api_key`); `${ENV}` supported |
-| `tls.enabled` | no | `true` | Accepted for parity; TLS is active whenever `url` is `https://` |
+| `tls.enabled` | no | `true` | **Ignored**: TLS is used exactly when `url` is `https://`; `true` with an `http://` URL connects in plaintext without an error |
 | `tls.ca_file` | no | — | PEM CA bundle for a private CA |
 | `tls.insecure_skip_verify` | no | `false` | Skip certificate verification |
 | `send_timeout_secs` | no | `30` | Per-`_bulk` timeout (timeouts → backpressure) |

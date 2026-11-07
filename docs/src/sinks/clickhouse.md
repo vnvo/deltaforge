@@ -29,12 +29,14 @@ sinks:
 | `mode` | no | `changelog` | `upsert` (current state) or `changelog` (retain all changes) |
 | `user` | no | — | ClickHouse user (`${ENV}` supported) |
 | `password` | no | — | Password/key (`${ENV}` supported) |
-| `tls.enabled` | no | `true` | TLS for `https://` endpoints |
+| `tls.enabled` | no | `true` | **Ignored** in this release: the URL scheme decides (see the warning below) |
 | `tls.insecure_skip_verify` | no | `false` | Skip certificate verification |
 | `version_source` | no | `source_position` | `_version` source: `source_position` (LSN/binlog) or `ts_ms` |
 | `auto_create` | no | `true` | Must be `true`: the sink writes only to a table it creates (see [Destination ownership](#destination-ownership-and-fencing)); `false` is rejected |
 | `send_timeout_secs` | no | `30` | Per-batch insert timeout (timeouts → backpressure) |
 | `required` | no | `true` | Required (blocks) vs best-effort (log + continue) |
+
+> **Warning:** `tls.ca_file` and `tls.enabled` are accepted but **not applied** in this release. TLS is used exactly when `url` is `https://`, verified against the system's trusted roots; a custom CA file is never loaded, and `tls.enabled: true` with an `http://` URL connects in plaintext without an error. Only `tls.insecure_skip_verify` takes effect.
 
 ## Modes
 

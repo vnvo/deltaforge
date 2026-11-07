@@ -355,7 +355,7 @@ sinks:
       exactly_once: false
       send_timeout_secs: 30
       client_conf:
-        security.protocol: SASL_SSL
+        security.protocol: SASL_SSL   # not available in this build: no Kafka TLS
 ```
 
 </td>

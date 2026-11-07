@@ -1,5 +1,7 @@
 # Production Kafka Configuration
 
+> **Not usable as written in this release.** This build's Kafka client has no TLS support and supports only the SASL mechanism `PLAIN`, so `security.protocol` `SSL` and `SASL_SSL`, mTLS, SCRAM, OAUTHBEARER and Kerberos fail. Use a plaintext listener on a trusted network until TLS support ships; the batching, acknowledgement and transaction settings below still apply. See [Network and TLS](../deployment-support.md#network-and-tls).
+
 This example demonstrates a production-ready Kafka sink configuration with authentication, high availability settings, and some  performance tuning.
 
 ## Overview

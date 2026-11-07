@@ -29,7 +29,7 @@ This page defines DeltaForge's data delivery guarantees, ordering model, transac
 
 The restart boundary is still **at-least-once**: DeltaForge advances its own checkpoint only after the Kafka transaction commits, so a crash between the commit and the checkpoint persist replays that batch on restart as a **new** transaction. A `read_committed` consumer then sees the batch a second time. To reach exactly-once end to end, consumers must dedup on the event `id` (or idempotency key), which is stable across replays.
 
-The transactional-producer overhead is **~7-11%** with properly tuned batch sizes. See the [Performance guide](performance.md#transactional-producer-overhead) for benchmark details.
+The transactional producer adds overhead per batch; an early development-machine measurement put it at about 7-11% with tuned batch sizes, but its raw output was not retained (see the [Performance guide](performance.md#transactional-producer-overhead)). Measure it in your environment.
 
 ## Ordering Model
 

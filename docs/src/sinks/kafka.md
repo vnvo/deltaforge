@@ -63,7 +63,7 @@ sinks:
 | `required` | bool | `true` | Gates checkpoints |
 | `exactly_once` | bool | `false` | Enable the transactional producer (atomic-batch delivery) |
 | `encode_workers` | int | `1` | Threads that encode an Avro batch, 1 to 64 (see [Avro encoding threads](#avro-encoding-threads)) |
-| `client_conf` | map | `{}` | librdkafka overrides |
+| `client_conf` | map | `{}` | librdkafka overrides. This build has no TLS and SASL `PLAIN` only: `security.protocol` `SSL` and `SASL_SSL`, and the mechanisms `SCRAM-SHA-256`, `SCRAM-SHA-512`, `OAUTHBEARER` and `GSSAPI`, are unavailable; `SASL_PLAINTEXT` with `PLAIN` sends credentials in clear (see [Network and TLS](../deployment-support.md#network-and-tls)) |
 
 </td>
 </tr>
