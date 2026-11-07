@@ -23,7 +23,7 @@ Known boundaries with an operator control, detailed below and in [Known limitati
 
 - At-least-once delivery: consumers dedup on the event `id`.
 - No automatic restart: a pipeline that stops fail-closed stays stopped until an operator restarts it.
-- No TLS to source databases, to a PostgreSQL state store, or to Kafka and Redis sinks; the REST API and metrics are unauthenticated ([Network and TLS](#network-and-tls)).
+- No transport encryption to source databases, a PostgreSQL state store, or Kafka and Redis sinks, and Kafka authentication limited to SASL `PLAIN` sent in clear: accepted for this beta **only on trusted, isolated networks**. The REST API and metrics are unauthenticated ([Network and TLS](#network-and-tls)).
 - Preflight does not cover every startup requirement ([Deployment preflight](#deployment-preflight)).
 - MySQL replay across an unprovable DDL stops fail-closed.
 - SQLite backup needs the WAL-safe procedure.
@@ -31,11 +31,13 @@ Known boundaries with an operator control, detailed below and in [Known limitati
 
 ### Unqualified deployments
 
+**Not suitable** for this release: any deployment that requires transport encryption between DeltaForge and its source databases, its state store, Kafka or Redis.
+
 Not validated for this release. They may work, but they are outside the supported envelope until qualified; validate them in a disposable environment first:
 
 - Source versions other than PostgreSQL 17 and MySQL 8.4 (MySQL 8.0.19 or later is accepted by the code; MariaDB is refused), and managed database services.
 - MySQL catalogs, active sets and fleets larger than the MySQL qualification run (one server, 40,000 tables, one pipeline); more than a few pipelines per instance.
-- The PostgreSQL state store (beta).
+- The PostgreSQL state store (beta). Its qualification is deferred: the release's qualification runs use the SQLite state store and do not cover it.
 - Live credential rotation and dynamic Vault database credentials.
 - Sink versions other than those the release-tier gate runs.
 
@@ -184,7 +186,13 @@ DeltaForge resolves credentials from typed secret references and never stores re
 
 ## Network and TLS
 
-Plan the network on the basis that **DeltaForge's source database connections, its PostgreSQL state-store connection, its Kafka and Redis sink connections and its own HTTP endpoints are not encrypted or authenticated in this release**. Deploy accordingly.
+Plan the network on the basis that **DeltaForge's source database connections, its PostgreSQL state-store connection, its Kafka and Redis sink connections and its own HTTP endpoints are not encrypted, and its HTTP endpoints are not authenticated, in this release**. This is accepted for this beta only on **trusted, isolated networks**: do not deploy DeltaForge where transport encryption is required.
+
+> **Warning: security settings that are accepted but not applied.** These settings pass configuration validation but change nothing, so do not rely on them:
+>
+> - **ClickHouse `tls.ca_file`** is ignored: a custom CA is never loaded, so a server signed by a private CA fails verification.
+> - **ClickHouse and Elasticsearch `tls.enabled`** are ignored: the URL scheme alone decides. `tls.enabled: true` with an `http://` URL connects **in plaintext without an error**; `tls.enabled: false` with `https://` still uses TLS.
+> - **TLS parameters in a source DSN** (for example PostgreSQL `sslmode`, MySQL SSL options) do not enable TLS in this build; whether a given parameter is refused or silently ignored has not been verified, so assume plaintext.
 
 - **Source DB connections are not encrypted.** Neither the PostgreSQL nor the MySQL source establishes TLS to the database in this build (the MySQL client is built without TLS, and every PostgreSQL connection, the replication stream included, is opened without TLS). Run DeltaForge on a trusted/private network segment with the source database, or place an encrypted tunnel (for example a service mesh sidecar, stunnel, or a cloud private link) between DeltaForge and the database. Do not run source traffic across an untrusted network. Do not rely on TLS parameters in a DSN: they do not enable TLS in this build.
 - **The PostgreSQL state store connection is not encrypted** either; keep that database on the same trusted network.
@@ -192,10 +200,10 @@ Plan the network on the basis that **DeltaForge's source database connections, i
 - **Metrics endpoint is unauthenticated** and defaults to `0.0.0.0:9000` (all interfaces). Bind it to loopback (`--metrics-addr 127.0.0.1:9000`) where the scraper is local, or confine it with a firewall/NetworkPolicy. **`/metrics` is also served on the API listener**, so restricting `--metrics-addr` alone does not hide it. See [Observability](observability.md#metrics-endpoint-address-and-exposure).
 - **Recovery admin listener**: `deltaforge recover` uses a separate listener (`--admin-addr`, default `127.0.0.1:9091`, loopback only) that starts only when `--admin-token-file` is given and requires that bearer token.
 - **Sink TLS in this build:**
-  - **Kafka: no TLS.** The Kafka client is built without OpenSSL, so `security.protocol` `SSL` and `SASL_SSL` do not work, and neither does SASL/SCRAM. Use a plaintext listener on a trusted network.
+  - **Kafka: no TLS, and SASL `PLAIN` only.** The Kafka client is built without OpenSSL and without Kerberos, so `security.protocol` `SSL` and `SASL_SSL` are unavailable, and so are the SASL mechanisms `SCRAM-SHA-256`, `SCRAM-SHA-512`, `OAUTHBEARER` (including OIDC) and `GSSAPI` (Kerberos). The only options are `PLAINTEXT` and `SASL_PLAINTEXT` with `PLAIN`, which sends the username and password in clear. Use them only on a trusted, isolated network.
   - **Redis: no TLS.** `rediss://` URLs fail.
-  - **Elasticsearch**: `https://`, with `tls.ca_file` and basic or API-key authentication.
-  - **ClickHouse**: `https://` with the system's trusted roots; `tls.insecure_skip_verify` applies, but a custom CA is not used.
+  - **Elasticsearch**: `https://`, with `tls.ca_file` and basic or API-key authentication. `tls.enabled` is ignored (see the warning above).
+  - **ClickHouse**: `https://` with the system's trusted roots; `tls.insecure_skip_verify` applies. `tls.ca_file` and `tls.enabled` are ignored (see the warning above).
   - **HTTP and S3**: `https://` with the system's trusted roots.
   - **NATS**: credentials-file, user and password, or token authentication; no CA or client-certificate option is exposed, and TLS to NATS is not validated in this release.
 
@@ -236,7 +244,8 @@ Not part of the supported deployment envelope (do not rely on these):
 
 - Multi-instance HA for a single source (no cluster-wide ownership lock/lease yet).
 - TLS directly to the source database or a PostgreSQL state store (use a trusted network or an external tunnel).
-- TLS to Kafka or Redis sinks.
+- TLS to Kafka or Redis sinks, and Kafka SASL mechanisms other than `PLAIN`.
+- Any deployment that requires transport encryption.
 - Authenticated REST API or metrics endpoint (use network controls).
 - Live/dynamic credential rotation as a supported contract (treat rotation as restart-required; dynamic Vault DB credentials are not live).
 - End-to-end exactly-once delivery, deterministic snapshot+replay rebuild, and any feature marked planned on the [Roadmap](roadmap.md).

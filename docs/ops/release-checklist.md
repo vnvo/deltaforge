@@ -18,11 +18,28 @@ These are the remaining steps before release. Each is a single, exact-commit che
 |---|------|--------|-------------------|
 | G1 | Release-tier gate `scripts/gate.sh --release` green on the exact release commit (the core tier plus the sink suites and the MiniStack S3 canaries) | **BLOCKED** - not run since `974ef8c` (2026-10-07) | Gate output with every suite passing, the tree unchanged from start to end, retained with a manifest |
 | G2 | CI green (lint, test, coverage) on the exact release commit | **BLOCKED** - pending the release commit | CI run on that commit |
-| G3 | MySQL T1a qualification ([design](../design/mysql-fleet-qualification.md); exploratory tier T1a: one server, 40,000 tables, one pipeline) | **BLOCKED** - both earlier attempts (2026-10-08, 2026-10-10) failed closed; their causes were fixed by #142, #144 and #145; not run since | Every authorized scenario run complete: no missing, duplicate or out-of-order event, no pipeline failure at any time (status sampled throughout, incidents counted), checkpoint progress, retained with a manifest |
-| G4 | PostgreSQL source qualification | **BLOCKED** - its scope is not yet written down and it has never run | A reviewed scope, then the same evidence as G3 |
+| G3 | MySQL T1a qualification ([scope](#g3-mysql-t1a)) | **BLOCKED** - both earlier attempts (2026-10-08, 2026-10-10) failed closed; their causes were fixed by #142, #144 and #145; not run since | Every scenario complete: no missing, duplicate or out-of-order event, no pipeline failure at any time (status polled throughout, incidents counted), checkpoint progress, retained with a manifest |
+| G4 | PostgreSQL source qualification ([scope](#g4-postgresql-source)) | **BLOCKED** - scope approved 2026-11-07; its harness is not yet built; never run | As G3, plus the TOAST and reconciliation results below |
 | G5 | Release documentation matches the code at the release commit (this checklist, the Supported Deployment Envelope, the CHANGELOG) | **PASS** at `80d6cb84`; re-check if code changes before the release commit | This revision |
 
-A gate passes only on the release commit. A failure is kept and investigated, never rerun until it passes.
+G1 and G2 pass only on the release commit. G3 and G4 run on the candidate commit; their evidence carries to the release commit only if the code is unchanged between the two. If qualification needs a code change, the reruns are decided from that change's scope. A failure is kept and investigated, never rerun until it passes. Every qualification run starts with at least 50 GiB free and stops if free disk falls below 25 GiB.
+
+**Neither G3 nor G4 qualifies the PostgreSQL state store.** Both use the SQLite state store, the supported production backend; PostgreSQL state-store qualification is deferred.
+
+### G3: MySQL T1a
+
+The exploratory tier T1a of the [MySQL fleet qualification design](../design/mysql-fleet-qualification.md): one MySQL 8.4 server with 200 databases of 200 tables (40,000 tables), one pipeline, the release image, scenarios S1 (30 minutes after a 2-minute warm-up), A1 to A3 (active sets of 0.01%, 0.1% and 1%), and S3 (a migration DDL storm, last because it changes the fixture). One run each.
+
+**Departure from the earlier plan:** T1a was planned with the PostgreSQL state store. It runs on SQLite, the supported production backend, so that the qualification covers what the release supports.
+
+### G4: PostgreSQL source
+
+- **Setup:** PostgreSQL 17, one source and one pipeline, a required Kafka sink (plaintext), the SQLite state store, the release image, a registered publication.
+- **Workload:** an initial snapshot of 1,000 tables, then 30 minutes of steady CDC across them with inserts, updates and deletes; one stop and resume during the CDC; one `ADD COLUMN` on a table that is receiving rows.
+- **TOAST, supported cases (must deliver correctly):** tables with large out-of-line values under `REPLICA IDENTITY FULL`, with updates that change those values and updates that leave them unchanged: every event's `after` equals the committed row, unchanged values filled exactly (`deltaforge_pg_unchanged_toast_total{outcome="reconstructed"}` equals the number of such values). Tables under `REPLICA IDENTITY DEFAULT`, with the native JSON sink: an unchanged out-of-line value is left out of `after` and listed in `unchanged_columns` (counted as `unavailable`).
+- **TOAST, deliberately unsupported cases (must fail visibly, counted separately):** run in a separate pipeline whose sink needs complete rows. A captured table with a TOAST-capable column without `REPLICA IDENTITY FULL` must be refused at start (`pg_table_unsupported`, class `toast_without_full_identity`) with nothing snapshotted and no checkpoint; changing a captured table's identity away from `FULL` while running must stop the source before that table's next row, with failed status and an incident. These expected refusals are reported on their own and are not G4 failures; any other outcome (a partial row delivered, streaming that continues) fails G4.
+- **Reconciliation (exact):** after the final drain, for every primary key the last delivered row equals the source table's final row in every column (by canonical value), across the snapshot-to-CDC handover, the stop and resume, and the `ADD COLUMN` (rows after it carry the new column). Every committed change is delivered at least once, in per-key commit order; duplicates are allowed only in the snapshot overlap and the restart replay, and are counted.
+- **Health:** the main pipeline's status is polled throughout and incidents are counted; any pipeline failure or incident in the main pipeline fails G4.
 
 ## Correctness
 
@@ -50,7 +67,7 @@ A gate passes only on the release commit. A failure is kept and investigated, ne
 | # | Criterion | Status | Evidence / operator control |
 |---|-----------|--------|------------------------------|
 | O1 | One DeltaForge server per state store | **PASS** | Enforced within a process (serialized lifecycle, durable source-id claim) and across processes by the store gate: a second server against the same store refuses to start. A crash leaves the gate held until an operator releases it. See [Store gate](../src/deployment-support.md#store-gate) |
-| O2 | No TLS to source databases or to a PostgreSQL state store; no TLS to Kafka or Redis sinks; the REST API and metrics are unauthenticated | **ACCEPTED LIMITATION** | **Operator control:** run on a trusted private network or through an encrypted tunnel; bind the API and metrics to loopback or confine them with a firewall or NetworkPolicy (metrics are also served on the API port). See [Network and TLS](../src/deployment-support.md#network-and-tls) |
+| O2 | No transport encryption to source databases, a PostgreSQL state store, or Kafka and Redis sinks; Kafka SASL `PLAIN` only (credentials in clear); some TLS settings accepted but ignored; the REST API and metrics are unauthenticated | **ACCEPTED LIMITATION** for this beta, **trusted, isolated networks only** | Not suitable where transport encryption is required. **Operator control:** run on a trusted, isolated network; bind the API and metrics to loopback or confine them with a firewall or NetworkPolicy (metrics are also served on the API port); do not rely on the ignored settings listed in [Network and TLS](../src/deployment-support.md#network-and-tls) |
 | O3 | Deployment preflight validates the source, configuration and credential references before start | **PASS** | PR #107; `preflight_e2e`; the Helm preflight initContainer |
 | O4 | Preflight does not cover every startup requirement | **ACCEPTED LIMITATION** | Preflight does not probe sink endpoints, and does not check the MySQL version, `log_replica_updates` or PostgreSQL publication registration (startup checks all three and refuses to run). It always requires MySQL `RELOAD` and `gtid_mode = ON`, also for a CDC-only pipeline. **Operator control:** validate sink connectivity during onboarding, and treat a startup refusal as the authoritative check. See [Deployment preflight](../src/deployment-support.md#deployment-preflight) |
 | O5 | Production quick start in the supported shape | **PASS** | PR #109; [Production Quick Start](../src/quickstart-production.md) |
@@ -88,6 +105,8 @@ Not criteria for this release, and not support claims:
 - Capacity sweeps beyond the qualified scope: more tables per source (100,000 and above), dense active sets (20 to 100% of tables), rotating active sets, multi-source fleets, and the load on the source database at those scales.
 - Further tuning of activation latency, schema capture, the selection cache and memory.
 - Real-AWS S3 qualification.
+- PostgreSQL state-store qualification (the backend stays beta).
+- TLS for source databases, the PostgreSQL state store, Kafka (with its other SASL mechanisms) and Redis, and applying the ignored ClickHouse and Elasticsearch TLS settings.
 
 ## Rollback procedure
 
