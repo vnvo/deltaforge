@@ -27,33 +27,36 @@ pub struct Sample {
 /// Parse the Prometheus text exposition (comments and unparsable lines are
 /// skipped).
 pub fn parse_prometheus(text: &str) -> Vec<Sample> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (series, value) = match line.rsplit_once(' ') {
-            Some(p) => p,
-            None => continue,
-        };
-        let Ok(value) = value.trim().parse::<f64>() else {
-            continue;
-        };
-        let (name, labels) = match series.split_once('{') {
-            None => (series.to_string(), BTreeMap::new()),
-            Some((name, rest)) => {
-                let body = rest.strip_suffix('}').unwrap_or(rest);
-                (name.to_string(), parse_labels(body))
-            }
-        };
-        out.push(Sample {
-            name,
-            labels,
-            value,
-        });
+    text.lines()
+        .filter_map(|line| {
+            let (name, labels, value) = parse_series(line)?;
+            Some(Sample {
+                name,
+                labels,
+                value: value.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+/// One exposition line as its series name, labels and unparsed value text
+/// (empty when the line has none); `None` for blanks and comments.
+pub fn parse_series(
+    line: &str,
+) -> Option<(String, BTreeMap<String, String>, &str)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
     }
-    out
+    let (series, value) = line.rsplit_once(' ').unwrap_or((line, ""));
+    let (name, labels) = match series.split_once('{') {
+        None => (series.to_string(), BTreeMap::new()),
+        Some((name, rest)) => {
+            let body = rest.strip_suffix('}').unwrap_or(rest);
+            (name.to_string(), parse_labels(body))
+        }
+    };
+    Some((name, labels, value.trim()))
 }
 
 fn parse_labels(body: &str) -> BTreeMap<String, String> {

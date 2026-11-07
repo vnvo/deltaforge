@@ -799,31 +799,148 @@ pub fn health(
     (bad.is_empty(), bad)
 }
 
-/// The sum of `name` for `pipeline` (and the given extra label, if any).
-fn metric(
+/// A metrics scrape: the exposition text, or why it could not be read.
+type Scrape = std::result::Result<String, String>;
+
+/// Scrape `url`. A refused request, an HTTP error status or an unreadable
+/// body is an error, never an empty exposition.
+async fn scrape(url: &str) -> Scrape {
+    let resp = reqwest::get(url)
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| format!("{url}: {e}"))?;
+    resp.text().await.map_err(|e| format!("{url}: body: {e}"))
+}
+
+/// Counter `name` of `pipeline` (with the extra label, if any), summed over
+/// its series. `None` when no series is exported: counters are exported
+/// lazily, on their first increment. A value that is not a finite,
+/// non-negative number is an error.
+fn counter(
     text: &str,
     name: &str,
     pipeline: &str,
     label: Option<(&str, &str)>,
-) -> f64 {
-    measure::parse_prometheus(text)
-        .into_iter()
-        .filter(|s| {
-            s.name == name
-                && s.labels.get("pipeline").map(String::as_str)
-                    == Some(pipeline)
-                && label.is_none_or(|(k, v)| {
-                    s.labels.get(k).map(String::as_str) == Some(v)
-                })
-        })
-        .map(|s| s.value)
-        .sum()
+) -> std::result::Result<Option<f64>, String> {
+    let mut sum = None;
+    for line in text.lines() {
+        let Some((n, labels, value)) = measure::parse_series(line) else {
+            continue;
+        };
+        let wanted = n == name
+            && labels.get("pipeline").map(String::as_str) == Some(pipeline)
+            && label.is_none_or(|(k, v)| {
+                labels.get(k).map(String::as_str) == Some(v)
+            });
+        if !wanted {
+            continue;
+        }
+        let v = value
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .ok_or_else(|| format!("{name}: invalid value {value:?}"))?;
+        sum = Some(sum.unwrap_or(0.0) + v);
+    }
+    Ok(sum)
 }
 
-async fn scrape(url: &str) -> String {
-    match reqwest::get(url).await {
-        Ok(r) => r.text().await.unwrap_or_default(),
-        Err(_) => String::new(),
+/// The increase of a counter between two scrapes. Not yet exported at the
+/// start is zero; a failed scrape, an invalid value, a series that
+/// disappears or a decrease is an error: missing evidence, never zero.
+fn counter_delta(
+    before: &Scrape,
+    after: &Scrape,
+    name: &str,
+    pipeline: &str,
+    label: Option<(&str, &str)>,
+) -> std::result::Result<f64, String> {
+    let read = |s: &Scrape, when: &str| {
+        let text = s
+            .as_ref()
+            .map_err(|e| format!("{when} scrape failed: {e}"))?;
+        counter(text, name, pipeline, label)
+            .map_err(|e| format!("{when} scrape: {e}"))
+    };
+    match (read(before, "start")?, read(after, "end")?) {
+        (Some(b), None) => Err(format!("{name}: disappeared (was {b})")),
+        (b, a) => {
+            let (b, a) = (b.unwrap_or(0.0), a.unwrap_or(0.0));
+            if a < b {
+                Err(format!("{name}: decreased from {b} to {a}"))
+            } else {
+                Ok(a - b)
+            }
+        }
+    }
+}
+
+/// The number of incidents in a `/pipelines/{name}/incidents` response
+/// (its list, or one if only a primary is named). A response that could not
+/// be read or lacks that shape is an error, never "no incidents".
+fn open_incidents(resp: &Result<Value>) -> std::result::Result<usize, String> {
+    let v = resp.as_ref().map_err(|e| format!("{e:#}"))?;
+    let list = v["incidents"]
+        .as_array()
+        .ok_or_else(|| format!("unexpected incidents response: {v}"))?;
+    Ok(list.len().max(usize::from(!v["primary"].is_null())))
+}
+
+/// The reasons the incident evidence fails the run, or leaves it
+/// incomplete.
+fn incident_reasons(
+    raised: &std::result::Result<f64, String>,
+    open: &std::result::Result<usize, String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    match raised {
+        Ok(n) if *n > 0.0 => out.push(format!("incidents raised: {n}")),
+        Ok(_) => {}
+        Err(e) => {
+            out.push(format!("incidents counter unreadable (incomplete): {e}"))
+        }
+    }
+    match open {
+        Ok(0) => {}
+        Ok(n) => out.push(format!("{n} incident(s) recorded")),
+        Err(e) => out.push(format!("incidents unreadable (incomplete): {e}")),
+    }
+    out
+}
+
+/// The reason an unchanged-TOAST counter fails the run, or leaves it
+/// incomplete. Its delta must be at least the delivered count: an event
+/// emitted before the stop and not delivered is emitted (and counted) again
+/// after it.
+fn toast_counter_reason(
+    outcome: &str,
+    delta: &std::result::Result<f64, String>,
+    delivered: u64,
+) -> Option<String> {
+    match delta {
+        Ok(d) if *d < delivered as f64 => Some(format!(
+            "unchanged-TOAST {outcome} counter delta {d} is below the {delivered} delivered"
+        )),
+        Ok(_) => None,
+        Err(e) => Some(format!(
+            "unchanged-TOAST {outcome} counter unreadable (incomplete): {e}"
+        )),
+    }
+}
+
+/// A read kept as evidence: its value, or the error.
+fn kept<T: Serialize>(r: &std::result::Result<T, String>) -> Value {
+    match r {
+        Ok(v) => json!(v),
+        Err(e) => json!({"error": e}),
+    }
+}
+
+/// An API read kept as evidence: its value, or the error.
+fn kept_api(r: &Result<Value>) -> Value {
+    match r {
+        Ok(v) => v.clone(),
+        Err(e) => json!({"error": format!("{e:#}")}),
     }
 }
 
@@ -899,23 +1016,31 @@ async fn unsupported(
         Ok(_) => until_status(api, &n1.pipeline, "failed", timeout).await,
         Err(_) => true,
     };
-    let incidents = api.incidents(&n1.pipeline).await.unwrap_or(Value::Null);
-    let class_seen = incidents.to_string().contains(REFUSAL_CLASS)
+    let incidents = api.incidents(&n1.pipeline).await;
+    let class_seen = incidents
+        .as_ref()
+        .is_ok_and(|v| v.to_string().contains(REFUSAL_CLASS))
         || created
             .as_ref()
             .err()
             .is_some_and(|e| e.to_string().contains(REFUSAL_CLASS));
     let messages =
         count_messages(&cfg.verifier_kafka_brokers, &n1.topic, idle).await?;
-    let checkpoints =
-        api.checkpoints(&n1.pipeline).await.unwrap_or(Value::Null);
-    let no_checkpoint = checkpoints.as_array().is_none_or(|a| a.is_empty());
-    out.insert("u1_refused_at_start".into(), json!({
-        "ok": failed && class_seen && messages == 0 && no_checkpoint,
-        "failed_status": failed, "incident_class_seen": class_seen,
-        "messages": messages, "checkpoints": checkpoints, "incidents": incidents,
-        "create_error": created.as_ref().err().map(|e| format!("{e:#}")),
-    }));
+    // An unreadable checkpoint list is no evidence of "no checkpoint".
+    let checkpoints = api.checkpoints(&n1.pipeline).await;
+    let no_checkpoint = checkpoints
+        .as_ref()
+        .is_ok_and(|v| v.as_array().is_some_and(|a| a.is_empty()));
+    out.insert(
+        "u1_refused_at_start".into(),
+        json!({
+            "ok": failed && class_seen && messages == 0 && no_checkpoint,
+            "failed_status": failed, "incident_class_seen": class_seen,
+            "messages": messages, "checkpoints": kept_api(&checkpoints),
+            "incidents": kept_api(&incidents),
+            "create_error": created.as_ref().err().map(|e| format!("{e:#}")),
+        }),
+    );
     api.delete(&n1.pipeline).await.ok();
 
     // U2: a FULL table changed away from FULL while running.
@@ -943,14 +1068,17 @@ async fn unsupported(
         ))
         .await?;
     let failed = until_status(api, &n2.pipeline, "failed", timeout).await;
-    let incidents = api.incidents(&n2.pipeline).await.unwrap_or(Value::Null);
-    let class_seen = incidents.to_string().contains(REFUSAL_CLASS);
+    let incidents = api.incidents(&n2.pipeline).await;
+    let class_seen = incidents
+        .as_ref()
+        .is_ok_and(|v| v.to_string().contains(REFUSAL_CLASS));
     let after =
         count_messages(&cfg.verifier_kafka_brokers, &n2.topic, idle).await?;
     out.insert("u2_stopped_when_changed".into(), json!({
         "ok": running && before == 1 && failed && class_seen && after == before,
         "ran": running, "messages_before_change": before, "messages_after": after,
-        "failed_status": failed, "incident_class_seen": class_seen, "incidents": incidents,
+        "failed_status": failed, "incident_class_seen": class_seen,
+        "incidents": kept_api(&incidents),
     }));
     api.delete(&n2.pipeline).await.ok();
     Ok(Value::Object(out))
@@ -1137,7 +1265,7 @@ pub async fn run(cfg: &PgQualConfig) -> Result<PathBuf> {
     health_tx.send(true).ok();
     watcher.await.ok();
     let m1 = scrape(&cfg.metrics_url).await;
-    let incidents = api.incidents(&names.pipeline).await.unwrap_or(Value::Null);
+    let incidents = api.incidents(&names.pipeline).await;
 
     let raw = std::mem::take(&mut *seen.lock());
     let mut delivered = Vec::with_capacity(raw.len());
@@ -1174,38 +1302,30 @@ pub async fn run(cfg: &PgQualConfig) -> Result<PathBuf> {
     }
     let pl = &names.pipeline;
     let incidents_raised =
-        metric(&m1, "deltaforge_incidents_raised_total", pl, None)
-            - metric(&m0, "deltaforge_incidents_raised_total", pl, None);
-    if incidents_raised > 0.0
-        || incidents.as_array().is_some_and(|a| !a.is_empty())
-    {
-        reasons.push(format!("incidents raised: {incidents_raised}"));
-    }
-    let toast_metric = |outcome| {
-        metric(
-            &m1,
-            "deltaforge_pg_unchanged_toast_total",
-            pl,
-            Some(("outcome", outcome)),
-        ) - metric(
+        counter_delta(&m0, &m1, "deltaforge_incidents_raised_total", pl, None);
+    reasons.extend(incident_reasons(
+        &incidents_raised,
+        &open_incidents(&incidents),
+    ));
+    let toast_delta = |outcome| {
+        counter_delta(
             &m0,
+            &m1,
             "deltaforge_pg_unchanged_toast_total",
             pl,
             Some(("outcome", outcome)),
         )
     };
     let (reconstructed, unavailable) =
-        (toast_metric("reconstructed"), toast_metric("unavailable"));
-    // Every delivered event was emitted (and counted); an event emitted
-    // before the stop and not delivered is emitted again after it.
-    if reconstructed < report.toast_reconstructed as f64
-        || unavailable < report.toast_unavailable as f64
-    {
-        reasons.push(
-            "the unchanged-TOAST counters are below the delivered events"
-                .into(),
-        );
-    }
+        (toast_delta("reconstructed"), toast_delta("unavailable"));
+    reasons.extend(
+        [
+            ("reconstructed", &reconstructed, report.toast_reconstructed),
+            ("unavailable", &unavailable, report.toast_unavailable),
+        ]
+        .into_iter()
+        .filter_map(|(o, d, n)| toast_counter_reason(o, d, n)),
+    );
     let unsupported_result = match &cfg.unsupported {
         Some(u) => match unsupported(cfg, &api, &admin, &names, u).await {
             Ok(v) => {
@@ -1249,8 +1369,9 @@ pub async fn run(cfg: &PgQualConfig) -> Result<PathBuf> {
         "messages": raw.len(), "undecodable": undecodable,
         "report": report,
         "health": {"ok": healthy, "issues": health_issues, "observations": statuses.len()},
-        "incidents": {"raised": incidents_raised, "open": incidents},
-        "toast_counters": {"reconstructed": reconstructed, "unavailable": unavailable,
+        "incidents": {"raised": kept(&incidents_raised), "open": kept_api(&incidents)},
+        "toast_counters": {"reconstructed": kept(&reconstructed),
+                           "unavailable": kept(&unavailable),
                            "delivered_reconstructed": report.toast_reconstructed,
                            "delivered_unavailable": report.toast_unavailable},
         "unsupported_cases": unsupported_result,
@@ -1368,22 +1489,130 @@ mod tests {
     }
 
     #[test]
-    fn metrics_are_summed_per_pipeline_and_label() {
+    fn counters_are_summed_per_pipeline_and_label() {
         let text = "deltaforge_pg_unchanged_toast_total{pipeline=\"g4-1\",source=\"s\",outcome=\"reconstructed\"} 3\n\
                     deltaforge_pg_unchanged_toast_total{pipeline=\"g4-1\",source=\"s\",outcome=\"unavailable\"} 2\n\
                     deltaforge_pg_unchanged_toast_total{pipeline=\"other\",source=\"s\",outcome=\"reconstructed\"} 9\n";
+        let c = |pl, label| {
+            counter(text, "deltaforge_pg_unchanged_toast_total", pl, label)
+        };
         assert_eq!(
-            metric(
-                text,
-                "deltaforge_pg_unchanged_toast_total",
-                "g4-1",
-                Some(("outcome", "reconstructed"))
-            ),
-            3.0
+            c("g4-1", Some(("outcome", "reconstructed"))),
+            Ok(Some(3.0))
         );
+        assert_eq!(c("g4-1", None), Ok(Some(5.0)));
+        assert_eq!(c("absent", None), Ok(None), "not exported yet");
+    }
+
+    const C: &str = "deltaforge_pg_unchanged_toast_total";
+
+    fn at(v: &str) -> Scrape {
+        Ok(format!(
+            "# TYPE {C} counter\n{C}{{pipeline=\"p\",outcome=\"reconstructed\"}} {v}\n"
+        ))
+    }
+
+    fn delta(
+        before: Scrape,
+        after: Scrape,
+    ) -> std::result::Result<f64, String> {
+        counter_delta(
+            &before,
+            &after,
+            C,
+            "p",
+            Some(("outcome", "reconstructed")),
+        )
+    }
+
+    /// Lazy export is zero; a failed scrape, an invalid value, a vanished
+    /// series or a decrease is missing evidence, never zero.
+    #[test]
+    fn counter_deltas_never_turn_missing_evidence_into_zero() {
+        let none = || Ok(String::new());
+        assert_eq!(delta(none(), none()), Ok(0.0), "never exported");
+        assert_eq!(delta(none(), at("5")), Ok(5.0), "exported during the run");
+        assert_eq!(delta(at("2"), at("5")), Ok(3.0));
+        let e = delta(Err("connection refused".into()), at("5")).unwrap_err();
+        assert!(e.contains("start scrape failed"), "{e}");
+        let e = delta(at("5"), Err("500 Internal Server Error".into()))
+            .unwrap_err();
+        assert!(e.contains("end scrape failed"), "{e}");
+        for bad in ["NaN", "-1", "+Inf", "abc", ""] {
+            assert!(delta(at("1"), at(bad)).is_err(), "end value {bad:?}");
+            assert!(delta(at(bad), at("1")).is_err(), "start value {bad:?}");
+        }
+        assert!(delta(at("5"), at("4")).unwrap_err().contains("decreased"));
+        assert!(delta(at("5"), none()).unwrap_err().contains("disappeared"));
+    }
+
+    /// Only a readable response of the API's shape counts incidents.
+    #[test]
+    fn incidents_are_counted_only_from_a_readable_response() {
+        let ok = |v: Value| -> Result<Value> { Ok(v) };
+        let empty = json!({"pipeline": "p", "primary": null, "incidents": []});
+        assert_eq!(open_incidents(&ok(empty)), Ok(0));
+        let two = json!({"primary": "a", "incidents": [{"incident_id": "a"}, {"incident_id": "b"}]});
+        assert_eq!(open_incidents(&ok(two)), Ok(2));
         assert_eq!(
-            metric(text, "deltaforge_pg_unchanged_toast_total", "g4-1", None),
-            5.0
+            open_incidents(&ok(json!({"primary": "a", "incidents": []}))),
+            Ok(1)
         );
+        assert!(open_incidents(&Err(anyhow::anyhow!("500"))).is_err());
+        assert!(open_incidents(&ok(Value::Null)).is_err(), "an empty body");
+        assert!(
+            open_incidents(&ok(json!([]))).is_err(),
+            "not the API's shape"
+        );
+
+        assert!(incident_reasons(&Ok(0.0), &Ok(0)).is_empty());
+        assert_eq!(incident_reasons(&Ok(1.0), &Ok(1)).len(), 2);
+        for r in [
+            incident_reasons(&Err("end scrape failed".into()), &Ok(0)),
+            incident_reasons(&Ok(0.0), &Err("unreadable".into())),
+        ] {
+            assert_eq!(r.len(), 1);
+            assert!(r[0].contains("(incomplete)"), "{r:?}");
+        }
+    }
+
+    /// The counter delta must reach the delivered count; more is a replayed
+    /// emission, an unreadable delta is incomplete.
+    #[test]
+    fn toast_counters_are_at_least_the_delivered_count() {
+        assert_eq!(toast_counter_reason("reconstructed", &Ok(5.0), 5), None);
+        assert_eq!(
+            toast_counter_reason("reconstructed", &Ok(6.0), 5),
+            None,
+            "a replayed emission"
+        );
+        assert!(toast_counter_reason("reconstructed", &Ok(4.0), 5).is_some());
+        let r =
+            toast_counter_reason("unavailable", &Err("x".into()), 0).unwrap();
+        assert!(r.contains("(incomplete)"), "{r}");
+    }
+
+    /// A refused request, an HTTP error or an unreadable body is a failed
+    /// scrape, never an empty exposition.
+    #[tokio::test]
+    async fn failed_scrapes_are_errors() {
+        use crate::deltaforge::tests::serve_raw;
+        let status = serve_raw(
+            "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(scrape(&status).await.is_err());
+        let truncated =
+            serve_raw("HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nx 1\n")
+                .await;
+        assert!(scrape(&truncated).await.is_err());
+        let good =
+            serve_raw("HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nx 1\n")
+                .await;
+        assert_eq!(scrape(&good).await.unwrap(), "x 1\n");
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        assert!(scrape(&format!("http://{addr}")).await.is_err());
     }
 }
