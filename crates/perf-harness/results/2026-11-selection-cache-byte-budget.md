@@ -7,6 +7,14 @@ instead of 4,096 timelines (PR #195, design
 validation is accepted with the qualifications below. This is not a release
 acceptance, and the failed checks stay recorded as failed.
 
+**Correction (2026-11-07).** Part B run F r2 at t10000-a50-steady-o0
+failed: its pipeline failed from 7.3 to 45.0 s and stayed down until the
+harness's scheduled resume. The harness recorded no error, so the run was
+counted as correct. Every row was delivered, but the run fails under the
+corrected rule (any pipeline failure fails the run, even when a later
+resume restores delivery). Rule 1 at that point is qualified (see Part B).
+The figures below are kept as originally recorded.
+
 ## Result
 
 Where the active set exceeded the old 4,096-timeline bound, the fix removed
@@ -87,14 +95,20 @@ MiB.
 
 Arms: B-L (base with a 32,768-table bound, its no-eviction reference) and F
 at the fits points; B-L, F, F-L (4 GiB) and F-64 (64 MiB) at the 20,000-table
-point; B and F at the controls. All 70 runs complete, correct and
-sufficient (usable 99.3 to 224.2 s); 26 failed only on deferrals. B-L is a
+point; B and F at the controls. As recorded: all 70 runs complete,
+correct and sufficient (usable 99.3 to 224.2 s); 26 failed only on
+deferrals. **Corrected: 69 of 70.** F r2 at t10000-a50-steady-o0 had a
+pipeline failure (7.3 to 45.0 s; the activation window failed closed) that
+the harness did not detect. B-L is a
 diagnostic-build reference: nothing here supersedes F0 or establishes
 default-build performance.
 
 **No-eviction equivalence (rule 1), F against B-L: passed** at all three
 fits points: p50 within -0.18 to +0.05 ms, p99 within -0.01 to +0.05 ms,
-CPU within +0.002 cores, zero evictions in both. Timeline reloads are
+CPU within +0.002 cores, zero evictions in both. At t10000-a50-steady-o0 this
+is qualified: one of F's five runs (r2) is a failed run, and its last
+activation came after the resume (48.1 s, against 18.1 to 22.0 s), so its
+post-activation interval started later than the others'. Timeline reloads are
 counted as timelines requested by history loader calls after the last
 activation, outside catch-up (requests, not proven installs or physical
 store reads): 0.005 to 0.132 per 1,000 rows, within B-L's plus 1. The frozen
