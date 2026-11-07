@@ -2858,6 +2858,33 @@ mod tests {
             );
         }
 
+        /// A capture that starts behind a table's rows (the rows' boundary
+        /// contains the capture's start: one transaction the stream had
+        /// that the capture's first position read did not) leaves that
+        /// table undecided: deferred, nothing of it written or prepared,
+        /// its rows back to the stream. The covered table is admitted.
+        #[tokio::test]
+        async fn a_capture_behind_a_tables_rows_defers_that_table() {
+            let mut ctx = ctx_on(std::sync::Arc::new(
+                storage::MemoryStorageBackend::new(),
+            ))
+            .await;
+            let (_, governs) = admit(
+                &mut ctx,
+                &["t1", "t2"],
+                vec![entry("t2", 5), entry("t1", 51)],
+            )
+            .await
+            .unwrap();
+            let governs: HashMap<_, _> =
+                governs.into_iter().map(|((_, t), _, g)| (t, g)).collect();
+            assert_eq!(governs["t2"], Governs::Admitted);
+            assert_eq!(governs["t1"], Governs::Deferred);
+            assert_eq!(seqs(&ctx, "t1").await, (None, None), "nothing written");
+            assert!(ctx.take_prepared("d", "t1", &wm(51), &at(51)).is_none());
+            assert!(seqs(&ctx, "t2").await.1.is_some(), "t2 admitted");
+        }
+
         /// A store that cannot commit: the window fails closed, nothing of it
         /// is written, and no cached timeline holds an uncommitted record.
         #[tokio::test]
