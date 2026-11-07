@@ -376,7 +376,7 @@ fn consume(
 /// DeltaForge's counters of the study, summed over labels. Its histograms
 /// are exported as summaries: their `_sum` and `_count` series are read
 /// (the bare name carries quantiles).
-const DF_COUNTERS: [&str; 25] = [
+const DF_COUNTERS: [&str; 27] = [
     "deltaforge_checkpoints_total",
     "deltaforge_kafka_requests_total",
     "deltaforge_sink_bytes_total",
@@ -406,6 +406,8 @@ const DF_COUNTERS: [&str; 25] = [
     "deltaforge_mysql_activation_window_overflow_total",
     "deltaforge_mysql_proof_rounds_failed_total",
     "deltaforge_mysql_capture_kill_failures_total",
+    "deltaforge_mysql_activation_window_behind_capture_total",
+    "deltaforge_incidents_raised_total",
 ];
 
 /// DeltaForge's study counters, each summed over its label sets, and the
@@ -990,6 +992,7 @@ pub async fn run(
         false => None,
     };
     let mut binlog_peak = binlog0;
+    let mut failed_status = FailedStatus::default();
     let mut step_results = Vec::new();
     let mut capacity_stop = None;
     while Instant::now() < load_end && !halt.load(Ordering::Relaxed) {
@@ -1045,6 +1048,7 @@ pub async fn run(
             let end = t_load.elapsed();
             if let Some(text) = &text {
                 keep_peaks(&mut gauge_peaks, parse_gauges(text));
+                failed_status.note(start, text);
             }
             write_sample(
                 &mut samples,
@@ -1153,6 +1157,7 @@ pub async fn run(
             let end = t_load.elapsed();
             if let Some(text) = &text {
                 keep_peaks(&mut gauge_peaks, parse_gauges(text));
+                failed_status.note(start, text);
             }
             write_sample(
                 &mut samples,
@@ -1470,6 +1475,10 @@ pub async fn run(
         Vec::new()
     };
     let mut failures = failures;
+    let pipeline_error = failed_status.error();
+    if let Some(e) = &pipeline_error {
+        failures.push(e.clone());
+    }
     if is_df
         && !touched.is_empty()
         && proofs["windows"].as_array().is_none_or(|w| w.is_empty())
@@ -1487,8 +1496,9 @@ pub async fn run(
         && generator_share.is_none_or(|g| g >= LIMIT_SHARE);
     Ok(json!({
         "ok": ok,
-        "error": writer_error.or(drain_error.clone()),
+        "error": writer_error.or(drain_error.clone()).or(pipeline_error),
         "drain_error": drain_error,
+        "pipeline_failed": failed_status.record(),
         "measured_failures": failures,
         "generator_bound": generator_share.is_some_and(|g| g < LIMIT_SHARE),
         "tables": point.tables, "active": point.active, "active_tables": n_active,
@@ -2047,7 +2057,7 @@ fn cache_limits(text: &str) -> Option<CacheLimits> {
 /// instrumentation and phase timings, the cache, window and proof counters
 /// every build has, the measured-failure counters ([`DF_FAILURES`]) and the
 /// pipeline's status, so a run that exits early keeps its last values.
-const SAMPLED: [&str; 12] = [
+const SAMPLED: [&str; 14] = [
     "deltaforge_perf_selection_",
     "deltaforge_perf_phase_latency_seconds",
     "deltaforge_mysql_selection_cache_",
@@ -2059,6 +2069,8 @@ const SAMPLED: [&str; 12] = [
     DF_FAILURES[3],
     DF_FAILURES[4],
     DF_FAILURES[5],
+    DF_FAILURES[6],
+    DF_FAILURES[7],
     "deltaforge_pipeline_status",
 ];
 
@@ -2154,14 +2166,65 @@ fn keep_peaks(peaks: &mut HashMap<String, f64>, sample: HashMap<String, f64>) {
 
 /// DeltaForge's counters whose increase fails a run (a measured failure,
 /// kept and investigated: `results/scale-stage2-plan.md`).
-const DF_FAILURES: [&str; 6] = [
+const DF_FAILURES: [&str; 8] = [
     "deltaforge_mysql_control_permit_timeouts_total",
     "deltaforge_mysql_control_saturation_deferrals_total",
     "deltaforge_mysql_activation_window_deferred_total",
     "deltaforge_mysql_activation_window_overflow_total",
     "deltaforge_mysql_proof_rounds_failed_total",
     "deltaforge_mysql_capture_kill_failures_total",
+    "deltaforge_mysql_activation_window_behind_capture_total",
+    // Any incident, including one between two status samples.
+    "deltaforge_incidents_raised_total",
 ];
+
+/// The samples in which the pipeline's status was failed: how many, and
+/// the first and last one's scrape start (ms on the load clock). A failure
+/// stays a failure of the run when a later resume restores delivery.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct FailedStatus {
+    samples: usize,
+    first_ms: f64,
+    last_ms: f64,
+}
+
+impl FailedStatus {
+    /// Note one scrape's status.
+    fn note(&mut self, at: Duration, text: &str) {
+        if metric_lines(text)
+            .iter()
+            .any(|(k, v)| k == "deltaforge_pipeline_status" && *v < 0.0)
+        {
+            let ms = at.as_secs_f64() * 1e3;
+            if self.samples == 0 {
+                self.first_ms = ms;
+            }
+            self.last_ms = ms;
+            self.samples += 1;
+        }
+    }
+
+    /// The run's error when the pipeline failed.
+    fn error(&self) -> Option<String> {
+        (self.samples > 0).then(|| {
+            format!(
+                "the pipeline failed during the run: its status was failed in \
+                 {} sample(s), from {:.1} s to {:.1} s",
+                self.samples,
+                self.first_ms / 1e3,
+                self.last_ms / 1e3
+            )
+        })
+    }
+
+    fn record(&self) -> Value {
+        if self.samples == 0 {
+            return Value::Null;
+        }
+        json!({"samples": self.samples, "first_ms": self.first_ms,
+               "last_ms": self.last_ms})
+    }
+}
 
 /// The measured failures in a run's counter increases.
 fn measured_failures(delta: &Value) -> Vec<String> {
@@ -3073,6 +3136,65 @@ mod tests {
             sample_line(scrape, "drain", 2.5, None),
             json!({"t_start_ms": 1000.0, "t_end_ms": 1012.0, "phase": "drain",
                    "cpu_s": 2.5, "scrape_failed": true})
+        );
+    }
+
+    /// A failed status in any sample is a failure of the run, kept with its
+    /// first and last sample, even when a later resume restores the
+    /// pipeline; healthy samples alone are none.
+    #[test]
+    fn a_failed_pipeline_fails_the_run_after_it_recovers() {
+        let status = |v: f64| {
+            format!("deltaforge_pipeline_status{{pipeline=\"p\"}} {v}\n")
+        };
+        let mut f = FailedStatus::default();
+        for (ms, v) in [
+            (100, 1.0),
+            (7500, -1.0),
+            (7750, -1.0),
+            (30100, 0.0),
+            (45300, 0.25),
+            (45500, 1.0),
+        ] {
+            f.note(Duration::from_millis(ms), &status(v));
+        }
+        assert_eq!(
+            f,
+            FailedStatus {
+                samples: 2,
+                first_ms: 7500.0,
+                last_ms: 7750.0
+            }
+        );
+        let e = f.error().unwrap();
+        assert!(e.contains("2 sample(s), from 7.5 s to 7.8 s"), "{e}");
+        assert_eq!(
+            f.record(),
+            json!({"samples": 2, "first_ms": 7500.0, "last_ms": 7750.0})
+        );
+        let mut healthy = FailedStatus::default();
+        for v in [0.25, 1.0, 0.0, 0.5] {
+            healthy.note(Duration::from_millis(1), &status(v));
+        }
+        assert_eq!(healthy.error(), None);
+        assert_eq!(healthy.record(), Value::Null);
+    }
+
+    /// An incident raised between two samples still fails the run: the
+    /// incident counter is a measured failure.
+    #[test]
+    fn an_incident_is_a_measured_failure() {
+        let text = "deltaforge_incidents_raised_total{pipeline=\"p\",reason_code=\"unclassified_failure\"} 1\n";
+        let (after, exported) = counters_of(text);
+        assert!(exported.contains(&"deltaforge_incidents_raised_total"));
+        let d: serde_json::Map<String, Value> = after
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), json!(v)))
+            .collect();
+        let d = Value::Object(d);
+        assert_eq!(
+            measured_failures(&d),
+            vec!["deltaforge_incidents_raised_total +1".to_string()]
         );
     }
 
