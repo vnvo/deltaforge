@@ -737,6 +737,18 @@ fn waited(class: Class, t0: Instant) {
 /// A MySQL control connection.
 pub(crate) struct MySqlLink(mysql_async::Conn);
 
+impl MySqlLink {
+    pub(crate) fn conn(&mut self) -> &mut mysql_async::Conn {
+        &mut self.0
+    }
+}
+
+impl From<mysql_async::Conn> for MySqlLink {
+    fn from(c: mysql_async::Conn) -> Self {
+        Self(c)
+    }
+}
+
 impl Link for MySqlLink {
     fn reset(&mut self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
         Box::pin(async move { self.0.reset().await.is_ok() })
@@ -898,7 +910,7 @@ const UNVERIFIED: &str = "";
 
 /// What a connection is reusable for: its DSN (as a digest: no credential
 /// is kept in clear) and its server.
-fn ident(dsn: &str, server_uuid: &str) -> String {
+pub(crate) fn ident(dsn: &str, server_uuid: &str) -> String {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
     h.update(dsn.as_bytes());
