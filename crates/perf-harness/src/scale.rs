@@ -2173,14 +2173,24 @@ const DF_FAILURES: [&str; 8] = [
     "deltaforge_mysql_activation_window_overflow_total",
     "deltaforge_mysql_proof_rounds_failed_total",
     "deltaforge_mysql_capture_kill_failures_total",
+    // A capture that started before a table's rows: its own failure,
+    // distinct from the budget deferrals above, so no exception for
+    // budget deferrals covers it.
     "deltaforge_mysql_activation_window_behind_capture_total",
-    // Any incident, including one between two status samples.
+    // Any incident fails the run, conservatively: not every incident is a
+    // pipeline failure, but one between two status samples is caught here.
     "deltaforge_incidents_raised_total",
 ];
 
 /// The samples in which the pipeline's status was failed: how many, and
 /// the first and last one's scrape start (ms on the load clock). A failure
 /// stays a failure of the run when a later resume restores delivery.
+///
+/// Limits: status is sampled (about every 250 ms during load and drain),
+/// so a failure recovered between two samples is seen only if it raised
+/// an incident (`DF_FAILURES`). Sampling plus incident increments is
+/// stronger evidence than delivery alone, not a guarantee that no
+/// transient failure went unseen.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct FailedStatus {
     samples: usize,
