@@ -2,7 +2,8 @@
 
 Status: **steps 1 to 3 done (2026-11-07).** The A/B missed its frozen
 criteria; the performance result was accepted by explicit review exception
-(see Results). The miss stands and is not relabelled as a pass. Deeper
+(see Results). **Corrected (2026-11-07): criterion 1 fails** - three runs had
+a pipeline failure that the harness did not detect (see Results). The miss stands and is not relabelled as a pass. Deeper
 speculation, reordered delivery and release acceptance are held.
 
 ## Problem
@@ -199,11 +200,32 @@ supplemental analysis in `capture-ab-supplement-279ee777`. Pinned default
 runners: B `ff2929ec`, F `55b793c2`; one harness, `f4d00701`, identical at
 both revisions.
 
-**Frozen verdict: MISS.** All 50 runs were correct and sufficient.
+**Correction (2026-11-07): criterion 1 fails.** Every committed row was
+eventually delivered, once, in order. But in three runs at
+t10000-a50-steady-o0 the pipeline failed: B r0 (failed from 7.5 to 45.0 s),
+B r3 (7.0 to 44.9 s) and F r4 (7.5 to 45.1 s). In each, the source failed
+closed in its activation window ("the activation window's capture of
+<table> does not contain its rows' position") and stopped. Nothing was
+delivered until the harness's scheduled stop and resume restarted it. The
+harness counted only writer and drain errors, so it recorded no run error,
+and the frozen verdict passed criterion 1. Under the corrected rule (any
+pipeline failure fails the run, even when a later resume restores
+delivery), those three runs fail. The failure also put their last
+activation after the resume (49.5, 47.7 and 47.4 s, against 18.1 to 23.3 s
+in the other runs), so this point's last-activation and post-activation
+comparisons include outage time in both arms. The other four points had no
+pipeline failure. One F warm-up at the same point failed the same way; the
+stop rule had classified it as "continue: deferral-only". The failure is a
+release blocker, tracked separately.
+
+The original frozen verdict is kept below as the historical record.
+
+**Frozen verdict (original): MISS.** As recorded: all 50 runs were correct
+and sufficient.
 
 | Criterion | Result |
 |---|---|
-| 1. Correctness | pass |
+| 1. Correctness | pass as recorded; **fails under the correction above** (B r0, B r3, F r4 at t10000-a50-steady-o0) |
 | 2. Capture cost per table | pass: 78.3% lower at t10000-a50-steady, 81.8% at t40000-a20-steady, 64.9% at t40000-a50-burst |
 | 3. Outcome | fail at all three improvement points: last activation 5.7%, 4.9%, 14.1% better; already-active p99 79.7%, 98.1%, 73.2% better |
 | 4. Controls | pass at both |
@@ -249,5 +271,6 @@ further benchmark runs for this change.
   and catch-up end, so it begins at different clock times in the two arms.
 - Activation lag was not a frozen metric.
 
-A delivery stall seen in these runs, which predates this change, is
-tracked separately as a release blocker.
+The delivery stall seen in these runs predates this change. It was a
+pipeline failure (see the correction above), tracked separately as a
+release blocker.
