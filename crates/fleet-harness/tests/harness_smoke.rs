@@ -549,6 +549,21 @@ async fn the_harness_runs_scenarios_end_to_end() {
         "{report}"
     );
 
+    // Without a state-store DSN (a SQLite store, as in G3), checkpoint
+    // progress is read through the REST API, by position.
+    let mut cfg = config("S5", &env, "none");
+    cfg.measure.state_store_dsn = None;
+    let sweep_api = sweep(cfg, opts.clone()).await.unwrap();
+    let r = result(out_s, &sweep_api.points[0].runs[0]);
+    let cp = &r["resources"]["checkpoints"]["c01"];
+    assert!(cp["distinct"].as_u64().unwrap() >= 2, "{cp}");
+    assert_eq!(r["verdict"]["progress_ok"], true, "{}", r["verdict"]);
+    assert_eq!(
+        r["verdict"]["correctness_ok"], true,
+        "{}",
+        r["completeness"]
+    );
+
     // A server over the redo budget fails the run before any pipeline.
     let mut cfg = config("S5", &env, "none");
     cfg.topology.redo_log_capacity_max_bytes = Some(1 << 20);
@@ -651,12 +666,12 @@ async fn the_harness_runs_scenarios_end_to_end() {
     assert!(r["measured_secs"].as_f64().unwrap() < 60.0);
     assert_partial_counters(&r);
 
-    // Six runs, each with its own evidence and row namespace.
+    // Seven runs, each with its own evidence and row namespace.
     let ids = run_ids(out_s);
-    assert_eq!(ids.len(), 6, "{ids:?}");
+    assert_eq!(ids.len(), 7, "{ids:?}");
     let tags: BTreeSet<u64> = ids
         .iter()
         .map(|id| result(out_s, id)["run_tag"].as_u64().unwrap())
         .collect();
-    assert_eq!(tags.len(), 6, "{tags:?}");
+    assert_eq!(tags.len(), 7, "{tags:?}");
 }

@@ -1,0 +1,67 @@
+# G3 (release checklist): MySQL T1a, scenario A3. One MySQL 8.4 server,
+# 200 databases x 200 tables (40,000), one pipeline, the release image on
+# the SQLite state store (a departure from the earlier T1a plan, which used
+# the PostgreSQL store; see qualification/README.md). Exploratory: traffic,
+# DDL and budget values are placeholders, claims_allowed false.
+class: exploratory
+profile: cdc
+output_dir: results
+topology:
+  servers:
+    - name: c01
+      host: 127.0.0.1
+      port: 33061
+      cdc_host: g3-mysql
+      cdc_port: 3306
+  admin_user: root
+  admin_password: rootpw
+  databases_per_server: 200
+  tables_per_database: 200
+  database_prefix: cust_
+  seed: 1
+deltaforge:
+  api_url: http://127.0.0.1:18080
+  metrics_url: http://127.0.0.1:19000/metrics
+  process: {kind: docker_container, name: g3-deltaforge}
+  state_store: sqlite
+  pipeline_prefix: g3
+  tenant: fleet
+  cdc_user: df
+  cdc_password: dfpw
+  kafka_brokers: g3-kafka:29092
+  topic_prefix: g3
+  key: {mode: template, template: "${after.id}"}
+  proof_trace: {kind: docker_logs, container: g3-deltaforge}
+  proof_trace_required: true
+verifier:
+  kafka_brokers: localhost:9395
+  expected_key: none
+  work_dir: work
+traffic:
+  changes_per_sec_avg: 2000
+  changes_per_sec_peak: 10000
+  peak_fraction: 0.05
+  op_mix: {insert: 0.6, update: 0.3, delete: 0.1}
+  row_bytes: 256
+  rows_per_txn: 1
+  zipf_exponent: 1.0
+  active_set: {pattern: fixed, fraction: 0.01}
+  writers_per_server: 8
+ddl:
+  migration_statements: 3
+  migration_pace: 50
+  migration_rollout: {kind: sequential}
+budgets:
+  lag_p99_secs: 5
+  memory_bytes: 6442450944
+measure:
+  interval_secs: 5
+  # No state_store_dsn: checkpoints are read through the REST API.
+  state_store_file: state/deltaforge.db
+  cdc_users: [df]
+run:
+  scenario: A3
+  duration_secs: 1200
+  warmup_secs: 120
+  repetitions: 1
+  sources: [1]

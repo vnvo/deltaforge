@@ -1,0 +1,17 @@
+# G4 (release checklist): PostgreSQL source qualification. One PostgreSQL 17
+# server, one pipeline into Kafka (native JSON), the release image on the
+# SQLite state store. This does not qualify the PostgreSQL state store.
+output_dir: results
+api_url: http://127.0.0.1:18081
+metrics_url: http://127.0.0.1:19001/metrics
+state_store: sqlite
+kafka_brokers: g4-kafka:29092
+verifier_kafka_brokers: localhost:9399
+admin_dsn: postgres://postgres:pgpw@127.0.0.1:55432/g4
+cdc_dsn: postgres://df:dfpw@g4-postgres:5432/g4
+tables: {count: 1000, toast_full: 50, toast_default: 50, initial_rows: 20, big_bytes: 8192}
+cdc: {duration_secs: 1800, ops_per_sec: 200, writers: 8}
+stop: {at_secs: 600, for_secs: 60}
+add_column: {at_secs: 1200, table: 150}
+unsupported: {schema_registry_url: "http://g4-schema-registry:8081"}
+seed: 1

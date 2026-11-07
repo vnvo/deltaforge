@@ -434,9 +434,17 @@ impl Default for Disruptions {
 pub struct Measure {
     #[serde(default = "default_interval")]
     pub interval_secs: u64,
-    /// The PostgreSQL state store, for size measurements.
+    /// The PostgreSQL state store, for size measurements and checkpoint
+    /// progress. Without it, checkpoints are read through the instance's
+    /// REST API (`/pipelines/{name}/checkpoints`), which works for any
+    /// state store.
     #[serde(default)]
     pub state_store_dsn: Option<String>,
+    /// A SQLite state store's database file as the harness sees it (a bind
+    /// mount of the instance's store), for size measurements: the file with
+    /// its `-wal` and `-shm` files.
+    #[serde(default)]
+    pub state_store_file: Option<String>,
     /// MySQL users whose connections count as DeltaForge's.
     pub cdc_users: Vec<String>,
 }

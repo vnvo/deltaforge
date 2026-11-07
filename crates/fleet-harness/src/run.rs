@@ -1168,6 +1168,10 @@ async fn sampler(
         }
         None => None,
     };
+    let api = match &store {
+        Some(_) => None,
+        None => deltaforge::Api::new(&cfg.deltaforge.api_url).ok(),
+    };
     let every = Duration::from_secs(cfg.measure.interval_secs.max(1));
     loop {
         let now = Instant::now();
@@ -1202,19 +1206,29 @@ async fn sampler(
                 }
             }
         }
-        let store_size = match &store {
-            Some(c) => measure::store_size(c).await.ok(),
-            None => None,
+        let store_size = match (&store, &cfg.measure.state_store_file) {
+            (Some(c), _) => measure::store_size(c).await.ok(),
+            (None, Some(f)) => measure::sqlite_store_size(Path::new(f)).ok(),
+            (None, None) => None,
         };
         let mut checkpoints = BTreeMap::new();
-        if let Some(c) = &store {
-            for (_, s) in &servers {
-                // A failed read is a sample without progress, never a
-                // server left out of the progress check.
-                let v =
-                    measure::checkpoints(c, &s.name).await.unwrap_or_default();
-                checkpoints.insert(s.name.clone(), v);
-            }
+        for (_, s) in &servers {
+            // A failed read is a sample without progress, never a server
+            // left out of the progress check.
+            let v = match &store {
+                Some(c) => {
+                    measure::checkpoints(c, &s.name).await.unwrap_or_default()
+                }
+                None => match &api {
+                    Some(api) => api
+                        .checkpoints(&deltaforge::pipeline_name(&cfg, s))
+                        .await
+                        .map(|v| measure::api_checkpoints(&v))
+                        .unwrap_or_default(),
+                    None => BTreeMap::new(),
+                },
+            };
+            checkpoints.insert(s.name.clone(), v);
         }
         let scrape_started = Instant::now();
         let metrics = match http.get(&cfg.deltaforge.metrics_url).send().await {
