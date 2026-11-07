@@ -283,7 +283,7 @@ async fn open_binlog(
         // stream, if the server did restart, ends and reconnects through
         // the same check.
         Ok(Opened::Stream(stream)) => {
-            match super::require_complete_binlog(control, dsn, expected_uuid)
+            match super::require_supported_server(control, dsn, expected_uuid)
                 .await
             {
                 Ok(()) => Ok(stream),

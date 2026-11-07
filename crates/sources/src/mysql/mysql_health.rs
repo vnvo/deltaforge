@@ -848,6 +848,54 @@ fn engine_hard_error(
     }
 }
 
+/// The oldest MySQL server the source runs against, as
+/// [`parse_server_version`](super::mysql_ddl_attribution::parse_server_version)
+/// encodes it: the schema capture's derived tables (`VALUES ROW`) need
+/// 8.0.19. This is the syntax minimum; the qualified version is MySQL 8.4.
+pub(crate) const MIN_SERVER_VERSION: u32 = 80019;
+
+/// Why a server reporting `version` (`SELECT VERSION()`) is refused, if it
+/// is: MariaDB, a MySQL older than [`MIN_SERVER_VERSION`], or a version that
+/// does not parse (fails closed).
+pub(crate) fn server_version_refusal(version: &str) -> Option<String> {
+    if version.to_ascii_lowercase().contains("mariadb") {
+        return Some(format!(
+            "the server is MariaDB ({version}), which is not supported: \
+             DeltaForge requires MySQL 8.0.19 or later."
+        ));
+    }
+    match super::mysql_ddl_attribution::parse_server_version(version) {
+        Some(v) if v >= MIN_SERVER_VERSION => None,
+        Some(_) => Some(format!(
+            "MySQL {version} is older than 8.0.19, the minimum DeltaForge \
+             requires (its schema capture uses VALUES ROW, added in 8.0.19). \
+             Upgrade the server."
+        )),
+        None => Some(format!(
+            "cannot parse the server version {version:?}: DeltaForge requires \
+             MySQL 8.0.19 or later."
+        )),
+    }
+}
+
+/// Refuse a server DeltaForge cannot run against: its version
+/// ([`server_version_refusal`]), then its binlog
+/// ([`require_complete_binlog`]). Fails closed when either cannot be read.
+pub(crate) async fn require_supported_server(
+    conn: &mut mysql_async::Conn,
+) -> std::result::Result<(), String> {
+    let version: Option<String> = conn
+        .query_first("SELECT VERSION()")
+        .await
+        .map_err(|e| format!("cannot read the server version: {e}"))?;
+    let version =
+        version.ok_or_else(|| "the server reported no version".to_string())?;
+    if let Some(refusal) = server_version_refusal(&version) {
+        return Err(refusal);
+    }
+    require_complete_binlog(conn).await
+}
+
 /// Refuse a server whose binlog may not hold every transaction it applies:
 /// `log_replica_updates` must be ON on every MySQL source, primary or
 /// replica. With it OFF, transactions applied through any replication
@@ -857,7 +905,7 @@ fn engine_hard_error(
 /// read-only (a server restart changes it, which ends every session); callers
 /// check it after each stream opens and before any event is read. Fails
 /// closed when it cannot be read.
-pub(crate) async fn require_complete_binlog(
+async fn require_complete_binlog(
     conn: &mut mysql_async::Conn,
 ) -> std::result::Result<(), String> {
     let updates: Option<u8> = match conn
@@ -885,6 +933,31 @@ pub(crate) async fn require_complete_binlog(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_mysql_from_8_0_19_is_supported() {
+        for ok in [
+            "8.0.19",
+            "8.0.36-log",
+            "8.4.9",
+            "9.1.0",
+            "8.0.19-0ubuntu0.20.04.1",
+        ] {
+            assert_eq!(server_version_refusal(ok), None, "{ok}");
+        }
+        for (old, why) in [
+            ("8.0.18", "older than 8.0.19"),
+            ("8.0.14-log", "older than 8.0.19"),
+            ("5.7.44-log", "older than 8.0.19"),
+            ("10.11.6-MariaDB", "MariaDB"),
+            ("5.5.5-10.6.12-MariaDB-log", "MariaDB"),
+            ("8.4", "cannot parse"),
+            ("", "cannot parse"),
+        ] {
+            let refusal = server_version_refusal(old).unwrap_or_default();
+            assert!(refusal.contains(why), "{old}: {refusal}");
+        }
+    }
 
     #[test]
     fn only_an_exact_gtid_subset_proves_a_resume_position() {

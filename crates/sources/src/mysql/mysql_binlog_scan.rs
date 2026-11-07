@@ -2185,25 +2185,17 @@ pub(crate) async fn capture_batch_with(
         let t = Instant::now();
         let mut missing = Vec::new();
         let present: Vec<(&str, &str)> = {
-            let pairs = vec!["(?, ?)"; sorted.len()].join(", ");
-            let params: Vec<mysql_async::Value> = sorted
-                .iter()
-                .flat_map(|(db, table)| {
-                    [db.as_str().into(), table.as_str().into()]
-                })
-                .collect();
             let existing: Vec<(String, String)> = if sorted.is_empty() {
                 Vec::new()
             } else {
-                conn.exec(
-                    format!(
-                        "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
-                         WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({pairs})"
-                    ),
-                    params,
-                )
-                .await
-                .map_err(|e| batch_error(e, "table existence"))?
+                let keys: Vec<(&str, &str)> = sorted
+                    .iter()
+                    .map(|(db, table)| (db.as_str(), table.as_str()))
+                    .collect();
+                let read = super::mysql_schema_loader::existence_read(&keys);
+                conn.exec(read.sql, read.params)
+                    .await
+                    .map_err(|e| batch_error(e, "table existence"))?
             };
             let existing: std::collections::HashSet<(String, String)> =
                 existing.into_iter().collect();
@@ -4870,6 +4862,274 @@ pub(crate) mod tests {
                 assert_eq!(all.schemas.len(), 3);
                 assert!(all.deferred.is_empty());
                 assert_eq!(all.schemas[&k("mm")].columns.len(), 9);
+            }
+
+            /// The capture's five INFORMATION_SCHEMA reads (existence,
+            /// columns, primary key, key prefixes, table metadata) return
+            /// what the row-constructor statements they replaced returned:
+            /// the same rows, values with their types, in order where the
+            /// capture depends on it, and the same result metadata. Tables
+            /// of every kind, names differing only in case or accent, a
+            /// view, missing tables and databases, and a repeated pair. Every
+            /// read finds tables by name; the replaced statements read every
+            /// table of a database (`docs/design/mysql-activation-capture-cost.md`).
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn capture_reads_match_the_row_constructor_statements() {
+                use crate::mysql::mysql_schema_loader::{
+                    CatalogRead, columns_read, existence_read, key_prefix_read,
+                    primary_key_read, table_metadata_read,
+                };
+                let dsn = server(true).await;
+                sql(
+                    &dsn,
+                    &[
+                        "CREATE DATABASE capeq",
+                        "CREATE DATABASE capEq",
+                        "CREATE DATABASE `capeq ü` CHARACTER SET latin1",
+                        "CREATE TABLE capeq.t_types (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, \
+                         ti TINYINT UNSIGNED NOT NULL DEFAULT 7, de DECIMAL(20,6) NULL, fl FLOAT, \
+                         db DOUBLE NOT NULL DEFAULT 1.5, bi BIT(5) DEFAULT b'101', da DATE, \
+                         dt DATETIME(6) DEFAULT '2001-02-03 04:05:06.000007', \
+                         ts TIMESTAMP(3) NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3), \
+                         tm TIME(2), yr YEAR, ch CHAR(10) CHARACTER SET latin1 COLLATE latin1_swedish_ci, \
+                         vb VARCHAR(100) COLLATE utf8mb4_bin NOT NULL DEFAULT '', \
+                         vg VARCHAR(50) CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci COMMENT 'ünï \"q\"', \
+                         tx TEXT, mb MEDIUMBLOB, js JSON, en ENUM('a','b''c') NOT NULL DEFAULT 'a', \
+                         st SET('x','y'), bn BINARY(16), vbn VARBINARY(8), gs BIGINT AS (id + 1) STORED, \
+                         gv VARCHAR(20) AS (CONCAT(vb, 'x')) VIRTUAL, pt POINT SRID 4326, inv INT INVISIBLE, \
+                         INDEX ix_fn ((ti + 1)), UNIQUE KEY uq (vb(10)))",
+                        "CREATE TABLE capeq.t_comp_pk (a INT NOT NULL, b VARCHAR(20) NOT NULL, c INT, PRIMARY KEY (b, a))",
+                        "CREATE TABLE capeq.t_prefix_pk (id INT NOT NULL, name VARCHAR(200) NOT NULL, \
+                         body BLOB NOT NULL, PRIMARY KEY (body(16), name(10), id))",
+                        "CREATE TABLE capeq.t_unique_nopk (id INT NOT NULL, u VARCHAR(10) NOT NULL, UNIQUE KEY (u))",
+                        "CREATE TABLE capeq.t_nokey (a INT, b TEXT)",
+                        "CREATE TABLE capeq.T_case (id INT PRIMARY KEY, x INT)",
+                        "CREATE TABLE capeq.t_case (id INT PRIMARY KEY, y VARCHAR(3))",
+                        "CREATE TABLE capeq.`é` (id INT PRIMARY KEY)",
+                        "CREATE TABLE capeq.e (id INT PRIMARY KEY, z INT)",
+                        "CREATE TABLE capeq.t_myisam (id INT PRIMARY KEY, v VARCHAR(5)) ENGINE=MyISAM",
+                        "CREATE TABLE capeq.t_part (id INT NOT NULL, k INT NOT NULL, PRIMARY KEY (id, k)) \
+                         PARTITION BY HASH (k) PARTITIONS 4",
+                        "CREATE TABLE capeq.`t sp` (`col sp` INT PRIMARY KEY, `col``bt` INT)",
+                        "CREATE TABLE capeq.t_latin1 (id INT PRIMARY KEY, s VARCHAR(10)) DEFAULT CHARSET=latin1 COLLATE=latin1_bin",
+                        "CREATE TABLE capeq.t_desc_pk (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a DESC, b))",
+                        "CREATE VIEW capeq.v_view AS SELECT id, vb FROM capeq.t_types",
+                        "CREATE TABLE capEq.t_types (id INT PRIMARY KEY, other INT)",
+                        "CREATE TABLE `capeq ü`.`tü` (id INT PRIMARY KEY, s VARCHAR(4))",
+                        "CREATE TABLE `capeq ü`.t_case (id INT PRIMARY KEY)",
+                    ],
+                )
+                .await;
+                // Present, missing (no such table; another case or accent;
+                // no such database; a database in another case), and one
+                // pair repeated.
+                let tables: Vec<(&str, &str)> = vec![
+                    ("capeq", "t_part"),
+                    ("capeq", "t_types"),
+                    ("capeq", "nope"),
+                    ("capeq", "t_comp_pk"),
+                    ("capeq", "T_case"),
+                    ("capeq ü", "tü"),
+                    ("capeq", "t_prefix_pk"),
+                    ("capeq", "é"),
+                    ("capeq", "T_CASE"),
+                    ("capeq", "t_unique_nopk"),
+                    ("capEq", "t_types"),
+                    ("capeq", "e"),
+                    ("capeq", "t_nokey"),
+                    ("capeq", "E"),
+                    ("capeq", "t_case"),
+                    ("capeq", "t_myisam"),
+                    ("capeq_none", "t"),
+                    ("capeq", "t sp"),
+                    ("capeq", "ê"),
+                    ("capeq", "t_latin1"),
+                    ("CAPEQ", "t_types"),
+                    ("capeq", "t_desc_pk"),
+                    ("capeq", "v_view"),
+                    ("capeq ü", "t_case"),
+                    ("capeq", "t_comp_pk"),
+                ];
+                // The statements as of 7724ff08.
+                let pairs = vec!["(?, ?)"; tables.len()].join(", ");
+                let pair_params: Vec<mysql_async::Value> = tables
+                    .iter()
+                    .flat_map(|(db, t)| [(*db).into(), (*t).into()])
+                    .collect();
+                let mut column_params: Vec<mysql_async::Value> = tables
+                    .iter()
+                    .map(|(db, t)| format!("{db}.{t}").into())
+                    .collect();
+                column_params.extend(pair_params.clone());
+                let ranks = vec!["?"; tables.len()].join(", ");
+                let replaced =
+                    |sql: String, params: Vec<mysql_async::Value>| {
+                        CatalogRead { sql, params }
+                    };
+                let cases: Vec<(&str, bool, CatalogRead, CatalogRead)> = vec![
+                    (
+                        "existence",
+                        false,
+                        existence_read(&tables),
+                        replaced(
+                            format!(
+                                "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
+                         WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({pairs})"
+                            ),
+                            pair_params.clone(),
+                        ),
+                    ),
+                    (
+                        "columns",
+                        true,
+                        columns_read(&tables),
+                        replaced(
+                            format!(
+                                "SELECT FIELD(CONCAT(TABLE_SCHEMA, '.', TABLE_NAME), {ranks}) AS RK, \
+                         TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, DATA_TYPE, IS_NULLABLE, \
+                         ORDINAL_POSITION, COLUMN_DEFAULT, EXTRA, COLUMN_COMMENT, CHARACTER_MAXIMUM_LENGTH, \
+                         NUMERIC_PRECISION, NUMERIC_SCALE, CHARACTER_OCTET_LENGTH, DATETIME_PRECISION, \
+                         (SELECT co.ID FROM INFORMATION_SCHEMA.COLLATIONS co \
+                          WHERE co.COLLATION_NAME = c.COLLATION_NAME) AS COLLATION_ID \
+                         FROM INFORMATION_SCHEMA.COLUMNS c \
+                         WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({pairs}) \
+                         ORDER BY RK, ORDINAL_POSITION"
+                            ),
+                            column_params,
+                        ),
+                    ),
+                    (
+                        "primary key",
+                        true,
+                        primary_key_read(&tables),
+                        replaced(
+                            format!(
+                                "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME \
+                         FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE \
+                         WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({pairs}) \
+                           AND CONSTRAINT_NAME = 'PRIMARY' \
+                         ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
+                            ),
+                            pair_params.clone(),
+                        ),
+                    ),
+                    (
+                        "key prefixes",
+                        false,
+                        key_prefix_read(&tables),
+                        replaced(
+                            format!(
+                                "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, SUB_PART \
+                         FROM INFORMATION_SCHEMA.STATISTICS \
+                         WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({pairs}) \
+                           AND INDEX_NAME = 'PRIMARY' AND SUB_PART IS NOT NULL"
+                            ),
+                            pair_params.clone(),
+                        ),
+                    ),
+                    (
+                        "table metadata",
+                        false,
+                        table_metadata_read(&tables),
+                        replaced(
+                            format!(
+                                "SELECT TABLE_SCHEMA, TABLE_NAME, ENGINE, TABLE_COLLATION \
+                         FROM INFORMATION_SCHEMA.TABLES \
+                         WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({pairs})"
+                            ),
+                            pair_params,
+                        ),
+                    ),
+                ];
+                let mut c = mysql_async::Conn::from_url(&dsn).await.unwrap();
+                // Rows (values) and result metadata of a read.
+                type Read = (Vec<String>, Vec<Vec<mysql_async::Value>>);
+                async fn run(
+                    c: &mut mysql_async::Conn,
+                    read: &CatalogRead,
+                ) -> Read {
+                    let mut result = c
+                        .exec_iter(read.sql.as_str(), read.params.clone())
+                        .await
+                        .unwrap();
+                    let meta = result
+                        .columns()
+                        .map(|cols| {
+                            cols.iter()
+                                .map(|k| {
+                                    format!(
+                                        "{} {:?} {:?} {} {} {}",
+                                        k.name_str(),
+                                        k.column_type(),
+                                        k.flags(),
+                                        k.character_set(),
+                                        k.column_length(),
+                                        k.decimals()
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let rows: Vec<mysql_async::Row> =
+                        result.collect().await.unwrap();
+                    (meta, rows.into_iter().map(|r| r.unwrap()).collect())
+                }
+                // Whether every table of the catalog's dictionary is read by
+                // name in the plan.
+                async fn by_name(
+                    c: &mut mysql_async::Conn,
+                    read: &CatalogRead,
+                ) -> bool {
+                    let plan: Vec<String> = c
+                        .exec(
+                            format!("EXPLAIN FORMAT=TREE {}", read.sql),
+                            read.params.clone(),
+                        )
+                        .await
+                        .unwrap();
+                    let plan = plan.join("\n");
+                    plan.lines()
+                        .filter(|l| l.contains(" on tbl "))
+                        .all(|l| l.contains("name="))
+                }
+                for (name, ordered, now, before) in &cases {
+                    let (now_meta, mut now_rows) = run(&mut c, now).await;
+                    let (before_meta, mut before_rows) =
+                        run(&mut c, before).await;
+                    assert!(
+                        !before_rows.is_empty(),
+                        "{name}: no rows to compare"
+                    );
+                    assert_eq!(
+                        now_meta, before_meta,
+                        "{name}: result metadata"
+                    );
+                    if !ordered {
+                        let key = |r: &Vec<mysql_async::Value>| {
+                            r.iter()
+                                .map(|v| v.as_sql(false))
+                                .collect::<Vec<_>>()
+                        };
+                        now_rows.sort_by_key(key);
+                        before_rows.sort_by_key(key);
+                    }
+                    assert_eq!(now_rows, before_rows, "{name}: rows");
+                    assert!(
+                        by_name(&mut c, now).await,
+                        "{name}: a table read not by name"
+                    );
+                    assert!(
+                        !by_name(&mut c, before).await,
+                        "{name}: the plan check detects nothing"
+                    );
+                }
+                let rows = run(&mut c, &cases[0].2).await.1;
+                assert_eq!(
+                    rows.len(),
+                    18,
+                    "existing tables, the view included, each once"
+                );
             }
 
             /// The largest table definition MySQL 8.4 accepts (4,096

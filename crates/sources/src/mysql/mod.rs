@@ -1505,7 +1505,7 @@ impl MySqlSource {
                 "MySQL source verified a non-MySQL identity"
             )));
         };
-        require_complete_binlog(
+        require_supported_server(
             captures.control(),
             self.dsn.expose(),
             &root_id.server_uuid,
@@ -2515,7 +2515,7 @@ async fn connect_first_stream(
         // Checked again once the stream is open, before any event is read:
         // the setting changes only with a restart, which ends this stream.
         Opened::Stream(stream) => {
-            require_complete_binlog(
+            require_supported_server(
                 ctx.capture.control(),
                 ctx.dsn.current().expose(),
                 &expected,
@@ -2622,7 +2622,7 @@ async fn reconnect_stream(
     );
     // A candidate whose binlog may miss applied transactions is refused
     // before reconciliation records anything.
-    require_complete_binlog(
+    require_supported_server(
         ctx.capture.control(),
         ctx.dsn.current().expose(),
         &found,
@@ -2647,7 +2647,7 @@ async fn reconnect_stream(
     {
         Opened::Stream(stream) => {
             ctx.retry.reset();
-            require_complete_binlog(
+            require_supported_server(
                 ctx.capture.control(),
                 ctx.dsn.current().expose(),
                 &expected,
@@ -2850,9 +2850,10 @@ impl RunCtx {
     }
 }
 
-/// Refuse a server whose binlog does not hold every transaction it applies
-/// (`mysql_health::require_complete_binlog`).
-pub(crate) async fn require_complete_binlog(
+/// Refuse a server DeltaForge cannot run against: too old, MariaDB, or a
+/// binlog that does not hold every transaction it applies
+/// (`mysql_health::require_supported_server`).
+pub(crate) async fn require_supported_server(
     control: &mysql_control::ControlPool,
     dsn: &str,
     expected_uuid: &str,
@@ -2860,7 +2861,7 @@ pub(crate) async fn require_complete_binlog(
     let mut conn = control_conn(control, Class::Position, dsn, expected_uuid)
         .await
         .map_err(|e| e.into_source_error(expected_uuid))?;
-    let r = mysql_health::require_complete_binlog(&mut conn).await;
+    let r = mysql_health::require_supported_server(&mut conn).await;
     if r.is_ok() {
         conn.release().await;
     }
@@ -3421,7 +3422,7 @@ async fn check_identity_post_reconnect(
         None => {
             // A reconnect's stream is open, nothing read yet: the server
             // may have restarted with another configuration.
-            require_complete_binlog(
+            require_supported_server(
                 ctx.capture.control(),
                 ctx.dsn.current().expose(),
                 &expected,
