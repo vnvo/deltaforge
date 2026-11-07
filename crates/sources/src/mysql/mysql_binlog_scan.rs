@@ -1479,7 +1479,7 @@ pub(crate) type BetweenHook<'a> = &'a (
             + Sync
     );
 
-async fn read_position(
+pub(crate) async fn read_position(
     conn: &mut mysql_async::Conn,
     gtid_mode: bool,
     lineage_hash: &str,
@@ -2007,7 +2007,9 @@ fn control_for(
 /// A capture's control connection that could not be had: saturation keeps
 /// its class, a connect failure is an open failure, another server is
 /// refused.
-fn control_error(e: super::mysql_control::ControlError) -> ProofError {
+pub(crate) fn control_error(
+    e: super::mysql_control::ControlError,
+) -> ProofError {
     use super::mysql_control::ControlError;
     use super::mysql_session::SessionError;
     match e {

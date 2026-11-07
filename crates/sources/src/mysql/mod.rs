@@ -31,6 +31,7 @@ pub use mysql_errors::{LoopControl, MySqlSourceError, MySqlSourceResult};
 mod mysql_activation;
 mod mysql_activation_window;
 mod mysql_baseline;
+mod mysql_behind_wait;
 mod mysql_binlog_scan;
 mod mysql_cache_cost;
 mod mysql_cache_index;
@@ -375,6 +376,11 @@ pub(crate) struct RunCtx {
     /// Proofs an activation window prepared, by table, consumed by the lazy
     /// baseline of the table's rows.
     prepared: HashMap<(String, String), mysql_activation_window::Prepared>,
+    /// Tables an activation window deferred because its capture started
+    /// before their rows: the rows' start, and whether a later window's
+    /// wait (`mysql_behind_wait`) has since seen the server's position
+    /// cover it.
+    behind_capture: HashMap<(String, String), (MySqlCheckpoint, bool)>,
     /// Schema-proof bounds.
     proofs: deltaforge_config::MysqlProofCfg,
     /// The source's shared proof scanner (`mysql_proof_scanner`), shared
@@ -1874,6 +1880,7 @@ impl MySqlSource {
             prefetch_error: None,
             last_received: std::time::Instant::now(),
             prepared: Default::default(),
+            behind_capture: Default::default(),
             proofs: self.proofs.clone(),
             proof_scanner: Arc::new(proof_scanner),
             selection: mysql_selection::Caches::new(&self.pipeline, &self.id),

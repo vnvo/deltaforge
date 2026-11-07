@@ -1656,6 +1656,7 @@ pub(crate) mod tests {
             prefetch_error: None,
             last_received: std::time::Instant::now(),
             prepared: Default::default(),
+            behind_capture: Default::default(),
             proofs: Default::default(),
             proof_scanner: Default::default(),
             selection: Default::default(),

@@ -1072,6 +1072,159 @@ pub(crate) async fn capture_and_scan(
     })
 }
 
+fn same_start(a: &MySqlCheckpoint, b: &MySqlCheckpoint) -> bool {
+    (&a.file, a.pos, &a.gtid_set) == (&b.file, b.pos, &b.gtid_set)
+}
+
+/// The server's position, read for [`behind_wait`].
+fn read_server_position<'c>(
+    link: &'c mut super::mysql_control::MySqlLink,
+    args: &'c super::mysql_behind_wait::ReadArgs,
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<MySqlCheckpoint, ProofError>>
+            + Send
+            + 'c,
+    >,
+> {
+    Box::pin(super::mysql_binlog_scan::read_position(
+        link.conn(),
+        args.gtid_mode,
+        &args.lineage,
+    ))
+}
+
+/// Before a window captures tables an earlier window deferred because its
+/// capture started before their rows: wait, within
+/// [`BEHIND_WAIT`](super::mysql_behind_wait::BEHIND_WAIT), for the
+/// server's position (read with `read`) to cover every recorded row start
+/// of the window's tables. Covered: the tables are marked as waited for
+/// (`admit_batch` fails closed if the capture is still before them).
+/// Otherwise the window fails closed before anything of it is captured,
+/// decided or dispatched. Its duration and outcome are measured.
+async fn behind_wait<R, Fut>(
+    ctx: &mut RunCtx,
+    tables: &[(String, String)],
+    batch: &BTreeMap<(String, String), MySqlCheckpoint>,
+    head: &MySqlCheckpoint,
+    read: R,
+) -> Result<(), SourceError>
+where
+    R: FnMut(Duration) -> Fut,
+    Fut: std::future::Future<
+            Output = Result<
+                MySqlCheckpoint,
+                super::mysql_behind_wait::WaitError,
+            >,
+        >,
+{
+    use super::mysql_behind_wait::{BEHIND_WAIT, WaitError, wait_covered};
+    let waiting: Vec<(String, String)> = tables
+        .iter()
+        .filter(|k| {
+            matches!(
+                (ctx.behind_capture.get(*k), batch.get(*k)),
+                (Some((a, _)), Some(b)) if same_start(a, b)
+            )
+        })
+        .cloned()
+        .collect();
+    if waiting.is_empty() {
+        return Ok(());
+    }
+    let targets: Vec<MySqlCheckpoint> = waiting
+        .iter()
+        .map(|k| ctx.behind_capture[k].0.clone())
+        .collect();
+    let t0 = Instant::now();
+    let r = wait_covered(&targets, &ctx.cancel, BEHIND_WAIT, read).await;
+    let outcome = match &r {
+        Ok(_) => "covered",
+        Err(e) => e.outcome(),
+    };
+    metrics::histogram!(
+        "deltaforge_mysql_activation_behind_wait_seconds",
+        "source" => ctx.source_id.clone(),
+        "outcome" => outcome,
+    )
+    .record(t0.elapsed().as_secs_f64());
+    let unchanged = "nothing of the window was admitted or dispatched and \
+                     the checkpoint stays before it";
+    let n = waiting.len();
+    match r {
+        Ok(waited) => {
+            info!(source_id = %ctx.source_id, tables = n, waited_ms = waited.as_millis() as u64, "activation window: the server's position covers the deferred tables' rows");
+            for k in &waiting {
+                if let Some(e) = ctx.behind_capture.get_mut(k) {
+                    e.1 = true;
+                }
+            }
+            Ok(())
+        }
+        Err(WaitError::Cancelled) => Err(SourceError::Cancelled),
+        Err(WaitError::TimedOut { waited, last }) => Err(SourceError::Schema {
+            details: format!(
+                "the activation window waited {waited:?} for the server's \
+                 position to cover the rows of {n} deferred table(s) (first \
+                 {}.{}); it did not (last read {last:?}): an uncertain \
+                 outcome; {unchanged}",
+                waiting[0].0, waiting[0].1
+            )
+            .into(),
+        }),
+        Err(WaitError::Unordered(why)) => Err(SourceError::Schema {
+            details: format!(
+                "the activation window's wait for the rows of {n} deferred \
+                 table(s): {why}: an uncertain outcome; {unchanged}"
+            )
+            .into(),
+        }),
+        Err(WaitError::Control(e)) => {
+            Err(match super::mysql_binlog_scan::control_error(e) {
+                ProofError::Saturated { scope, .. } => {
+                    crate::incident_drafts::mysql_control_plane_saturated(
+                        &ctx.source_id,
+                        "activation window",
+                        &waiting,
+                        scope,
+                        head,
+                    )
+                }
+                ProofError::Open(_, why) => SourceError::Connect {
+                    details: format!(
+                        "the activation window's position read could not \
+                     connect ({why}); {unchanged}"
+                    )
+                    .into(),
+                },
+                e => SourceError::Schema {
+                    details: format!(
+                        "the activation window's position read failed ({e}); \
+                     {unchanged}"
+                    )
+                    .into(),
+                },
+            })
+        }
+        Err(WaitError::Read(ProofError::Open(_, why))) => {
+            Err(SourceError::Connect {
+                details: format!(
+                    "the activation window's position read lost its \
+                     connection ({why}); {unchanged}"
+                )
+                .into(),
+            })
+        }
+        Err(WaitError::Read(e)) => Err(SourceError::Schema {
+            details: format!(
+                "the activation window's position read failed ({e}); \
+                 {unchanged}"
+            )
+            .into(),
+        }),
+    }
+}
+
 /// A fresh window: its capture and scan, then the atomic admission of all
 /// its tables.
 async fn admit_window(
@@ -1095,6 +1248,41 @@ async fn admit_window(
         lineage: Some(capture.lineage.clone()),
         ..a_head.clone()
     };
+    let pool = capture.capture.control().clone();
+    let dsn = capture.capture.dsn().current().expose().to_string();
+    let ident = super::mysql_control::ident(&dsn, &capture.server_uuid);
+    let args = super::mysql_behind_wait::ReadArgs {
+        gtid_mode: head.gtid_set.is_some(),
+        lineage: capture.lineage.clone(),
+    };
+    behind_wait(ctx, &tables, &batch, &head, |left| {
+        let (pool, dsn, ident, uuid) = (
+            pool.clone(),
+            dsn.clone(),
+            ident.clone(),
+            capture.server_uuid.clone(),
+        );
+        let args = &args;
+        async move {
+            super::mysql_behind_wait::read_once(
+                &pool,
+                &ident,
+                left,
+                |t| async move {
+                    super::mysql_session::open_control_connection(
+                        &dsn, &uuid, t,
+                    )
+                    .await
+                    .map(super::mysql_control::MySqlLink::from)
+                },
+                read_server_position,
+                args,
+            )
+            .await
+        }
+    })
+    .await
+    .map_err(LoopControl::Fail)?;
     let done = capture_and_scan(capture, &tables, &froms, &head)
         .await
         .map_err(LoopControl::Fail)?;
@@ -1324,6 +1512,63 @@ async fn admit_batch(
     let (tables, gone): (Vec<_>, Vec<_>) = tables
         .into_iter()
         .partition(|((db, table), _, _)| cap.table(db, table).is_some());
+    // A table whose rows start after the capture's start (ordered, so the
+    // stream had a transaction that the capture's first position read did
+    // not yet show as executed) is not contained by the capture, but its
+    // outcome is not uncertain: it stays undecided, deferred like a cut
+    // table, nothing of it decided or written, its rows back to the stream
+    // for a later window. That window first waits, bounded, for the
+    // server's position to cover the rows (`mysql_behind_wait`); a capture
+    // still before them after such a wait fails the window closed, as does
+    // a wait that ends otherwise. An unordered start stays uncertain
+    // (below).
+    let from = mysql_checkpoint_position(
+        &cap.from.file,
+        cap.from.pos,
+        cap.from.gtid_set.as_deref(),
+    );
+    let (tables, behind): (Vec<_>, Vec<_>) =
+        tables.into_iter().partition(|(_, at, _)| {
+            let row = mysql_checkpoint_position(
+                &at.file,
+                at.pos,
+                at.gtid_set.as_deref(),
+            );
+            !matches!(
+                (&row, &from),
+                (Some(r), Some(f))
+                    if matches!(order_positions(r, f), CheckpointOrder::After)
+            )
+        });
+    for ((db, table), at, _) in &behind {
+        let k = (db.clone(), table.clone());
+        let waited = matches!(
+            ctx.behind_capture.get(&k),
+            Some((a, true)) if same_start(a, at)
+        );
+        if waited {
+            ctx.behind_capture.remove(&k);
+            return Err(SourceError::Schema {
+                details: format!(
+                    "the activation window's capture of {db}.{table} started \
+                     before its rows' position after the server's position \
+                     was read as covering them: an uncertain outcome; \
+                     nothing of the window was admitted or dispatched and \
+                     the checkpoint stays before it"
+                )
+                .into(),
+            });
+        }
+        warn!(source_id = %ctx.source_id, %db, %table, "activation window: the capture started before the table's rows; deferred");
+        ctx.behind_capture.insert(k, (at.clone(), false));
+    }
+    if !behind.is_empty() {
+        metrics::counter!(
+            "deltaforge_mysql_activation_window_behind_capture_total",
+            "source" => ctx.source_id.clone(),
+        )
+        .increment(behind.len() as u64);
+    }
     // Its rows are covered up to the statement that dropped or renamed it.
     // With no such statement in its proof answer the outcome is uncertain:
     // the window fails closed, before anything is written.
@@ -1787,8 +2032,19 @@ async fn admit_batch(
         let checked: Vec<(String, String)> =
             tables.iter().map(|(k, ..)| k.clone()).collect();
         super::mysql_failover_drift::window_checked(ctx, &checked).await?;
+        for (k, ..) in &governs {
+            ctx.behind_capture.remove(k);
+        }
         for ((db, table), at, _) in &deferred {
             trace_proof(&tag, db, table, None, None, lctn, "deferred");
+            governs.push((
+                (db.clone(), table.clone()),
+                at.clone(),
+                Governs::Deferred,
+            ));
+        }
+        for ((db, table), at, _) in &behind {
+            trace_proof(&tag, db, table, None, None, lctn, "behind_capture");
             governs.push((
                 (db.clone(), table.clone()),
                 at.clone(),
@@ -2856,6 +3112,214 @@ mod tests {
                 seqs(&ctx, "t1").await.1.is_some(),
                 "the other table is admitted"
             );
+        }
+
+        /// A capture that starts behind a table's rows (the rows' boundary
+        /// contains the capture's start: one transaction the stream had
+        /// that the capture's first position read did not) leaves that
+        /// table undecided: deferred, nothing of it written or prepared,
+        /// its rows back to the stream. The covered table is admitted.
+        #[tokio::test]
+        async fn a_capture_behind_a_tables_rows_defers_that_table() {
+            let mut ctx = ctx_on(std::sync::Arc::new(
+                storage::MemoryStorageBackend::new(),
+            ))
+            .await;
+            let (_, governs) = admit(
+                &mut ctx,
+                &["t1", "t2"],
+                vec![entry("t2", 5), entry("t1", 51)],
+            )
+            .await
+            .unwrap();
+            let governs: HashMap<_, _> =
+                governs.into_iter().map(|((_, t), _, g)| (t, g)).collect();
+            assert_eq!(governs["t2"], Governs::Admitted);
+            assert_eq!(governs["t1"], Governs::Deferred);
+            assert_eq!(seqs(&ctx, "t1").await, (None, None), "nothing written");
+            assert!(ctx.take_prepared("d", "t1", &wm(51), &at(51)).is_none());
+            assert!(seqs(&ctx, "t2").await.1.is_some(), "t2 admitted");
+        }
+
+        /// The deferred table cuts the window's output at its first row: the
+        /// rows before it go on in order, nothing after it is dispatched.
+        #[tokio::test]
+        async fn a_table_deferred_behind_the_capture_cuts_at_its_first_row() {
+            let mut ctx = ctx_on(std::sync::Arc::new(
+                storage::MemoryStorageBackend::new(),
+            ))
+            .await;
+            let (_, governs) = admit(
+                &mut ctx,
+                &["t1", "t2"],
+                vec![entry("t2", 5), entry("t1", 51)],
+            )
+            .await
+            .unwrap();
+            let decisions: HashMap<
+                (String, String),
+                (MySqlCheckpoint, Governs),
+            > = governs.into_iter().map(|(k, a, g)| (k, (a, g))).collect();
+            let k = |t: &str| ("d".to_string(), t.to_string());
+            let rows = vec![
+                (0, k("t2"), at(5)),
+                (1, k("t2"), at(6)),
+                (2, k("t1"), at(51)),
+                (3, k("t2"), at(52)),
+            ];
+            assert_eq!(first_uncovered(&rows, &decisions), Some(2));
+        }
+
+        fn lineage_of(ctx: &RunCtx) -> String {
+            ctx.registry_scope
+                .current()
+                .unwrap()
+                .lineage()
+                .lineage_hash
+                .clone()
+        }
+
+        fn reads(
+            p: MySqlCheckpoint,
+        ) -> impl FnMut(
+            Duration,
+        ) -> std::future::Ready<
+            Result<MySqlCheckpoint, crate::mysql::mysql_behind_wait::WaitError>,
+        > {
+            move |_| std::future::ready(Ok(p.clone()))
+        }
+
+        /// After a covered wait the table is marked; a capture still before
+        /// its rows then fails closed with nothing written, and a capture
+        /// that covers them admits the table and forgets the record.
+        #[tokio::test(start_paused = true)]
+        async fn a_capture_still_before_the_rows_after_a_covered_wait_fails_closed()
+         {
+            let mut ctx = ctx_on(std::sync::Arc::new(
+                storage::MemoryStorageBackend::new(),
+            ))
+            .await;
+            admit(&mut ctx, &["t1"], vec![entry("t1", 51)])
+                .await
+                .unwrap();
+            assert!(!ctx.behind_capture[&("d".into(), "t1".into())].1);
+            let tables = vec![("d".to_string(), "t1".to_string())];
+            let batch = BTreeMap::from([(tables[0].clone(), at(51))]);
+            behind_wait(&mut ctx, &tables, &batch, &at(50), reads(at(60)))
+                .await
+                .unwrap();
+            assert!(ctx.behind_capture[&tables[0]].1, "waited for");
+            let err = admit(&mut ctx, &["t1"], vec![entry("t1", 51)])
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains(
+                    "started before its rows' position after the server's position"
+                ),
+                "{err:#}"
+            );
+            assert_eq!(seqs(&ctx, "t1").await, (None, None), "nothing written");
+
+            admit(&mut ctx, &["t1"], vec![entry("t1", 51)])
+                .await
+                .unwrap();
+            behind_wait(&mut ctx, &tables, &batch, &at(50), reads(at(60)))
+                .await
+                .unwrap();
+            let lineage = lineage_of(&ctx);
+            let mut later = capture(&ctx, &["t1"]);
+            later.from = MySqlCheckpoint {
+                lineage: later.from.lineage.clone(),
+                ..at(55)
+            };
+            let (_, governs) =
+                admit_batch(&mut ctx, &lineage, &later, vec![entry("t1", 51)])
+                    .await
+                    .unwrap();
+            assert_eq!(governs[0].2, Governs::Admitted);
+            assert!(ctx.behind_capture.is_empty(), "decided: record forgotten");
+        }
+
+        /// A wait that times out or is cancelled fails the window before
+        /// anything of it is captured: nothing is dispatched, no checkpoint
+        /// is written, nothing of the table is stored, and its record stays
+        /// unmarked. The timeout comes at the 5 s bound.
+        #[tokio::test(start_paused = true)]
+        async fn a_wait_that_times_out_or_is_cancelled_dispatches_nothing() {
+            let mut ctx = ctx_on(std::sync::Arc::new(
+                storage::MemoryStorageBackend::new(),
+            ))
+            .await;
+            let (tx, mut rx) = mpsc::channel(8);
+            ctx.tx = tx;
+            admit(&mut ctx, &["t1"], vec![entry("t1", 51)])
+                .await
+                .unwrap();
+            let tables = vec![("d".to_string(), "t1".to_string())];
+            let batch = BTreeMap::from([(tables[0].clone(), at(51))]);
+
+            let t0 = tokio::time::Instant::now();
+            let err =
+                behind_wait(&mut ctx, &tables, &batch, &at(50), reads(at(50)))
+                    .await
+                    .unwrap_err();
+            assert_eq!(
+                t0.elapsed(),
+                crate::mysql::mysql_behind_wait::BEHIND_WAIT
+            );
+            assert!(
+                matches!(&err, SourceError::Schema { details } if details.contains("waited 5s")),
+                "{err:#}"
+            );
+
+            ctx.cancel.cancel();
+            let err =
+                behind_wait(&mut ctx, &tables, &batch, &at(50), reads(at(50)))
+                    .await
+                    .unwrap_err();
+            assert!(matches!(err, SourceError::Cancelled), "{err:#}");
+
+            assert!(rx.try_recv().is_err(), "nothing dispatched");
+            assert!(
+                ctx.chkpt.get_raw(&ctx.source_id).await.unwrap().is_none(),
+                "no checkpoint written"
+            );
+            assert_eq!(seqs(&ctx, "t1").await, (None, None), "nothing stored");
+            assert!(!ctx.behind_capture[&tables[0]].1, "not marked");
+        }
+
+        /// A table whose rows' position cannot be ordered against the
+        /// capture's start (another server's transactions) is still an
+        /// uncertain outcome: the window fails closed.
+        #[tokio::test]
+        async fn an_unordered_capture_start_still_fails_closed() {
+            let mut ctx = ctx_on(std::sync::Arc::new(
+                storage::MemoryStorageBackend::new(),
+            ))
+            .await;
+            let other = MySqlCheckpoint {
+                gtid_set: Some(format!(
+                    "{U}:1-49,4e11fa47-71ca-11e1-9e33-c80aa9429562:1-2"
+                )),
+                ..at(49)
+            };
+            let err = admit(
+                &mut ctx,
+                &["t1", "t2"],
+                vec![
+                    entry("t2", 5),
+                    (("d".into(), "t1".into()), other, report(Vec::new())),
+                ],
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                format!("{err:#}")
+                    .contains("does not contain its rows' position"),
+                "{err:#}"
+            );
+            assert_eq!(seqs(&ctx, "t2").await, (None, None), "nothing written");
+            assert!(ctx.behind_capture.is_empty());
         }
 
         /// A store that cannot commit: the window fails closed, nothing of it
