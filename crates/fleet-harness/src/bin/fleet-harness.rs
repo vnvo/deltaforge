@@ -70,6 +70,10 @@ enum Cmd {
         #[arg(long)]
         restore: Option<String>,
     },
+    /// PostgreSQL source qualification (release checklist G4): one run of
+    /// the configured snapshot, CDC, stop and resume, ADD COLUMN, TOAST and
+    /// unsupported cases. Exits non-zero unless every check passes.
+    PgQualify { config: String },
 }
 
 #[tokio::main]
@@ -210,6 +214,22 @@ async fn main() -> Result<()> {
             )
             .await?;
             println!("{}", serde_json::to_string_pretty(&r)?);
+        }
+        Cmd::PgQualify { config } => {
+            let text = std::fs::read_to_string(&config)
+                .with_context(|| format!("read {config}"))?;
+            let cfg: fleet_harness::pgqual::PgQualConfig =
+                serde_yaml::from_str(&text)
+                    .with_context(|| format!("parse {config}"))?;
+            let dir = fleet_harness::pgqual::run(&cfg).await?;
+            let result: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(dir.join("result.json"))?,
+            )?;
+            println!("{}", dir.display());
+            println!("ok: {}; reasons: {}", result["ok"], result["reasons"]);
+            if result["ok"] != serde_json::json!(true) {
+                std::process::exit(1);
+            }
         }
     }
     Ok(())

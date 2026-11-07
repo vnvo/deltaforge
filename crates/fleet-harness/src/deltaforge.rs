@@ -142,6 +142,17 @@ impl Api {
         .await
     }
 
+    /// The pipeline's per-sink checkpoints (`sink_id`, `position`,
+    /// `age_seconds`), from any state store.
+    pub async fn checkpoints(&self, name: &str) -> Result<Value> {
+        self.send(
+            self.http
+                .get(format!("{}/pipelines/{name}/checkpoints", self.base)),
+            "pipeline checkpoints",
+        )
+        .await
+    }
+
     pub async fn stop(&self, name: &str) -> Result<Value> {
         self.send(
             self.http

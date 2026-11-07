@@ -18,6 +18,8 @@ pub mod evidence;
 pub mod fixture;
 pub mod ledger;
 pub mod measure;
+pub mod pgqual;
+pub mod pgqual_check;
 pub mod results;
 pub mod run;
 pub mod scenario;
