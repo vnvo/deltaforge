@@ -2,7 +2,9 @@
 //! deferred because its capture started before their rows (`admit_batch`):
 //! the server's position is read until it covers every recorded row start,
 //! within [`BEHIND_WAIT`] in all (pool acquisition, queries and backoff),
-//! or the window fails closed.
+//! or the window fails closed. The bound covers this readiness wait only,
+//! not the whole recovery: the recapture that follows has its own budget
+//! (the capture's lock wait, `capture_lock_wait_secs`).
 //!
 //! The position read is a readiness check, not proof: it does not show that
 //! the recapture covers the rows, so a recapture still behind after a
@@ -26,7 +28,8 @@ use crate::durable_checkpoint::{
     WmPos, mysql_checkpoint_position, order_positions,
 };
 
-/// The whole wait's bound: a recovery ceiling, not a routine pause.
+/// The readiness wait's bound (not the recapture's, which has its own): a
+/// recovery ceiling, not a routine pause.
 pub(crate) const BEHIND_WAIT: Duration = Duration::from_secs(5);
 /// The first pause between reads, doubled after each up to [`MAX_BACKOFF`].
 const FIRST_BACKOFF: Duration = Duration::from_millis(5);
