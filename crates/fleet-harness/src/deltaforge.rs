@@ -100,11 +100,20 @@ impl Api {
     ) -> Result<Value> {
         let resp = req.send().await.with_context(|| what.to_string())?;
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp
+            .text()
+            .await
+            .with_context(|| format!("{what}: {status}: reading the body"))?;
         if !status.is_success() {
             bail!("{what}: {status}: {body}");
         }
-        Ok(serde_json::from_str(&body).unwrap_or(Value::Null))
+        // An empty body is no value; anything else must be JSON, never
+        // read as null.
+        if body.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_str(&body)
+            .with_context(|| format!("{what}: {status}: unparsable body"))
     }
 
     pub async fn create(&self, spec: &Value) -> Result<Value> {
@@ -138,6 +147,17 @@ impl Api {
             self.http
                 .get(format!("{}/pipelines/{name}/incidents", self.base)),
             "pipeline incidents",
+        )
+        .await
+    }
+
+    /// The pipeline's per-sink checkpoints (`sink_id`, `position`,
+    /// `age_seconds`), from any state store.
+    pub async fn checkpoints(&self, name: &str) -> Result<Value> {
+        self.send(
+            self.http
+                .get(format!("{}/pipelines/{name}/checkpoints", self.base)),
+            "pipeline checkpoints",
         )
         .await
     }
@@ -203,9 +223,53 @@ impl Api {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::tests::EXAMPLE;
+
+    /// Answer every connection with the raw HTTP `response`, then close it.
+    /// Returns the base URL.
+    pub(crate) async fn serve_raw(response: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let _ = s.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A response whose body cannot be read or parsed is an error, never a
+    /// null value; only an empty body is.
+    #[tokio::test]
+    async fn unreadable_or_unparsable_bodies_are_errors() {
+        let truncated = serve_raw(
+            "HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n{\"incidents\"",
+        )
+        .await;
+        assert!(Api::new(&truncated).unwrap().incidents("p").await.is_err());
+        let garbage =
+            serve_raw("HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nnope").await;
+        assert!(Api::new(&garbage).unwrap().incidents("p").await.is_err());
+        let empty = serve_raw("HTTP/1.1 204 No Content\r\n\r\n").await;
+        assert_eq!(
+            Api::new(&empty).unwrap().incidents("p").await.unwrap(),
+            Value::Null
+        );
+        let json = serve_raw(
+            "HTTP/1.1 200 OK\r\ncontent-length: 16\r\n\r\n{\"incidents\":[]}",
+        )
+        .await;
+        assert_eq!(
+            Api::new(&json).unwrap().incidents("p").await.unwrap(),
+            serde_json::json!({"incidents": []})
+        );
+    }
 
     #[test]
     fn a_spec_per_cluster_with_its_topic_key_and_overrides() {

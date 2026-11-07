@@ -27,6 +27,7 @@ mysql_async = "0.36"
 tokio-postgres = "0.7"
 storage = { path = "../storage" }
 scale-harness = { path = "../scale-harness" }
+sources = { path = "../sources" }
 
 [dev-dependencies]
 tempfile = "3"
@@ -35,6 +36,7 @@ runner = { path = "../runner" }
 rest-api = { path = "../rest-api" }
 testcontainers = "0.25"
 gate-ownership = { path = "../gate-ownership" }
+o11y = { path = "../o11y" }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 

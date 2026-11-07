@@ -77,6 +77,10 @@ cargo run --release -p fleet-harness -- fixture crates/fleet-harness/configs/t1-
 # The pipeline specs a run creates (one per cluster).
 cargo run -p fleet-harness -- render crates/fleet-harness/configs/t1-exploratory.yaml
 
+# PostgreSQL source qualification (release checklist G4): one run; exits
+# non-zero unless every check passes. See qualification/README.md.
+cargo run --release -p fleet-harness -- pg-qualify crates/fleet-harness/qualification/g4-postgres.yaml
+
 # Run the configured scenario at every source count and repetition.
 cargo run --release -p fleet-harness -- run crates/fleet-harness/configs/t1-exploratory.yaml
 

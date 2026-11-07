@@ -27,33 +27,36 @@ pub struct Sample {
 /// Parse the Prometheus text exposition (comments and unparsable lines are
 /// skipped).
 pub fn parse_prometheus(text: &str) -> Vec<Sample> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (series, value) = match line.rsplit_once(' ') {
-            Some(p) => p,
-            None => continue,
-        };
-        let Ok(value) = value.trim().parse::<f64>() else {
-            continue;
-        };
-        let (name, labels) = match series.split_once('{') {
-            None => (series.to_string(), BTreeMap::new()),
-            Some((name, rest)) => {
-                let body = rest.strip_suffix('}').unwrap_or(rest);
-                (name.to_string(), parse_labels(body))
-            }
-        };
-        out.push(Sample {
-            name,
-            labels,
-            value,
-        });
+    text.lines()
+        .filter_map(|line| {
+            let (name, labels, value) = parse_series(line)?;
+            Some(Sample {
+                name,
+                labels,
+                value: value.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+/// One exposition line as its series name, labels and unparsed value text
+/// (empty when the line has none); `None` for blanks and comments.
+pub fn parse_series(
+    line: &str,
+) -> Option<(String, BTreeMap<String, String>, &str)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
     }
-    out
+    let (series, value) = line.rsplit_once(' ').unwrap_or((line, ""));
+    let (name, labels) = match series.split_once('{') {
+        None => (series.to_string(), BTreeMap::new()),
+        Some((name, rest)) => {
+            let body = rest.strip_suffix('}').unwrap_or(rest);
+            (name.to_string(), parse_labels(body))
+        }
+    };
+    Some((name, labels, value.trim()))
 }
 
 fn parse_labels(body: &str) -> BTreeMap<String, String> {
@@ -230,6 +233,47 @@ pub async fn store_size(client: &tokio_postgres::Client) -> Result<StoreSize> {
     })
 }
 
+/// A SQLite state store's size: the database file with its `-wal` and
+/// `-shm` files (each counted when present). A missing database file is an
+/// error, never a size of zero.
+pub fn sqlite_store_size(path: &Path) -> Result<StoreSize> {
+    let db = std::fs::metadata(path)
+        .with_context(|| format!("state store file {}", path.display()))?
+        .len();
+    let mut relations = BTreeMap::new();
+    let mut total = db;
+    relations.insert("db".to_string(), db);
+    for suffix in ["-wal", "-shm"] {
+        let mut p = path.as_os_str().to_owned();
+        p.push(suffix);
+        if let Ok(m) = std::fs::metadata(&p) {
+            total += m.len();
+            relations
+                .insert(suffix.trim_start_matches('-').to_string(), m.len());
+        }
+    }
+    Ok(StoreSize {
+        database_bytes: total,
+        relations,
+    })
+}
+
+/// A pipeline's per-sink checkpoints as the REST API reports them, by sink:
+/// each sink's position only (its age changes without progress, so it is
+/// left out).
+pub fn api_checkpoints(v: &serde_json::Value) -> BTreeMap<String, String> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            Some((
+                c.get("sink_id")?.as_str()?.to_string(),
+                c.get("position")?.to_string(),
+            ))
+        })
+        .collect()
+}
+
 /// Running aggregates over a measured window.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Aggregate {
@@ -374,6 +418,43 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// Checkpoints read through the API count progress by position only:
+    /// a changing age with an unchanged position is no progress.
+    #[test]
+    fn api_checkpoints_are_compared_by_position_only() {
+        let at = |pos: u64, age: f64| {
+            api_checkpoints(&serde_json::json!([
+                {"sink_id": "kafka", "position": {"gtid": pos}, "age_seconds": age}
+            ]))
+        };
+        let mut a = Aggregate::default();
+        a.checkpoints("c01", &at(1, 0.5));
+        a.checkpoints("c01", &at(1, 9.0));
+        assert_eq!(
+            a.checkpoints["c01"].distinct, 1,
+            "age alone is not progress"
+        );
+        a.checkpoints("c01", &at(2, 0.1));
+        assert_eq!(a.checkpoints["c01"].distinct, 2);
+        assert!(api_checkpoints(&serde_json::json!(null)).is_empty());
+    }
+
+    /// A SQLite store's size counts its WAL and shared-memory files; a
+    /// missing store is an error, not zero.
+    #[test]
+    fn a_sqlite_store_counts_its_wal_and_shm() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("deltaforge.db");
+        assert!(sqlite_store_size(&db).is_err());
+        std::fs::write(&db, vec![0u8; 4096]).unwrap();
+        std::fs::write(dir.path().join("deltaforge.db-wal"), vec![0u8; 100])
+            .unwrap();
+        let s = sqlite_store_size(&db).unwrap();
+        assert_eq!(s.database_bytes, 4196);
+        assert_eq!(s.relations.get("wal"), Some(&100));
+        assert!(!s.relations.contains_key("shm"));
+    }
 
     #[test]
     fn checkpoint_progress_counts_distinct_sets_and_ignores_empty_ones() {
