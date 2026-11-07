@@ -2,7 +2,42 @@
 
 This page defines the **bounded support envelope for the current DeltaForge release**: the configurations DeltaForge is validated for, what operators must provide, and what is explicitly out of scope. Anything not listed here as supported should be treated as unvalidated - test it in a disposable environment first, and talk to us before relying on it.
 
-The delivery and correctness guarantees referenced below are defined in [Guarantees & Correctness](guarantees.md). Read that page together with this one.
+The delivery and correctness guarantees referenced below are defined in [Guarantees & Correctness](guarantees.md). Read that page together with this one. The release gate that decides each item's status is the [Release Checklist](https://github.com/vnvo/deltaforge/blob/main/docs/ops/release-checklist.md).
+
+## Release scope at a glance
+
+### Demonstrated behavior
+
+Shown by the release's tests and gates (see the Release Checklist for the evidence):
+
+- PostgreSQL 17 and MySQL 8.4 sources: CDC, initial snapshots, restarts and failover handling, all failing closed when a position, identity or schema cannot be proven.
+- MySQL rows decoded only with the schema version proven for their position, including across DDL when that version is provable; a MySQL activation window never admits a table its capture does not contain.
+- At-least-once delivery with checkpoints persisted only after the commit policy is satisfied; required sinks hold the checkpoint on failure.
+- One server per state store, enforced by the store gate; serialized pipeline lifecycle.
+- The SQLite state store, including survival of `SIGKILL`.
+- The Kafka sink against Confluent Platform 7.5 and 7.7 without TLS, and the other sinks as covered by their suites in the release-tier gate.
+
+### Accepted limitations
+
+Known boundaries with an operator control, detailed below and in [Known limitations](#known-limitations):
+
+- At-least-once delivery: consumers dedup on the event `id`.
+- No automatic restart: a pipeline that stops fail-closed stays stopped until an operator restarts it.
+- No TLS to source databases, to a PostgreSQL state store, or to Kafka and Redis sinks; the REST API and metrics are unauthenticated ([Network and TLS](#network-and-tls)).
+- Preflight does not cover every startup requirement ([Deployment preflight](#deployment-preflight)).
+- MySQL replay across an unprovable DDL stops fail-closed.
+- SQLite backup needs the WAL-safe procedure.
+- Capacity guidance is a starting point, not a tested ceiling ([Capacity & Resource Envelope](capacity-envelope.md)).
+
+### Unqualified deployments
+
+Not validated for this release. They may work, but they are outside the supported envelope until qualified; validate them in a disposable environment first:
+
+- Source versions other than PostgreSQL 17 and MySQL 8.4 (MySQL 8.0.19 or later is accepted by the code; MariaDB is refused), and managed database services.
+- MySQL catalogs, active sets and fleets larger than the MySQL qualification run (one server, 40,000 tables, one pipeline); more than a few pipelines per instance.
+- The PostgreSQL state store (beta).
+- Live credential rotation and dynamic Vault database credentials.
+- Sink versions other than those the release-tier gate runs.
 
 ## Build and freeze
 
@@ -22,9 +57,9 @@ Other sinks (Redis, NATS, HTTP, S3-compatible object storage, ClickHouse, Elasti
 
 ## Topology: single owner per source
 
-Run **one DeltaForge instance per source (per replication slot / binlog reader)**. DeltaForge does not yet provide a cluster-wide lock or lease that prevents two instances from being started against the same source; single ownership is enforced at the slot and producer level, not globally.
+Run **one DeltaForge instance per source (per replication slot / binlog reader)**. The store gate stops a second server on the same state store, but nothing stops two instances with *different* state stores from reading the same source; single ownership of a source is enforced at the slot and producer level, not globally.
 
-**Single-instance requirement.** For the supported single-instance deployment, run exactly **one** DeltaForge process against a given checkpoint/state store. Within one process, lifecycle operations (start, stop, delete, patch, resume) are serialized and a durable per-source-id claim rejects a second pipeline that reuses an active source id, so two pipelines can never share a source id and corrupt each other's checkpoints (checkpoints are keyed by source id). Across processes, the [store gate](#store-gate) makes a second server against the same state store refuse to start. Deploy DeltaForge as a single instance (a single replica; if orchestrated, `replicas: 1` with `strategy: Recreate`, not rolling), and do not point a second process at the same state store.
+**Single-instance requirement.** For the supported single-instance deployment, run exactly **one** DeltaForge process against a given checkpoint/state store. Within one process, lifecycle operations (start, stop, delete, patch, resume) are serialized and a durable per-source-id claim rejects a second pipeline that reuses an active source id, so two pipelines can never share a source id and corrupt each other's checkpoints (checkpoints are keyed by source id). Across processes, the [store gate](#store-gate) makes a second server against the same state store refuse to start. Deploy DeltaForge as a single instance (the Helm chart's StatefulSet with `replicaCount: 1`), and do not point a second process at the same state store.
 
 - **PostgreSQL**: the replication slot has durable, DeltaForge-recorded ownership. DeltaForge only drops or recreates a slot it can prove it owns, whose lineage matches, and that is inactive; a foreign, ambiguously owned, or active slot **fails closed** with remediation rather than being taken over. A slot created outside DeltaForge (no ownership record) fails closed on re-snapshot - drop it and let DeltaForge recreate it, or run `snapshot.mode = never`.
 - **Kafka**: with `exactly_once: true`, a second producer using the same `transactional.id` fences the first. Fencing is a fatal error that stops the pipeline. This is a safety net, not a substitute for running a single instance.
@@ -43,10 +78,16 @@ deltaforge preflight <config-file-or-dir> --json   # machine-readable report
 Preflight resolves the config's secrets and source DSN exactly as startup does, connects to the source, and runs the source checks plus local config validation. It exits non-zero (fail closed) if any check fails, so it is safe to gate a deploy on it in CI/CD.
 
 - **PostgreSQL**: `wal_level = logical`; the publication exists and has tables; WAL-retention capacity vs estimated snapshot size. **Slot validation is mode-aware**: DeltaForge creates and owns the replication slot in every supported mode, so an absent slot on a fresh deployment is reported as informational, not a failure. An *existing* slot is checked under the same ownership rules as startup - a slot that is invalidated, WAL-lost, currently active (another consumer), or **foreign** (no matching ownership record for this server/database) fails closed.
-- **MySQL**: `log_bin` on, `binlog_format = ROW`, `gtid_mode = ON`, the `RELOAD` privilege (when a snapshot will run), captured tables on InnoDB, binlog retention window.
+- **MySQL**: `log_bin` on, `binlog_format = ROW`, `gtid_mode = ON`, the `RELOAD` privilege, captured tables on InnoDB, binlog retention window. The preflight command requires `RELOAD` and `gtid_mode = ON` for every pipeline, including a CDC-only one that does not need them at runtime.
 - **Both**: connectivity; **source and sink credential references** are resolved (a missing/invalid secret or an inline+reference conflict fails here); commit-policy validity vs sink count; at least one sink configured; and **source ids are unique** across the supplied config(s).
 
 Wildcard table patterns are reported as not validated per-table (server-level checks still run). Preflight validates **credentials and configuration**, not endpoints: **sink endpoint reachability is not probed** (a documented follow-up), and the slot-ownership check requires pointing preflight at the deployment's storage backend (the same `--storage-*` flags the server uses).
+
+**Startup checks that preflight does not run.** The source checks these when it starts (and MySQL again on every reconnect) and refuses to run if one fails; preflight does not report them:
+
+- MySQL version 8.0.19 or later, and not MariaDB.
+- MySQL `log_replica_updates = ON` (or `log_slave_updates`), on every MySQL source, primary or replica.
+- PostgreSQL publication registration (`deltaforge pg-publication register`; see [Required privileges](#postgresql)).
 
 ## Store gate
 
@@ -114,7 +155,8 @@ Schema history written by earlier releases is kept but not used automatically: a
 - `GRANT USAGE ON SCHEMA <schema>` and `GRANT SELECT` on the tables to be captured (snapshot reads and schema introspection).
 - `pg_hba.conf` must permit both regular and `replication` connections for the role/host.
 - The **publication is not auto-created** - create it before starting the pipeline. The replication slot is created by DeltaForge.
-- `REPLICA IDENTITY FULL` is recommended on captured tables for complete before-images.
+- **The publication must be registered** with `deltaforge pg-publication register`, run by a superuser. Registration installs event triggers that refuse, in that database, every `ALTER PUBLICATION` and `DROP PUBLICATION` and any drop of a registered publication's tables, so changing a publication becomes a maintenance procedure with every source stopped. The source refuses to start (and to reconnect) on a publication that is not registered, has changed since registration, or whose triggers were disabled. See [PostgreSQL source](sources/postgres.md).
+- `REPLICA IDENTITY FULL` is **required** on every captured table with a TOAST-capable column when a sink needs complete rows (Avro on any sink, S3 Parquet, ClickHouse, Elasticsearch): the source refuses to start otherwise. For other pipelines it is recommended, for complete before-images.
 
 ### MySQL
 
@@ -122,7 +164,10 @@ Schema history written by earlier releases is kept but not used automatically: a
 - `BACKUP_ADMIN ON *.*` and `SELECT ON performance_schema.log_status` for a first start without a checkpoint and without a snapshot: the capture boundary (binlog position and GTID set) is read there in one consistent query. Without them that start fails closed. Validated on MySQL 8.4; managed services are not yet qualified for these grants.
 - `SELECT, SHOW VIEW` on the captured database(s) for reads and introspection.
 - `RELOAD ON *.*` **only when an initial snapshot runs** (needed for the brief `FLUSH TABLES WITH READ LOCK` that anchors the snapshot). A CDC-only pipeline (`snapshot.mode = never`) does not need `RELOAD`.
-- Server settings enforced fail-closed at snapshot preflight: `gtid_mode = ON`, `enforce_gtid_consistency = ON`, `binlog_format = ROW`, and captured tables on InnoDB. `binlog_row_image = FULL` is recommended.
+- Server settings enforced fail-closed at snapshot preflight: `gtid_mode = ON`, `binlog_format = ROW`, and captured tables on InnoDB (MySQL itself requires `enforce_gtid_consistency = ON` before `gtid_mode = ON`). `binlog_row_image = FULL` is recommended (a warning otherwise).
+- Server settings enforced fail-closed at every start and reconnect: MySQL 8.0.19 or later (not MariaDB) and `log_replica_updates = ON`.
+- `binlog_row_metadata = FULL` is recommended: under `MINIMAL`, more DDL situations stop the source fail-closed (see [Known limitations](#known-limitations)).
+- GTID mode is required for snapshots, failover and live credential rotation; CDC alone also runs with file and position coordinates.
 - On managed MySQL (for example RDS/Aurora) where `RELOAD` / `FLUSH TABLES WITH READ LOCK` is unavailable, the snapshot **fails closed** with a typed error - there is no silent unsafe fallback. Grant `RELOAD`, or run `snapshot.mode = never` and perform the initial load out of band.
 
 ### Sinks
@@ -134,23 +179,31 @@ Sink credentials and auth modes are documented per sink (see [Sinks](sinks/READM
 DeltaForge resolves credentials from typed secret references and never stores resolved secrets in serialized config. See [Secrets & Credentials](secrets.md).
 
 - **Secret providers**: `env`, `file`, and `vault` (Vault KV v2). Kubernetes is not a separate provider - inject secrets as env (`secretKeyRef`) or as files (projected volume) and reference them with the `env` or `file` provider.
-- **Vault**: static KV references are supported (the runner must be built with the `vault` feature; a Vault reference fails closed at startup otherwise). **Dynamic Vault database credentials (lease-driven reconnect) are not live in the current release** - the lease lifecycle exists but does not yet drive a DSN swap.
+- **Vault**: static KV references are supported (the runner must be built with the `vault` feature; a Vault reference fails closed at startup otherwise). The repository's `Dockerfile` builds without it. **Dynamic Vault database credentials (lease-driven reconnect) are not live in the current release** - the lease lifecycle exists but does not yet drive a DSN swap.
 - **Rotation: treat credential rotation as restart-required.** Change the secret, then restart the affected pipeline or the runner for it to take effect. An opt-in live-reconnect path for file-backed *source* database credentials exists in the code (MySQL requires GTID mode), but it is **outside the supported deployment envelope** - validate it in a disposable environment before considering it. Environment-variable credentials are process-immutable and never rotate live; sink credentials are restart-required.
 
 ## Network and TLS
 
-Plan the network on the basis that **DeltaForge's source database connections and its own HTTP endpoints are not encrypted or authenticated in this release**. Deploy accordingly.
+Plan the network on the basis that **DeltaForge's source database connections, its PostgreSQL state-store connection, its Kafka and Redis sink connections and its own HTTP endpoints are not encrypted or authenticated in this release**. Deploy accordingly.
 
-- **Source DB connections are not encrypted.** Neither the PostgreSQL nor the MySQL source establishes TLS to the database in this build. Run DeltaForge on a trusted/private network segment with the source database, or place an encrypted tunnel (for example a service mesh sidecar, stunnel, or a cloud private link) between DeltaForge and the database. Do not run source traffic across an untrusted network.
+- **Source DB connections are not encrypted.** Neither the PostgreSQL nor the MySQL source establishes TLS to the database in this build (the MySQL client is built without TLS, and every PostgreSQL connection, the replication stream included, is opened without TLS). Run DeltaForge on a trusted/private network segment with the source database, or place an encrypted tunnel (for example a service mesh sidecar, stunnel, or a cloud private link) between DeltaForge and the database. Do not run source traffic across an untrusted network. Do not rely on TLS parameters in a DSN: they do not enable TLS in this build.
+- **The PostgreSQL state store connection is not encrypted** either; keep that database on the same trusted network.
 - **REST API is unauthenticated and binds all interfaces by default.** The default `--api-addr` is `0.0.0.0:8080` (every interface), so an unrestricted deployment exposes the unauthenticated API on the network. Bind it to loopback (`--api-addr 127.0.0.1:8080`) where the client is local, or confine it with a firewall / Kubernetes NetworkPolicy; do not expose it publicly.
-- **Metrics endpoint is unauthenticated** and defaults to `0.0.0.0:9000` (all interfaces). Bind it to loopback (`--metrics-addr 127.0.0.1:9000`) where the scraper is local, or confine it with a firewall/NetworkPolicy. See [Observability](observability.md#metrics-endpoint-address-and-exposure).
-- **Sink TLS/auth is supported** where the sink provides it: Kafka (SASL + `SASL_SSL` via `client_conf`), Elasticsearch (`https://` with `tls.ca_file`, basic/API-key auth), HTTP (`https://` with header-based auth), NATS (TLS + credentials/token). Confirm Redis and ClickHouse TLS in your environment before relying on it.
+- **Metrics endpoint is unauthenticated** and defaults to `0.0.0.0:9000` (all interfaces). Bind it to loopback (`--metrics-addr 127.0.0.1:9000`) where the scraper is local, or confine it with a firewall/NetworkPolicy. **`/metrics` is also served on the API listener**, so restricting `--metrics-addr` alone does not hide it. See [Observability](observability.md#metrics-endpoint-address-and-exposure).
+- **Recovery admin listener**: `deltaforge recover` uses a separate listener (`--admin-addr`, default `127.0.0.1:9091`, loopback only) that starts only when `--admin-token-file` is given and requires that bearer token.
+- **Sink TLS in this build:**
+  - **Kafka: no TLS.** The Kafka client is built without OpenSSL, so `security.protocol` `SSL` and `SASL_SSL` do not work, and neither does SASL/SCRAM. Use a plaintext listener on a trusted network.
+  - **Redis: no TLS.** `rediss://` URLs fail.
+  - **Elasticsearch**: `https://`, with `tls.ca_file` and basic or API-key authentication.
+  - **ClickHouse**: `https://` with the system's trusted roots; `tls.insecure_skip_verify` applies, but a custom CA is not used.
+  - **HTTP and S3**: `https://` with the system's trusted roots.
+  - **NATS**: credentials-file, user and password, or token authentication; no CA or client-certificate option is exposed, and TLS to NATS is not validated in this release.
 
 ## State and backup requirements
 
 DeltaForge keeps all runtime state (checkpoints, schema registry, snapshot progress, DLQ/journal) in one storage backend. See [Storage](storage.md) and [Checkpoints](checkpoints.md).
 
-- **Backends**: `sqlite` (default; single-instance production) and `postgres` (a shared storage backend, **beta** - not yet given the same crash/recovery validation as SQLite). One state store serves exactly one DeltaForge server at a time (enforced by the [store gate](#store-gate)); the PostgreSQL backend does **not** make source processing highly available. Use with caution. `memory` is for testing only and is lost on restart.
+- **Backends**: `sqlite` (default; single-instance production) and `postgres` (a shared storage backend, **beta** - not yet given the same crash/recovery validation as SQLite). An unrecognized `--storage-backend` value falls back to `sqlite`, so check the flag's spelling. One state store serves exactly one DeltaForge server at a time (enforced by the [store gate](#store-gate)); the PostgreSQL backend does **not** make source processing highly available. Use with caution. `memory` is for testing only and is lost on restart.
 - **Back up the state store regularly.** For SQLite the store is the `deltaforge.db` file (default under `./data/`), which holds both checkpoints and schema history; losing it means losing resume position and schema lineage. The store runs in **WAL mode**, so do not copy `deltaforge.db` on its own while DeltaForge is running - committed data may still be in the `-wal` file, and a bare file copy can be inconsistent. Use one of:
   - SQLite's online-backup API or `VACUUM INTO 'backup.db'` against the live database;
   - stop DeltaForge cleanly, checkpoint the WAL (`PRAGMA wal_checkpoint(TRUNCATE)`), then copy the file;
@@ -182,7 +235,8 @@ These are documented in full on [Guarantees & Correctness](guarantees.md); the s
 Not part of the supported deployment envelope (do not rely on these):
 
 - Multi-instance HA for a single source (no cluster-wide ownership lock/lease yet).
-- TLS directly to the source database (use a trusted network or an external tunnel).
+- TLS directly to the source database or a PostgreSQL state store (use a trusted network or an external tunnel).
+- TLS to Kafka or Redis sinks.
 - Authenticated REST API or metrics endpoint (use network controls).
 - Live/dynamic credential rotation as a supported contract (treat rotation as restart-required; dynamic Vault DB credentials are not live).
 - End-to-end exactly-once delivery, deterministic snapshot+replay rebuild, and any feature marked planned on the [Roadmap](roadmap.md).

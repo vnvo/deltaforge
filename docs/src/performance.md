@@ -8,6 +8,8 @@ This guide covers throughput optimization for DeltaForge CDC pipelines, based on
 
 These are observations from tuning runs, not a supported or comparable throughput figure: single runs on Docker containers on a developer machine (not dedicated infrastructure, contention not controlled), draining a 1-10M row backlog to a single-node Kafka broker. DeltaForge publishes no headline throughput number ([Capacity Envelope](capacity-envelope.md#throughput)); comparative numbers will come only from runs that follow the [benchmark design](https://github.com/vnvo/deltaforge/blob/main/docs/design/benchmarks.md), published with their method and environment. Use the figures below to see the relative effect of the settings, and measure your own workload.
 
+> **Historical figures (beta.9, March 2026).** The raw output behind the tables in this section was not retained, so these figures cannot be checked or reproduced from evidence, and the retained drain logs of that period do not reach them. They are kept for the relative effect of the settings only; do not cite them as throughput. The settings shown also predate current constraints: with `respect_source_tx = true` (the default), `max_inflight` must be 1.
+
 ### With tuned batching (recommended)
 
 `batch.max_events=16000`, `batch.max_bytes=16MB`, `batch.max_inflight=4`, `linger.ms=0`

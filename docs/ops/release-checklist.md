@@ -1,90 +1,124 @@
 # Release Checklist & Acceptance Criteria
 
-Binary, evidence-backed gate for cutting a DeltaForge release. Every criterion is exactly one of:
+The finite, evidence-backed gate for cutting a DeltaForge release. Every criterion has exactly one status:
 
-- **PASS** - met, with test/report/commit evidence.
-- **ACCEPTED LIMITATION** - a known boundary that does not block release, with the required operator control stated.
+- **PASS** - met, with test, report or commit evidence.
+- **ACCEPTED LIMITATION** - a known boundary that does not block release, with the operator control stated and documented in the [Supported Deployment Envelope](../src/deployment-support.md).
 - **BLOCKED** - not met; prevents release.
 
-**Release decision rule:** release only when there are **zero BLOCKED** criteria and every ACCEPTED LIMITATION is documented in the [Supported Deployment Envelope](../src/deployment-support.md) with its operator control in place.
+**Release decision rule:** release only when no criterion is BLOCKED and every ACCEPTED LIMITATION is in the Supported Deployment Envelope with its operator control. Work listed under [Deferred, not in this release's scope](#deferred-not-in-this-releases-scope) is neither a criterion nor a support claim.
 
-Evidence baseline: `main` at the release commit; PRs #103-#110 and MySQL historical schema selection (#114, superseding the MySQL TableMap fail-closed fix).
+**Evidence baseline:** `main` at `80d6cb84` (PR #198). Its code is identical to `dba04df2`, whose full core gate passed (64 suites; evidence `gate-activation-window-behind-capture-dba04df2`, manifest `0839ea72`). The release commit is checked again by G1 and G2.
+
+## Release gates
+
+These are the remaining steps before release. Each is a single, exact-commit check.
+
+| # | Gate | Status | Evidence required |
+|---|------|--------|-------------------|
+| G1 | Release-tier gate `scripts/gate.sh --release` green on the exact release commit (the core tier plus the sink suites and the MiniStack S3 canaries) | **BLOCKED** - not run since `974ef8c` (2026-10-07) | Gate output with every suite passing, the tree unchanged from start to end, retained with a manifest |
+| G2 | CI green (lint, test, coverage) on the exact release commit | **BLOCKED** - pending the release commit | CI run on that commit |
+| G3 | MySQL T1a qualification ([design](../design/mysql-fleet-qualification.md); exploratory tier T1a: one server, 40,000 tables, one pipeline) | **BLOCKED** - both earlier attempts (2026-10-08, 2026-10-10) failed closed; their causes were fixed by #142, #144 and #145; not run since | Every authorized scenario run complete: no missing, duplicate or out-of-order event, no pipeline failure at any time (status sampled throughout, incidents counted), checkpoint progress, retained with a manifest |
+| G4 | PostgreSQL source qualification | **BLOCKED** - its scope is not yet written down and it has never run | A reviewed scope, then the same evidence as G3 |
+| G5 | Release documentation matches the code at the release commit (this checklist, the Supported Deployment Envelope, the CHANGELOG) | **PASS** at `80d6cb84`; re-check if code changes before the release commit | This revision |
+
+A gate passes only on the release commit. A failure is kept and investigated, never rerun until it passes.
 
 ## Correctness
 
 | # | Criterion | Status | Evidence |
 |---|-----------|--------|----------|
-| C1 | Required-sink / per-row acks fail closed (no silent data loss) | **PASS** | PR #103; `crates/runner/src/coordinator.rs` + `dlq.rs` tests (`queue_push_backend_failure_returns_dropped`, required/optional-sink hold-checkpoint tests) |
-| C2 | Failover identity is fail-closed (verified nonzero lineage before streaming; no fail-open compare/persist) | **PASS** | PR #104; `failover_e2e` 10/10 (final matrix) + `identity_fail_closed_tests`; zero-open counted seam |
-| C3 | Lifecycle safety: serialized start/stop/delete/patch; delete fail-closed; duplicate source-id rejected | **PASS** | PR #105; `pipeline_manager` unit tests (concurrency, injected-failure, `Deleting` state); storage `slot_create` one-winner |
-| C4 | Source authority fail-closed: PG schema reload propagates; MySQL snapshot-progress + non-GTID lineage fail closed | **PASS** | PR #106; `load_snapshot_progress` / `mysql_server_lineage` unit tests; PG reload live tests |
-| C5 | Green live fault/lifecycle matrix on merged main | **PASS** | Consolidated matrix: `failover_e2e` 10, PG/MySQL snapshot, `txn_coordinator_e2e`, PG schema-drift subset, MySQL schema-reload, throughput - 38 tests, 0 fail |
-| C6 | Internal reliability soak recorded | **PASS** | PR #110; [reliability-soak.md](reliability-soak.md) - restart, required-sink outage, checkpoint-store outage, shutdown with committed tx in flight (4/4) + schema compatible/Halt/Adapt |
-| C7 | MySQL rows are emitted only when decoded with the schema version proven for their binlog position and consistent with the layout the binlog recorded; otherwise never emitted | **PASS** | `mysql_proof_matrix_e2e` (replay across DROP COLUMN in GTID and file/position mode, drop + recreate, mid-table add column, A -> B -> A, table-id changes, same-signature rename swap with and without proof, qualified DDL, DDLs while stopped, MINIMAL and FULL barriers, crash before a FULL observation, a proven version contradicted by an unlogged DDL, stored evidence validated on read, rows-event identity and compressed transactions; every row checked against the version it is stamped with), `mysql_ddl_replay_failclosed` (unprovable replay: typed error, no row, checkpoint unchanged; plus a no-DDL control), and the `mysql_selection`, `mysql_signature` (including a live TableMap of every supported type) and `mysql_activation` unit tests |
-| C8 | MySQL replay of binlog rows across a DDL | **ACCEPTED LIMITATION** | Supported when the version in effect is provable (C7). Remaining boundary, fail-closed (C7): with `binlog_row_metadata=MINIMAL`, rows older than a DDL the source never observed, rows after a statement that cannot be attributed to tables (until later proof for the table: usually its next rows, once its definition is captured and proven unchanged since them, or a later DDL of it that the source proves), and rows between two DDLs of one table that the source did not read separately (also under FULL unless that definition is already recorded and is the single exact match). **Operator control:** set `binlog_row_metadata=FULL`; keep the pipeline caught up before applying DDL; on this failure, re-snapshot (restart once with snapshot mode `always`) as the immediate remediation - manually moving the position past the DDL intentionally abandons every retained change in between, for all captured tables, and requires an operator impact assessment. Evidence: [Guarantees](../src/guarantees.md#mysql-replay-across-a-schema-change). |
+| C1 | Required-sink and per-row acknowledgements fail closed (no silent data loss) | **PASS** | PR #103; `crates/runner/src/coordinator.rs` and `dlq.rs` tests (`queue_push_backend_failure_returns_dropped`, required and optional sink hold-checkpoint tests) |
+| C2 | Failover identity fails closed (a verified nonzero lineage before streaming; no fail-open compare or persist) | **PASS** | PR #104; `failover_e2e` and `identity_fail_closed_tests` |
+| C3 | Lifecycle safety: start, stop, delete and patch are serialized; delete fails closed; a duplicate source id is rejected; a second server against the same state store refuses to start | **PASS** | PR #105; `pipeline_manager` unit tests; storage `slot_create` one-winner; the [store gate](../src/deployment-support.md#store-gate) |
+| C4 | Source authority fails closed: PostgreSQL schema reload propagates; MySQL snapshot progress and non-GTID lineage fail closed | **PASS** | PR #106; `load_snapshot_progress` and `mysql_server_lineage` unit tests; PostgreSQL reload live tests |
+| C5 | Live fault and lifecycle suites green on the evidence baseline | **PASS** | The core gate on `dba04df2` (64 suites), including `failover_e2e`, the snapshot restart suites, `txn_coordinator_e2e` and `kafka_outage_restart_e2e` |
+| C6 | Internal reliability soak recorded | **PASS** | PR #110; [reliability-soak.md](reliability-soak.md) |
+| C7 | MySQL rows are emitted only when decoded with the schema version proven for their binlog position and consistent with the layout the binlog recorded; otherwise never emitted | **PASS** | `mysql_proof_matrix_e2e`, `mysql_ddl_replay_failclosed`, and the `mysql_selection`, `mysql_signature` and `mysql_activation` unit tests |
+| C8 | MySQL replay of binlog rows across a DDL | **ACCEPTED LIMITATION** | Supported when the version in effect is provable (C7); otherwise the source stops fail-closed. **Operator control:** set `binlog_row_metadata=FULL`, keep the pipeline caught up before applying DDL, and re-snapshot on this failure. See [Guarantees](../src/guarantees.md#mysql-replay-across-a-schema-change) |
+| C9 | A MySQL activation window never admits a table its capture does not contain: a capture that started before a table's rows defers the table and recaptures after a bounded readiness wait; anything not provably ordered, or still behind after the wait, fails closed with nothing dispatched and the checkpoint unchanged | **PASS** | PR #198: `a_capture_behind_a_tables_rows_defers_that_table` (red before the fix), `a_wait_that_times_out_or_is_cancelled_dispatches_nothing`, `a_capture_still_before_the_rows_after_a_covered_wait_fails_closed`, `an_unordered_capture_start_still_fails_closed` and the `mysql_behind_wait` tests |
 
 ## Delivery semantics
 
 | # | Criterion | Status | Evidence / operator control |
 |---|-----------|--------|------------------------------|
-| D1 | At-least-once delivery; consumers dedup on event `id` | **ACCEPTED LIMITATION** | No sink is end-to-end exactly-once. **Operator control:** consumers must dedup on the event `id`; snapshot→CDC has a bounded at-least-once overlap and restarts re-deliver. Evidence: [Guarantees](../src/guarantees.md), soak report (0 duplicates observed but the contract is at-least-once). |
-| D2 | Terminal required-sink and checkpoint-store failures require an explicit restart | **ACCEPTED LIMITATION** | DeltaForge has **no internal auto-restart**: on a required-sink or checkpoint-store terminal failure the pipeline stops fail-closed and `/ready` returns 503, but **`/health` stays 200, so Kubernetes does NOT restart the pod** - readiness only removes it from Service endpoints. **Operator control:** perform an explicit recovery action once the fault clears - a pipeline restart (stop then resume via the API) or a pod/process restart (e.g. `kubectl rollout restart`). Any external automation must **watch `/ready` or `deltaforge_pipeline_status` and deliberately invoke that action**; standard Kubernetes liveness/readiness behaviour alone does not recover the pipeline. Readiness returns to 200 after a successful restart. Automatic pipeline supervision is future work. Evidence: [reliability-soak.md](reliability-soak.md) (Recovery model). |
+| D1 | At-least-once delivery; consumers dedup on the event `id` | **ACCEPTED LIMITATION** | No sink is end-to-end exactly-once. **Operator control:** consumers dedup on the event `id`. See [Guarantees](../src/guarantees.md) |
+| D2 | A pipeline that stops fail-closed stays stopped until an operator restarts it | **ACCEPTED LIMITATION** | There is no internal auto-restart. Terminal required-sink and checkpoint-store failures, and every source error that fails closed (including the MySQL activation window's), stop the pipeline. `/ready` returns 503 while any pipeline is failed or starting, has a blocking incident or has a recovery pending; `/health` stays 200, so Kubernetes does not restart the pod. **Operator control:** alert on `/ready` or `deltaforge_pipeline_status`, and restart the pipeline (stop then resume) or the process once the cause is understood. See [reliability-soak.md](reliability-soak.md) |
 
 ## Deployment & operations
 
 | # | Criterion | Status | Evidence / operator control |
 |---|-----------|--------|------------------------------|
-| O1 | Single DeltaForge process per state store | **ACCEPTED LIMITATION** | Enforced within one process (serialized lifecycle + durable source-id claim), **not** across processes. **`ReadWriteOnce` is not a cross-process lock** (it restricts volume attachment to one node; pods on that node could still mount it). **Operator control:** the control is `replicaCount: 1` plus the prohibition against starting a second installation against the same state store - do not scale the replica count or point a second install at the same store. Evidence: PR #105; [deployment-support: single owner](../src/deployment-support.md#topology-single-owner-per-source). |
-| O2 | Source DB connections have no TLS; REST API and metrics are unauthenticated | **ACCEPTED LIMITATION** | **Operator control:** run on a trusted/private network or via an encrypted tunnel; bind the API/metrics to loopback or confine with a firewall/NetworkPolicy. Evidence: [deployment-support: Network and TLS](../src/deployment-support.md#network-and-tls); [Observability](../src/observability.md#metrics-endpoint-address-and-exposure). |
-| O3 | Deployment preflight validates source + config + credentials before start | **PASS** | PR #107; `preflight_e2e` (fresh/owned/foreign slot, missing sink secret, unavailable ownership store); Helm preflight initContainer gate |
-| O4 | Sink endpoint reachability is not covered by preflight | **ACCEPTED LIMITATION** | Preflight validates the source, config, commit policy, and source+sink credential *references*, but does not connect to sink endpoints. **Operator control:** validate sink connectivity separately during onboarding. Evidence: PR #107; [deployment-support: preflight](../src/deployment-support.md#deployment-preflight). |
-| O5 | Production quick start using the supported shape | **PASS** | PR #109; [Production Quick Start](../src/quickstart-production.md) (single-instance, persistence, referenced secrets, probes, resource limits, preflight gate) |
-| O6 | SQLite state backup/restore procedure documented | **ACCEPTED LIMITATION** | **Operator control:** back up the state volume with the WAL-safe procedure (online-backup / `VACUUM INTO`, or clean stop + `wal_checkpoint(TRUNCATE)` + copy, or a consistent volume snapshot including `-wal`/`-shm`); a lost volume loses the durable checkpoint and requires restore or re-snapshot. Evidence: [deployment-support: State and backup](../src/deployment-support.md#state-and-backup-requirements). |
+| O1 | One DeltaForge server per state store | **PASS** | Enforced within a process (serialized lifecycle, durable source-id claim) and across processes by the store gate: a second server against the same store refuses to start. A crash leaves the gate held until an operator releases it. See [Store gate](../src/deployment-support.md#store-gate) |
+| O2 | No TLS to source databases or to a PostgreSQL state store; no TLS to Kafka or Redis sinks; the REST API and metrics are unauthenticated | **ACCEPTED LIMITATION** | **Operator control:** run on a trusted private network or through an encrypted tunnel; bind the API and metrics to loopback or confine them with a firewall or NetworkPolicy (metrics are also served on the API port). See [Network and TLS](../src/deployment-support.md#network-and-tls) |
+| O3 | Deployment preflight validates the source, configuration and credential references before start | **PASS** | PR #107; `preflight_e2e`; the Helm preflight initContainer |
+| O4 | Preflight does not cover every startup requirement | **ACCEPTED LIMITATION** | Preflight does not probe sink endpoints, and does not check the MySQL version, `log_replica_updates` or PostgreSQL publication registration (startup checks all three and refuses to run). It always requires MySQL `RELOAD` and `gtid_mode = ON`, also for a CDC-only pipeline. **Operator control:** validate sink connectivity during onboarding, and treat a startup refusal as the authoritative check. See [Deployment preflight](../src/deployment-support.md#deployment-preflight) |
+| O5 | Production quick start in the supported shape | **PASS** | PR #109; [Production Quick Start](../src/quickstart-production.md) |
+| O6 | SQLite state backup and restore procedure documented | **ACCEPTED LIMITATION** | **Operator control:** back up the state store with the WAL-safe procedure; a lost store loses the checkpoint and needs a restore or a re-snapshot. See [State and backup](../src/deployment-support.md#state-and-backup-requirements) |
 
 ## Capacity & scale
 
 | # | Criterion | Status | Evidence / operator control |
 |---|-----------|--------|------------------------------|
-| S1 | Capacity guidance is a starting point, not a tested ceiling | **ACCEPTED LIMITATION** | Every bound in the [Capacity & Resource Envelope](../src/capacity-envelope.md) is classified (measured / code-derived / external / operator / unknown); no aggregate memory cap exists. **Operator control:** benchmark and soak in the target environment before committing to numbers. |
-| S2 | Dense-fleet / catalog-scale deployment is not yet supported | **ACCEPTED LIMITATION** | Single-instance only; per-table metric cardinality, full schema-registry load at startup, and O(tables²) enumeration are unbounded in the table dimension. **Operator control:** start with a small number of pipelines and tens-to-low-hundreds of tables per source; fleet-scale architecture is future work. Evidence: [capacity-envelope.md](../src/capacity-envelope.md). |
+| S1 | Capacity guidance is a starting point, not a tested ceiling | **ACCEPTED LIMITATION** | Every bound in the [Capacity & Resource Envelope](../src/capacity-envelope.md) is classified (measured, code-derived, external, operator, unknown); there is no aggregate memory cap. **Operator control:** soak in the target environment before relying on a number |
+| S2 | Large catalogs, dense active sets and fleets are unqualified | **ACCEPTED LIMITATION** | Single instance only. Qualified scope ends where G3 and G4 end; everything larger is listed under [Unqualified deployments](../src/deployment-support.md#unqualified-deployments). **Operator control:** stay inside the qualified scope or validate in a disposable environment first |
 
 ## Release engineering
 
 | # | Criterion | Status | Evidence / control |
 |---|-----------|--------|--------------------|
-| R1 | Rollback procedure defined | **PASS** | See [Rollback](#rollback-procedure) below |
-| R2 | Minimum observability checks defined | **PASS** | See [Observability](#minimum-observability-checks) below |
-| R3 | CI gates green on the release commit | **PASS** | `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (lint + test jobs green on #103-#110) |
+| R1 | Rollback procedure defined | **PASS** | [Rollback](#rollback-procedure) below |
+| R2 | Minimum observability checks defined | **PASS** | [Observability](#minimum-observability-checks) below |
+| R3 | Release-tier gate and CI on the release commit | see G1, G2 | - |
+
+## Open incidents
+
+| # | Incident | Status | Rule |
+|---|----------|--------|------|
+| I1 | One unexplained SIGBUS of the `sources` library test binary in a CI coverage run at `df726153`; it passed on rerun and on every later revision | **ACCEPTED, unresolved, non-blocking** | Any recurrence blocks release and requires diagnosis. Coverage is not rerun only to pursue the historical failure |
+
+## Performance claims
+
+No performance figure is a release criterion, and neither this checklist nor the Supported Deployment Envelope cites one. Figures elsewhere in the documentation are development-machine observations (see [Capacity & Resource Envelope](../src/capacity-envelope.md#throughput)). The release notes cite only figures whose retained runs show every row delivered and no runner error; where the raw output was not retained, the figure is marked as such.
+
+## Deferred, not in this release's scope
+
+Not criteria for this release, and not support claims:
+
+- Capacity sweeps beyond the qualified scope: more tables per source (100,000 and above), dense active sets (20 to 100% of tables), rotating active sets, multi-source fleets, and the load on the source database at those scales.
+- Further tuning of activation latency, schema capture, the selection cache and memory.
+- Real-AWS S3 qualification.
 
 ## Rollback procedure
 
 Single-instance StatefulSet, so rollback is a controlled replace, not a scale event:
 
-1. **Pin forward and back by commit/tag + image digest.** Keep the previous release's chart values and image digest.
-2. **Roll back the deployment**: `helm rollback <release> <previous-revision>` (or redeploy the previous chart/image). The StatefulSet terminates the old pod before starting the new one; the **preflight initContainer re-gates** the rollback.
-3. **State-store compatibility**: the checkpoint/schema store is shared across versions. Roll back only to a version with a compatible on-disk format; if a release changed the checkpoint or schema-registry format, treat the state store as forward-only and follow that release's notes (a rollback may require restore from backup or re-snapshot).
+1. **Pin forward and back by commit or tag and image digest.** Keep the previous release's chart values and image digest.
+2. **Roll back the deployment**: `helm rollback <release> <previous-revision>` (or redeploy the previous chart and image). The StatefulSet terminates the old pod before starting the new one, and the preflight initContainer gates the rollback again.
+3. **State-store compatibility**: the checkpoint and schema store is shared across versions. Roll back only to a version with a compatible on-disk format; if a release changed the checkpoint or schema-registry format, treat the state store as forward-only and follow that release's notes (a rollback may need a restore from backup or a re-snapshot).
 4. **Verify** `/ready` returns 200 and the expected pipelines are `running` before restoring traffic.
-5. **If the state volume is suspect**, restore from the last good backup (accept at-least-once re-delivery after the backup point) or re-snapshot.
+5. **If the state store is suspect**, restore from the last good backup (accept at-least-once re-delivery after the backup point) or re-snapshot.
 
 ## Minimum observability checks
 
 Confirm before and after release:
 
-- **Liveness**: `GET /health` returns 200 (process/event loop alive; stays 200 even if a pipeline is failed).
-- **Readiness**: `GET /ready` returns 200 when all pipelines are healthy, 503 naming the offender when any required pipeline is `failed`.
-- **Metrics**: `GET /metrics` (default `:9000`) serves Prometheus metrics, including `deltaforge_pipeline_status` per pipeline, source/sink counters, and stage-latency histograms. Restrict exposure per O2.
-- **Pipeline status**: `deltaforge_pipeline_status` reflects running/paused/stopped/failed; alert on `failed` (it corresponds to `/ready` 503 and requires operator restart per D2).
-- **Logs**: `RUST_LOG` set to an operable level; a failed pipeline logs a typed, actionable error (e.g. schema-drift-under-Halt remediation).
+- **Liveness**: `GET /health` returns 200 while the process runs, also when a pipeline is failed.
+- **Readiness**: `GET /ready` returns 200 when every pipeline is healthy, and 503 naming the offender while any pipeline is failed or starting, has a blocking incident or has a recovery pending.
+- **Metrics**: Prometheus metrics are served on the metrics listener (default `0.0.0.0:9000`) and also on the API listener (default `0.0.0.0:8080`). They include `deltaforge_pipeline_status` per pipeline, source and sink counters and stage-latency histograms. Restrict exposure per O2.
+- **Pipeline status**: `deltaforge_pipeline_status` is 1 running, 0.5 paused, 0.25 starting, 0 stopped and -1 failed; alert on -1 (an operator restart is needed, D2).
+- **Incidents**: `deltaforge_incidents_raised_total` counts every incident raised; investigate any increase.
+- **Logs**: `RUST_LOG` set to an operable level; a failed pipeline logs a typed, actionable error.
 
-Evidence: `crates/rest-api/src/health.rs`, `crates/o11y/src/df_metrics.rs`, [Observability](../src/observability.md).
+Evidence: `crates/rest-api/src/health.rs`, `crates/o11y/src/df_metrics.rs`, `crates/runner/src/pipeline_manager.rs`, [Observability](../src/observability.md).
 
-## Acceptance criteria (summary)
+## Acceptance
 
-A release is **accepted** when:
+A release is accepted when:
 
-1. C1-C7 are **PASS** (correctness + green matrix + soak).
-2. R1-R3 are **PASS** (rollback, observability, CI gates).
-3. Every ACCEPTED LIMITATION (C8, D1-D2, O1-O2, O4, O6, S1-S2) is documented in the Supported Deployment Envelope with its operator control in place.
-4. There are **zero BLOCKED** criteria.
+1. G1 to G5 are **PASS** on the release commit.
+2. C1 to C7, C9, O1, O3, O5 and R1 to R2 are **PASS**.
+3. Every ACCEPTED LIMITATION (C8, D1, D2, O2, O4, O6, S1, S2) is in the Supported Deployment Envelope with its operator control.
+4. No criterion is **BLOCKED**, and open incident I1 has not recurred.
 
-Current status against this release baseline (#103-#110 plus MySQL historical schema selection (#114, superseding the MySQL TableMap fail-closed fix)): **no BLOCKED criteria**; all correctness and release-engineering criteria PASS; the listed limitations are accepted with operator controls documented.
+Status at `80d6cb84`: **BLOCKED** on G1 to G4.
