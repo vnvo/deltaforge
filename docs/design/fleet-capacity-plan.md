@@ -1,70 +1,105 @@
-# Bounded Fleet-Capacity Plan (after v0.1.0-rc.1)
+# Single-Source Capacity Frontier: First Campaign
 
-**Status:** proposal for review. No runs and no product changes until it is approved.
+**Status:** proposal for review. No runs until it is approved.
 
-## Purpose
+## Goal
 
-v0.1.0-rc.1 is qualified for one instance at the scale of its qualification runs: one MySQL 8.4 server with 40,000 tables and one pipeline at active sets up to 1% (G3), and one PostgreSQL 17 source with 1,000 tables (G4). Everything larger is unqualified (release checklist S2).
+Measure where one MySQL source on one DeltaForge instance stops keeping up: first as the catalog grows, then as traffic rises at a chosen working set. The result is a measured frontier (the highest viable point and the lowest saturated point of each sweep, or an unresolved limit), not a qualification matrix and not a support claim beyond the configuration measured.
 
-This plan answers three questions with a fixed number of runs, in order, and stops for a ruling after each stage. It is not the full fleet qualification of the [fleet qualification design](mysql-fleet-qualification.md) (25 clusters of 400,000 tables per instance): that target does not fit the available host, and it needs owner inputs this plan does not assume.
+The campaign reuses the fleet harness and the release qualification procedures. It changes no product code, and it does not fix the limits it finds: each limit is reported, and whether to work on it is a separate decision.
 
-## Questions
+## Baseline (current findings)
 
-1. **Dense activity on one source.** Does one pipeline sustain 20%, 50% and 100% of 40,000 tables active, and a rotating active set, with cold activation and warm restart measured separately?
-2. **Several pipelines in one process.** How do connections, the shared caches, the state store and process memory behave with several sources in one instance, and is per-pipeline cost additive?
-3. **A larger catalog per source.** What changes between 40,000 and a larger catalog on one source (cache behavior, state-store size, activation)?
+- **Release qualification (G3):** one MySQL 8.4 server, 200 databases x 200 tables (40,000), one pipeline, active sets up to 1%, about 2,000 changes/s offered and achieved, a DDL storm: no loss, duplicate or reordering, no pipeline failure.
+- **Activation after #196** (the capture A/B on `279ee777`, 40,000 tables): capture 0.7 to 1.5 ms per table; a 20% set (8,000 tables) finished activating in 29 to 49 s, a 50% burst (20,000 tables) in 86 to 125 s.
+- **The earlier delivery stall** was a pipeline failure (a capture behind a table's rows), addressed by #198 and #205; G3's S3 passed on the fixed build.
+- **Fixture build:** 40,000 tables in 91 s (16 connections), about 440 tables/s.
 
-Each answer is a measured statement for the configuration run, never an extrapolated ceiling.
+No throughput limit has been measured: every run so far offered a fixed rate and achieved it.
 
-## Known risks going in
+## Fixed parameters
 
-These are recorded findings, not new claims. Stage 1 measures them as they are; any fix is its own reviewed PR afterwards.
+- One MySQL 8.4 server, one pipeline, one Kafka sink (JSON), the SQLite state store, the release image (`deltaforge:qual-3f63a814`, pinned) and a pinned harness.
+- Catalog shape: up to 2,000 databases x 150 tables. Active set: 40% of the catalog, fixed (no rotation).
+- Host safety limits, enforced by the run wrapper: at least 50 GiB free at the start (byte-exact) and a 25 GiB floor during a run; a run is stopped when available memory falls below 2 GiB or any container is OOM-killed; a deadline per run, with a graceful stop and then a forced one.
+- No latency or memory budget: lag, throughput and resources are reported as measured.
 
-- **Activation pacing.** New tables are activated in windows run one after another, and window time is dominated by the schema capture (2 to 6 ms per table measured at 40,000 tables). Dense or rotating activity may leave rows of already-active tables waiting behind the window chain.
-- **An unexplained delivery stall** of about 23 s, seen in some runs of the 10,000-table, 50% steady point (3 of 10 in one comparison), recovered only by the scheduled stop.
-- **Process memory.** Only cache-owned memory is accounted and bounded; process RSS is not, and it was about 150 MiB higher at 20,000 tables with the byte-budget cache. There is no aggregate memory cap.
-- **Broad schema invalidation** pauses are provisionally accepted (about 120 ms for a barrier over 90% of a database's tables); frequent broad invalidation is unqualified.
+## Saturation, defined before any run
 
-## Stages
+A step is **saturated** when, over its measurement window, any of these holds:
 
-Every stage uses the procedures of the release qualification: pinned image and harness builds with recorded hashes, a fresh source id and state store per scenario verified before the start, at least 50 GiB free at the start (byte-exact) and a 25 GiB floor during the run, a deadline per invocation with a graceful then forced stop, stop at the first correctness failure, no rerun to obtain a pass, and evidence kept with a verified manifest.
+1. **Offered traffic not achieved:** DeltaForge delivers less than 95% of the rate MySQL committed.
+2. **Sustained backlog growth:** the backlog (committed minus delivered) grows across the whole window, by more than one window-second of offered traffic.
+3. **Resource exhaustion:** a host safety limit is reached, or a DeltaForge, MySQL, Kafka or harness process is pinned at its CPU allocation for the window.
+4. **Correctness or health failure:** any missing, duplicate or out-of-order event, a pipeline failure or an incident. This also ends the campaign.
 
-### Stage 1: dense activity, one source (question 1)
+**Attribution.** A saturated step is attributed before it counts as a DeltaForge limit:
 
-- **Fixture:** the existing G3 fixture (one MySQL 8.4 server, 200 databases x 200 tables).
-- **Scenarios** (one run each, 30 minutes after a 2-minute warm-up, the G3 traffic profile):
-  - D20, D50, D100: fixed active sets of 20%, 50% and 100%;
-  - R20: a moving 20% set that shifts to a disjoint set every 6 minutes, reaching 100% cumulatively;
-  - after each scenario, a CDC-only restart of the pipeline (warm restart).
-- **Measured and reported:** correctness (no missing, duplicate or out-of-order event); time to activate the active set (cold) and time to first change after the restart (warm); lag p50/p99 over the run; the window, capture and scan timings; process RSS peak and cache-owned memory; state-store growth; any stall.
-- **Pass:** correctness only. Lag and memory are reported against proposed budgets (lag p99 5 s, process memory 16 GiB) without a pass/fail verdict, since the budgets are owner inputs.
-- **Bound:** 4 scenarios plus 4 restarts, about 5 hours of runs. Then stop for a ruling.
+- **Generator limit:** MySQL committed less than 95% of the offered rate while MySQL is not saturated. Remedy, once per sweep: more writers or more rows per transaction, then the step is repeated.
+- **MySQL limit:** the commit rate falls short with MySQL at its CPU allocation or with commit latency rising.
+- **DeltaForge limit:** MySQL commits the offered rate, but the source's binlog position falls further behind the binlog head, or delivery falls short with Kafka unsaturated.
+- **Sink limit:** produce latency or broker CPU saturates while DeltaForge keeps up with the binlog.
 
-### Stage 2: several pipelines, one process (question 2)
+Only a DeltaForge limit bounds the frontier. A generator, MySQL or sink limit is reported as the ceiling of the environment at that point.
 
-Only after the Stage 1 ruling.
+## Campaign (one working day, including fixture builds)
 
-- **Fixture:** 4 MySQL servers of 10,000 tables each (40,000 tables in all), one pipeline per server, one process, one SQLite state store. The server count is sized for the available host (12 cores, 31 GB) and is confirmed against Stage 1's measured memory before the stage starts.
-- **Scenarios:** steady CDC at a 1% and a 20% active set (30 minutes each); a restart of all four pipelines; one server restarted under load.
-- **Measured and reported:** as Stage 1 per pipeline, plus connections per server and in all, state-store operation latency, and whether process memory grows with the number of pipelines or with the active tables.
-- **Bound:** 3 scenarios, about 3 hours. Then stop for a ruling.
+### Phase A: catalog growth (about 3 hours)
 
-### Stage 3: a larger catalog, one source (question 3)
+At a fixed offered rate (the G3 profile, 2,000 changes/s), one screening run per catalog size:
 
-Decided after Stage 2: the catalog size (100,000 or 200,000 tables) depends on fixture build time and disk, which Stages 1 and 2 measure.
+| Point | Catalog | Active (40%) |
+|---|---|---|
+| A100 | 2,000 x 50 = 100,000 tables | 40,000 |
+| A200 | 2,000 x 100 = 200,000 | 80,000 |
+| A300 | 2,000 x 150 = 300,000 | 120,000 |
 
-## Out of scope
+Writes are uniform over the active set (no skew), so every active table is touched. Touching all of them takes about n·ln n random changes (about 1.4 million for 120,000 tables, 12 minutes at 2,000/s), so activation is reported as activated tables over time and an activation rate, as well as its completion. Each run lasts until the active set has finished activating, then 10 minutes more. Recorded:
+- time to activate the active set;
+- lag through activation and after it;
+- delivered and committed rates;
+- process RSS and cache-owned memory;
+- state-store size and growth;
+- MySQL, Kafka and DeltaForge CPU.
 
-- The full fleet target (25 clusters x 400,000 tables per instance), and multi-host topologies.
-- The PostgreSQL state store, and initial snapshots of large catalogs (the snapshot profile).
-- Product changes. A risk confirmed by a stage is fixed in its own reviewed PR, or documented as a limit, before any later stage depends on it.
+**Stop increasing the size** at the first point that is saturated, that cannot finish activating within its deadline, or whose fixture does not fit the disk limits. The last viable size is the Phase A result. If a later size fails, the bracket is that pair.
 
-## Publication
+**Disk.** Each empty table with `innodb_file_per_table` takes on the order of 100 KiB, so 300,000 tables may need about 30 GiB before any row. This estimate is measured at A100. If A300 would cross the 25 GiB floor, it is not built, and the limit is reported as the host's, not DeltaForge's.
 
-The capacity envelope and the deployment support pages change only from completed stages, stating exactly the configuration run (servers, tables, active sets, pipelines, host). No result is generalized beyond it.
+### Phase B: traffic staircase (about 3 hours)
 
-## Decisions needed before Stage 1
+At the largest viable Phase A size (or a smaller one if activation dominates the day), with its 40% working set activated once, the offered aggregate rate rises in steps within one run: 2,000, 4,000, 8,000, 16,000, 32,000 and 64,000 changes/s, each step held 5 minutes (2 minutes settling, 3 measured). For every step, recorded:
+- offered, committed and delivered events/s;
+- delivered bytes/s;
+- end-to-end lag p50/p99;
+- backlog slope;
+- per-process CPU and memory.
 
-1. Whether the G3 traffic profile (2,000 changes/s average, 10,000 at peak, per source) is the right Stage 1 workload, or production numbers are available.
-2. The 6-minute rotation period of R20, or another.
-3. Whether to run Stage 1 on the code as released (recommended: it measures the known risks as they are), or to address the activation-pacing risk first.
+The staircase stops at the first saturated step, or at 64,000 if none saturates (then reported as "not reached").
+
+The harness offers a fixed rate per run today. A rate schedule within a run (a list of `at_secs`, rate pairs) is the one harness change this needs, as its own reviewed harness PR. It touches no product code. Without it, each step would be a separate run, and every new pipeline would activate its working set again.
+
+### Phase C: one sustained confirmation (about 1 hour)
+
+The highest viable Phase B step (the last unsaturated one), held for 45 minutes on a fresh pipeline at the same size and working set, with the saturation criteria applied to the whole run.
+
+### Time bound
+
+Fixture builds (about 15 minutes in all, plus dropping or replacing the previous fixture), Phase A, Phase B and Phase C fit one working day. When time runs out the campaign stops and reports what it has: a bracket, or the limit as unresolved. It is not extended automatically.
+
+## Report
+
+- **Phase A:** one row per size: activation time, lag, rates, memory, store growth, CPU, and saturation with its attribution.
+- **Phase B:** one row per step, and the frontier as (highest viable rate, lowest saturated rate) with the limiting component.
+- **Phase C:** the confirmation result.
+
+Every number states the configuration it was measured on. Nothing is extrapolated beyond it.
+
+## Later, after the single-source limits are understood
+
+Rotation of the active set, restarts (warm and cold) at the frontier, several sources in one process, catalogs beyond 300,000 tables, and the PostgreSQL state store. None is part of this campaign.
+
+## Decisions needed before the campaign
+
+1. Approval of the harness rate-schedule PR (harness only) for Phase B.
+2. If A300 does not fit the disk limits, whether to stop at A200 or free space first.
