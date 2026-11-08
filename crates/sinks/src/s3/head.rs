@@ -312,18 +312,18 @@ fn head_key(prefix: &str, pipeline: &str) -> object_store::path::Path {
     )
 }
 
-/// Whether durable_v2 state (a HEAD) exists for `pipeline` under `prefix`:
-/// a read only. Any error other than "not found" is returned, so a caller
-/// that cannot tell fails closed.
-pub(crate) async fn head_exists(
+/// The durable_v2 HEAD of `pipeline` under `prefix`, its content (a read
+/// only), or `None` when there is none. Any error other than "not found"
+/// is returned, so a caller that cannot tell fails closed.
+pub(crate) async fn head_content(
     store: &dyn object_store::ObjectStore,
     prefix: &str,
     pipeline: &str,
-) -> Result<bool, object_store::Error> {
+) -> Result<Option<Vec<u8>>, object_store::Error> {
     use object_store::ObjectStoreExt;
-    match store.head(&head_key(prefix, pipeline)).await {
-        Ok(_) => Ok(true),
-        Err(object_store::Error::NotFound { .. }) => Ok(false),
+    match store.get(&head_key(prefix, pipeline)).await {
+        Ok(r) => Ok(Some(r.bytes().await?.to_vec())),
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
         Err(e) => Err(e),
     }
 }

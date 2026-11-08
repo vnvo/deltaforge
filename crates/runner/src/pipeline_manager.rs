@@ -902,6 +902,15 @@ pub(crate) fn coordinator_exit_failed(
 /// Checkpoint keys are `{source_id}::sink::{sink_id}` - they carry no tenant or
 /// pipeline qualifier, so two pipelines that reuse the same `source_id` would
 /// collide in the checkpoint store and corrupt each other's resume position.
+/// A source id owned by another pipeline.
+fn source_in_use(source_id: &str, owner: &str) -> PipelineAPIError {
+    PipelineAPIError::Conflict(format!(
+        "source id '{source_id}' is already in use by pipeline '{owner}'; a \
+         source id must be unique across pipelines because checkpoints are \
+         keyed by source id"
+    ))
+}
+
 /// A refused binding check as an API error.
 fn binding_api_error(
     e: crate::state_binding::BindingError,
@@ -1841,6 +1850,32 @@ impl PipelineManager {
         crate::pipeline_metrics::check(&spec)
             .map_err(PipelineAPIError::BadRequest)?;
 
+        // The source id must be free, or this pipeline's, before its binding
+        // is read or written: another pipeline's create must never replace
+        // the binding of a source that is registered, starting or claimed.
+        // (Starts are serialized by the lifecycle lock, so none is starting
+        // concurrently.)
+        let source_id = spec.spec.source.source_id().to_string();
+        let registered_by_other =
+            self.pipelines.read().iter().find_map(|(n, r)| {
+                (n != &name && r.spec.spec.source.source_id() == source_id)
+                    .then(|| n.clone())
+            });
+        if let Some(owner) = registered_by_other {
+            return Err(source_in_use(&source_id, &owner));
+        }
+        if let Some((_, owner)) = self
+            .backend
+            .slot_get(ACTIVE_SOURCES_NS, &source_id)
+            .await
+            .map_err(PipelineAPIError::Failed)?
+        {
+            let owner = String::from_utf8_lossy(&owner).into_owned();
+            if owner != name {
+                return Err(source_in_use(&source_id, &owner));
+            }
+        }
+
         // Retained state: the spec must match the binding the source's
         // retained state was written under, or bind it on a first start.
         // Before the claim, and before anything reads or writes that state.
@@ -1855,7 +1890,6 @@ impl PipelineManager {
         // Claim the source id before spawning so two pipelines can never share a
         // source id and corrupt each other's checkpoints. A restart of the same
         // pipeline reuses its own claim; a different pipeline is rejected.
-        let source_id = spec.spec.source.source_id().to_string();
         let newly_claimed = self.claim_source_id(&source_id, &name).await?;
 
         let runtime = match self.spawn_pipeline(spec).await {
@@ -1915,11 +1949,7 @@ impl PipelineManager {
                 if owner == pipeline_name {
                     Ok(false)
                 } else {
-                    Err(PipelineAPIError::Conflict(format!(
-                        "source id '{source_id}' is already in use by pipeline \
-                         '{owner}'; a source id must be unique across pipelines \
-                         because checkpoints are keyed by source id"
-                    )))
+                    Err(source_in_use(source_id, &owner))
                 }
             }
         }
@@ -4376,6 +4406,64 @@ mod tests {
         mgr.start_pipeline(spec_dead("rb"))
             .await
             .expect("the recorded spec resumes");
+    }
+
+    /// A create by another pipeline for a source that is registered, or
+    /// claimed by a pipeline not registered (after a restart), is refused
+    /// before the binding is read or written: the original binding stays.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_create_leaves_the_original_binding_unchanged() {
+        let mgr = PipelineManager::for_testing();
+        let backend = Arc::clone(&mgr.backend);
+        mgr.start_pipeline(spec_dead("owner"))
+            .await
+            .expect("starts");
+        let original = crate::state_binding::read(&backend, "mysql")
+            .await
+            .unwrap()
+            .expect("bound")
+            .1;
+        let mut other = spec_dead("intruder");
+        if let SourceCfg::Mysql(ref mut c) = other.spec.source {
+            c.tables = vec!["db.other".into()];
+        }
+        let err = mgr
+            .start_pipeline(other.clone())
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(matches!(err, PipelineAPIError::Conflict(_)), "{err:?}");
+        let after = crate::state_binding::read(&backend, "mysql")
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_eq!(after, original, "registered: binding unchanged");
+
+        // Claimed but not registered (a server restart): likewise.
+        let fresh = PipelineManager::for_testing();
+        let b2 = Arc::clone(&fresh.backend);
+        fresh
+            .start_pipeline(spec_dead("owner"))
+            .await
+            .expect("starts");
+        fresh.pipelines.write().clear();
+        let original = crate::state_binding::read(&b2, "mysql")
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        let err = fresh.start_pipeline(other).await.map(|_| ()).unwrap_err();
+        assert!(matches!(err, PipelineAPIError::Conflict(_)), "{err:?}");
+        assert_eq!(
+            crate::state_binding::read(&b2, "mysql")
+                .await
+                .unwrap()
+                .unwrap()
+                .1,
+            original,
+            "claimed: binding unchanged"
+        );
     }
 
     /// PATCH refuses a recorded change and a source id change before

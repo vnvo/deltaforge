@@ -197,10 +197,12 @@ The process-local lifecycle lock serializes operations within one server; the st
 
 The check runs in `start_pipeline_locked`, after `held_for_recovery` and before `claim_source_id`. That is before anything reads or writes checkpoints, ownership, snapshot state, the PostgreSQL slot, the S3 HEAD or other source state.
 
+Before the binding is read, the source id must be free or this pipeline's: a create is refused (`409`, the claim conflict) when another registered pipeline uses the source id or another pipeline holds its claim (also one not registered, after a restart). A refused create therefore never changes another pipeline's binding. Starts are serialized by the lifecycle lock, so no other start of that source is in progress.
+
 1. Read the binding, and check for binding-protected state. This is store reads only, with no connection to the source or sinks.
 2. Act on what was found:
    - **Binding present, protected state present:** compare canonical forms. A difference refuses with `409 retained_state_incompatible` (fields listed, redacted), and nothing is claimed, spawned or written.
-   - **Binding present, no protected state:** the binding is stale. Replace it with `slot_cas` on its version.
+   - **Binding present, differing, no protected state in the store:** replace it (`slot_cas` on its version) only when the new spec's probes reach exactly the external state the recorded binding could have left, and find none. They never do for PostgreSQL (the binding does not record the server, which a new DSN may change); for a durable S3 sink they do only at the same endpoint, region, bucket and prefix under the same pipeline name. Otherwise the recorded destination's state cannot be verified absent, and the start is refused (`retained_state_incompatible`). An empty new destination never makes a binding stale. There is no reset mechanism in this change: a new source id is the way to a new lifecycle.
    - **Binding absent, protected state present:** refuse with `retained_state_unbound`, naming the adoption command.
    - **Binding absent, no protected state:** a first start. Create the binding with `slot_create`.
 3. Claim the source id, then spawn.
@@ -245,6 +247,8 @@ A store written before this change can hold binding-protected state with no bind
    - the PostgreSQL slot owner's slot, database and pipeline against the spec.
 
    Any mismatch refuses the adoption. It prints the binding it would write, with redacted canonical values, and a proof digest over the state found and that binding. Fields with no retained record to check against are listed as adopted on the operator's statement.
+
+   The proof covers contents, not only keys: checkpoint and progress values; slot records with their versions (snapshot generation, recovery authorization, every snapshot plan item, every ownership record); every DLQ entry's id and content; a PostgreSQL slot's identity and state (system identifier, plugin, database, restart and confirmed positions, catalog xmin); an S3 HEAD's content. A change under the same key between the dry run and the apply therefore fails the apply.
 2. **`--apply --expect-proof <digest>`** writes the binding with `slot_create`, under the store gate, only if the store still produces the same proof, and writes an audit record. The gate is taken in the server role, so a crash during the apply (one atomic write) leaves a gate `store-gate break` can release.
 
 The external probes count here too: a PostgreSQL slot or S3 HEAD found with no store record is listed as adopted on the operator's statement. A pre-created slot (one an operator made before the first start) is such state: its first start refuses until it is adopted or removed.

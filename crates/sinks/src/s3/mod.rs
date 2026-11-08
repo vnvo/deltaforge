@@ -50,21 +50,21 @@ pub use sink::{S3Sink, S3SinkArgs, build_s3_sink};
 pub use writer_pool::SchemaResolver;
 pub use writer_pool::{CommittedFile, WriterPool, WriterPoolConfig};
 
-/// Whether the durable_v2 sink `cfg` of `pipeline` already has state (a
-/// HEAD) in its bucket. A read only: a local store whose root does not
-/// exist has none, and nothing is created. An error means it cannot be
-/// told.
-pub async fn durable_state_exists(
+/// The durable_v2 sink `cfg`'s state of `pipeline` in its bucket: the
+/// HEAD's content, or `None` when there is none. A read only: a local store
+/// whose root does not exist has none, and nothing is created. An error
+/// means it cannot be told.
+pub async fn durable_state(
     cfg: &deltaforge_config::S3SinkCfg,
     creds: &crate::ResolvedSinkCreds,
     pipeline: &str,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<Vec<u8>>> {
     let params = object_writer::s3_object_store_params(cfg, creds)?;
     if params.local && !std::path::Path::new(&params.bucket).exists() {
-        return Ok(false);
+        return Ok(None);
     }
     let store = object_writer::build_object_store(&params)?;
-    head::head_exists(store.as_ref(), &cfg.prefix, pipeline)
+    head::head_content(store.as_ref(), &cfg.prefix, pipeline)
         .await
         .map_err(|e| anyhow::anyhow!("read the durable_v2 HEAD: {e}"))
 }

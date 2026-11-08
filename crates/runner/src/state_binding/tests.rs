@@ -488,3 +488,198 @@ async fn adoption_matches_a_snapshot_generation_of_the_same_tables() {
             .any(|v| v.contains("snapshot generation"))
     );
 }
+
+// ── A mismatching binding is replaced only when its state is verifiable ──
+
+const PG: &str = r#"
+metadata: {name: orders, tenant: acme}
+spec:
+  source:
+    type: postgres
+    config:
+      id: src
+      dsn: "postgres://df:PLANTED-SRC-PW@pg.example:5432/app"
+      publication: pub1
+      slot: slot1
+      tables: ["public.orders"]
+  processors: []
+  sinks:
+    - type: kafka
+      config: {id: k, brokers: "kafka:9092", topic: orders}
+"#;
+
+const S3: &str = r#"
+metadata: {name: orders, tenant: acme}
+spec:
+  source:
+    type: mysql
+    config:
+      id: src
+      dsn: "mysql://df:PLANTED-SRC-PW@db.example:3306/shop"
+      tables: ["shop.orders"]
+  processors: []
+  sinks:
+    - type: kafka
+      config: {id: k, brokers: "kafka:9092", topic: orders}
+    - type: s3
+      config: {id: s, bucket: lake, prefix: cdc, region: eu-west-1}
+"#;
+
+/// A probe that records whether it was asked.
+#[derive(Default)]
+struct Watched {
+    asked: Mutex<u32>,
+}
+
+#[async_trait]
+impl ExternalState for Watched {
+    async fn protected(&self, _spec: &PipelineSpec) -> Result<Vec<Found>> {
+        *self.asked.lock().unwrap() += 1;
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn an_empty_new_destination_never_makes_a_binding_stale() {
+    // PostgreSQL: the recorded slot's server is not recorded, so a new spec
+    // cannot check it; the mismatching binding is never replaced.
+    let b = backend();
+    let probe = Watched::default();
+    check_and_bind(&b, &probe, &spec(PG)).await.unwrap();
+    let before = stored(&b).await.unwrap();
+    let moved = spec(&PG.replace("slot: slot1", "slot: slot2"));
+    let err = check_and_bind(&b, &probe, &moved).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            BindingError::Incompatible {
+                unverifiable: true,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(err.to_string().contains("cannot be verified absent"));
+    assert_eq!(stored(&b).await.unwrap(), before, "unchanged");
+
+    // S3 durable: a moved bucket cannot be checked through the new spec.
+    let b = backend();
+    let probe = Watched::default();
+    check_and_bind(&b, &probe, &spec(S3)).await.unwrap();
+    let before = stored(&b).await.unwrap();
+    let err = check_and_bind(
+        &b,
+        &probe,
+        &spec(&S3.replace("bucket: lake", "bucket: other")),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            BindingError::Incompatible {
+                unverifiable: true,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert_eq!(stored(&b).await.unwrap(), before, "unchanged");
+    let asked = *probe.asked.lock().unwrap();
+
+    // The same bucket, prefix and pipeline: the new spec probes the recorded
+    // state itself, and with none found the stale binding is replaced.
+    let same_place = spec(&S3.replace("topic: orders", "topic: elsewhere"));
+    assert_eq!(
+        check_and_bind(&b, &probe, &same_place).await.unwrap(),
+        Outcome::Replaced
+    );
+    assert!(
+        *probe.asked.lock().unwrap() > asked,
+        "the probe was consulted"
+    );
+}
+
+// ── The adoption proof covers state contents, not only keys ──────────────
+
+async fn proof(b: &ArcStorageBackend, probe: &Probe) -> String {
+    adopt_plan(b, probe, &spec(BASE)).await.unwrap().proof
+}
+
+#[tokio::test]
+async fn same_key_changes_change_the_adoption_proof() {
+    let probe = Probe::default();
+
+    // An ownership record rewritten under its key.
+    let b = backend();
+    plant(&b, "destination_ownership").await;
+    let key = format!(
+        "{}k/elasticsearch/c1/orders",
+        sinks::ownership_prefix("orders")
+    );
+    let before = proof(&b, &probe).await;
+    let (v, _) = b
+        .slot_get(crate::destination_ownership::NAMESPACE, &key)
+        .await
+        .unwrap()
+        .unwrap();
+    b.slot_cas(
+        crate::destination_ownership::NAMESPACE,
+        &key,
+        v,
+        b"{\"fence\":\"x\"}",
+    )
+    .await
+    .unwrap();
+    assert_ne!(proof(&b, &probe).await, before, "ownership content");
+
+    // A snapshot plan item rewritten under its key.
+    let b = backend();
+    plant(&b, "sink_checkpoint").await;
+    let item = format!("{}/0000000000000001/aa/bb", hex(b"src"));
+    b.slot_create(sources::snapshot_queue::PLAN_NS, &item, b"pending")
+        .await
+        .unwrap();
+    let before = proof(&b, &probe).await;
+    b.slot_cas(sources::snapshot_queue::PLAN_NS, &item, 1, b"done")
+        .await
+        .unwrap();
+    assert_ne!(proof(&b, &probe).await, before, "plan item content");
+
+    // A DLQ entry replaced: the same number of entries, other content.
+    let b = backend();
+    plant(&b, "dlq_entries").await;
+    let before = proof(&b, &probe).await;
+    let entries = b
+        .queue_peek(crate::dlq::JOURNAL_NS, "orders:dlq", 10)
+        .await
+        .unwrap();
+    b.queue_ack(crate::dlq::JOURNAL_NS, "orders:dlq", entries[0].0)
+        .await
+        .unwrap();
+    b.queue_push(crate::dlq::JOURNAL_NS, "orders:dlq", b"other")
+        .await
+        .unwrap();
+    assert_ne!(proof(&b, &probe).await, before, "DLQ content");
+
+    // An external slot or HEAD of the same name in another state.
+    let b = backend();
+    let probe = Probe::default();
+    probe.found.lock().unwrap().push(found(
+        "postgresql_replication_slot",
+        "slot1",
+        b"confirmed_flush_lsn=0/10",
+    ));
+    let plan = adopt_plan(&b, &probe, &spec(BASE)).await.unwrap();
+    *probe.found.lock().unwrap() = vec![found(
+        "postgresql_replication_slot",
+        "slot1",
+        b"confirmed_flush_lsn=0/20",
+    )];
+    assert_ne!(proof(&b, &probe).await, plan.proof, "external state");
+    let err = adopt_apply(&b, &probe, &spec(BASE), &plan.proof, "tester")
+        .await
+        .unwrap_err();
+    assert!(err.downcast_ref::<AdoptRefused>().is_some(), "{err:#}");
+    assert!(stored(&b).await.is_none());
+}

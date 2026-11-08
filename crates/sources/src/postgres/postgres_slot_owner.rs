@@ -244,11 +244,35 @@ pub enum SlotPreflight {
 /// ownership rules as startup: an existing slot is OK only when this pipeline's
 /// durable ownership record proves it owns that slot on this exact server/db, and
 /// it is not already in active use.
-/// Whether the replication slot `slot` exists on the server `dsn` reaches.
-/// A connection or query failure is an error, never "absent".
-pub async fn slot_exists(dsn: &str, slot: &str) -> Result<bool> {
+/// The replication slot `slot` on the server `dsn` reaches, as a stable
+/// description of its identity and state: the server's system identifier,
+/// the database, the slot's plugin, database and positions. `None` when
+/// the slot does not exist. A connection or query failure is an error,
+/// never "absent". The description changes when the slot is dropped and
+/// recreated, moves, or is consumed.
+pub async fn slot_state(dsn: &str, slot: &str) -> Result<Option<String>> {
     let client = connect(dsn).await?;
-    Ok(slot_status(&client, slot).await?.is_some())
+    let row = client
+        .query_opt(
+            "SELECT plugin::text, database::text, \
+             coalesce(restart_lsn::text, ''), \
+             coalesce(confirmed_flush_lsn::text, ''), \
+             coalesce(catalog_xmin::text, '') \
+             FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .await
+        .context("query the replication slot")?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let id = fetch_identity(&client).await?;
+    let parts: Vec<String> = (0..5).map(|i| row.get::<_, String>(i)).collect();
+    Ok(Some(format!(
+        "system_identifier={} slot={slot} plugin={} database={} \
+         restart_lsn={} confirmed_flush_lsn={} catalog_xmin={}",
+        id.system_identifier, parts[0], parts[1], parts[2], parts[3], parts[4]
+    )))
 }
 
 pub async fn preflight_classify_slot(

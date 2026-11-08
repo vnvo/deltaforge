@@ -35,10 +35,13 @@ pub const AUDIT_NAMESPACE: &str = "state_binding.audit";
 pub enum BindingError {
     /// A spec field or name cannot be classified (a validation error).
     Unclassified(Vec<Rejection>),
-    /// The spec differs from the binding while protected state exists.
+    /// The spec differs from the binding while protected state exists, or
+    /// while the recorded destination's state cannot be verified absent
+    /// (`unverifiable`).
     Incompatible {
         source_id: String,
         differences: Vec<Difference>,
+        unverifiable: bool,
     },
     /// Protected state exists with no binding: adopt it first.
     Unbound {
@@ -62,13 +65,25 @@ impl std::fmt::Display for BindingError {
             BindingError::Incompatible {
                 source_id,
                 differences,
+                unverifiable,
             } => {
-                write!(
-                    f,
-                    "retained_state_incompatible: source id '{source_id}' has \
-                     retained state written under a different spec; nothing \
-                     was claimed, started or written. Differences: "
-                )?;
+                if *unverifiable {
+                    write!(
+                        f,
+                        "retained_state_incompatible: source id '{source_id}' \
+                         is bound to a different spec whose source slot or \
+                         durable sink state lives where the new spec cannot \
+                         check it, so that state cannot be verified absent; \
+                         nothing was claimed, started or written. Differences: "
+                    )?;
+                } else {
+                    write!(
+                        f,
+                        "retained_state_incompatible: source id '{source_id}' \
+                         has retained state written under a different spec; \
+                         nothing was claimed, started or written. Differences: "
+                    )?;
+                }
                 join(f, differences.iter().map(ToString::to_string))?;
                 write!(
                     f,
@@ -95,8 +110,9 @@ impl std::fmt::Display for BindingError {
             BindingError::Undetermined(why) => write!(
                 f,
                 "retained_state_undetermined: whether retained state exists \
-                 cannot be determined ({why}); the start is refused until \
-                 it can"
+                 cannot be determined ({why}); nothing was claimed, started \
+                 or written. Retry once the state store, the source server \
+                 and the durable sinks' buckets are reachable"
             ),
         }
     }
@@ -125,6 +141,12 @@ fn found(kind: &'static str, key: impl Into<String>, content: &[u8]) -> Found {
         key: key.into(),
         digest: hex(&Sha256::digest(content)),
     }
+}
+
+/// Length-prefixed, so adjacent parts cannot run together.
+fn framed(h: &mut Sha256, part: &[u8]) {
+    h.update((part.len() as u64).to_be_bytes());
+    h.update(part);
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -171,17 +193,20 @@ impl ExternalState for LiveExternalState {
             let dsn = sources::resolve_source_dsn(spec, resolver.as_ref())
                 .await
                 .context("resolve the source DSN")?;
-            if sources::postgres::postgres_slot_owner::slot_exists(
-                dsn.expose(),
-                &c.slot,
-            )
-            .await
-            .context("look for the replication slot")?
+            // Its identity and state, not only its name: a slot dropped and
+            // recreated, moved or consumed under the same name differs.
+            if let Some(state) =
+                sources::postgres::postgres_slot_owner::slot_state(
+                    dsn.expose(),
+                    &c.slot,
+                )
+                .await
+                .context("look for the replication slot")?
             {
                 out.push(found(
                     "postgresql_replication_slot",
                     &c.slot,
-                    c.slot.as_bytes(),
+                    state.as_bytes(),
                 ));
             }
         }
@@ -190,7 +215,9 @@ impl ExternalState for LiveExternalState {
                 .await
                 .context("resolve the sink credentials")?;
             for cfg in durable {
-                if sinks::s3::durable_state_exists(
+                // The HEAD's content: a HEAD rewritten under the same key
+                // differs.
+                if let Some(head) = sinks::s3::durable_state(
                     cfg,
                     secrets.for_sink(&cfg.id),
                     &spec.metadata.name,
@@ -200,14 +227,13 @@ impl ExternalState for LiveExternalState {
                     format!("look for sink '{}' durable state", cfg.id)
                 })? {
                     let key = format!(
-                        "{}/{}/{}",
-                        cfg.bucket, cfg.prefix, spec.metadata.name
+                        "{}/{}/{}/{}",
+                        cfg.endpoint.as_deref().unwrap_or("aws"),
+                        cfg.bucket,
+                        cfg.prefix,
+                        spec.metadata.name
                     );
-                    out.push(found(
-                        "s3_durable_head",
-                        key.clone(),
-                        key.as_bytes(),
-                    ));
+                    out.push(found("s3_durable_head", key, &head));
                 }
             }
         }
@@ -333,19 +359,40 @@ pub async fn local_protected(
             out.push(found(kind, key, &content));
         }
     }
+    // The snapshot plan: every item, with its version and content.
     let plan_prefix = format!("{}/", hex(source_id.as_bytes()));
-    let page = backend
-        .slot_list(
-            sources::snapshot_queue::PLAN_NS,
-            Some(&plan_prefix),
-            None,
-            1,
-        )
-        .await?;
-    if let Some(r) = page.records.first() {
-        out.push(found("snapshot_plan", r.key.clone(), r.key.as_bytes()));
+    let mut plan = Sha256::new();
+    let mut items = 0u64;
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = backend
+            .slot_list(
+                sources::snapshot_queue::PLAN_NS,
+                Some(&plan_prefix),
+                cursor.as_deref(),
+                storage::SLOT_LIST_MAX_LIMIT,
+            )
+            .await?;
+        for r in &page.records {
+            items += 1;
+            framed(&mut plan, r.key.as_bytes());
+            plan.update(r.version.to_be_bytes());
+            framed(&mut plan, &r.value);
+        }
+        match page.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    if items > 0 {
+        out.push(Found {
+            kind: "snapshot_plan",
+            key: format!("{plan_prefix} ({items} items)"),
+            digest: hex(&plan.finalize()),
+        });
     }
     for pipeline in pipelines {
+        // Ownership records: each with its version and content.
         let prefix = sinks::ownership_prefix(pipeline);
         let mut cursor: Option<String> = None;
         loop {
@@ -358,10 +405,12 @@ pub async fn local_protected(
                 )
                 .await?;
             for r in &page.records {
+                let mut content = r.version.to_be_bytes().to_vec();
+                content.extend_from_slice(&r.value);
                 out.push(found(
                     "destination_ownership",
                     r.key.clone(),
-                    r.key.as_bytes(),
+                    &content,
                 ));
             }
             match page.next_cursor {
@@ -369,10 +418,23 @@ pub async fn local_protected(
                 None => break,
             }
         }
+        // DLQ entries: every entry's id and content.
         let dlq = format!("{pipeline}:dlq");
         let len = backend.queue_len(crate::dlq::JOURNAL_NS, &dlq).await?;
         if len > 0 {
-            out.push(found("dlq_entries", dlq, &len.to_be_bytes()));
+            let mut h = Sha256::new();
+            let entries = backend
+                .queue_peek(crate::dlq::JOURNAL_NS, &dlq, len as usize)
+                .await?;
+            for (id, value) in &entries {
+                h.update(id.to_be_bytes());
+                framed(&mut h, value);
+            }
+            out.push(Found {
+                kind: "dlq_entries",
+                key: format!("{dlq} ({} entries)", entries.len()),
+                digest: hex(&h.finalize()),
+            });
         }
     }
     out.sort();
@@ -420,6 +482,56 @@ fn sanitized(s: &str) -> String {
         .join(" ")
 }
 
+/// Whether probing the new spec reaches exactly the external state the
+/// recorded binding could have left: never for PostgreSQL (the binding does
+/// not record the server, which a new DSN may change), and for each durable
+/// S3 sink only at the same endpoint, region, bucket and prefix under the
+/// same pipeline name.
+fn probes_the_recorded_state(
+    stored: &StateBinding,
+    new: &StateBinding,
+) -> bool {
+    if stored.engine == "postgres" {
+        return false;
+    }
+    let empty = serde_json::Map::new();
+    let sinks = |b: &StateBinding| {
+        b.canonical["sinks"]
+            .as_object()
+            .cloned()
+            .unwrap_or_else(|| empty.clone())
+    };
+    let (old, now) = (sinks(stored), sinks(new));
+    for (id, sink) in &old {
+        let durable = sink["type"] == "s3"
+            && sink["durability"]
+                .as_str()
+                .is_none_or(|d| d == "durable_v2");
+        if !durable {
+            continue;
+        }
+        let Some(next) = now.get(id) else {
+            return false;
+        };
+        let same = stored.pipeline == new.pipeline
+            && [
+                "type",
+                "endpoint",
+                "region",
+                "bucket",
+                "prefix",
+                "local",
+                "durability",
+            ]
+            .iter()
+            .all(|k| sink.get(*k) == next.get(*k));
+        if !same {
+            return false;
+        }
+    }
+    true
+}
+
 /// What a start found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -464,17 +576,39 @@ pub async fn check_and_bind(
                 if differences.is_empty() {
                     return Ok(Outcome::Matched);
                 }
-                let found = protected(
+                let local = local_protected(
                     backend,
-                    external,
-                    spec,
+                    &source_id,
                     &[&stored.pipeline, &new.pipeline],
                 )
-                .await?;
+                .await
+                .map_err(store_err)?;
+                if !local.is_empty() {
+                    return Err(BindingError::Incompatible {
+                        source_id,
+                        differences,
+                        unverifiable: false,
+                    });
+                }
+                // The new spec's probes reach only its own slot and
+                // buckets: an empty new destination proves nothing about
+                // the recorded one. Replace only when the recorded external
+                // state is exactly what the new spec probes.
+                if !probes_the_recorded_state(&stored, &new) {
+                    return Err(BindingError::Incompatible {
+                        source_id,
+                        differences,
+                        unverifiable: true,
+                    });
+                }
+                let found = external.protected(spec).await.map_err(|e| {
+                    BindingError::Undetermined(sanitized(&format!("{e:#}")))
+                })?;
                 if !found.is_empty() {
                     return Err(BindingError::Incompatible {
                         source_id,
                         differences,
+                        unverifiable: false,
                     });
                 }
                 // Stale: nothing it protects remains.
@@ -538,6 +672,7 @@ pub async fn check_patch(
         Err(BindingError::Incompatible {
             source_id: base.source_id,
             differences,
+            unverifiable: false,
         })
     }
 }
