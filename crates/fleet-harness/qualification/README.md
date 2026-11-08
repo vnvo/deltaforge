@@ -13,8 +13,17 @@ candidate commit, on throwaway containers, with the **SQLite** state store.
   progress through the REST API (`/pipelines/{name}/checkpoints`, positions
   only) and the store's size from `measure.state_store_file` (a bind mount of
   the instance's store).
-- **Disk:** every invocation starts with at least 50 GiB free and stops if
-  free disk falls below 25 GiB: run it under [`floor-watch.sh`](floor-watch.sh).
+- **Disk and time:** every invocation runs under
+  [`floor-watch.sh`](floor-watch.sh): it starts with at least 50 GiB free,
+  stops if free disk falls below 25 GiB, and stops at its deadline
+  (`DEADLINE_SECS`). A stop sends SIGINT (the harness aborts and still writes
+  its result), then SIGKILL after `GRACE_SECS` (default 120). `df -B1G` rounds
+  up, so pass `START_GIB=51 FLOOR_GIB=26` to hold the floors exactly or
+  stricter, and check the start in bytes (at least 53,687,091,200).
+- **Deadlines:** warm-up + duration + `--drain-max-secs` + 900 s for setup and
+  verification: S1 4,620 s; A1, A2, A3 4,020 s; S3 3,720 s. G4
+  (`pg-qualify`): snapshot timeout + CDC + drain maximum + 900 s = 6,300 s. A stopped invocation is a failure of that
+  invocation, kept like any other.
 - **Failures** are kept and investigated, never rerun until they pass. A
   scenario that fails stops the sequence.
 
@@ -67,7 +76,8 @@ Then, from the run directory:
 ```bash
 fleet-harness fixture g3-t1a-S1.yaml --concurrency 16
 for sc in S1 A1 A2 A3 S3; do
-  floor-watch.sh -- fleet-harness run g3-t1a-$sc.yaml --drain-idle-secs 60 --drain-max-secs 1800 || break
+  DEADLINE_SECS=<deadline of $sc> START_GIB=51 FLOOR_GIB=26 \
+    floor-watch.sh -- fleet-harness run g3-t1a-$sc.yaml --drain-idle-secs 60 --drain-max-secs 1800 || break
 done
 ```
 
@@ -86,7 +96,7 @@ unsupported cases use an Avro sink). DeltaForge as for G3, named
 with its own `state` directory.
 
 ```bash
-floor-watch.sh -- fleet-harness pg-qualify g4-postgres.yaml
+DEADLINE_SECS=6300 START_GIB=51 FLOOR_GIB=26 floor-watch.sh -- fleet-harness pg-qualify g4-postgres.yaml
 ```
 
 `results/g4/<run id>/` holds `result.json` (verdict and reasons),

@@ -147,8 +147,13 @@ impl ActiveSet {
 
     /// A table to change now.
     pub fn pick(&self, elapsed_secs: u64, rng: &mut impl Rng) -> TableRef {
+        self.pick_in(self.window(elapsed_secs), rng)
+    }
+
+    /// A table of `window`'s set.
+    pub fn pick_in(&self, window: u64, rng: &mut impl Rng) -> TableRef {
         let rank = self.zipf.sample(rng) as u64;
-        self.table_at(self.window(elapsed_secs), rank)
+        self.table_at(window, rank)
     }
 }
 

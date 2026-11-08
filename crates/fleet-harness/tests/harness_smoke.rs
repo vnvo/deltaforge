@@ -453,6 +453,31 @@ async fn the_harness_runs_scenarios_end_to_end() {
     assert!(r["resources"]["samples"].as_u64().unwrap() > 0);
     assert!(r["resources"]["connections_max"]["c01"].as_u64().unwrap() >= 1);
 
+    // Fewer active tables than writers: a writer that owns none of them
+    // waits for stop instead of spinning, and the run ends on time with
+    // everything the others wrote delivered.
+    let mut cfg = config("S1", &env, "none");
+    cfg.run.duration_secs = 10;
+    cfg.traffic.writers_per_server = 4;
+    cfg.traffic.active_set.value =
+        fleet_harness::config::ActiveSetPattern::Fixed { fraction: 0.05 };
+    let before = run_ids(out_s);
+    let ended = tokio::time::timeout(
+        Duration::from_secs(180),
+        sweep(cfg, opts.clone()),
+    )
+    .await
+    .expect("the run ends although most writers own no active table")
+    .unwrap();
+    assert!(ended.points[0].correctness_ok);
+    let r = new_result(out_s, &before);
+    assert_eq!(r["outcome"], "completed", "{r}");
+    let c = &r["completeness"];
+    assert!(c["written"].as_u64().unwrap() > 0, "{c}");
+    for k in ["missing", "duplicates", "unexpected"] {
+        assert_eq!(c[k], 0, "{k}: {c}");
+    }
+
     // An interrupted run stops its writers, drains and still checks what it
     // wrote. The next run (S5, successful) starts immediately after it.
     let mut cfg = config("S5", &env, "none");
@@ -666,12 +691,12 @@ async fn the_harness_runs_scenarios_end_to_end() {
     assert!(r["measured_secs"].as_f64().unwrap() < 60.0);
     assert_partial_counters(&r);
 
-    // Seven runs, each with its own evidence and row namespace.
+    // Eight runs, each with its own evidence and row namespace.
     let ids = run_ids(out_s);
-    assert_eq!(ids.len(), 7, "{ids:?}");
+    assert_eq!(ids.len(), 8, "{ids:?}");
     let tags: BTreeSet<u64> = ids
         .iter()
         .map(|id| result(out_s, id)["run_tag"].as_u64().unwrap())
         .collect();
-    assert_eq!(tags.len(), 7, "{tags:?}");
+    assert_eq!(tags.len(), 8, "{tags:?}");
 }
