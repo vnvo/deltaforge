@@ -51,6 +51,8 @@ checkpoints = { path = "../checkpoints" }
 serde_yaml.workspace = true
 tikv-jemallocator = { version = "0.6", optional = true }
 
+sha2.workspace = true
+
 [dev-dependencies]
 deltaforge-core = { path = "../deltaforge-core", features = ["test-fixtures"] }
 s3-test-server = { path = "../s3-test-server" }

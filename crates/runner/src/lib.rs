@@ -22,6 +22,7 @@ pub mod schema_context;
 pub mod schema_migrate;
 mod schema_provider;
 mod sensing_api;
+pub mod state_binding;
 pub mod storage_secrets;
 
 pub use schema_provider::{

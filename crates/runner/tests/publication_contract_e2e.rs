@@ -593,6 +593,38 @@ async fn retained_wal_before_the_registration_is_refused() -> Result<()> {
     register(port).await;
     let hook = Hook::start().await;
     let (mgr, backend) = manager().await;
+    // A slot made before the first start is retained state with no
+    // binding: refused until it is adopted, nothing started.
+    let err = mgr
+        .start_pipeline(spec("pcwal", port, &hook.url, "never"))
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        matches!(&err, rest_api::PipelineAPIError::RetainedState { code, .. }
+            if *code == "RETAINED_STATE_UNBOUND"),
+        "{err:?}"
+    );
+    let external = runner::state_binding::LiveExternalState;
+    let s = spec("pcwal", port, &hook.url, "never");
+    let plan =
+        runner::state_binding::adopt_plan(&backend, &external, &s).await?;
+    assert!(
+        plan.found
+            .iter()
+            .any(|(k, _)| k == "postgresql_replication_slot"),
+        "{plan:?}"
+    );
+    runner::state_binding::adopt_apply(
+        &backend,
+        &external,
+        &s,
+        &plan.proof,
+        "test",
+    )
+    .await?;
+    // Adopted, the publication contract refuses the WAL retained before
+    // the registration.
     mgr.start_pipeline(spec("pcwal", port, &hook.url, "never"))
         .await?;
     failed_with(

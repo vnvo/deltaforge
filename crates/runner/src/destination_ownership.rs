@@ -128,6 +128,32 @@ impl OwnershipStore for StorageOwnershipStore {
     async fn remove(&self, key: &str) -> anyhow::Result<bool> {
         Ok(self.backend.slot_delete(NAMESPACE, key).await?)
     }
+
+    async fn list(
+        &self,
+        prefix: &str,
+    ) -> anyhow::Result<Vec<(String, OwnershipRecord)>> {
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = self
+                .backend
+                .slot_list(
+                    NAMESPACE,
+                    Some(prefix),
+                    cursor.as_deref(),
+                    storage::SLOT_LIST_MAX_LIMIT,
+                )
+                .await?;
+            for r in page.records {
+                out.push((r.key, decode(&r.value)?));
+            }
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => return Ok(out),
+            }
+        }
+    }
 }
 
 #[cfg(test)]

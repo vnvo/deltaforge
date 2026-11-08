@@ -902,6 +902,28 @@ pub(crate) fn coordinator_exit_failed(
 /// Checkpoint keys are `{source_id}::sink::{sink_id}` - they carry no tenant or
 /// pipeline qualifier, so two pipelines that reuse the same `source_id` would
 /// collide in the checkpoint store and corrupt each other's resume position.
+/// A refused binding check as an API error.
+fn binding_api_error(
+    e: crate::state_binding::BindingError,
+) -> PipelineAPIError {
+    use crate::state_binding::BindingError as B;
+    let message = e.to_string();
+    match e {
+        B::Unclassified(_) => PipelineAPIError::BadRequest(message),
+        B::Incompatible { .. } => PipelineAPIError::RetainedState {
+            code: "RETAINED_STATE_INCOMPATIBLE",
+            message,
+        },
+        B::Unbound { .. } => PipelineAPIError::RetainedState {
+            code: "RETAINED_STATE_UNBOUND",
+            message,
+        },
+        B::Undetermined(_) => {
+            PipelineAPIError::RetainedStateUndetermined(message)
+        }
+    }
+}
+
 /// This claim rejects a second pipeline that reuses an active `source_id`. It is
 /// keyed by `source_id` alone, matching the checkpoint-key collision domain
 /// (keying it by tenant would not, since the keys themselves are not
@@ -927,6 +949,9 @@ pub struct PipelineManager {
     /// never interleave with an apply (`crate::recovery`).
     pub(crate) recovering:
         Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    /// Protected retained state outside the store (a PostgreSQL slot, an
+    /// S3 durable_v2 HEAD), consulted by the binding check.
+    pub(crate) external: crate::state_binding::SharedExternalState,
 }
 
 impl PipelineManager {
@@ -1001,7 +1026,17 @@ impl PipelineManager {
             backend,
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             recovering: Default::default(),
+            external: Arc::new(crate::state_binding::LiveExternalState),
         })
+    }
+
+    /// Replace the probes of protected state outside the store (tests).
+    pub fn with_external_state(
+        mut self,
+        external: crate::state_binding::SharedExternalState,
+    ) -> Self {
+        self.external = external;
+        self
     }
 
     /// In-memory constructor for tests - no persistence.
@@ -1021,6 +1056,7 @@ impl PipelineManager {
             backend,
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             recovering: Default::default(),
+            external: Arc::new(crate::state_binding::LiveExternalState),
         }
     }
 
@@ -1804,6 +1840,17 @@ impl PipelineManager {
             .map_err(|e| PipelineAPIError::Failed(anyhow::anyhow!(e)))?;
         crate::pipeline_metrics::check(&spec)
             .map_err(PipelineAPIError::BadRequest)?;
+
+        // Retained state: the spec must match the binding the source's
+        // retained state was written under, or bind it on a first start.
+        // Before the claim, and before anything reads or writes that state.
+        crate::state_binding::check_and_bind(
+            &self.backend,
+            self.external.as_ref(),
+            &spec,
+        )
+        .await
+        .map_err(binding_api_error)?;
 
         // Claim the source id before spawning so two pipelines can never share a
         // source id and corrupt each other's checkpoints. A restart of the same
@@ -2602,6 +2649,23 @@ impl PipelineController for PipelineManager {
             ));
         }
 
+        // A new source id is a new source lifecycle, never a change.
+        if new_spec.spec.source.source_id() != old_spec.spec.source.source_id()
+        {
+            return Err(PipelineAPIError::BadRequest(format!(
+                "changing source.id ('{}' to '{}') starts a new source \
+                 lifecycle and cannot be done by PATCH; create a new pipeline \
+                 with the new source id",
+                old_spec.spec.source.source_id(),
+                new_spec.spec.source.source_id()
+            )));
+        }
+        // Retained state: the merged spec must match the binding, before
+        // anything is stopped.
+        crate::state_binding::check_patch(&self.backend, &old_spec, &new_spec)
+            .await
+            .map_err(binding_api_error)?;
+
         // Refuse settings that cannot apply before stopping anything.
         new_spec
             .spec
@@ -2874,8 +2938,34 @@ impl PipelineController for PipelineManager {
             })?;
 
         // Everything durable is cleaned; now drop the in-memory runtime.
-        self.pipelines.write().remove(name);
+        let removed = self.pipelines.write().remove(name);
         crate::pipeline_metrics::forget(name);
+
+        // The binding goes only when nothing it protects remains (state
+        // Delete leaves behind keeps it authoritative). Kept when that
+        // cannot be told: a stale binding is replaced at the next first
+        // start.
+        if let Some(rt) = removed {
+            match crate::state_binding::release_if_unprotected(
+                &self.backend,
+                self.external.as_ref(),
+                &rt.spec,
+            )
+            .await
+            {
+                Ok(true) => {
+                    tracing::info!(pipeline = %name, "state binding removed")
+                }
+                Ok(false) => tracing::info!(
+                    pipeline = %name, source_id = %source_id,
+                    "state binding kept: retained state remains"
+                ),
+                Err(e) => tracing::warn!(
+                    pipeline = %name, source_id = %source_id, error = %e,
+                    "state binding kept: retained state could not be checked"
+                ),
+            }
+        }
         Ok(())
     }
 
@@ -3540,6 +3630,7 @@ mod tests {
             backend,
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             recovering: Default::default(),
+            external: Arc::new(crate::state_binding::LiveExternalState),
         }
     }
 
@@ -4235,6 +4326,91 @@ mod tests {
         );
         // The pipeline is untouched and still registered.
         assert!(mgr.get_pipeline("pl").is_some());
+    }
+
+    /// A recreate whose spec differs from the binding of retained state
+    /// that DELETE left behind is refused before the claim: nothing is
+    /// claimed, registered or written; the same spec starts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recreate_against_retained_state_is_refused_before_the_claim() {
+        let mgr = PipelineManager::for_testing();
+        let backend = Arc::clone(&mgr.backend);
+        mgr.start_pipeline(spec_dead("rb")).await.expect("starts");
+        // State DELETE leaves behind: a legacy aggregate checkpoint.
+        backend
+            .kv_put(storage::CHECKPOINTS_NS, "mysql", b"cp")
+            .await
+            .unwrap();
+        mgr.delete("rb").await.expect("delete succeeds");
+        assert!(
+            crate::state_binding::read(&backend, "mysql")
+                .await
+                .unwrap()
+                .is_some(),
+            "the binding stays while retained state remains"
+        );
+
+        let mut other = spec_dead("rb");
+        if let SourceCfg::Mysql(ref mut c) = other.spec.source {
+            c.tables = vec!["db.other".into()];
+        }
+        let err = mgr.start_pipeline(other).await.map(|_| ()).unwrap_err();
+        match &err {
+            PipelineAPIError::RetainedState { code, message } => {
+                assert_eq!(*code, "RETAINED_STATE_INCOMPATIBLE");
+                assert!(message.contains("source.tables"), "{message}");
+                assert!(!message.contains("root:root"), "{message}");
+            }
+            e => panic!("{e:?}"),
+        }
+        assert!(
+            backend
+                .slot_get(ACTIVE_SOURCES_NS, "mysql")
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing claimed"
+        );
+        assert!(mgr.get_pipeline("rb").is_none(), "nothing registered");
+
+        mgr.start_pipeline(spec_dead("rb"))
+            .await
+            .expect("the recorded spec resumes");
+    }
+
+    /// PATCH refuses a recorded change and a source id change before
+    /// anything is stopped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn patch_refuses_recorded_changes_before_stopping() {
+        let mgr = PipelineManager::for_testing();
+        mgr.start_pipeline(spec_dead("pb")).await.expect("starts");
+        let err = mgr
+            .patch(
+                "pb",
+                serde_json::json!({"spec": {"sinks": [{"config": {"stream": "other"}}]}}),
+            )
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            matches!(&err, PipelineAPIError::RetainedState { code, .. }
+                if *code == "RETAINED_STATE_INCOMPATIBLE"),
+            "{err:?}"
+        );
+        let err = mgr
+            .patch(
+                "pb",
+                serde_json::json!({"spec": {"source": {"config": {"id": "other"}}}}),
+            )
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            matches!(&err, PipelineAPIError::BadRequest(m) if m.contains("source.id")),
+            "{err:?}"
+        );
+        let info = mgr.get_pipeline("pb").expect("still registered");
+        assert_ne!(info.status, "stopped", "never stopped");
     }
 
     /// A source that exits on its own fails the pipeline with its blocking

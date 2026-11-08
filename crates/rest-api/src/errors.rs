@@ -19,6 +19,15 @@ pub enum PipelineAPIError {
     /// schema registry scope does not exist yet (maps to 503, retryable). The
     /// message names the pipeline and the action to take.
     SchemaLineageNotEstablished(String),
+    /// Retained state refuses the start or change (maps to 409): `code` is
+    /// `RETAINED_STATE_INCOMPATIBLE` or `RETAINED_STATE_UNBOUND`.
+    RetainedState {
+        code: &'static str,
+        message: String,
+    },
+    /// Whether retained state exists cannot be determined (maps to 503,
+    /// retryable).
+    RetainedStateUndetermined(String),
     Failed(anyhow::Error),
 }
 
@@ -50,6 +59,12 @@ impl std::fmt::Display for PipelineAPIError {
             PipelineAPIError::BadRequest(msg) => write!(f, "{msg}"),
             PipelineAPIError::Conflict(msg) => write!(f, "{msg}"),
             PipelineAPIError::SchemaLineageNotEstablished(msg) => {
+                write!(f, "{msg}")
+            }
+            PipelineAPIError::RetainedState { message, .. } => {
+                write!(f, "{message}")
+            }
+            PipelineAPIError::RetainedStateUndetermined(msg) => {
                 write!(f, "{msg}")
             }
             PipelineAPIError::Failed(e) => std::fmt::Display::fmt(e, f),
@@ -91,6 +106,13 @@ pub fn pipeline_error(err: PipelineAPIError) -> (StatusCode, Json<ApiError>) {
         PipelineAPIError::SchemaLineageNotEstablished(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "SCHEMA_LINEAGE_NOT_ESTABLISHED",
+        ),
+        PipelineAPIError::RetainedState { code, .. } => {
+            (StatusCode::CONFLICT, *code)
+        }
+        PipelineAPIError::RetainedStateUndetermined(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "RETAINED_STATE_UNDETERMINED",
         ),
         PipelineAPIError::Failed(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR")

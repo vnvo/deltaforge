@@ -244,6 +244,13 @@ pub enum SlotPreflight {
 /// ownership rules as startup: an existing slot is OK only when this pipeline's
 /// durable ownership record proves it owns that slot on this exact server/db, and
 /// it is not already in active use.
+/// Whether the replication slot `slot` exists on the server `dsn` reaches.
+/// A connection or query failure is an error, never "absent".
+pub async fn slot_exists(dsn: &str, slot: &str) -> Result<bool> {
+    let client = connect(dsn).await?;
+    Ok(slot_status(&client, slot).await?.is_some())
+}
+
 pub async fn preflight_classify_slot(
     chkpt: &Arc<dyn CheckpointStore>,
     dsn: &str,

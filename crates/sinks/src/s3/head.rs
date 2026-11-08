@@ -312,6 +312,22 @@ fn head_key(prefix: &str, pipeline: &str) -> object_store::path::Path {
     )
 }
 
+/// Whether durable_v2 state (a HEAD) exists for `pipeline` under `prefix`:
+/// a read only. Any error other than "not found" is returned, so a caller
+/// that cannot tell fails closed.
+pub(crate) async fn head_exists(
+    store: &dyn object_store::ObjectStore,
+    prefix: &str,
+    pipeline: &str,
+) -> Result<bool, object_store::Error> {
+    use object_store::ObjectStoreExt;
+    match store.head(&head_key(prefix, pipeline)).await {
+        Ok(_) => Ok(true),
+        Err(object_store::Error::NotFound { .. }) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Test-only accessor for the HEAD key, so crash-boundary tests can read the
 /// authoritative HEAD directly from the store (with no live writer).
 #[cfg(test)]
