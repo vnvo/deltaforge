@@ -54,6 +54,7 @@ The exploratory tier T1a of the [MySQL fleet qualification design](../design/mys
 | C7 | MySQL rows are emitted only when decoded with the schema version proven for their binlog position and consistent with the layout the binlog recorded; otherwise never emitted | **PASS** | `mysql_proof_matrix_e2e`, `mysql_ddl_replay_failclosed`, and the `mysql_selection`, `mysql_signature` and `mysql_activation` unit tests |
 | C8 | MySQL replay of binlog rows across a DDL | **ACCEPTED LIMITATION** | Supported when the version in effect is provable (C7); otherwise the source stops fail-closed. **Operator control:** set `binlog_row_metadata=FULL`, keep the pipeline caught up before applying DDL, and re-snapshot on this failure. See [Guarantees](../src/guarantees.md#mysql-replay-across-a-schema-change) |
 | C9 | A MySQL activation window never admits a table its capture does not contain: a capture that started before a table's rows defers the table and recaptures after a bounded readiness wait; anything not provably ordered, or still behind after the wait, fails closed with nothing dispatched and the checkpoint unchanged | **PASS** | PR #198: `a_capture_behind_a_tables_rows_defers_that_table` (red before the fix), `a_wait_that_times_out_or_is_cancelled_dispatches_nothing`, `a_capture_still_before_the_rows_after_a_covered_wait_fails_closed`, `an_unordered_capture_start_still_fails_closed` and the `mysql_behind_wait` tests |
+| C10 | Recreating a pipeline (same name and source id) adopts retained state only when the new spec is compatible with the one that wrote it: tenant, source selection and sink identities are checked before adoption, and a mismatch refuses | **BLOCKED** | Today the state is adopted without that check; checkpoint keys and the source-id claim are not tenant-scoped. Restart contract and operator control documented in [Restarts and recreating a pipeline](../src/apireference.md#restarts-and-recreating-a-pipeline) and the [envelope](../src/deployment-support.md#release-blocker-retained-state-adopted-without-a-compatibility-check). Design of a durable compatibility check authorized 2026-11-08; no implementation yet |
 
 ## Delivery semantics
 
@@ -136,8 +137,8 @@ Evidence: `crates/rest-api/src/health.rs`, `crates/o11y/src/df_metrics.rs`, `cra
 A release is accepted when:
 
 1. G1 to G5 are **PASS** on the release commit.
-2. C1 to C7, C9, O1, O3, O5 and R1 to R2 are **PASS**.
+2. C1 to C7, C9, C10, O1, O3, O5 and R1 to R2 are **PASS**.
 3. Every ACCEPTED LIMITATION (C8, D1, D2, O2, O4, O6, S1, S2) is in the Supported Deployment Envelope with its operator control.
 4. No criterion is **BLOCKED**, and open incident I1 has not recurred.
 
-Status at `80d6cb84`: **BLOCKED** on G1 to G4.
+Status at `80d6cb84`: **BLOCKED** on G1 to G4 and C10.

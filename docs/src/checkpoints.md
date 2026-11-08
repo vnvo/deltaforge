@@ -75,7 +75,7 @@ sqlite3 ./data/deltaforge.db \
 
 ### Resetting a Pipeline
 
-Checkpoints are never edited or deleted by hand: a deleted or rewritten checkpoint can skip or lose changes, and the snapshot and continuity state that refers to it would no longer match. To copy a source's data again, use the reviewed, audited [`resnapshot` recovery operation](recovery.md#resnapshot) (it keeps every checkpoint and moves each sink into the new snapshot through its start barrier). To start a source from scratch, configure a new source id (it starts with a snapshot).
+Checkpoints are never edited or deleted by hand: a deleted or rewritten checkpoint can skip or lose changes, and the snapshot and continuity state that refers to it would no longer match. To copy a source's data again, use the reviewed, audited [`resnapshot` recovery operation](recovery.md#resnapshot) (it keeps every checkpoint and moves each sink into the new snapshot through its start barrier). To start a source from scratch, configure a new source id (it starts with a snapshot). Recreating a pipeline with the same name and source id resumes from its retained checkpoints, also after a server restart; it does not start fresh or backfill newly selected tables. See [Restarts and recreating a pipeline](apireference.md#restarts-and-recreating-a-pipeline).
 
 ### MySQL GTID state from earlier versions
 

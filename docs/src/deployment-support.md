@@ -29,6 +29,27 @@ Known boundaries with an operator control, detailed below and in [Known limitati
 - SQLite backup needs the WAL-safe procedure.
 - Capacity guidance is a starting point, not a tested ceiling ([Capacity & Resource Envelope](capacity-envelope.md)).
 
+### Release blocker: retained state adopted without a compatibility check
+
+Recreating a pipeline with the same name and source id resumes from the state
+retained in the store (checkpoints, source-id claim, destination ownership
+records), also after a server restart. That state is adopted **without
+comparing the new spec with the one that wrote it**: tenant, table selection
+and sinks are not checked.
+
+- **Isolation and correctness:** checkpoint keys and the source-id claim are
+  not tenant-scoped, so a spec of another tenant with the same name and source
+  id inherits the earlier pipeline's position and ownership. Newly selected
+  tables are not snapshotted or backfilled; new sinks start at the old resume
+  position.
+- **Operator control until it is resolved:** recreate only with the same
+  tenant, table selection, sinks and source; for anything else, use a new
+  source id. Delete a pipeline before abandoning it, so no state is left for a
+  later create to adopt.
+- **Status:** blocks release until the compatibility-check decision (Release
+  Checklist C10). See
+  [Restarts and recreating a pipeline](apireference.md#restarts-and-recreating-a-pipeline).
+
 ### Unqualified deployments
 
 **Not suitable** for this release: any deployment that requires transport encryption between DeltaForge and its source databases, its state store, Kafka or Redis.
@@ -234,6 +255,7 @@ These are documented in full on [Guarantees & Correctness](guarantees.md); the s
 - **DLQ must be enabled** (`journal.enabled: true`) to isolate poison events; without it a single unprocessable event blocks the pipeline.
 - **PostgreSQL `start_position` is not implemented** - a newly created slot always starts at its consistent point (the current WAL position when it is created).
 - **Changing a pipeline's sink set via `PATCH` is disabled.** Adding or removing a sink changes the per-sink checkpoint keys, which is not crash-safe; a `PATCH` that alters the sink set is rejected. Patches that leave the sink set unchanged are allowed. To change sinks, delete and recreate the pipeline.
+- **API-created pipelines are not restored on restart; recreating resumes retained state without a compatibility check.** Recreating the same name and source id resumes from the retained checkpoints (no fresh start, no snapshot, no backfill of newly selected tables), and tenant, table selection and sinks are not compared with the spec that wrote that state. This blocks release (see [Release blocker](#release-blocker-retained-state-adopted-without-a-compatibility-check)). To start fresh, use a new source id. See [Restarts and recreating a pipeline](apireference.md#restarts-and-recreating-a-pipeline).
 - **Deleting a pipeline is fail-closed.** Delete stops the source, cleans up its checkpoints, and only then releases the source-id claim; if checkpoint cleanup fails, the delete fails and the source id stays locked (safe: it blocks reuse rather than exposing stale checkpoints). Retry the delete once the store is reachable.
 - Cross-primary position safety at failover depends on GTID (MySQL) and slot-aware HA (PostgreSQL); see [Failover Handling](failover.md).
 - **MySQL replays binlog rows across a DDL only when the schema in effect can be proven.** Rows are decoded with the version proven for their position. When none can be proven (retained rows older than a DDL the source never observed, a statement that cannot be attributed to tables such as a versioned-comment DDL, or two DDLs of one table before the source reads the first), the source stops fail-closed (no event, no checkpoint advance). The immediate remediation is a **re-snapshot** (restart once with snapshot mode `always`); after an unattributable statement, the table's next rows (once its definition is captured and proven unchanged since them) or a later proven DDL of the table also restore proof. Moving the source position past the DDL intentionally abandons all retained changes in between, for every captured table, and requires an operator assessment of that loss. Set `binlog_row_metadata=FULL` to remove most of these stops. See [Guarantees](guarantees.md#mysql-replay-across-a-schema-change).
