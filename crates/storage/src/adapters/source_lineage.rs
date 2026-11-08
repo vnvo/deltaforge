@@ -250,6 +250,30 @@ pub async fn establish(
 /// Read the lineage record for `(tenant, source_id)`. `Ok(None)` means no
 /// lineage has been established; an error is a storage failure and must be
 /// treated as fail-closed by callers (never as "no lineage").
+/// Whether `(tenant, source_id)` has a recorded lineage, and whether any
+/// other tenant has one for `source_id` (the keys are compared encoded, so
+/// a `/` in either segment cannot forge a match).
+pub async fn recorded_for(
+    backend: &ArcStorageBackend,
+    tenant: &str,
+    source_id: &str,
+) -> Result<(bool, bool)> {
+    let own = record_key(tenant, source_id);
+    let suffix = format!("/{}", encode_segment(source_id));
+    let mut mine = false;
+    let mut other = false;
+    for key in backend.kv_list(NS, None).await? {
+        if key == own {
+            mine = true;
+        } else if key.ends_with(&suffix)
+            && !key[..key.len() - suffix.len()].contains('/')
+        {
+            other = true;
+        }
+    }
+    Ok((mine, other))
+}
+
 pub async fn load(
     backend: &ArcStorageBackend,
     tenant: &str,

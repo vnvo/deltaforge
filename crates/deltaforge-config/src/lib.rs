@@ -9,6 +9,10 @@ mod storage;
 pub use storage::*;
 
 mod sanitize;
+
+/// The retained-state binding: the canonical spec fields retained state
+/// depends on (`docs/design/retained-state-compatibility.md`).
+pub mod state_binding;
 pub use sanitize::serialize_sanitized_spec;
 
 mod snapshot_cfg;

@@ -20,6 +20,8 @@ common = { path = "../common" }
 # SecretReference is the only serializable secret type; the config schema carries
 # references (never resolved values). No provider runtime is pulled in here.
 secrets = { path = "../secrets" }
+sha2.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 deltaforge-core = { path = "../deltaforge-core", features = ["test-fixtures"] }

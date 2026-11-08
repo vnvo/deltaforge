@@ -17,7 +17,7 @@ use storage::ArcStorageBackend;
 use tracing::{debug, error, warn};
 
 /// Namespace used for all journal queue entries in the StorageBackend.
-const JOURNAL_NS: &str = "journal";
+pub(crate) const JOURNAL_NS: &str = "journal";
 
 /// Maximum time the `Block` overflow policy waits for space before failing
 /// closed (returning [`DlqWrite::Dropped`]) so a full DLQ can never hang the

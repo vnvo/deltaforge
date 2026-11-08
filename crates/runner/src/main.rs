@@ -129,6 +129,12 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Administer the retained-state bindings
+    /// (`docs/design/retained-state-compatibility.md`).
+    StateBinding {
+        #[command(subcommand)]
+        action: BindingAction,
+    },
     /// Inspect or break the store gate that keeps the server and the schema
     /// migration from using the state store at the same time.
     StoreGate {
@@ -229,6 +235,34 @@ enum PgPublicationAction {
     },
     /// Remove enforcement; refused while any publication is registered.
     Uninstall,
+}
+
+#[derive(Subcommand, Debug)]
+enum BindingAction {
+    /// Bind the retained state of one source written before bindings
+    /// existed, to the spec that wrote it. Dry run by default: lists the
+    /// state found, what was verified against the spec and what is adopted
+    /// on the operator's statement, and prints the proof digest.
+    /// `--apply --expect-proof <digest>` writes the binding only if the
+    /// store still produces that proof, holding the store gate (stop the
+    /// server first).
+    Adopt {
+        /// The pipeline spec file (one pipeline).
+        #[arg(long)]
+        spec: String,
+        /// Write the binding (requires --expect-proof).
+        #[arg(long, requires = "expect_proof")]
+        apply: bool,
+        /// Proof digest printed by the dry run being applied.
+        #[arg(long)]
+        expect_proof: Option<String>,
+        /// Who applies it (recorded in the audit, not verified).
+        #[arg(long, default_value = "operator")]
+        actor: String,
+        /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -382,6 +416,69 @@ async fn main() -> Result<()> {
             },
         )
         .await;
+    }
+    if let Some(Command::StateBinding {
+        action:
+            BindingAction::Adopt {
+                spec,
+                apply,
+                expect_proof,
+                actor,
+                json,
+            },
+    }) = &args.command
+    {
+        let backend = build_storage_backend(&storage_config_from(&args))
+            .await
+            .context("initialise storage backend for state-binding")?;
+        let spec = deltaforge_config::load_from_path(spec)
+            .with_context(|| format!("load the pipeline spec {spec}"))?;
+        let external = runner::state_binding::LiveExternalState;
+        let plan = if *apply {
+            let expected = expect_proof
+                .as_deref()
+                .context("--apply requires --expect-proof <digest>")?;
+            runner::state_binding::adopt_apply(
+                &backend, &external, &spec, expected, actor,
+            )
+            .await?
+        } else {
+            runner::state_binding::adopt_plan(&backend, &external, &spec)
+                .await?
+        };
+        if *json {
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        } else {
+            println!("Source id: {}", plan.source_id);
+            println!("Retained state found:");
+            for (kind, key) in &plan.found {
+                println!("  {kind}: {key}");
+            }
+            println!("Verified against the spec:");
+            for v in &plan.verified {
+                println!("  {v}");
+            }
+            println!("Adopted on the operator's statement:");
+            for u in &plan.unverified {
+                println!("  {u}");
+            }
+            println!(
+                "Binding:\n{}",
+                serde_json::to_string_pretty(&plan.binding)?
+            );
+            println!("Proof: {}", plan.proof);
+            if *apply {
+                println!("Applied: the binding was written and audited.");
+            } else {
+                println!(
+                    "\nDry run: nothing was written. To apply exactly this \
+                     (stop the DeltaForge server first):\n  deltaforge \
+                     state-binding adopt --spec <file> --apply --expect-proof {}",
+                    plan.proof
+                );
+            }
+        }
+        return Ok(());
     }
     if let Some(Command::StoreGate { action }) = &args.command {
         let backend = build_storage_backend(&storage_config_from(&args))

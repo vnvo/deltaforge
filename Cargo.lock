@@ -1622,10 +1622,12 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "serial_test",
+ "sha2 0.10.9",
  "shellexpand",
  "tempfile",
  "thiserror 1.0.69",
  "tracing",
+ "url",
  "walkdir",
 ]
 

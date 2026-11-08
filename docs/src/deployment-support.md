@@ -29,26 +29,25 @@ Known boundaries with an operator control, detailed below and in [Known limitati
 - SQLite backup needs the WAL-safe procedure.
 - Capacity guidance is a starting point, not a tested ceiling ([Capacity & Resource Envelope](capacity-envelope.md)).
 
-### Release blocker: retained state adopted without a compatibility check
+### Retained-state compatibility
 
 Recreating a pipeline with the same name and source id resumes from the state
-retained in the store (checkpoints, source-id claim, destination ownership
-records), also after a server restart. That state is adopted **without
-comparing the new spec with the one that wrote it**: tenant, table selection
-and sinks are not checked.
+retained for that source. Since this release that state is adopted only by a
+spec compatible with the one that wrote it (Release Checklist C10): the first
+start records a binding, and a later create or PATCH that differs in a
+recorded field is refused before anything is claimed or written. See
+[Restarts and recreating a pipeline](apireference.md#restarts-and-recreating-a-pipeline).
 
-- **Isolation and correctness:** checkpoint keys and the source-id claim are
-  not tenant-scoped, so a spec of another tenant with the same name and source
-  id inherits the earlier pipeline's position and ownership. Newly selected
-  tables are not snapshotted or backfilled; new sinks start at the old resume
-  position.
-- **Operator control until it is resolved:** recreate only with the same
-  tenant, table selection, sinks and source; for anything else, use a new
-  source id. Delete a pipeline before abandoning it, so no state is left for a
-  later create to adopt.
-- **Status:** blocks release until the compatibility-check decision (Release
-  Checklist C10). See
-  [Restarts and recreating a pipeline](apireference.md#restarts-and-recreating-a-pipeline).
+- **Upgrade step:** a source id with retained state from an earlier release
+  is refused (`RETAINED_STATE_UNBOUND`) until it is adopted once with
+  `deltaforge state-binding adopt`.
+- **A pre-created PostgreSQL slot** (made by an operator before the first
+  start) is retained state: that first start is refused until the slot is
+  adopted or removed.
+- **Selection changes refuse in both directions:** adding or removing a table
+  pattern, sink or processor needs a new source id.
+- **A refused `--config` pipeline stops server startup** with the refusal, as
+  any start error of a configured pipeline does.
 
 ### Unqualified deployments
 
@@ -255,7 +254,8 @@ These are documented in full on [Guarantees & Correctness](guarantees.md); the s
 - **DLQ must be enabled** (`journal.enabled: true`) to isolate poison events; without it a single unprocessable event blocks the pipeline.
 - **PostgreSQL `start_position` is not implemented** - a newly created slot always starts at its consistent point (the current WAL position when it is created).
 - **Changing a pipeline's sink set via `PATCH` is disabled.** Adding or removing a sink changes the per-sink checkpoint keys, which is not crash-safe; a `PATCH` that alters the sink set is rejected. Patches that leave the sink set unchanged are allowed. To change sinks, delete and recreate the pipeline.
-- **API-created pipelines are not restored on restart; recreating resumes retained state without a compatibility check.** Recreating the same name and source id resumes from the retained checkpoints (no fresh start, no snapshot, no backfill of newly selected tables), and tenant, table selection and sinks are not compared with the spec that wrote that state. This blocks release (see [Release blocker](#release-blocker-retained-state-adopted-without-a-compatibility-check)). To start fresh, use a new source id. See [Restarts and recreating a pipeline](apireference.md#restarts-and-recreating-a-pipeline).
+- **API-created pipelines are not restored on restart.** Recreating the same name and source id resumes from the retained checkpoints (no fresh start, no snapshot, no backfill of newly selected tables), and only a spec compatible with the recorded binding may do so (see [Retained-state compatibility](#retained-state-compatibility)). To start fresh, use a new source id. See [Restarts and recreating a pipeline](apireference.md#restarts-and-recreating-a-pipeline).
+- **Endpoint parameters must be classified.** HTTP, Elasticsearch, NATS and S3 endpoint query parameters, HTTP headers other than the built-in ones, and Kafka `client_conf` keys outside the built-in lists are rejected; so is a non-credential header or key supplied through `secret_refs`.
 - **Deleting a pipeline is fail-closed.** Delete stops the source, cleans up its checkpoints, and only then releases the source-id claim; if checkpoint cleanup fails, the delete fails and the source id stays locked (safe: it blocks reuse rather than exposing stale checkpoints). Retry the delete once the store is reachable. Delete removes only the replay incarnation, the per-sink checkpoints, the destination ownership records and the claim; retained identity, lineage, continuity and snapshot records may remain, so Delete is not a fresh start. To start fresh, use a new source id (see [Delete Pipeline](apireference.md#delete-pipeline)).
 - Cross-primary position safety at failover depends on GTID (MySQL) and slot-aware HA (PostgreSQL); see [Failover Handling](failover.md).
 - **MySQL replays binlog rows across a DDL only when the schema in effect can be proven.** Rows are decoded with the version proven for their position. When none can be proven (retained rows older than a DDL the source never observed, a statement that cannot be attributed to tables such as a versioned-comment DDL, or two DDLs of one table before the source reads the first), the source stops fail-closed (no event, no checkpoint advance). The immediate remediation is a **re-snapshot** (restart once with snapshot mode `always`); after an unattributable statement, the table's next rows (once its definition is captured and proven unchanged since them) or a later proven DDL of the table also restore proof. Moving the source position past the DDL intentionally abandons all retained changes in between, for every captured table, and requires an operator assessment of that loss. Set `binlog_row_metadata=FULL` to remove most of these stops. See [Guarantees](guarantees.md#mysql-replay-across-a-schema-change).

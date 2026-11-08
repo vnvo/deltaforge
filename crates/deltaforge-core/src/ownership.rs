@@ -293,6 +293,12 @@ pub trait OwnershipStore: Send + Sync {
 
     /// Remove the record (only with the reset of the sink's checkpoint).
     async fn remove(&self, key: &str) -> anyhow::Result<bool>;
+
+    /// Every record whose key starts with `prefix` (one sink's records).
+    async fn list(
+        &self,
+        prefix: &str,
+    ) -> anyhow::Result<Vec<(String, OwnershipRecord)>>;
 }
 
 /// An in-memory store (tests).
@@ -356,6 +362,20 @@ impl OwnershipStore for MemoryOwnershipStore {
     async fn remove(&self, key: &str) -> anyhow::Result<bool> {
         Ok(self.records.lock().expect("records").remove(key).is_some())
     }
+
+    async fn list(
+        &self,
+        prefix: &str,
+    ) -> anyhow::Result<Vec<(String, OwnershipRecord)>> {
+        let m = self.records.lock().expect("records");
+        let mut out: Vec<_> = m
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, (_, r))| (k.clone(), r.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
 }
 
 /// Why a destination was refused (`sink_destination_conflict` classes).
@@ -376,6 +396,7 @@ pub enum OwnershipClass {
     ServerChanged,
     FencingUnenforced,
     UnsupportedTopology,
+    DestinationChanged,
 }
 
 impl OwnershipClass {
@@ -398,14 +419,15 @@ impl OwnershipClass {
             Self::ServerChanged => "server_changed",
             Self::FencingUnenforced => "fencing_unenforced",
             Self::UnsupportedTopology => "unsupported_topology",
+            Self::DestinationChanged => "destination_changed",
         }
     }
 
     fn action(self) -> ActionCode {
         match self {
-            Self::FencingUnenforced | Self::UnsupportedTopology => {
-                ActionCode::VerifyEndpoint
-            }
+            Self::FencingUnenforced
+            | Self::UnsupportedTopology
+            | Self::DestinationChanged => ActionCode::VerifyEndpoint,
             Self::DestinationMissing => ActionCode::RebootstrapSink,
             _ => ActionCode::VerifySinkState,
         }
@@ -614,6 +636,44 @@ fn store_err(e: anyhow::Error) -> ClaimFailure {
 /// state-store record agree and rotate its fence. Returns the fence writes
 /// must carry. Only a committed rotation (or creation) returns `Ok`; every
 /// other path leaves the destination unverified.
+/// Whether the sink owning `key` holds a record for a destination on
+/// another server (ClickHouse: another server identity) or cluster
+/// (Elasticsearch: another cluster in the key), so a destination absent
+/// here is not new but moved: the endpoint now reaches somewhere else.
+async fn moved_away(
+    store: &dyn OwnershipStore,
+    key: &str,
+    expected: &Expected,
+    server: &Option<String>,
+) -> anyhow::Result<bool> {
+    let Some(prefix) = key.strip_suffix(&expected.destination.name()) else {
+        return Ok(false);
+    };
+    let here = &expected.destination;
+    for (other, rec) in store.list(prefix).await? {
+        if other == key {
+            continue;
+        }
+        let name = &other[prefix.len()..];
+        let moved = match here.kind.as_str() {
+            "elasticsearch" => name
+                .strip_prefix("elasticsearch/")
+                .and_then(|rest| rest.split('/').next())
+                .is_some_and(|cluster| {
+                    Some(cluster) != here.cluster.as_deref()
+                }),
+            _ => matches!(
+                (&rec.server_identity, server),
+                (Some(a), Some(b)) if a != b
+            ),
+        };
+        if moved {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub async fn claim(
     dest: &dyn FencedDestination,
     store: &dyn OwnershipStore,
@@ -640,6 +700,17 @@ pub async fn claim(
                         ));
                     }
                     None => {
+                        // Never a fresh destination for a sink whose
+                        // retained records name another server or cluster:
+                        // its endpoint changed under it.
+                        if moved_away(store, key, expected, &server)
+                            .await
+                            .map_err(store_err)?
+                        {
+                            return Err(ClaimFailure::refused(
+                                OwnershipClass::DestinationChanged,
+                            ));
+                        }
                         // Intent first: a crash after the remote create
                         // leaves the fence pending, which the next claim
                         // commits.
@@ -987,6 +1058,12 @@ mod tests {
         async fn remove(&self, key: &str) -> anyhow::Result<bool> {
             self.inner.remove(key).await
         }
+        async fn list(
+            &self,
+            prefix: &str,
+        ) -> anyhow::Result<Vec<(String, OwnershipRecord)>> {
+            self.inner.list(prefix).await
+        }
     }
 
     impl FlakyStore {
@@ -1037,6 +1114,68 @@ mod tests {
 
     fn unavailable(r: &Result<Claimed, ClaimFailure>) -> bool {
         matches!(r, Err(ClaimFailure::Unavailable(_)))
+    }
+
+    /// A sink whose endpoint now reaches another cluster or server never
+    /// gets a fresh destination there (`destination_changed`); a new
+    /// destination on the same cluster or server is created as before.
+    #[tokio::test]
+    async fn a_moved_endpoint_never_creates_a_fresh_destination() {
+        let key = |e: &Expected| {
+            format!("p/{}/{}", e.owner.sink, e.destination.name())
+        };
+        // Elasticsearch: the cluster is part of the key.
+        let store = MemoryOwnershipStore::default();
+        let first = expected(D1);
+        claim(&Fake::default(), &store, &key(&first), &first)
+            .await
+            .unwrap();
+        let mut moved = expected(D1);
+        moved.destination = DestinationMarker::elasticsearch("c2", "orders");
+        let elsewhere = Fake::default();
+        assert_eq!(
+            class(claim(&elsewhere, &store, &key(&moved), &moved).await),
+            OwnershipClass::DestinationChanged
+        );
+        assert!(
+            elsewhere.0.lock().unwrap().dest.is_none(),
+            "nothing created"
+        );
+        assert!(store.get(&key(&moved)).await.unwrap().is_none());
+        let mut same_cluster = expected(D1);
+        same_cluster.destination =
+            DestinationMarker::elasticsearch("c1", "items");
+        claim(&Fake::default(), &store, &key(&same_cluster), &same_cluster)
+            .await
+            .unwrap();
+
+        // ClickHouse: the recorded server identity.
+        let store = MemoryOwnershipStore::default();
+        let ch = |table: &str| {
+            let mut e = expected(D1);
+            e.owner.sink = "ch".into();
+            e.destination = DestinationMarker::clickhouse("db", table);
+            e
+        };
+        let on = |server: &str| {
+            let f = Fake::default();
+            f.0.lock().unwrap().server = Some(server.into());
+            f
+        };
+        claim(&on("s1"), &store, &key(&ch("t1")), &ch("t1"))
+            .await
+            .unwrap();
+        let other_server = on("s2");
+        assert_eq!(
+            class(
+                claim(&other_server, &store, &key(&ch("t2")), &ch("t2")).await
+            ),
+            OwnershipClass::DestinationChanged
+        );
+        assert!(other_server.0.lock().unwrap().dest.is_none());
+        claim(&on("s1"), &store, &key(&ch("t2")), &ch("t2"))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1337,6 +1476,13 @@ mod tests {
                 }
                 async fn remove(&self, k: &str) -> anyhow::Result<bool> {
                     self.0.remove(k).await
+                }
+                async fn list(
+                    &self,
+                    p: &str,
+                ) -> anyhow::Result<Vec<(String, OwnershipRecord)>>
+                {
+                    self.0.list(p).await
                 }
             }
             claim(&dest, &OnceAfter(&store, Mutex::new(0)), KEY, &expected(D1))

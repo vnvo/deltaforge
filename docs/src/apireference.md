@@ -357,19 +357,58 @@ ordinary restart would. It does **not** start fresh, does **not** snapshot, and
 does **not** backfill tables newly selected by the spec: they are captured only
 from the resume position on.
 
-- **The retained state is adopted without checking the new spec.** Tenant,
-  table selection and sinks are not compared with the spec that wrote the
-  state; only the source server's identity and lineage are checked (see
-  [Failover Handling](failover.md)). Recreate only with the same tenant, table
-  selection, sinks and source. This is a known limitation of this beta, and a
-  release blocker until a compatibility check is decided (see
-  [Known limitations](deployment-support.md#known-limitations)).
+- **The retained state is adopted only by a compatible spec.** The first start
+  of a source id records a binding: the spec fields its retained state depends
+  on (tenant, name, source selection and contract, processing, delivery policy,
+  sink ids, destinations and contracts), without credentials. Every later
+  create and PATCH is compared with it before anything is claimed, stopped or
+  written. A difference is refused with `409 RETAINED_STATE_INCOMPATIBLE`,
+  naming each differing field with its recorded and new value. Operational
+  settings (batching, timeouts, journal limits, metrics, snapshot knobs,
+  labels) and credentials may change. A source id that holds retained state
+  but no binding (written before this release, or a PostgreSQL slot or S3
+  durable HEAD left by earlier use) is refused with `409
+  RETAINED_STATE_UNBOUND` until it is adopted (below). When whether retained
+  state exists cannot be determined (the state store, the source server or the
+  bucket cannot be read), the start is refused with `503
+  RETAINED_STATE_UNDETERMINED`.
+- **PATCH cannot change `source.id`** (`400`): a new source id is a new source
+  lifecycle; create a new pipeline.
+- **Unclassified endpoint parameters are rejected** (`400`): query parameters
+  of HTTP, Elasticsearch, NATS and S3 endpoints, HTTP headers other than
+  `Authorization`, `Proxy-Authorization`, `Cookie`, `Content-Type` and
+  `Content-Encoding`, Kafka `client_conf` keys outside the built-in lists,
+  unclassified Redis and ClickHouse URL parameters, and a header or
+  `client_conf` key supplied through `secret_refs` unless it is a credential.
+  Any of these could select a tenant or destination, so none is left out of
+  the comparison.
 - **A different pipeline name with the same source id is refused** (`409
   Conflict`) while the claim is held.
 - **A client that exits without `DELETE`** (crash, `SIGKILL`) leaves the
   claim, the checkpoints and the ownership records in place. They are adopted by
-  the next create with the same name and source id, including after a server
-  restart.
+  the next create with the same name, source id and a compatible spec,
+  including after a server restart.
+- **The binding outlives DELETE while retained state remains.** DELETE removes
+  it only when none of the state listed under
+  [Delete Pipeline](#delete-pipeline) remains (and no PostgreSQL slot or S3
+  durable HEAD is found); otherwise a later create with the same source id must
+  match it, or use a new source id.
+
+**Adopting retained state written before bindings existed** (once per source
+id, with the server stopped):
+
+```bash
+deltaforge state-binding adopt --spec pipeline.yaml            # dry run
+deltaforge state-binding adopt --spec pipeline.yaml --apply --expect-proof <digest>
+```
+
+The dry run lists the retained state found, what it verified against the spec
+(sink ids against checkpoint keys, the pipeline name against the claim, the
+tenant against the lineage record, the snapshot generation against the table
+patterns, the PostgreSQL slot owner against the slot, database and pipeline),
+refuses any mismatch, and prints the binding and a proof digest. The apply
+writes the binding only if the store still produces that proof, and audits
+it.
 
 **To start fresh:**
 
@@ -880,4 +919,7 @@ All error responses return structured JSON:
 | `400 Bad Request` | `PIPELINE_NAME_MISMATCH` | Invalid request body or name mismatch |
 | `404 Not Found` | `PIPELINE_NOT_FOUND` | Resource doesn't exist |
 | `409 Conflict` | `PIPELINE_ALREADY_EXISTS` | Resource already exists |
+| `409 Conflict` | `RETAINED_STATE_INCOMPATIBLE` | The spec differs from the binding of the source's retained state |
+| `409 Conflict` | `RETAINED_STATE_UNBOUND` | The source id holds retained state with no binding; adopt it first |
+| `503 Service Unavailable` | `RETAINED_STATE_UNDETERMINED` | Whether retained state exists cannot be determined; retry once the store, source and sinks are reachable |
 | `500 Internal Server Error` | `INTERNAL_ERROR` | Unexpected server error |

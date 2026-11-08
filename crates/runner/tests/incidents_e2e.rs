@@ -303,6 +303,31 @@ async fn a_failure_keeps_one_incident_until_a_verified_recovery() -> Result<()>
     let (mgr, backend) = manager().await;
     let store = IncidentStore::new(Arc::clone(&backend), "inc");
 
+    // A first start whose source cannot be reached is refused before
+    // anything starts: whether retained state (a slot) exists cannot be
+    // determined.
+    let err = mgr
+        .start_pipeline(spec("inc", proxy.port, &hook.url))
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            rest_api::PipelineAPIError::RetainedStateUndetermined(_)
+        ),
+        "{err:?}"
+    );
+    // Bound once while the endpoint is up (and deleted: the slot it made
+    // keeps the binding), a recreate with the recorded spec starts without
+    // reaching the source first.
+    proxy.switch_to(pg_port);
+    mgr.start_pipeline(spec("inc", proxy.port, &hook.url))
+        .await?;
+    until(&mgr, "inc", "running", |i| i.status == "running").await;
+    mgr.delete("inc").await?;
+    proxy.switch_to(dead);
+
     // The endpoint is down: the pipeline fails with one incident.
     mgr.start_pipeline(spec("inc", proxy.port, &hook.url))
         .await?;
