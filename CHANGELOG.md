@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [v0.1.0-rc.1] - 2026-11-08
 
+This section also includes changes already present in the v0.1.0-beta.10 tag, for which no GitHub Release was published.
+
 ### Performance
 
 - **MySQL schema capture reads tables by name** - the batched capture of newly active tables filtered `INFORMATION_SCHEMA` with `(TABLE_SCHEMA, TABLE_NAME) IN (...)`, which the server applied only after reading every table of the catalog (or of the database), so each of the capture's five reads cost about the same at any batch size: about 30 ms at 40,000 tables, more under write load. The reads now join a derived table of the requested tables (`VALUES ROW`), which the server reads by name; results and result metadata are identical. In an offline probe at 40,000 tables (MySQL 8.4.9, one capture at a time), a 64-table capture's statements took 22 ms instead of 274 ms under write load; locking and window overlap, unchanged, decide how much of that reaches activation latency. Requires MySQL 8.0.19 (see Changed).
