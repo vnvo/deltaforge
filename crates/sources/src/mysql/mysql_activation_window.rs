@@ -948,10 +948,12 @@ pub(crate) struct CaptureScan {
 }
 
 /// A window's capture and every table's scan answer (in the sorted order
-/// of its tables).
+/// of its tables). `None`: the table's rows start beyond the capture's
+/// start ([`beyond_capture_start`]), so it was not scanned and the
+/// decision defers it.
 pub(crate) struct CapturedWindow {
     pub cap: BatchCaptured,
-    pub answers: Vec<ScanReport>,
+    pub answers: Vec<Option<ScanReport>>,
     pub attempts: u32,
     pub captured: Duration,
     pub scanned: Duration,
@@ -959,7 +961,10 @@ pub(crate) struct CapturedWindow {
 
 /// One batched capture of the sorted `tables` (retried in the same order,
 /// at most [`CAPTURE_ATTEMPTS`] in all), then one scanner request answering
-/// every table over its own `(from_i, B]`. Failures keep their class.
+/// every table over its own `(from_i, B]`, except a table whose rows start
+/// beyond the capture's start: the capture does not contain them, so it is
+/// not scanned (its answer is `None`) and the decision defers it. No
+/// request is made when every table is beyond. Failures keep their class.
 pub(crate) async fn capture_and_scan(
     cs: &CaptureScan,
     tables: &[(String, String)],
@@ -1026,20 +1031,29 @@ pub(crate) async fn capture_and_scan(
     };
     let captured = t.elapsed();
     let t = Instant::now();
-    let answers = match super::mysql_proof_scanner::shared_intervals(
-        &cs.scanner,
-        cs.capture.dsn().current().expose(),
-        &cs.source_id,
-        &cs.server_uuid,
-        &cs.lineage,
-        froms,
-        &cap.position,
-        cs.anchor.as_ref(),
-        Some(head),
-        &tag,
-    )
-    .await
-    {
+    let scanned: Vec<usize> = (0..froms.len())
+        .filter(|&i| !beyond_capture_start(&froms[i], &cap.from))
+        .collect();
+    let eligible: Vec<MySqlCheckpoint> =
+        scanned.iter().map(|&i| froms[i].clone()).collect();
+    let reports = if eligible.is_empty() {
+        Ok(Vec::new())
+    } else {
+        super::mysql_proof_scanner::shared_intervals(
+            &cs.scanner,
+            cs.capture.dsn().current().expose(),
+            &cs.source_id,
+            &cs.server_uuid,
+            &cs.lineage,
+            &eligible,
+            &cap.position,
+            cs.anchor.as_ref(),
+            Some(head),
+            &tag,
+        )
+        .await
+    };
+    let reports = match reports {
         Ok(a) => a,
         Err(ProofError::OtherServer(found)) => {
             return Err(SourceError::Lineage {
@@ -1063,6 +1077,17 @@ pub(crate) async fn capture_and_scan(
             });
         }
     };
+    if reports.len() != scanned.len() {
+        return Err(invariant(&format!(
+            "the shared proof scan answered {} of {} table(s)",
+            reports.len(),
+            scanned.len()
+        )));
+    }
+    let mut answers: Vec<Option<ScanReport>> = vec![None; froms.len()];
+    for (i, report) in scanned.into_iter().zip(reports) {
+        answers[i] = Some(report);
+    }
     Ok(CapturedWindow {
         cap,
         answers,
@@ -1070,6 +1095,22 @@ pub(crate) async fn capture_and_scan(
         captured,
         scanned: t.elapsed(),
     })
+}
+
+/// Whether rows starting at `at` start strictly beyond `start`, the
+/// capture's first position read: ordered after it, so the capture does
+/// not contain them and the table is deferred (neither scanned nor
+/// decided). A start that is unordered with it, or unparseable, is not
+/// beyond: it stays in the scan and the decision, which fail it closed.
+fn beyond_capture_start(at: &MySqlCheckpoint, start: &MySqlCheckpoint) -> bool {
+    let pos = |c: &MySqlCheckpoint| {
+        mysql_checkpoint_position(&c.file, c.pos, c.gtid_set.as_deref())
+    };
+    matches!(
+        (pos(at), pos(start)),
+        (Some(r), Some(f))
+            if matches!(order_positions(&r, &f), CheckpointOrder::After)
+    )
 }
 
 fn same_start(a: &MySqlCheckpoint, b: &MySqlCheckpoint) -> bool {
@@ -1324,7 +1365,13 @@ async fn decide_and_commit(
 ) -> Result<Admitted, LoopControl> {
     let index: HashMap<&(String, String), usize> =
         captured.iter().enumerate().map(|(i, k)| (k, i)).collect();
-    let work = done.answers.first().map(|r| r.work).unwrap_or_default();
+    let work = done
+        .answers
+        .iter()
+        .flatten()
+        .next()
+        .map(|r| r.work)
+        .unwrap_or_default();
     let mut tables_in_order = Vec::with_capacity(required.len());
     for k in order {
         let (Some(at), Some(i)) = (required.get(&k), index.get(&k)) else {
@@ -1383,7 +1430,7 @@ async fn admit_batch(
     ctx: &mut RunCtx,
     lineage: &str,
     cap: &BatchCaptured,
-    tables: Vec<((String, String), MySqlCheckpoint, ScanReport)>,
+    tables: Vec<((String, String), MySqlCheckpoint, Option<ScanReport>)>,
 ) -> Result<
     (
         BatchStats,
@@ -1508,38 +1555,35 @@ async fn admit_batch(
         )
         .increment(deferred.len() as u64);
     }
-    // A table gone before the capture has no shape: nothing to decide.
-    let (tables, gone): (Vec<_>, Vec<_>) = tables
-        .into_iter()
-        .partition(|((db, table), _, _)| cap.table(db, table).is_some());
     // A table whose rows start after the capture's start (ordered, so the
     // stream had a transaction that the capture's first position read did
     // not yet show as executed) is not contained by the capture, but its
     // outcome is not uncertain: it stays undecided, deferred like a cut
     // table, nothing of it decided or written, its rows back to the stream
-    // for a later window. That window first waits, bounded, for the
-    // server's position to cover the rows (`mysql_behind_wait`); a capture
-    // still before them after such a wait fails the window closed, as does
-    // a wait that ends otherwise. An unordered start stays uncertain
-    // (below).
-    let from = mysql_checkpoint_position(
-        &cap.from.file,
-        cap.from.pos,
-        cap.from.gtid_set.as_deref(),
-    );
-    let (tables, behind): (Vec<_>, Vec<_>) =
-        tables.into_iter().partition(|(_, at, _)| {
-            let row = mysql_checkpoint_position(
-                &at.file,
-                at.pos,
-                at.gtid_set.as_deref(),
-            );
-            !matches!(
-                (&row, &from),
-                (Some(r), Some(f))
-                    if matches!(order_positions(r, f), CheckpointOrder::After)
-            )
-        });
+    // for a later window. It was not scanned (`capture_and_scan` applies the
+    // same rule). That window first waits, bounded, for the server's
+    // position to cover the rows (`mysql_behind_wait`); a capture still
+    // before them after such a wait fails the window closed, as does a wait
+    // that ends otherwise. An unordered start stays uncertain (below).
+    let (tables, behind): (Vec<_>, Vec<_>) = tables
+        .into_iter()
+        .partition(|(_, at, _)| !beyond_capture_start(at, &cap.from));
+    // Every other table was scanned: its answer is present, or the window
+    // fails closed.
+    let tables = tables
+        .into_iter()
+        .map(|((db, table), at, report)| match report {
+            Some(r) => Ok(((db, table), at, r)),
+            None => Err(invariant(&format!(
+                "table {db}.{table} has no scan answer though its rows start \
+                 within the capture"
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // A table gone before the capture has no shape: nothing to decide.
+    let (tables, gone): (Vec<_>, Vec<_>) = tables
+        .into_iter()
+        .partition(|((db, table), _, _)| cap.table(db, table).is_some());
     for ((db, table), at, _) in &behind {
         let k = (db.clone(), table.clone());
         let waited = matches!(
@@ -2468,7 +2512,18 @@ mod tests {
                 .lineage_hash
                 .clone();
             let cap = capture(ctx, tables);
-            admit_batch(ctx, &lineage, &cap, entries).await
+            admit_batch(ctx, &lineage, &cap, scanned(entries)).await
+        }
+
+        /// Entries as scanned answers.
+        fn scanned(
+            entries: Vec<((String, String), MySqlCheckpoint, ScanReport)>,
+        ) -> Vec<((String, String), MySqlCheckpoint, Option<ScanReport>)>
+        {
+            entries
+                .into_iter()
+                .map(|(k, a, r)| (k, a, Some(r)))
+                .collect()
         }
 
         mod timelines {
@@ -3232,10 +3287,14 @@ mod tests {
                 lineage: later.from.lineage.clone(),
                 ..at(55)
             };
-            let (_, governs) =
-                admit_batch(&mut ctx, &lineage, &later, vec![entry("t1", 51)])
-                    .await
-                    .unwrap();
+            let (_, governs) = admit_batch(
+                &mut ctx,
+                &lineage,
+                &later,
+                scanned(vec![entry("t1", 51)]),
+            )
+            .await
+            .unwrap();
             assert_eq!(governs[0].2, Governs::Admitted);
             assert!(ctx.behind_capture.is_empty(), "decided: record forgotten");
         }
@@ -3320,6 +3379,148 @@ mod tests {
             );
             assert_eq!(seqs(&ctx, "t2").await, (None, None), "nothing written");
             assert!(ctx.behind_capture.is_empty());
+        }
+
+        /// A table beyond the capture's start, with no scan answer
+        /// (`capture_and_scan` did not scan it), beside one within it: the
+        /// first is admitted, the second deferred with nothing of it stored
+        /// and its record kept for the next window's wait. Decided tables
+        /// come first, in first-touch order.
+        #[tokio::test]
+        async fn an_unscanned_table_beyond_the_capture_is_deferred_beside_an_admitted_one()
+         {
+            let mut ctx = ctx_on(std::sync::Arc::new(
+                storage::MemoryStorageBackend::new(),
+            ))
+            .await;
+            let lineage = lineage_of(&ctx);
+            let cap = capture(&ctx, &["t1", "t2"]);
+            let (_, governs) = admit_batch(
+                &mut ctx,
+                &lineage,
+                &cap,
+                vec![
+                    (("d".into(), "t1".into()), at(55), None),
+                    (
+                        ("d".into(), "t2".into()),
+                        at(5),
+                        Some(report(Vec::new())),
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+            let got: Vec<_> =
+                governs.iter().map(|(k, _, g)| (k.1.as_str(), g)).collect();
+            assert_eq!(
+                got,
+                vec![("t2", &Governs::Admitted), ("t1", &Governs::Deferred)]
+            );
+            assert_eq!(seqs(&ctx, "t1").await, (None, None), "nothing stored");
+            assert!(!ctx.behind_capture[&("d".into(), "t1".into())].1);
+        }
+
+        /// Every table beyond the capture's start: nothing is decided or
+        /// stored. The next window's wait is bounded: a server still before
+        /// the rows fails it closed at the bound; a server that covers them
+        /// lets a later capture admit every table.
+        #[tokio::test(start_paused = true)]
+        async fn a_window_entirely_beyond_the_capture_defers_every_table_then_recovers()
+         {
+            let mut ctx = ctx_on(std::sync::Arc::new(
+                storage::MemoryStorageBackend::new(),
+            ))
+            .await;
+            let lineage = lineage_of(&ctx);
+            let cap = capture(&ctx, &["t1", "t2"]);
+            let (_, governs) = admit_batch(
+                &mut ctx,
+                &lineage,
+                &cap,
+                vec![
+                    (("d".into(), "t1".into()), at(51), None),
+                    (("d".into(), "t2".into()), at(52), None),
+                ],
+            )
+            .await
+            .unwrap();
+            assert!(governs.iter().all(|(_, _, g)| *g == Governs::Deferred));
+            for t in ["t1", "t2"] {
+                assert_eq!(seqs(&ctx, t).await, (None, None), "{t}: nothing");
+            }
+            let tables = vec![
+                ("d".to_string(), "t1".to_string()),
+                ("d".to_string(), "t2".to_string()),
+            ];
+            let batch = BTreeMap::from([
+                (tables[0].clone(), at(51)),
+                (tables[1].clone(), at(52)),
+            ]);
+
+            let t0 = tokio::time::Instant::now();
+            let err =
+                behind_wait(&mut ctx, &tables, &batch, &at(50), reads(at(50)))
+                    .await
+                    .unwrap_err();
+            assert_eq!(
+                t0.elapsed(),
+                crate::mysql::mysql_behind_wait::BEHIND_WAIT
+            );
+            assert!(matches!(err, SourceError::Schema { .. }), "{err:#}");
+
+            behind_wait(&mut ctx, &tables, &batch, &at(50), reads(at(60)))
+                .await
+                .unwrap();
+            let mut later = capture(&ctx, &["t1", "t2"]);
+            later.from = MySqlCheckpoint {
+                lineage: later.from.lineage.clone(),
+                ..at(55)
+            };
+            let (_, governs) = admit_batch(
+                &mut ctx,
+                &lineage,
+                &later,
+                scanned(vec![entry("t1", 51), entry("t2", 52)]),
+            )
+            .await
+            .unwrap();
+            assert!(governs.iter().all(|(_, _, g)| *g == Governs::Admitted));
+            assert!(ctx.behind_capture.is_empty());
+        }
+
+        /// A table within the capture must have its scan answer: without
+        /// one the window fails closed, nothing written.
+        #[tokio::test]
+        async fn a_table_within_the_capture_without_a_scan_answer_fails_closed()
+        {
+            let mut ctx = ctx_on(std::sync::Arc::new(
+                storage::MemoryStorageBackend::new(),
+            ))
+            .await;
+            let lineage = lineage_of(&ctx);
+            let cap = capture(&ctx, &["t1", "t2"]);
+            let err = admit_batch(
+                &mut ctx,
+                &lineage,
+                &cap,
+                vec![
+                    (("d".into(), "t1".into()), at(5), None),
+                    (
+                        ("d".into(), "t2".into()),
+                        at(6),
+                        Some(report(Vec::new())),
+                    ),
+                ],
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("has no scan answer"),
+                "{err:#}"
+            );
+            for t in ["t1", "t2"] {
+                assert_eq!(seqs(&ctx, t).await, (None, None), "{t}: nothing");
+            }
         }
 
         /// A store that cannot commit: the window fails closed, nothing of it
@@ -3659,7 +3860,8 @@ mod tests {
             let w = capture_and_scan(&cs, &tables, &froms, &start)
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
-            assert_eq!(w.answers.len(), 2);
+            assert!(w.answers[0].is_some(), "t1 is scanned");
+            assert!(w.answers[1].is_none(), "t2 is deferred, not scanned");
         }
 
         /// Every table's rows start beyond the capture: nothing is scanned.
@@ -3675,7 +3877,7 @@ mod tests {
             let w = capture_and_scan(&cs, &tables, &froms, &start)
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
-            assert_eq!(w.answers.len(), 2);
+            assert!(w.answers.iter().all(Option::is_none), "nothing scanned");
             assert_eq!(cs.scanner.retained().await, None, "no scan was issued");
         }
     }

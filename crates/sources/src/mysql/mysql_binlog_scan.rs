@@ -1044,8 +1044,8 @@ async fn scan(
         CheckpointOrder::Equal => return Ok(empty(Vec::new())),
         CheckpointOrder::Before => {}
         other => {
-            return Err(ProofError::Positions(format!(
-                "from is not before to ({other:?})"
+            return Err(ProofError::Positions(not_before(
+                from, to, &pf, &pt, other,
             )));
         }
     }
@@ -1478,6 +1478,33 @@ pub(crate) type BetweenHook<'a> = &'a (
 > + Send
             + Sync
     );
+
+/// Why `(from, to]` is no interval: both positions as read (file, offset
+/// and GTID set) and the basis they were ordered on.
+pub(crate) fn not_before(
+    from: &MySqlCheckpoint,
+    to: &MySqlCheckpoint,
+    a: &WmPos,
+    b: &WmPos,
+    order: CheckpointOrder,
+) -> String {
+    let show = |c: &MySqlCheckpoint| match &c.gtid_set {
+        Some(g) => format!("{}:{} (GTID set {g})", c.file, c.pos),
+        None => format!("{}:{}", c.file, c.pos),
+    };
+    let basis = match (a, b) {
+        (WmPos::MysqlGtid { .. }, WmPos::MysqlGtid { .. }) => "GTID set",
+        (WmPos::MysqlBinlog { .. }, WmPos::MysqlBinlog { .. }) => {
+            "binlog coordinate"
+        }
+        _ => "positions of different kinds",
+    };
+    format!(
+        "from {} is not before to {}: {order:?}, compared by {basis}",
+        show(from),
+        show(to)
+    )
+}
 
 pub(crate) async fn read_position(
     conn: &mut mysql_async::Conn,
@@ -3780,7 +3807,17 @@ pub(crate) mod tests {
             let guard = records.install();
             let err = scan(&dsn, &to, &from).await.unwrap_err();
             drop(guard);
-            assert!(matches!(err, ProofError::Positions(_)), "{err:?}");
+            let basis = if gtid {
+                "GTID set"
+            } else {
+                "binlog coordinate"
+            };
+            assert!(
+                matches!(&err, ProofError::Positions(why)
+                    if why.contains(&format!("from {}:{}", to.file, to.pos))
+                        && why.ends_with(&format!("After, compared by {basis}"))),
+                "{err:?}"
+            );
             assert_eq!(records.of("scan").last().unwrap()["outcome"], "failed");
         }
 

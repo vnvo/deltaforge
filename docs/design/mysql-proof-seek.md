@@ -1118,7 +1118,13 @@ more rows in the held events, which is rare.
    dispatching records it). The scanner positions only at an anchor taken
    at exactly the request's start set; C's anchor would leave S's scan
    unanchored, reading its file from the start. The task holds
-   nothing of `RunCtx`. If C finishes before S closes, S is dropped
+   nothing of `RunCtx`. A table whose rows start beyond the capture's
+   first position read is not in the request: the capture does not
+   contain those rows, so the table is deferred unscanned (no request at
+   all when every table is), and its next window waits, bounded, for the
+   server's position to cover them. When S's head table is deferred, the
+   request's least start is not the anchored head and its scan runs
+   unanchored. If C finishes before S closes, S is dropped
    unformed and its events stay held: when the stream reaches them, an
    ordinary window forms over them, with its time bound counted from
    receipt.

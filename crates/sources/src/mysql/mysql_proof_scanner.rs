@@ -394,9 +394,11 @@ impl ProofScanner {
                 CheckpointOrder::Equal => false,
                 CheckpointOrder::Before => true,
                 other => {
-                    return Err(ProofError::Positions(format!(
-                        "from is not before to ({other:?})"
-                    )));
+                    return Err(ProofError::Positions(
+                        crate::mysql::mysql_binlog_scan::not_before(
+                            f, to, &a, &b, other,
+                        ),
+                    ));
                 }
             };
             if open {
@@ -1420,10 +1422,26 @@ mod tests {
             assert!(r.statements.is_empty());
             assert_eq!(r.digest, syn.direct(7, 7).1);
             assert!(syn.scanned.lock().unwrap().is_empty());
-            assert!(matches!(
-                ask(&sc, &syn, 9, 7, None).await,
-                Err(ProofError::Positions(_))
-            ));
+            let Err(ProofError::Positions(why)) =
+                ask(&sc, &syn, 9, 7, None).await
+            else {
+                panic!("from after to is no interval");
+            };
+            let (from, to) = (syn.at(9), syn.at(7));
+            assert!(
+                why.contains(&format!("from {}:{}", from.file, from.pos))
+                    && why.contains(&format!("to {}:{}", to.file, to.pos)),
+                "{why}"
+            );
+            let basis = if gtid {
+                "GTID set"
+            } else {
+                "binlog coordinate"
+            };
+            assert!(
+                why.ends_with(&format!("After, compared by {basis}")),
+                "{why}"
+            );
         }
     }
 
@@ -1434,7 +1452,11 @@ mod tests {
         let r = sc
             .interval(g.seg(), U, L, &g.at(1), &f.at(5), None, None, &TAG)
             .await;
-        assert!(matches!(r, Err(ProofError::Positions(_))), "{r:?}");
+        assert!(
+            matches!(&r, Err(ProofError::Positions(why))
+                if why.ends_with("Incomparable, compared by positions of different kinds")),
+            "{r:?}"
+        );
         let r = sc
             .interval(g.seg(), U, "other", &g.at(1), &g.at(5), None, None, &TAG)
             .await;
