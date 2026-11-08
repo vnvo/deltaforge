@@ -160,34 +160,50 @@ jobs:
             echo "is_prerelease=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Generate changelog
+      # The notes are the release's own scope and limits
+      # (.github/release-notes/<tag>.md, required), the image pull commands,
+      # and the tag's CHANGELOG section (required, its relative links pointed
+      # at the tagged source); never a commit-subject dump or generated notes.
+      - name: Generate release notes
         id: changelog
         run: |
-          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          TAG="${{ steps.version.outputs.tag }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          SCOPE=".github/release-notes/${TAG}.md"
+          if [ ! -s "$SCOPE" ]; then
+            echo "missing release scope notes: $SCOPE" >&2
+            exit 1
+          fi
+          awk -v h="## [${TAG}]" '
+            index($0, h) == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md \
+            | perl -pe 's{\]\((?!https?://|#|mailto:)([^)\s]+)\)}{](https://github.com/vnvo/deltaforge/blob/'"$TAG"'/$1)}g' \
+            > CHANGES.md
+          if ! grep -q '[^[:space:]]' CHANGES.md; then
+            echo "CHANGELOG.md has no section for ${TAG}" >&2
+            exit 1
+          fi
           {
-            echo "## Docker Images"
+            cat "$SCOPE"
             echo ""
-            echo "Both images support \`linux/amd64\` and \`linux/arm64\`."
+            echo "## Docker Images"
             echo ""
             echo "**Minimal** (scratch-based):"
             echo "\`\`\`bash"
-            echo "docker pull ghcr.io/vnvo/deltaforge:${{ steps.version.outputs.version }}"
-            echo "docker pull ${{ secrets.DOCKERHUB_USERNAME }}/deltaforge:${{ steps.version.outputs.version }}"
+            echo "docker pull ghcr.io/vnvo/deltaforge:${VERSION}"
+            echo "docker pull ${{ secrets.DOCKERHUB_USERNAME }}/deltaforge:${VERSION}"
             echo "\`\`\`"
             echo ""
             echo "**Debug** (includes shell):"
             echo "\`\`\`bash"
-            echo "docker pull ghcr.io/vnvo/deltaforge:${{ steps.version.outputs.version }}-debug"
-            echo "docker pull ${{ secrets.DOCKERHUB_USERNAME }}/deltaforge:${{ steps.version.outputs.version }}-debug"
+            echo "docker pull ghcr.io/vnvo/deltaforge:${VERSION}-debug"
+            echo "docker pull ${{ secrets.DOCKERHUB_USERNAME }}/deltaforge:${VERSION}-debug"
             echo "\`\`\`"
             echo ""
-            echo "## What's Changed"
-            echo ""
-            if [ -n "$PREV_TAG" ]; then
-              git log --pretty=format:"* %s (%h)" $PREV_TAG..HEAD
-            else
-              echo "Initial release of DeltaForge!"
-            fi
+            echo "## Changes"
+            cat CHANGES.md
           } > RELEASE_NOTES.md
 
       - name: Create GitHub Release
@@ -195,4 +211,5 @@ jobs:
         with:
           body_path: RELEASE_NOTES.md
           prerelease: ${{ steps.version.outputs.is_prerelease == 'true' }}
-          generate_release_notes: true
+          make_latest: ${{ steps.version.outputs.is_prerelease == 'true' && 'false' || 'legacy' }}
+          generate_release_notes: false
