@@ -222,6 +222,59 @@ fn owner(table: &TableRef, writers: u32) -> u32 {
     (h.finish() % u64::from(writers.max(1))) as u32
 }
 
+/// Whether `writer_index` owns a table of `window`'s active set that is not
+/// poisoned. A writer that owns none has nothing to write until the window
+/// or its poisoned tables change.
+fn owns_active(
+    active: &ActiveSet,
+    window: u64,
+    writer_index: u32,
+    writers: u32,
+    poisoned: &HashSet<TableRef>,
+) -> bool {
+    (0..active.size())
+        .map(|r| active.table_at(window, r))
+        .any(|t| owner(&t, writers) == writer_index && !poisoned.contains(&t))
+}
+
+/// Draws between checks for stop while looking for an owned table. A writer
+/// that owns one finds it long before this; it bounds the loop if one is
+/// improbable.
+const PICK_ATTEMPTS: u32 = 1 << 16;
+
+/// How often a writer that owns no active table looks again (a moving set
+/// changes its tables), unless stop comes first.
+const IDLE_RECHECK: Duration = Duration::from_secs(1);
+
+/// A table of `window`'s set owned by `writer_index` and not poisoned, drawn
+/// as the unbounded loop drew it; `None` if stop is signalled while looking.
+/// After every [`PICK_ATTEMPTS`] misses it checks stop and yields.
+async fn pick_owned(
+    active: &ActiveSet,
+    window: u64,
+    writer_index: u32,
+    writers: u32,
+    poisoned: &HashSet<TableRef>,
+    rng: &mut impl Rng,
+    stop: &watch::Receiver<bool>,
+) -> Option<TableRef> {
+    let mut misses = 0u32;
+    loop {
+        let t = active.pick_in(window, rng);
+        if owner(&t, writers) == writer_index && !poisoned.contains(&t) {
+            return Some(t);
+        }
+        misses += 1;
+        if misses == PICK_ATTEMPTS {
+            if *stop.borrow() {
+                return None;
+            }
+            misses = 0;
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
 fn now_micros() -> i64 {
     Utc::now().timestamp_micros()
 }
@@ -324,7 +377,9 @@ pub async fn writer(
         .with_context(|| format!("writer connection to {}", ctx.server.name))?;
     let started = Instant::now();
     let mut next_at = Instant::now();
-    loop {
+    // Whether this writer owns an active table, by window and poisoned count.
+    let mut owns: Option<(u64, usize, bool)> = None;
+    'run: loop {
         if *stop.borrow() {
             break;
         }
@@ -346,17 +401,51 @@ pub async fn writer(
             next_at = now; // do not accumulate unbounded catch-up
         }
 
+        // One window per transaction. A writer that owns none of its tables
+        // waits for stop (or the next window) instead of drawing.
+        let window = ctx.active.window(started.elapsed().as_secs());
+        let has = match owns {
+            Some((w, p, has)) if (w, p) == (window, poisoned.len()) => has,
+            _ => {
+                let has = owns_active(
+                    &ctx.active,
+                    window,
+                    writer_index,
+                    writers,
+                    &poisoned,
+                );
+                owns = Some((window, poisoned.len(), has));
+                has
+            }
+        };
+        if !has {
+            tokio::select! {
+                _ = tokio::time::sleep(IDLE_RECHECK) => {}
+                _ = stop.changed() => break,
+            }
+            next_at = Instant::now();
+            continue;
+        }
+
         let mut sql = Vec::new();
         let mut records = Vec::new();
         let mut kinds = Vec::new();
         let mut planned: Vec<Planned> = Vec::new();
         for _ in 0..rows_per_txn {
-            let table = loop {
-                let t = ctx.active.pick(started.elapsed().as_secs(), &mut rng);
-                if owner(&t, writers) == writer_index && !poisoned.contains(&t)
-                {
-                    break t;
-                }
+            // Nothing of this transaction has run yet: on stop, its plan is
+            // dropped.
+            let Some(table) = pick_owned(
+                &ctx.active,
+                window,
+                writer_index,
+                writers,
+                &poisoned,
+                &mut rng,
+                &stop,
+            )
+            .await
+            else {
+                break 'run;
             };
             let range = rows.entry(table).or_default();
             let db = ctx.naming.database(table.db);
@@ -875,6 +964,83 @@ pub async fn lifecycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ActiveSetPattern;
+
+    /// G3's A1: 4 active tables among 40,000, 8 writers.
+    fn a1() -> ActiveSet {
+        ActiveSet::new(
+            0,
+            200,
+            200,
+            &ActiveSetPattern::Fixed { fraction: 0.0001 },
+            1.0,
+            1,
+        )
+    }
+
+    #[test]
+    fn with_fewer_active_tables_than_writers_some_writers_own_none() {
+        let set = a1();
+        assert_eq!(set.size(), 4);
+        let none = HashSet::new();
+        let owning: Vec<u32> = (0..8)
+            .filter(|&w| owns_active(&set, 0, w, 8, &none))
+            .collect();
+        assert!(!owning.is_empty() && owning.len() <= 4, "{owning:?}");
+        // Poisoning every table a writer owns leaves it nothing.
+        let w = owning[0];
+        let poisoned: HashSet<TableRef> = (0..set.size())
+            .map(|r| set.table_at(0, r))
+            .filter(|t| owner(t, 8) == w)
+            .collect();
+        assert!(!owns_active(&set, 0, w, 8, &poisoned));
+    }
+
+    /// A writer that owns tables draws exactly what the unbounded loop drew.
+    #[tokio::test]
+    async fn an_owning_writer_draws_as_before() {
+        let set = a1();
+        let none = HashSet::new();
+        let (_tx, stop) = watch::channel(false);
+        for w in (0..8).filter(|&w| owns_active(&set, 0, w, 8, &none)) {
+            let (mut a, mut b) =
+                (StdRng::seed_from_u64(9), StdRng::seed_from_u64(9));
+            for _ in 0..1_000 {
+                let before = loop {
+                    let t = set.pick(0, &mut a);
+                    if owner(&t, 8) == w {
+                        break t;
+                    }
+                };
+                let now = pick_owned(&set, 0, w, 8, &none, &mut b, &stop).await;
+                assert_eq!(now, Some(before));
+            }
+        }
+    }
+
+    /// A writer that owns nothing gives up its thread between attempts and
+    /// returns as soon as stop is signalled, even on one thread.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_writer_that_owns_nothing_returns_on_stop() {
+        let set = a1();
+        let none = HashSet::new();
+        let empty = (0..8)
+            .find(|&w| !owns_active(&set, 0, w, 8, &none))
+            .unwrap();
+        let (tx, stop) = watch::channel(false);
+        let picking = tokio::spawn(async move {
+            let mut rng = StdRng::seed_from_u64(9);
+            pick_owned(&set, 0, empty, 8, &HashSet::new(), &mut rng, &stop)
+                .await
+        });
+        tokio::task::yield_now().await;
+        tx.send(true).unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(10), picking)
+            .await
+            .expect("returns promptly once stopped")
+            .unwrap();
+        assert_eq!(r, None);
+    }
 
     #[test]
     fn the_schedule_bursts_to_peak_for_its_fraction_of_each_minute() {

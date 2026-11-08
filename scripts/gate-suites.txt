@@ -75,6 +75,7 @@ parallel   runner/incidents_e2e             -p runner --test incidents_e2e
 parallel   runner/metric_cardinality_e2e    -p runner --test metric_cardinality_e2e
 # The fleet qualification harness's own machinery, at toy scale.
 parallel   fleet-harness/harness_smoke      -p fleet-harness --test harness_smoke
+workspace  fleet-harness/floor_watch
 parallel   fleet-harness/run_identity       -p fleet-harness --test run_identity
 parallel   fleet-harness/pg_qualify_smoke   -p fleet-harness --test pg_qualify_smoke
 parallel   runner/capture_boundary_e2e        -p runner --test capture_boundary_e2e
