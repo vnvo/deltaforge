@@ -3576,4 +3576,107 @@ mod tests {
             assert!(!is_transaction_control(sql), "{sql}");
         }
     }
+
+    mod live {
+        //! The window's capture and shared scan on a live server: a table
+        //! whose rows start beyond the capture's start is deferred before the
+        //! scan, never handed to it.
+        use super::*;
+        use crate::gtid_set::GtidSet;
+        use crate::mysql::mysql_binlog_scan::CaptureCtx;
+        use crate::mysql::mysql_binlog_scan::tests::live::{
+            position, server, sql, uuid,
+        };
+        use crate::mysql::mysql_proof_scanner::{ProofScanner, RecordLimits};
+
+        const LINEAGE: &str = "fedcba9876543210fedcba9876543210";
+
+        fn capture_scan(dsn: &str, server_uuid: String) -> CaptureScan {
+            CaptureScan {
+                capture: CaptureCtx::detached(dsn.to_string()),
+                server_uuid,
+                lineage: LINEAGE.into(),
+                source_id: "window-defer".into(),
+                lock_wait_secs: 5,
+                scanner: std::sync::Arc::new(ProofScanner::new(
+                    RecordLimits::default(),
+                )),
+                anchor: None,
+            }
+        }
+
+        fn lineaged(p: MySqlCheckpoint) -> MySqlCheckpoint {
+            MySqlCheckpoint {
+                lineage: Some(LINEAGE.into()),
+                ..p
+            }
+        }
+
+        /// A row start no capture reaches: `p`'s executed set with the
+        /// server's own GTIDs extended to 2^40. Nothing commits that many
+        /// transactions (the lane runs one test at a time), so it stays
+        /// strictly beyond every position the capture reads.
+        fn beyond(p: &MySqlCheckpoint, server_uuid: &str) -> MySqlCheckpoint {
+            let mut set =
+                GtidSet::parse(p.gtid_set.as_deref().unwrap()).unwrap();
+            set.union(
+                &GtidSet::parse(&format!("{server_uuid}:1-{}", 1u64 << 40))
+                    .unwrap(),
+            );
+            MySqlCheckpoint {
+                gtid_set: Some(set.to_string()),
+                ..p.clone()
+            }
+        }
+
+        async fn tables(dsn: &str, db: &str) -> Vec<(String, String)> {
+            sql(
+                dsn,
+                &[
+                    &format!("CREATE DATABASE {db}"),
+                    &format!("CREATE TABLE {db}.t1 (a INT PRIMARY KEY)"),
+                    &format!("CREATE TABLE {db}.t2 (a INT PRIMARY KEY)"),
+                ],
+            )
+            .await;
+            vec![(db.into(), "t1".into()), (db.into(), "t2".into())]
+        }
+
+        /// One table's rows start before the capture, the other's beyond
+        /// it: the window's capture and scan succeed, scanning only the
+        /// first.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_table_beyond_the_capture_start_is_deferred_before_the_scan()
+        {
+            let dsn = server(true).await;
+            let u = uuid(&dsn).await;
+            let tables = tables(&dsn, "wdefer_mixed").await;
+            let start = lineaged(position(&dsn).await);
+            sql(&dsn, &["INSERT INTO wdefer_mixed.t1 VALUES (1)"]).await;
+            let froms = vec![start.clone(), beyond(&start, &u)];
+            let cs = capture_scan(&dsn, u);
+            let w = capture_and_scan(&cs, &tables, &froms, &start)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(w.answers.len(), 2);
+        }
+
+        /// Every table's rows start beyond the capture: nothing is scanned.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_window_entirely_beyond_the_capture_start_scans_nothing() {
+            let dsn = server(true).await;
+            let u = uuid(&dsn).await;
+            let tables = tables(&dsn, "wdefer_all").await;
+            let start = lineaged(position(&dsn).await);
+            let froms = vec![beyond(&start, &u), beyond(&start, &u)];
+            let cs = capture_scan(&dsn, u);
+            let w = capture_and_scan(&cs, &tables, &froms, &start)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(w.answers.len(), 2);
+            assert_eq!(cs.scanner.retained().await, None, "no scan was issued");
+        }
+    }
 }
