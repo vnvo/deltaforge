@@ -6,168 +6,195 @@
 
 A pipeline's durable state outlives its registration. Pipelines created through the API are not restored when the server restarts, and recreating the same name and source id is the restart mechanism: it resumes from the retained state. Today that state is adopted without comparing the new spec with the one that wrote it. Only the source server's identity and lineage are checked.
 
-- **Retained state, keyed by source id:**
-  - per-sink checkpoints `{source_id}::sink::*`;
-  - the source-id claim `active_sources/{source_id}`, whose value is the pipeline name;
-  - the failover identity `failover/identity:{source_id}`;
-  - PostgreSQL slot owner and continuity records.
-- **Retained state, keyed by tenant and source id:** the schema lineage `schema_lineage/{tenant}/{source_id}` and the schema history (`schemas.v1*`, with MySQL activation records).
-- **Retained state, keyed by pipeline name:** destination ownership `sink_destination_ownership/{pipeline}/{sink}/...`.
+The state that carries a position is:
+- the per-sink checkpoints `{source_id}::sink::*`;
+- the destination ownership records `sink_destination_ownership/{pipeline}/...`;
+- the source-id claim `active_sources/{source_id}`, whose value is the pipeline name.
 
-Checkpoint keys and the claim are not tenant-scoped. A spec of another tenant, with other tables or other sinks, therefore inherits the earlier pipeline's position and destination ownership:
+None of it is tenant-scoped. A spec of another tenant, with other tables, sinks or processing, therefore inherits the earlier pipeline's position and ownership:
 - newly selected tables are captured from the resume position with no snapshot;
 - new sinks start at the old resume position;
-- the old sinks' orphaned checkpoints can hold the resume position back.
+- changed processing is applied from the middle of a stream.
 
-PATCH has the same gap on a running pipeline. It refuses only a change of the sink-id set and the per-table metrics cap, so tenant, table selection, destinations and `source.id` can all be patched.
+PATCH has the same gap on a running pipeline. It refuses only a change of the sink-id set and the per-table metrics cap, so tenant, selection, destinations, processing and `source.id` can all be patched.
 
-## Decisions this design follows
+## Decisions
 
 1. **Recreating stays the restart mechanism.** A compatible recreate resumes, as today.
-2. **Before any retained state is adopted,** tenant, source selection and sink identities are checked against a durable record of the spec that wrote the state.
-3. **A mismatch refuses;** it never only warns.
-4. **The check tells apart** compatible operational changes, credential rotation, supported failover, and changes that need a migration or fresh state.
-5. **Stores without a recorded spec** are handled explicitly.
+2. **Before any retained state is adopted,** the spec is compared with a durable record of the spec that wrote it. A mismatch refuses; there is no warn-only mode and no override flag.
+3. **The comparison is an allowlist.** Only fields classified as operational, credential, or fenced endpoint may differ. Every other field must match, including fields added later until they are classified.
+4. **Changing `source.id` is a new source lifecycle.** PATCH refuses it, as it refuses a change of the sink set.
+5. **Existing stores** with retained state and no record are refused until one explicit, reviewed adoption binds them. There is no bulk mode in this change.
 
 ## The state binding
 
-There is one durable record per source id. It sits in the existing slot table: namespace `state_binding`, key `{source_id}`. It is written with `slot_create` and updated with `slot_cas`.
+There is one record per source id: slot namespace `state_binding`, key `{source_id}`. It holds only the fields that must match, in canonical form:
 
 ```
 StateBinding {
   format_version: 1,
   source_id, pipeline, tenant,
-  engine: mysql | postgres,
-  selection: { ... canonical identity fields of the source, below ... },
-  sinks: { sink_id -> { type, destination: { ... }, contract: { ... } } },
-  bound_at, bound_by_version,
-  history: [ { at, by_version, kind: created | operational | credential | failover_endpoint, fields: [...] } ]   // bounded, newest last
+  engine,                    // mysql | postgres
+  source: { ... },           // selection, processing, source contract
+  sinks: { sink_id -> { type, destination, contract } },
+  digest                     // SHA-256 over the canonical form above
 }
 ```
 
-- **Canonical fields, not just a digest.** A refusal can then name every differing field and its old and new value. Credential material is never recorded: no user, password, secret value or secret location.
-- **Separate from the claim.** The claim's value stays the raw pipeline name. Existing claims keep working, and the claim's legacy equality check is untouched.
-- **Keyed by source id**, the same collision domain as the checkpoints and the claim. The tenant is a recorded field, so a different tenant refuses.
+- **Immutable for the life of the retained state.** It is created on the first start that writes it and removed by DELETE. Because a compatible change by definition touches no recorded field, PATCH never rewrites it and there is no history.
+- **Separate from the claim.** The claim's value stays the raw pipeline name, so existing claims and the claim's equality check are untouched.
+- **No credentials.** Credential fields are not part of the binding (see Canonical form).
 
-## Classification
-
-Every spec field falls in exactly one class, and the implementation keeps the table in code next to the spec types. A new spec field fails a test until it is classified, so nothing is compatible by omission.
-
-### Must match: a mismatch refuses
+## What must match
 
 | Area | Fields |
 |---|---|
-| Owner | `metadata.tenant`, `metadata.name`. A different name with the same source id is already refused by the claim. |
-| Source kind | Engine (`mysql` or `postgres`), `source.id` |
-| MySQL selection | `tables`, `table_options`, `outbox.tables`, `type_mapping` |
-| PostgreSQL selection | `publication`, `slot`, `tables`, `table_options`, `outbox` prefixes, `type_mapping`, the DSN's database name |
-| Partitioning | `sharding` (it decides which part of the source this pipeline owns) |
+| Owner | `metadata.tenant`, `metadata.name`, `source.id`, engine |
+| MySQL selection | `tables`, `table_options`, `outbox.tables`, `sharding` |
+| PostgreSQL selection | `publication`, `slot`, `tables`, `table_options`, `outbox` prefixes, `sharding`, the DSN's database name |
+| Source contract | `type_mapping`, `on_schema_drift` |
+| Processing | `processors` (in order), each sink's `filter`, `schema_sensing.output.emit_events` |
+| Delivery policy | `commit_policy` mode and quorum, each sink's `required`, `journal.enabled` (whether a failing event is set aside instead of blocking) |
 | Sink set | The set of sink ids |
-| Per sink, destination | Kafka `topic`; Redis `stream`; NATS `subject`, `stream`; HTTP `url` path and `method`; S3 `bucket`, `prefix`; ClickHouse `database`, `table`, `mode`; Elasticsearch `index`, `id_fields`, `id_separator` |
-| Per sink, consumer contract | `type`; `envelope`, `encoding`, `key`, `json_wide_integers`, `exactly_once` (Kafka: the transactional id derives from the pipeline and sink id); S3 `format`, `compression`, `durability`; ClickHouse and Elasticsearch `version_source` |
+| Sink destination | Kafka `topic` and the credential-free `brokers`; Redis `stream` and the credential-free `uri`; NATS `subject`, `stream` and the credential-free `url`; HTTP the credential-free `url` and `method`; S3 `bucket`, `prefix`, `region`, `endpoint`; ClickHouse `database`, `table`, `mode`; Elasticsearch `index`, `id_fields`, `id_separator` |
+| Sink contract | `type`; `envelope`, `encoding`, `key`, `json_wide_integers`, `exactly_once`; S3 `format`, `compression`, `durability`; ClickHouse and Elasticsearch `version_source` |
 
-These changes make the retained position wrong, or wrong for some tables, sinks or consumers:
-- added tables have no history before the resume position;
-- a new destination has nothing before it;
-- a changed key, envelope or encoding mixes two contracts in one destination.
+**Endpoints:**
+- **Sources.** The source endpoint (DSN host and port) is not recorded. The source has its own identity fence: MySQL compares the server identity and needs GTID coverage for another server; PostgreSQL refuses another cluster through its continuity chain and slot owner. A supported failover therefore needs no binding change.
+- **Sinks with a fence.** ClickHouse and Elasticsearch verify the destination instance through an ownership marker with a random instance id, also recorded in the store. Their `url` is therefore not recorded either.
+- **Every other sink.** Kafka, Redis, NATS, HTTP and S3 have no such fence. Their credential-free endpoint is recorded, and an endpoint change refuses; it is never assumed to reach the same destination. Kafka `client_conf` keys that change the destination or the transaction identity (`bootstrap.servers`, `transactional.id`) are compared as part of the destination and contract.
 
-Each one needs a fresh state or an explicit migration (see Refusal).
+**Selection changes refuse in both directions.** Adding tables would leave them without history; removing them would let a later re-add silently skip the interval in between. Safe reconfiguration can come later as a separate, explicit operation.
 
-### Compatible: adopted, recorded in `history`
+## What may differ (the allowlist)
 
 - **Operational:**
-  - `batch`, `commit_policy` timeouts, `sink_batch_deadline_secs`, `connection_policy`, `journal`, `schema_sensing`, `metrics` (the per-table cap keeps its own check);
-  - MySQL `proofs` bounds;
-  - snapshot parallelism, chunk and lock knobs;
+  - `batch`, `sink_batch_deadline_secs`, `commit_policy` timeouts, `connection_policy`;
+  - `journal` settings other than `enabled`;
+  - `schema_sensing` other than `output.emit_events`;
+  - `metrics` (the per-table cap keeps its own check);
+  - MySQL `proofs` bounds; snapshot parallelism, chunk and lock knobs;
   - `snapshot.mode` (it only acts on a first start);
   - `max_message_bytes`;
   - sink timeouts, roll and flush settings, `encode_workers`;
-  - `on_schema_drift` (a halting or adapting policy, not a position).
-- **Delivered content from the resume position on:** `processors`, the sink `filter`, a sink's `required` flag, and `commit_policy` mode and quorum. These change what is delivered next, but not whether the retained position is valid for the selection. They are compatible and recorded, so the change is visible in the binding history and the audit log.
-- **Credential rotation:** an inline DSN's user and password, `dsn_secret`, `credentials`, sink `*_ref` and `secret_refs`, `secrets` providers, and `rotation`. They are excluded from the binding entirely, so they never refuse. A whole-DSN secret hides its endpoint as well; that is acceptable because the endpoint is not part of the binding.
-- **Endpoint changes:** source DSN host and port, Kafka `brokers`, Redis `uri`, NATS `url` host, ClickHouse and Elasticsearch `url`, S3 `endpoint` and `region`. These are not in the binding.
-  - For the source, supported failover keeps its existing gates. MySQL compares the server identity and needs GTID coverage for another server; PostgreSQL refuses another cluster through the continuity chain and the slot owner. A changed endpoint with the same server is an operational move. The binding records the change kind `failover_endpoint` when the source's identity check reports a transition.
-  - For sinks, destination ownership fencing (#164) already detects another destination instance where it is implemented. Kafka `client_conf` is operational, except two keys: `bootstrap.servers` follows `brokers`, and `transactional.id` follows the consumer contract.
+  - Kafka `client_conf` other than the two keys above.
+- **Credentials:**
+  - inline DSN user and password, `dsn_secret`, `credentials`, the `secrets` providers and `rotation`;
+  - sink `*_ref` and `secret_refs`;
+  - userinfo and query strings in sink endpoints;
+  - HTTP `headers`.
+- **Fenced endpoints:** the source DSN host and port; ClickHouse and Elasticsearch `url`.
 
-## Where the check runs
+A test enumerates every spec field and fails if one is in neither list. An unclassified field is compared, so it refuses until someone classifies it.
 
-**Create and start:** in `start_pipeline_locked`, under the lifecycle lock, after `held_for_recovery` and before `claim_source_id`. At that point nothing has yet read or written checkpoints, ownership, the S3 HEAD or source state.
+## Canonical form
 
-1. Read `state_binding/{source_id}`.
-2. **Binding present:** compare.
-   - **Identical or compatible:** proceed. A compatible difference is written with `slot_cas` before the claim, so a crash between the two leaves a binding that already matches the running spec.
-   - **Must-match difference:** refuse with `409 Conflict`, code `retained_state_incompatible`. The body lists every differing field (old and new value, credential fields never shown) and the remediations below. Nothing is claimed, spawned or written.
-3. **Binding absent:** look for retained state for this source id. That means any `{source_id}::sink::*` checkpoint, the claim, destination ownership records under the name, the failover identity, a PostgreSQL slot owner or continuity record, or snapshot generation control.
-   - **None:** a first start. Create the binding with `slot_create` before the claim. The create-if-absent makes two concurrent first starts settle on one binding.
-   - **Some:** the store predates the binding, or it was written by an unclean path. Refuse with `retained_state_unbound` unless the store was adopted (see Existing stores).
+The binding and the comparison use the same canonical form, so that irrelevant differences never refuse:
 
-**PATCH:** the same comparison, between the binding and the merged spec, before anything is stopped. A must-match change refuses with the same error. That closes the PATCH path for tenant, selection, destination and `source.id`. The sink-set rule stays as is.
+- **Sets are sorted and deduplicated:** table patterns, outbox tables and prefixes, the sink-id set, `id_fields`.
+- **Maps are sorted by key:** `table_options`, sinks by sink id.
+- **Order is kept only where it changes behavior:** `processors`.
+- **Defaults are made explicit:** a field omitted and the same field set to its default compare equal.
+- **Endpoints are reduced to scheme, lowercased host, port (explicit, with the scheme's default filled in) and path.** Userinfo, query string and fragment are removed before storing and before comparing.
 
-**Startup `--config` pipelines:** the same check. A refusal fails that pipeline closed, with an incident whose class names the differing fields, and the other pipelines continue.
+Credential fields are dropped before canonicalization. They are never stored, never compared and never shown.
 
-**DELETE:** removes the binding in the same fail-closed sequence, after the ownership records and before the claim. A delete that fails keeps the binding, and so does the claim.
+## Redaction
 
-Schema history and activation records left after a DELETE do not count as retained state. A later first start writes a start barrier, so they are never reused as proof.
+Stored values and refusal messages contain only canonical, credential-free values. A refusal names each differing field with its stored and new canonical value. A value that would contain a credential is not in the canonical form in the first place: endpoint userinfo, query strings and headers are removed, and secret references are excluded.
 
-## Refusal and remediation
+As a backstop, refusal text passes through the existing DSN redaction before it is logged or returned. A test plants a password, a token in a query string and an `Authorization` header in a spec and asserts that none appears in the binding or in any refusal.
 
-The refusal names the path that fits the change:
+## When the check runs, and crash behavior
 
-- **Different tenant or source, or a reused source id:** use a new source id.
-- **Changed table selection:**
-  - to keep the position for the unchanged tables and copy the added ones, a future explicit selection change (outside this design);
-  - today, a new source id, or `DELETE` and recreate (a first start that snapshots according to `snapshot.mode`).
-- **Changed sink set, destination or contract:** `DELETE` and recreate, or a new source id. This matches today's rule for sink-set changes.
+The process-local lifecycle lock serializes create, PATCH and DELETE within one server. Across servers, the store gate allows only one server per store. Durable consistency comes from the order of durable writes, the slot operations' atomicity (`slot_create` is create-if-absent; `slot_cas` and `slot_delete` act on a version), and one rule:
 
-No override flag adopts incompatible state. The only path that binds state the server would otherwise refuse is the reviewed adoption below.
+> **A binding is authoritative only while position-bearing state exists for its source id.** That means a `{source_id}::sink::*` checkpoint, or a destination ownership record of the binding's pipeline. A binding without such state is stale and is replaced at the next first start.
 
-## Existing stores (retained state, no binding)
+This rule makes every crash point below recoverable without operator action.
 
-A store written before this change has checkpoints, claims and ownership records, but no binding. Refusing silently would stop every existing pipeline at upgrade, and adopting silently would keep the gap open. Adoption is therefore explicit and reviewed. It follows the schema-history migration (dry run, proof digest, `--apply --expect-proof` under the store gate, never deleting):
+### Create and start
 
-1. **`deltaforge state-binding adopt --spec <file> --dry-run`** lists, for the spec's source id, the retained state found:
-   - the checkpoints with their positions;
-   - the claim and its pipeline name;
+The check runs in `start_pipeline_locked`, after `held_for_recovery` and before `claim_source_id`, so it runs before anything reads or writes checkpoints, ownership, the S3 HEAD or source state.
+
+1. Read the binding, and check for position-bearing state.
+2. Act on what was found:
+   - **Binding present, position-bearing state present:** compare canonical forms. A difference refuses with `409 retained_state_incompatible` (fields listed, redacted), and nothing is claimed, spawned or written. Equal means proceed.
+   - **Binding present, no position-bearing state:** the binding is stale. Replace it with `slot_cas` on its version.
+   - **Binding absent, position-bearing state present:** refuse with `retained_state_unbound`. The error names the adoption command.
+   - **Binding absent, no position-bearing state:** a first start. Create the binding with `slot_create`.
+3. Claim the source id, then spawn.
+
+Crash points:
+- **After the binding is written, before the claim:** a binding with no position-bearing state. The next start replaces it, or finds it equal.
+- **After the claim, before the first checkpoint:** the same, plus a held claim for the same name, which the existing claim logic treats as a restart.
+- **After the first checkpoint:** a binding with state, compared on every later start.
+
+### PATCH
+
+The merged spec is canonicalized and compared with the binding before anything is stopped:
+- a change of `source.id` refuses explicitly;
+- any other recorded-field difference refuses with `retained_state_incompatible`;
+- an allowed change proceeds as today.
+
+PATCH never writes the binding, so a crash during PATCH leaves the binding as it was. The running pipeline's spec stays within the allowlist of it.
+
+### DELETE
+
+The existing fail-closed order is kept, and the binding is removed last:
+
+1. replay incarnation;
+2. stop;
+3. checkpoints;
+4. ownership records;
+5. claim;
+6. binding.
+
+Crash points:
+- **Before step 5:** the claim is held and the delete is retried as today. The binding still matches whatever state remains.
+- **Between steps 5 and 6:** no claim and no position-bearing state, so the binding is stale and is replaced at the next first start.
+
+A delete never removes the binding while checkpoints or ownership records remain.
+
+### Startup `--config` pipelines
+
+Same check as create. A refusal fails that pipeline closed with an incident naming the differing fields; the other pipelines continue.
+
+### Out of scope
+
+- **Records not removed by DELETE:** the failover identity, lineage, PostgreSQL continuity and slot owner records, and snapshot generation control. They are not position-bearing in the sense above and keep their own checks. Whether DELETE should remove some of them is a separate question.
+- **Schema history and MySQL activation records:** a first start invalidates them as proof with its start barrier.
+
+## Adopting an existing source
+
+A store written before this change can hold position-bearing state with no binding. Every create, PATCH or startup of that source id then refuses with `retained_state_unbound`. There is one explicit operation per source id, following the schema-history migration (dry run, proof digest, apply with the expected proof, under the store gate, never deleting):
+
+1. **`deltaforge state-binding adopt --spec <file> --dry-run`** lists the source id's position-bearing state:
+   - the checkpoints, by sink id, with their positions;
    - the ownership records;
-   - the lineage, the identity and the PostgreSQL records;
-   - the snapshot generation and its `config_fingerprint`.
+   - the claim and its pipeline name.
 
-   It also shows the binding it would write and a proof digest over all of that. Where retained records carry identity of their own, it checks them against the spec, and a mismatch is reported as a refusal of the adoption:
-   - the claim's pipeline name;
-   - the lineage `tenant/source_id` key;
-   - the PostgreSQL slot owner's slot, database and pipeline;
-   - the publication registration digest;
-   - the snapshot `config_fingerprint` over engine and table patterns.
+   Against the spec it checks:
+   - the sink ids against the checkpoint keys;
+   - the pipeline name against the claim and the ownership keys;
+   - the tenant against the lineage key, where that record exists.
 
-   Fields with no retained record to check against, such as sink destinations, are adopted on the operator's statement and listed as such.
-2. **`--apply --expect-proof <digest>`** writes the binding only if the store still matches the dry run, with an audit record.
-3. **Until adopted,** a create, PATCH or startup of that source id refuses with `retained_state_unbound`, and the error names the command. The release notes make this an upgrade step for pipelines that already exist.
+   Any mismatch refuses the adoption. It prints the binding it would write, with redacted canonical values, and a proof digest over the state found and that binding. Fields with no retained record to check against (selection, processing, destinations) are listed as adopted on the operator's statement.
+2. **`--apply --expect-proof <digest>`** writes the binding with `slot_create`, only if the store still produces the same proof, and writes an audit record.
 
-A store with no retained state for the source id needs nothing: its first start binds.
-
-## Interactions
-
-- **Snapshot generation fingerprint:** the existing `config_fingerprint` stays. The binding is checked first, so a selection change refuses before the snapshot logic sees it.
-- **Failover and continuity:** unchanged. The binding only adds the facts these checks never compared (tenant, selection, sinks).
-- **Destination ownership:** unchanged and still keyed by pipeline name. A same-name recreate with a different destination now refuses at the binding instead of relying on the first write's fence.
-- **Docs:** `docs/src/secrets.md` says rotation needs a restart, while the code has opt-in live rotation. That is to be reconciled separately. The binding treats both alike.
+The release notes make this an upgrade step for every source that already exists.
 
 ## Tests the implementation must carry
 
-- A recreate with the same spec resumes, and its binding is unchanged.
-- A recreate with a changed operational field or credential resumes, with one history entry, or none for a credential.
-- Each must-match field, changed alone on recreate, refuses with that field named, and with no claim, checkpoint, ownership or source state touched. This is generated from the classification table.
-- The same for PATCH, with nothing stopped.
-- A different tenant with the same name and source id refuses (the cross-tenant case).
-- Retained state with no binding refuses with `retained_state_unbound`. Dry run and apply bind it, and a changed store between the two fails the apply.
-- DELETE removes the binding, and a failed delete keeps it.
-- Two concurrent first starts settle on one binding.
-- A crash after the binding is written and before the claim leaves a consistent next start.
-- An unclassified new spec field fails the classification test.
-
-## Open questions for review
-
-1. **Sink endpoints** (`brokers`, `url`, `endpoint`, `region`) are compatible here, on the grounds that hosts move. The alternative is to treat a sink endpoint as destination identity where no ownership fence exists (Kafka, Redis, NATS, HTTP).
-2. **Narrowing the table selection** (removing tables) is refused here, like widening. It could be compatible, since the remaining tables keep a valid position. It is refused because a later re-widen would then silently skip the removed interval.
-3. **`processors`, `filter` and the commit policy** are compatible here and recorded. Should a change to them refuse unless acknowledged?
-4. **Adoption of existing stores** is per source id, through the CLI. Should a bulk mode exist for fleets, with one proof per source id?
+- **Same spec:** a recreate resumes, and the binding is unchanged.
+- **Allowlist:** a recreate with each allowlisted field changed, and with credentials rotated, resumes, and the binding is unchanged.
+- **Each recorded field, changed alone:** generated from the table. On recreate, it refuses with that field named, and nothing is claimed, spawned or written. On PATCH, it refuses with nothing stopped.
+- **Ordering and defaults:** reordered table patterns, sinks or `table_options`, and an omitted default, compare equal. Reordered processors refuse.
+- **Specific refusals:**
+  - another tenant with the same name and source id;
+  - a Kafka broker list, Redis URI, NATS URL, HTTP URL or S3 endpoint change;
+  - a `source.id` change through PATCH.
+- **Redaction:** the planted password, token and header never appear in the binding or in a refusal.
+- **Crash points:** each one above, with an injected failure, then a next start that resumes or replaces as specified.
+- **Unbound state:** position-bearing state with no binding refuses. Dry run and apply bind it, a store changed between the two fails the apply, and an adoption whose sink ids or claim do not match refuses.
+- **Classification:** an unclassified new spec field fails the classification test.
