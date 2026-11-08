@@ -5,13 +5,14 @@ seriously and appreciate responsible disclosure.
 
 ## Supported versions
 
-While in the `0.1.0-beta` line, only the **most recent beta release** (and
-`main`) receives security fixes. Older betas are not patched — please upgrade.
+While in the `0.1.0` pre-release line, only the **most recent release
+candidate** (and `main`) receives security fixes. Earlier release candidates
+and betas are not patched: please upgrade.
 
 | Version | Supported |
 | --- | --- |
-| latest `0.1.0-beta.*` / `main` | ✅ |
-| older betas | ❌ |
+| latest `0.1.0-rc.*` / `main` | ✅ |
+| older release candidates and betas | ❌ |
 
 ## Reporting a vulnerability
 
