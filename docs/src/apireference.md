@@ -377,8 +377,16 @@ from the resume position on.
   retained for it, so the pipeline starts as a first start and snapshots
   according to `snapshot.mode`. For PostgreSQL, also use a new `slot` name: the
   slot is named in the config, not derived from the source id, and an existing
-  slot is reused from its confirmed position. This is the only supported way to
-  start fresh.
+  slot is reused from its confirmed position. With those source prerequisites
+  met, this is the only supported way to start the source fresh.
+- **A new source id does not clear external destinations.** Data already
+  delivered stays in Kafka topics and other destinations. A ClickHouse or
+  Elasticsearch sink writes only to a table or index it created, so a fresh
+  pipeline pointed at one created by an earlier pipeline is refused; point it
+  at a new table or index, or
+  clear the old one yourself (see
+  [ClickHouse](sinks/clickhouse.md#destination-ownership-and-fencing) and
+  [Elasticsearch](sinks/elasticsearch.md#destination-ownership-and-fencing)).
 - `DELETE` followed by a create with the same source id is **not** a fresh
   start: Delete removes only the records listed under
   [Delete Pipeline](#delete-pipeline), and the retained identity, lineage,
