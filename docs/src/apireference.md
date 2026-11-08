@@ -302,13 +302,62 @@ backlog drain.
 DELETE /pipelines/{name}
 ```
 
-Permanently removes a pipeline from the runtime. The checkpoint is **not**
-preserved. Use `stop` first if you may want to restart the pipeline later.
+Permanently removes a pipeline from the runtime. Use `stop` first if you may
+want to restart the pipeline later. Delete stops the source and then removes,
+in order, the pipeline's replay incarnation, every per-sink checkpoint of its
+source id (`{source_id}::sink::*`), its sinks' destination ownership records,
+and the source-id claim. Each step fails closed: if one fails, the delete
+fails, the source id stays locked, and the delete can be retried. Recorded
+schema history is kept; for MySQL, a later fresh start writes a start barrier,
+so that history is not reused as proof.
+
+Delete works only on a pipeline that is registered in the running server. See
+[Restarts and recreating a pipeline](#restarts-and-recreating-a-pipeline) for a
+pipeline that is no longer registered after a restart.
 
 **Response:** `204 No Content`
 
 **Errors:**
 - `404 Not Found` - Pipeline doesn't exist
+
+### Restarts and recreating a pipeline
+
+**Pipelines created through the API are not restored when the server
+restarts.** Only pipelines from the `--config` file are created at startup.
+Their retained state stays in the state store: the per-sink checkpoints, the
+source-id claim, the destination ownership records and the schema history.
+
+**Recreating is the restart mechanism.** Creating a pipeline again with the
+same name and the same source id resumes from the retained checkpoints, as an
+ordinary restart would. It does **not** start fresh, does **not** snapshot, and
+does **not** backfill tables newly selected by the spec: they are captured only
+from the resume position on.
+
+- **The retained state is adopted without checking the new spec.** Tenant,
+  table selection and sinks are not compared with the spec that wrote the
+  state; only the source server's identity and lineage are checked (see
+  [Failover Handling](failover.md)). Recreate only with the same tenant, table
+  selection, sinks and source. This is a known limitation of this beta, and a
+  release blocker until a compatibility check is decided (see
+  [Known limitations](deployment-support.md#known-limitations)).
+- **A different pipeline name with the same source id is refused** (`409
+  Conflict`) while the claim is held.
+- **A client that exits without `DELETE`** (crash, `SIGKILL`) leaves the
+  claim, the checkpoints and the ownership records in place. They are adopted by
+  the next create with the same name and source id, including after a server
+  restart.
+
+**To start fresh:**
+
+- Use a **new source id**. It has no retained checkpoints, so the pipeline
+  starts as a first start and snapshots according to `snapshot.mode`.
+- Or, with the same source id, `DELETE` the pipeline while it is registered,
+  then create it again: with its checkpoints removed it starts as a first
+  start. After a server restart the pipeline is not registered, so `DELETE`
+  returns `404`; recreating it to delete it first resumes it from its retained
+  checkpoints (it streams until it is deleted), so prefer a new source id.
+- To copy a source's data again while keeping its checkpoints, use the
+  [`resnapshot` recovery operation](recovery.md#resnapshot).
 
 ---
 
