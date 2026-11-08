@@ -128,8 +128,23 @@ cargo run --release -p fleet-harness -- store-matrix --dsn postgres://... \
 
 ## Scenarios
 
-S1-S17 (not S6) and A1-A5, as in the design. Soaks carry repeated disruptions
-inside the run. Built-in actions:
+S1-S17 (not S6) and A1-A5, as in the design, and two capacity scenarios
+([capacity frontier plan](../../docs/design/fleet-capacity-plan.md)):
+
+- **F0:** steady traffic with no actions (catalog-growth screening and the
+  sustained confirmation).
+- **F1:** a traffic staircase. `traffic.rate_steps` lists the change rate per
+  source of each step, and `traffic.rate_step_secs` how long each is held. The
+  first step starts when warm-up ends (warm-up runs at `changes_per_sec_avg`, so
+  the working set can activate first). F1 needs `peak_fraction: 0`, and
+  `run.duration_secs` must cover every step.
+
+Every line of `samples.jsonl` records, per server, `offered_ops` (operations the
+workload asked for so far) and `committed_ops` (operations MySQL committed),
+next to the instance's `sink_events` and `lag_seconds`, so each interval's
+offered-to-committed and committed-to-delivered ratios can be computed.
+
+Soaks carry repeated disruptions inside the run. Built-in actions:
 - Toxiproxy endpoint outages;
 - REST lifecycle operations (stop, resume, patch, restart);
 - rate changes for hot clusters.
