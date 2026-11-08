@@ -304,12 +304,36 @@ DELETE /pipelines/{name}
 
 Permanently removes a pipeline from the runtime. Use `stop` first if you may
 want to restart the pipeline later. Delete stops the source and then removes,
-in order, the pipeline's replay incarnation, every per-sink checkpoint of its
-source id (`{source_id}::sink::*`), its sinks' destination ownership records,
-and the source-id claim. Each step fails closed: if one fails, the delete
-fails, the source id stays locked, and the delete can be retried. Recorded
-schema history is kept; for MySQL, a later fresh start writes a start barrier,
-so that history is not reused as proof.
+in order, exactly these records:
+
+1. the pipeline's replay incarnation;
+2. every per-sink checkpoint of its source id (`{source_id}::sink::*`);
+3. its sinks' destination ownership records;
+4. the source-id claim.
+
+Each step fails closed: if one fails, the delete fails, the source id stays
+locked, and the delete can be retried.
+
+**Delete removes nothing else.** Other retained records of the source id or the
+pipeline name may remain in the state store or on the source server and may be
+read again by a later pipeline with the same source id (or name):
+
+- **Identity:** the source's recorded server identity (failover identity) and,
+  for PostgreSQL, its continuity record (system identifier, database, timeline).
+- **Lineage:** the source lineage record and the schema history recorded under
+  it; for MySQL, its activation records and barriers.
+- **Continuity:** a checkpoint in the older aggregate format (`{source_id}`,
+  without `::sink::`), and for PostgreSQL the replication slot with its
+  confirmed position, its slot ownership record and the publication (Delete
+  drops neither the slot nor the publication).
+- **Snapshot:** the snapshot generation record and its plan; a completed
+  generation can make a later pipeline stream without snapshotting, from the
+  retained position.
+- **By pipeline name:** DLQ entries, incident records and their recovery state.
+
+So Delete does **not** guarantee that a later pipeline with the same source id
+starts fresh. To start fresh, use a new source id (see
+[Restarts and recreating a pipeline](#restarts-and-recreating-a-pipeline)).
 
 Delete works only on a pipeline that is registered in the running server. See
 [Restarts and recreating a pipeline](#restarts-and-recreating-a-pipeline) for a
@@ -349,13 +373,18 @@ from the resume position on.
 
 **To start fresh:**
 
-- Use a **new source id**. It has no retained checkpoints, so the pipeline
-  starts as a first start and snapshots according to `snapshot.mode`.
-- Or, with the same source id, `DELETE` the pipeline while it is registered,
-  then create it again: with its checkpoints removed it starts as a first
-  start. After a server restart the pipeline is not registered, so `DELETE`
-  returns `404`; recreating it to delete it first resumes it from its retained
-  checkpoints (it streams until it is deleted), so prefer a new source id.
+- Use a **new source id**. No checkpoint, snapshot or continuity record is
+  retained for it, so the pipeline starts as a first start and snapshots
+  according to `snapshot.mode`. For PostgreSQL, also use a new `slot` name: the
+  slot is named in the config, not derived from the source id, and an existing
+  slot is reused from its confirmed position. This is the only supported way to
+  start fresh.
+- `DELETE` followed by a create with the same source id is **not** a fresh
+  start: Delete removes only the records listed under
+  [Delete Pipeline](#delete-pipeline), and the retained identity, lineage,
+  continuity and snapshot records may still be read. After a server restart the
+  pipeline is not registered, so `DELETE` returns `404`; recreating it in order
+  to delete it resumes it from its retained checkpoints.
 - To copy a source's data again while keeping its checkpoints, use the
   [`resnapshot` recovery operation](recovery.md#resnapshot).
 
