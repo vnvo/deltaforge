@@ -117,9 +117,15 @@ mysql)
   for _ in $(seq 120); do docker exec cap-mysql mysqladmin -uroot -prootpw ping >/dev/null 2>&1 && break; sleep 2; done
   sleep 10   # the entrypoint restarts mysqld once after initialising
   for _ in $(seq 60); do docker exec cap-mysql mysql -uroot -prootpw -e 'select 1' >/dev/null 2>&1 && break; sleep 2; done
+  # The documented grants (docs/src/sources/mysql.md), including the fresh
+  # CDC start's capture boundary: BACKUP_ADMIN and performance_schema.log_status.
   docker exec cap-mysql mysql -uroot -prootpw -e "CREATE USER 'df'@'%' IDENTIFIED BY 'dfpw';
-    GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'df'@'%'; GRANT SELECT, SHOW VIEW ON \`cust_%\`.* TO 'df'@'%';" \
+    GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'df'@'%'; GRANT SELECT, SHOW VIEW ON \`cust_%\`.* TO 'df'@'%';
+    GRANT BACKUP_ADMIN ON *.* TO 'df'@'%'; GRANT SELECT ON performance_schema.log_status TO 'df'@'%'; FLUSH PRIVILEGES;" \
     || die "mysql: df user not created"
+  docker exec cap-mysql mysql -uroot -prootpw -N -e "SHOW GRANTS FOR 'df'@'%'" > "$C/cap-mysql-$size.grants" \
+    && grep -q BACKUP_ADMIN "$C/cap-mysql-$size.grants" && grep -q 'performance_schema`.`log_status' "$C/cap-mysql-$size.grants" \
+    || die "mysql: df grants incomplete (see cap-mysql-$size.grants)"
   log "mysql $size up: container $(cat "$C/cap-mysql-$size.id") volume cap-mysql-$size"
   ;;
 fixture)
@@ -141,6 +147,14 @@ drop)
   id=$(cat "$C/cap-mysql-$size.id") || die "no container id recorded for size $size"
   [ "$(docker inspect --format '{{.Id}} {{range .Mounts}}{{.Name}}{{end}}' cap-mysql)" = "$id cap-mysql-$size" ] \
     || die "cap-mysql is not the size-$size container with volume cap-mysql-$size"
+  # Only after every run of this size has its evidence verified.
+  [ -s "$C/fixture-a$size.log" ] || die "drop: no fixture log for size $size"
+  for r in "$C"/runs/[a-z]*"$size"/ "$C"/runs/[a-z]*"$size"-*/; do
+    [ -d "$r" ] || continue
+    (cd "$r" && [ -s MANIFEST.sha256 ] && sha256sum -c --quiet MANIFEST.sha256) \
+      || die "drop: evidence of $(basename "$r") does not verify"
+    log "drop: evidence of $(basename "$r") verified"
+  done
   before=$(avail)
   docker rm -f "$id" >/dev/null && docker volume rm "cap-mysql-$size" >/dev/null || die "drop failed"
   log "dropped size $size: container $id volume cap-mysql-$size free $before -> $(avail)"
@@ -175,28 +189,69 @@ run)
   for _ in $(seq 50); do hp=$(pgrep -P "$fw" -f fleet-harness) && break; sleep 0.2; done
   "$C/kit/watch.sh" "$inv" "$hp" &
   wp=$!
-  case $phase in B|BR) python3 "$C/kit/frontier.py" B "$inv" "${ACTIVE[$size]}" --live "$hp" > live.log 2>&1 & ;; esac
+  topic=cap.$name
+  case $phase in B|BR) python3 "$C/kit/frontier.py" B "$inv" "${ACTIVE[$size]}" --live "$hp" "$topic" "$KAFKA" > live.log 2>&1 & ;; esac
   wait "$fw"; rc=$?
   echo "$rc" > floor-watch.rc
   wait
-  finish "$phase" "$name" "$s" "$rc"
-  inc=$(curl -sf -m 10 http://127.0.0.1:19010/metrics | awk '/^deltaforge_incidents_raised_total[{ ]/{s += $NF} END {print s + 0}') || inc=unreadable
-  python3 - "$inc" "$started" > end-state.json <<PY
-import json, subprocess, sys
-inc, started = sys.argv[1], sys.argv[2]
-i = json.loads(subprocess.check_output(["docker", "inspect", "cap-df"]))[0]
-print(json.dumps({"incidents": float(inc) if inc != "unreadable" else None,
-                  "restarted": i["RestartCount"] != 0 or i["State"]["StartedAt"] != started or not i["State"]["Running"],
-                  "oom_killed": i["State"]["OOMKilled"]}))
+  # End state. A failed HTTP request, read or parse leaves the value unknown
+  # (null, with the error), never zero; the scraped body is kept as evidence.
+  python3 - "$started" > end-state.json <<'PY'
+import json, re, subprocess, sys, urllib.request
+started, out = sys.argv[1], {}
+try:
+    with urllib.request.urlopen("http://127.0.0.1:19010/metrics", timeout=10) as r:
+        if r.status != 200:
+            raise RuntimeError(f"HTTP {r.status}")
+        body = r.read().decode()
+    open("metrics-end.txt", "w").write(body)
+    inc, families = 0.0, set()
+    for line in body.splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        m = re.fullmatch(r'([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+(\S+)(\s+-?\d+)?\s*', line)
+        if not m:
+            raise ValueError(f"unparseable metrics line: {line[:200]!r}")
+        families.add(m.group(1))
+        if m.group(1) == "deltaforge_incidents_raised_total":
+            inc += float(m.group(3))
+    # The incident counter exists only once raised; its absence is zero only
+    # in a complete scrape of this run's instance, shown by its sink counter.
+    if "deltaforge_sink_events_total" not in families:
+        raise ValueError("deltaforge_sink_events_total absent: not a complete scrape of this run")
+    out.update(incidents=inc, incidents_read="ok")
+except Exception as e:
+    out.update(incidents=None, incidents_read=f"{type(e).__name__}: {e}")
+try:
+    i = json.loads(subprocess.check_output(["docker", "inspect", "cap-df"]))[0]
+    out.update(restarted=i["RestartCount"] != 0 or i["State"]["StartedAt"] != started or not i["State"]["Running"],
+               oom_killed=i["State"]["OOMKilled"], inspect_read="ok")
+except Exception as e:
+    out.update(restarted=None, oom_killed=None, inspect_read=f"{type(e).__name__}: {e}")
+print(json.dumps(out))
 PY
   docker logs -t cap-df > df.log 2>&1
   for c in cap-df cap-mysql cap-kafka; do docker inspect "$c" > "inspect-$c.json"; done
   docker stop cap-df >/dev/null && docker rename cap-df "cap-df-$name"
-  # The verified run's topic: its data is not evidence and holds disk.
-  docker exec cap-kafka kafka-topics --bootstrap-server localhost:29092 --delete --topic "cap.$name" >> run.log 2>&1
+  # Coverage from the retained topic, then the evaluation; the topic stays.
+  python3 "$C/kit/frontier.py" coverage "$inv" "${ACTIVE[$size]}" "$topic" "$KAFKA" | tee -a "$C/campaign.log"
   python3 "$C/kit/frontier.py" "${phase/BR/B}" "$inv" "${ACTIVE[$size]}" | tee -a "$C/campaign.log"
   vrc=${PIPESTATUS[0]}
   find . -type f ! -name MANIFEST.sha256 ! -path './state/*' -print0 | sort -z | xargs -0 sha256sum > MANIFEST.sha256
+  finish "$phase" "$name" "$s" "$rc"
+  # The topic is deleted only after the completeness evaluation and a
+  # verified manifest, and only when the verdict marks it deletable (no
+  # failure, evidence complete, coverage established). Otherwise it stays.
+  if sha256sum -c --quiet MANIFEST.sha256 \
+     && python3 -c 'import json,sys; sys.exit(0 if json.load(open("verdict.json")).get("topic_deletable") is True else 1)'; then
+    if docker exec cap-kafka kafka-topics --bootstrap-server localhost:29092 --delete --topic "$topic" >> "$C/topics.log" 2>&1; then
+      log "deleted topic $topic of verified run $name"
+    else
+      log "topic $topic: deletion failed (kept)"
+    fi
+  else
+    log "topic $topic kept: verdict not deletable or manifest unverified"
+  fi
   [ "$rc" = 3 ] && exit 3
   exit "$vrc"
   ;;

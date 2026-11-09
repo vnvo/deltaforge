@@ -188,17 +188,19 @@ How the numbers were fixed:
 
 ### Activation completion
 
-DeltaForge logs a `window` proof-trace record for each activation window. Its `tables` field counts the tables the window activated, with deferred tables excluded, and the record carries the commit time.
+Completion is established from distinct table identities in the run's retained Kafka events, not from a sum of per-window counts. A sum, even one equal to the target, cannot exclude repeated activations and untouched tables.
 
-- **Completion** is the commit time of the window at which the running sum reaches the active set: 40,000, 80,000 or 120,000 tables, exactly ceil(0.4 x catalog).
-- **Not established:** a final sum different from the active set leaves completion not established, and that run's throughput is not evaluated.
-- **Checked on G3:** in G3's S3 log, the window sums equal its 400-table active set.
-- **Where it is read:** from the container's log (`df.log`, saved per run). The harness's trace file keeps only proof records, and they carry no time.
+- **Coverage pass.** After the run, before any deletion, `frontier.py coverage` reads the run's whole topic with the pinned Kafka image's console consumer and records, for each source table (`source.db`, `source.table`), the earliest record timestamp. The record count must equal the sum of the topic's end offsets. The consumer must report its total, and every record must parse.
+- **Completion** is the latest of those first appearances, once exactly the active set has appeared: 40,000, 80,000 or 120,000 distinct tables, exactly ceil(0.4 x catalog). A record is produced only after its table's activation, so the boundary is never earlier than activation.
+- **Why distinct delivery means coverage.** The writers only touch the active set, and the completeness check proves every committed change was delivered with nothing unexpected. So exactly that many distinct delivered tables means every active table was captured.
+- **Not established:** a different number of distinct tables leaves completion not established. That run's throughput is not evaluated and its topic is kept.
+- **Incomplete:** a short read, a missing consumer total or an unreadable record leaves the evidence incomplete. The run is inconclusive and its topic is kept.
+- **Reported only:** the product's `window` records (`df.log`) are summarized, never used as the boundary.
 
 How each phase uses it:
 
 - **Phase A:** the measured window is from completion to the end of writes, and must be at least 600 s. Otherwise the size did not activate within its allowance and is not viable.
-- **Phase B:** a step is measured only if completion precedes its measured window.
+- **Phase B:** a step is measured only if completion precedes its measured window. Live mode follows the topic with the same parser only until coverage is complete, which happens during warm-up, so no reader runs during the measured steps.
 - **Phase C:** the measured window starts at the later of warm-up end and completion, and must be 2,700 s. Otherwise the confirmation is reported as unconfirmed.
 
 ### Step transitions
@@ -230,6 +232,13 @@ The criteria are those defined above:
 3. **Resource exhaustion:** `MEMFLOOR`, `OOM` or the disk floor.
 4. **Correctness or health failure:** the result's correctness or evidence fails; any missing, duplicate, unexpected, final-state, ordering, decode or key error; a failed pipeline; any incident; or an instance restart.
 
+**Unknown is never zero.**
+
+- **Delivery samples:** a window is judged only when every sample in it carries delivery counters and no gap exceeds 30 s. Otherwise its delivery is unknown: Phase A and C are inconclusive, and in Phase B the step is "evidence incomplete" and caps the frontier below it.
+- **End state:** incidents are read from the final metrics scrape with HTTP, read and parse errors kept. An HTTP error, an unparseable line, or a scrape without `deltaforge_sink_events_total` leaves incidents unknown, with the error recorded. The incident counter exists only once raised, so its absence counts as zero only in a complete scrape. The scrape is saved as `metrics-end.txt`. An unreadable restart state is unknown in the same way.
+- **Result:** an absent completeness check or stream summary is incomplete, not a pass.
+- **Verdict:** any unknown leaves the run inconclusive with `evidence_complete: false`. It is never a pass and never a failure.
+
 **Generator check:** committed below 95% of offered is reported as a generator limit, or as a MySQL limit when MySQL is at 90% or more of its 3 CPUs. It is never saturation.
 
 **Attribution** of a saturated step:
@@ -249,14 +258,16 @@ The harness measures neither commit latency nor produce latency, so CPU and lag 
 | 2 | correctness or health failure (ends the campaign) |
 | 3 | inconclusive |
 
-**Live mode (Phase B).** The evaluator follows the run and sends SIGINT after the first measured step that is saturated or generator-limited. The harness's abort path still stops the writers, drains, and checks completeness.
+**Live mode (Phase B).** The evaluator follows the run and sends SIGINT after the first measured step that is saturated or generator-limited. It also sends SIGINT when its reader has passed step 2's window start without complete coverage (`ACTIVATION-STOP`), since no later step could then be measured. A step stays undecided while coverage is unknown. The harness's abort path still stops the writers, drains, and checks completeness.
 
-**Self-tests on synthetic runs:**
+**Self-tests on synthetic runs** (a docker shim stands in for the Kafka tools; no container is touched):
 
-- **Saturation:** a staircase saturated at 32,000 was reported viable through 16,000, saturated at 32,000, and a DeltaForge limit.
-- **Activation:** an over-counted activation was inconclusive.
-- **Stops:** a deadline stop was evaluated; an aborted run without a stop marker failed.
-- **Live:** live mode stopped the run in the saturated step.
+- **Saturation:** a staircase saturated at 32,000 was reported viable through 16,000, saturated at 32,000, and a DeltaForge limit; transitions were exact.
+- **Coverage:** repeated tables were counted once and the earliest timestamp kept. Thirty tables activated repeatedly did not reach 40. A short read, a missing consumer total and an unreadable record were each incomplete.
+- **Activation:** product windows summing to the target, with fewer distinct tables, did not establish activation. Steps before coverage were not measured.
+- **Unknowns:** a window with missing delivery samples was evidence incomplete and capped the frontier below it. Unreadable incidents, an unknown restart state, an incomplete coverage read and an absent completeness check were inconclusive. A raised incident was a failure.
+- **End-state reader** (the script in `campaign.sh`, against a local server): a refused connection, HTTP 500, an unparseable body and a scrape without the sink counter were all unknown. A complete scrape without incidents read zero, and raised incidents were summed.
+- **Live:** stopped in the saturated step. Stopped on activation when its reader passed step 2 with 30 of 40 tables. A lagging reader did not stop the run.
 
 ### Floors and deadlines (enforced by `campaign.sh`)
 
@@ -294,21 +305,29 @@ Exit 2 at any step ends the campaign.
 
 - the harness result (`result.json`, `samples.jsonl`, proof trace);
 - `df.log`, `resources.jsonl`, `run.log`, `live.log`;
-- `verdict.json`, `end-state.json`, the container inspections;
+- `verdict.json`, `end-state.json`, `coverage.json`, `metrics-end.txt`, the container inspections;
 - `MANIFEST.sha256`.
 
 **Per campaign:** `campaign.log`, `clock.log`, `identity.txt`, `IDENTITY.sha256` and the fixture logs.
 
-**Containers and topics:** DeltaForge containers are kept stopped (`cap-df-<run>`). Each run's Kafka topic is deleted after its completeness check.
+**Containers and topics:** DeltaForge containers are kept stopped (`cap-df-<run>`). After each run, in this order:
 
-### Before the campaign: inputs to review
+1. the end state, logs and inspections;
+2. the coverage pass over the retained topic;
+3. the evaluation;
+4. `MANIFEST.sha256`, then verified with `sha256sum -c`;
+5. the topic is deleted only if the manifest verifies and the verdict is `topic_deletable`: no failure, evidence complete, coverage established. A failed, incomplete or unestablished run keeps its topic. Each deletion or retention is logged.
 
-1. **Disk does not reach the start floor today.**
-   - **Free now:** 14.8 GB. The standing approval (`deltaforge-build/target/debug/{incremental,deps}`, 30.1 GB) brings it to 44.9 GB (41.8 GiB).
-   - **Needed before each size's fixture**, at about 110 KiB per empty table (measured at A100), with the previous size dropped: about 60.5 GiB for `a100`, 71 GiB for `a200`, 82 GiB for `a300`.
-   - **Candidate removals needing approval:** G3's stopped `g3-mysql` (`8c2583bcb53e`, volume `g3-mysql`, 14.99 GB) and `g3-kafka` (`9eae6edcb912`, volume `47d5feb87e0e`, 4.2 GB). G3 is accepted and its evidence is kept in `~/deltaforge-evidence/qualification-42d3f77e`. Also `target/release` (2.66 GB), after the harness copy.
-   - **With those removals:** about 62 GiB, so A100 fits and A200 does not under the rule as implemented. No further cleanup is proposed.
-2. **Reading of the 50 GiB start floor.** As implemented, it applies to every invocation. If it applied only at each size's fixture build, with runs bounded by the 25 GiB floor, A200 would also fit (about 39 GiB free after its fixture). This needs a decision.
-3. **Removals inside the campaign:** approval for `campaign.sh drop <size>` (the campaign's own MySQL container and volume, by the ids logged at creation) and for deleting each checked run's topic.
-4. **Phase B is likely to end on disk.** At 1.8 KiB of disk per committed change (G3 A2 and A3), a run starting at 50 GiB has 25 GiB of headroom, about 14.5 million changes. At A100, the warm-up and the steps through 16,000 take about 10.6 million. Unless DeltaForge saturates earlier, the staircase is expected to reach the disk floor in the 32,000 step, which is a host limit.
-5. **Host sharing:** the k3d test cluster runs on this host and is allowed by the preflight, which records it. Stopping it is your call.
+**MySQL fixtures:** `drop <size>` removes the campaign's MySQL container and volume by the ids recorded at creation. It does so only after that size's fixture log exists and every run of that size verifies against its manifest.
+
+### Decisions (reviewed)
+
+- **Grants.** `mysql` creates `df` with the documented grants, including the fresh CDC start's `BACKUP_ADMIN` and `SELECT` on `performance_schema.log_status`, and refuses unless `SHOW GRANTS` shows both.
+- **Disk floors.** 50 GiB free (53,687,091,200 bytes) at every fixture-build and run start, plus the continuous 25 GiB floor.
+- **Approved cleanup before setup:**
+  - G3's stopped `g3-mysql` (`8c2583bcb53e`, volume `g3-mysql`) and `g3-kafka` (`9eae6edcb912`, volume `47d5feb87e0e`), after verifying full ids, mounts and preserved evidence;
+  - `df-capacity-plan/target`, after the build, open-handle and artifact checks.
+- **Within the campaign:** `drop` of campaign fixtures by recorded ids after their evidence verifies, and topic deletion as above.
+- **Host limit.** If disk prevents A200 or A300, or stops the staircase, that is reported as a host limit. Floors are not weakened and no further cleanup is done to force progress. Phase B is expected to reach the disk floor in the 32,000 step (25 GiB of headroom at 1.8 KiB per change is about 14.5 million changes), unless DeltaForge saturates first.
+- **Host sharing:** the k3d test cluster is allowed by the preflight and recorded.
+- **Cap:** the eight-hour campaign cap is unchanged.
