@@ -2242,71 +2242,66 @@ async fn full_fallback(
         "{}/capture",
         ctx.source_id
     ));
-    let (capture_ctx, scanner, boundary, source_id, lctn) = (
-        &ctx.capture,
-        &ctx.proof_scanner,
-        ctx.txn_eval_cp.as_ref(),
-        ctx.source_id.as_str(),
-        ctx.lower_case_table_names,
-    );
-    let (uuid, lineage_hash) = (server_uuid.as_str(), lineage.as_str());
-    let capture = move || async move {
-        match capture_proven(
-            capture_ctx,
-            server_id,
-            uuid,
-            lineage_hash,
-            db,
-            table,
-            lctn,
-            CAPTURE_ATTEMPTS,
-            &ScanLimits::default(),
-            None,
-            &super::mysql_binlog_scan::ScanTag {
-                source_id,
-                kind: super::mysql_binlog_scan::ProofKind::FullFallback,
-            },
-            Some(super::mysql_binlog_scan::SharedProofs {
-                scanner,
-                boundary,
-                // The capture interval starts at the capture's own position
-                // read, never a stream boundary: no stream anchor.
-                anchor: None,
-            }),
-        )
-        .await?
-        {
-            Ok(mut cap) => {
-                if cap.position.gtid_set.is_some()
-                    && let Some(set) = crate::stream_probe::full_capture_lag()
-                {
-                    cap.position.gtid_set = Some(set);
-                }
-                let at = cap.position.clone();
-                Ok((cap, at))
-            }
-            Err(ProofError::OtherServer(found)) => Err(SourceError::Lineage {
-                details: format!("a schema capture reached another server ({found}), expected {uuid}").into(),
-            }),
-            Err(e) => Err(fail(
-                db,
-                table,
-                &format!("no proven live capture ({e})"),
-            )),
-        }
-    };
     use super::mysql_behind_wait::{
         BEHIND_WAIT, NotAfter, WaitError, capture_at_or_after,
     };
-    let cap = match capture_at_or_after(
-        &row_cp,
-        &ctx.cancel,
-        BEHIND_WAIT,
-        capture,
-        reads,
-    )
-    .await
-    {
+    let done = {
+        // Shared by every capture and the wait.
+        let ctx: &RunCtx = ctx;
+        let (uuid, lineage_hash) = (server_uuid.as_str(), lineage.as_str());
+        let capture = move || async move {
+            match capture_proven(
+                &ctx.capture,
+                server_id,
+                uuid,
+                lineage_hash,
+                db,
+                table,
+                ctx.lower_case_table_names,
+                CAPTURE_ATTEMPTS,
+                &ScanLimits::default(),
+                None,
+                &super::mysql_binlog_scan::ScanTag {
+                    source_id: &ctx.source_id,
+                    kind: super::mysql_binlog_scan::ProofKind::FullFallback,
+                },
+                Some(super::mysql_binlog_scan::SharedProofs {
+                    scanner: &ctx.proof_scanner,
+                    boundary: ctx.txn_eval_cp.as_ref(),
+                    // The capture interval starts at the capture's own position
+                    // read, never a stream boundary: no stream anchor.
+                    anchor: None,
+                }),
+            )
+            .await?
+            {
+                Ok(mut cap) => {
+                    if cap.position.gtid_set.is_some()
+                        && let Some(set) = crate::stream_probe::full_capture_lag()
+                    {
+                        cap.position.gtid_set = Some(set);
+                    }
+                    let at = cap.position.clone();
+                    Ok((cap, at))
+                }
+                Err(ProofError::OtherServer(found)) => Err(SourceError::Lineage {
+                    details: format!(
+                        "a schema capture reached another server ({found}), \
+                         expected {uuid}"
+                    )
+                    .into(),
+                }),
+                Err(e) => Err(fail(
+                    db,
+                    table,
+                    &format!("no proven live capture ({e})"),
+                )),
+            }
+        };
+        capture_at_or_after(&row_cp, &ctx.cancel, BEHIND_WAIT, capture, reads)
+            .await
+    };
+    let cap = match done {
         Ok(cap) => cap,
         Err(NotAfter::Capture(e)) => return Err(e),
         Err(NotAfter::Wait(WaitError::Cancelled)) => {
