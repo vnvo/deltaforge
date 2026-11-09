@@ -9,6 +9,8 @@
 #   MEMFLOOR    host MemAvailable falls below 4 GiB (4,294,967,296 bytes);
 #   OOM         a campaign container was OOM-killed or stopped running;
 #   FAILCLOSED  the run's pipeline failed (its incidents are saved).
+# It also records the source's binlog table maps (`table_maps`: the
+# `deltaforge_mysql_table_maps` gauges and installed counters by map).
 # Unreadable values are logged as null, never as healthy.
 #   watch.sh <run dir> <harness pid>
 set -u
@@ -30,14 +32,24 @@ while kill -0 "$PID" 2>/dev/null; do
   pl=$(curl -sf -m 5 http://127.0.0.1:18090/pipelines | python3 -c 'import json,sys
 try: print(" ".join("%s=%s" % (p.get("name"), p.get("status")) for p in json.load(sys.stdin)))
 except Exception: print("unreadable")')
-  python3 - "$now" "${mem:-}" "[${stats}]" "$state" "$head" "${cpu:-}" "$pl" >> "$DIR/resources.jsonl" <<'PY'
+  maps=$(curl -sf -m 5 http://127.0.0.1:19010/metrics | python3 -c 'import json, re, sys
+out = {}
+for line in sys.stdin:
+    m = re.match(r"(deltaforge_mysql_table_maps(?:_installed_total)?)\{[^}]*map=\"(\w+)\"[^}]*\} (\S+)$", line.strip())
+    if m:
+        out[("installed_" if m.group(1).endswith("_total") else "") + m.group(2)] = float(m.group(3))
+print(json.dumps(out) if out else "null")' 2>/dev/null)
+  python3 - "$now" "${mem:-}" "[${stats}]" "$state" "$head" "${cpu:-}" "$pl" "${maps:-null}" >> "$DIR/resources.jsonl" <<'PY'
 import json, sys
-at, mem, stats, state, head, cpu, pl = sys.argv[1:]
+at, mem, stats, state, head, cpu, pl, maps = sys.argv[1:]
 try: stats = json.loads(stats)
 except Exception: stats = None
+try: maps = json.loads(maps)
+except Exception: maps = None
 print(json.dumps({"at": at, "mem_available": int(mem) if mem else None, "docker_stats": stats,
                   "containers": state or None, "mysql": head or None,
-                  "harness_cpu_ticks": int(cpu) if cpu else None, "pipelines": pl}))
+                  "harness_cpu_ticks": int(cpu) if cpu else None, "pipelines": pl,
+                  "table_maps": maps}))
 PY
   if [ -n "$mem" ] && [ "$mem" -lt "$FLOOR" ]; then
     echo "$now MemAvailable=$mem < $FLOOR" > "$DIR/MEMFLOOR"; stop; break

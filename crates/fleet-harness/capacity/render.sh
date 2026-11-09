@@ -6,6 +6,7 @@
 #   br{100,200,300}.yaml       Phase B generator remedy (8 rows per transaction)
 #   c{100,200,300}-<rate>.yaml Phase C confirmation at each possible step rate
 #   a001.yaml                  tooling validation only (100 tables, 6 minutes)
+#   a100c.yaml                 the A100 confirmation of the table-map fix (a100, 35 minutes)
 # The output is fixed: CONFIGS.sha256 lists its hashes, and the run wrapper
 # refuses a configuration whose hash differs.
 set -eu
@@ -87,6 +88,9 @@ EOF
 }
 
 emit a001 5 F0 0 360 2000 1 "" 20
+# a100's catalog, active set and traffic, run long enough to observe at
+# least 20 minutes after activation (about 6 minutes at A100).
+emit a100c 50 F0 0 2100 2000 1 ""
 
 STEPS="2000, 4000, 8000, 16000, 32000, 64000"
 # size tables phase-A duration (activation allowance + 600 measured seconds)

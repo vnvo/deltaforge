@@ -16,12 +16,16 @@
 set -u
 KIT=$(cd "$(dirname "$0")" && pwd)
 C=${CAMPAIGN_DIR:-$HOME/deltaforge-evidence/capacity-rc1}
+# The product image: the published RC by digest, unless setup was given a
+# local build (CAP_IMAGE), which is then pinned by its image id. Every later
+# step uses what setup recorded.
 IMAGE=ghcr.io/vnvo/deltaforge@sha256:63823feac0c30805072b1b3b4a87544d64b77af22a2a6bbf43ece5e7f919b0d9
+[ -f "$C/image.ref" ] && IMAGE=$(cat "$C/image.ref")
 MYSQL=mysql@sha256:c36050afdca850f23cef85703f84c7531a5ae155a11b5ee1c60acb09937c4084
 KAFKA=confluentinc/cp-kafka@sha256:fbbb6fa11b258a88b83f54d4f0bddfcffbf2279f99d66a843486e3da7bdfbf41
 NEED_FIXTURE=53687091200  # 50 GiB, byte-exact, before each fixture build
 NEED_RUN=42949672960      # 40 GiB, byte-exact, before each measured run
-PRIOR_BPT=112640          # 110 KiB per empty table, the estimate until A100 measures it
+PRIOR_BPT=146597          # bytes per empty table, measured at A100 (2026-11-09), until a campaign measures its own
 MEMFLOOR=4294967296       # 4 GiB available memory
 TOTAL_CAP=28800           # 8 hours from T0
 REPORT=900                # the last 15 minutes are the report's
@@ -29,7 +33,6 @@ declare -A BUDGET=([F]=2700 [A]=10800 [B]=9000 [BR]=9000 [C]=5400 [V]=600)
 declare -A ACTIVE=([001]=40 [100]=40000 [200]=80000 [300]=120000)
 declare -A TABLES=([001]=100 [100]=100000 [200]=200000 [300]=300000)
 declare -A ALLOW=([100]=780 [200]=1500 [300]=2220)      # Phase B warm-up (Phase A activation allowance)
-declare -A ADEAD=([100]=2880 [200]=3600 [300]=4320)     # Phase A: duration + 600 drain + 900
 
 log() { echo "$(date -Is) $*" | tee -a "$C/campaign.log"; }
 die() { log "REFUSED: $1"; exit "${2:-3}"; }
@@ -37,8 +40,13 @@ avail() { df -B1 --output=avail "$C" "$(docker info --format '{{.DockerRootDir}}
 
 identity() {
   (cd "$C" && sha256sum -c --quiet IDENTITY.sha256) || die "identity: a pinned file changed"
-  [ "$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE" 2>/dev/null)" = "$IMAGE" ] \
-    || die "identity: $IMAGE is not the local image"
+  [ "$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null)" = "$(cat "$C/image.id")" ] \
+    || die "identity: $IMAGE is not the pinned image $(cat "$C/image.id")"
+  case $IMAGE in
+    *@sha256:*)
+      [ "$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE" 2>/dev/null)" = "$IMAGE" ] \
+        || die "identity: $IMAGE is not the local image" ;;
+  esac
 }
 
 # Time used by a phase (BR shares B's budget) and since T0.
@@ -81,14 +89,26 @@ setup)
   cp -a "$KIT/../qualification/floor-watch.sh" "$C/kit/"
   "$KIT/render.sh" "$C/configs"
   (cd "$C/configs" && sha256sum -c --quiet ../kit/CONFIGS.sha256) || { echo "rendered configs differ from CONFIGS.sha256"; exit 3; }
-  docker pull "$IMAGE" >/dev/null && docker pull "$MYSQL" >/dev/null && docker pull "$KAFKA" >/dev/null
-  (cd "$C" && sha256sum bin/fleet-harness kit/* configs/* > IDENTITY.sha256)
+  IMAGE=${CAP_IMAGE:-$IMAGE}
+  case $IMAGE in
+    *@sha256:*) docker pull "$IMAGE" >/dev/null || { echo "pull failed: $IMAGE"; exit 3; } ;;
+    *) docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "no local image $IMAGE"; exit 3; } ;;
+  esac
+  docker pull "$MYSQL" >/dev/null && docker pull "$KAFKA" >/dev/null
+  echo "$IMAGE" > "$C/image.ref"
+  docker image inspect --format '{{.Id}}' "$IMAGE" > "$C/image.id"
+  # Each campaign's Kafka data in its own volume (an earlier campaign's,
+  # with any topic it kept, is never reused).
+  KVOL=cap-kafka-$(basename "$C")
+  docker volume inspect "$KVOL" >/dev/null 2>&1 && { echo "volume $KVOL exists"; exit 3; }
+  (cd "$C" && sha256sum bin/fleet-harness image.ref image.id kit/* configs/* > IDENTITY.sha256)
   {
     echo "product $IMAGE platform $(docker image inspect --format '{{.Os}}/{{.Architecture}} {{.Id}}' "$IMAGE")"
     echo "harness $(sha256sum "$C/bin/fleet-harness" | cut -d' ' -f1) from $(git -C "$KIT" rev-parse HEAD)"
-    echo "mysql $MYSQL"; echo "kafka $KAFKA"
+    echo "mysql $MYSQL"; echo "kafka $KAFKA volume $KVOL"
   } > "$C/identity.txt"
-  docker network create cap >/dev/null || { echo "network cap could not be created"; exit 3; }
+  docker network inspect cap >/dev/null 2>&1 || docker network create cap >/dev/null \
+    || { echo "network cap could not be created"; exit 3; }
   docker run -d --name cap-kafka --network cap --cpus 2 --memory 3g -p 127.0.0.1:9405:9405 \
     -e KAFKA_NODE_ID=1 -e KAFKA_PROCESS_ROLES=broker,controller -e CLUSTER_ID=MkU3OEVBNTcwNTJENDM2Qg \
     -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:29093 -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
@@ -98,7 +118,7 @@ setup)
     -e KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT -e KAFKA_AUTO_CREATE_TOPICS_ENABLE=false \
     -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
     -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
-    -v cap-kafka:/var/lib/kafka/data "$KAFKA" > "$C/cap-kafka.id" || { echo "cap-kafka could not be started"; exit 3; }
+    -v "$KVOL:/var/lib/kafka/data" "$KAFKA" > "$C/cap-kafka.id" || { echo "cap-kafka could not be started"; exit 3; }
   date +%s > "$C/T0"; : > "$C/clock.log"
   echo "setup $(date -Is) T0=$(cat "$C/T0")" >> "$C/campaign.log"
   ;;
@@ -172,7 +192,10 @@ run)
   phase=$2 name=$3
   size=$(echo "$name" | sed -E 's/^[a-z]+([0-9]{3}).*/\1/')
   case $phase in
-    A)    deadline=${ADEAD[$size]}; drain=600 ;;
+    # Phase A: the configuration's duration, 600 s of drain and 900 s.
+    A)    dur=$(awk '$1 == "duration_secs:" {print $2}' "$C/configs/$name.yaml")
+          [ -n "$dur" ] || die "no duration in $name.yaml"
+          deadline=$(( dur + 600 + 900 )); drain=600 ;;
     B|BR) deadline=$(( ${ALLOW[$size]} + 1800 + 1800 + 900 )); drain=1800 ;;
     C)    deadline=5400; drain=900 ;;
     V)    deadline=600; drain=120 ;;
