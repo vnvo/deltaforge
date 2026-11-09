@@ -3631,4 +3631,164 @@ pub(crate) mod tests {
         );
         assert_eq!(ctx.last_file, "mysql-bin.000042");
     }
+
+    /// Retention of binlog table maps. MySQL gives a table a new
+    /// `table_id` each time it reopens it after evicting it from its table
+    /// definition cache, so an active set larger than that cache sees a
+    /// new id on most transactions. A mapping is needed only to decode the
+    /// rows events that follow it in the same transaction (MySQL writes a
+    /// TABLE_MAP before every statement's rows), so the maps must not grow
+    /// with the number of transactions.
+    mod table_map_retention {
+        use super::*;
+        use mysql_binlog_connector_rust::binlog_parser::BinlogParser;
+        use mysql_binlog_connector_rust::event::xid_event::XidEvent;
+        use std::io::Cursor;
+
+        const TRANSACTIONS: u64 = 10_000;
+
+        /// One binlog event (v4 header, no checksum) around `body`.
+        fn event(event_type: u8, body: &[u8]) -> Vec<u8> {
+            let len = (19 + body.len()) as u32;
+            let mut e = Vec::with_capacity(len as usize);
+            e.extend_from_slice(&1_700_000_000u32.to_le_bytes());
+            e.push(event_type);
+            e.extend_from_slice(&1u32.to_le_bytes());
+            e.extend_from_slice(&len.to_le_bytes());
+            e.extend_from_slice(&0u32.to_le_bytes());
+            e.extend_from_slice(&0u16.to_le_bytes());
+            e.extend_from_slice(body);
+            e
+        }
+
+        /// TABLE_MAP_EVENT for `shop.orders` under `table_id`: one
+        /// nullable BIGINT column.
+        fn table_map(table_id: u64) -> Vec<u8> {
+            let mut b = table_id.to_le_bytes()[..6].to_vec();
+            b.extend_from_slice(&0u16.to_le_bytes());
+            for name in ["shop", "orders"] {
+                b.push(name.len() as u8);
+                b.extend_from_slice(name.as_bytes());
+                b.push(0);
+            }
+            b.push(1); // column count
+            b.push(mysql_binlog_connector_rust::column::column_type::ColumnType::LongLong as u8);
+            b.push(0); // metadata length (BIGINT has none)
+            b.push(0b1); // nullable bits
+            event(19, &b)
+        }
+
+        /// WRITE_ROWS_EVENT v2 of one row `id` under `table_id`, ending
+        /// its statement.
+        fn write_rows(table_id: u64, id: i64) -> Vec<u8> {
+            let mut b = table_id.to_le_bytes()[..6].to_vec();
+            b.extend_from_slice(&1u16.to_le_bytes()); // STMT_END_F
+            b.extend_from_slice(&2u16.to_le_bytes()); // no extra data
+            b.push(1); // column count
+            b.push(0b1); // included columns
+            b.push(0); // null bitmap of the row
+            b.extend_from_slice(&id.to_le_bytes());
+            event(30, &b)
+        }
+
+        fn xid(n: u64) -> Vec<u8> {
+            event(16, &n.to_le_bytes())
+        }
+
+        #[test]
+        fn the_binlog_parser_keeps_table_maps_bounded_across_transactions() {
+            let mut stream = Vec::new();
+            for i in 0..TRANSACTIONS {
+                stream.extend(table_map(1_000 + i));
+                stream.extend(write_rows(1_000 + i, i as i64));
+                stream.extend(xid(i));
+            }
+            let mut parser = BinlogParser {
+                checksum_length: 0,
+                table_map_event_by_table_id: HashMap::new(),
+            };
+            let mut cursor = Cursor::new(stream);
+            let mut rows = 0u64;
+            for _ in 0..3 * TRANSACTIONS {
+                let (_, data) =
+                    parser.next(&mut cursor).expect("a valid event");
+                if let EventData::WriteRows(w) = data {
+                    // Every rows event decoded with its own transaction's map.
+                    assert_eq!(w.table_id, 1_000 + rows);
+                    assert!(matches!(
+                        w.rows[0].column_values[0],
+                        ColumnValue::LongLong(v) if v == rows as i64
+                    ));
+                    rows += 1;
+                }
+            }
+            assert_eq!(rows, TRANSACTIONS);
+            let retained = parser.table_map_event_by_table_id.len();
+            assert!(
+                retained <= 1,
+                "the parser retains {retained} table maps after {TRANSACTIONS} \
+                 committed transactions; at a transaction boundary no rows \
+                 event can still need any of them"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_source_keeps_table_maps_bounded_across_transactions() {
+            const N: u64 = 2_000;
+            let (tx, mut rx) = mpsc::channel::<SourceItem>(1024);
+            let drain =
+                tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            let mut ctx = make_runctx(tx);
+            let template = ctx.table_map[&TABLE_ID].clone();
+            ctx.table_map.clear();
+            // GTID transactions on a verified lineage, each its GTID, table
+            // map, rows and XID, dispatched as the stream dispatches them.
+            with_scope(&mut ctx).await;
+            ctx.current_gtid = None;
+            ctx.in_explicit_txn = false;
+            ctx.mark_transaction_boundary();
+            for i in 0..N {
+                let table_id = 1_000 + i;
+                let events = [
+                    EventData::Gtid(GtidEvent {
+                        flags: 0,
+                        gtid: format!("{UUID}:{}", 6 + i),
+                    }),
+                    // A table outside the allow-list: its rows are
+                    // skipped, its table map is kept like any other.
+                    EventData::TableMap(TableMapEvent {
+                        table_id,
+                        database_name: "other".to_string(),
+                        table_name: "audit".to_string(),
+                        ..template.clone()
+                    }),
+                    EventData::WriteRows(WriteRowsEvent {
+                        table_id,
+                        included_columns: vec![true, true],
+                        rows: vec![RowEvent {
+                            column_values: vec![
+                                ColumnValue::LongLong(i as i64),
+                                ColumnValue::String(b"sku".to_vec()),
+                            ],
+                        }],
+                    }),
+                    EventData::Xid(XidEvent { xid: i }),
+                ];
+                for data in events {
+                    dispatch_event(&mut ctx, &make_header(), data)
+                        .await
+                        .expect("a committed transaction dispatches");
+                }
+            }
+            let retained = ctx.table_map.len();
+            drop(ctx);
+            drain.await.unwrap();
+            assert!(
+                retained <= 1,
+                "the source retains {retained} table maps after {N} committed \
+                 transactions; at a transaction boundary no rows event can \
+                 still need any of them"
+            );
+        }
+    }
 }
