@@ -15,6 +15,14 @@
 #   cal100s.yaml               recovery check on the fixed build: cal100n's
 #                              fixture and allocations, scenario F0 at a
 #                              constant 2,000 changes/s for 840 s
+# The laptop campaign (one shared host; docs/design/fleet-capacity-plan.md,
+# "Laptop campaign"):
+#   a003.yaml                  the throughput track's fixture (2,500 tables)
+#   g003.yaml                  generator check: 2,000, 4,000 and 8,000 changes/s, 300 s each
+#   b003.yaml                  staircase on 1,000 active tables (F1)
+#   t003-<rate>.yaml           30-minute confirmation at each possible step rate (F0)
+#   k100.yaml                  catalog track: the 100,000-table fixture, 1,000
+#                              active tables, 500 changes/s for 20 minutes
 # The output is fixed: CONFIGS.sha256 lists its hashes, and the run wrapper
 # refuses a configuration whose hash differs.
 set -eu
@@ -23,7 +31,7 @@ mkdir -p "$out"
 
 # name tables scenario warmup duration rate rows_per_txn steps [databases]
 emit() {
-  local name=$1 tables=$2 scenario=$3 warmup=$4 duration=$5 rate=$6 rows=$7 steps=$8 dbs=${9:-2000}
+  local name=$1 tables=$2 scenario=$3 warmup=$4 duration=$5 rate=$6 rows=$7 steps=$8 dbs=${9:-2000} fraction=${10:-0.4}
   {
     cat <<EOF
 # Capacity campaign, run $name (rendered by capacity/render.sh; do not edit).
@@ -69,7 +77,7 @@ traffic:
   row_bytes: 256
   rows_per_txn: $rows
   zipf_exponent: 0
-  active_set: {pattern: fixed, fraction: 0.4}
+  active_set: {pattern: fixed, fraction: $fraction}
   writers_per_server: 32
 EOF
     if [ -n "$steps" ]; then
@@ -126,3 +134,15 @@ for row in "100 50 1380" "200 100 2100" "300 150 2820"; do
     emit "c$size-$rate" "$tables" F0 900 2700 "$rate" 1 ""
   done
 done
+
+# The laptop campaign. Throughput track: 50 databases of 50 tables (2,500),
+# 40% active (1,000 tables, inside MySQL's default table caches).
+emit a003 50 F0 0 600 2000 1 "" 50
+emit g003 50 F1 0 900 2000 1 "2000, 4000, 8000" 50
+emit b003 50 F1 120 1800 2000 1 "$STEPS" 50
+for rate in 2000 4000 8000 16000 32000 64000; do
+  emit "t003-$rate" 50 F0 0 1800 "$rate" 1 "" 50
+done
+# Catalog track: the kept 100,000-table fixture, 1% active (1,000 tables),
+# at low traffic.
+emit k100 50 F0 0 1200 500 1 "" 2000 0.01

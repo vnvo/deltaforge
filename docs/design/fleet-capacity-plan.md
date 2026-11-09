@@ -421,3 +421,130 @@ The resumed campaign (`~/deltaforge-evidence/capacity-resume`, product `c9257fe1
   - MySQL was resource-constrained in these configurations; the host's maximum generation capacity is unproven.
 
 Capacity runs stay paused until the activation defect is fixed.
+
+## Recovery check after the activation fix (2026-11-10)
+
+The fix (#214, merged as `025373ab`) is supported by its regression tests and its core gate on `428c5b44`: a red-then-green reproduction of the `cal100n` stop, plus held-head, repeated-deferral, timeout, cancellation and FULL-fallback cases. That is the current fix evidence.
+
+The 100,000-table recovery workload is inconclusive and is not retried:
+- **`cal100r`:** a setup failure. Scenario `F1` was rendered without rate steps; no traffic ran.
+- **`cal100s`:** stopped at 3 min 50 s. MySQL was OOM-killed at its 10 GiB limit, and DeltaForge then failed closed (`source_connect`). By then 39,996 of 40,000 tables were admitted. DeltaForge peaked at 927 MiB.
+  - The fix's path did not occur: no behind-capture deferral and no held head.
+- **Evidence:** `~/deltaforge-evidence/capacity-resume` (`RECOVERY-CRITERIA.md`, `RECOVERY-RESULT.md`).
+
+The A100 memory confirmation (`a100c`, above) stands.
+
+## Laptop campaign (single shared host, for review)
+
+The laptop is the only host. One host runs:
+- the generator (the harness);
+- MySQL;
+- Kafka;
+- DeltaForge;
+- the harness's own verifier.
+
+Every result here is therefore a result of this shared laptop under the recorded allocations. None is a production capacity ceiling.
+
+Each run's report gives the constraints of the generator, MySQL, Kafka and DeltaForge separately: offered and committed rates, CPU against each allocation, memory, MySQL table-open rates, harness CPU, lag and backlog, all from the existing samples and resource records.
+
+**Product, harness and evaluator**
+- **Product:** `deltaforge:recovery-025373ab` (image id `sha256:c3b6ba28...`, built from `025373ab`).
+- **Harness:** the pinned binary (`2caef8ac...`).
+- **Evaluator:** `frontier.py`, unchanged.
+
+**Kit changes, configuration only:**
+- **`render.sh`:**
+  - an optional active-set fraction;
+  - the configs `a003` (fixture), `g003`, `b003`, `t003-<rate>` and `k100`;
+  - every earlier config renders byte-identical.
+- **`campaign.sh`:**
+  - a 4-hour clock (`TOTAL_CAP` 14,400 s, the last 15 minutes for the report);
+  - size `003` (2,500 tables, 1,000 active, a 120 s warm-up);
+  - each run's active-table count read from its configuration;
+  - phase `GEN`, the calibration readout with no live rule: no R2, no generator stop and no remedy, so its `remedy: R1` label means the base configuration.
+- **Validated before review:** every new config passes `fleet-harness check` and `render`, and the harness's own scenario planner gives 3 steps for `g003`, 6 for `b003` and 0 for each constant-rate run.
+
+**Allocations:**
+- MySQL: 3 CPUs, 6 GiB, default table caches. The 50,000-entry caches are never applied.
+- Kafka: 2 CPUs, 3 GiB.
+- DeltaForge: 4 CPUs, 6 GiB.
+
+**Floors (unchanged):**
+- disk: 42,949,672,960 bytes free to start a run, 26,843,545,600 continuously;
+- memory: 4 GiB available on the host.
+
+### Throughput track: 2,500 tables, 1,000 active
+
+A fresh small fixture (50 databases of 50 tables). Its 1,000 active tables fit MySQL's default table caches (2,000 definitions, 4,000 open tables), so there is no table-id churn.
+
+1. **Generator check (`g003`, phase `GEN`):** 2,000, 4,000 and 8,000 changes/s, 300 s each, at most 20 minutes.
+   - **Adequate** if the readout reports no failure and keeps up (committed at least 95% of offered) at 4,000 changes/s or more.
+   - **Otherwise:** the throughput track ends as a generator limit. No remedy is applied and there is no tuning round.
+2. **Staircase (`b003`, phase B)** with its live evaluator: 2,000 up to 64,000 changes/s at 300 s per step. It stops at the first saturated or generator-limited step, or at the disk floor.
+3. **Confirmation (`t003-<rate>`, evaluated as Phase A):** 30 minutes at a constant rate.
+   - **Rate:** the staircase's highest viable step, lowered to the highest step whose projected disk use fits: rate x 1,800 s x 1,843 bytes must be at most free space at start minus the floor minus 2 GiB.
+   - **When it is skipped:** if the staircase has no viable step.
+   - **Window:** the Phase A evaluator judges from activation to the end of writes.
+
+### Catalog track: the kept 100,000-table fixture at low traffic
+
+**Run (`k100`, evaluated as Phase A):** 1,000 active tables (1%), 500 changes/s, 20 minutes. MySQL at 6 GiB with default caches. Its 1,000-table active set and default caches match the throughput track's, so a comparison with that track isolates the catalog's effect on DeltaForge: startup, activation, memory and lag.
+
+**What it adds:** the 40,000-active, 2,000 changes/s point at 100,000 tables is the existing `a100c` result.
+
+**200,000 and 300,000 tables are a host limit here.** The fixture needs about 29.3e9 or 44.0e9 bytes beyond the 100,000-table one. With that one removed (about 16.7e9 back), the host would have about 57e9 free. The 200,000 fixture would then leave about 28e9, under the 42.9e9 run floor.
+
+### Disk budget (bytes; 1,843 bytes per change, measured at A100)
+
+| Item | Bytes |
+|---|---|
+| Free now (2026-11-10) | 43,613,179,904 |
+| Standing cleanups before setup: main worktree `target/debug/{incremental,deps}`; `df-capacity-plan/target` | +2,190,761,940, +2,524,392,914; +2,341,303,156 |
+| Binlog purge of the 100,000-table fixture before `k100` (standing approval; volume 16.71e9 against about 14.66e9 of tables) | about +2.0e9, measured and recorded when done |
+| Expected free at setup | about 50.67e9 |
+| `a003` fixture: 2,500 x 146,597 | about 0.37e9 |
+| `g003`: up to 4.2M changes | up to 7.7e9; topic deleted when its verdict allows, binlogs purged before the next run |
+| `b003`: cumulative by the end of each step: 2k 1.1e9, 4k 3.3e9, 8k 7.7e9, 16k 16.6e9, 32k 34.3e9 | starting near 50e9, the continuous floor stops it in the 32,000 step. That is a disk limit, reported as such, not a DeltaForge result |
+| `t003-<rate>`, 30 minutes: 2k 6.6e9, 4k 13.3e9, 8k 26.5e9 | 8,000 fits only from about 55.4e9 free; otherwise the confirmation is at most 4,000 |
+| `k100`: 0.6M changes | about 1.1e9 |
+| `a003` fixture dropped after the throughput track (`drop 003`, evidence verified first) | about +0.4e9 back |
+
+**Not touched:** the Docker images, the remaining build cache, the earlier campaigns' kept containers, volumes and topics, and all evidence.
+
+### Schedule (at most 4 hours; every run bounded by its own deadline, and the clock refuses a run that would cross 3 h 45 min)
+
+| Start | Step | Bound |
+|---|---|---|
+| 0:00 | Standing cleanups. Rename the kept containers out of the way (non-destructive): `cap-kafka` to `cap-kafka-capacity-resume`, `cap-mysql` to `cap-mysql-a100kept`. `setup`, `mysql 003`, `fixture 003` | 10 min |
+| 0:10 | `run GEN g003` | 20 min |
+| 0:30 | If adequate: purge binlogs, `run B b003` | at most 77 min (warm-up 120 + 1,800 + drain 1,800 + 900) |
+| 1:47 | If the staircase found a viable step: purge binlogs, `run A t003-<rate>` | at most 55 min (1,800 + 600 + 900) |
+| 2:42 | `drop 003`. Rename `cap-mysql-a100kept` back to `cap-mysql`. Restore its memory limit to 6 GiB (it was raised to 10 GiB for `cal100m`). `adopt 100`, purge binlogs | 8 min |
+| 2:50 | `run A k100` | at most 45 min (1,200 + 600 + 900) |
+| 3:35 | Report | 25 min |
+
+**Stop rules:**
+- Any correctness or health failure, including a fail-closed pipeline, stops the campaign with its evidence kept. It is not retried.
+- A container OOM, or a floor or deadline stop, ends that run as an environment limit. It is not retried either.
+- If the generator check fails, the throughput track ends with no tuning round, and the catalog track still runs.
+
+### Commands (after review; `C=~/deltaforge-evidence/capacity-laptop`, `K=<#209 checkout>/crates/fleet-harness/capacity`)
+
+```
+docker rename cap-kafka cap-kafka-capacity-resume
+docker rename cap-mysql cap-mysql-a100kept
+CAP_IMAGE=deltaforge:recovery-025373ab $K/campaign.sh setup $C ~/deltaforge-evidence/capacity-resume/bin/fleet-harness
+export CAMPAIGN_DIR=$C
+$C/kit/campaign.sh mysql 003
+$C/kit/campaign.sh fixture 003
+$C/kit/campaign.sh run GEN g003
+$C/kit/campaign.sh run B b003                  # only if g003 is adequate
+$C/kit/campaign.sh run A t003-<rate>           # rate by the rule above
+$C/kit/campaign.sh drop 003
+docker rename cap-mysql-a100kept cap-mysql
+docker update --memory 6g --memory-swap 12g cap-mysql
+$C/kit/campaign.sh adopt 100 d6fcbc43b0b471e34910f9a5a0c102f482b52694a07001135968cc1be1eaaac2
+$C/kit/campaign.sh run A k100
+```
+
+**Binlog purges between runs** use the standing approval for the campaign's own fixture (`PURGE BINARY LOGS TO` the current file), recorded with the inventory, GTID state and free bytes.

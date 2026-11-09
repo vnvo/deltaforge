@@ -9,7 +9,7 @@
 #   campaign.sh drop <size>                             remove that size's MySQL container and volume
 #   campaign.sh adopt <size> <container id>             start a kept, stopped fixture container (full id)
 #   campaign.sh tune R1                                 MySQL table caches sized to the active set (50,000)
-#   campaign.sh run <A|B|BR|C|V|REC> <config name>      one run, evaluated (exit: frontier.py's)
+#   campaign.sh run <A|B|BR|C|V|REC|GEN> <config name>  one run, evaluated (exit: frontier.py's)
 #
 # Size 001 (100 tables) and phase V are the tooling validation only: a short
 # Phase A run, with the live coverage reader, in its own campaign directory.
@@ -20,6 +20,11 @@
 # invocation with its own 20-minute deadline, drain included, outside the
 # campaign clock; constant rate, no live rule (no R2), evaluated as Phase A
 # for correctness, health, activation and memory.
+# Phase GEN is the laptop campaign's generator check (`g003`): the
+# calibration's readout of its three steps, with no live rule (no R2, no
+# generator stop) and no remedy; its `remedy: R1` label then means the base
+# configuration. A run's active-table count is its configuration's
+# (databases x tables x active fraction).
 #
 # Exit 3: refused (disk start floor, identity, freshness); 6: deadline or cap.
 set -u
@@ -36,12 +41,12 @@ NEED_FIXTURE=53687091200  # 50 GiB, byte-exact, before each fixture build
 NEED_RUN=42949672960      # 40 GiB, byte-exact, before each measured run
 PRIOR_BPT=146597          # bytes per empty table, measured at A100 (2026-11-09), until a campaign measures its own
 MEMFLOOR=4294967296       # 4 GiB available memory
-TOTAL_CAP=28800           # 8 hours from T0
+TOTAL_CAP=14400           # 4 hours from T0 (the laptop campaign)
 REPORT=900                # the last 15 minutes are the report's
-declare -A BUDGET=([F]=2700 [A]=10800 [B]=9000 [BR]=9000 [C]=5400 [V]=600 [CAL]=2400 [REC]=1200)  # CAL: two 20-minute invocations (cal100, cal100m)
-declare -A ACTIVE=([001]=40 [100]=40000 [200]=80000 [300]=120000)
-declare -A TABLES=([001]=100 [100]=100000 [200]=200000 [300]=300000)
-declare -A ALLOW=([100]=780 [200]=1500 [300]=2220)      # Phase B warm-up (Phase A activation allowance)
+declare -A BUDGET=([F]=2700 [A]=10800 [B]=9000 [BR]=9000 [C]=5400 [V]=600 [CAL]=2400 [REC]=1200 [GEN]=1200)  # CAL: two 20-minute invocations (cal100, cal100m)
+declare -A ACTIVE=([001]=40 [003]=1000 [100]=40000 [200]=80000 [300]=120000)
+declare -A TABLES=([001]=100 [003]=2500 [100]=100000 [200]=200000 [300]=300000)
+declare -A ALLOW=([003]=120 [100]=780 [200]=1500 [300]=2220)      # Phase B warm-up (Phase A activation allowance)
 
 log() { echo "$(date -Is) $*" | tee -a "$C/campaign.log"; }
 die() { log "REFUSED: $1"; exit "${2:-3}"; }
@@ -242,9 +247,16 @@ run)
     CAL)  deadline=1200; drain=240 ;;
     # The recovery check: 20 minutes in all, drain included.
     REC)  deadline=1200; drain=240 ;;
+    # The generator check: 15 minutes of writes, 20 minutes in all.
+    GEN)  deadline=1200; drain=240 ;;
     *)    die "phase $phase" ;;
   esac
   identity; budget "$phase" "$deadline"; preflight "$NEED_RUN"
+  # The run's active tables, from its configuration.
+  n=$(awk '$1 == "databases_per_server:" {d = $2} $1 == "tables_per_database:" {t = $2}
+           /active_set:/ {match($0, /fraction: [0-9.]+/); f = substr($0, RSTART + 10, RLENGTH - 10)}
+           END {printf "%d", d * t * f + 0.5}' "$C/configs/$name.yaml")
+  [ "$n" -gt 0 ] || die "no active-table count in $name.yaml"
   inv=$C/runs/$name
   [ -e "$inv" ] && die "$inv exists (a run is never repeated under the same name)"
   docker ps -a --format '{{.Names}}' | grep -qx cap-df && die "cap-df exists"
@@ -301,8 +313,8 @@ run)
     done > allocations-start.txt
     "$C/kit/watch.sh" "$inv" "$hp" &
     case $phase in
-      B|BR|V) python3 "$C/kit/frontier.py" B "$inv" "${ACTIVE[$size]}" --live "$hp" "$topic" "$KAFKA" > live.log 2>&1 & ;;
-      CAL)    python3 "$C/kit/frontier.py" CAL "$inv" "${ACTIVE[$size]}" --live "$hp" "$topic" "$KAFKA" > live.log 2>&1 & ;;
+      B|BR|V) python3 "$C/kit/frontier.py" B "$inv" "$n" --live "$hp" "$topic" "$KAFKA" > live.log 2>&1 & ;;
+      CAL)    python3 "$C/kit/frontier.py" CAL "$inv" "$n" --live "$hp" "$topic" "$KAFKA" > live.log 2>&1 & ;;
     esac
   fi
   wait "$fw"; rc=$?
@@ -349,10 +361,10 @@ PY
   for c in cap-df cap-mysql cap-kafka; do docker inspect "$c" > "inspect-$c.json"; done
   docker stop cap-df >/dev/null && docker rename cap-df "cap-df-$name"
   # Coverage from the retained topic, then the evaluation; the topic stays.
-  python3 "$C/kit/frontier.py" coverage "$inv" "${ACTIVE[$size]}" "$topic" "$KAFKA" | tee -a "$C/campaign.log"
-  ev=$phase; [ "$phase" = BR ] && ev=B; [ "$phase" = V ] && ev=A; [ "$phase" = REC ] && ev=A
+  python3 "$C/kit/frontier.py" coverage "$inv" "$n" "$topic" "$KAFKA" | tee -a "$C/campaign.log"
+  ev=$phase; [ "$phase" = BR ] && ev=B; [ "$phase" = V ] && ev=A; [ "$phase" = REC ] && ev=A; [ "$phase" = GEN ] && ev=CAL
   [ "$phase" = CAL ] && docker inspect --format '{{.HostConfig.NanoCpus}}' cap-mysql > mysql-cpus-end.txt
-  python3 "$C/kit/frontier.py" "$ev" "$inv" "${ACTIVE[$size]}" | tee -a "$C/campaign.log"
+  python3 "$C/kit/frontier.py" "$ev" "$inv" "$n" | tee -a "$C/campaign.log"
   vrc=${PIPESTATUS[0]}
   find . -type f ! -name MANIFEST.sha256 ! -path './state/*' -print0 | sort -z | xargs -0 sha256sum > MANIFEST.sha256
   finish "$phase" "$name" "$s" "$rc"
