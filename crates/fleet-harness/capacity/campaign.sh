@@ -242,6 +242,22 @@ run)
     -p 127.0.0.1:18090:8080 -p 127.0.0.1:19010:9000 \
     "$IMAGE" --storage-backend sqlite --storage-path /data/deltaforge.db > "$inv/cap-df.id"
   for _ in $(seq 60); do curl -sf -m 2 http://127.0.0.1:18090/pipelines >/dev/null && break; sleep 1; done
+  # Every component running and answering before any traffic: MySQL a
+  # query, Kafka its broker listener, DeltaForge its API and metrics.
+  # Otherwise the run is refused (its DeltaForge container kept, renamed).
+  bad=
+  for c in cap-mysql cap-kafka cap-df; do
+    [ "$(docker inspect --format '{{.State.Running}}' "$c" 2>/dev/null)" = true ] || bad="$bad $c-not-running"
+  done
+  docker exec cap-mysql mysql -uroot -prootpw -N -e 'SELECT 1' >/dev/null 2>&1 || bad="$bad mysql-query"
+  docker exec cap-kafka kafka-broker-api-versions --bootstrap-server localhost:29092 >/dev/null 2>&1 || bad="$bad kafka-broker"
+  curl -sf -m 5 http://127.0.0.1:18090/pipelines >/dev/null || bad="$bad deltaforge-api"
+  curl -sf -m 5 http://127.0.0.1:19010/metrics >/dev/null || bad="$bad deltaforge-metrics"
+  if [ -n "$bad" ]; then
+    docker stop cap-df >/dev/null 2>&1; docker rename cap-df "cap-df-$name-refused" 2>/dev/null
+    die "endpoints:$bad (no traffic started)"
+  fi
+  log "endpoints ok: mysql query, kafka broker, deltaforge api and metrics"
   started=$(docker inspect --format '{{.State.StartedAt}}' cap-df)
   log "run $phase $name: deadline=${deadline}s drain=${drain}s cap-df $(cat "$inv/cap-df.id") started $started"
   s=$(date +%s); echo "$s START $phase $name $deadline" >> "$C/clock.log"

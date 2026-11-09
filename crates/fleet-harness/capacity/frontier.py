@@ -423,6 +423,11 @@ def evaluate(phase, inv, n):
         return out, 3
     run = os.path.dirname(runs[-1])
     d = json.load(open(runs[-1]))
+    if not os.path.exists(os.path.join(run, "samples.jsonl")):
+        # The harness ended before sampling: nothing measured, never a crash.
+        out.update(status="inconclusive", run=run, reasons=["no samples.jsonl (the run ended before sampling)"]
+                   + resource_stop(inv))
+        return out, 3
     s = load_samples(os.path.join(run, "samples.jsonl"))
     res = resources(os.path.join(inv, "resources.jsonl"))
     try:
@@ -591,6 +596,11 @@ def calibrate(inv, n):
         return out, 3
     run = os.path.dirname(runs[-1])
     d = json.load(open(runs[-1]))
+    if not os.path.exists(os.path.join(run, "samples.jsonl")):
+        # The harness ended before sampling: nothing measured, never a crash.
+        out.update(status="inconclusive", run=run, reasons=["no samples.jsonl (the run ended before sampling)"]
+                   + resource_stop(inv))
+        return out, 3
     s = load_samples(os.path.join(run, "samples.jsonl"))
     res = resources(os.path.join(inv, "resources.jsonl"))
     mrows = mysql_rows(inv)
