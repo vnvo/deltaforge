@@ -1130,11 +1130,20 @@ fn read_server_position<'c>(
             + 'c,
     >,
 > {
-    Box::pin(super::mysql_binlog_scan::read_position(
-        link.conn(),
-        args.gtid_mode,
-        &args.lineage,
-    ))
+    Box::pin(async move {
+        let mut at = super::mysql_binlog_scan::read_server_status(
+            link.conn(),
+            args.gtid_mode,
+            &args.lineage,
+        )
+        .await?;
+        if at.gtid_set.is_some()
+            && let Some(set) = crate::stream_probe::readiness_read_lag()
+        {
+            at.gtid_set = Some(set);
+        }
+        Ok(at)
+    })
 }
 
 /// Before a window captures tables an earlier window deferred because its

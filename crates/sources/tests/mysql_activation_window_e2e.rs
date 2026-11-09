@@ -1780,3 +1780,330 @@ async fn an_executable_comment_ddl_closing_a_window_starts_the_next_after_it() {
     )
     .await;
 }
+
+/// The server's executed set, `uuid:1-n` on a fresh GTID server: (uuid, n).
+async fn executed(port: u16) -> (String, u64) {
+    let set: String = conn(port)
+        .await
+        .query_first("SELECT @@GLOBAL.gtid_executed")
+        .await
+        .unwrap()
+        .unwrap();
+    let (uuid, range) = set.trim().split_once(':').expect("one source");
+    let n = range.rsplit('-').next().unwrap().parse().unwrap();
+    (uuid.to_string(), n)
+}
+
+/// The last GTID of the source's stored checkpoint (single interval).
+async fn stored_gno(store: &Store, id: &str) -> u64 {
+    let raw = store.ckpt.get_raw(id).await.unwrap().expect("a checkpoint");
+    let cp: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let set = cp["gtid_set"].as_str().expect("a GTID checkpoint");
+    set.rsplit('-').next().unwrap().parse().unwrap()
+}
+
+/// Disarms the lagging executed set however a test ends.
+struct LagGuard;
+impl Drop for LagGuard {
+    fn drop(&mut self) {
+        sources::stream_probe::reset_executed_set_lag();
+    }
+}
+
+/// A window whose capture's executed set is behind its rows, as
+/// `SHOW BINARY LOG STATUS` can report it (offset past a transaction its
+/// executed set does not contain yet). `t0000` is proven and checkpointed
+/// at `n0` by a first run; then, with the source stopped:
+///
+/// - T1 (`n0 + 1`): `t0000` row 2;
+/// - T2 (`n0 + 2`): `t0000` row 3, `t0001` row 1 (the window's head),
+///   `t0000` row 4, `t0002` row 1;
+/// - T3 (`n0 + 3`): `t0000` row 5, `t0003` row 1.
+///
+/// The second run starts with every capture's executed set lagging at
+/// `n0 + lag_after` (`lag_after` 0: before every new table's rows), as
+/// `lag` says.
+struct Behind {
+    container: ContainerAsync<GenericImage>,
+    port: u16,
+    store: Store,
+    id: String,
+    n0: u64,
+    run: Running,
+    /// Notified at each readiness read.
+    read: Arc<tokio::sync::Notify>,
+    _lag: LagGuard,
+}
+
+/// Every row of the second run, in binary-log order.
+fn behind_rows() -> Vec<(String, i64)> {
+    [
+        ("t0000", 2),
+        ("t0000", 3),
+        ("t0001", 1),
+        ("t0000", 4),
+        ("t0002", 1),
+        ("t0000", 5),
+        ("t0003", 1),
+    ]
+    .iter()
+    .map(|(t, id)| (t.to_string(), *id))
+    .collect()
+}
+
+/// The rows of the second run before its window's head.
+fn before_head() -> Vec<(String, i64)> {
+    behind_rows()[..2].to_vec()
+}
+
+async fn behind(
+    id: &str,
+    lag: sources::stream_probe::Lag,
+    lag_after: u64,
+) -> Behind {
+    let (container, port) = start_with(true, true).await;
+    let mut c = conn(port).await;
+    tables(&mut c, 4).await;
+    let store = Store::memory();
+    let first = run_on(port, id, MysqlProofCfg::default(), &store).await;
+    c.query_drop("INSERT INTO t0000 VALUES (1, 0)")
+        .await
+        .unwrap();
+    first.delivered(1, Duration::from_secs(30)).await;
+    first.stop().await;
+    let (uuid, n0) = executed(port).await;
+    assert_eq!(stored_gno(&store, id).await, n0, "checkpointed after row 1");
+    for txn in [
+        "INSERT INTO t0000 VALUES (2, 0)",
+        "BEGIN; INSERT INTO t0000 VALUES (3, 0); INSERT INTO t0001 VALUES (1, 1); \
+         INSERT INTO t0000 VALUES (4, 0); INSERT INTO t0002 VALUES (1, 2); COMMIT",
+        "BEGIN; INSERT INTO t0000 VALUES (5, 0); INSERT INTO t0003 VALUES (1, 3); \
+         COMMIT",
+    ] {
+        c.query_drop(txn).await.unwrap();
+    }
+    assert_eq!(executed(port).await.1, n0 + 3);
+    let read = sources::stream_probe::lag_executed_set(
+        &format!("{uuid}:1-{}", n0 + lag_after),
+        lag,
+    );
+    let lag_guard = LagGuard;
+    let run = run_on(port, id, MysqlProofCfg::default(), &store).await;
+    Behind {
+        container,
+        port,
+        store,
+        id: id.to_string(),
+        n0,
+        run,
+        read,
+        _lag: lag_guard,
+    }
+}
+
+impl Behind {
+    /// Wait for every row of the second run; then stop it.
+    async fn completes(self) -> Self {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while self.run.rows.load(std::sync::atomic::Ordering::SeqCst) < 7 {
+            assert!(
+                !self.run.handle.join.is_finished(),
+                "the source ended; delivered {:?}",
+                self.run.order.lock().unwrap()
+            );
+            assert!(Instant::now() < deadline, "not every row delivered");
+            sleep(Duration::from_millis(20)).await;
+        }
+        sleep(Duration::from_millis(500)).await;
+        self
+    }
+
+    /// The source stops on its own with an error: returns its text.
+    async fn fails(&mut self) -> String {
+        let join = &mut self.run.handle.join;
+        let end = tokio::time::timeout(Duration::from_secs(60), join)
+            .await
+            .expect("the source stops")
+            .expect("the source task completes");
+        format!("{:#}", end.expect_err("the source fails closed"))
+    }
+
+    /// Nothing of the window was delivered, no table of it is recorded and
+    /// the checkpoint is still the first run's.
+    async fn nothing_of_the_window(&self) {
+        assert_eq!(*self.run.order.lock().unwrap(), before_head());
+        for t in ["t0001", "t0002", "t0003"] {
+            assert!(
+                self.store
+                    .activation(self.port, &self.id, t)
+                    .await
+                    .is_empty(),
+                "{t}: nothing recorded"
+            );
+        }
+        assert_eq!(stored_gno(&self.store, &self.id).await, self.n0);
+    }
+
+    /// Every table of the window has exactly one activation record.
+    async fn one_record_each(&self) {
+        for t in ["t0001", "t0002", "t0003"] {
+            let recs = self.store.activation(self.port, &self.id, t).await;
+            assert_eq!(recs.len(), 1, "{t}: {recs:?}");
+        }
+    }
+}
+
+/// The capture is behind every table of the window, the head's included:
+/// nothing is decided and the head is held with everything after it, the
+/// proven table's rows too. The next window opens at the head, waits for
+/// the server's position (caught up) and admits every table: every row
+/// once, in binary-log order, one record per table, and the checkpoint
+/// after the last transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn a_window_deferred_at_its_head_holds_the_head_and_recovers() {
+    let b = behind("held-head", sources::stream_probe::Lag::UntilWait, 0)
+        .await
+        .completes()
+        .await;
+    assert_eq!(*b.run.order.lock().unwrap(), behind_rows());
+    b.one_record_each().await;
+    let Behind {
+        container,
+        store,
+        id,
+        n0,
+        run,
+        ..
+    } = b;
+    run.stop().await;
+    assert_eq!(stored_gno(&store, &id).await, n0 + 3);
+    container.rm().await.ok();
+    // The second run's windows (the first run's is first).
+    let windows = records(&id, "window")[1..].to_vec();
+    assert_eq!(windows.len(), 2, "{windows:?}");
+    assert_eq!(windows[0]["held_head"], true, "{windows:?}");
+    assert_eq!(count(&windows[0], "tables"), 0, "{windows:?}");
+    assert_eq!(count(&windows[0], "events"), 0, "{windows:?}");
+    assert_eq!(count(&windows[1], "tables"), 3, "{windows:?}");
+    assert_eq!(windows[1]["held_head"], false, "{windows:?}");
+}
+
+/// The capture is behind only the window's last table (T3's, lagging at
+/// T1): the head's tables are admitted, the queue is cut at that table's
+/// first row, and the next window waits and admits it. Every row once, in
+/// order, one record per table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn a_window_deferred_after_its_head_dispatches_the_rows_before_the_cut() {
+    let b = behind("cut-queue", sources::stream_probe::Lag::UntilWait, 1)
+        .await
+        .completes()
+        .await;
+    assert_eq!(*b.run.order.lock().unwrap(), behind_rows());
+    b.one_record_each().await;
+    let Behind {
+        container,
+        store,
+        id,
+        n0,
+        run,
+        ..
+    } = b;
+    run.stop().await;
+    assert_eq!(stored_gno(&store, &id).await, n0 + 3);
+    container.rm().await.ok();
+    // The second run's windows (the first run's is first).
+    let windows = records(&id, "window")[1..].to_vec();
+    assert_eq!(windows.len(), 2, "{windows:?}");
+    assert_eq!(windows[0]["cut"], true, "{windows:?}");
+    assert_ne!(windows[0]["held_head"], true, "{windows:?}");
+    assert_eq!(count(&windows[0], "tables"), 2, "{windows:?}");
+    assert_eq!(count(&windows[1], "tables"), 1, "{windows:?}");
+}
+
+/// Deferred again after a covered wait (the recapture is still behind):
+/// the window fails closed. Nothing of the window is delivered or
+/// recorded, and the checkpoint stays before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn a_head_deferred_again_after_a_covered_wait_fails_closed() {
+    let mut b =
+        behind("held-twice", sources::stream_probe::Lag::Captures, 0).await;
+    let err = b.fails().await;
+    assert!(
+        err.contains(
+            "started before its rows' position after the server's position \
+             was read as covering them"
+        ),
+        "{err}"
+    );
+    b.nothing_of_the_window().await;
+    b.run.drain.abort();
+    b.container.rm().await.ok();
+}
+
+/// The server's position never covers the held head's rows: the window
+/// fails closed at the wait's bound, with nothing of it delivered or
+/// recorded and the checkpoint before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn a_held_head_whose_wait_times_out_fails_closed() {
+    let mut b =
+        behind("held-timeout", sources::stream_probe::Lag::All, 0).await;
+    let t = Instant::now();
+    let err = b.fails().await;
+    assert!(
+        t.elapsed() >= Duration::from_secs(5),
+        "failed after {:?}: {err}",
+        t.elapsed()
+    );
+    assert!(err.contains("waited 5"), "{err}");
+    assert!(err.contains("deferred table(s)"), "{err}");
+    b.nothing_of_the_window().await;
+    b.run.drain.abort();
+    b.container.rm().await.ok();
+}
+
+/// A stop during the held head's wait: the run ends cleanly with nothing
+/// of the window delivered or recorded, and its checkpoint is the boundary
+/// before the head's transaction (after T1). The next run (the server
+/// caught up) delivers every row from there, once, in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn a_stop_during_a_held_heads_wait_resumes_before_it() {
+    let b = behind("held-stop", sources::stream_probe::Lag::All, 0).await;
+    tokio::time::timeout(Duration::from_secs(30), b.read.notified())
+        .await
+        .expect("a readiness wait for the held head");
+    b.run.handle.stop();
+    let end = tokio::time::timeout(Duration::from_secs(30), b.run.handle.join)
+        .await
+        .expect("the source stops")
+        .expect("the source task completes");
+    assert!(end.is_ok(), "a clean stop: {end:?}");
+    assert_eq!(*b.run.order.lock().unwrap(), before_head());
+    for t in ["t0001", "t0002", "t0003"] {
+        assert!(b.store.activation(b.port, &b.id, t).await.is_empty(), "{t}");
+    }
+    assert_eq!(stored_gno(&b.store, &b.id).await, b.n0 + 1);
+    b.run.drain.abort();
+
+    sources::stream_probe::reset_executed_set_lag();
+    let again = run_on(b.port, &b.id, MysqlProofCfg::default(), &b.store).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while again.rows.load(std::sync::atomic::Ordering::SeqCst) < 6 {
+        assert!(!again.handle.join.is_finished(), "the source ended");
+        assert!(Instant::now() < deadline, "not every row delivered");
+        sleep(Duration::from_millis(20)).await;
+    }
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(*again.order.lock().unwrap(), behind_rows()[1..]);
+    for t in ["t0001", "t0002", "t0003"] {
+        let recs = b.store.activation(b.port, &b.id, t).await;
+        assert_eq!(recs.len(), 1, "{t}: {recs:?}");
+    }
+    again.stop().await;
+    assert_eq!(stored_gno(&b.store, &b.id).await, b.n0 + 3);
+    b.container.rm().await.ok();
+}

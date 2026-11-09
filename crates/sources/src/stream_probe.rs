@@ -309,3 +309,71 @@ pub(crate) fn history_batch(
         });
     }
 }
+
+// ---------------------------------------------------------------------------
+// A lagging executed set (MySQL). The two values of `SHOW BINARY LOG STATUS`
+// are not read atomically: its offset can be past a transaction whose GTID
+// its executed set does not contain yet. Armed, position reads keep their
+// real offset and report the executed set a test fixed. Disarmed: one atomic
+// load per position read.
+// ---------------------------------------------------------------------------
+
+/// Which position reads report the lagging executed set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lag {
+    /// Captures' reads lag until the first readiness read (the bounded
+    /// wait before a recapture), which reads the real set and disarms the
+    /// lag: the server caught up meanwhile.
+    UntilWait,
+    /// Captures' reads lag; readiness reads read the real set.
+    Captures,
+    /// Every read lags: the server never catches up.
+    All,
+}
+
+static LAG_ARMED: AtomicBool = AtomicBool::new(false);
+static LAG: Mutex<Option<(String, Lag, Arc<Notify>)>> = Mutex::new(None);
+
+/// Arm the lag: position reads report the executed set `set`, as `lag`
+/// says. The returned notify is notified at every readiness read.
+pub fn lag_executed_set(set: &str, lag: Lag) -> Arc<Notify> {
+    let read = Arc::new(Notify::new());
+    *LAG.lock().unwrap() = Some((set.to_string(), lag, read.clone()));
+    LAG_ARMED.store(true, Ordering::SeqCst);
+    read
+}
+
+/// Disarm the lag.
+pub fn reset_executed_set_lag() {
+    LAG_ARMED.store(false, Ordering::SeqCst);
+    *LAG.lock().unwrap() = None;
+}
+
+/// The executed set a capture's position read reports instead of the
+/// server's, while lagging.
+pub(crate) fn capture_read_lag() -> Option<String> {
+    if !LAG_ARMED.load(Ordering::Relaxed) {
+        return None;
+    }
+    LAG.lock().unwrap().as_ref().map(|(set, _, _)| set.clone())
+}
+
+/// The executed set a readiness read reports instead of the server's,
+/// while lagging (notifying the test of the read).
+pub(crate) fn readiness_read_lag() -> Option<String> {
+    if !LAG_ARMED.load(Ordering::Relaxed) {
+        return None;
+    }
+    let mut lag = LAG.lock().unwrap();
+    let (set, mode, read) = lag.as_ref()?;
+    read.notify_one();
+    match mode {
+        Lag::All => Some(set.clone()),
+        Lag::Captures => None,
+        Lag::UntilWait => {
+            LAG_ARMED.store(false, Ordering::SeqCst);
+            *lag = None;
+            None
+        }
+    }
+}
