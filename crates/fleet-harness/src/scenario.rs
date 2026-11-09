@@ -114,6 +114,50 @@ fn soak_disruptions(cfg: &RunConfig, duration: u64) -> Vec<Step> {
     steps
 }
 
+/// Scenario F1: one rate change per step of `traffic.rate_steps`, every
+/// `traffic.rate_step_secs` from the end of warm-up, on every source.
+fn staircase(cfg: &RunConfig) -> Result<Vec<Step>> {
+    let t = &cfg.traffic;
+    let (Some(rates), Some(secs)) = (&t.rate_steps, t.rate_step_secs) else {
+        bail!("F1 needs traffic.rate_steps and traffic.rate_step_secs");
+    };
+    if rates.is_empty() || secs == 0 {
+        bail!("F1 needs at least one rate step and rate_step_secs > 0");
+    }
+    if let Some(bad) = rates.iter().find(|r| !(r.is_finite() && **r > 0.0)) {
+        bail!("F1 rate steps must be positive, got {bad}");
+    }
+    if t.peak_fraction.value != 0.0 {
+        bail!(
+            "F1 needs traffic.peak_fraction 0: bursts would change the \
+             offered rate inside a step"
+        );
+    }
+    let avg = t.changes_per_sec_avg.value;
+    if !(avg.is_finite() && avg > 0.0) {
+        bail!("F1 needs a positive traffic.changes_per_sec_avg");
+    }
+    let span = secs * rates.len() as u64;
+    if cfg.run.duration_secs < span {
+        bail!(
+            "F1's {} steps of {secs} s need run.duration_secs >= {span}, got {}",
+            rates.len(),
+            cfg.run.duration_secs
+        );
+    }
+    Ok(rates
+        .iter()
+        .enumerate()
+        .map(|(i, rate)| Step {
+            at_secs: secs * i as u64,
+            action: Action::SetRate {
+                servers: usize::MAX,
+                multiplier: rate / avg,
+            },
+        })
+        .collect())
+}
+
 pub fn plan(cfg: &RunConfig) -> Result<Plan> {
     let d = cfg.run.duration_secs;
     let id = cfg.run.scenario.as_str();
@@ -197,7 +241,9 @@ pub fn plan(cfg: &RunConfig) -> Result<Plan> {
             };
             (Some(pattern), soak_disruptions(cfg, d))
         }
-        other => bail!("unknown scenario {other} (S1-S17 or A1-A5)"),
+        "F0" => (None, Vec::new()),
+        "F1" => (None, staircase(cfg)?),
+        other => bail!("unknown scenario {other} (S1-S17, A1-A5, F0 or F1)"),
     };
     Ok(Plan {
         scenario: id.to_string(),
@@ -237,6 +283,81 @@ mod tests {
         c.run.scenario = scenario.into();
         c.run.duration_secs = duration;
         c
+    }
+
+    /// F1's steps set each rate in turn from the end of warm-up, on every
+    /// source; F0 has no actions.
+    #[test]
+    fn the_staircase_sets_each_rate_in_turn() {
+        let mut c = cfg("F1", 1_800);
+        c.traffic.peak_fraction.value = 0.0;
+        c.traffic.rate_steps = Some(vec![2_000.0, 4_000.0, 8_000.0]);
+        c.traffic.rate_step_secs = Some(300);
+        let p = plan(&c).unwrap();
+        let avg = c.traffic.changes_per_sec_avg.value;
+        let got: Vec<(u64, f64)> = p
+            .steps
+            .iter()
+            .map(|s| match s.action {
+                Action::SetRate {
+                    servers,
+                    multiplier,
+                } => {
+                    assert_eq!(servers, usize::MAX, "every source");
+                    (s.at_secs, multiplier * avg)
+                }
+                ref a => panic!("{a:?}"),
+            })
+            .collect();
+        assert_eq!(got, vec![(0, 2_000.0), (300, 4_000.0), (600, 8_000.0)]);
+        assert!(plan(&cfg("F0", 600)).unwrap().steps.is_empty());
+    }
+
+    /// A staircase that cannot be offered as written is refused before
+    /// the run.
+    #[test]
+    fn an_unusable_staircase_is_refused() {
+        let base = || {
+            let mut c = cfg("F1", 1_800);
+            c.traffic.peak_fraction.value = 0.0;
+            c.traffic.rate_steps = Some(vec![2_000.0, 4_000.0]);
+            c.traffic.rate_step_secs = Some(300);
+            c
+        };
+        plan(&base()).unwrap();
+        type Edit = Box<dyn Fn(&mut RunConfig)>;
+        let cases: Vec<(&str, Edit)> = vec![
+            (
+                "needs traffic.rate_steps",
+                Box::new(|c| c.traffic.rate_steps = None),
+            ),
+            (
+                "at least one",
+                Box::new(|c| c.traffic.rate_steps = Some(vec![])),
+            ),
+            (
+                "at least one",
+                Box::new(|c| c.traffic.rate_step_secs = Some(0)),
+            ),
+            (
+                "positive",
+                Box::new(|c| c.traffic.rate_steps = Some(vec![1.0, -5.0])),
+            ),
+            (
+                "peak_fraction 0",
+                Box::new(|c| c.traffic.peak_fraction.value = 0.05),
+            ),
+            (
+                "duration_secs >= 600",
+                Box::new(|c| c.run.duration_secs = 599),
+            ),
+        ];
+        for (why, edit) in cases {
+            let mut c = base();
+            edit(&mut c);
+            let err = plan(&c).unwrap_err().to_string();
+            assert!(err.contains(why), "{why}: {err}");
+        }
     }
 
     #[test]

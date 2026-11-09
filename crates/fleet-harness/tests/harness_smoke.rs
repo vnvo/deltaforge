@@ -478,6 +478,53 @@ async fn the_harness_runs_scenarios_end_to_end() {
         assert_eq!(c[k], 0, "{k}: {c}");
     }
 
+    // F1: the staircase raises the offered and committed rates step by
+    // step, and every interval sample records both.
+    let mut cfg = config("F1", &env, "none");
+    cfg.run.duration_secs = 16;
+    cfg.traffic.rate_steps = Some(vec![20.0, 80.0]);
+    cfg.traffic.rate_step_secs = Some(8);
+    let staircase = sweep(cfg, opts.clone()).await.unwrap();
+    assert!(staircase.points[0].correctness_ok);
+    let run_f1 = &staircase.points[0].runs[0];
+    let samples: Vec<Value> = std::fs::read_to_string(
+        Path::new(out_s)
+            .join("exploratory")
+            .join(run_f1)
+            .join("samples.jsonl"),
+    )
+    .unwrap()
+    .lines()
+    .map(|l| serde_json::from_str(l).unwrap())
+    .collect();
+    let series = |k: &str| -> Vec<f64> {
+        samples
+            .iter()
+            .map(|v| v[k]["c01"].as_f64().unwrap())
+            .collect()
+    };
+    let (offered, committed) = (series("offered_ops"), series("committed_ops"));
+    // Each step's seconds, found by the offered rate of each 1 s interval
+    // (warm-up runs at 40/s); committed per second over the same intervals.
+    let committed_rate = |step: std::ops::Range<f64>| {
+        let (mut ops, mut secs) = (0.0, 0.0);
+        for i in 1..offered.len() {
+            if step.contains(&(offered[i] - offered[i - 1])) {
+                ops += committed[i] - committed[i - 1];
+                secs += 1.0;
+            }
+        }
+        assert!(secs >= 4.0, "{secs} intervals at {step:?}");
+        ops / secs
+    };
+    let (step1, step2) =
+        (committed_rate(15.0..25.0), committed_rate(70.0..90.0));
+    assert!(step2 > 2.0 * step1, "step 1 {step1}/s, step 2 {step2}/s");
+    let r = result(out_s, run_f1);
+    for k in ["missing", "duplicates", "unexpected"] {
+        assert_eq!(r["completeness"][k], 0, "{k}: {}", r["completeness"]);
+    }
+
     // An interrupted run stops its writers, drains and still checks what it
     // wrote. The next run (S5, successful) starts immediately after it.
     let mut cfg = config("S5", &env, "none");
@@ -691,12 +738,12 @@ async fn the_harness_runs_scenarios_end_to_end() {
     assert!(r["measured_secs"].as_f64().unwrap() < 60.0);
     assert_partial_counters(&r);
 
-    // Eight runs, each with its own evidence and row namespace.
+    // Nine runs, each with its own evidence and row namespace.
     let ids = run_ids(out_s);
-    assert_eq!(ids.len(), 8, "{ids:?}");
+    assert_eq!(ids.len(), 9, "{ids:?}");
     let tags: BTreeSet<u64> = ids
         .iter()
         .map(|id| result(out_s, id)["run_tag"].as_u64().unwrap())
         .collect();
-    assert_eq!(tags.len(), 8, "{tags:?}");
+    assert_eq!(tags.len(), 9, "{tags:?}");
 }

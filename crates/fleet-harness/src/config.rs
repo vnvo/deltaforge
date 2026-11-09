@@ -338,6 +338,14 @@ pub struct Traffic {
     /// Writer connections per server.
     #[serde(default = "default_writers")]
     pub writers_per_server: u32,
+    /// Scenario F1 (traffic staircase): the change rate per source at each
+    /// step, the first step starting when warm-up ends. Warm-up runs at
+    /// `changes_per_sec_avg`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_steps: Option<Vec<f64>>,
+    /// Scenario F1: how long each step is held, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_step_secs: Option<u64>,
 }
 
 fn default_writers() -> u32 {
@@ -456,7 +464,9 @@ fn default_interval() -> u64 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Run {
-    /// Scenario id (`S1`..`S17`) or active-set point (`A1`..`A5`).
+    /// Scenario id (`S1`..`S17`), active-set point (`A1`..`A5`), or a
+    /// capacity scenario: `F0` (steady, no actions) or `F1` (the traffic
+    /// staircase of `traffic.rate_steps`).
     pub scenario: String,
     pub duration_secs: u64,
     #[serde(default)]

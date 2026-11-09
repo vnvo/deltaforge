@@ -504,24 +504,27 @@ async fn run_inner(
     };
     progress.lock().readiness = Some(readiness.clone());
 
-    // Sampler.
-    let agg = Arc::new(Mutex::new(Aggregate::default()));
-    let (sampler_stop_tx, sampler_stop) = watch::channel(false);
-    let sampler_task = tokio::spawn(sampler(
-        cfg.clone(),
-        servers.clone(),
-        agg.clone(),
-        dir.join("samples.jsonl"),
-        sampler_stop,
-    ));
-
-    // Writers.
+    // The servers' workload contexts (their counters are sampled).
     let ctxs: Vec<Arc<ServerCtx>> = servers
         .iter()
         .map(|(i, s)| {
             Arc::new(ServerCtx::new(&cfg, *i, s, probes.clone(), run_tag))
         })
         .collect();
+
+    // Sampler.
+    let agg = Arc::new(Mutex::new(Aggregate::default()));
+    let (sampler_stop_tx, sampler_stop) = watch::channel(false);
+    let sampler_task = tokio::spawn(sampler(
+        cfg.clone(),
+        servers.clone(),
+        ctxs.clone(),
+        agg.clone(),
+        dir.join("samples.jsonl"),
+        sampler_stop,
+    ));
+
+    // Writers.
     stage("writers");
     progress.lock().ctxs = ctxs.clone();
     let (driver_stop_tx, driver_stop) = watch::channel(false);
@@ -1149,9 +1152,32 @@ async fn execute(
 }
 
 /// Sample the instance every `measure.interval_secs` until stopped.
+/// Per server: the operations the workload asked for so far (offered) and
+/// the operations MySQL committed (committed), for the rate ratios of each
+/// interval.
+fn rate_counters(
+    ctxs: &[Arc<ServerCtx>],
+) -> (BTreeMap<String, f64>, BTreeMap<String, u64>) {
+    let offered = ctxs
+        .iter()
+        .map(|c| (c.server.name.clone(), c.target_ops()))
+        .collect();
+    let committed = ctxs
+        .iter()
+        .map(|c| {
+            (
+                c.server.name.clone(),
+                c.counters.ops.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+        .collect();
+    (offered, committed)
+}
+
 async fn sampler(
     cfg: Arc<RunConfig>,
     servers: Vec<(u16, Server)>,
+    ctxs: Vec<Arc<ServerCtx>>,
     agg: Arc<Mutex<Aggregate>>,
     path: PathBuf,
     mut stop: watch::Receiver<bool>,
@@ -1266,6 +1292,10 @@ async fn sampler(
             "sink_events": measure::sum_by(&samples, "deltaforge_sink_events_total", "pipeline"),
             "scrape_ms": scrape_ms,
         });
+        let mut line = line;
+        let (offered, committed) = rate_counters(&ctxs);
+        line["offered_ops"] = json!(offered);
+        line["committed_ops"] = json!(committed);
         writeln!(out, "{line}")?;
         out.flush()?;
         tokio::select! {
