@@ -351,3 +351,53 @@ The campaign ended at its first measured run. Its finding is a memory scaling li
   - The 40-table validation runs stayed flat.
 - **Standing restriction:** this is a capacity restriction of v0.1.0-rc.1 alongside its documented scope. A MySQL source whose written-to active set exceeds the server's table definition cache grows without bound, at roughly 4 KB per change on a table outside that cache.
 - **Next:** a targeted reproduction and fix, before any further capacity run.
+
+## A100 confirmation of the fix (2026-11-09)
+
+The original OOM workload was run again on the merged fix (#212, `c9257fe1`): the same catalog, active set, traffic, MySQL table caches (2,000 definitions, 4,000 open tables) and DeltaForge limits (4 CPUs, 6 GiB), for 2,100 s (`a100c`). All five criteria, frozen before the run, passed. Evidence: `~/deltaforge-evidence/confirm-a100-c9257fe1-run` (`CRITERIA-RESULT.md`, run manifest).
+
+| | v0.1.0-rc.1 (`a100`) | Fix (`a100c`) |
+|---|---|---|
+| Outcome | OOM-killed at 6 GiB after 13 minutes | completed 2,100 s, no stop, no incident, no restart |
+| DeltaForge memory | about 0.4 GiB/min, kept rising after activation | 816 -> 809 MiB from 5 minutes after activation to the end; slope over the last 15 minutes -0.17 MiB/min; peak 920 MiB |
+| Table maps held (sampled every 5 s) | not observable | parser 1, source 0 or 1, in all 281 samples |
+| Correctness | 4,470 missing after the kill | 0 missing, duplicate, unexpected, final-state or ordering errors |
+| Activation | 40,000 tables at 6 minutes | 40,000 tables at 317 s, then 1,783 s of writes |
+
+**What it shows:** the table-map leak is resolved on this workload. Memory and correctness held across 100,000 catalog tables with 40,000 receiving writes.
+
+**What it does not show:**
+- **Throughput:** this is not a throughput result. MySQL committed 1,864 of the 2,000 offered changes/s at about 2.76 of its 3 CPUs.
+- **Table maps:** the map conclusion covers sampled values only. Five-second samples do not establish the maximum between scrapes, and the parser gauge refreshes on the main read path only.
+
+## Resuming the campaign from A100
+
+**Carried forward:**
+- **A100 memory and correctness:** the confirmation above.
+- **A100 throughput:** not established at 2,000 changes/s, because the generator (MySQL) limited it.
+
+A100 is not repeated only to reproduce the pass.
+
+**1. Attribute the generator limit.**
+- In both A100 runs, MySQL used nearly all of its 3 CPUs.
+- The leading hypothesis is MySQL's own table cache. With 40,000 active tables against 2,000 table definitions and 4,000 open tables, about 83% of row events were written under a newly assigned table id (binlogs of the first run), so MySQL reopened a table for most statements.
+- `watch.sh` will record MySQL's `Opened_table_definitions`, `Opened_tables`, `Table_open_cache_misses` and `Com_insert`/`Com_update`/`Com_delete` with each sample, alongside host and container CPU. This changes the observer only.
+
+**2. Remove the limit before the staircase.** One generator calibration at A100 on the preserved fixture, using the existing Phase B run and its generator check. The live evaluator stops it at the first generator-limited step, and DeltaForge's limits are unchanged. The remedies are applied in order, each only if the previous one leaves the generator below the staircase's rates:
+- **R1:** size MySQL's table caches to the active set (`table_definition_cache` and `table_open_cache` 50,000). This is configuration only. It also removes table-id churn, which the confirmation above already covered; the staircase then measures DeltaForge without churn.
+- **R2:** raise MySQL to 5 CPUs. The host has 12: MySQL 5, DeltaForge 4 and Kafka 2, with the harness and the k3d cluster sharing the rest, all recorded.
+- **R3:** 8 rows per transaction (`br100`, already in the kit). This changes the workload shape, so it is a last resort, reported as such.
+
+**3. Phase B at A100 (`b100`)** with the chosen remedy. The rates and step durations are unchanged. The evaluator reports the highest demonstrated viable rate separately, and a step with incomplete evidence gives no conclusion at its rate. At about 1.8 KiB of disk per change, a run starting at 40 GiB is expected to reach the 25 GiB floor in the 32,000 step unless DeltaForge saturates first; that is a host limit.
+
+**4. Phase C** at the highest viable rate, if it fits the remaining time and disk.
+
+**Phase A at 200,000 and 300,000 tables** needs about 29 GB and 44 GB of fixture plus the 40 GiB run floor. With the A100 fixture kept, the host has about 36 GB free, so both are a host limit unless more space is made available.
+
+**Before any of this runs (for review):**
+- **Kit:**
+  - the `mysql` step takes the R1/R2 settings;
+  - `watch.sh` records the MySQL counters;
+  - a calibration configuration.
+- **Disk:** the run start floor is 42,949,672,960 bytes, and free disk is about 36.5e9 with the A100 fixture kept. A cleanup proposal is needed.
+- **Clock:** a fresh eight-hour cap.
