@@ -7,7 +7,10 @@
 #   campaign.sh mysql <size>                            fresh MySQL for a size (100, 200, 300)
 #   campaign.sh fixture <size>                          build that size's fixture
 #   campaign.sh drop <size>                             remove that size's MySQL container and volume
-#   campaign.sh run <A|B|BR|C> <config name>            one run, evaluated (exit: frontier.py's)
+#   campaign.sh run <A|B|BR|C|V> <config name>          one run, evaluated (exit: frontier.py's)
+#
+# Size 001 (100 tables) and phase V are the tooling validation only: a short
+# Phase A run, with the live coverage reader, in its own campaign directory.
 #
 # Exit 3: refused (disk start floor, identity, freshness); 6: deadline or cap.
 set -u
@@ -16,12 +19,15 @@ C=${CAMPAIGN_DIR:-$HOME/deltaforge-evidence/capacity-rc1}
 IMAGE=ghcr.io/vnvo/deltaforge@sha256:63823feac0c30805072b1b3b4a87544d64b77af22a2a6bbf43ece5e7f919b0d9
 MYSQL=mysql@sha256:c36050afdca850f23cef85703f84c7531a5ae155a11b5ee1c60acb09937c4084
 KAFKA=confluentinc/cp-kafka@sha256:fbbb6fa11b258a88b83f54d4f0bddfcffbf2279f99d66a843486e3da7bdfbf41
-NEED=53687091200          # 50 GiB, byte-exact, at the start of every invocation
+NEED_FIXTURE=53687091200  # 50 GiB, byte-exact, before each fixture build
+NEED_RUN=42949672960      # 40 GiB, byte-exact, before each measured run
+PRIOR_BPT=112640          # 110 KiB per empty table, the estimate until A100 measures it
 MEMFLOOR=4294967296       # 4 GiB available memory
 TOTAL_CAP=28800           # 8 hours from T0
 REPORT=900                # the last 15 minutes are the report's
-declare -A BUDGET=([F]=2700 [A]=10800 [B]=9000 [BR]=9000 [C]=5400)
-declare -A ACTIVE=([100]=40000 [200]=80000 [300]=120000)
+declare -A BUDGET=([F]=2700 [A]=10800 [B]=9000 [BR]=9000 [C]=5400 [V]=600)
+declare -A ACTIVE=([001]=40 [100]=40000 [200]=80000 [300]=120000)
+declare -A TABLES=([001]=100 [100]=100000 [200]=200000 [300]=300000)
 declare -A ALLOW=([100]=780 [200]=1500 [300]=2220)      # Phase B warm-up (Phase A activation allowance)
 declare -A ADEAD=([100]=2880 [200]=3600 [300]=4320)     # Phase A: duration + 600 drain + 900
 
@@ -48,15 +54,16 @@ budget() {
 }
 
 preflight() {
+  local need=$1
   pgrep -x cargo >/dev/null && die "a cargo process is running"
   local others
   others=$(docker ps --format '{{.Names}}' | grep -v -E '^(cap-mysql|cap-kafka|k3d-.*|buildx_buildkit_.*)$')
   [ -z "$others" ] || die "other containers running: $others"
   local a; a=$(avail)
-  [ "$a" -ge "$NEED" ] || die "disk: $a bytes free < $NEED"
+  [ "$a" -ge "$need" ] || die "disk: $a bytes free < $need"
   local m; m=$(awk '/^MemAvailable:/{print $2 * 1024}' /proc/meminfo)
   [ "$m" -ge "$MEMFLOOR" ] || die "memory: $m bytes available < $MEMFLOOR"
-  log "preflight ok: free=$a mem_available=$m"
+  log "preflight ok: free=$a (start floor $need) mem_available=$m"
 }
 
 finish() {
@@ -81,7 +88,7 @@ setup)
     echo "harness $(sha256sum "$C/bin/fleet-harness" | cut -d' ' -f1) from $(git -C "$KIT" rev-parse HEAD)"
     echo "mysql $MYSQL"; echo "kafka $KAFKA"
   } > "$C/identity.txt"
-  docker network create cap >/dev/null
+  docker network create cap >/dev/null || { echo "network cap could not be created"; exit 3; }
   docker run -d --name cap-kafka --network cap --cpus 2 --memory 3g -p 127.0.0.1:9405:9405 \
     -e KAFKA_NODE_ID=1 -e KAFKA_PROCESS_ROLES=broker,controller -e CLUSTER_ID=MkU3OEVBNTcwNTJENDM2Qg \
     -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:29093 -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
@@ -91,7 +98,7 @@ setup)
     -e KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT -e KAFKA_AUTO_CREATE_TOPICS_ENABLE=false \
     -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
     -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
-    -v cap-kafka:/var/lib/kafka/data "$KAFKA" > "$C/cap-kafka.id"
+    -v cap-kafka:/var/lib/kafka/data "$KAFKA" > "$C/cap-kafka.id" || { echo "cap-kafka could not be started"; exit 3; }
   date +%s > "$C/T0"; : > "$C/clock.log"
   echo "setup $(date -Is) T0=$(cat "$C/T0")" >> "$C/campaign.log"
   ;;
@@ -99,14 +106,16 @@ mysql)
   size=$2; identity
   docker ps -a --format '{{.Names}}' | grep -qx cap-mysql && die "cap-mysql exists (remove the previous size first)"
   docker volume inspect "cap-mysql-$size" >/dev/null 2>&1 && die "volume cap-mysql-$size exists"
-  # A larger size is built only if, at A100's measured bytes per table, its
-  # runs could still start with 50 GiB free.
-  if [ "$size" != 100 ]; then
+  # A size is built only if, at the measured bytes per table (A100's, or the
+  # prior estimate before A100 is measured), the fixture would leave room
+  # for the following run to start: 40 GiB free.
+  if [ "$size" != 001 ]; then
     bpt=$(grep -o 'fixture a100 rc=0 .*bytes_per_table=[0-9]*' "$C/campaign.log" | tail -1 | sed 's/.*=//')
-    [ -n "$bpt" ] || die "fit: no measured A100 bytes per table"
-    projected=$(( $(avail) - bpt * ${ACTIVE[$size]} * 5 / 2 ))
-    [ "$projected" -ge "$NEED" ] || die "fit: a$size leaves $projected bytes free < $NEED (host limit; not built)"
-    log "fit a$size: projected free after the fixture $projected bytes"
+    src="measured at a100"
+    [ -n "$bpt" ] || { bpt=$PRIOR_BPT; src="prior estimate"; }
+    projected=$(( $(avail) - bpt * ${TABLES[$size]} ))
+    [ "$projected" -ge "$NEED_RUN" ] || die "fit: a$size leaves $projected bytes free < $NEED_RUN for its run ($bpt bytes per table, $src; host limit; not built)"
+    log "fit a$size: projected free after the fixture $projected bytes ($bpt bytes per table, $src)"
   fi
   docker run -d --name cap-mysql --network cap --network-alias cap-mysql --cpus 3 --memory 6g \
     -p 127.0.0.1:33071:3306 -e MYSQL_ROOT_PASSWORD=rootpw -v "cap-mysql-$size:/var/lib/mysql" "$MYSQL" \
@@ -133,13 +142,13 @@ fixture)
   used=$(awk '$2 == "END" && $3 == "F" {s += $5} END {print s + 0}' "$C/clock.log")
   deadline=$(( ${BUDGET[F]} - used ))
   [ "$deadline" -gt 0 ] || die "fixture budget spent" 6
-  budget F "$deadline"; preflight
+  budget F "$deadline"; preflight "$NEED_FIXTURE"
   before=$(avail); s=$(date +%s)
   echo "$s START F a$size $deadline" >> "$C/clock.log"
   (cd "$C" && DEADLINE_SECS=$deadline START_GIB=51 FLOOR_GIB=26 kit/floor-watch.sh -- \
      bin/fleet-harness fixture "configs/a$size.yaml" --concurrency 16) > "$C/fixture-a$size.log" 2>&1
   rc=$?; finish F "a$size" "$s" "$rc"
-  log "fixture a$size rc=$rc free_before=$before free_after=$(avail) bytes_per_table=$(( (before - $(avail)) / (${ACTIVE[$size]} * 5 / 2) ))"
+  log "fixture a$size rc=$rc free_before=$before free_after=$(avail) bytes_per_table=$(( (before - $(avail)) / ${TABLES[$size]} ))"
   exit $rc
   ;;
 drop)
@@ -166,9 +175,10 @@ run)
     A)    deadline=${ADEAD[$size]}; drain=600 ;;
     B|BR) deadline=$(( ${ALLOW[$size]} + 1800 + 1800 + 900 )); drain=1800 ;;
     C)    deadline=5400; drain=900 ;;
+    V)    deadline=600; drain=120 ;;
     *)    die "phase $phase" ;;
   esac
-  identity; budget "$phase" "$deadline"; preflight
+  identity; budget "$phase" "$deadline"; preflight "$NEED_RUN"
   inv=$C/runs/$name
   [ -e "$inv" ] && die "$inv exists (a run is never repeated under the same name)"
   docker ps -a --format '{{.Names}}' | grep -qx cap-df && die "cap-df exists"
@@ -182,7 +192,7 @@ run)
   log "run $phase $name: deadline=${deadline}s drain=${drain}s cap-df $(cat "$inv/cap-df.id") started $started"
   s=$(date +%s); echo "$s START $phase $name $deadline" >> "$C/clock.log"
   cd "$inv" || exit 1
-  DEADLINE_SECS=$deadline START_GIB=51 FLOOR_GIB=26 "$C/kit/floor-watch.sh" -- \
+  DEADLINE_SECS=$deadline START_GIB=41 FLOOR_GIB=26 "$C/kit/floor-watch.sh" -- \
     "$C/bin/fleet-harness" run "$C/configs/$name.yaml" --drain-idle-secs 60 --drain-max-secs "$drain" \
     > run.log 2>&1 &
   fw=$!
@@ -190,7 +200,7 @@ run)
   "$C/kit/watch.sh" "$inv" "$hp" &
   wp=$!
   topic=cap.$name
-  case $phase in B|BR) python3 "$C/kit/frontier.py" B "$inv" "${ACTIVE[$size]}" --live "$hp" "$topic" "$KAFKA" > live.log 2>&1 & ;; esac
+  case $phase in B|BR|V) python3 "$C/kit/frontier.py" B "$inv" "${ACTIVE[$size]}" --live "$hp" "$topic" "$KAFKA" > live.log 2>&1 & ;; esac
   wait "$fw"; rc=$?
   echo "$rc" > floor-watch.rc
   wait
@@ -235,7 +245,8 @@ PY
   docker stop cap-df >/dev/null && docker rename cap-df "cap-df-$name"
   # Coverage from the retained topic, then the evaluation; the topic stays.
   python3 "$C/kit/frontier.py" coverage "$inv" "${ACTIVE[$size]}" "$topic" "$KAFKA" | tee -a "$C/campaign.log"
-  python3 "$C/kit/frontier.py" "${phase/BR/B}" "$inv" "${ACTIVE[$size]}" | tee -a "$C/campaign.log"
+  ev=$phase; [ "$phase" = BR ] && ev=B; [ "$phase" = V ] && ev=A
+  python3 "$C/kit/frontier.py" "$ev" "$inv" "${ACTIVE[$size]}" | tee -a "$C/campaign.log"
   vrc=${PIPESTATUS[0]}
   find . -type f ! -name MANIFEST.sha256 ! -path './state/*' -print0 | sort -z | xargs -0 sha256sum > MANIFEST.sha256
   finish "$phase" "$name" "$s" "$rc"

@@ -492,11 +492,19 @@ def evaluate(phase, inv, n):
                                    or row["status"].startswith("evidence incomplete")):
             first_stop = row
     out["steps"] = steps
-    # The frontier counts viable steps below the first step that saturated,
-    # was generator-limited or had unknown delivery.
+    # Reported separately: the highest rate any measured step demonstrated
+    # viable; the viable steps below the first step that saturated, was
+    # generator-limited or had unknown delivery; and that step. A ceiling is
+    # bracketed only by a saturated step; an incomplete step gives no
+    # conclusion at its rate, so the rate below it is not a ceiling.
+    demonstrated = [r["rate"] for r in steps if r["status"] == "viable"]
+    out["highest_demonstrated_viable"] = max(demonstrated) if demonstrated else None
     viable = [r["rate"] for r in steps if r["status"] == "viable" and (first_stop is None or r["step"] < first_stop["step"])]
     out["highest_viable"] = max(viable) if viable else None
     out["lowest_saturated"] = first_stop["rate"] if first_stop and first_stop["status"] == "saturated" else None
+    if first_stop is not None and first_stop["status"].startswith("evidence incomplete"):
+        out["no_conclusion_at"] = first_stop["rate"]
+    out["ceiling_bracketed"] = out["lowest_saturated"] is not None
     out["evidence_complete"] = not any(r["status"].startswith("evidence incomplete") for r in steps)
     if stops and first_stop is None:
         out["resource_stop"] = stops
@@ -544,6 +552,8 @@ def live(inv, n, pid, topic, image):
             done = cov.complete_at()
             if done is not None and reader["p"] is not False:
                 stop_reader()
+                print(f"coverage complete: {cov.distinct()} distinct tables, complete_at={done}, "
+                      f"records={cov.records}, unreadable={cov.errors}", flush=True)
             paths = glob.glob(os.path.join(inv, "results/exploratory/*/samples.jsonl"))
             if paths:
                 s = load_samples(paths[-1])
@@ -597,6 +607,7 @@ if __name__ == "__main__":
     out["topic_deletable"] = (out.get("status") != "failure" and out.get("evidence_complete") is True
                               and out.get("activation", {}).get("established") is True)
     json.dump(out, open(os.path.join(inv, "verdict.json"), "w"), indent=1)
-    keys = ("status", "evidence_complete", "highest_viable", "lowest_saturated", "attribution", "saturated", "reasons")
+    keys = ("status", "evidence_complete", "highest_demonstrated_viable", "highest_viable", "lowest_saturated",
+            "no_conclusion_at", "attribution", "saturated", "reasons")
     print(mode, " ".join(f"{k}={out[k]}" for k in keys if out.get(k) is not None), f"verdict={inv}/verdict.json")
     sys.exit(rc)

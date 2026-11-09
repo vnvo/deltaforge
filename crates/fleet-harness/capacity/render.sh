@@ -5,15 +5,16 @@
 #   b{100,200,300}.yaml        Phase B staircase (F1), one per possible size
 #   br{100,200,300}.yaml       Phase B generator remedy (8 rows per transaction)
 #   c{100,200,300}-<rate>.yaml Phase C confirmation at each possible step rate
+#   a001.yaml                  tooling validation only (100 tables, 6 minutes)
 # The output is fixed: CONFIGS.sha256 lists its hashes, and the run wrapper
 # refuses a configuration whose hash differs.
 set -eu
 out=${1:?usage: render.sh <dir>}
 mkdir -p "$out"
 
-# name tables scenario warmup duration rate rows_per_txn steps
+# name tables scenario warmup duration rate rows_per_txn steps [databases]
 emit() {
-  local name=$1 tables=$2 scenario=$3 warmup=$4 duration=$5 rate=$6 rows=$7 steps=$8
+  local name=$1 tables=$2 scenario=$3 warmup=$4 duration=$5 rate=$6 rows=$7 steps=$8 dbs=${9:-2000}
   {
     cat <<EOF
 # Capacity campaign, run $name (rendered by capacity/render.sh; do not edit).
@@ -29,7 +30,7 @@ topology:
       cdc_port: 3306
   admin_user: root
   admin_password: rootpw
-  databases_per_server: 2000
+  databases_per_server: $dbs
   tables_per_database: $tables
   database_prefix: cust_
   seed: 1
@@ -84,6 +85,8 @@ run:
 EOF
   } > "$out/$name.yaml"
 }
+
+emit a001 5 F0 0 360 2000 1 "" 20
 
 STEPS="2000, 4000, 8000, 16000, 32000, 64000"
 # size tables phase-A duration (activation allowance + 600 measured seconds)

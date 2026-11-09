@@ -21,7 +21,7 @@ No throughput limit has been measured: every run so far offered a fixed rate and
 
 - One MySQL 8.4 server, one pipeline, one Kafka sink (JSON), the SQLite state store, the published release candidate image (`ghcr.io/vnvo/deltaforge@sha256:63823feac0c30805072b1b3b4a87544d64b77af22a2a6bbf43ece5e7f919b0d9`, v0.1.0-rc.1) and the harness built from `f89cfbbb` (the merge of the rate-schedule PR), pinned separately.
 - Catalog shape: up to 2,000 databases x 150 tables. Active set: 40% of the catalog, fixed (no rotation).
-- Host safety limits, enforced by the run wrapper: at least 50 GiB free at the start (byte-exact) and a 25 GiB floor during a run; a run is stopped when available memory falls below 4 GiB (the established floor) or any container is OOM-killed; a deadline per run, with a graceful stop and then a forced one.
+- Host safety limits, enforced by the run wrapper: at least 50 GiB free before each fixture build and 40 GiB before each measured run (byte-exact), and a 25 GiB floor throughout; a run is stopped when available memory falls below 4 GiB (the established floor) or any container is OOM-killed; a deadline per run, with a graceful stop and then a forced one.
 - No latency or memory budget: lag, throughput and resources are reported as measured.
 
 ## Saturation, defined before any run
@@ -107,7 +107,7 @@ The eight-hour cap is absolute. When it is reached, the campaign stops and repor
 ## Report
 
 - **Phase A:** one row per size: activation time, lag, rates, memory, store growth, CPU, and saturation with its attribution.
-- **Phase B:** one row per step, and the frontier as (highest viable rate, lowest saturated rate) with the limiting component.
+- **Phase B:** one row per step; the highest demonstrated viable rate, reported separately; and the frontier as (highest viable rate below the first stop, lowest saturated rate) with the limiting component. Only a saturated step brackets a ceiling. A step with incomplete evidence gives no conclusion at its rate, and the rate below it is not reported as the ceiling.
 - **Phase C:** the confirmation result.
 
 Every number states the configuration it was measured on. Nothing is extrapolated beyond it.
@@ -272,7 +272,7 @@ The harness measures neither commit latency nor produce latency, so CPU and lag 
 ### Floors and deadlines (enforced by `campaign.sh`)
 
 - **Disk.** Every fixture build and every run checks two things:
-  - **At the start:** at least 53,687,091,200 bytes free on the campaign directory's and Docker's filesystems (byte-exact).
+  - **At the start:** before a fixture build, at least 53,687,091,200 bytes (50 GiB) free on the campaign directory's and Docker's filesystems; before a measured run, at least 42,949,672,960 bytes (40 GiB). Both byte-exact.
   - **While running:** it runs under `floor-watch.sh` with `FLOOR_GIB=26` and its deadline: SIGINT, then SIGKILL after 120 s.
 - **Memory.**
   - **At the start:** refused below 4 GiB available.
@@ -287,7 +287,7 @@ The harness measures neither commit latency nor produce latency, so CPU and lag 
 1. **Setup:** the preconditions below, then `campaign.sh setup` (T0).
 2. **A100:** `mysql 100`, `fixture 100` (measures bytes per table), `run A a100`.
 3. **Larger sizes.** If `a100` is viable: `drop 100`, `mysql 200`, `fixture 200`, `run A a200`; then the same for 300.
-   - **Fit check:** `mysql` refuses a size whose fixture, at A100's measured bytes per table, would leave less than 50 GiB free.
+   - **Fit check:** `mysql` refuses a size whose fixture would leave less than 40 GiB free, so its run could not start. It uses A100's measured bytes per table, or the 110 KiB prior estimate before A100 is measured.
    - **Stop rule:** Phase A stops at the first size that is saturated, inconclusive on activation, refused by the fit check or a floor, or out of phase time.
    - **Result:** the largest viable size. No cleanup is done to make room.
 4. **Phase B** at the largest viable size S:
@@ -323,11 +323,12 @@ Exit 2 at any step ends the campaign.
 ### Decisions (reviewed)
 
 - **Grants.** `mysql` creates `df` with the documented grants, including the fresh CDC start's `BACKUP_ADMIN` and `SELECT` on `performance_schema.log_status`, and refuses unless `SHOW GRANTS` shows both.
-- **Disk floors.** 50 GiB free (53,687,091,200 bytes) at every fixture-build and run start, plus the continuous 25 GiB floor.
+- **Disk floors (this campaign only).** 50 GiB free before each fixture build, 40 GiB before each measured run, the continuous 25 GiB floor and the 4 GiB memory floor. A size whose projected fixture growth would prevent its run from starting is not built.
 - **Approved cleanup before setup:**
   - G3's stopped `g3-mysql` (`8c2583bcb53e`, volume `g3-mysql`) and `g3-kafka` (`9eae6edcb912`, volume `47d5feb87e0e`), after verifying full ids, mounts and preserved evidence;
   - `df-capacity-plan/target`, after the build, open-handle and artifact checks.
 - **Within the campaign:** `drop` of campaign fixtures by recorded ids after their evidence verifies, and topic deletion as above.
-- **Host limit.** If disk prevents A200 or A300, or stops the staircase, that is reported as a host limit. Floors are not weakened and no further cleanup is done to force progress. Phase B is expected to reach the disk floor in the 32,000 step (25 GiB of headroom at 1.8 KiB per change is about 14.5 million changes), unless DeltaForge saturates first.
+- **Host limit.** If disk prevents a size, or stops the staircase, that is reported as a host limit. Floors are not weakened and no further cleanup is done to force progress. Phase B is expected to reach the disk floor in the 32,000 step (25 GiB of headroom at 1.8 KiB per change is about 14.5 million changes), unless DeltaForge saturates first.
 - **Host sharing:** the k3d test cluster is allowed by the preflight and recorded.
 - **Cap:** the eight-hour campaign cap is unchanged.
+- **Tooling validation before the campaign.** One short real-container run in its own campaign directory: size `001` (20 databases of 5 tables, 40 active), `fixture 001`, `run V a001` (F0 at 2,000 changes/s for 6 minutes, a 10-minute deadline, with the live coverage reader), then `drop 001`. It checks the driver end to end and the console consumer's record format. It is tooling validation, not capacity evidence; its result is kept.
