@@ -109,6 +109,15 @@ async fn start_with(
     gtid: bool,
     full: bool,
 ) -> (ContainerAsync<GenericImage>, u16) {
+    start_with_args(gtid, full, &[]).await
+}
+
+/// [`start_with`], with more server options.
+async fn start_with_args(
+    gtid: bool,
+    full: bool,
+    extra: &[&str],
+) -> (ContainerAsync<GenericImage>, u16) {
     let mut cmd = vec![
         "--server-id=71".to_string(),
         "--log-bin=mysql-bin".into(),
@@ -122,6 +131,7 @@ async fn start_with(
         cmd.push("--gtid-mode=ON".into());
         cmd.push("--enforce-gtid-consistency=ON".into());
     }
+    cmd.extend(extra.iter().map(|a| a.to_string()));
     let c = GenericImage::new("mysql", "8.4")
         .with_wait_for(WaitFor::message_on_stderr(
             "ready for connections. Version: '8.4",
@@ -2106,4 +2116,72 @@ async fn a_stop_during_a_held_heads_wait_resumes_before_it() {
     again.stop().await;
     assert_eq!(stored_gno(&b.store, &b.id).await, b.n0 + 3);
     b.container.rm().await.ok();
+}
+
+/// One compressed transaction (`binlog_transaction_compression`: a single
+/// payload event, the window's head, carrying every row) touches five wide
+/// tables twice each, and the caps take two tables per plan. Each window
+/// admits its prefix and holds the head again for the rest: the next
+/// window's first table is the first one still unproven, so every window
+/// admits at least one table and the head is requeued at most until all
+/// are admitted (three windows, never more). Every row once, in order,
+/// one record per table in first-touch order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn a_compressed_head_over_the_window_budget_progresses_by_prefixes() {
+    let (container, port) =
+        start_with_args(true, false, &["--binlog-transaction-compression=ON"])
+            .await;
+    let mut c = conn(port).await;
+    wide_tables(&mut c, 5).await;
+    let _caps = WindowCaps::set(110_000, 16_384, 110_000);
+    let id = "compressed-head";
+    let store = Store::memory();
+    let r = run_on(port, id, MysqlProofCfg::default(), &store).await;
+    r.handle.pause();
+    let touch = [3, 0, 4, 1, 2];
+    let mut txn = String::from("BEGIN;");
+    for round in 1..=2 {
+        for i in touch {
+            txn.push_str(&format!(
+                "INSERT INTO t{i:04} (id, v) VALUES ({round}, {i});"
+            ));
+        }
+    }
+    txn.push_str("COMMIT");
+    c.query_drop(txn).await.unwrap();
+    r.handle.resume();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while r.rows.load(std::sync::atomic::Ordering::SeqCst) < 10 {
+        assert!(!r.handle.join.is_finished(), "the source ended");
+        assert!(Instant::now() < deadline, "not every row delivered");
+        sleep(Duration::from_millis(50)).await;
+    }
+    sleep(Duration::from_secs(1)).await;
+    let order = r.order.lock().unwrap().clone();
+    let want: Vec<(String, i64)> = (1..=2)
+        .flat_map(|round| touch.map(|i| (format!("t{i:04}"), round)))
+        .collect();
+    assert_eq!(order, want, "every row once, in binary-log order");
+    let mut seqs = Vec::new();
+    for i in touch {
+        let t = format!("t{i:04}");
+        let recs = store.activation(port, id, &t).await;
+        assert_eq!(recs.len(), 1, "{t}: {recs:?}");
+        seqs.push(recs[0].0);
+    }
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "commit order is first-touch order: {seqs:?}"
+    );
+    r.stop().await;
+    container.rm().await.ok();
+    let windows = records(id, "window");
+    let tables: Vec<u64> = windows.iter().map(|w| count(w, "tables")).collect();
+    let held: Vec<bool> = windows
+        .iter()
+        .map(|w| w["held_head"].as_bool().unwrap())
+        .collect();
+    assert_eq!(tables, [2, 2, 1], "{windows:?}");
+    assert_eq!(held, [true, true, false], "{windows:?}");
 }
