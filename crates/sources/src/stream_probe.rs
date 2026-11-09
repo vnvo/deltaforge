@@ -329,6 +329,10 @@ pub enum Lag {
     Captures,
     /// Every read lags: the server never catches up.
     All,
+    /// Only the FULL fallback's capture reports the lagging set (its
+    /// interval proof read the real one), until the first readiness read,
+    /// which disarms the lag.
+    FullFallback,
 }
 
 static LAG_ARMED: AtomicBool = AtomicBool::new(false);
@@ -355,7 +359,24 @@ pub(crate) fn capture_read_lag() -> Option<String> {
     if !LAG_ARMED.load(Ordering::Relaxed) {
         return None;
     }
-    LAG.lock().unwrap().as_ref().map(|(set, _, _)| set.clone())
+    LAG.lock()
+        .unwrap()
+        .as_ref()
+        .filter(|(_, lag, _)| *lag != Lag::FullFallback)
+        .map(|(set, _, _)| set.clone())
+}
+
+/// The executed set the FULL fallback's capture position reports instead
+/// of the server's, while lagging ([`Lag::FullFallback`]).
+pub(crate) fn full_capture_lag() -> Option<String> {
+    if !LAG_ARMED.load(Ordering::Relaxed) {
+        return None;
+    }
+    LAG.lock()
+        .unwrap()
+        .as_ref()
+        .filter(|(_, lag, _)| *lag == Lag::FullFallback)
+        .map(|(set, _, _)| set.clone())
 }
 
 /// The executed set a readiness read reports instead of the server's,
@@ -370,7 +391,7 @@ pub(crate) fn readiness_read_lag() -> Option<String> {
     match mode {
         Lag::All => Some(set.clone()),
         Lag::Captures => None,
-        Lag::UntilWait => {
+        Lag::UntilWait | Lag::FullFallback => {
             LAG_ARMED.store(false, Ordering::SeqCst);
             *lag = None;
             None

@@ -2252,7 +2252,14 @@ async fn full_fallback(
     )
     .await?
     {
-        Ok(cap) => cap,
+        Ok(mut cap) => {
+            if cap.position.gtid_set.is_some()
+                && let Some(set) = crate::stream_probe::full_capture_lag()
+            {
+                cap.position.gtid_set = Some(set);
+            }
+            cap
+        }
         Err(ProofError::OtherServer(found)) => {
             return Err(SourceError::Lineage {
                 details: format!("a schema capture reached another server ({found}), expected {server_uuid}").into(),

@@ -952,6 +952,50 @@ async fn full_past_a_barrier(db: &str, barrier: &str) {
     assert_eq!(full_observations(&records).len(), 1, "{records:?}");
 }
 
+/// FULL past a barrier, with the live capture's executed set behind the
+/// rows (its offset past them): the capture is not used. The fallback waits
+/// for the server's position to cover the rows (it has), captures once
+/// more and selects as without the lag: every row, one FULL observation.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn full_fallback_recaptures_after_a_capture_behind_the_rows() {
+    init_test_tracing();
+    let db = "pm_full_behind";
+    let port = server(true, true).await;
+    let hash = lineage_hash(port).await;
+    prepare(port, db, &[T]).await;
+    let st = State::new().await;
+    commit_a_position(port, &st, db, db).await;
+    let mut c = mysql_async::Conn::from_url(dsn(port, "")).await.unwrap();
+    let before: String = c
+        .query_first("SELECT @@GLOBAL.gtid_executed")
+        .await
+        .unwrap()
+        .unwrap();
+    c.disconnect().await.ok();
+    sql(port, db, &rows_past_a_barrier(KEEPING_BARRIER)).await;
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            sources::stream_probe::reset_executed_set_lag();
+        }
+    }
+    let read = sources::stream_probe::lag_executed_set(
+        before.trim(),
+        sources::stream_probe::Lag::FullFallback,
+    );
+    let _disarm = Disarm;
+    let mut r = run(source(db, port, db, &["t"], &st), &st).await;
+    let live = rows(&mut r.rx, 4).await;
+    let waited = timeout(Duration::from_secs(1), read.notified()).await;
+    stop(r.handle).await;
+    assert_eq!(live.len(), 4, "rows: {:?}", image(&live));
+    assert_eq!(after(&live[3], "x"), 9);
+    assert!(waited.is_ok(), "the fallback read the server's position");
+    let records = st.activation(db, &hash, db, "t").await;
+    assert_eq!(full_observations(&records).len(), 1, "{records:?}");
+}
+
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn full_metadata_selects_past_a_barrier_by_a_unique_match() {
