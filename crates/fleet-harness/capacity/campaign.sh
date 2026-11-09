@@ -196,14 +196,29 @@ run)
     "$C/bin/fleet-harness" run "$C/configs/$name.yaml" --drain-idle-secs 60 --drain-max-secs "$drain" \
     > run.log 2>&1 &
   fw=$!
-  for _ in $(seq 50); do hp=$(pgrep -P "$fw" -f fleet-harness) && break; sleep 0.2; done
-  "$C/kit/watch.sh" "$inv" "$hp" &
-  wp=$!
+  # The harness is floor-watch's child running the pinned binary (matched by
+  # process name and executable, never by command line: floor-watch's own
+  # subshells carry the binary's path in theirs).
+  hp= bin=$(readlink -f "$C/bin/fleet-harness")
+  for _ in $(seq 100); do
+    for p in $(pgrep -P "$fw" -x fleet-harness); do
+      [ "$(readlink -f "/proc/$p/exe")" = "$bin" ] && hp=$p
+    done
+    [ -n "$hp" ] && break; sleep 0.2
+  done
   topic=cap.$name
-  case $phase in B|BR|V) python3 "$C/kit/frontier.py" B "$inv" "${ACTIVE[$size]}" --live "$hp" "$topic" "$KAFKA" > live.log 2>&1 & ;; esac
+  if [ -z "$hp" ]; then
+    echo "$(date -Is) harness not found under floor-watch $fw; stopped unobserved" > NOHARNESS
+    pkill -INT -P "$fw" -x fleet-harness
+  else
+    log "run $name: harness pid $hp observed"
+    "$C/kit/watch.sh" "$inv" "$hp" &
+    case $phase in B|BR|V) python3 "$C/kit/frontier.py" B "$inv" "${ACTIVE[$size]}" --live "$hp" "$topic" "$KAFKA" > live.log 2>&1 & ;; esac
+  fi
   wait "$fw"; rc=$?
   echo "$rc" > floor-watch.rc
   wait
+  docker stop cap-cov-live >/dev/null 2>&1   # never left behind (auto-removed)
   # End state. A failed HTTP request, read or parse leaves the value unknown
   # (null, with the error), never zero; the scraped body is kept as evidence.
   python3 - "$started" > end-state.json <<'PY'

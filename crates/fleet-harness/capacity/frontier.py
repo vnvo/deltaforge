@@ -343,6 +343,8 @@ def health(d, inv, phase):
     bad, incomplete = [], []
     if os.path.exists(os.path.join(inv, "FAILCLOSED")):
         bad.append("pipeline failed (FAILCLOSED)")
+    if os.path.exists(os.path.join(inv, "NOHARNESS")):
+        bad.append("the harness process was not found, so the run was not observed (NOHARNESS)")
     markers = ("SATURATED-STOP", "GENERATOR-STOP", "ACTIVATION-STOP", "MEMFLOOR", "OOM")
     stopped = any(os.path.exists(os.path.join(inv, f)) for f in markers)
     try:
@@ -532,6 +534,11 @@ def live(inv, n, pid, topic, image):
         while reader["p"] is not False:
             p = subprocess.Popen(consumer_cmd("cap-cov-live", topic, image), stdout=subprocess.PIPE,
                                  stderr=subprocess.DEVNULL, text=True, errors="replace")
+            if reader["p"] is False:   # stopped while starting: stop this one too
+                time.sleep(5)
+                subprocess.run(["docker", "stop", "cap-cov-live"], capture_output=True)
+                p.wait()
+                return
             reader["p"] = p
             for line in p.stdout:
                 cov.add(line)
