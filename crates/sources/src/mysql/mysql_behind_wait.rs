@@ -217,7 +217,7 @@ pub(crate) enum NotAfter<E> {
     StillBefore(MySqlCheckpoint),
 }
 
-/// A capture (by `capture`, with its position) at or after the row start
+/// A capture (by `make_capture`, with its position) at or after the row start
 /// `row`. A capture ordered before it (the server's executed set lagged the
 /// stream) is not used: the server's position is read with `read` until it
 /// covers `row`, within `bound` and stopped by `cancel` ([`wait_covered`]),
@@ -228,7 +228,7 @@ pub(crate) async fn capture_at_or_after<T, E, C, CFut, R, RFut>(
     row: &MySqlCheckpoint,
     cancel: &CancellationToken,
     bound: Duration,
-    mut capture: C,
+    mut make_capture: C,
     read: R,
 ) -> Result<T, NotAfter<E>>
 where
@@ -241,7 +241,7 @@ where
     let order = |at: &MySqlCheckpoint| -> Result<CheckpointOrder, String> {
         Ok(order_positions(&row_at, &pos(at)?))
     };
-    let (t, at) = capture().await.map_err(NotAfter::Capture)?;
+    let (t, at) = make_capture().await.map_err(NotAfter::Capture)?;
     match order(&at).map_err(NotAfter::Unordered)? {
         CheckpointOrder::Before | CheckpointOrder::Equal => return Ok(t),
         CheckpointOrder::After => {}
@@ -255,7 +255,7 @@ where
     wait_covered(std::slice::from_ref(row), cancel, bound, read)
         .await
         .map_err(NotAfter::Wait)?;
-    let (t, at) = capture().await.map_err(NotAfter::Capture)?;
+    let (t, at) = make_capture().await.map_err(NotAfter::Capture)?;
     match order(&at).map_err(NotAfter::Unordered)? {
         CheckpointOrder::Before | CheckpointOrder::Equal => Ok(t),
         CheckpointOrder::After => Err(NotAfter::StillBefore(at)),
