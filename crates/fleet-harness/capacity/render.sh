@@ -10,6 +10,9 @@
 #   cal100.yaml                generator calibration at a100: 2,000, 4,000 and 8,000 changes/s, 300 s each
 #   cal100m.yaml               the same calibration, second attempt (MySQL memory raised to 10 GiB)
 #   cal100n.yaml               that attempt again after cal100m never ran traffic
+#   cal100r.yaml               recovery check on the fixed build: cal100n's
+#                              fixture and allocations at a constant 2,000
+#                              changes/s for 840 s (no rate steps)
 # The output is fixed: CONFIGS.sha256 lists its hashes, and the run wrapper
 # refuses a configuration whose hash differs.
 set -eu
@@ -102,6 +105,9 @@ emit cal100 50 F1 0 900 2000 1 "2000, 4000, 8000"
 emit cal100m 50 F1 0 900 2000 1 "2000, 4000, 8000"
 # The same attempt, after cal100m was stopped before traffic (Kafka was down).
 emit cal100n 50 F1 0 900 2000 1 "2000, 4000, 8000"
+# The recovery check (phase REC): cal100n held at its first rate, writes
+# ending at 840 s so the drain fits the check's 20-minute deadline.
+emit cal100r 50 F1 0 840 2000 1 ""
 
 STEPS="2000, 4000, 8000, 16000, 32000, 64000"
 # size tables phase-A duration (activation allowance + 600 measured seconds)
