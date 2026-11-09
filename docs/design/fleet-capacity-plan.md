@@ -401,3 +401,23 @@ A100 is not repeated only to reproduce the pass.
   - a calibration configuration.
 - **Disk:** the run start floor is 42,949,672,960 bytes, and free disk is about 36.5e9 with the A100 fixture kept. A cleanup proposal is needed.
 - **Clock:** a fresh eight-hour cap.
+
+## Resumed campaign: stopped before a throughput frontier (2026-11-09)
+
+The resumed campaign (`~/deltaforge-evidence/capacity-resume`, product `c9257fe1`) stopped during generator calibration. No throughput frontier was established.
+
+- **`cal100`, MySQL 3 CPUs and 6 GiB, R1 caches 50,000.**
+  - MySQL was OOM-killed at its limit 16 s in.
+  - DeltaForge failed closed (`source_connect`).
+- **`cal100m`.** Void: the campaign's Kafka had been left stopped, so the run was stopped before traffic.
+- **`cal100n`, MySQL raised to 10 GiB, otherwise unchanged.**
+  - MySQL peaked at 9.98 GiB and stayed at its 3 CPUs.
+  - It committed 97.6% of 2,000 changes/s from 30 to 120 s.
+  - DeltaForge stopped fail-closed at 124 s, before any step was measured.
+- **Cause of the `cal100n` stop** (`~/deltaforge-evidence/cal100n-activation-investigation`): a behind-capture deferral of an activation window's head table does not hold back the head rows event. The lazy and FULL paths then recapture without the bounded wait, and the FULL check fails fatally.
+  - The trigger was MySQL's position pair: the binlog offset ran ahead of the GTID set, by up to about 32 transactions under concurrent commits. This occurred in the rc.1 A100 run as well.
+- **Limits of these results:**
+  - Fail-closed protected the checkpoint, but this run failed; no recovery or reconciliation followed.
+  - MySQL was resource-constrained in these configurations; the host's maximum generation capacity is unproven.
+
+Capacity runs stay paused until the activation defect is fixed.
