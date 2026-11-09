@@ -15,6 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 This section also includes changes already present in the v0.1.0-beta.10 tag, for which no GitHub Release was published.
 
+### Known issues
+
+- **Known defect: unbounded memory growth under MySQL table-ID churn.** A MySQL source keeps every binlog table map it receives and never releases it, including the table maps of tables its filters exclude. MySQL can give a table a new table ID each time it evicts the table's definition and later reopens it, for example when the tables receiving writes outnumber what the server's table caches (`table_definition_cache`, `table_open_cache`) hold. Under sustained churn, DeltaForge's memory grows until the process is OOM-killed. In testing, 40,000 tables receiving writes reached a 6 GiB container limit in 13 minutes.
+  - This can occur within the documented 40,000-table catalog size. Exposure depends on how often MySQL evicts and reopens table definitions, not on catalog size; exceeding a configured cache size does not by itself imply a particular churn rate.
+  - Table filters do not remove the exposure: table maps of excluded tables are retained too.
+  - The growth rate depends on the change rate, how often table IDs change, and the tables' column definitions.
+  - Raising `table_definition_cache` and `table_open_cache` above the number of tables receiving writes is an untested mitigation, not a supported remedy.
+  - Sign of exposure: MySQL's `Opened_table_definitions` keeps rising while DeltaForge's memory grows.
+  - Workloads that can cause sustained table-ID churn should not use this release candidate until a fix is released.
+
 ### Performance
 
 - **MySQL schema capture reads tables by name** - the batched capture of newly active tables filtered `INFORMATION_SCHEMA` with `(TABLE_SCHEMA, TABLE_NAME) IN (...)`, which the server applied only after reading every table of the catalog (or of the database), so each of the capture's five reads cost about the same at any batch size: about 30 ms at 40,000 tables, more under write load. The reads now join a derived table of the requested tables (`VALUES ROW`), which the server reads by name; results and result metadata are identical. In an offline probe at 40,000 tables (MySQL 8.4.9, one capture at a time), a 64-table capture's statements took 22 ms instead of 274 ms under write load; locking and window overlap, unchanged, decide how much of that reaches activation latency. Requires MySQL 8.0.19 (see Changed).

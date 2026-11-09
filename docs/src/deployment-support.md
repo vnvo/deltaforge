@@ -17,6 +17,17 @@ Shown by the release's tests and gates (see the Release Checklist for the eviden
 - The SQLite state store, including survival of `SIGKILL`.
 - The Kafka sink against Confluent Platform 7.5 and 7.7 without TLS, and the other sinks as covered by their suites in the release-tier gate.
 
+### Known defect in v0.1.0-rc.1: MySQL table-ID churn
+
+A MySQL source keeps every binlog table map it receives and never releases it, including the table maps of tables its filters exclude. MySQL can give a table a new table ID each time it evicts the table's definition and later reopens it, for example when the tables receiving writes outnumber what the server's table caches (`table_definition_cache`, `table_open_cache`) hold. Under sustained churn, DeltaForge's memory grows until the process is OOM-killed. In testing, 40,000 tables receiving writes reached a 6 GiB container limit in 13 minutes.
+
+- This can occur within the documented 40,000-table catalog size. Exposure depends on how often MySQL evicts and reopens table definitions, not on catalog size; exceeding a configured cache size does not by itself imply a particular churn rate.
+- Table filters do not remove the exposure: table maps of excluded tables are retained too.
+- The growth rate depends on the change rate, how often table IDs change, and the tables' column definitions.
+- Raising `table_definition_cache` and `table_open_cache` above the number of tables receiving writes is an untested mitigation, not a supported remedy.
+- Sign of exposure: MySQL's `Opened_table_definitions` keeps rising while DeltaForge's memory grows.
+- Workloads that can cause sustained table-ID churn should not use this release candidate until a fix is released.
+
 ### Accepted limitations
 
 Known boundaries with an operator control, detailed below and in [Known limitations](#known-limitations):
@@ -245,6 +256,7 @@ DeltaForge keeps all runtime state (checkpoints, schema registry, snapshot progr
 
 These are documented in full on [Guarantees & Correctness](guarantees.md); the summary:
 
+- **v0.1.0-rc.1: unbounded memory growth under MySQL table-ID churn.** Workloads that can cause sustained table-ID churn should not use this release candidate; see [Known defect in v0.1.0-rc.1](#known-defect-in-v010-rc1-mysql-table-id-churn).
 - **Delivery is at-least-once.** No sink is end-to-end exactly-once. Kafka `exactly_once: true` adds transactional atomic-batch delivery (a `read_committed` consumer never sees a partial batch) but is still at-least-once across a restart. Consumers must dedup on the event `id` for exactly-once end to end.
 - **Snapshot to CDC has a bounded at-least-once overlap** - rows committed between the anchor and the snapshot export are delivered by both the snapshot and CDC. Current-state sinks converge; append-only sinks see duplicates.
 - **No cross-table global ordering.** Per-primary-key ordering within a table is guaranteed; different tables may interleave.
