@@ -64,13 +64,14 @@ budget() {
   [ "$phase" = BR ] && key=B
   t0=$(cat "$C/T0"); now=$(date +%s)
   used=$(awk -v k="$key" '$2 == "END" && ($3 == k || (k == "B" && $3 == "BR")) {s += $5} END {print s + 0}' "$C/clock.log")
-  [ $((used + deadline)) -le "${BUDGET[$phase]}" ] \
-    || die "phase $key: ${used}s used + deadline ${deadline}s > ${BUDGET[$phase]}s" 6
-  # The recovery check has its own deadline, outside the campaign clock.
+  # The recovery check: each invocation has its own deadline, outside the
+  # campaign clock and any phase total (a setup failure spends none of it).
   if [ "$phase" = REC ]; then
-    log "phase REC: own deadline ${deadline}s, outside the campaign clock ($((now - t0))s since T0)"
+    log "phase REC: own deadline ${deadline}s, outside the campaign clock ($((now - t0))s since T0) and the phase total (${used}s by earlier invocations)"
     return
   fi
+  [ $((used + deadline)) -le "${BUDGET[$phase]}" ] \
+    || die "phase $key: ${used}s used + deadline ${deadline}s > ${BUDGET[$phase]}s" 6
   [ $((now - t0 + deadline)) -le $((TOTAL_CAP - REPORT)) ] \
     || die "total cap: $((now - t0))s elapsed + deadline ${deadline}s > $((TOTAL_CAP - REPORT))s" 6
 }
