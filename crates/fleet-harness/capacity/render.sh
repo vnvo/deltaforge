@@ -8,6 +8,7 @@
 #   a001.yaml                  tooling validation only (100 tables, 6 minutes)
 #   a100c.yaml                 the A100 confirmation of the table-map fix (a100, 35 minutes)
 #   cal100.yaml                generator calibration at a100: 2,000, 4,000 and 8,000 changes/s, 300 s each
+#   cal100m.yaml               the same calibration, second attempt (MySQL memory raised to 10 GiB)
 # The output is fixed: CONFIGS.sha256 lists its hashes, and the run wrapper
 # refuses a configuration whose hash differs.
 set -eu
@@ -95,6 +96,9 @@ emit a100c 50 F0 0 2100 2000 1 ""
 # The generator calibration: the staircase's first three steps, no warm-up
 # (the harness invocation is bounded to 20 minutes, drain included).
 emit cal100 50 F1 0 900 2000 1 "2000, 4000, 8000"
+# Identical to cal100 under its own name (a run name, and its topic, is
+# never reused): the attempt with MySQL's memory limit raised to 10 GiB.
+emit cal100m 50 F1 0 900 2000 1 "2000, 4000, 8000"
 
 STEPS="2000, 4000, 8000, 16000, 32000, 64000"
 # size tables phase-A duration (activation allowance + 600 measured seconds)
