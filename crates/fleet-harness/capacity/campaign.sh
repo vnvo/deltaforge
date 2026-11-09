@@ -182,10 +182,14 @@ fixture)
   used=$(awk '$2 == "END" && $3 == "F" {s += $5} END {print s + 0}' "$C/clock.log")
   deadline=$(( ${BUDGET[F]} - used ))
   [ "$deadline" -gt 0 ] || die "fixture budget spent" 6
-  budget F "$deadline"; preflight "$NEED_FIXTURE"
+  # The 2,500-table fixture (about 0.37e9) starts under the run floor
+  # (authorized 2026-11-10); every other size keeps the 50 GiB fixture floor.
+  need=$NEED_FIXTURE start_gib=51
+  [ "$size" = 003 ] && { need=$NEED_RUN start_gib=41; }
+  budget F "$deadline"; preflight "$need"
   before=$(avail); s=$(date +%s)
   echo "$s START F a$size $deadline" >> "$C/clock.log"
-  (cd "$C" && DEADLINE_SECS=$deadline START_GIB=51 FLOOR_GIB=26 kit/floor-watch.sh -- \
+  (cd "$C" && DEADLINE_SECS=$deadline START_GIB=$start_gib FLOOR_GIB=26 kit/floor-watch.sh -- \
      bin/fleet-harness fixture "configs/a$size.yaml" --concurrency 16) > "$C/fixture-a$size.log" 2>&1
   rc=$?; finish F "a$size" "$s" "$rc"
   log "fixture a$size rc=$rc free_before=$before free_after=$(avail) bytes_per_table=$(( (before - $(avail)) / ${TABLES[$size]} ))"
