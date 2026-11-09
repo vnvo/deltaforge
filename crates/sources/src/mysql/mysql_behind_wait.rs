@@ -1,5 +1,7 @@
-//! The bounded wait before an activation window recaptures tables it
-//! deferred because its capture started before their rows (`admit_batch`):
+//! The bounded wait before a capture is made again because an earlier one
+//! started before the rows it is for: an activation window's deferred
+//! tables (`admit_batch`), and the FULL fallback's live capture
+//! ([`capture_at_or_after`]). For a window's deferred tables:
 //! the server's position is read until it covers every recorded row start,
 //! within [`BEHIND_WAIT`] in all (pool acquisition, queries and backoff),
 //! or the window fails closed. The bound covers this readiness wait only,
@@ -196,6 +198,71 @@ where
             waited: t0.elapsed(),
             last,
         }),
+    }
+}
+
+/// Why a capture that must be at or after a row start is not.
+#[derive(Debug)]
+pub(crate) enum NotAfter<E> {
+    /// A capture failed, with its own error.
+    Capture(E),
+    /// The row start and a capture's position cannot be ordered (or one
+    /// cannot be parsed).
+    Unordered(String),
+    /// The wait for the server's position ended without covering the row
+    /// start.
+    Wait(WaitError),
+    /// After a covered wait, the recapture's position is still before the
+    /// row start.
+    StillBefore(MySqlCheckpoint),
+}
+
+/// A capture (by `make_capture`, with its position) at or after the row start
+/// `row`. A capture ordered before it (the server's executed set lagged the
+/// stream) is not used: the server's position is read with `read` until it
+/// covers `row`, within `bound` and stopped by `cancel` ([`wait_covered`]),
+/// and the capture is made once more. Anything else ends it, never used: an
+/// unordered position, a wait that ends otherwise, or a recapture still
+/// before `row`.
+pub(crate) async fn capture_at_or_after<T, E, C, CFut, R, RFut>(
+    row: &MySqlCheckpoint,
+    cancel: &CancellationToken,
+    bound: Duration,
+    mut make_capture: C,
+    read: R,
+) -> Result<T, NotAfter<E>>
+where
+    C: FnMut() -> CFut,
+    CFut: Future<Output = Result<(T, MySqlCheckpoint), E>>,
+    R: FnMut(Duration) -> RFut,
+    RFut: Future<Output = Result<MySqlCheckpoint, WaitError>>,
+{
+    let row_at = pos(row).map_err(NotAfter::Unordered)?;
+    let order = |at: &MySqlCheckpoint| -> Result<CheckpointOrder, String> {
+        Ok(order_positions(&row_at, &pos(at)?))
+    };
+    let (t, at) = make_capture().await.map_err(NotAfter::Capture)?;
+    match order(&at).map_err(NotAfter::Unordered)? {
+        CheckpointOrder::Before | CheckpointOrder::Equal => return Ok(t),
+        CheckpointOrder::After => {}
+        CheckpointOrder::Incomparable => {
+            return Err(NotAfter::Unordered(format!(
+                "the row start {row:?} and the capture's position {at:?} \
+                 cannot be ordered"
+            )));
+        }
+    }
+    wait_covered(std::slice::from_ref(row), cancel, bound, read)
+        .await
+        .map_err(NotAfter::Wait)?;
+    let (t, at) = make_capture().await.map_err(NotAfter::Capture)?;
+    match order(&at).map_err(NotAfter::Unordered)? {
+        CheckpointOrder::Before | CheckpointOrder::Equal => Ok(t),
+        CheckpointOrder::After => Err(NotAfter::StillBefore(at)),
+        CheckpointOrder::Incomparable => Err(NotAfter::Unordered(format!(
+            "the row start {row:?} and the recapture's position {at:?} \
+             cannot be ordered"
+        ))),
     }
 }
 
@@ -584,5 +651,198 @@ mod tests {
             ),
             "{e:?}"
         );
+    }
+
+    /// Captures made in turn (the last repeats): each returns its number
+    /// (from 1) and its position.
+    fn captures(
+        script: Vec<MySqlCheckpoint>,
+        made: Arc<AtomicUsize>,
+    ) -> impl FnMut() -> std::future::Ready<
+        Result<(usize, MySqlCheckpoint), &'static str>,
+    > {
+        move || {
+            let n = made.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok((
+                n + 1,
+                script[n.min(script.len() - 1)].clone(),
+            )))
+        }
+    }
+
+    /// A capture at or after the row start is used as it is: no read.
+    #[tokio::test(start_paused = true)]
+    async fn a_capture_at_or_after_the_row_is_used_without_a_wait() {
+        for p in [u(51), u(60)] {
+            let (made, reads) = (Arc::default(), Arc::new(AtomicUsize::new(0)));
+            let got = capture_at_or_after(
+                &u(51),
+                &CancellationToken::new(),
+                BEHIND_WAIT,
+                captures(vec![p], Arc::clone(&made)),
+                scripted(
+                    vec![u(60)],
+                    Duration::ZERO,
+                    reads.clone(),
+                    Arc::default(),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(got, 1);
+            assert_eq!(made.load(Ordering::SeqCst), 1);
+            assert_eq!(reads.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    /// A capture before the row start waits for the server's position to
+    /// cover it, then captures once more and uses that capture.
+    #[tokio::test(start_paused = true)]
+    async fn a_capture_before_the_row_waits_then_recaptures() {
+        let (made, reads) = (Arc::default(), Arc::new(AtomicUsize::new(0)));
+        let got = capture_at_or_after(
+            &u(51),
+            &CancellationToken::new(),
+            BEHIND_WAIT,
+            captures(vec![u(50), u(53)], Arc::clone(&made)),
+            scripted(
+                vec![u(50), u(53)],
+                Duration::ZERO,
+                reads.clone(),
+                Arc::default(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, 2, "the recapture is used");
+        assert_eq!(made.load(Ordering::SeqCst), 2);
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "until covered");
+    }
+
+    /// After a covered wait, a recapture still before the row start ends
+    /// it: two captures in all, never a third.
+    #[tokio::test(start_paused = true)]
+    async fn a_recapture_still_before_the_row_fails() {
+        let made = Arc::new(AtomicUsize::new(0));
+        let e = capture_at_or_after(
+            &u(51),
+            &CancellationToken::new(),
+            BEHIND_WAIT,
+            captures(vec![u(50)], Arc::clone(&made)),
+            scripted(
+                vec![u(60)],
+                Duration::ZERO,
+                Arc::default(),
+                Arc::default(),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&e, NotAfter::StillBefore(p) if *p == u(50)),
+            "{e:?}"
+        );
+        assert_eq!(made.load(Ordering::SeqCst), 2);
+    }
+
+    /// A server that never covers the row start: it ends at the bound,
+    /// with no recapture.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_that_times_out_does_not_recapture() {
+        let made = Arc::new(AtomicUsize::new(0));
+        let t0 = tokio::time::Instant::now();
+        let e = capture_at_or_after(
+            &u(51),
+            &CancellationToken::new(),
+            BEHIND_WAIT,
+            captures(vec![u(50)], Arc::clone(&made)),
+            scripted(
+                vec![u(50)],
+                Duration::ZERO,
+                Arc::default(),
+                Arc::default(),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(e, NotAfter::Wait(WaitError::TimedOut { .. })),
+            "{e:?}"
+        );
+        assert_eq!(t0.elapsed(), BEHIND_WAIT);
+        assert_eq!(made.load(Ordering::SeqCst), 1);
+    }
+
+    /// A stop during the wait ends it at once, with no recapture.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_during_the_wait_does_not_recapture() {
+        let made = Arc::new(AtomicUsize::new(0));
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        let t0 = tokio::time::Instant::now();
+        let row = u(51);
+        let (e, ()) = tokio::join!(
+            capture_at_or_after(
+                &row,
+                &cancel,
+                BEHIND_WAIT,
+                captures(vec![u(50)], Arc::clone(&made)),
+                scripted(
+                    vec![u(50)],
+                    Duration::ZERO,
+                    Arc::default(),
+                    Arc::default()
+                ),
+            ),
+            async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                stop.cancel();
+            }
+        );
+        let e = e.unwrap_err();
+        assert!(matches!(e, NotAfter::Wait(WaitError::Cancelled)), "{e:?}");
+        assert_eq!(t0.elapsed(), Duration::from_secs(1));
+        assert_eq!(made.load(Ordering::SeqCst), 1);
+    }
+
+    /// A capture whose position cannot be ordered against the row start
+    /// ends it at once: no wait, no recapture. So does a failed capture.
+    #[tokio::test(start_paused = true)]
+    async fn an_unordered_capture_or_a_failed_one_ends_it_at_once() {
+        let (made, reads) = (Arc::default(), Arc::new(AtomicUsize::new(0)));
+        let e = capture_at_or_after(
+            &u(51),
+            &CancellationToken::new(),
+            BEHIND_WAIT,
+            captures(vec![at(&format!("{U}:1-50,{V}:1"))], Arc::clone(&made)),
+            scripted(
+                vec![u(60)],
+                Duration::ZERO,
+                reads.clone(),
+                Arc::default(),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(e, NotAfter::Unordered(_)), "{e:?}");
+        assert_eq!(made.load(Ordering::SeqCst), 1);
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+
+        let e = capture_at_or_after(
+            &u(51),
+            &CancellationToken::new(),
+            BEHIND_WAIT,
+            || std::future::ready(Err::<((), MySqlCheckpoint), _>("lock wait")),
+            scripted(
+                vec![u(60)],
+                Duration::ZERO,
+                reads.clone(),
+                Arc::default(),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(e, NotAfter::Capture("lock wait")), "{e:?}");
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
     }
 }

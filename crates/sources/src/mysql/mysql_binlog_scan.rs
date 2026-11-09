@@ -1506,7 +1506,24 @@ pub(crate) fn not_before(
     )
 }
 
+/// A capture's position read ([`read_server_status`], with the lagging
+/// executed set of `stream_probe::lag_executed_set` while a test arms it).
 pub(crate) async fn read_position(
+    conn: &mut mysql_async::Conn,
+    gtid_mode: bool,
+    lineage_hash: &str,
+) -> Result<MySqlCheckpoint, ProofError> {
+    let mut at = read_server_status(conn, gtid_mode, lineage_hash).await?;
+    if at.gtid_set.is_some()
+        && let Some(set) = crate::stream_probe::capture_read_lag()
+    {
+        at.gtid_set = Some(set);
+    }
+    Ok(at)
+}
+
+/// The server's binary log position and, in GTID mode, its executed set.
+pub(crate) async fn read_server_status(
     conn: &mut mysql_async::Conn,
     gtid_mode: bool,
     lineage_hash: &str,
