@@ -2160,9 +2160,8 @@ impl MySqlSource {
                             )
                             .await
                             {
-                                Ok(_) => {
-                                    advance_position(&mut ctx, &header);
-                                    mysql_activation_window::dispatch_watched(&mut ctx, &header, data).await?;
+                                Ok(head) => {
+                                    hand_on(&mut ctx, head, header, data).await?;
                                     Ok(())
                                 }
                                 Err(ctrl) => Err(ctrl),
@@ -2177,9 +2176,8 @@ impl MySqlSource {
                         )
                         .await
                         {
-                            Ok(_) => {
-                                advance_position(&mut ctx, &header);
-                                mysql_activation_window::dispatch_watched(&mut ctx, &header, data).await?;
+                            Ok(head) => {
+                                hand_on(&mut ctx, head, header, data).await?;
                                 Ok(())
                             }
                             Err(ctrl) => Err(ctrl),
@@ -3001,6 +2999,28 @@ async fn record_stream_start(ctx: &mut RunCtx) -> SourceResult<()> {
     })?;
     info!(source_id = %ctx.source_id, "stream discontinuity: activation barrier at the start position");
     Ok(())
+}
+
+/// Hand on the event a window was considered at: dispatched once the
+/// position advances past it or, when the window deferred a table of its
+/// own rows, held unadvanced in front of what the window held after it, so
+/// the next window opens at it again (`mysql_activation_window::Head`).
+async fn hand_on(
+    ctx: &mut RunCtx,
+    head: mysql_activation_window::Head,
+    header: mysql_binlog_connector_rust::event::event_header::EventHeader,
+    data: mysql_binlog_connector_rust::event::event_data::EventData,
+) -> SourceResult<()> {
+    match head {
+        mysql_activation_window::Head::Dispatch => {
+            advance_position(ctx, &header);
+            mysql_activation_window::dispatch_watched(ctx, &header, data).await
+        }
+        mysql_activation_window::Head::Hold { received, seq } => {
+            ctx.prefetched.push_front((received, seq, header, data));
+            Ok(())
+        }
+    }
 }
 
 /// Advance the file/position cursor to the end of `header`'s event. The

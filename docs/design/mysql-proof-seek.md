@@ -1088,6 +1088,15 @@ result, except for the position-specific outcomes.
   events with its receipt times, and an ordinary window forms at that row
   when the stream reaches it. That window decides it with one batched
   capture.
+- **At C's head event:** the head event's own rows are governed the same
+  way. A table of them that C deferred (its capture started before the
+  rows, or the table was cut from C's prefix) leaves them uncovered, so
+  the cut comes before the head event itself: it is not dispatched and
+  its position does not advance. It returns, with its receipt time, in
+  front of the whole queue, and the next window forms at it again. That
+  window first waits, bounded, for the server's position to cover a
+  deferred table's rows; a capture still behind them after the wait fails
+  closed.
 - **In S's events:** if a C table has uncovered rows in S's events, S
   cannot hold that table (it was reserved when S formed).
 

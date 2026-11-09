@@ -19,7 +19,9 @@
 //! a capture and a scan of its own ([`super::mysql_baseline::establish_at`]):
 //! every table is then admitted or refused exactly as without a window.
 //! The head event and the queue are dispatched in order afterwards
-//! (`RunCtx::lookahead`), so output and checkpoints are unchanged.
+//! (`RunCtx::lookahead`), so output and checkpoints are unchanged, up to
+//! the first row no decision covers: that row and everything after it are
+//! held for a later window, the head event too when the row is its own.
 //!
 //! Outcomes are all or nothing and bounded: at most
 //! [`CAPTURE_ATTEMPTS`] batched captures per window, never a per-table
@@ -99,6 +101,9 @@ pub(crate) struct WindowTrace {
     pub next_candidates: usize,
     /// Whether the queue was cut before a row no decision covers.
     pub cut: bool,
+    /// Whether the cut came before the head event itself: it is held with
+    /// the queue for a later window.
+    pub held_head: bool,
     /// The window's number, and when its admission committed (unix
     /// microseconds; measurement only).
     pub window_seq: u64,
@@ -414,20 +419,33 @@ fn held_tables(d: &EventData, out: &mut Vec<(String, String)>) {
     }
 }
 
+/// What the caller does with the event a window was considered at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Head {
+    /// Advance the position past it and dispatch it.
+    Dispatch,
+    /// Neither: hold it, received at `received` with held sequence `seq`,
+    /// in front of `ctx.prefetched` (the window put what it read after it
+    /// there). A decision of the window does not cover its rows, so a later
+    /// window opens at it again.
+    Hold { received: Instant, seq: u64 },
+}
+
 /// Run a window before `header`'s position advances, when its event is the
 /// first rows of a table without a positional proof (see the module docs).
 /// Returns with nothing done otherwise. On success, the read-ahead events
 /// are queued in `ctx.lookahead` and the batch's proofs in
-/// `ctx.prepared`; the caller then dispatches the head event. An error is
-/// the loop's control: the stream was lost while reading ahead (the queue
-/// is discarded and the position never passed the head event), or the
-/// window failed closed.
+/// `ctx.prepared`; the caller then dispatches the head event, unless a
+/// table of its own rows was deferred ([`Head::Hold`]). An error is the
+/// loop's control: the stream was lost while reading ahead (the queue is
+/// discarded and the position never passed the head event), or the window
+/// failed closed.
 pub(super) async fn maybe_window(
     ctx: &mut RunCtx,
     stream: &mut BinlogStream,
     header: &EventHeader,
     data: &EventData,
-) -> Result<Option<WindowTrace>, LoopControl> {
+) -> Result<Head, LoopControl> {
     // A speculative window whose head passed without a window opening
     // there is dropped unused (its task aborted).
     if let Some(p) = &ctx.pending
@@ -453,7 +471,7 @@ pub(super) async fn maybe_window(
         if at_pending_head {
             ctx.pending = None;
         }
-        Ok(None)
+        Ok(Head::Dispatch)
     };
     if !ctx.lookahead.is_empty() || ctx.transaction_open_without_eval() {
         return not_here(ctx);
@@ -469,6 +487,14 @@ pub(super) async fn maybe_window(
     if found.is_empty() {
         return not_here(ctx);
     }
+    // The head event's receipt, should it be held.
+    let head_receipt = (ctx.last_received, ctx.last_seq);
+    // Every row the window's decisions govern, with its transaction's
+    // start: the head event's at 0, the queue's event `i` at `i + 1`.
+    let mut rows_at: Vec<(usize, (String, String), MySqlCheckpoint)> = found
+        .iter()
+        .map(|(db, table, at)| (0, (db.clone(), table.clone()), at.clone()))
+        .collect();
     prefetch_histories(ctx, stream, &found).await?;
     let mut batch: BTreeMap<(String, String), MySqlCheckpoint> =
         BTreeMap::new();
@@ -524,9 +550,6 @@ pub(super) async fn maybe_window(
         ctx.last_received + Duration::from_millis(cfg.activation_window_ms);
     let mut queue: VecDeque<(EventHeader, EventData)> = VecDeque::new();
     let mut receipts: Vec<(Instant, u64)> = Vec::new();
-    // Every queued row of a table, with its transaction's start.
-    let mut rows_at: Vec<(usize, (String, String), MySqlCheckpoint)> =
-        Vec::new();
     let mut bytes = 0u64;
     let closed_by = loop {
         if let Some(p) = &pending {
@@ -596,7 +619,7 @@ pub(super) async fn maybe_window(
         if close.is_none() {
             for (db, table, at) in &found {
                 rows_at.push((
-                    queue.len(),
+                    queue.len() + 1,
                     (db.clone(), table.clone()),
                     at.clone(),
                 ));
@@ -633,7 +656,7 @@ pub(super) async fn maybe_window(
         // order with nothing admitted.
         drop(pending);
         ctx.lookahead = queue;
-        return Ok(None);
+        return Ok(Head::Dispatch);
     }
 
     let scope = ctx
@@ -734,10 +757,11 @@ pub(super) async fn maybe_window(
         }
     }
 
-    // How each decision governs the table's other held rows: the queue is
-    // cut before the first row no decision covers (a later window decides
-    // it), and a speculation that cannot hold an uncovered row of a
-    // reserved table is abandoned before it decides.
+    // How each decision governs the table's other held rows: the window's
+    // output is cut before the first row no decision covers (a later
+    // window decides it), the head event's own rows too, and a speculation
+    // that cannot hold an uncovered row of a reserved table is abandoned
+    // before it decides.
     let decisions: HashMap<(String, String), (MySqlCheckpoint, Governs)> =
         admitted
             .governs
@@ -756,9 +780,11 @@ pub(super) async fn maybe_window(
     } else {
         ctx.pending = speculation;
     }
+    // Cut at the head: it is held in front of the whole queue.
+    let held_head = cut == Some(0);
     if let Some(i) = cut {
-        let rest = queue.split_off(i);
-        let rest_receipts = receipts.split_off(i);
+        let rest = queue.split_off(i.saturating_sub(1));
+        let rest_receipts = receipts.split_off(i.saturating_sub(1));
         for ((h, d), (received, seq)) in
             rest.into_iter().zip(rest_receipts).rev()
         {
@@ -778,11 +804,17 @@ pub(super) async fn maybe_window(
         next: next.as_str(),
         next_candidates: candidates,
         cut: cut.is_some(),
+        held_head,
         window_seq: ctx.window_seq,
         commit_unix_us,
     };
     observe_window(&ctx.source_id, &trace, read, &admitted);
-    Ok(Some(trace))
+    Ok(if held_head {
+        let (received, seq) = head_receipt;
+        Head::Hold { received, seq }
+    } else {
+        Head::Dispatch
+    })
 }
 
 fn unix_us() -> u128 {
@@ -1146,6 +1178,62 @@ fn read_server_position<'c>(
     })
 }
 
+/// One read of the server's position per call (on a control connection of
+/// `capture`'s pool, given what is left of the wait): the readiness reads
+/// of a bounded wait (`mysql_behind_wait`).
+pub(crate) fn server_positions(
+    capture: &super::mysql_binlog_scan::CaptureCtx,
+    server_uuid: &str,
+    lineage: &str,
+    gtid_mode: bool,
+) -> impl FnMut(
+    Duration,
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<
+                    MySqlCheckpoint,
+                    super::mysql_behind_wait::WaitError,
+                >,
+            > + Send,
+    >,
+> + use<> {
+    let pool = capture.control().clone();
+    let dsn = capture.dsn().current().expose().to_string();
+    let ident = super::mysql_control::ident(&dsn, server_uuid);
+    let uuid = server_uuid.to_string();
+    let args = std::sync::Arc::new(super::mysql_behind_wait::ReadArgs {
+        gtid_mode,
+        lineage: lineage.to_string(),
+    });
+    move |left| {
+        let (pool, dsn, ident, uuid, args) = (
+            pool.clone(),
+            dsn.clone(),
+            ident.clone(),
+            uuid.clone(),
+            args.clone(),
+        );
+        Box::pin(async move {
+            super::mysql_behind_wait::read_once(
+                &pool,
+                &ident,
+                left,
+                |t| async move {
+                    super::mysql_session::open_control_connection(
+                        &dsn, &uuid, t,
+                    )
+                    .await
+                    .map(super::mysql_control::MySqlLink::from)
+                },
+                read_server_position,
+                &args,
+            )
+            .await
+        })
+    }
+}
+
 /// Before a window captures tables an earlier window deferred because its
 /// capture started before their rows: wait, within
 /// [`BEHIND_WAIT`](super::mysql_behind_wait::BEHIND_WAIT), for the
@@ -1300,39 +1388,18 @@ async fn admit_window(
         lineage: Some(capture.lineage.clone()),
         ..a_head.clone()
     };
-    let pool = capture.capture.control().clone();
-    let dsn = capture.capture.dsn().current().expose().to_string();
-    let ident = super::mysql_control::ident(&dsn, &capture.server_uuid);
-    let args = super::mysql_behind_wait::ReadArgs {
-        gtid_mode: head.gtid_set.is_some(),
-        lineage: capture.lineage.clone(),
-    };
-    behind_wait(ctx, &tables, &batch, &head, |left| {
-        let (pool, dsn, ident, uuid) = (
-            pool.clone(),
-            dsn.clone(),
-            ident.clone(),
-            capture.server_uuid.clone(),
-        );
-        let args = &args;
-        async move {
-            super::mysql_behind_wait::read_once(
-                &pool,
-                &ident,
-                left,
-                |t| async move {
-                    super::mysql_session::open_control_connection(
-                        &dsn, &uuid, t,
-                    )
-                    .await
-                    .map(super::mysql_control::MySqlLink::from)
-                },
-                read_server_position,
-                args,
-            )
-            .await
-        }
-    })
+    behind_wait(
+        ctx,
+        &tables,
+        &batch,
+        &head,
+        server_positions(
+            &capture.capture,
+            &capture.server_uuid,
+            &capture.lineage,
+            head.gtid_set.is_some(),
+        ),
+    )
     .await
     .map_err(LoopControl::Fail)?;
     let done = capture_and_scan(capture, &tables, &froms, &head)
@@ -2334,6 +2401,7 @@ fn observe_window(
         "next": t.next,
         "next_candidates": t.next_candidates,
         "cut": t.cut,
+        "held_head": t.held_head,
         "window_seq": t.window_seq,
         "commit_unix_us": t.commit_unix_us,
         "extensions_committed": t.work.extensions_committed,
