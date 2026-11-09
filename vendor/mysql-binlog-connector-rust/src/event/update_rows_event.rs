@@ -23,7 +23,9 @@ impl UpdateRowsEvent {
         let (table_id, column_count, included_columns_before) =
             EventHeader::parse_rows_event_common_header(cursor, row_event_version)?;
         let included_columns_after = cursor.read_bits(column_count, false)?;
-        let table_map_event = table_map_event_by_table_id.get(&table_id).unwrap();
+        let table_map_event = table_map_event_by_table_id
+            .get(&table_id)
+            .ok_or(BinlogError::UnmappedTableId(table_id))?;
 
         let mut rows: Vec<(RowEvent, RowEvent)> = Vec::new();
         while cursor.available() > 0 {

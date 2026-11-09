@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap,
-    io::{Cursor, Seek, SeekFrom},
-};
+use std::io::{Cursor, Seek, SeekFrom};
 
 use serde::{Deserialize, Serialize};
 
@@ -26,10 +23,7 @@ impl TransactionPayloadEvent {
 
         // construct a new parser from the payload
         let mut payload_cursor = Cursor::new(uncompressed_payload);
-        let mut parser = BinlogParser {
-            checksum_length: 0,
-            table_map_event_by_table_id: HashMap::new(),
-        };
+        let mut parser = BinlogParser::new(0);
 
         // parse events in payload
         let mut uncompressed_events: Vec<(EventHeader, EventData)> = Vec::new();

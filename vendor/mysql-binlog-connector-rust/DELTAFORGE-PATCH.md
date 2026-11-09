@@ -120,3 +120,32 @@ sizes sent in random fragments and read with random cancellations (each
 arrives once, exactly, in order). The five cancellation tests fail against
 the vendored code. Upstream: not yet proposed; a follow-up is to offer it to
 `apecloud/mysql-binlog-connector-rust`, as for the other patches.
+
+## Bounded table maps and unmapped table ids
+
+`BinlogParser` kept every `TableMapEvent` it parsed, by table id, for the
+life of the stream. MySQL can give a table a new table id each time it
+reopens the table after evicting it from its table cache, so with sustained
+churn the map grew without bound. A rows event only references the table
+maps of its own statement, which MySQL writes right before the statement's
+rows.
+
+- `BinlogParser::transaction_end` (default `None`: upstream behavior) is a
+  rule the caller installs; when it returns true for a parsed event, the
+  parser releases its table maps. DeltaForge's rule
+  (`mysql_event::release_table_maps_at_transaction_ends`) ends a
+  transaction at an XID, a query that completes it (`COMMIT`, `ROLLBACK`, a
+  DDL outside `BEGIN`, using the same rule as its dispatcher) or a
+  compressed transaction, with GTIDs on or off.
+- `BinlogParser::table_maps_installed` counts table maps installed (an id
+  not mapped at the time), for DeltaForge's metrics.
+- `BinlogParser::new` builds a parser; `BinlogClient::connect` and the
+  compressed-transaction parser use it.
+- A rows event whose table id has no table map returns
+  `BinlogError::UnmappedTableId` instead of panicking (`unwrap`).
+
+Files: `src/binlog_parser.rs`, `src/binlog_error.rs`, `src/binlog_client.rs`,
+`src/event/transaction_payload_event.rs`, `src/event/write_rows_event.rs`,
+`src/event/update_rows_event.rs`, `src/event/delete_rows_event.rs`. Tested by
+DeltaForge (`mysql_event::tests::table_map_retention`, and the live
+`mysql_reconnect_boundaries_e2e` churn cases).

@@ -68,6 +68,8 @@ tracing-subscriber = { version = "0.3", features = [
     "json",
 ] }
 tempfile = "3"
+# Compressed binlog transactions for the table-map retention tests.
+zstd = "0.13"
 # Vault admin setup (write KV, create/rotate secrets) for the live Vault+source
 # integration test.
 reqwest = { workspace = true }

@@ -20,11 +20,35 @@ use std::{
 pub struct BinlogParser {
     pub checksum_length: u8,
     pub table_map_event_by_table_id: HashMap<u64, TableMapEvent>,
+    /// DeltaForge patch: decides, for each parsed event, whether it ends the
+    /// transaction the events before it belong to. When it does, the table
+    /// maps are released: a rows event only references a table map of its
+    /// own statement, which MySQL writes before the statement's rows. `None`
+    /// keeps every table map (upstream behavior).
+    pub transaction_end: Option<TransactionEnd>,
+    /// DeltaForge patch: table maps installed so far (a TABLE_MAP whose
+    /// table id was not mapped at the time). Counts installations, not
+    /// distinct ids: an id mapped again after a release counts again.
+    pub table_maps_installed: u64,
 }
+
+/// See [`BinlogParser::transaction_end`].
+pub type TransactionEnd = Box<dyn FnMut(&EventData) -> bool + Send>;
 
 const MAGIC_VALUE: [u8; 4] = [0xfeu8, 0x62, 0x69, 0x6e];
 
 impl BinlogParser {
+    /// DeltaForge patch: a parser with no table maps and no
+    /// [`transaction_end`](Self::transaction_end) rule.
+    pub fn new(checksum_length: u8) -> Self {
+        Self {
+            checksum_length,
+            table_map_event_by_table_id: HashMap::new(),
+            transaction_end: None,
+            table_maps_installed: 0,
+        }
+    }
+
     pub fn check_magic<S: Read + Seek>(&mut self, stream: &mut S) -> Result<(), BinlogError> {
         let mut magic = [0u8; 4];
         stream.read_exact(&mut magic)?;
@@ -35,6 +59,19 @@ impl BinlogParser {
     }
 
     pub fn next<S: Read + Seek>(
+        &mut self,
+        stream: &mut S,
+    ) -> Result<(EventHeader, EventData), BinlogError> {
+        let (header, data) = self.parse_next(stream)?;
+        if let Some(end) = self.transaction_end.as_mut() {
+            if end(&data) {
+                self.table_map_event_by_table_id.clear();
+            }
+        }
+        Ok((header, data))
+    }
+
+    fn parse_next<S: Read + Seek>(
         &mut self,
         stream: &mut S,
     ) -> Result<(EventHeader, EventData), BinlogError> {
@@ -65,8 +102,13 @@ impl BinlogParser {
 
             EventType::TableMap => {
                 let event_data = TableMapEvent::parse(&mut cursor)?;
-                self.table_map_event_by_table_id
-                    .insert(event_data.table_id, event_data.clone());
+                if self
+                    .table_map_event_by_table_id
+                    .insert(event_data.table_id, event_data.clone())
+                    .is_none()
+                {
+                    self.table_maps_installed += 1;
+                }
                 Ok((header, EventData::TableMap(event_data)))
             }
 

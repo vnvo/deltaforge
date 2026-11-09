@@ -2,16 +2,18 @@
 //! transaction boundary: a transaction cut short is read again (duplicates
 //! allowed), never skipped in part. GTID and file-position modes; a dropped
 //! connection injected after the GTID, BEGIN, TableMap, between rows events,
-//! right before the XID and right after it; and a real killed connection
-//! while the source is backpressured mid-transaction.
+//! right before the XID and right after it; a real killed connection
+//! while the source is backpressured mid-transaction; and table-id churn
+//! (MySQL reopening tables under new ids) with read-ahead and a reconnect.
 //!
 //! Run with:
 //! ```bash
 //! cargo test -p sources --test mysql_reconnect_boundaries_e2e -- --include-ignored --test-threads=1
 //! ```
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use checkpoints::{CheckpointStore, MemCheckpointStore};
@@ -19,6 +21,7 @@ use ctor::dtor;
 use deltaforge_config::{OnSchemaDrift, SnapshotCfg, SnapshotMode};
 use deltaforge_core::{Event, Source, SourceHandle, SourceItem};
 use gate_ownership::GateOwned;
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use mysql_async::prelude::Queryable;
 use sources::MySqlSource;
 use sources::stream_probe::{self, Point};
@@ -146,9 +149,11 @@ impl Delivered {
     fn versions(&self) -> BTreeMap<(String, i64), Vec<i64>> {
         let mut out: BTreeMap<_, Vec<i64>> = BTreeMap::new();
         for e in &self.rows {
-            let img = test_common::row_view(
-                e.after.as_ref().or(e.before.as_ref()).unwrap(),
-            );
+            // DDL events carry no row image.
+            let Some(image) = e.after.as_ref().or(e.before.as_ref()) else {
+                continue;
+            };
+            let img = test_common::row_view(image);
             let id = img["id"].as_i64().unwrap();
             let v = if e.after.is_some() {
                 img["v"].as_i64().unwrap()
@@ -443,4 +448,215 @@ async fn gtid_killed_during_backpressure() {
 async fn file_killed_during_backpressure() {
     test_common::init_test_tracing();
     killed_during_backpressure(false, "file_bp").await;
+}
+
+/// The process's metrics, recorded for reading back (installed once).
+fn recorded() -> &'static Snapshotter {
+    static SNAP: OnceLock<Snapshotter> = OnceLock::new();
+    SNAP.get_or_init(|| {
+        let rec = DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        metrics::set_global_recorder(rec).expect("no other recorder");
+        snap
+    })
+}
+
+/// Source `id`'s table-map gauges `(parser, source)` and its installed
+/// mappings of the source map, as published now (`None`: not published).
+fn table_maps(
+    snap: &Snapshotter,
+    id: &str,
+) -> (Option<f64>, Option<f64>, Option<u64>) {
+    let (mut parser, mut source, mut installed) = (None, None, None);
+    for (key, _, _, value) in snap.snapshot().into_vec() {
+        let k = key.key();
+        if !k.labels().any(|l| l.key() == "source" && l.value() == id) {
+            continue;
+        }
+        let map = k
+            .labels()
+            .find(|l| l.key() == "map")
+            .map(|l| l.value().to_string());
+        match (k.name(), map.as_deref(), value) {
+            (
+                "deltaforge_mysql_table_maps",
+                Some("parser"),
+                DebugValue::Gauge(v),
+            ) => parser = Some(v.into_inner()),
+            (
+                "deltaforge_mysql_table_maps",
+                Some("source"),
+                DebugValue::Gauge(v),
+            ) => source = Some(v.into_inner()),
+            (
+                "deltaforge_mysql_table_maps_installed_total",
+                Some("source"),
+                DebugValue::Counter(n),
+            ) => installed = Some(n),
+            _ => {}
+        }
+    }
+    (parser, source, installed)
+}
+
+/// The table ids the binary logs map `db.table` under.
+async fn table_ids(port: u16, db: &str, table: &str) -> BTreeSet<u64> {
+    let mut c = mysql_async::Conn::from_url(dsn(port, "")).await.unwrap();
+    let logs: Vec<mysql_async::Row> =
+        c.query("SHOW BINARY LOGS").await.unwrap();
+    let needle = format!("({db}.{table})");
+    let mut ids = BTreeSet::new();
+    for log in logs {
+        let file: String = log.get(0).unwrap();
+        let events: Vec<mysql_async::Row> = c
+            .query(format!("SHOW BINLOG EVENTS IN '{file}'"))
+            .await
+            .unwrap();
+        for e in events {
+            let kind: String = e.get("Event_type").unwrap();
+            let info: String = e.get("Info").unwrap();
+            if kind == "Table_map" && info.ends_with(&needle) {
+                let id = info
+                    .trim_start_matches("table_id: ")
+                    .split(' ')
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                ids.insert(id);
+            }
+        }
+    }
+    c.disconnect().await.ok();
+    ids
+}
+
+const CHURN_ROUNDS: i64 = 40;
+const NEW_TABLES: i64 = 8;
+
+/// MySQL gives a table a new table id each time it reopens it, here after
+/// every `FLUSH TABLES`. Rounds of multi-statement transactions (three
+/// tables each, one of them first written during the run, so activation
+/// windows read ahead over later transactions) with a dropped connection
+/// after the 30th table map: every row arrives in per-key order, the table
+/// ids really changed, and neither the parser nor the source ever holds
+/// more table maps than one transaction needs.
+async fn table_id_churn(gtid: bool, name: &str) {
+    let _serial = SERIAL.lock().await;
+    stream_probe::reset_event_hooks();
+    let snap = recorded();
+    let mut case = Case::start(gtid, name, 64).await;
+    let id: &'static str = Box::leak(format!("rb-{name}").into_boxed_str());
+    for t in 0..NEW_TABLES {
+        sql(
+            case.port,
+            &case.db,
+            &[&format!(
+                "CREATE TABLE c{t} (id INT PRIMARY KEY, v INT NOT NULL)"
+            )],
+        )
+        .await;
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let sampling = {
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            let (mut parser, mut source) = (0.0f64, 0.0f64);
+            while !stop.load(Ordering::SeqCst) {
+                let (p, s, _) = table_maps(snap, id);
+                parser = parser.max(p.unwrap_or(0.0));
+                source = source.max(s.unwrap_or(0.0));
+                sleep(Duration::from_millis(2)).await;
+            }
+            (parser, source)
+        })
+    };
+    let reached = stream_probe::disconnect_after(Point::AfterTableMap, 30);
+    for r in 0..CHURN_ROUNDS {
+        sql(
+            case.port,
+            &case.db,
+            &[
+                "BEGIN",
+                &format!("INSERT INTO a VALUES ({}, {r})", 100 + r),
+                &format!("INSERT INTO c{} VALUES ({r}, {r})", r % NEW_TABLES),
+                "UPDATE b SET v = v + 1 WHERE id = 1",
+                "COMMIT",
+                "FLUSH TABLES",
+            ],
+        )
+        .await;
+    }
+    timeout(Duration::from_secs(30), reached.notified())
+        .await
+        .expect("the disconnect point was never reached");
+    let last = 100 + CHURN_ROUNDS - 1;
+    case.until(|d| {
+        let v = d.versions();
+        v.contains_key(&("a".into(), last))
+            && v.get(&("b".into(), 1)).and_then(|s| s.last())
+                == Some(&CHURN_ROUNDS)
+            && (0..CHURN_ROUNDS)
+                .all(|r| v.contains_key(&(format!("c{}", r % NEW_TABLES), r)))
+    })
+    .await;
+    let versions = case.delivered.versions();
+    for r in 0..CHURN_ROUNDS {
+        assert_eq!(versions[&("a".to_string(), 100 + r)].last(), Some(&r));
+        assert_eq!(
+            versions[&(format!("c{}", r % NEW_TABLES), r)].last(),
+            Some(&r)
+        );
+    }
+    let b = &versions[&("b".to_string(), 1)];
+    assert!(
+        b.windows(2).all(|w| w[0] <= w[1]),
+        "b.1 out of order: {b:?}"
+    );
+    let ids = table_ids(case.port, &case.db, "a").await;
+    assert!(
+        ids.len() as i64 >= CHURN_ROUNDS / 2,
+        "MySQL reopened `a` under new ids: {} ids",
+        ids.len()
+    );
+    stop.store(true, Ordering::SeqCst);
+    let (parser_peak, source_peak) = sampling.await.unwrap();
+    let (parser, source, installed) = table_maps(snap, id);
+    let (Some(parser), Some(source), Some(installed)) =
+        (parser, source, installed)
+    else {
+        panic!(
+            "table-map metrics not published: {parser:?} {source:?} {installed:?}"
+        );
+    };
+    eprintln!(
+        "{name}: {} ids for `a`; peak table maps parser {parser_peak} source \
+         {source_peak}; at the end parser {parser} source {source}; {installed} \
+         source mappings installed",
+        ids.len()
+    );
+    // One transaction maps at most its three tables.
+    assert!(parser_peak <= 3.0, "parser held {parser_peak} table maps");
+    assert!(source_peak <= 3.0, "source held {source_peak} table maps");
+    assert_eq!((parser, source), (0.0, 0.0), "none held at a boundary");
+    assert!(
+        installed >= 3 * CHURN_ROUNDS as u64,
+        "every transaction installed its maps: {installed}"
+    );
+    assert!(!case.handle.join.is_finished(), "the source stopped");
+    case.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn gtid_table_id_churn() {
+    test_common::init_test_tracing();
+    table_id_churn(true, "gtid_churn").await;
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn file_table_id_churn() {
+    test_common::init_test_tracing();
+    table_id_churn(false, "file_churn").await;
 }

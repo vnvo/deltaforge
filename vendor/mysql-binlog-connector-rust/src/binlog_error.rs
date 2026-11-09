@@ -31,4 +31,9 @@ pub enum BinlogError {
 
     #[error("invalid gtid: {0}")]
     InvalidGtid(String),
+
+    /// DeltaForge patch: a rows event whose table id has no table map in
+    /// the parser (the vendored code panicked).
+    #[error("rows event for table id {0} without a table map")]
+    UnmappedTableId(u64),
 }

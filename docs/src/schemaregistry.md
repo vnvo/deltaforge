@@ -223,17 +223,13 @@ curl http://localhost:8080/pipelines/{name}/schemas
 
 ## Troubleshooting
 
-### Unknown table_id Errors
+### Rows Event Without a Table Map
 
 ```
-WARN write_rows for unknown table_id, table_id=42
+rows event for table id 42 without a table map in its transaction
 ```
 
-The binlog contains row events for a table not in the table_map. This happens when:
-- A table was created after the CDC stream started
-- Table patterns don't match the table
-
-Solution: Trigger a schema reload via the REST API.
+MySQL writes a statement's table maps right before its rows events, for every table (captured or not), so a rows event always has its table map in the same transaction. If one does not, the source stops fail-closed with a schema error: the rows are neither decoded nor skipped, no event is emitted and the checkpoint is not advanced. Earlier versions logged `write_rows for unknown table_id` and skipped the rows. Restart the pipeline once the cause is understood; it resumes from the last checkpoint.
 
 ### Schema Fetch Returned 0 Columns
 

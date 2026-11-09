@@ -12,7 +12,6 @@
 //! all use it). It mirrors `BinlogClient::connect` with the identity query
 //! added: same timeout, start-position defaults, checksum, heartbeat.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use deltaforge_core::SourceError;
@@ -20,7 +19,6 @@ use deltaforge_core::SourceError;
 use super::mysql_failure::{Failure, of_binlog, of_mysql};
 use mysql_async::prelude::Queryable;
 use mysql_binlog_connector_rust::binlog_client::BinlogClient;
-use mysql_binlog_connector_rust::binlog_parser::BinlogParser;
 use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
 use mysql_binlog_connector_rust::command::authenticator::Authenticator;
 use mysql_binlog_connector_rust::command::command_util::CommandUtil;
@@ -240,10 +238,7 @@ async fn open_session(
         .map_err(connect)?;
     Ok(BinlogStream {
         channel,
-        parser: BinlogParser {
-            checksum_length: checksum.get_length(),
-            table_map_event_by_table_id: HashMap::new(),
-        },
+        parser: super::mysql_event::bounded_parser(checksum.get_length()),
     })
 }
 
