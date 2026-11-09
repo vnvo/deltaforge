@@ -333,3 +333,21 @@ Exit 2 at any step ends the campaign.
 - **Cap:** the eight-hour campaign cap is unchanged.
 - **Tooling validation before the campaign.** One short real-container run in its own campaign directory: size `001` (20 databases of 5 tables, 40 active), `fixture 001`, `run V a001` (F0 at 2,000 changes/s for 6 minutes, a 10-minute deadline, with the live coverage reader), then `drop 001`. It checks the driver end to end and the console consumer's record format. It is tooling validation, not capacity evidence; its result is kept.
   - **First validation (2026-11-09, kept in `~/deltaforge-evidence/capacity-rc1-validation`).** The record format, grants, end state, coverage (544,591 of 544,591 records, 40 distinct tables), manifest, topic deletion and `drop` all worked. It found two driver defects. The harness PID was looked up by command line, which matched floor-watch's short-lived subshells, so `watch.sh` and the live reader attached to a process that had already exited. A live consumer started after its stop was left running. Fixed: the PID is now matched by process name and executable (a run without it is stopped and fails as `NOHARNESS`), the live reader stops a consumer that starts late, and the driver stops `cap-cov-live` after every run.
+
+## Result of the first campaign (2026-11-09)
+
+The campaign ended at its first measured run. Its finding is a memory scaling limit of the published RC, not a throughput ceiling.
+
+- **A100** (100,000 tables, 40,000 active, 2,000 changes/s offered):
+  - **Fixture:** built in 218 s at 146,597 bytes per table.
+  - **Activation:** all 40,000 active tables were covered at 6 minutes.
+  - **Memory:** DeltaForge grew about 3.7 KB per delivered event and kept growing after activation, while lag stayed under 1 s. It was OOM-killed at its 6 GiB limit after 13 minutes.
+  - **MySQL:** at its 3-CPU allocation, committing about 94% of the offered rate.
+  - **Measurement:** no window completed.
+- **Cause (read-only investigation, `~/deltaforge-evidence/capacity-rc1-memory-investigation/REPORT.md`):**
+  - DeltaForge keeps two maps from binlog `table_id` to the full table map event, and neither is ever pruned: the vendored parser's map and the MySQL source's `RunCtx.table_map`.
+  - MySQL assigns a new `table_id` whenever a table is reopened after leaving its table definition cache. This run had a 2,000-entry definition cache; its binlogs show about 83% of row events under a new `table_id`.
+  - The growth therefore depends on an active set larger than the server's table definition cache, not on catalog size. It applies inside the qualified 40,000-table catalog as well.
+  - The 40-table validation runs stayed flat.
+- **Standing restriction:** this is a capacity restriction of v0.1.0-rc.1 alongside its documented scope. A MySQL source whose written-to active set exceeds the server's table definition cache grows without bound, at roughly 4 KB per change on a table outside that cache.
+- **Next:** a targeted reproduction and fix, before any further capacity run.
