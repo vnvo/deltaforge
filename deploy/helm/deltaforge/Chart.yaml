@@ -3,7 +3,7 @@ name: deltaforge
 description: High-performance CDC engine — stream database changes to Kafka, NATS, Redis
 type: application
 version: 0.1.0
-appVersion: "0.1.0-rc.1"
+appVersion: "0.1.0-rc.2"
 
 home: https://github.com/vnvo/deltaforge
 sources:
