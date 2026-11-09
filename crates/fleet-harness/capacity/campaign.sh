@@ -7,10 +7,15 @@
 #   campaign.sh mysql <size>                            fresh MySQL for a size (100, 200, 300)
 #   campaign.sh fixture <size>                          build that size's fixture
 #   campaign.sh drop <size>                             remove that size's MySQL container and volume
+#   campaign.sh adopt <size> <container id>             start a kept, stopped fixture container (full id)
+#   campaign.sh tune R1                                 MySQL table caches sized to the active set (50,000)
 #   campaign.sh run <A|B|BR|C|V> <config name>          one run, evaluated (exit: frontier.py's)
 #
 # Size 001 (100 tables) and phase V are the tooling validation only: a short
 # Phase A run, with the live coverage reader, in its own campaign directory.
+# Phase CAL is the generator calibration (`cal100`): one invocation of at
+# most 20 minutes, R1 applied before it and R2 (MySQL 5 CPUs) applied live
+# only if a step is MySQL-limited (frontier.py).
 #
 # Exit 3: refused (disk start floor, identity, freshness); 6: deadline or cap.
 set -u
@@ -29,7 +34,7 @@ PRIOR_BPT=146597          # bytes per empty table, measured at A100 (2026-11-09)
 MEMFLOOR=4294967296       # 4 GiB available memory
 TOTAL_CAP=28800           # 8 hours from T0
 REPORT=900                # the last 15 minutes are the report's
-declare -A BUDGET=([F]=2700 [A]=10800 [B]=9000 [BR]=9000 [C]=5400 [V]=600)
+declare -A BUDGET=([F]=2700 [A]=10800 [B]=9000 [BR]=9000 [C]=5400 [V]=600 [CAL]=1200)
 declare -A ACTIVE=([001]=40 [100]=40000 [200]=80000 [300]=120000)
 declare -A TABLES=([001]=100 [100]=100000 [200]=200000 [300]=300000)
 declare -A ALLOW=([100]=780 [200]=1500 [300]=2220)      # Phase B warm-up (Phase A activation allowance)
@@ -171,6 +176,30 @@ fixture)
   log "fixture a$size rc=$rc free_before=$before free_after=$(avail) bytes_per_table=$(( (before - $(avail)) / ${TABLES[$size]} ))"
   exit $rc
   ;;
+adopt)
+  # A kept fixture container, matched by its full id, image and only mount.
+  size=$2 want=$3; identity
+  got=$(docker inspect --format '{{.Id}} {{.Name}} {{.State.Status}} {{.Config.Image}} {{range .Mounts}}{{.Type}}:{{.Name}}{{end}}' "$want" 2>/dev/null)
+  [ "$got" = "$want /cap-mysql exited $MYSQL volume:cap-mysql-$size" ] \
+    || die "adopt: $want is not the stopped size-$size fixture container ($got)"
+  docker start "$want" >/dev/null || die "adopt: start failed"
+  for _ in $(seq 120); do docker exec cap-mysql mysql -uroot -prootpw -e 'select 1' >/dev/null 2>&1 && break; sleep 2; done
+  echo "$want" > "$C/cap-mysql-$size.id"
+  docker exec cap-mysql mysql -uroot -prootpw -N -e "SHOW GRANTS FOR 'df'@'%'" > "$C/cap-mysql-$size.grants" \
+    && grep -q BACKUP_ADMIN "$C/cap-mysql-$size.grants" || die "adopt: df grants incomplete"
+  log "adopted size $size: container $want volume cap-mysql-$size free=$(avail)"
+  ;;
+tune)
+  # R1 at runtime (not persisted): the table caches sized to the active
+  # set. The settings in effect are recorded.
+  [ "${2:-}" = R1 ] || die "tune: only R1 (R2 is applied live by the calibration)"
+  identity
+  docker exec cap-mysql mysql -uroot -prootpw -e "SET GLOBAL table_definition_cache = 50000; SET GLOBAL table_open_cache = 50000;" \
+    || die "tune: R1 not applied"
+  { date -Is; docker exec cap-mysql mysql -uroot -prootpw -N -e "SHOW GLOBAL VARIABLES WHERE Variable_name IN ('table_definition_cache', 'table_open_cache', 'table_open_cache_instances', 'open_files_limit', 'innodb_buffer_pool_size', 'max_connections')"; } \
+    | tee -a "$C/mysql-settings.log"
+  log "tune R1 applied: $(tr '\n\t' '  ' < "$C/mysql-settings.log" | tail -c 400)"
+  ;;
 drop)
   size=$2
   id=$(cat "$C/cap-mysql-$size.id") || die "no container id recorded for size $size"
@@ -199,6 +228,8 @@ run)
     B|BR) deadline=$(( ${ALLOW[$size]} + 1800 + 1800 + 900 )); drain=1800 ;;
     C)    deadline=5400; drain=900 ;;
     V)    deadline=600; drain=120 ;;
+    # The calibration: one invocation of at most 20 minutes, drain included.
+    CAL)  deadline=1200; drain=240 ;;
     *)    die "phase $phase" ;;
   esac
   identity; budget "$phase" "$deadline"; preflight "$NEED_RUN"
@@ -235,8 +266,16 @@ run)
     pkill -INT -P "$fw" -x fleet-harness
   else
     log "run $name: harness pid $hp observed"
+    # CPU and memory allocations at the start (the calibration may raise
+    # MySQL's; the end-of-run inspections record the final ones).
+    for c in cap-mysql cap-kafka cap-df; do
+      docker inspect --format "$c {{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}" "$c"
+    done > allocations-start.txt
     "$C/kit/watch.sh" "$inv" "$hp" &
-    case $phase in B|BR|V) python3 "$C/kit/frontier.py" B "$inv" "${ACTIVE[$size]}" --live "$hp" "$topic" "$KAFKA" > live.log 2>&1 & ;; esac
+    case $phase in
+      B|BR|V) python3 "$C/kit/frontier.py" B "$inv" "${ACTIVE[$size]}" --live "$hp" "$topic" "$KAFKA" > live.log 2>&1 & ;;
+      CAL)    python3 "$C/kit/frontier.py" CAL "$inv" "${ACTIVE[$size]}" --live "$hp" "$topic" "$KAFKA" > live.log 2>&1 & ;;
+    esac
   fi
   wait "$fw"; rc=$?
   echo "$rc" > floor-watch.rc
@@ -284,6 +323,7 @@ PY
   # Coverage from the retained topic, then the evaluation; the topic stays.
   python3 "$C/kit/frontier.py" coverage "$inv" "${ACTIVE[$size]}" "$topic" "$KAFKA" | tee -a "$C/campaign.log"
   ev=$phase; [ "$phase" = BR ] && ev=B; [ "$phase" = V ] && ev=A
+  [ "$phase" = CAL ] && docker inspect --format '{{.HostConfig.NanoCpus}}' cap-mysql > mysql-cpus-end.txt
   python3 "$C/kit/frontier.py" "$ev" "$inv" "${ACTIVE[$size]}" | tee -a "$C/campaign.log"
   vrc=${PIPESTATUS[0]}
   find . -type f ! -name MANIFEST.sha256 ! -path './state/*' -print0 | sort -z | xargs -0 sha256sum > MANIFEST.sha256

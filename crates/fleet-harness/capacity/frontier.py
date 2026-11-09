@@ -23,6 +23,14 @@ Writes verdict.json and prints one line. Exit: 0 viable, 1 saturated,
 2 correctness or health failure (ends the campaign), 3 inconclusive
 (including evidence incomplete: verdict.json evidence_complete is false).
 
+Calibration (`CAL`, run `cal100`) reads the generator only: per step, the
+offered, committed and delivered rates, MySQL's CPU against its allocation,
+its table-open rates and memory. Live, it applies R2 (MySQL to 5 CPUs) once,
+after the first step whose committed traffic is under 95% of offered while
+MySQL is at 90% or more of 3 CPUs (`R2-APPLIED`); a later such step, or one
+where MySQL is not at its allocation, stops the run as an environment limit
+(`GENERATOR-STOP`). It is never extended.
+
 Live mode (Phase B only) follows the run and SIGINTs the harness after the
 first step that is saturated (SATURATED-STOP) or generator-limited
 (GENERATOR-STOP), or when step 2's window starts before coverage is
@@ -41,6 +49,7 @@ C_WARMUP, C_MEASURED = 900, 2700
 DELIVERY_RATIO = 0.95   # criterion 1, and the generator check
 ALLOC = {"cap-mysql": 3.0, "cap-kafka": 2.0, "cap-df": 4.0}  # CPUs
 BUSY = 0.9              # a component at >= 90% of its CPUs is "at allocation"
+R2_CPUS = 5.0           # the calibration's R2: MySQL's CPUs
 MAX_GAP = 30            # samples further apart than this leave a window incomplete
 COVERAGE_IDLE_MS = 60000
 COVERAGE_TIMEOUT = 900
@@ -521,6 +530,174 @@ def evaluate(phase, inv, n):
     return out, 0 if out["status"] == "viable" else 3
 
 
+def mysql_rows(inv):
+    """(t, MySQL counters, MySQL memory bytes) from the watcher's samples."""
+    out = []
+    path = os.path.join(inv, "resources.jsonl")
+    if not os.path.exists(path):
+        return out
+    units = {"KiB": 2 ** 10, "MiB": 2 ** 20, "GiB": 2 ** 30, "B": 1}
+    for line in open(path):
+        r = json.loads(line)
+        mem = None
+        for st in r.get("docker_stats") or []:
+            if st.get("Name") == "cap-mysql":
+                m = re.match(r"([\d.]+)(KiB|MiB|GiB|B)", st.get("MemUsage", ""))
+                mem = float(m.group(1)) * units[m.group(2)] if m else None
+        out.append((ts(r["at"]), r.get("mysql_status"), mem))
+    return out
+
+
+def r2_applied(inv):
+    try:
+        return json.load(open(os.path.join(inv, "R2-APPLIED")))
+    except Exception:
+        return None
+
+
+def calibration_step(s, res, mrows, lo, hi, r2):
+    """One step's generator readout over [lo, hi]."""
+    m = measure(s, res, lo, hi)
+    if m is None:
+        return None
+    alloc = R2_CPUS if r2 and r2["at"] <= lo else ALLOC["cap-mysql"]
+    rows = [(t, st, mem) for t, st, mem in mrows if lo <= t <= hi]
+    known = [(t, st) for t, st, _ in rows if st]
+    rates = {}
+    if len(known) >= 2 and known[-1][0] > known[0][0]:
+        (a, sa), (b, sb) = known[0], known[-1]
+        rates = {k: (sb[k] - sa[k]) / (b - a) for k in sa if k in sb}
+    mysql_cpu = m["cpu_used"].get("cap-mysql")
+    ratio = m["offered_to_committed"]
+    return {
+        "from": lo, "to": hi, "offered_per_sec": m["offered_per_sec"], "committed_per_sec": m["committed_per_sec"],
+        "delivered_per_sec": m["delivered_per_sec"], "committed_to_offered": ratio,
+        "generator_limited": ratio is not None and ratio < DELIVERY_RATIO,
+        "mysql_cpus": alloc, "mysql_cpu_used": mysql_cpu,
+        "mysql_at_allocation": mysql_cpu is not None and mysql_cpu >= BUSY * alloc,
+        "mysql_mixed_allocation": bool(r2 and lo < r2["at"] < hi),
+        "mysql_rates_per_sec": rates,
+        "mysql_memory_max": max((mem for *_, mem in rows if mem is not None), default=None),
+        "df_memory_max": m["df_memory_max"], "lag_p99": m["lag_p99"], "host_mem_available_min": m["host_mem_available_min"],
+    }
+
+
+def calibrate(inv, n):
+    """The calibration's readout (`calibration` in verdict.json)."""
+    out = {"phase": "CAL", "invocation": inv, "active_tables": n, "evidence_complete": False}
+    runs = sorted(glob.glob(os.path.join(inv, "results/exploratory/*/result.json")))
+    if not runs:
+        out.update(status="inconclusive", reasons=["no result.json"] + resource_stop(inv))
+        return out, 3
+    run = os.path.dirname(runs[-1])
+    d = json.load(open(runs[-1]))
+    s = load_samples(os.path.join(run, "samples.jsonl"))
+    res = resources(os.path.join(inv, "resources.jsonl"))
+    mrows = mysql_rows(inv)
+    r2 = r2_applied(inv)
+    bad, incomplete = health(d, inv, "CAL")
+    act = activation(inv, n)
+    start, end = writes_span(s)
+    out.update(run=run, activation=act, writes_from=start, writes_to=end, r2=r2)
+    if bad:
+        out.update(status="failure", reasons=bad + incomplete)
+        return out, 2
+    if start is None:
+        out.update(status="inconclusive", reasons=["no writes recorded"] + incomplete)
+        return out, 3
+    tr = transitions(s, start)
+    if 2 in tr:
+        tr[1] = tr[2] - STEP_SECS
+    else:
+        tr[1] = start
+    steps = []
+    for k in range(1, 4):
+        if k not in tr:
+            steps.append({"step": k, "rate": STEPS[k - 1], "status": "not reached"})
+            continue
+        lo, hi = tr[k] + SETTLE, tr.get(k + 1, end)
+        row = calibration_step(s, res, mrows, lo, hi, r2) if hi - lo >= MIN_STEP_SPAN else None
+        steps.append({"step": k, "rate": STEPS[k - 1], "started_at": tr[k], **(row or {"status": "window too short"})})
+    out["steps"] = steps
+    out["evidence_complete"] = not incomplete
+    met = [r for r in steps if "committed_to_offered" in r and not r["mysql_mixed_allocation"]]
+    kept_up = [r["rate"] for r in met if not r["generator_limited"]]
+    out["highest_rate_kept_up"] = max(kept_up) if kept_up else None
+    r1 = [r for r in met if r["mysql_cpus"] == ALLOC["cap-mysql"]]
+    r1_limited = [r["rate"] for r in r1 if r["generator_limited"]]
+    if r1_limited:
+        out["r1_insufficient_at"] = min(r1_limited)
+
+    def why(r):
+        return "MySQL at its allocation" if r["mysql_at_allocation"] else "MySQL not at its allocation"
+
+    if r2:
+        after = [r for r in met if r["mysql_cpus"] == R2_CPUS]
+        limited = [r for r in after if r["generator_limited"]]
+        if limited:
+            out.update(status="environment limit", remedy="R2", reasons=[
+                f"with R2, committed under 95% of offered at {limited[0]['rate']}/s ({why(limited[0])})"])
+            return out, 3
+        if not after:
+            out.update(status="inconclusive", remedy="R2", reasons=["no step measured after R2"])
+            return out, 3
+        out.update(status="generator sufficient", remedy="R2")
+        return out, 0
+    limited = [r for r in r1 if r["generator_limited"]]
+    if not limited:
+        out.update(status="generator sufficient", remedy="R1")
+        return out, 0
+    last = limited[0]
+    if last["mysql_at_allocation"]:
+        out.update(status="inconclusive", remedy="R1", reasons=[
+            f"with R1, committed under 95% of offered at {last['rate']}/s (MySQL at its allocation); "
+            "R2 not tested (no later step)"])
+        return out, 3
+    out.update(status="environment limit", remedy="R1", reasons=[
+        f"committed under 95% of offered at {last['rate']}/s ({why(last)})"])
+    return out, 3
+
+
+def live_calibrate(inv, pid):
+    """Apply R2 once after the first MySQL-limited step; stop on the next
+    limited step (or one where MySQL is not at its allocation)."""
+    seen = 0
+    while True:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+        paths = glob.glob(os.path.join(inv, "results/exploratory/*/samples.jsonl"))
+        if paths:
+            s = load_samples(paths[-1])
+            res = resources(os.path.join(inv, "resources.jsonl"))
+            mrows = mysql_rows(inv)
+            start, _ = writes_span(s)
+            tr = transitions(s, start) if start else {}
+            for k in range(1, 3):
+                if k + 1 not in tr or k <= seen:
+                    continue
+                seen = k
+                lo = (tr[k] if k > 1 else tr[2] - STEP_SECS) + SETTLE
+                hi = tr[k + 1]
+                r2 = r2_applied(inv)
+                row = calibration_step(s, res, mrows, lo, hi, r2) if hi - lo >= MIN_STEP_SPAN else None
+                if row is None or not row["generator_limited"]:
+                    continue
+                if row["mysql_at_allocation"] and r2 is None:
+                    rc = subprocess.run(["docker", "update", "--cpus", str(R2_CPUS), "cap-mysql"],
+                                        capture_output=True, text=True)
+                    json.dump({"at": time.time(), "after_step": k, "rate": STEPS[k - 1], "rc": rc.returncode,
+                               "stderr": rc.stderr.strip(), "step": row}, open(os.path.join(inv, "R2-APPLIED"), "w"), indent=1)
+                    print(f"R2 applied after step {k} ({STEPS[k - 1]}/s): rc={rc.returncode}", flush=True)
+                    continue
+                json.dump({"step": k, "rate": STEPS[k - 1], "generator_limited": True, "metrics": row,
+                           "at": time.time()}, open(os.path.join(inv, "GENERATOR-STOP"), "w"), indent=1)
+                os.kill(pid, signal.SIGINT)
+                return
+        time.sleep(5)
+
+
 def live(inv, n, pid, topic, image):
     """Phase B: stop the harness after the first saturated or
     generator-limited step whose window followed complete coverage, or when
@@ -606,15 +783,18 @@ if __name__ == "__main__":
                                                               "expected_records", "complete_at", "reasons")))
         sys.exit(0 if c["established"] else 3)
     if len(sys.argv) > 7 and sys.argv[4] == "--live":
-        live(inv, n, int(sys.argv[5]), sys.argv[6], sys.argv[7])
+        if mode == "CAL":
+            live_calibrate(inv, int(sys.argv[5]))
+        else:
+            live(inv, n, int(sys.argv[5]), sys.argv[6], sys.argv[7])
         sys.exit(0)
-    out, rc = evaluate(mode, inv, n)
+    out, rc = calibrate(inv, n) if mode == "CAL" else evaluate(mode, inv, n)
     # The run's topic may be deleted only when the evaluation is complete:
     # no failure, every piece of evidence read, and coverage established.
     out["topic_deletable"] = (out.get("status") != "failure" and out.get("evidence_complete") is True
                               and out.get("activation", {}).get("established") is True)
     json.dump(out, open(os.path.join(inv, "verdict.json"), "w"), indent=1)
-    keys = ("status", "evidence_complete", "highest_demonstrated_viable", "highest_viable", "lowest_saturated",
+    keys = ("status", "remedy", "highest_rate_kept_up", "evidence_complete", "highest_demonstrated_viable", "highest_viable", "lowest_saturated",
             "no_conclusion_at", "attribution", "saturated", "reasons")
     print(mode, " ".join(f"{k}={out[k]}" for k in keys if out.get(k) is not None), f"verdict={inv}/verdict.json")
     sys.exit(rc)
