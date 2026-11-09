@@ -22,7 +22,9 @@ impl WriteRowsEvent {
         // refer: https://mariadb.com/kb/en/rows_event_v1v2-rows_compressed_event_v1/
         let (table_id, _column_count, included_columns) =
             EventHeader::parse_rows_event_common_header(cursor, row_event_version)?;
-        let table_map_event = table_map_event_by_table_id.get(&table_id).unwrap();
+        let table_map_event = table_map_event_by_table_id
+            .get(&table_id)
+            .ok_or(BinlogError::UnmappedTableId(table_id))?;
 
         let mut rows: Vec<RowEvent> = Vec::new();
         while cursor.available() > 0 {

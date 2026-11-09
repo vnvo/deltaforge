@@ -167,6 +167,8 @@ impl Ahead {
     fn commit(&mut self, end_pos: u32) {
         self.txn_anchor = None;
         self.explicit = false;
+        // Rows read ahead past this boundary have their own table maps.
+        self.table_map.clear();
         if let (Some(done), Some(g)) =
             (self.done.as_mut(), self.open_gtid.take())
             && !done.insert(&g)
@@ -3757,6 +3759,85 @@ mod tests {
             assert_eq!(ahead.boundary.pos, 500, "{ddl}");
             assert!(found.is_empty());
         }
+    }
+
+    /// The read-ahead resolves each rows event's table from its own
+    /// transaction's table maps (seeded from the stream's for the open
+    /// transaction) and drops them at each transaction end it reads past:
+    /// a later transaction that reuses an old id without mapping it finds
+    /// nothing, rather than a stale table.
+    #[test]
+    fn the_read_ahead_keeps_only_the_open_transactions_table_maps() {
+        use mysql_binlog_connector_rust::column::column_value::ColumnValue;
+        use mysql_binlog_connector_rust::event::{
+            row_event::RowEvent, table_map_event::TableMapEvent,
+            write_rows_event::WriteRowsEvent, xid_event::XidEvent,
+        };
+        let header = |end: u32| EventHeader {
+            timestamp: 0,
+            event_type: 0,
+            server_id: 1,
+            event_length: 50,
+            next_event_position: end,
+            event_flags: 0,
+        };
+        let map = |id: u64, table: &str| {
+            EventData::TableMap(TableMapEvent {
+                table_id: id,
+                database_name: "d".into(),
+                table_name: table.into(),
+                column_types: vec![8],
+                column_metas: vec![0],
+                null_bits: vec![true],
+                table_metadata: None,
+            })
+        };
+        let rows = |id: u64| {
+            EventData::WriteRows(WriteRowsEvent {
+                table_id: id,
+                included_columns: vec![true],
+                rows: vec![RowEvent {
+                    column_values: vec![ColumnValue::LongLong(1)],
+                }],
+            })
+        };
+        let xid = EventData::Xid(XidEvent { xid: 1 });
+        // Seeded with the open transaction's map (the head's table).
+        let mut ahead = Ahead {
+            file: "mysql-bin.000001".into(),
+            done: None,
+            open_gtid: None,
+            boundary: MySqlCheckpoint {
+                file: "mysql-bin.000001".into(),
+                pos: 100,
+                gtid_set: None,
+                lineage: None,
+                snapshot_completed: None,
+                snapshot_chain: None,
+            },
+            table_map: HashMap::from([(1, ("d".to_string(), "a".to_string()))]),
+            broken: false,
+            txn_anchor: None,
+            explicit: false,
+            server_version: Some(80409),
+        };
+        let mut found = Vec::new();
+        touched(&mut ahead, &header(150), &map(2, "b"), &mut found);
+        touched(&mut ahead, &header(200), &rows(1), &mut found);
+        touched(&mut ahead, &header(250), &rows(2), &mut found);
+        assert_eq!(ahead.table_map.len(), 2);
+        touched(&mut ahead, &header(300), &xid, &mut found);
+        assert!(ahead.table_map.is_empty(), "released at the commit");
+        // The next transaction maps `a` under a new id.
+        touched(&mut ahead, &header(350), &map(3, "a"), &mut found);
+        touched(&mut ahead, &header(400), &rows(3), &mut found);
+        touched(&mut ahead, &header(450), &rows(1), &mut found);
+        let tables: Vec<_> = found
+            .iter()
+            .map(|(_, t, cp)| (t.as_str(), cp.pos))
+            .collect();
+        assert_eq!(tables, vec![("a", 100), ("b", 100), ("a", 300)]);
+        assert_eq!(ahead.table_map.len(), 1);
     }
 
     #[test]

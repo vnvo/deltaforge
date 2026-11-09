@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
 use crate::{
     binlog_error::BinlogError,
@@ -148,10 +148,7 @@ impl BinlogClient {
         CommandUtil::dump_binlog(&mut channel, self).await?;
 
         // list for binlog
-        let parser = BinlogParser {
-            checksum_length: binlog_checksum.get_length(),
-            table_map_event_by_table_id: HashMap::new(),
-        };
+        let parser = BinlogParser::new(binlog_checksum.get_length());
 
         Ok(BinlogStream { channel, parser })
     }

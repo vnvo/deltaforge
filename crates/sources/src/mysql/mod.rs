@@ -290,7 +290,13 @@ pub(crate) struct RunCtx {
     allow: AllowList,
     retry: RetryPolicy,
     inactivity: Duration,
+    /// The table maps of the transaction being dispatched, by table id:
+    /// cleared at its commit boundary and when a stream is reopened (see
+    /// `mysql_event::handle_table_map`).
     table_map: HashMap<u64, TableMapEvent>,
+    /// The stream parser's installed-table-map count last exported
+    /// (`deltaforge_mysql_table_maps_installed_total{map="parser"}`).
+    parser_table_maps_installed: u64,
     last_file: String,
     last_pos: u64,
     /// The executed set through the last proven transaction boundary (GTID
@@ -1856,6 +1862,7 @@ impl MySqlSource {
             registry_backend: Arc::clone(&backend),
             inactivity: Duration::from_secs(60),
             table_map: HashMap::new(),
+            parser_table_maps_installed: 0,
             last_file: init_file,
             last_pos: init_pos,
             last_gtid: init_gtid,
@@ -2762,6 +2769,10 @@ impl RunCtx {
         // resume starts from: never dispatched.
         self.lookahead.clear();
         self.prefetched.clear();
+        // The reopened stream sends the table maps again from the resume
+        // boundary, to a new parser.
+        mysql_event::release_table_maps(self);
+        self.parser_table_maps_installed = 0;
         self.prefetch_error = None;
         // A speculative window goes too: its task is aborted.
         self.pending = None;

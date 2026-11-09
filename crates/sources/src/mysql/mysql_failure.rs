@@ -173,7 +173,8 @@ pub(crate) fn of_binlog(e: &BinlogError) -> Failure {
         | BinlogError::ParseIntError(_)
         | BinlogError::FromUtf8Error(_)
         | BinlogError::ParseJsonError(_)
-        | BinlogError::InvalidGtid(_) => Failure::Protocol,
+        | BinlogError::InvalidGtid(_)
+        | BinlogError::UnmappedTableId(_) => Failure::Protocol,
     }
 }
 

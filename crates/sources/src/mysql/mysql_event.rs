@@ -10,6 +10,7 @@ use deltaforge_core::{
 use metrics::counter;
 use mysql_binlog_connector_rust::column::column_value::ColumnValue;
 use mysql_binlog_connector_rust::{
+    binlog_parser::BinlogParser,
     binlog_stream::BinlogStream,
     event::{
         event_data::EventData, event_header::EventHeader,
@@ -71,6 +72,7 @@ pub(super) async fn read_next_event(
     match read {
         Ok(event) => {
             ctx.last_received = std::time::Instant::now();
+            note_parser_table_maps(ctx, &stream.parser, &event.1);
             Ok(event)
         }
         Err(outcome) => {
@@ -240,30 +242,86 @@ async fn handle_table_map(
     ctx: &mut RunCtx,
     tm: TableMapEvent,
 ) -> SourceResult<()> {
-    let is_new = !ctx.table_map.contains_key(&tm.table_id);
-    ctx.table_map.insert(tm.table_id, tm.clone());
-
-    if ctx.allow.matches(&tm.database_name, &tm.table_name) {
-        if is_new {
-            info!(
-                table_id=tm.table_id,
-                db=%tm.database_name,
-                table=%tm.table_name,
-                "table mapped");
-        } else {
-            debug!(
-                table_id=tm.table_id,
-                db=%tm.database_name,
-                table=%tm.table_name,
-                "table re-mapped");
-        }
-    } else {
-        debug!(
-            db=%tm.database_name,
-            table=%tm.table_name,
-            "skipping table (not in allow-list)");
+    debug!(
+        table_id = tm.table_id,
+        db = %tm.database_name,
+        table = %tm.table_name,
+        "table map"
+    );
+    // Every table's map is kept, captured or not: a rows event is skipped
+    // by the allow-list only once its table is known. The map lives until
+    // the transaction's commit boundary (`release_table_maps`).
+    if ctx.table_map.insert(tm.table_id, tm).is_none() {
+        counter!(
+            "deltaforge_mysql_table_maps_installed_total",
+            "pipeline" => ctx.pipeline.clone(),
+            "source" => ctx.source_id.clone(),
+            "map" => "source",
+        )
+        .increment(1);
+        set_table_maps(ctx, "source", ctx.table_map.len());
     }
     Ok(())
+}
+
+/// `deltaforge_mysql_table_maps{map}`: the table maps held now by the
+/// stream's binlog parser (`parser`) or by the dispatching source
+/// (`source`). Both are bounded by the open transaction's tables.
+fn set_table_maps(ctx: &RunCtx, map: &'static str, n: usize) {
+    metrics::gauge!(
+        "deltaforge_mysql_table_maps",
+        "pipeline" => ctx.pipeline.clone(),
+        "source" => ctx.source_id.clone(),
+        "map" => map,
+    )
+    .set(n as f64);
+}
+
+/// Release the dispatching source's table maps. At a transaction's commit
+/// boundary no later rows event can reference them (each statement's rows
+/// follow its own table maps), and when a stream is reopened the server
+/// sends them again from the resume boundary. MySQL can give a table a new
+/// table id each time it reopens the table, so kept maps would grow with
+/// the number of transactions.
+pub(super) fn release_table_maps(ctx: &mut RunCtx) {
+    if !ctx.table_map.is_empty() {
+        ctx.table_map.clear();
+        set_table_maps(ctx, "source", 0);
+    }
+}
+
+/// Export the stream parser's table maps (how many it holds, and the
+/// installations since the last export) after a read that can change them.
+fn note_parser_table_maps(
+    ctx: &mut RunCtx,
+    parser: &BinlogParser,
+    data: &EventData,
+) {
+    if !matches!(
+        data,
+        EventData::TableMap(_)
+            | EventData::Xid(_)
+            | EventData::Query(_)
+            | EventData::TransactionPayload(_)
+    ) {
+        return;
+    }
+    let installed = parser.table_maps_installed;
+    // A reopened stream's parser counts from zero.
+    let new = installed
+        .checked_sub(ctx.parser_table_maps_installed)
+        .unwrap_or(installed);
+    ctx.parser_table_maps_installed = installed;
+    if new > 0 {
+        counter!(
+            "deltaforge_mysql_table_maps_installed_total",
+            "pipeline" => ctx.pipeline.clone(),
+            "source" => ctx.source_id.clone(),
+            "map" => "parser",
+        )
+        .increment(new);
+    }
+    set_table_maps(ctx, "parser", parser.table_map_event_by_table_id.len());
 }
 
 /// Build SourceInfo for MySQL events
@@ -433,7 +491,7 @@ async fn handle_write_rows(
             .increment(sent);
         }
     } else {
-        warn!(source_id=%ctx.source_id, table_id=wr.table_id, "write_rows for unknown table_id");
+        return Err(super::mysql_errors::unmapped_table_id(wr.table_id));
     }
     Ok(())
 }
@@ -542,7 +600,7 @@ async fn handle_update_rows(
             .increment(sent);
         }
     } else {
-        warn!(source_id=%ctx.source_id, table_id=ur.table_id, "update_rows for unknown table_id");
+        return Err(super::mysql_errors::unmapped_table_id(ur.table_id));
     }
     Ok(())
 }
@@ -639,7 +697,7 @@ async fn handle_delete_rows(
             .increment(sent);
         }
     } else {
-        warn!(source_id=%ctx.source_id, table_id=dr.table_id, "delete_rows for unknown table_id");
+        return Err(super::mysql_errors::unmapped_table_id(dr.table_id));
     }
     Ok(())
 }
@@ -762,6 +820,7 @@ async fn emit_tx_commit(ctx: &mut RunCtx) {
     ctx.last_gtid = ctx.executed_through_current();
     // Rows of the next transaction are evaluated at this boundary.
     ctx.mark_transaction_boundary();
+    release_table_maps(ctx);
     let Some(tx_id) = ctx.current_gtid.clone() else {
         return;
     };
@@ -1066,6 +1125,79 @@ pub(super) enum QueryBoundary {
     /// A control statement inside an explicit transaction (`SAVEPOINT`,
     /// `SET`, ...): part of it, closed later.
     Continues,
+}
+
+/// The read position's place in its transaction, from the events read so
+/// far: [`query_boundary`]'s explicit-transaction state and the server
+/// version (from the format description event). It follows a binlog
+/// stream's reads, ahead of dispatching (prefetched and read-ahead events
+/// included), so it is kept with the stream's parser.
+#[derive(Debug, Default)]
+pub(super) struct ReadBoundary {
+    explicit: bool,
+    server_version: Option<u32>,
+}
+
+impl ReadBoundary {
+    /// Whether `data` ends the transaction the events before it belong to:
+    /// an XID, a query that completes it under [`query_boundary`] (the rule
+    /// dispatching uses: inside `BEGIN`, only `COMMIT`, `ROLLBACK` or a DDL),
+    /// or a whole compressed transaction. GTID events are not needed: the
+    /// same boundaries end a transaction with GTIDs on or off.
+    pub(super) fn ends_transaction(&mut self, data: &EventData) -> bool {
+        match data {
+            EventData::FormatDescription(fde) => {
+                self.server_version =
+                    super::mysql_ddl_attribution::parse_server_version(
+                        &fde.server_version,
+                    );
+                false
+            }
+            EventData::Xid(_) | EventData::TransactionPayload(_) => {
+                self.explicit = false;
+                true
+            }
+            EventData::Query(q) => match query_boundary(
+                &q.query,
+                self.explicit,
+                self.server_version,
+            ) {
+                QueryBoundary::Opens => {
+                    self.explicit = true;
+                    false
+                }
+                QueryBoundary::Completes => {
+                    self.explicit = false;
+                    true
+                }
+                QueryBoundary::Continues => false,
+            },
+            _ => false,
+        }
+    }
+}
+
+/// Bound a binlog parser's table maps to the open transaction: they are
+/// released at every transaction end the parser reads ([`ReadBoundary`]).
+/// The parser decodes a rows event only as it reads it, with the table maps
+/// of the rows' own statement (MySQL writes them before the statement's
+/// rows), so no later rows event needs a map from before such a boundary.
+/// MySQL can give a table a new table id each time it reopens the table,
+/// so without this the maps grow with the number of transactions.
+pub(crate) fn release_table_maps_at_transaction_ends(
+    parser: &mut BinlogParser,
+) {
+    let mut at = ReadBoundary::default();
+    parser.transaction_end =
+        Some(Box::new(move |data| at.ends_transaction(data)));
+}
+
+/// A parser for a stream that starts at a transaction boundary, with its
+/// table maps bounded to the open transaction.
+pub(crate) fn bounded_parser(checksum_length: u8) -> BinlogParser {
+    let mut parser = BinlogParser::new(checksum_length);
+    release_table_maps_at_transaction_ends(&mut parser);
+    parser
 }
 
 pub(super) fn query_boundary(
@@ -1624,6 +1756,7 @@ pub(crate) mod tests {
             inactivity: Duration::from_secs(60),
             type_mapping: deltaforge_core::TypeMapping::V2,
             table_map,
+            parser_table_maps_installed: 0,
             last_file: "mysql-bin.000001".to_string(),
             last_pos: 1234,
             last_gtid: Some(
@@ -3630,5 +3763,610 @@ pub(crate) mod tests {
             },
         );
         assert_eq!(ctx.last_file, "mysql-bin.000042");
+    }
+
+    /// Retention of binlog table maps. MySQL gives a table a new
+    /// `table_id` each time it reopens it after evicting it from its table
+    /// definition cache, so an active set larger than that cache sees a new
+    /// id on most transactions. A rows event only references the table maps
+    /// of its own statement, written right before it, so the maps of the
+    /// parser and of the dispatching source must stay bounded by the open
+    /// transaction: never released inside it, always released at its end,
+    /// with GTIDs on or off.
+    mod table_map_retention {
+        use super::*;
+        use mysql_binlog_connector_rust::binlog_error::BinlogError;
+        use mysql_binlog_connector_rust::event::xid_event::XidEvent;
+        use std::io::Cursor;
+
+        const TRANSACTIONS: u64 = 10_000;
+        const UUID_BYTES: [u8; 16] = [0x3e; 16];
+
+        /// One binlog event (v4 header, no checksum) around `body`.
+        fn event(event_type: u8, body: &[u8]) -> Vec<u8> {
+            let len = (19 + body.len()) as u32;
+            let mut e = Vec::with_capacity(len as usize);
+            e.extend_from_slice(&1_700_000_000u32.to_le_bytes());
+            e.push(event_type);
+            e.extend_from_slice(&1u32.to_le_bytes());
+            e.extend_from_slice(&len.to_le_bytes());
+            e.extend_from_slice(&0u32.to_le_bytes());
+            e.extend_from_slice(&0u16.to_le_bytes());
+            e.extend_from_slice(body);
+            e
+        }
+
+        /// TABLE_MAP_EVENT for `db.table` under `table_id`: one nullable
+        /// BIGINT column.
+        fn table_map(table_id: u64, db: &str, table: &str) -> Vec<u8> {
+            let mut b = table_id.to_le_bytes()[..6].to_vec();
+            b.extend_from_slice(&0u16.to_le_bytes());
+            for name in [db, table] {
+                b.push(name.len() as u8);
+                b.extend_from_slice(name.as_bytes());
+                b.push(0);
+            }
+            b.push(1); // column count
+            b.push(
+                mysql_binlog_connector_rust::column::column_type::ColumnType::LongLong
+                    as u8,
+            );
+            b.push(0); // metadata length (BIGINT has none)
+            b.push(0b1); // nullable bits
+            event(19, &b)
+        }
+
+        /// WRITE_ROWS_EVENT v2 of one row `id` under `table_id`;
+        /// `stmt_end` sets STMT_END_F (the statement's last rows event).
+        fn write_rows(table_id: u64, id: i64, stmt_end: bool) -> Vec<u8> {
+            let mut b = table_id.to_le_bytes()[..6].to_vec();
+            b.extend_from_slice(&u16::from(stmt_end).to_le_bytes());
+            b.extend_from_slice(&2u16.to_le_bytes()); // no extra data
+            b.push(1); // column count
+            b.push(0b1); // included columns
+            b.push(0); // null bitmap of the row
+            b.extend_from_slice(&id.to_le_bytes());
+            event(30, &b)
+        }
+
+        fn xid(n: u64) -> Vec<u8> {
+            event(16, &n.to_le_bytes())
+        }
+
+        /// QUERY_EVENT of `sql` in `db`.
+        fn query(db: &str, sql: &str) -> Vec<u8> {
+            let mut b = Vec::new();
+            b.extend_from_slice(&7u32.to_le_bytes()); // thread id
+            b.extend_from_slice(&0u32.to_le_bytes()); // exec time
+            b.push(db.len() as u8);
+            b.extend_from_slice(&0u16.to_le_bytes()); // error code
+            b.extend_from_slice(&0u16.to_le_bytes()); // no status vars
+            b.extend_from_slice(db.as_bytes());
+            b.push(0);
+            b.extend_from_slice(sql.as_bytes());
+            event(2, &b)
+        }
+
+        /// GTID_LOG_EVENT (`gtid` true) or ANONYMOUS_GTID_LOG_EVENT.
+        fn gtid(gtid: bool, gno: u64) -> Vec<u8> {
+            let mut b = vec![1u8];
+            b.extend_from_slice(&UUID_BYTES);
+            b.extend_from_slice(&gno.to_le_bytes());
+            b.push(2); // logical timestamp type
+            b.extend_from_slice(&0u64.to_le_bytes());
+            b.extend_from_slice(&0u64.to_le_bytes());
+            event(if gtid { 33 } else { 34 }, &b)
+        }
+
+        /// TRANSACTION_PAYLOAD_EVENT: `inner` events, zstd-compressed.
+        fn payload(inner: &[u8]) -> Vec<u8> {
+            let compressed = zstd::encode_all(inner, 3).unwrap();
+            // Compression type zstd (field 2), then the end of the header.
+            let mut b = vec![2u8, 1, 0, 0];
+            b.extend_from_slice(&compressed);
+            event(40, &b)
+        }
+
+        /// A parser as every DeltaForge binlog stream gets it.
+        fn parser() -> BinlogParser {
+            bounded_parser(0)
+        }
+
+        /// Parse every event of `stream`; after each one, the table maps
+        /// the parser holds, with the event.
+        fn parse_all(
+            parser: &mut BinlogParser,
+            stream: Vec<u8>,
+        ) -> Vec<(EventData, usize)> {
+            let len = stream.len() as u64;
+            let mut cursor = Cursor::new(stream);
+            let mut out = Vec::new();
+            while cursor.position() < len {
+                let (_, data) =
+                    parser.next(&mut cursor).expect("a valid event");
+                out.push((data, parser.table_map_event_by_table_id.len()));
+            }
+            out
+        }
+
+        /// The (table id, value) of a one-row rows event.
+        fn decoded(data: &EventData) -> Option<(u64, i64)> {
+            let EventData::WriteRows(w) = data else {
+                return None;
+            };
+            let ColumnValue::LongLong(v) = w.rows[0].column_values[0] else {
+                panic!("a BIGINT value");
+            };
+            Some((w.table_id, v))
+        }
+
+        #[test]
+        fn the_binlog_parser_keeps_table_maps_bounded_across_transactions() {
+            let mut stream = Vec::new();
+            for i in 0..TRANSACTIONS {
+                stream.extend(gtid(true, i + 1));
+                stream.extend(query("shop", "BEGIN"));
+                stream.extend(table_map(1_000 + i, "shop", "orders"));
+                stream.extend(write_rows(1_000 + i, i as i64, true));
+                stream.extend(xid(i));
+            }
+            let mut parser = parser();
+            let events = parse_all(&mut parser, stream);
+            let mut rows = 0u64;
+            for (data, held) in &events {
+                // Throughout: at most the open transaction's one table map,
+                // and none once it committed.
+                assert!(*held <= 1, "{held} table maps held");
+                if matches!(data, EventData::Xid(_)) {
+                    assert_eq!(
+                        *held, 0,
+                        "a table map outlived its transaction"
+                    );
+                }
+                if let Some((id, v)) = decoded(data) {
+                    assert_eq!((id, v), (1_000 + rows, rows as i64));
+                    rows += 1;
+                }
+            }
+            assert_eq!(rows, TRANSACTIONS);
+            assert_eq!(parser.table_map_event_by_table_id.len(), 0);
+            assert_eq!(parser.table_maps_installed, TRANSACTIONS);
+        }
+
+        #[test]
+        fn a_multi_statement_transaction_keeps_every_table_map_until_it_ends() {
+            // One transaction: a statement on orders (id 10), a SAVEPOINT
+            // (inside the transaction: not a boundary), a statement on
+            // items (11) and orders under a second id (12), and a statement
+            // that maps items again under its id. Then a second transaction
+            // closed by COMMIT (a non-XID engine), and a ROLLBACK.
+            let mut s = Vec::new();
+            s.extend(gtid(true, 1));
+            s.extend(query("shop", "BEGIN"));
+            s.extend(table_map(10, "shop", "orders"));
+            s.extend(write_rows(10, 1, true));
+            s.extend(query("shop", "SAVEPOINT s1"));
+            s.extend(table_map(11, "shop", "items"));
+            s.extend(table_map(12, "shop", "orders"));
+            s.extend(write_rows(11, 2, false));
+            s.extend(write_rows(12, 3, true));
+            s.extend(query("shop", "ROLLBACK TO SAVEPOINT s1"));
+            s.extend(table_map(11, "shop", "items"));
+            s.extend(write_rows(11, 4, true));
+            s.extend(xid(1));
+            s.extend(gtid(true, 2));
+            s.extend(query("shop", "BEGIN"));
+            s.extend(table_map(13, "shop", "log"));
+            s.extend(write_rows(13, 5, true));
+            s.extend(query("shop", "COMMIT"));
+            s.extend(gtid(true, 3));
+            s.extend(query("shop", "BEGIN"));
+            s.extend(table_map(14, "shop", "log"));
+            s.extend(write_rows(14, 6, true));
+            s.extend(query("shop", "ROLLBACK"));
+            let events = parse_all(&mut parser(), s);
+            let rows: Vec<_> =
+                events.iter().filter_map(|(d, _)| decoded(d)).collect();
+            assert_eq!(
+                rows,
+                vec![(10, 1), (11, 2), (12, 3), (11, 4), (13, 5), (14, 6)]
+            );
+            let held: Vec<usize> = events.iter().map(|(_, h)| *h).collect();
+            // GTID BEGIN TM10 R TM-SAVEPOINT TM11 TM12 R R ROLLBACK-TO TM11 R XID
+            assert_eq!(&held[..13], &[0, 0, 1, 1, 1, 2, 3, 3, 3, 3, 3, 3, 0]);
+            // GTID BEGIN TM13 R COMMIT, GTID BEGIN TM14 R ROLLBACK
+            assert_eq!(&held[13..], &[0, 0, 1, 1, 0, 0, 0, 1, 1, 0]);
+        }
+
+        #[test]
+        fn gtid_off_transactions_keep_table_maps_bounded() {
+            // Anonymous GTIDs (gtid_mode OFF): the same boundaries end each
+            // transaction: XID, COMMIT, and a DDL outside any transaction.
+            let mut s = Vec::new();
+            for i in 0..1_000u64 {
+                s.extend(gtid(false, 0));
+                s.extend(query("shop", "BEGIN"));
+                s.extend(table_map(100 + i, "shop", "orders"));
+                s.extend(write_rows(100 + i, i as i64, true));
+                if i % 2 == 0 {
+                    s.extend(xid(i));
+                } else {
+                    s.extend(query("shop", "COMMIT"));
+                }
+                s.extend(gtid(false, 0));
+                s.extend(query(
+                    "shop",
+                    "CREATE TABLE IF NOT EXISTS t (id INT)",
+                ));
+            }
+            let mut parser = parser();
+            let events = parse_all(&mut parser, s);
+            let mut next = 0i64;
+            for (data, held) in &events {
+                assert!(*held <= 1, "{held} table maps held");
+                if let Some((id, v)) = decoded(data) {
+                    assert_eq!((id, v), (100 + next as u64, next));
+                    next += 1;
+                }
+            }
+            assert_eq!(next, 1_000);
+            assert_eq!(parser.table_map_event_by_table_id.len(), 0);
+        }
+
+        #[test]
+        fn a_compressed_transaction_decodes_with_its_own_table_maps() {
+            let mut inner = Vec::new();
+            inner.extend(query("shop", "BEGIN"));
+            inner.extend(table_map(20, "shop", "orders"));
+            inner.extend(table_map(21, "shop", "items"));
+            inner.extend(write_rows(20, 1, false));
+            inner.extend(write_rows(21, 2, true));
+            inner.extend(xid(7));
+            let mut s = Vec::new();
+            s.extend(gtid(true, 1));
+            s.extend(payload(&inner));
+            // The next transaction is not compressed and maps its own table.
+            s.extend(gtid(true, 2));
+            s.extend(query("shop", "BEGIN"));
+            s.extend(table_map(22, "shop", "orders"));
+            s.extend(write_rows(22, 3, true));
+            s.extend(xid(8));
+            let mut parser = parser();
+            let events = parse_all(&mut parser, s);
+            let EventData::TransactionPayload(tp) = &events[1].0 else {
+                panic!("a compressed transaction");
+            };
+            let inner_rows: Vec<_> = tp
+                .uncompressed_events
+                .iter()
+                .filter_map(|(_, d)| decoded(d))
+                .collect();
+            assert_eq!(inner_rows, vec![(20, 1), (21, 2)]);
+            assert_eq!(
+                events[1].1, 0,
+                "the stream's parser holds none of its maps"
+            );
+            let rows: Vec<_> =
+                events.iter().filter_map(|(d, _)| decoded(d)).collect();
+            assert_eq!(rows, vec![(22, 3)]);
+            assert_eq!(parser.table_map_event_by_table_id.len(), 0);
+        }
+
+        #[test]
+        fn rows_without_a_table_map_are_an_error_not_a_panic() {
+            // Never mapped.
+            let mut stream = Vec::new();
+            stream.extend(query("shop", "BEGIN"));
+            stream.extend(write_rows(99, 1, true));
+            let mut never = parser();
+            let mut cursor = Cursor::new(stream);
+            never.next(&mut cursor).unwrap();
+            assert!(matches!(
+                never.next(&mut cursor),
+                Err(BinlogError::UnmappedTableId(99))
+            ));
+            // Mapped in an earlier, committed transaction only.
+            let mut stream = Vec::new();
+            stream.extend(query("shop", "BEGIN"));
+            stream.extend(table_map(5, "shop", "orders"));
+            stream.extend(write_rows(5, 1, true));
+            stream.extend(xid(1));
+            stream.extend(query("shop", "BEGIN"));
+            stream.extend(write_rows(5, 2, true));
+            let mut later = parser();
+            let mut cursor = Cursor::new(stream);
+            for _ in 0..5 {
+                later.next(&mut cursor).unwrap();
+            }
+            assert!(matches!(
+                later.next(&mut cursor),
+                Err(BinlogError::UnmappedTableId(5))
+            ));
+            // The source fails such a stream closed (no reload, no retry).
+            assert!(matches!(
+                LoopControl::from_binlog_error(BinlogError::UnmappedTableId(5)),
+                LoopControl::Fail(SourceError::Schema { .. })
+            ));
+        }
+
+        /// A context on a verified lineage, at a transaction boundary, with
+        /// no table maps; and a drain for what it emits.
+        async fn source() -> (
+            RunCtx,
+            TableMapEvent,
+            tokio::task::JoinHandle<Vec<SourceItem>>,
+        ) {
+            let (tx, mut rx) = mpsc::channel::<SourceItem>(1024);
+            let drain = tokio::spawn(async move {
+                let mut items = Vec::new();
+                while let Some(item) = rx.recv().await {
+                    items.push(item);
+                }
+                items
+            });
+            let mut ctx = make_runctx(tx);
+            let template = ctx.table_map[&TABLE_ID].clone();
+            ctx.table_map.clear();
+            with_scope(&mut ctx).await;
+            ctx.current_gtid = None;
+            ctx.in_explicit_txn = false;
+            ctx.mark_transaction_boundary();
+            (ctx, template, drain)
+        }
+
+        /// A table outside the allow-list (its rows are skipped, its table
+        /// map is kept like any other) under `table_id`.
+        fn filtered(template: &TableMapEvent, table_id: u64) -> EventData {
+            EventData::TableMap(TableMapEvent {
+                table_id,
+                database_name: "other".to_string(),
+                table_name: "audit".to_string(),
+                ..template.clone()
+            })
+        }
+
+        fn rows(table_id: u64, id: i64) -> EventData {
+            EventData::WriteRows(WriteRowsEvent {
+                table_id,
+                included_columns: vec![true, true],
+                rows: vec![RowEvent {
+                    column_values: vec![
+                        ColumnValue::LongLong(id),
+                        ColumnValue::String(b"sku".to_vec()),
+                    ],
+                }],
+            })
+        }
+
+        fn gtid_event(gno: u64) -> EventData {
+            EventData::Gtid(GtidEvent {
+                flags: 0,
+                gtid: format!("{UUID}:{gno}"),
+            })
+        }
+
+        fn query_event(sql: &str) -> EventData {
+            EventData::Query(QueryEvent {
+                thread_id: 1,
+                exec_time: 0,
+                error_code: 0,
+                schema: "other".to_string(),
+                query: sql.to_string(),
+            })
+        }
+
+        #[tokio::test]
+        async fn the_source_keeps_table_maps_bounded_across_transactions() {
+            const N: u64 = 2_000;
+            let (mut ctx, template, drain) = source().await;
+            for i in 0..N {
+                let table_id = 1_000 + i;
+                let events = [
+                    gtid_event(6 + i),
+                    filtered(&template, table_id),
+                    rows(table_id, i as i64),
+                    EventData::Xid(XidEvent { xid: i }),
+                ];
+                for data in events {
+                    let commit = matches!(data, EventData::Xid(_));
+                    dispatch_event(&mut ctx, &make_header(), data)
+                        .await
+                        .expect("a committed transaction dispatches");
+                    let held = ctx.table_map.len();
+                    assert!(held <= 1, "{held} table maps held");
+                    if commit {
+                        assert_eq!(
+                            held, 0,
+                            "a table map outlived its transaction"
+                        );
+                    }
+                }
+            }
+            drop(ctx);
+            drain.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn the_source_keeps_a_transactions_table_maps_until_its_commit() {
+            let (mut ctx, template, drain) = source().await;
+            let events = [
+                gtid_event(6),
+                query_event("BEGIN"),
+                filtered(&template, 30),
+                rows(30, 1),
+                query_event("SAVEPOINT s1"),
+                filtered(&template, 31),
+                rows(31, 2),
+                rows(30, 3),
+                EventData::Xid(XidEvent { xid: 1 }),
+            ];
+            let mut held = Vec::new();
+            for data in events {
+                dispatch_event(&mut ctx, &make_header(), data)
+                    .await
+                    .unwrap();
+                held.push(ctx.table_map.len());
+            }
+            assert_eq!(held, vec![0, 0, 1, 1, 1, 2, 2, 2, 0]);
+            drop(ctx);
+            drain.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn rows_without_a_table_map_stop_the_source_and_emit_nothing() {
+            let (mut ctx, template, drain) = source().await;
+            for data in [gtid_event(6), filtered(&template, 40), rows(40, 1)] {
+                dispatch_event(&mut ctx, &make_header(), data)
+                    .await
+                    .unwrap();
+            }
+            dispatch_event(
+                &mut ctx,
+                &make_header(),
+                EventData::Xid(XidEvent { xid: 1 }),
+            )
+            .await
+            .unwrap();
+            // The next transaction's rows name the committed one's id, with
+            // no table map of their own: refused, not skipped.
+            let before = ctx.resume_point();
+            dispatch_event(&mut ctx, &make_header(), gtid_event(7))
+                .await
+                .unwrap();
+            let refused =
+                dispatch_event(&mut ctx, &make_header(), rows(40, 2)).await;
+            assert!(
+                matches!(&refused, Err(SourceError::Schema { details }) if details.contains("without a table map")),
+                "{refused:?}"
+            );
+            assert_eq!(
+                ctx.resume_point(),
+                before,
+                "the checkpoint did not move"
+            );
+            drop(ctx);
+            let items = drain.await.unwrap();
+            assert!(
+                !items.iter().any(|i| matches!(i, SourceItem::Event(_))),
+                "no row event was emitted"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_reopened_stream_starts_without_the_old_table_maps() {
+            let (mut ctx, template, drain) = source().await;
+            // Cut inside a transaction, after its table map.
+            for data in [gtid_event(6), filtered(&template, 50), rows(50, 1)] {
+                dispatch_event(&mut ctx, &make_header(), data)
+                    .await
+                    .unwrap();
+            }
+            ctx.parser_table_maps_installed = 9;
+            assert_eq!(ctx.table_map.len(), 1);
+            ctx.abandon_open_transaction().await.unwrap();
+            assert!(ctx.table_map.is_empty());
+            assert_eq!(ctx.parser_table_maps_installed, 0);
+            // The server sends the whole transaction again, maps first.
+            for data in [
+                gtid_event(6),
+                filtered(&template, 50),
+                rows(50, 1),
+                EventData::Xid(XidEvent { xid: 1 }),
+            ] {
+                dispatch_event(&mut ctx, &make_header(), data)
+                    .await
+                    .unwrap();
+            }
+            assert!(ctx.table_map.is_empty());
+            drop(ctx);
+            drain.await.unwrap();
+        }
+
+        #[test]
+        fn the_table_map_metrics_separate_the_parser_and_the_source() {
+            use metrics_util::debugging::{
+                DebugValue, DebuggingRecorder, Snapshotter,
+            };
+            let rec = DebuggingRecorder::new();
+            let snap = rec.snapshotter();
+            // (gauge, installed) by `map` label.
+            type Series = (
+                std::collections::BTreeMap<String, f64>,
+                std::collections::BTreeMap<String, u64>,
+            );
+            fn read(snap: &Snapshotter) -> Series {
+                let (mut gauges, mut installed) = Series::default();
+                for (key, _, _, value) in snap.snapshot().into_vec() {
+                    let k = key.key();
+                    let map = k
+                        .labels()
+                        .find(|l| l.key() == "map")
+                        .map(|l| l.value().to_string())
+                        .unwrap_or_default();
+                    match (k.name(), value) {
+                        (
+                            "deltaforge_mysql_table_maps",
+                            DebugValue::Gauge(v),
+                        ) => {
+                            gauges.insert(map, v.into_inner());
+                        }
+                        (
+                            "deltaforge_mysql_table_maps_installed_total",
+                            DebugValue::Counter(n),
+                        ) => {
+                            installed.insert(map, n);
+                        }
+                        _ => {}
+                    }
+                }
+                (gauges, installed)
+            }
+            metrics::with_local_recorder(&rec, || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let (mut ctx, template, drain) = source().await;
+                    for data in [
+                        gtid_event(6),
+                        filtered(&template, 60),
+                        filtered(&template, 61),
+                    ] {
+                        dispatch_event(&mut ctx, &make_header(), data)
+                            .await
+                            .unwrap();
+                    }
+                    let (gauges, installed) = read(&snap);
+                    assert_eq!(gauges.get("source"), Some(&2.0));
+                    assert_eq!(installed.get("source"), Some(&2));
+                    dispatch_event(
+                        &mut ctx,
+                        &make_header(),
+                        EventData::Xid(XidEvent { xid: 1 }),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(read(&snap).0.get("source"), Some(&0.0));
+                    // The parser's own series, from the parser's counts.
+                    let mut parser = parser();
+                    let mut s = Vec::new();
+                    s.extend(query("shop", "BEGIN"));
+                    s.extend(table_map(70, "shop", "orders"));
+                    let events = parse_all(&mut parser, s);
+                    note_parser_table_maps(&mut ctx, &parser, &events[1].0);
+                    let (gauges, installed) = read(&snap);
+                    assert_eq!(gauges.get("parser"), Some(&1.0));
+                    assert_eq!(installed.get("parser"), Some(&1));
+                    assert_eq!(
+                        installed.get("source"),
+                        Some(&2),
+                        "series stay separate"
+                    );
+                    drop(ctx);
+                    drain.await.unwrap();
+                });
+            });
+        }
     }
 }

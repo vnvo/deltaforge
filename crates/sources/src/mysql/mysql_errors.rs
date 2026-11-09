@@ -202,6 +202,9 @@ impl LoopControl {
             ParseUrlError(e) => Self::Fail(SourceError::Incompatible {
                 details: format!("invalid DSN: {e}").into(),
             }),
+            // A rows event without its statement's table map: never decoded,
+            // never skipped.
+            UnmappedTableId(id) => Self::Fail(unmapped_table_id(id)),
 
             // --- Programming errors (shouldn't happen in normal operation) ---
             FmtError(e) => Self::fail_internal(e),
@@ -226,6 +229,21 @@ impl LoopControl {
 }
 
 /// Check if an error message indicates an authentication/authorization failure.
+/// A rows event whose table id has no table map in its transaction. MySQL
+/// writes a statement's table maps before its rows, so this is never a
+/// state to decode around: the rows are not decoded or skipped, no event is
+/// emitted and the checkpoint is not advanced.
+pub(crate) fn unmapped_table_id(table_id: u64) -> SourceError {
+    SourceError::Schema {
+        details: format!(
+            "rows event for table id {table_id} without a table map in its \
+             transaction: no event was emitted and the checkpoint was not \
+             advanced (fail-closed)"
+        )
+        .into(),
+    }
+}
+
 pub(crate) fn is_auth_error(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     lower.contains("access denied")
