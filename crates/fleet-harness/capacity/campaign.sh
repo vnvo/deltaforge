@@ -34,7 +34,7 @@ PRIOR_BPT=146597          # bytes per empty table, measured at A100 (2026-11-09)
 MEMFLOOR=4294967296       # 4 GiB available memory
 TOTAL_CAP=28800           # 8 hours from T0
 REPORT=900                # the last 15 minutes are the report's
-declare -A BUDGET=([F]=2700 [A]=10800 [B]=9000 [BR]=9000 [C]=5400 [V]=600 [CAL]=1200)
+declare -A BUDGET=([F]=2700 [A]=10800 [B]=9000 [BR]=9000 [C]=5400 [V]=600 [CAL]=2400)  # CAL: two 20-minute invocations (cal100, cal100m)
 declare -A ACTIVE=([001]=40 [100]=40000 [200]=80000 [300]=120000)
 declare -A TABLES=([001]=100 [100]=100000 [200]=200000 [300]=300000)
 declare -A ALLOW=([100]=780 [200]=1500 [300]=2220)      # Phase B warm-up (Phase A activation allowance)
