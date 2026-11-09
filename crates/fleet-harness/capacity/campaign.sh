@@ -16,7 +16,7 @@
 # Phase CAL is the generator calibration (`cal100`): one invocation of at
 # most 20 minutes, R1 applied before it and R2 (MySQL 5 CPUs) applied live
 # only if a step is MySQL-limited (frontier.py).
-# Phase REC is the recovery check after the activation fix (`cal100r`): one
+# Phase REC is the recovery check after the activation fix (`cal100s`): one
 # invocation with its own 20-minute deadline, drain included, outside the
 # campaign clock; constant rate, no live rule (no R2), evaluated as Phase A
 # for correctness, health, activation and memory.
