@@ -23,6 +23,9 @@
 #   t003-<rate>.yaml           30-minute confirmation at each possible step rate (F0)
 #   k100.yaml                  catalog track: the 100,000-table fixture, 1,000
 #                              active tables, 500 changes/s for 20 minutes
+#   d003.yaml                  backlog drain (scenario D1): 4,000 changes/s for
+#                              900 s, the pipeline stopped from 300 s and
+#                              resumed after the writers finish
 # The output is fixed: CONFIGS.sha256 lists its hashes, and the run wrapper
 # refuses a configuration whose hash differs.
 set -eu
@@ -146,3 +149,6 @@ done
 # Catalog track: the kept 100,000-table fixture, 1% active (1,000 tables),
 # at low traffic.
 emit k100 50 F0 0 1200 500 1 "" 2000 0.01
+# The backlog drain (harness scenario D1, fleet-harness 9cf13075/e20d45e5):
+# about 2.4M changes written while the pipeline is stopped.
+emit d003 50 D1 0 900 4000 1 "" 50

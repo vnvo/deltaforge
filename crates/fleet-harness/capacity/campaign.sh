@@ -9,7 +9,7 @@
 #   campaign.sh drop <size>                             remove that size's MySQL container and volume
 #   campaign.sh adopt <size> <container id>             start a kept, stopped fixture container (full id)
 #   campaign.sh tune R1                                 MySQL table caches sized to the active set (50,000)
-#   campaign.sh run <A|B|BR|C|V|REC|GEN> <config name>  one run, evaluated (exit: frontier.py's)
+#   campaign.sh run <A|B|BR|C|V|REC|GEN|DRN> <config name>  one run, evaluated (exit: frontier.py's)
 #
 # Size 001 (100 tables) and phase V are the tooling validation only: a short
 # Phase A run, with the live coverage reader, in its own campaign directory.
@@ -25,6 +25,10 @@
 # generator stop) and no remedy; its `remedy: R1` label then means the base
 # configuration. A run's active-table count is its configuration's
 # (databases x tables x active fraction).
+# Phase DRN is the backlog drain (`d003`, harness scenario D1): its own
+# 40-minute deadline outside the campaign clock (900 s of writes, at most
+# 900 s of drain from the resume, then the verifier), no live rule,
+# evaluated by frontier.py's DRAIN readout.
 #
 # Exit 3: refused (disk start floor, identity, freshness); 6: deadline or cap.
 set -u
@@ -43,7 +47,7 @@ PRIOR_BPT=146597          # bytes per empty table, measured at A100 (2026-11-09)
 MEMFLOOR=4294967296       # 4 GiB available memory
 TOTAL_CAP=14400           # 4 hours from T0 (the laptop campaign)
 REPORT=900                # the last 15 minutes are the report's
-declare -A BUDGET=([F]=2700 [A]=10800 [B]=9000 [BR]=9000 [C]=5400 [V]=600 [CAL]=2400 [REC]=1200 [GEN]=1200)  # CAL: two 20-minute invocations (cal100, cal100m)
+declare -A BUDGET=([F]=2700 [A]=10800 [B]=9000 [BR]=9000 [C]=5400 [V]=600 [CAL]=2400 [REC]=1200 [GEN]=1200 [DRN]=2400)  # CAL: two 20-minute invocations (cal100, cal100m)
 declare -A ACTIVE=([001]=40 [003]=1000 [100]=40000 [200]=80000 [300]=120000)
 declare -A TABLES=([001]=100 [003]=2500 [100]=100000 [200]=200000 [300]=300000)
 declare -A ALLOW=([003]=120 [100]=780 [200]=1500 [300]=2220)      # Phase B warm-up (Phase A activation allowance)
@@ -71,8 +75,8 @@ budget() {
   used=$(awk -v k="$key" '$2 == "END" && ($3 == k || (k == "B" && $3 == "BR")) {s += $5} END {print s + 0}' "$C/clock.log")
   # The recovery check: each invocation has its own deadline, outside the
   # campaign clock and any phase total (a setup failure spends none of it).
-  if [ "$phase" = REC ]; then
-    log "phase REC: own deadline ${deadline}s, outside the campaign clock ($((now - t0))s since T0) and the phase total (${used}s by earlier invocations)"
+  if [ "$phase" = REC ] || [ "$phase" = DRN ]; then
+    log "phase $phase: own deadline ${deadline}s, outside the campaign clock ($((now - t0))s since T0) and the phase total (${used}s by earlier invocations)"
     return
   fi
   [ $((used + deadline)) -le "${BUDGET[$phase]}" ] \
@@ -253,6 +257,8 @@ run)
     REC)  deadline=1200; drain=240 ;;
     # The generator check: 15 minutes of writes, 20 minutes in all.
     GEN)  deadline=1200; drain=240 ;;
+    # The backlog drain: 40 minutes in all.
+    DRN)  deadline=2400; drain=900 ;;
     *)    die "phase $phase" ;;
   esac
   identity; budget "$phase" "$deadline"; preflight "$NEED_RUN"
@@ -366,7 +372,7 @@ PY
   docker stop cap-df >/dev/null && docker rename cap-df "cap-df-$name"
   # Coverage from the retained topic, then the evaluation; the topic stays.
   python3 "$C/kit/frontier.py" coverage "$inv" "$n" "$topic" "$KAFKA" | tee -a "$C/campaign.log"
-  ev=$phase; [ "$phase" = BR ] && ev=B; [ "$phase" = V ] && ev=A; [ "$phase" = REC ] && ev=A; [ "$phase" = GEN ] && ev=CAL
+  ev=$phase; [ "$phase" = BR ] && ev=B; [ "$phase" = V ] && ev=A; [ "$phase" = REC ] && ev=A; [ "$phase" = GEN ] && ev=CAL; [ "$phase" = DRN ] && ev=DRAIN
   [ "$phase" = CAL ] && docker inspect --format '{{.HostConfig.NanoCpus}}' cap-mysql > mysql-cpus-end.txt
   python3 "$C/kit/frontier.py" "$ev" "$inv" "$n" | tee -a "$C/campaign.log"
   vrc=${PIPESTATUS[0]}

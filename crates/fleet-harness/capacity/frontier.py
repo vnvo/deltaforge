@@ -535,6 +535,112 @@ def evaluate(phase, inv, n):
     return out, 0 if out["status"] == "viable" else 3
 
 
+def container_memory(inv, lo, hi):
+    """Each container's peak memory (bytes) over [lo, hi], from docker stats."""
+    units = {"B": 1, "KiB": 2 ** 10, "MiB": 2 ** 20, "GiB": 2 ** 30}
+    peak = {}
+    path = os.path.join(inv, "resources.jsonl")
+    if not os.path.exists(path):
+        return peak
+    for line in open(path):
+        r = json.loads(line)
+        if not lo <= ts(r["at"]) <= hi:
+            continue
+        for st in r.get("docker_stats") or []:
+            m = re.match(r"([\d.]+)([KMG]?i?B)", st.get("MemUsage", ""))
+            if m and m.group(2) in units:
+                v = float(m.group(1)) * units[m.group(2)]
+                peak[st["Name"]] = max(peak.get(st["Name"], 0), v)
+    return peak
+
+
+def drain_readout(inv, n):
+    """The backlog drain (phase DRN, harness scenario D1): correctness and
+    health over the whole run, activation before the pause, and the drain
+    from the resume request to the last expected event (`backlog-drain.json`,
+    written by the harness)."""
+    out = {"phase": "DRN", "invocation": inv, "active_tables": n, "evidence_complete": False,
+           "scheduled_pause": "expected: the pipelines are stopped by the scenario, not failed"}
+    runs = sorted(glob.glob(os.path.join(inv, "results/exploratory/*/result.json")))
+    if not runs:
+        out.update(status="inconclusive", reasons=["no result.json"] + resource_stop(inv))
+        return out, 3
+    run = os.path.dirname(runs[-1])
+    d = json.load(open(runs[-1]))
+    try:
+        rep = json.load(open(os.path.join(run, "backlog-drain.json")))
+    except Exception as e:
+        out.update(status="inconclusive", run=run, reasons=[f"backlog-drain.json unreadable: {e}"] + resource_stop(inv))
+        return out, 3
+    s = load_samples(os.path.join(run, "samples.jsonl")) if os.path.exists(os.path.join(run, "samples.jsonl")) else []
+    res = resources(os.path.join(inv, "resources.jsonl"))
+    act = activation(inv, n)
+    start, _ = writes_span(s)
+    out.update(run=run, activation=act, backlog=rep)
+    bad, incomplete = health(d, inv, "DRN")
+    if not act["read_complete"]:
+        incomplete += [f"coverage: {r}" for r in act["reasons"]]
+    # A drain stopped at its bound leaves rows undelivered: reported as an
+    # incomplete drain with the ledger's counts, not as proven loss. Any
+    # other finding (duplicates, unexpected rows, order, decoding, a failed
+    # pipeline, an incident or a restart) still fails the run.
+    c = d.get("completeness") or {}
+    out["ledger"] = {k: c.get(k) for k in ("missing", "duplicates", "unexpected", "final_state_mismatches",
+                                         "partition_order_violations")}
+    if rep.get("outcome") == "drain incomplete":
+        undelivered = ("missing=", "final_state_mismatches=", "correctness_ok false", "evidence_ok false")
+        bad = [b for b in bad if not b.startswith(undelivered)]
+    if not rep.get("checkpoint_preserved"):
+        bad.append("the durable checkpoint was not preserved across the pause")
+    if rep.get("outcome") in ("pipeline failed", "resume failed", "not resumed"):
+        bad.append(f"drain {rep.get('outcome')}: {rep.get('failure')}")
+    if bad:
+        out.update(status="failure", reasons=bad + incomplete)
+        return out, 2
+    t_pause = ts(rep["paused"]["at"])
+    t_resume = ts(rep["resume_requested_at"])
+    secs = rep.get("complete_after_secs")
+    t_end = t_resume + secs if secs else ts(rep["metrics_at_end"]["at"]) if rep.get("metrics_at_end") else None
+    if act["established"] and start is not None:
+        out["activation"]["secs"] = act["complete_at"] - start
+        out["activation"]["before_pause"] = act["complete_at"] <= t_pause
+    out["steady_before_pause"] = measure(s, res, act["complete_at"] or start or t_pause, t_pause) if s else None
+    m = measure(s, res, t_resume, t_end) if s and t_end else None
+    a, b = rep.get("metrics_at_resume"), rep.get("metrics_at_end")
+    scr = None
+    if a and b and ts(b["at"]) > ts(a["at"]):
+        dt = ts(b["at"]) - ts(a["at"])
+        scr = {"secs": dt, "sink_events": b["sink_events"] - a["sink_events"], "sink_bytes": b["sink_bytes"] - a["sink_bytes"],
+               "events_per_sec": (b["sink_events"] - a["sink_events"]) / dt,
+               "bytes_per_sec": (b["sink_bytes"] - a["sink_bytes"]) / dt}
+    # The 5-second samples bracketing the drain: the window is known to
+    # within one sample period at each end.
+    samp = None
+    inside = [x for x in s if x["dlv"] is not None and t_resume <= x["t"] <= (t_end or t_resume)]
+    if secs and len(inside) >= 2:
+        span = inside[-1]["t"] - inside[0]["t"]
+        moved = inside[-1]["dlv"] - inside[0]["dlv"]
+        samp = {"from": inside[0]["t"], "to": inside[-1]["t"], "span_secs": span, "delivered": moved,
+                "events_per_sec": moved / span if span else None,
+                "rate_bounds_events_per_sec": [rep["backlog_events"] / (secs + 5.0), rep["backlog_events"] / max(secs - 5.0, 1e-9)]}
+    out["drain"] = {
+        "outcome": rep["outcome"], "backlog_events": rep["backlog_events"], "expected_row_events": rep["expected_row_events"],
+        "delivered_at_resume": rep["delivered_at_resume"], "delivered_at_end": rep["delivered_at_end"],
+        "uncertain_ops": rep.get("uncertain_ops"),
+        "startup_reload_secs": rep.get("running_after_secs"), "first_delivery_secs": rep.get("first_delivery_after_secs"),
+        "complete_secs": secs, "completion_resolution_secs": rep.get("poll_secs"),
+        "backlog_events_per_sec": rep["backlog_events"] / secs if secs else None,
+        "scrapes": scr, "samples": samp, "window": m,
+        "memory_peak_bytes": container_memory(inv, t_resume, t_end) if t_end else None,
+    }
+    out["evidence_complete"] = not incomplete and m is not None and scr is not None
+    if incomplete:
+        out.update(status="inconclusive", reasons=["evidence incomplete"] + incomplete + resource_stop(inv))
+        return out, 3
+    out["status"] = "drained" if rep["outcome"] == "drained" else "drain incomplete"
+    return out, 0 if out["status"] == "drained" else 3
+
+
 def mysql_rows(inv):
     """(t, MySQL counters, MySQL memory bytes) from the watcher's samples."""
     out = []
@@ -798,7 +904,8 @@ if __name__ == "__main__":
         else:
             live(inv, n, int(sys.argv[5]), sys.argv[6], sys.argv[7])
         sys.exit(0)
-    out, rc = calibrate(inv, n) if mode == "CAL" else evaluate(mode, inv, n)
+    out, rc = (calibrate(inv, n) if mode == "CAL" else drain_readout(inv, n) if mode == "DRAIN"
+               else evaluate(mode, inv, n))
     # The run's topic may be deleted only when the evaluation is complete:
     # no failure, every piece of evidence read, and coverage established.
     out["topic_deletable"] = (out.get("status") != "failure" and out.get("evidence_complete") is True
