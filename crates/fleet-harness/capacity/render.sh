@@ -25,7 +25,10 @@
 #                              active tables, 500 changes/s for 20 minutes
 #   d003.yaml                  backlog drain (scenario D1): 4,000 changes/s for
 #                              900 s, the pipeline stopped from 300 s and
-#                              resumed after the writers finish
+#                              resumed after the writers finish (not resumed:
+#                              its checkpoint was read before it settled)
+#   d003b.yaml                 the same drain under its own name, on the
+#                              harness that settles the checkpoint first
 # The output is fixed: CONFIGS.sha256 lists its hashes, and the run wrapper
 # refuses a configuration whose hash differs.
 set -eu
@@ -152,3 +155,6 @@ emit k100 50 F0 0 1200 500 1 "" 2000 0.01
 # The backlog drain (harness scenario D1, fleet-harness 9cf13075/e20d45e5):
 # about 2.4M changes written while the pipeline is stopped.
 emit d003 50 D1 0 900 4000 1 "" 50
+# d003 again under its own name (fleet-harness c20d2d18 settles the checkpoint
+# after stopped, 1 s polls within 10 s).
+emit d003b 50 D1 0 900 4000 1 "" 50
