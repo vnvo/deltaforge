@@ -188,12 +188,19 @@ fixture)
   # Never past the clock: what is left of it bounds the build too.
   left=$(( TOTAL_CAP - REPORT - ($(date +%s) - $(cat "$C/T0")) ))
   [ "$left" -lt "$deadline" ] && deadline=$left
-  [ "$deadline" -gt 0 ] || die "fixture budget spent" 6
-  # The 2,500-table fixture (about 0.37e9) starts under the run floor
-  # (authorized 2026-11-10); every other size keeps the 50 GiB fixture floor.
+  # The 2,500-table fixture (about 0.37e9, 10 s) starts under the run floor
+  # (authorized 2026-11-10) and, for the backlog drains, is rebuilt with its
+  # own 300 s deadline outside the clock; every other size keeps the 50 GiB
+  # fixture floor and the clock.
   need=$NEED_FIXTURE start_gib=51
-  [ "$size" = 003 ] && { need=$NEED_RUN start_gib=41; }
-  budget F "$deadline"; preflight "$need"
+  [ "$size" = 003 ] && { need=$NEED_RUN start_gib=41; deadline=300; }
+  [ "$deadline" -gt 0 ] || die "fixture budget spent" 6
+  if [ "$size" = 003 ]; then
+    log "fixture 003: own deadline ${deadline}s, outside the campaign clock"
+  else
+    budget F "$deadline"
+  fi
+  preflight "$need"
   before=$(avail); s=$(date +%s)
   echo "$s START F a$size $deadline" >> "$C/clock.log"
   (cd "$C" && DEADLINE_SECS=$deadline START_GIB=$start_gib FLOOR_GIB=26 kit/floor-watch.sh -- \
