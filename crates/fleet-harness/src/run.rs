@@ -162,6 +162,65 @@ struct Shared {
     stop: watch::Receiver<bool>,
     work: PathBuf,
     run_tag: u64,
+    /// The backlog drain's pause, resumed after the writers finish.
+    paused: Arc<Mutex<Option<crate::backlog::Paused>>>,
+}
+
+/// The drain's view of DeltaForge: its REST API and metrics endpoint.
+struct ApiOps {
+    api: Api,
+    metrics_url: String,
+    http: reqwest::Client,
+}
+
+impl crate::backlog::Ops for ApiOps {
+    fn status<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>,
+    > {
+        Box::pin(self.api.status(name))
+    }
+    fn checkpoints<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<BTreeMap<String, String>>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            Ok(measure::api_checkpoints(&self.api.checkpoints(name).await?))
+        })
+    }
+    fn resume<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>,
+    > {
+        Box::pin(async move { self.api.resume(name).await.map(drop) })
+    }
+    fn metrics(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            Ok(self
+                .http
+                .get(&self.metrics_url)
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?)
+        })
+    }
 }
 
 /// How far a run got, for its failure result.
@@ -470,7 +529,10 @@ async fn run_inner(
             .collect::<Vec<_>>(),
     );
     let group = format!("fleet-harness-{run_id}");
+    // The verifier's row events of this run, live (the backlog drain).
+    let observed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let consumer_task = {
+        let observed = observed.clone();
         let brokers = cfg.verifier.kafka_brokers.clone();
         let drain = Drain {
             idle: opts.drain_idle,
@@ -488,6 +550,7 @@ async fn run_inner(
                 drain,
                 expected,
                 ready_tx,
+                observed,
             )
             .await
         })
@@ -576,6 +639,7 @@ async fn run_inner(
         stop: driver_stop.clone(),
         work: work.clone(),
         run_tag,
+        paused: Arc::new(Mutex::new(None)),
     };
     let mut steps = Vec::new();
     let mut background: Vec<(usize, JoinHandle<Result<String>>)> = Vec::new();
@@ -625,23 +689,62 @@ async fn run_inner(
         ctxs.iter().map(|c| c.counters.snapshot()).collect();
     let target_at_end: Vec<f64> = ctxs.iter().map(|c| c.target_ops()).collect();
 
-    // Stop and drain.
+    // Stop and drain. A paused pipeline (the backlog drain) is resumed only
+    // after every writer has finished and the committed counts are final.
     stage("drain");
     monitor.abort();
-    driver_stop_tx.send(true).ok();
-    let mut writer_errors = Vec::new();
-    for w in writers {
-        match w.await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => writer_errors.push(format!("{e:#}")),
-            Err(e) => writer_errors.push(format!("writer task: {e}")),
-        }
-    }
-    for i in integrators {
-        i.await.ok();
-    }
-    let final_counters: Vec<CountersSnapshot> =
-        ctxs.iter().map(|c| c.counters.snapshot()).collect();
+    let paused = shared.paused.lock().take();
+    let (writer_errors, final_counters) =
+        crate::backlog::after_writers(&driver_stop_tx, writers, || async {
+            for i in integrators {
+                i.await.ok();
+            }
+            let final_counters: Vec<CountersSnapshot> =
+                ctxs.iter().map(|c| c.counters.snapshot()).collect();
+            if let Some(paused) = paused {
+                let expected: u64 = final_counters
+                    .iter()
+                    .map(|c| c.ops + c.delete_stamps)
+                    .sum();
+                let uncertain: u64 =
+                    final_counters.iter().map(|c| c.uncertain_ops).sum();
+                let ops = ApiOps {
+                    api: api.clone(),
+                    metrics_url: cfg.deltaforge.metrics_url.clone(),
+                    http: reqwest::Client::new(),
+                };
+                let report = crate::backlog::drain(
+                    &ops,
+                    &names,
+                    paused,
+                    expected,
+                    uncertain,
+                    &observed,
+                    opts.drain_max,
+                    Duration::from_millis(250),
+                )
+                .await;
+                match serde_json::to_vec_pretty(&report) {
+                    Ok(b) => {
+                        if let Err(e) =
+                            std::fs::write(dir.join("backlog-drain.json"), b)
+                        {
+                            eprintln!("  backlog drain: record not written: {e}");
+                        }
+                    }
+                    Err(e) => eprintln!("  backlog drain: record: {e}"),
+                }
+                eprintln!(
+                    "  backlog drain: {} backlog {} of {} expected, complete after {:?}s",
+                    report.outcome,
+                    report.backlog_events,
+                    report.expected_row_events,
+                    report.complete_after_secs
+                );
+            }
+            final_counters
+        })
+        .await;
     for (i, t) in background {
         let end = match t.await {
             Ok(Ok(note)) => Ok(note),
@@ -1026,6 +1129,39 @@ async fn execute(
                 )
                 .await?;
                 Ok(Some(vec![*i]))
+            }
+            Action::BacklogPause => {
+                let mut checkpoints = BTreeMap::new();
+                for name in &shared.names {
+                    shared.api.stop(name).await?;
+                    let deadline = Instant::now() + opts.start_timeout;
+                    loop {
+                        match shared.api.status(name).await?.as_str() {
+                            "stopped" => break,
+                            "failed" => bail!("pipeline {name} failed on stop"),
+                            _ => {}
+                        }
+                        if Instant::now() >= deadline {
+                            bail!("pipeline {name} not stopped after {:?}", opts.start_timeout);
+                        }
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                    let cp = measure::api_checkpoints(
+                        &shared.api.checkpoints(name).await?,
+                    );
+                    if cp.is_empty() {
+                        bail!(
+                            "pipeline {name} stopped with no durable checkpoint: \
+                             its backlog would not resume from before it"
+                        );
+                    }
+                    checkpoints.insert(name.clone(), cp);
+                }
+                *shared.paused.lock() = Some(crate::backlog::Paused {
+                    at: Utc::now(),
+                    checkpoints,
+                });
+                Ok(None)
             }
             Action::RestartPipelines => {
                 for name in &shared.names {
