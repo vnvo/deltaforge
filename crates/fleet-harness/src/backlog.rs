@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::sync::watch;
@@ -34,11 +34,63 @@ pub trait Ops: Sync {
     fn metrics(&self) -> Fut<'_, String>;
 }
 
-/// The pause: when, and every pipeline's per-sink checkpoints once stopped.
+/// The pause: when, every pipeline's per-sink checkpoints once settled
+/// after `stopped` (the durable ones the backlog resumes from), how they
+/// settled, and the row events delivered by then.
 #[derive(Debug, Clone, Serialize)]
 pub struct Paused {
     pub at: DateTime<Utc>,
     pub checkpoints: BTreeMap<String, BTreeMap<String, String>>,
+    pub settling: BTreeMap<String, Settled>,
+    pub delivered_at_settle: u64,
+}
+
+/// A pipeline's checkpoints after it reported `stopped`, read once per poll
+/// until one read equals the one before it. An observed settling: not proof
+/// that every stop activity has finished.
+#[derive(Debug, Clone, Serialize)]
+pub struct Settled {
+    /// The first read, right after `stopped`.
+    pub first: BTreeMap<String, String>,
+    /// Every later read that differed from the one before it: (seconds
+    /// after the first read, the checkpoints read).
+    pub changes: Vec<(f64, BTreeMap<String, String>)>,
+    pub stable: BTreeMap<String, String>,
+    pub settled_after_secs: f64,
+}
+
+/// Read `name`'s checkpoints every `poll` until two consecutive reads are
+/// equal, within `bound` of the first; past it, an error (the pause fails).
+pub async fn settle(
+    ops: &dyn Ops,
+    name: &str,
+    poll: Duration,
+    bound: Duration,
+) -> Result<Settled> {
+    let t0 = Instant::now();
+    let first = ops.checkpoints(name).await?;
+    let (mut last, mut changes) = (first.clone(), Vec::new());
+    loop {
+        if t0.elapsed() + poll > bound {
+            bail!(
+                "pipeline {name}: its checkpoints were still changing {bound:?} \
+                 after it reported stopped ({} change(s) observed)",
+                changes.len()
+            );
+        }
+        tokio::time::sleep(poll).await;
+        let now = ops.checkpoints(name).await?;
+        if now == last {
+            return Ok(Settled {
+                first,
+                changes,
+                stable: now,
+                settled_after_secs: t0.elapsed().as_secs_f64(),
+            });
+        }
+        changes.push((t0.elapsed().as_secs_f64(), now.clone()));
+        last = now;
+    }
 }
 
 /// One metrics scrape: the run's pipelines' delivered events and bytes.
@@ -61,7 +113,10 @@ pub struct Report {
     /// stamps), and the uncertain operations beside them.
     pub expected_row_events: u64,
     pub uncertain_ops: u64,
-    /// Row events the verifier had received at the resume, and the backlog.
+    /// Row events the verifier had received once the checkpoints settled,
+    /// and at the resume; the backlog is the expected row events less the
+    /// settled count.
+    pub delivered_at_settle: u64,
     pub delivered_at_resume: u64,
     pub backlog_events: u64,
     pub resume_requested_at: Option<DateTime<Utc>>,
@@ -155,6 +210,7 @@ pub async fn drain(
         && now_cp == paused.checkpoints
         && paused.checkpoints.values().all(|c| !c.is_empty());
     let delivered = observed.load(Ordering::Relaxed);
+    let settled = paused.delivered_at_settle;
     let mut r = Report {
         paused,
         status_before_resume: status,
@@ -162,8 +218,9 @@ pub async fn drain(
         checkpoint_preserved: preserved,
         expected_row_events: expected,
         uncertain_ops,
+        delivered_at_settle: settled,
         delivered_at_resume: delivered,
-        backlog_events: expected.saturating_sub(delivered),
+        backlog_events: expected.saturating_sub(settled),
         resume_requested_at: None,
         running_after_secs: None,
         first_delivery_after_secs: None,
@@ -314,7 +371,81 @@ mod tests {
                 "p".to_string(),
                 BTreeMap::from([("kafka".to_string(), "cp-1".to_string())]),
             )]),
+            settling: BTreeMap::new(),
+            delivered_at_settle: 0,
         }
+    }
+
+    /// A stopped pipeline whose checkpoint reads follow `script` (the last
+    /// repeats): the last in-flight batch committed after `stopped`.
+    struct Delayed {
+        script: Vec<&'static str>,
+        reads: AtomicU64,
+    }
+
+    impl Ops for Delayed {
+        fn status<'a>(&'a self, _: &'a str) -> Fut<'a, String> {
+            Box::pin(async { Ok("stopped".into()) })
+        }
+        fn checkpoints<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Fut<'a, BTreeMap<String, String>> {
+            let n = self.reads.fetch_add(1, Ordering::SeqCst) as usize;
+            let cp = self.script[n.min(self.script.len() - 1)];
+            Box::pin(async move {
+                Ok(BTreeMap::from([("kafka".into(), cp.to_string())]))
+            })
+        }
+        fn resume<'a>(&'a self, _: &'a str) -> Fut<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn stop<'a>(&'a self, _: &'a str) -> Fut<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn metrics(&self) -> Fut<'_, String> {
+            Box::pin(async { Ok(String::new()) })
+        }
+    }
+
+    /// The checkpoint advances once after `stopped` (as observed: about a
+    /// second later): the settled value is the advanced one, the change is
+    /// recorded, and reads are one second apart. One that never settles
+    /// within the bound fails the pause.
+    #[tokio::test(start_paused = true)]
+    async fn a_checkpoint_committed_after_stopped_settles_to_its_last_value() {
+        let d = Delayed {
+            script: vec!["cp-0", "cp-1", "cp-1"],
+            reads: AtomicU64::new(0),
+        };
+        let s =
+            settle(&d, "p", Duration::from_secs(1), Duration::from_secs(10))
+                .await
+                .unwrap();
+        assert_eq!(s.first["kafka"], "cp-0");
+        assert_eq!(s.stable["kafka"], "cp-1");
+        assert_eq!(s.changes.len(), 1);
+        assert_eq!(s.changes[0].0, 1.0);
+        assert_eq!(s.settled_after_secs, 2.0);
+        assert_eq!(d.reads.load(Ordering::SeqCst), 3);
+
+        let moving = Delayed {
+            script: vec![
+                "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l",
+            ],
+            reads: AtomicU64::new(0),
+        };
+        let t0 = Instant::now();
+        let e = settle(
+            &moving,
+            "p",
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("still changing"), "{e:#}");
+        assert!(t0.elapsed() <= Duration::from_secs(10));
     }
 
     /// Writers still committing when the stop is sent: the resume is

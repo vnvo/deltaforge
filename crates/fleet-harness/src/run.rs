@@ -164,6 +164,8 @@ struct Shared {
     run_tag: u64,
     /// The backlog drain's pause, resumed after the writers finish.
     paused: Arc<Mutex<Option<crate::backlog::Paused>>>,
+    /// The verifier's row events of this run, live.
+    observed: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// The drain's view of DeltaForge: its REST API and metrics endpoint.
@@ -648,6 +650,7 @@ async fn run_inner(
         work: work.clone(),
         run_tag,
         paused: Arc::new(Mutex::new(None)),
+        observed: observed.clone(),
     };
     let mut steps = Vec::new();
     let mut background: Vec<(usize, JoinHandle<Result<String>>)> = Vec::new();
@@ -1139,7 +1142,13 @@ async fn execute(
                 Ok(Some(vec![*i]))
             }
             Action::BacklogPause => {
+                let ops = ApiOps {
+                    api: shared.api.clone(),
+                    metrics_url: shared.cfg.deltaforge.metrics_url.clone(),
+                    http: reqwest::Client::new(),
+                };
                 let mut checkpoints = BTreeMap::new();
+                let mut settling = BTreeMap::new();
                 for name in &shared.names {
                     shared.api.stop(name).await?;
                     let deadline = Instant::now() + opts.start_timeout;
@@ -1154,9 +1163,18 @@ async fn execute(
                         }
                         tokio::time::sleep(Duration::from_millis(250)).await;
                     }
-                    let cp = measure::api_checkpoints(
-                        &shared.api.checkpoints(name).await?,
-                    );
+                    // The last in-flight batch may commit its checkpoint
+                    // after `stopped`: the durable checkpoint is the
+                    // settled one.
+                    let settled = crate::backlog::settle(
+                        &ops,
+                        name,
+                        Duration::from_secs(1),
+                        Duration::from_secs(10),
+                    )
+                    .await?;
+                    let cp = settled.stable.clone();
+                    settling.insert(name.clone(), settled);
                     if cp.is_empty() {
                         bail!(
                             "pipeline {name} stopped with no durable checkpoint: \
@@ -1168,6 +1186,10 @@ async fn execute(
                 *shared.paused.lock() = Some(crate::backlog::Paused {
                     at: Utc::now(),
                     checkpoints,
+                    settling,
+                    delivered_at_settle: shared
+                        .observed
+                        .load(std::sync::atomic::Ordering::Relaxed),
                 });
                 Ok(None)
             }
