@@ -185,6 +185,9 @@ fixture)
   size=$2; identity
   used=$(awk '$2 == "END" && $3 == "F" {s += $5} END {print s + 0}' "$C/clock.log")
   deadline=$(( ${BUDGET[F]} - used ))
+  # Never past the clock: what is left of it bounds the build too.
+  left=$(( TOTAL_CAP - REPORT - ($(date +%s) - $(cat "$C/T0")) ))
+  [ "$left" -lt "$deadline" ] && deadline=$left
   [ "$deadline" -gt 0 ] || die "fixture budget spent" 6
   # The 2,500-table fixture (about 0.37e9) starts under the run floor
   # (authorized 2026-11-10); every other size keeps the 50 GiB fixture floor.
