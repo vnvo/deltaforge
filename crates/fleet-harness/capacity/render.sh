@@ -29,6 +29,8 @@
 #                              its checkpoint was read before it settled)
 #   d003b.yaml                 the same drain under its own name, on the
 #                              harness that settles the checkpoint first
+#   d003c.yaml                 d003b with larger batches (spec_overrides:
+#                              batch.max_events 20000, max_bytes 64 MiB, max_ms 100)
 # The output is fixed: CONFIGS.sha256 lists its hashes, and the run wrapper
 # refuses a configuration whose hash differs.
 set -eu
@@ -158,3 +160,7 @@ emit d003 50 D1 0 900 4000 1 "" 50
 # d003 again under its own name (fleet-harness c20d2d18 settles the checkpoint
 # after stopped, 1 s polls within 10 s).
 emit d003b 50 D1 0 900 4000 1 "" 50
+# d003b with larger batches: one 20,000-event batch in flight (transaction
+# alignment kept on), everything else at its default.
+emit d003c 50 D1 0 900 4000 1 "" 50
+sed -i 's|^  proof_trace_required: true$|  proof_trace_required: true\n  spec_overrides:\n    batch: {max_events: 20000, max_bytes: 67108864, max_ms: 100}|' "$out/d003c.yaml"
