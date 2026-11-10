@@ -30,6 +30,7 @@ pub trait Ops: Sync {
         name: &'a str,
     ) -> Fut<'a, BTreeMap<String, String>>;
     fn resume<'a>(&'a self, name: &'a str) -> Fut<'a, ()>;
+    fn stop<'a>(&'a self, name: &'a str) -> Fut<'a, ()>;
     fn metrics(&self) -> Fut<'_, String>;
 }
 
@@ -71,7 +72,8 @@ pub struct Report {
     pub complete_after_secs: Option<f64>,
     pub delivered_at_end: u64,
     /// `drained`, `drain incomplete` (the bound passed: not proven loss; the
-    /// ledger's missing counts stand beside it), `pipeline failed`,
+    /// pipelines are stopped there and the ledger's missing counts stand
+    /// beside it), `pipeline failed`,
     /// `resume failed` or `not resumed`.
     pub outcome: String,
     pub failure: Option<String>,
@@ -223,6 +225,13 @@ pub async fn drain(
         if t0.elapsed() >= max {
             r.delivered_at_end = seen;
             r.outcome = "drain incomplete".into();
+            // Stopped at the bound, so the verifier's completeness is of
+            // what arrived within it (and the run ends in its deadline).
+            for p in pipelines {
+                if let Err(e) = ops.stop(p).await {
+                    r.failure = Some(format!("stop {p} at the bound: {e:#}"));
+                }
+            }
             break;
         }
         tokio::time::sleep(poll).await;
@@ -277,6 +286,12 @@ mod tests {
                     self.committed.load(Ordering::SeqCst),
                 ));
                 self.resumed.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+        fn stop<'a>(&'a self, _: &'a str) -> Fut<'a, ()> {
+            Box::pin(async move {
+                self.resumed.store(false, Ordering::SeqCst);
                 Ok(())
             })
         }
@@ -414,6 +429,7 @@ mod tests {
         .await;
         assert_eq!(r.outcome, "drain incomplete");
         assert!(r.complete_after_secs.is_none());
+        assert!(!fake.resumed.load(Ordering::SeqCst), "stopped at the bound");
         assert!(r.delivered_at_end > 0 && r.delivered_at_end < 1_000_000);
 
         let mut changed = paused();

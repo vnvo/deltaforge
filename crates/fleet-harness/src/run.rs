@@ -204,6 +204,14 @@ impl crate::backlog::Ops for ApiOps {
     > {
         Box::pin(async move { self.api.resume(name).await.map(drop) })
     }
+    fn stop<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>,
+    > {
+        Box::pin(async move { self.api.stop(name).await.map(drop) })
+    }
     fn metrics(
         &self,
     ) -> std::pin::Pin<
