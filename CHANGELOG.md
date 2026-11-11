@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.1.0-rc.2] - 2026-11-09
+
+Fixes the v0.1.0-rc.1 known defect below; v0.1.0-rc.1 images remain affected.
+
 ### Fixed
 
 - **MySQL binlog table maps are bounded to the open transaction** - a MySQL source kept every binlog table map it received, in the binlog parser and again in its own state, and never released them, so sustained table-id churn (MySQL reopening tables under new ids after evicting them from its table cache) grew memory until the process was OOM-killed; table maps of tables excluded by the source's filters were kept too. Both now hold only the open transaction's table maps, released at each transaction end (XID, `COMMIT`, `ROLLBACK`, a DDL outside an explicit transaction, a compressed transaction; with GTIDs on or off, never at other statements inside `BEGIN`) and when the stream is reopened; the activation window's read-ahead copies only the open transaction's maps and releases them at each transaction end it reads past. A rows event without a table map in its transaction now stops the source fail-closed (no event, no checkpoint advance) instead of being skipped with a warning (the binlog parser panicked). New metrics `deltaforge_mysql_table_maps{pipeline,source,map}` and `deltaforge_mysql_table_maps_installed_total{pipeline,source,map}`, with `map` `parser` or `source`. Vendored binlog parser patch: `vendor/mysql-binlog-connector-rust/DELTAFORGE-PATCH.md`.
