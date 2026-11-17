@@ -827,3 +827,100 @@ fn duplicate_columns_are_refused_in_narrow_and_wide_rows() {
         assert!(err.0.contains("duplicate column c1"), "{err:?}");
     }
 }
+
+// ----- JSON output ----------------------------------------------------------
+
+/// Every value, in before and after images, through every envelope under
+/// every type mapping and integer rendering:
+/// `json_out` writes exactly what `serde_json` writes (or both fail).
+#[test]
+fn every_value_writes_the_same_json_through_the_envelopes() {
+    use crate::envelope::EnvelopeType;
+    use crate::{EventId, Op, SourceInfo, SourcePosition};
+    let row = CanonicalRow::new(
+        every_value()
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| (format!("c{i}\"\\\n"), v))
+            .collect(),
+    )
+    .unwrap();
+    // A before image is complete: no unchanged marker.
+    let before = CanonicalRow::new(
+        every_value()
+            .into_iter()
+            .filter(|v| !matches!(v, CanonicalValue::Unchanged))
+            .enumerate()
+            .map(|(i, v)| (format!("b{i}"), v))
+            .collect(),
+    )
+    .unwrap();
+    let envelopes = [
+        EnvelopeType::Native,
+        EnvelopeType::Debezium,
+        EnvelopeType::CloudEvents {
+            type_prefix: "df.\"t\"".into(),
+        },
+    ];
+    let mut compared = 0;
+    for mapping in [TypeMapping::V1, TypeMapping::V2] {
+        let mut ev = crate::Event::new_row(
+            EventId::mysql_row_server(1, "binlog.000001", 4, 0),
+            SourceInfo {
+                version: "deltaforge-test".into(),
+                connector: "mysql".into(),
+                name: "pipe\u{1}line".into(),
+                ts_ms: 1_700_000_000_000,
+                db: "shop".into(),
+                schema: None,
+                table: "t\u{7f}".into(),
+                snapshot: None,
+                position: SourcePosition::mysql(
+                    7,
+                    Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:5".into()),
+                    Some("binlog.000001".into()),
+                    Some(4),
+                    Some(0),
+                ),
+            },
+            Op::Update,
+            Some(before.clone()),
+            Some(row.clone()),
+            mapping,
+            1_700_000_000_001,
+            4096,
+        );
+        ev.tenant_id = Some("ten\"ant".into());
+        for wide in [WideIntegers::String, WideIntegers::Number] {
+            let opts = crate::NativeOpts {
+                wide_integers: wide,
+            };
+            for envelope in &envelopes {
+                let built = envelope.build();
+                let Ok(data) = built.wrap(&ev, opts) else {
+                    continue;
+                };
+                let want = serde_json::to_vec(&data);
+                let got = crate::json_out::to_vec(&data);
+                match (&want, &got) {
+                    (Ok(w), Ok(g)) => {
+                        assert_eq!(
+                            String::from_utf8_lossy(g),
+                            String::from_utf8_lossy(w),
+                            "{} {mapping:?} {wide:?}",
+                            envelope.name()
+                        );
+                        compared += 1;
+                    }
+                    (Err(_), Err(_)) => {}
+                    _ => panic!(
+                        "{} {mapping:?} {wide:?}: serde_json {want:?}, json_out {got:?}",
+                        envelope.name()
+                    ),
+                }
+            }
+        }
+    }
+    // Every envelope under both mappings writes with exact integer strings.
+    assert!(compared >= 6, "{compared} outputs compared");
+}

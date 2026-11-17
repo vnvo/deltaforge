@@ -1644,6 +1644,7 @@ dependencies = [
  "checkpoints",
  "chrono",
  "hex",
+ "itoa",
  "metrics",
  "parking_lot",
  "reqwest",
@@ -1655,6 +1656,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "zmij",
 ]
 
 [[package]]

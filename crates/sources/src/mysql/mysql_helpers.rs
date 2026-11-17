@@ -430,7 +430,7 @@ pub(crate) fn make_checkpoint_meta(
         snapshot_chain: None,
     };
 
-    let bytes = serde_json::to_vec(&cp).unwrap_or_else(|e| {
+    let bytes = deltaforge_core::json_out::to_vec(&cp).unwrap_or_else(|e| {
         tracing::error!(error=%e, "failed to serialize checkpoint");
         Vec::new()
     });

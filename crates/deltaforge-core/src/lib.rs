@@ -39,6 +39,8 @@ pub mod batch_context;
 pub use batch_context::BatchContext;
 
 pub mod event_id;
+/// Compact JSON output, byte for byte `serde_json`'s.
+pub mod json_out;
 pub use event_id::{
     EventClass, EventId, IdentityCell, IdentityKind, IdentityValue,
     SourceLineage, TemporalKind,

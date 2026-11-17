@@ -79,7 +79,7 @@ pub(crate) fn native_json(
     // Straight into the message buffer (no intermediate `Bytes` copy),
     // sized like this thread's previous payload so it rarely grows.
     let mut buf = Vec::with_capacity(PAYLOAD_HINT.get());
-    serde_json::to_writer(&mut buf, &data)
+    deltaforge_core::json_out::to_writer(&mut buf, &data)
         .map_err(|e| EncodingError::from(e).into_sink_error_for(sink_id))?;
     PAYLOAD_HINT.set(buf.len().clamp(MIN_PAYLOAD, MAX_PAYLOAD_HINT));
     Ok(buf)
@@ -96,8 +96,10 @@ pub(crate) fn raw_payload(
         EncodingError::from(deltaforge_core::envelope::EnvelopeError::from(e))
             .into_sink_error_for(sink_id)
     })?;
-    serde_json::to_vec(&payload.after).map_err(|e| SinkError::Serialization {
-        details: e.to_string().into(),
+    deltaforge_core::json_out::to_vec(&payload.after).map_err(|e| {
+        SinkError::Serialization {
+            details: e.to_string().into(),
+        }
     })
 }
 

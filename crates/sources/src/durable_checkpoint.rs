@@ -231,7 +231,7 @@ impl DurableWatermark {
 
     /// Serialize for storage in HEAD.
     pub fn to_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("watermark serializes")
+        deltaforge_core::json_out::to_vec(self).expect("watermark serializes")
     }
 
     /// Parse, returning `None` on any malformed / unknown-version / missing-field

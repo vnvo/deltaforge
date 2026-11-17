@@ -10,6 +10,8 @@ async-trait.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+itoa.workspace = true
+zmij.workspace = true
 uuid.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -29,7 +31,8 @@ arrow-schema = "58"
 [dev-dependencies]
 # The order production builds have (deno_core enables it): the goldens of
 # map-ordered output (inferred Avro schemas) are the same in every build.
-serde_json = { workspace = true, features = ["preserve_order"] }
+# `raw_value`: json_out's tests hand serde_json's private marker types to it.
+serde_json = { workspace = true, features = ["preserve_order", "raw_value"] }
 
 [features]
 # Canonical rows built from JSON literals, for test fixtures only.

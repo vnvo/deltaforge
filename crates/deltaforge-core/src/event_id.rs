@@ -85,9 +85,19 @@ pub struct EventId {
 /// Builds the length-prefixed, big-endian coordinate buffer that is hashed.
 /// Keeping this explicit (rather than a formatted string) removes delimiter and
 /// escaping ambiguity, so the encoding is reproducible byte-for-byte.
-#[derive(Default)]
 struct Coordinates {
     buf: Vec<u8>,
+}
+
+/// Room for a row coordinate in one allocation (a GTID row's is 37 bytes).
+const COORDINATES_CAPACITY: usize = 64;
+
+impl Default for Coordinates {
+    fn default() -> Self {
+        Self {
+            buf: Vec::with_capacity(COORDINATES_CAPACITY),
+        }
+    }
 }
 
 impl Coordinates {
