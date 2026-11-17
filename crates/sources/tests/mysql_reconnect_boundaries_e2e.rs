@@ -138,8 +138,8 @@ impl Delivered {
                 );
             }
             SourceItem::Event(e) => match self.open.as_mut() {
-                Some((_, rows)) => rows.push(e),
-                None => self.rows.push(e),
+                Some((_, rows)) => rows.push(*e),
+                None => self.rows.push(*e),
             },
             _ => {}
         }

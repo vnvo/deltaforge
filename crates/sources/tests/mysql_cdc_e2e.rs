@@ -61,7 +61,7 @@ where
         match timeout(remaining, rx.recv()).await {
             Ok(Some(SourceItem::Event(e))) => {
                 debug!(op = ?e.op, table = %e.source.full_table_name(), "received event");
-                events.push(e);
+                events.push(*e);
                 if condition(&events) {
                     break;
                 }
@@ -1029,7 +1029,7 @@ async fn mysql_cdc_compressed_transaction() -> Result<()> {
     while commit.is_none() && Instant::now() < deadline {
         let left = deadline.saturating_duration_since(Instant::now());
         match timeout(left, rx.recv()).await {
-            Ok(Some(SourceItem::Event(e))) => rows.push(e),
+            Ok(Some(SourceItem::Event(e))) => rows.push(*e),
             Ok(Some(SourceItem::TxCommit { boundary, .. }))
                 if !rows.is_empty() =>
             {

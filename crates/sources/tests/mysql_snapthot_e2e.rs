@@ -79,7 +79,7 @@ where
     while Instant::now() < deadline {
         match timeout(Duration::from_millis(100), rx.recv()).await {
             Ok(Some(SourceItem::Event(e))) => {
-                events.push(e);
+                events.push(*e);
                 if pred(&events) {
                     return events;
                 }

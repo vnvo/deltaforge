@@ -185,9 +185,9 @@ impl GenerationPublisher {
             std::time::Duration::ZERO,
         );
         for ev in events {
-            self.send(SourceItem::Event(ev)).await?;
+            self.send(SourceItem::event(ev)).await?;
         }
-        self.send(SourceItem::Event(last)).await?;
+        self.send(SourceItem::event(last)).await?;
         drop(seq);
         crate::snapshot_probe::during_copy().await;
         Ok(())

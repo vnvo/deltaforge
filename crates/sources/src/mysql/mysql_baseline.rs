@@ -1469,7 +1469,9 @@ mod tests {
                                 break;
                             }
                         }
-                        SourceItem::Event(e) if e.ddl.is_none() => rows.push(e),
+                        SourceItem::Event(e) if e.ddl.is_none() => {
+                            rows.push(*e)
+                        }
                         _ => {}
                     }
                 }

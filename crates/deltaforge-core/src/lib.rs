@@ -755,15 +755,15 @@ impl BatchResult {
 /// to sinks. It lets the coordinator form transaction-aligned batches and
 /// checkpoint only at commit boundaries (even for empty or fully-filtered
 /// transactions).
-// `Event` is the hot-path variant - one per row - and was already moved by
-// value through the old `Sender<Event>`. Boxing it to shrink the enum would add
-// a heap allocation per event that the previous channel never paid; `TxCommit`
-// is rare (once per transaction), so the size difference is intentional.
-#[allow(clippy::large_enum_variant)]
+// `Event` is the hot-path variant - one per row. It is boxed: an `Event` is
+// several hundred bytes and an item is moved at every stage on its way to the
+// coordinator (outbox, channel slot, receive buffer), so a move costs a pointer
+// rather than a copy of the whole event; the one allocation per event is
+// cheaper than those copies.
 #[derive(Debug, Clone)]
 pub enum SourceItem {
-    /// A change event.
-    Event(Event),
+    /// A change event; build one with [`SourceItem::event`].
+    Event(Box<Event>),
     /// The start of a source transaction. `tx_id` matches the `transaction.id`
     /// stamped on that transaction's events and the `tx_id` of its closing
     /// [`SourceItem::TxCommit`]. Emitted exactly once per real transaction, so
@@ -905,7 +905,7 @@ impl SourceBoundary {
 impl SourceItem {
     /// Convenience: wrap an event as a stream item.
     pub fn event(ev: Event) -> Self {
-        SourceItem::Event(ev)
+        SourceItem::Event(Box::new(ev))
     }
 }
 

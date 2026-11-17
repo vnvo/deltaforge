@@ -597,7 +597,7 @@ async fn handle_write_rows(
             ev.schema_version = Some(fingerprint_str.clone());
             ev.schema_sequence = Some(loaded.sequence);
 
-            if emit(&ctx.tx, &mut ctx.outbox, SourceItem::Event(ev)).await {
+            if emit(&ctx.tx, &mut ctx.outbox, SourceItem::event(ev)).await {
                 sent += 1;
             } else {
                 error!(source_id=%ctx.source_id, "channel send failed (op=insert)");
@@ -697,7 +697,7 @@ async fn handle_update_rows(
             ev.schema_version = Some(fingerprint_str.clone());
             ev.schema_sequence = Some(sequence);
 
-            if emit(&ctx.tx, &mut ctx.outbox, SourceItem::Event(ev)).await {
+            if emit(&ctx.tx, &mut ctx.outbox, SourceItem::event(ev)).await {
                 sent += 1;
             } else {
                 error!(source_id=%ctx.source_id, "channel send failed (op=update)");
@@ -784,7 +784,7 @@ async fn handle_delete_rows(
             ev.schema_version = Some(fingerprint_str.clone());
             ev.schema_sequence = Some(sequence);
 
-            if emit(&ctx.tx, &mut ctx.outbox, SourceItem::Event(ev)).await {
+            if emit(&ctx.tx, &mut ctx.outbox, SourceItem::event(ev)).await {
                 sent += 1;
             } else {
                 error!(source_id=%ctx.source_id, "channel send failed (op=delete)");
@@ -1216,7 +1216,7 @@ async fn emit_ddl_event(
         data_collection_order: None,
     });
 
-    if !emit(&ctx.tx, &mut ctx.outbox, SourceItem::Event(ev)).await {
+    if !emit(&ctx.tx, &mut ctx.outbox, SourceItem::event(ev)).await {
         error!(source_id=%ctx.source_id, "channel send failed (op=ddl)");
     }
     // DDL is auto-committed (its own transaction) → emit its boundary.
@@ -1789,7 +1789,7 @@ pub(crate) mod tests {
         tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(item) = rx.recv().await {
                 if let SourceItem::Event(ev) = item {
-                    return Some(ev);
+                    return Some(*ev);
                 }
             }
             None

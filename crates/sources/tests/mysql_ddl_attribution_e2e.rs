@@ -273,7 +273,9 @@ async fn row_in(r: &mut Run, db: &str, table: &str, id: i64) -> Next {
     let deadline = Instant::now() + Duration::from_secs(60);
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
         match timeout(left, r.rx.recv()).await {
-            Ok(Some(SourceItem::Event(e))) if e.ddl.is_some() => r.ddls.push(e),
+            Ok(Some(SourceItem::Event(e))) if e.ddl.is_some() => {
+                r.ddls.push(*e)
+            }
             Ok(Some(SourceItem::Event(e))) => {
                 if e.ddl.is_none()
                     && e.source.db == db
@@ -285,7 +287,7 @@ async fn row_in(r: &mut Run, db: &str, table: &str, id: i64) -> Next {
                         .and_then(|v| v.as_i64())
                         == Some(id)
                 {
-                    return Next::Row(Box::new(e));
+                    return Next::Row(e);
                 }
             }
             Ok(Some(_)) => {}
@@ -351,7 +353,7 @@ async fn ddl(r: &mut Run, needle: &str) -> (String, Value) {
                 if matches(&e) {
                     return (e.source.db.clone(), e.ddl.clone().unwrap());
                 }
-                r.ddls.push(e);
+                r.ddls.push(*e);
             }
             Ok(Some(_)) => {}
             Ok(None) => panic!("the source stopped before the DDL {needle:?}"),

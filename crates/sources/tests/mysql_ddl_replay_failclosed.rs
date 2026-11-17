@@ -115,7 +115,7 @@ async fn replay(
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match timeout(remaining, rx.recv()).await {
-            Ok(Some(SourceItem::Event(e))) => events.push(e),
+            Ok(Some(SourceItem::Event(e))) => events.push(*e),
             Ok(Some(_)) => continue,
             // Channel closed: the source task has ended.
             Ok(None) | Err(_) => break,
@@ -299,7 +299,7 @@ async fn replay_without_ddl_decodes_normally() -> Result<()> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match timeout(remaining, rx.recv()).await {
             Ok(Some(SourceItem::Event(e))) if e.op == Op::Create => {
-                rows.push(e)
+                rows.push(*e)
             }
             Ok(Some(_)) => continue,
             Ok(None) | Err(_) => break,

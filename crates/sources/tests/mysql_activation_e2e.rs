@@ -247,7 +247,7 @@ async fn ddl_event(rx: &mut mpsc::Receiver<SourceItem>, needle: &str) -> Event {
                     .as_ref()
                     .is_some_and(|d| d.to_string().contains(needle))
                 {
-                    return e;
+                    return *e;
                 }
             }
             Ok(Some(_)) => {}

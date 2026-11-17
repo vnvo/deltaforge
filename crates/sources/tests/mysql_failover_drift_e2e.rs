@@ -222,7 +222,7 @@ fn rows(items: &[SourceItem]) -> Vec<&Event> {
                         Op::Create | Op::Update | Op::Delete | Op::Read
                     ) =>
             {
-                Some(e)
+                Some(&**e)
             }
             _ => None,
         })

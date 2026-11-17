@@ -127,7 +127,7 @@ where
     while Instant::now() < deadline {
         match timeout(Duration::from_millis(100), rx.recv()).await {
             Ok(Some(SourceItem::Event(e))) => {
-                events.push(e);
+                events.push(*e);
                 if pred(&events) {
                     return events;
                 }
@@ -147,7 +147,7 @@ async fn next_event(
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match timeout(remaining, rx.recv()).await {
-            Ok(Some(SourceItem::Event(e))) => return Some(e),
+            Ok(Some(SourceItem::Event(e))) => return Some(*e),
             Ok(Some(SourceItem::TxBegin { .. })) => continue,
             Ok(Some(SourceItem::TxCommit { .. })) => continue,
             _ => return None,
@@ -1229,7 +1229,7 @@ async fn pg_dropped_table_retained_wal_recovers_via_durable_schema()
     let events: Vec<&Event> = items
         .iter()
         .filter_map(|i| match i {
-            SourceItem::Event(e) => Some(e),
+            SourceItem::Event(e) => Some(&**e),
             _ => None,
         })
         .collect();
@@ -1524,7 +1524,7 @@ async fn pg_dropped_table_recreated_uses_historical_not_recreated() -> Result<()
     let events: Vec<&Event> = items
         .iter()
         .filter_map(|i| match i {
-            SourceItem::Event(e) => Some(e),
+            SourceItem::Event(e) => Some(&**e),
             _ => None,
         })
         .collect();
@@ -2739,7 +2739,7 @@ async fn next_toasty(
             Ok(Some(SourceItem::Event(ev)))
                 if ev.source.table == "toasty" && ev.op == op =>
             {
-                return Some(ev);
+                return Some(*ev);
             }
             Ok(Some(_)) => continue,
             _ => return None,
@@ -5068,7 +5068,7 @@ mod event_schema_identity {
             let items = drain_items(&mut rx, Duration::from_millis(500)).await;
             let mut events = events;
             events.extend(items.into_iter().filter_map(|i| match i {
-                SourceItem::Event(e) => Some(e),
+                SourceItem::Event(e) => Some(*e),
                 _ => None,
             }));
             h.stop();
@@ -5538,7 +5538,7 @@ mod event_schema_identity {
                     .await
                     .into_iter()
                     .filter_map(|i| match i {
-                        SourceItem::Event(e) => Some(e),
+                        SourceItem::Event(e) => Some(*e),
                         _ => None,
                     }),
             );

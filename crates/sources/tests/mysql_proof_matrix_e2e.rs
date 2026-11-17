@@ -325,7 +325,7 @@ async fn rows(rx: &mut mpsc::Receiver<SourceItem>, n: usize) -> Vec<Event> {
             break;
         };
         match timeout(left, rx.recv()).await {
-            Ok(Some(SourceItem::Event(e))) if is_row(&e) => out.push(e),
+            Ok(Some(SourceItem::Event(e))) if is_row(&e) => out.push(*e),
             Ok(Some(_)) => {}
             _ => break,
         }
@@ -340,7 +340,7 @@ async fn until_stopped(r: Run) -> (Vec<Event>, SourceResult<()>) {
     let deadline = Instant::now() + Duration::from_secs(60);
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
         match timeout(left, rx.recv()).await {
-            Ok(Some(SourceItem::Event(e))) if is_row(&e) => out.push(e),
+            Ok(Some(SourceItem::Event(e))) if is_row(&e) => out.push(*e),
             Ok(Some(_)) => {}
             Ok(None) => break,
             Err(_) => panic!("the source did not stop"),

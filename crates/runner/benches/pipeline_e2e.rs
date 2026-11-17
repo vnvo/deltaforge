@@ -528,7 +528,7 @@ async fn run_coordinator_bench(
     let coord = builder.build();
 
     for ev in events {
-        tx.send(SourceItem::Event(ev)).await?;
+        tx.send(SourceItem::event(ev)).await?;
     }
     drop(tx);
 
@@ -560,7 +560,7 @@ async fn run_coordinator_bench_with_sensing(
     let coord = builder.build();
 
     for ev in events {
-        tx.send(SourceItem::Event(ev)).await?;
+        tx.send(SourceItem::event(ev)).await?;
     }
     drop(tx);
 

@@ -203,7 +203,7 @@ async fn next(r: &mut Run, op: Op, id: i64) -> Event {
                         .map(|a| test_common::row_view(a)["id"].clone())
                         .is_some_and(|v| v.as_i64() == Some(id)) =>
             {
-                return e;
+                return *e;
             }
             Ok(Some(_)) => {}
             Ok(None) => panic!("the source stopped before {op:?} id={id}"),

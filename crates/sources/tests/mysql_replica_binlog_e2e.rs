@@ -354,7 +354,7 @@ async fn rows(
     while let Ok(Some(item)) = timeout(quiet, rx.recv()).await {
         if let SourceItem::Event(e) = item {
             if matches!(e.op, Op::Create | Op::Update | Op::Delete | Op::Read) {
-                out.push(e);
+                out.push(*e);
             }
         }
     }
@@ -374,7 +374,7 @@ async fn row(rx: &mut mpsc::Receiver<SourceItem>, id: i64) -> Event {
                     .as_ref()
                     .is_some_and(|a| test_common::row_view(a)["id"] == id) =>
             {
-                return e;
+                return *e;
             }
             Ok(Some(_)) => {}
             other => panic!("no row {id}: {other:?}"),
@@ -794,8 +794,8 @@ async fn failover_at(
                 if matches!(e.op, Op::Create | Op::Update | Op::Delete) =>
             {
                 match open.as_mut() {
-                    Some(o) => o.push(e),
-                    None => delivered.push(e),
+                    Some(o) => o.push(*e),
+                    None => delivered.push(*e),
                 }
             }
             _ => {}

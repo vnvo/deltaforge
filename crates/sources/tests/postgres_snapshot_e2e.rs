@@ -99,7 +99,7 @@ async fn run_until(
     while reads.len() < want {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(SourceItem::Event(ev))) if ev.op == Op::Read => {
-                reads.push(ev)
+                reads.push(*ev)
             }
             Ok(Some(_)) => continue,
             _ => break,
@@ -467,7 +467,7 @@ async fn a_restart_after_completion_streams_without_copying() -> Result<()> {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(SourceItem::Event(ev))) => {
                 assert_ne!(ev.op, Op::Read, "no row is copied again");
-                changes.push(ev);
+                changes.push(*ev);
             }
             Ok(Some(_)) => continue,
             _ => break,
@@ -549,7 +549,7 @@ async fn a_crash_after_the_terminal_acknowledgement_completes_without_copying()
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while !events.iter().any(|e: &Event| e.op == Op::Create) {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Some(SourceItem::Event(ev))) => events.push(ev),
+            Ok(Some(SourceItem::Event(ev))) => events.push(*ev),
             Ok(Some(_)) => continue,
             _ => break,
         }
@@ -622,7 +622,7 @@ async fn pg_snapshot_anchor_zero_loss_bounded_overlap() -> Result<()> {
     while s_events.len() < 100 {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(SourceItem::Event(ev))) if ev.op == Op::Read => {
-                s_events.push(ev)
+                s_events.push(*ev)
             }
             Ok(Some(_)) => continue,
             _ => break,
@@ -1200,7 +1200,7 @@ async fn a_proven_hardened_legacy_snapshot_is_upgraded_in_place() -> Result<()>
         .any(|e: &Event| ids(std::slice::from_ref(e)).contains(&4))
     {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Some(SourceItem::Event(ev))) => events.push(ev),
+            Ok(Some(SourceItem::Event(ev))) => events.push(*ev),
             Ok(Some(_)) => continue,
             _ => break,
         }
