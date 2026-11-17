@@ -382,6 +382,53 @@ async fn kafka_sink_sends_batch() -> Result<()> {
     Ok(())
 }
 
+/// A large batch's encoding gives way to the runtime's other tasks: on one
+/// thread, a task beside it is never held up for long, so a source sharing
+/// the sink's worker is not queued behind a whole batch's encoding.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires docker"]
+async fn kafka_sink_batch_lets_other_tasks_run() -> Result<()> {
+    let (brokers, topic) = setup("cooperative", 3).await?;
+    let sink = make_sink(
+        "test-kafka-cooperative",
+        &brokers,
+        &topic,
+        EnvelopeCfg::Native,
+    )?;
+    let events: Vec<Event> = (0..30_000).map(make_test_event).collect();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Timed from before the batch starts: a task never run during the
+    // batch waited all of it.
+    let mut last = Instant::now();
+    let beside = tokio::spawn({
+        let stop = Arc::clone(&stop);
+        async move {
+            let mut longest = Duration::ZERO;
+            loop {
+                let now = Instant::now();
+                longest = longest.max(now - last);
+                last = now;
+                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    return longest;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+    let started = Instant::now();
+    sink.send_batch(&events).await?;
+    let took = started.elapsed();
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let longest = beside.await?;
+    info!(?took, ?longest, "30000-event batch beside a yielding task");
+    assert!(
+        longest < Duration::from_millis(50),
+        "the task beside the batch waited {longest:?} (the batch took {took:?})"
+    );
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
+
 /// Test that empty batch is a no-op.
 #[tokio::test]
 #[ignore = "requires docker"]

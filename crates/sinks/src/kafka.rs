@@ -897,6 +897,10 @@ impl Sink for KafkaSink {
         // prepared here, in order.
         let mut ahead = self.prepare_parallel(events);
         for (i, e) in events.iter().enumerate() {
+            // Encoding a batch is CPU work with nothing to wait on: it gives
+            // way whenever the task's budget is spent, so a task sharing the
+            // worker (the source) is never queued behind a whole batch.
+            tokio::task::consume_budget().await;
             let prepared = match ahead.get_mut(i).and_then(Option::take) {
                 Some(prepared) => prepared,
                 None => {
@@ -960,6 +964,7 @@ impl Sink for KafkaSink {
             }
         }
         for prepared in prepared_all {
+            tokio::task::consume_budget().await;
             if let Err(e) = self
                 .enqueue(
                     prepared,
