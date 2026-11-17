@@ -86,6 +86,49 @@ impl Signature {
     }
 }
 
+/// How many tables' last signatures [`SignatureMemo`] keeps.
+const MEMO_TABLES: usize = 4096;
+
+/// Each table id's last signature and its digest: a TableMap identical in
+/// every signature field reuses the digest instead of serializing and
+/// hashing it again (a digest is a function of the signature alone).
+pub(crate) struct SignatureMemo {
+    by_table: lru::LruCache<u64, (Signature, String)>,
+}
+
+impl SignatureMemo {
+    pub(crate) fn new() -> Self {
+        Self {
+            by_table: lru::LruCache::new(
+                std::num::NonZeroUsize::new(MEMO_TABLES).expect("nonzero"),
+            ),
+        }
+    }
+
+    /// `Signature::of(tm).digest()`.
+    pub(crate) fn digest(&mut self, tm: &TableMapEvent) -> String {
+        if let Some((sig, digest)) = self.by_table.get(&tm.table_id)
+            && sig.is_of(tm)
+        {
+            return digest.clone();
+        }
+        let sig = Signature::of(tm);
+        let digest = sig.digest();
+        self.by_table.put(tm.table_id, (sig, digest.clone()));
+        digest
+    }
+}
+
+impl Signature {
+    /// Whether `tm` has this signature.
+    fn is_of(&self, tm: &TableMapEvent) -> bool {
+        self.column_types == tm.column_types
+            && self.column_metas == tm.column_metas
+            && self.null_bits == tm.null_bits
+            && self.table_metadata == tm.table_metadata
+    }
+}
+
 /// Base type, lower-cased, without length/attributes ("varchar", "int").
 fn base(c: &MySqlColumn) -> String {
     c.data_type.trim().to_ascii_lowercase()
@@ -686,5 +729,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn memo_digest_is_the_signature_digest_and_follows_every_field() {
+        use mysql_binlog_connector_rust::event::table_map::table_metadata::{
+            ColumnMetadata, TableMetadata,
+        };
+        let fresh = |t: &TableMapEvent| Signature::of(t).digest();
+        let base = tm(&[(3, 0), (15, 40)]);
+        let full = |name: &str| {
+            let mut t = base.clone();
+            t.table_metadata = Some(TableMetadata {
+                default_charset: None,
+                enum_and_set_default_charset: None,
+                columns: vec![
+                    ColumnMetadata {
+                        column_name: Some("id".into()),
+                        ..Default::default()
+                    },
+                    ColumnMetadata {
+                        column_name: Some(name.into()),
+                        ..Default::default()
+                    },
+                ],
+                primary_key: vec![(0, 0)],
+            });
+            t
+        };
+        let mut types = base.clone();
+        types.column_types[1] = 253;
+        let mut metas = base.clone();
+        metas.column_metas[1] = 80;
+        let mut nulls = base.clone();
+        nulls.null_bits[0] = false;
+        let mut other_table = base.clone();
+        other_table.table_name = "u".into();
+        let mut memo = SignatureMemo::new();
+        // The same table id through every change and back: each digest is
+        // the fresh one, a change is never answered from the memo.
+        for t in [
+            &base,
+            &base,
+            &types,
+            &base,
+            &metas,
+            &base,
+            &nulls,
+            &base,
+            &full("a"),
+            &full("a"),
+            &full("b"),
+            &base,
+            &other_table,
+        ] {
+            assert_eq!(memo.digest(t), fresh(t));
+        }
+        assert_ne!(fresh(&full("a")), fresh(&full("b")));
+        assert_ne!(fresh(&base), fresh(&types));
     }
 }

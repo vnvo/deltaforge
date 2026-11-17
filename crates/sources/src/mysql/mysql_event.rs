@@ -136,12 +136,7 @@ pub(super) async fn dispatch_event(
         "event received"
     );
 
-    counter!(
-        "deltaforge_source_bytes_total",
-        "pipeline" => ctx.pipeline.clone(),
-        "source" => ctx.source_id.clone(),
-    )
-    .increment(header.event_length as u64);
+    ctx.meters.bytes.increment(header.event_length as u64);
 
     match data {
         // A compressed transaction: its events, in order. They have no
@@ -252,13 +247,7 @@ async fn handle_table_map(
     // by the allow-list only once its table is known. The map lives until
     // the transaction's commit boundary (`release_table_maps`).
     if ctx.table_map.insert(tm.table_id, tm).is_none() {
-        counter!(
-            "deltaforge_mysql_table_maps_installed_total",
-            "pipeline" => ctx.pipeline.clone(),
-            "source" => ctx.source_id.clone(),
-            "map" => "source",
-        )
-        .increment(1);
+        ctx.meters.source_maps_installed.increment(1);
         set_table_maps(ctx, "source", ctx.table_map.len());
     }
     Ok(())
@@ -268,13 +257,59 @@ async fn handle_table_map(
 /// stream's binlog parser (`parser`) or by the dispatching source
 /// (`source`). Both are bounded by the open transaction's tables.
 fn set_table_maps(ctx: &RunCtx, map: &'static str, n: usize) {
-    metrics::gauge!(
-        "deltaforge_mysql_table_maps",
-        "pipeline" => ctx.pipeline.clone(),
-        "source" => ctx.source_id.clone(),
-        "map" => map,
-    )
-    .set(n as f64);
+    match map {
+        "source" => ctx.meters.source_maps.set(n as f64),
+        "parser" => ctx.meters.parser_maps.set(n as f64),
+        _ => metrics::gauge!(
+            "deltaforge_mysql_table_maps",
+            "pipeline" => ctx.pipeline.clone(),
+            "source" => ctx.source_id.clone(),
+            "map" => map,
+        )
+        .set(n as f64),
+    }
+}
+
+/// The source's metrics whose labels never change, registered once (not
+/// looked up again for every binlog event).
+pub(crate) struct SourceMeters {
+    bytes: metrics::Counter,
+    source_maps_installed: metrics::Counter,
+    parser_maps_installed: metrics::Counter,
+    source_maps: metrics::Gauge,
+    parser_maps: metrics::Gauge,
+}
+
+impl SourceMeters {
+    pub(crate) fn new(pipeline: &str, source: &str) -> Self {
+        let installed = |map: &'static str| {
+            counter!(
+                "deltaforge_mysql_table_maps_installed_total",
+                "pipeline" => pipeline.to_string(),
+                "source" => source.to_string(),
+                "map" => map,
+            )
+        };
+        let maps = |map: &'static str| {
+            metrics::gauge!(
+                "deltaforge_mysql_table_maps",
+                "pipeline" => pipeline.to_string(),
+                "source" => source.to_string(),
+                "map" => map,
+            )
+        };
+        Self {
+            bytes: counter!(
+                "deltaforge_source_bytes_total",
+                "pipeline" => pipeline.to_string(),
+                "source" => source.to_string(),
+            ),
+            source_maps_installed: installed("source"),
+            parser_maps_installed: installed("parser"),
+            source_maps: maps("source"),
+            parser_maps: maps("parser"),
+        }
+    }
 }
 
 /// Release the dispatching source's table maps. At a transaction's commit
@@ -313,13 +348,7 @@ fn note_parser_table_maps(
         .unwrap_or(installed);
     ctx.parser_table_maps_installed = installed;
     if new > 0 {
-        counter!(
-            "deltaforge_mysql_table_maps_installed_total",
-            "pipeline" => ctx.pipeline.clone(),
-            "source" => ctx.source_id.clone(),
-            "map" => "parser",
-        )
-        .increment(new);
+        ctx.meters.parser_maps_installed.increment(new);
     }
     set_table_maps(ctx, "parser", parser.table_map_event_by_table_id.len());
 }
@@ -1757,6 +1786,7 @@ pub(crate) mod tests {
             type_mapping: deltaforge_core::TypeMapping::V2,
             table_map,
             parser_table_maps_installed: 0,
+            meters: SourceMeters::new("test-pipeline", "unit-test"),
             last_file: "mysql-bin.000001".to_string(),
             last_pos: 1234,
             last_gtid: Some(
@@ -4348,6 +4378,35 @@ pub(crate) mod tests {
                     .await
                     .unwrap();
                     assert_eq!(read(&snap).0.get("source"), Some(&0.0));
+                    // Every dispatched event's bytes, in the source's series.
+                    let bytes: Vec<_> = snap
+                        .snapshot()
+                        .into_vec()
+                        .into_iter()
+                        .filter(|(k, ..)| {
+                            k.key().name() == "deltaforge_source_bytes_total"
+                        })
+                        .map(|(k, _, _, v)| {
+                            let labels: Vec<(String, String)> = k
+                                .key()
+                                .labels()
+                                .map(|l| {
+                                    (l.key().to_string(), l.value().to_string())
+                                })
+                                .collect();
+                            (labels, v)
+                        })
+                        .collect();
+                    assert_eq!(
+                        bytes,
+                        vec![(
+                            vec![
+                                ("pipeline".into(), ctx.pipeline.clone()),
+                                ("source".into(), ctx.source_id.clone()),
+                            ],
+                            DebugValue::Counter(400)
+                        )]
+                    );
                     // The parser's own series, from the parser's counts.
                     let mut parser = parser();
                     let mut s = Vec::new();

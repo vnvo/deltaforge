@@ -297,6 +297,8 @@ pub(crate) struct RunCtx {
     /// The stream parser's installed-table-map count last exported
     /// (`deltaforge_mysql_table_maps_installed_total{map="parser"}`).
     parser_table_maps_installed: u64,
+    /// The source's fixed-label metric handles.
+    meters: mysql_event::SourceMeters,
     last_file: String,
     last_pos: u64,
     /// The executed set through the last proven transaction boundary (GTID
@@ -1863,6 +1865,7 @@ impl MySqlSource {
             inactivity: Duration::from_secs(60),
             table_map: HashMap::new(),
             parser_table_maps_installed: 0,
+            meters: mysql_event::SourceMeters::new(&self.pipeline, &self.id),
             last_file: init_file,
             last_pos: init_pos,
             last_gtid: init_gtid,

@@ -551,7 +551,7 @@ impl KafkaSink {
             return Ok(self.topic.as_str().into());
         }
 
-        let event_json = crate::payload::route_view(event);
+        let event_json = crate::payload::RouteView::new(event);
 
         let resolved = self
             .topic_template
@@ -585,7 +585,7 @@ impl KafkaSink {
                 return tmpl.resolve_lenient(&serde_json::Value::Null);
             }
             {
-                let event_json = crate::payload::route_view(event);
+                let event_json = crate::payload::RouteView::new(event);
                 return tmpl.resolve_lenient(&event_json);
             }
         }

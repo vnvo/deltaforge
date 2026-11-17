@@ -331,6 +331,30 @@ pub fn mysql_checkpoint_position(
     }
 }
 
+/// How many GTID set texts [`parsed_gtid_set`] keeps parsed, per thread.
+const PARSED_GTID_SETS: usize = 256;
+
+/// `GtidSet::parse(text)`, remembered: selection compares the same few
+/// positions again and again (a pure function of the text).
+fn parsed_gtid_set(text: &str) -> Option<std::rc::Rc<GtidSet>> {
+    thread_local! {
+        static PARSED: std::cell::RefCell<
+            lru::LruCache<String, Option<std::rc::Rc<GtidSet>>>,
+        > = std::cell::RefCell::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(PARSED_GTID_SETS).expect("nonzero"),
+        ));
+    }
+    PARSED.with(|p| {
+        let mut p = p.borrow_mut();
+        if let Some(set) = p.get(text) {
+            return set.clone();
+        }
+        let set = GtidSet::parse(text).map(std::rc::Rc::new);
+        p.put(text.to_string(), set.clone());
+        set
+    })
+}
+
 /// Order two positions known to belong to the SAME lineage (the caller has
 /// established that; [`order`] checks it for watermarks). The single position
 /// comparator shared by durable watermarks, MySQL checkpoint selection and
@@ -371,7 +395,7 @@ pub fn order_positions(a: &WmPos, b: &WmPos) -> CheckpointOrder {
         (
             WmPos::MysqlGtid { gtid_set: ga },
             WmPos::MysqlGtid { gtid_set: gb },
-        ) => match (GtidSet::parse(ga), GtidSet::parse(gb)) {
+        ) => match (parsed_gtid_set(ga), parsed_gtid_set(gb)) {
             (Some(sa), Some(sb)) => {
                 order_from_subset(sa.is_subset(&sb), sb.is_subset(&sa))
             }
@@ -1896,5 +1920,49 @@ mod snapshot_chain_watermark_tests {
             DurableWatermark::pg_commit(7, 10, None).version,
             WATERMARK_VERSION
         );
+    }
+
+    #[test]
+    fn remembered_gtid_set_parse_is_the_parse() {
+        let u = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+        let w = "4e11fa47-71ca-11e1-9e33-c80aa9429562";
+        let texts = [
+            format!("{u}:1-5"),
+            format!("{u}:1-5"),
+            format!("{u}:1-7"),
+            format!("{u}:1-5,{w}:1-2"),
+            format!("{w}:1-2,{u}:1-5"),
+            String::new(),
+            "not a gtid set".to_string(),
+            "not a gtid set".to_string(),
+            format!("{u}:1-5:7-9"),
+        ];
+        // Through the memo twice (a miss, then hits): each answer is the
+        // parse's, and the ordering every pair gets is the parsed one.
+        for _ in 0..2 {
+            for a in &texts {
+                assert_eq!(
+                    parsed_gtid_set(a).as_deref(),
+                    GtidSet::parse(a).as_ref(),
+                    "{a}"
+                );
+                for b in &texts {
+                    let direct = match (GtidSet::parse(a), GtidSet::parse(b)) {
+                        (Some(sa), Some(sb)) => order_from_subset(
+                            sa.is_subset(&sb),
+                            sb.is_subset(&sa),
+                        ),
+                        _ => CheckpointOrder::Incomparable,
+                    };
+                    let pa = WmPos::MysqlGtid {
+                        gtid_set: a.clone(),
+                    };
+                    let pb = WmPos::MysqlGtid {
+                        gtid_set: b.clone(),
+                    };
+                    assert_eq!(order_positions(&pa, &pb), direct, "{a} vs {b}");
+                }
+            }
+        }
     }
 }

@@ -12,14 +12,23 @@ use deltaforge_core::{EventId, SourceInfo};
 /// Parse a MySQL GTID UUID (`3e11fa47-71ca-11e1-9e33-c80aa9429562`) into 16
 /// bytes. Returns `None` if it isn't a well-formed 32-hex-digit (dashed) UUID.
 pub(crate) fn parse_uuid16(uuid: &str) -> Option<[u8; 16]> {
-    let hex: String = uuid.chars().filter(|c| *c != '-').collect();
-    if hex.len() != 32 {
-        return None;
-    }
-    let bytes = hex::decode(hex).ok()?;
+    // 32 hex digits, any `-` between them ignored; decoded in place.
+    let nibble = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
     let mut out = [0u8; 16];
-    out.copy_from_slice(&bytes);
-    Some(out)
+    let mut n = 0;
+    for b in uuid.bytes().filter(|b| *b != b'-') {
+        if n == 32 {
+            return None;
+        }
+        out[n / 2] = (out[n / 2] << 4) | nibble(b)?;
+        n += 1;
+    }
+    (n == 32).then_some(out)
 }
 
 /// Derive the provisional `myrow` [`EventId`] from a MySQL event's source
@@ -142,5 +151,32 @@ mod tests {
             Some(0),
         );
         assert!(mysql_row_event_id(&src(pos)).is_err());
+    }
+
+    #[test]
+    fn uuid_bytes_decode_as_the_filtered_hex() {
+        let reference = |uuid: &str| -> Option<[u8; 16]> {
+            let hex: String = uuid.chars().filter(|c| *c != '-').collect();
+            if hex.len() != 32 {
+                return None;
+            }
+            hex::decode(hex).ok()?.try_into().ok()
+        };
+        for u in [
+            "3e11fa47-71ca-11e1-9e33-c80aa9429562",
+            "3E11FA47-71CA-11E1-9E33-C80AA9429562",
+            "3e11fa4771ca11e19e33c80aa9429562",
+            "-3e11fa47-71ca-11e1-9e33-c80aa9429562-",
+            "3e11fa47--71ca-11e1-9e33-c80aa942956",
+            "3e11fa47-71ca-11e1-9e33-c80aa94295620",
+            "3e11fa47-71ca-11e1-9e33-c80aa942956g",
+            "3e11fa47-71ca-11e1-9e33-c80aa94295é",
+            "",
+            "----",
+            "00000000-0000-0000-0000-000000000000",
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        ] {
+            assert_eq!(parse_uuid16(u), reference(u), "{u}");
+        }
     }
 }

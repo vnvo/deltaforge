@@ -170,15 +170,32 @@ impl SchemaKey {
     /// The durable backend key string. Every non-hash segment is percent-encoded
     /// so a value containing `/` or `%` cannot forge a segment boundary.
     pub fn backend_key(&self) -> String {
-        format!(
-            "{}/{}/{}/{}/{}/{}",
-            FORMAT_VERSION,
-            enc(&self.tenant),
-            enc(&self.source_id),
-            self.lineage_hash,
-            enc(&self.db),
-            enc(&self.table)
-        )
+        // One buffer, the encoded segments written straight into it.
+        let mut k = String::with_capacity(
+            FORMAT_VERSION.len()
+                + 5
+                + self.tenant.len()
+                + self.source_id.len()
+                + self.lineage_hash.len()
+                + self.db.len()
+                + self.table.len(),
+        );
+        k.push_str(FORMAT_VERSION);
+        for (segment, encoded) in [
+            (&self.tenant, true),
+            (&self.source_id, true),
+            (&self.lineage_hash, false),
+            (&self.db, true),
+            (&self.table, true),
+        ] {
+            k.push('/');
+            if encoded {
+                k.extend(utf8_percent_encode(segment, SEGMENT_ESCAPE));
+            } else {
+                k.push_str(segment);
+            }
+        }
+        k
     }
 
     /// Prefix that scopes enumeration to one `(tenant, source_id, lineage)`.
@@ -325,5 +342,29 @@ mod tests {
         let k = SchemaKey::new("acme", "src2", "deadbeef", "public", "orders");
         let prefix = SchemaKey::source_prefix("acme", "src1", "deadbeef");
         assert!(!k.backend_key().starts_with(&prefix));
+    }
+
+    #[test]
+    fn backend_key_is_the_formatted_encoded_segments() {
+        for (t, s, l, d, n) in [
+            ("acme", "src", "ab12", "shop", "orders"),
+            ("a/b", "s%2F", "h/%", "d/b%", "t\u{7f}\n/x"),
+            ("", "", "", "", ""),
+            ("ténant", "源", "ffff", "db é", "tbl/%/%25"),
+        ] {
+            let k = SchemaKey::new(t, s, l, d, n);
+            assert_eq!(
+                k.backend_key(),
+                format!(
+                    "{}/{}/{}/{}/{}/{}",
+                    FORMAT_VERSION,
+                    enc(t),
+                    enc(s),
+                    l,
+                    enc(d),
+                    enc(n)
+                )
+            );
+        }
     }
 }

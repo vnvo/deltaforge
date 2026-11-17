@@ -12,6 +12,47 @@ pub(crate) fn route_view(event: &Event) -> Value {
     event.view_value()
 }
 
+/// [`route_view`] for template resolution, built only as far as a path
+/// needs: `before.<column>...` and `after.<column>...` read that one
+/// column; any other path resolves against the full view, built once.
+pub(crate) struct RouteView<'a> {
+    event: &'a Event,
+    full: std::cell::OnceCell<Value>,
+}
+
+impl<'a> RouteView<'a> {
+    pub(crate) fn new(event: &'a Event) -> Self {
+        Self {
+            event,
+            full: std::cell::OnceCell::new(),
+        }
+    }
+}
+
+impl common::PathLookup for RouteView<'_> {
+    fn resolve(&self, path: &[String]) -> Option<String> {
+        if let [image, column, rest @ ..] = path {
+            let row = match image.as_str() {
+                "before" => Some(&self.event.before),
+                "after" => Some(&self.event.after),
+                _ => None,
+            };
+            if let Some(row) = row {
+                let v = deltaforge_core::canonical::view::column_view(
+                    row.as_ref()?,
+                    column,
+                    self.event.type_mapping,
+                )?;
+                return common::resolve_path(&v, rest);
+            }
+        }
+        common::resolve_path(
+            self.full.get_or_init(|| route_view(self.event)),
+            path,
+        )
+    }
+}
+
 /// The smallest and largest capacity a payload buffer starts with.
 const MIN_PAYLOAD: usize = 256;
 const MAX_PAYLOAD_HINT: usize = 64 * 1024;
@@ -186,5 +227,96 @@ mod tests {
         let u = event(DbValue::uint(u64::MAX, IntWidth::W64).unwrap());
         let view = route_view(&u);
         assert_eq!(view["after"]["big"], json!(u64::MAX));
+    }
+
+    #[test]
+    fn route_view_paths_resolve_as_the_full_view() {
+        use common::PathLookup;
+        use deltaforge_core::canonical::{Document, JsonText};
+        let cols = |id: i64| {
+            vec![
+                (
+                    "id".to_string(),
+                    CanonicalValue::Db(
+                        DbValue::int(id, IntWidth::W64).unwrap(),
+                    ),
+                ),
+                (
+                    "big".to_string(),
+                    CanonicalValue::Db(
+                        DbValue::uint(u64::MAX, IntWidth::W64).unwrap(),
+                    ),
+                ),
+                (
+                    "name".to_string(),
+                    CanonicalValue::Db(DbValue::Text("a\"b".into())),
+                ),
+                ("flag".to_string(), CanonicalValue::Db(DbValue::Bool(true))),
+                ("gone".to_string(), CanonicalValue::Null),
+                (
+                    "doc".to_string(),
+                    CanonicalValue::Db(DbValue::Json(
+                        JsonText::new(
+                            r#"{"a": {"b": [1, "x"]}, "n": null}"#.into(),
+                        )
+                        .unwrap(),
+                    )),
+                ),
+                ("toast".to_string(), CanonicalValue::Unchanged),
+            ]
+        };
+        let ext =
+            || vec![("extra".to_string(), Document::new(json!({"k": 3})))];
+        let mut update = event(DbValue::int(0, IntWidth::W64).unwrap());
+        update.before =
+            Some(CanonicalRow::with_extensions(cols(1), ext()).unwrap());
+        update.after =
+            Some(CanonicalRow::with_extensions(cols(2), ext()).unwrap());
+        update.tenant_id = Some("acme".into());
+        let mut delete = update.clone();
+        delete.after = None;
+        let mut insert = update.clone();
+        insert.before = None;
+
+        let paths = [
+            "after.id",
+            "after.big",
+            "after.name",
+            "after.flag",
+            "after.gone",
+            "after.doc",
+            "after.doc.a",
+            "after.doc.a.b",
+            "after.doc.n",
+            "after.toast",
+            "after.extra",
+            "after.extra.k",
+            "after.missing",
+            "before.id",
+            "before.toast",
+            "before.missing",
+            "after",
+            "before",
+            "source.table",
+            "source.db",
+            "op",
+            "tenant_id",
+            "nope.x",
+            "after.id.x",
+        ];
+        for e in [&update, &delete, &insert] {
+            let full = route_view(e);
+            let lazy = RouteView::new(e);
+            for p in paths {
+                let path: Vec<String> =
+                    p.split('.').map(String::from).collect();
+                assert_eq!(
+                    lazy.resolve(&path),
+                    full.resolve(&path),
+                    "{p} on {:?}",
+                    e.op
+                );
+            }
+        }
     }
 }

@@ -56,7 +56,9 @@ pub mod time;
 // =============================================================================
 // Routing Tempaltes
 // =============================================================================
-pub use routing::{CompiledTemplate, TemplateError, UnresolvedVar};
+pub use routing::{
+    CompiledTemplate, PathLookup, TemplateError, UnresolvedVar, resolve_path,
+};
 
 // =============================================================================
 // DSN Utilities

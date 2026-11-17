@@ -256,7 +256,7 @@ impl NatsSink {
         if self.subject_template.is_static() {
             return Ok(self.subject.clone());
         }
-        let event_json = crate::payload::route_view(event);
+        let event_json = crate::payload::RouteView::new(event);
         let resolved = self
             .subject_template
             .resolve_strict(&event_json)
@@ -297,7 +297,7 @@ impl NatsSink {
         }
         if let Some(ref tmpl) = self.key_template {
             {
-                let event_json = crate::payload::route_view(event);
+                let event_json = crate::payload::RouteView::new(event);
                 let resolved = tmpl.resolve_lenient(&event_json);
                 if !resolved.is_empty() {
                     return Some(resolved);

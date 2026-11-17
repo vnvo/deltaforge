@@ -282,6 +282,9 @@ pub(crate) struct Caches {
     load_charge: u64,
     pair_charge: u64,
     meters: Meters,
+    /// The TableMap signature digests (outside the byte bound: at most
+    /// [`super::mysql_signature::SignatureMemo`]'s tables).
+    pub(crate) signatures: super::mysql_signature::SignatureMemo,
 }
 
 /// The cache's metrics: evictions, and its own accounting (estimated bytes
@@ -367,6 +370,7 @@ impl Caches {
             load_charge: 0,
             pair_charge: 0,
             meters,
+            signatures: super::mysql_signature::SignatureMemo::new(),
         }
     }
 
@@ -1978,8 +1982,7 @@ pub(crate) async fn select_for_rows(
     let Some(row) = ctx.txn_eval.clone() else {
         return Err(fail(db, table, "the rows have no evaluation position"));
     };
-    let signature = Signature::of(tm);
-    let sig_digest = signature.digest();
+    let sig_digest = ctx.selection.signatures.digest(tm);
     let mut t = timeline(ctx, &key).await?;
     // After a failover, the table's drift policy applies before anything is
     // registered, baselined, decoded or emitted for these rows (once per
@@ -2044,6 +2047,7 @@ pub(crate) async fn select_for_rows(
         )),
         Selection::Unproven(reason) => {
             info!(source_id = %ctx.source_id, %db, %table, ?reason, "no positional proof; FULL signature selection");
+            let signature = Signature::of(tm);
             full_fallback(ctx, tm, &key, &row, signature, sig_digest, &t).await
         }
     }

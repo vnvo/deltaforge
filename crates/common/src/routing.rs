@@ -199,9 +199,9 @@ impl CompiledTemplate {
     ///
     /// Use for topic/subject resolution where an empty segment would create
     /// a garbage destination.
-    pub fn resolve_strict(
+    pub fn resolve_strict<P: PathLookup + ?Sized>(
         &self,
-        event_json: &Value,
+        event_json: &P,
     ) -> Result<String, UnresolvedVar> {
         if self.is_static {
             return Ok(self.static_value());
@@ -212,7 +212,7 @@ impl CompiledTemplate {
             match seg {
                 TemplateSegment::Literal(s) => result.push_str(s),
                 TemplateSegment::Variable(path) => {
-                    let val = resolve_path(event_json, path);
+                    let val = event_json.resolve(path);
                     match val {
                         Some(s) => result.push_str(&s),
                         None => {
@@ -232,7 +232,10 @@ impl CompiledTemplate {
     ///
     /// Use for key resolution where empty = round-robin partitioning.
     /// Logs a warning once per unique unresolvable path.
-    pub fn resolve_lenient(&self, event_json: &Value) -> String {
+    pub fn resolve_lenient<P: PathLookup + ?Sized>(
+        &self,
+        event_json: &P,
+    ) -> String {
         if self.is_static {
             return self.static_value();
         }
@@ -242,7 +245,7 @@ impl CompiledTemplate {
             match seg {
                 TemplateSegment::Literal(s) => result.push_str(s),
                 TemplateSegment::Variable(path) => {
-                    match resolve_path(event_json, path) {
+                    match event_json.resolve(path) {
                         Some(s) => result.push_str(&s),
                         None => self.warn_unresolved(path),
                     }
@@ -314,11 +317,23 @@ impl std::error::Error for UnresolvedVar {}
 // Path Resolution
 // =============================================================================
 
+/// What a template's variables resolve against: a dotted path to its
+/// rendered text, `None` when a segment is missing or the value is null.
+pub trait PathLookup {
+    fn resolve(&self, path: &[String]) -> Option<String>;
+}
+
+impl PathLookup for Value {
+    fn resolve(&self, path: &[String]) -> Option<String> {
+        resolve_path(self, path)
+    }
+}
+
 /// Resolve a dotted path against a JSON value.
 ///
 /// Returns `None` if any segment is missing or the final value is null.
 /// Non-string values (numbers, booleans) are converted via `to_string()`.
-fn resolve_path(root: &Value, path: &[String]) -> Option<String> {
+pub fn resolve_path(root: &Value, path: &[String]) -> Option<String> {
     let mut current = root;
     for segment in path {
         current = current.get(segment.as_str())?;
