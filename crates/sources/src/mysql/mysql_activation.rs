@@ -32,7 +32,7 @@ use storage::adapters::SchemaKey;
 use storage::{AppendStatus, ArcStorageBackend, DurableSchemaRegistry};
 
 use crate::durable_checkpoint::{
-    ParsedPos, WmPos, order_against, order_positions,
+    ParsedPos, WmPos, order_kept, order_kept_against, order_positions,
 };
 
 /// Per-table activation streams.
@@ -178,6 +178,9 @@ pub(crate) struct Record {
     pub position: WmPos,
     #[serde(flatten)]
     pub kind: Kind,
+    /// `position`'s GTID set once parsed (never stored).
+    #[serde(skip)]
+    pub gtid: crate::durable_checkpoint::GtidMemo,
 }
 
 impl Record {
@@ -186,6 +189,7 @@ impl Record {
             format_version: FORMAT_VERSION,
             position,
             kind,
+            gtid: Default::default(),
         }
     }
 
@@ -877,7 +881,7 @@ fn select_inner<'a>(
 ) -> (Selection, Option<&'a Stored>) {
     let mut applicable: Vec<&Stored> = Vec::new();
     for r in records {
-        match order_against(&r.record.position, row) {
+        match order_kept_against(&r.record.position, &r.record.gtid, row) {
             CheckpointOrder::Before | CheckpointOrder::Equal => {
                 applicable.push(r)
             }
@@ -905,7 +909,12 @@ fn select_inner<'a>(
             {
                 continue;
             }
-            match order_positions(&a.record.position, &b.record.position) {
+            match order_kept(
+                &a.record.position,
+                &a.record.gtid,
+                &b.record.position,
+                &b.record.gtid,
+            ) {
                 CheckpointOrder::Before => {
                     dominated = true;
                     break;

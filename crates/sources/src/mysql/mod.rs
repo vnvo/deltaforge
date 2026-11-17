@@ -351,6 +351,8 @@ pub(crate) struct RunCtx {
     /// The last checkpoint built (rows and commits): a transaction's rows
     /// share the bytes its predecessor's commit built.
     checkpoint_memo: mysql_helpers::CheckpointMemo,
+    /// The GTID commit watermarks of [`Self::durable_lineage`].
+    gtid_watermarks: crate::durable_checkpoint::GtidCommitWatermarks,
     /// Each table's registry and backend keys under the current scope.
     table_keys: mysql_selection::TableKeys,
     /// GTID mode: the physical start of the current transaction (its GTID
@@ -1893,6 +1895,7 @@ impl MySqlSource {
             txn_eval: None,
             txn_eval_cp: None,
             checkpoint_memo: Default::default(),
+            gtid_watermarks: Default::default(),
             table_keys: Default::default(),
             txn_anchor: None,
             last_event_start: 0,
@@ -2758,7 +2761,7 @@ impl RunCtx {
     /// transaction is open.
     /// The canonical text of the executed set through the last boundary.
     pub(crate) fn gtid_text(&self) -> Option<String> {
-        self.last_gtid.as_ref().map(GtidSet::to_string)
+        self.last_gtid.as_ref().map(GtidSet::text)
     }
 
     pub(crate) fn executed_through_current(&self) -> Option<GtidSet> {

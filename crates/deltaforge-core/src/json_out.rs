@@ -36,6 +36,16 @@ pub fn to_vec<T: ?Sized + Serialize>(value: &T) -> serde_json::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// A string as [`to_vec`] writes it: quoted, with JSON's escapes.
+pub fn write_json_str(out: &mut Vec<u8>, s: &str) {
+    write_str(out, s);
+}
+
+/// A `u64` as [`to_vec`] writes it.
+pub fn write_json_u64(out: &mut Vec<u8>, n: u64) {
+    out.extend_from_slice(itoa::Buffer::new().format(n).as_bytes());
+}
+
 /// Why this writer stopped; the value is then written by `serde_json`.
 #[derive(Debug)]
 struct Stop;

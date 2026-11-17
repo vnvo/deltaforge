@@ -79,7 +79,7 @@ impl GtidSet {
     pub fn single(gtid: &str) -> Option<Self> {
         let (uuid, n) = split_gtid(gtid)?;
         let mut set = Self::new();
-        set.map.insert(uuid, vec![(n, n)]);
+        set.map.insert(uuid.into_owned(), vec![(n, n)]);
         Some(set)
     }
 
@@ -90,7 +90,11 @@ impl GtidSet {
         let Some((uuid, n)) = split_gtid(gtid) else {
             return false;
         };
-        let ivs = self.map.entry(uuid).or_default();
+        // A UUID already in the set is found without allocating its key.
+        if !self.map.contains_key(&*uuid) {
+            self.map.insert(uuid.to_string(), Vec::new());
+        }
+        let ivs = self.map.get_mut(&*uuid).expect("the UUID was inserted");
         // The interval at or after n, and the one before it.
         let i = ivs.partition_point(|&(_, hi)| hi < n);
         if i < ivs.len() && ivs[i].0 <= n {
@@ -123,7 +127,7 @@ impl GtidSet {
     /// malformed.
     pub fn contains(&self, gtid: &str) -> bool {
         split_gtid(gtid).is_some_and(|(uuid, n)| {
-            self.map.get(&uuid).is_some_and(|ivs| {
+            self.map.get(&*uuid).is_some_and(|ivs| {
                 let i = ivs.partition_point(|&(_, hi)| hi < n);
                 i < ivs.len() && ivs[i].0 <= n
             })
@@ -161,32 +165,69 @@ impl GtidSet {
     }
 }
 
-impl fmt::Display for GtidSet {
+impl GtidSet {
     /// The canonical text: UUIDs sorted, each with its merged intervals.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    /// Written straight into one string sized for it ([`fmt::Display`]
+    /// writes this text).
+    pub fn text(&self) -> String {
+        let mut len = 0;
+        for (uuid, ivs) in self.intervals() {
+            len += uuid.len() + 1 + ivs.len() * 42;
+        }
+        let mut out = String::with_capacity(len);
+        let mut digits = [0u8; 20];
         let mut first = true;
         for (uuid, ivs) in self.intervals() {
             if !first {
-                f.write_str(",")?;
+                out.push(',');
             }
             first = false;
-            f.write_str(uuid)?;
+            out.push_str(uuid);
             for &(lo, hi) in ivs {
-                if lo == hi {
-                    write!(f, ":{lo}")?;
-                } else {
-                    write!(f, ":{lo}-{hi}")?;
+                out.push(':');
+                out.push_str(decimal(lo, &mut digits));
+                if lo != hi {
+                    out.push('-');
+                    out.push_str(decimal(hi, &mut digits));
                 }
             }
         }
-        Ok(())
+        out
     }
 }
 
-/// `uuid:n` split into its lowercase UUID and number, `n > 0`.
-fn split_gtid(gtid: &str) -> Option<(String, u64)> {
+impl fmt::Display for GtidSet {
+    /// [`GtidSet::text`].
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.text())
+    }
+}
+
+/// `n` in decimal, written into `digits` (a `u64` has at most 20 digits):
+/// the canonical text without the formatting machinery per number.
+fn decimal(mut n: u64, digits: &mut [u8; 20]) -> &str {
+    let mut i = digits.len();
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    std::str::from_utf8(&digits[i..]).expect("ASCII digits")
+}
+
+/// `uuid:n` split into its lowercase UUID and number, `n > 0`. The UUID
+/// is borrowed when it is already lowercase (as MySQL writes it).
+fn split_gtid(gtid: &str) -> Option<(std::borrow::Cow<'_, str>, u64)> {
     let (uuid, n) = gtid.trim().rsplit_once(':')?;
-    let uuid = uuid.trim().to_ascii_lowercase();
+    let uuid = uuid.trim();
+    let uuid = if uuid.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(uuid.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(uuid)
+    };
     // A tagged GTID (`uuid:tag:n`) leaves a colon in the UUID part.
     if uuid.is_empty() || uuid.contains(':') {
         return None;
@@ -373,5 +414,37 @@ mod tests {
         let mut u = gapped.clone();
         u.union(&set(&format!("{U}:9-12,{V}:1")));
         assert_eq!(u.to_string(), format!("{U}:1-13,{V}:1"));
+    }
+
+    /// A GTID written in uppercase is the same transaction as in lowercase:
+    /// inserted under, and found in, the one lowercase UUID.
+    #[test]
+    fn an_uppercase_gtid_joins_its_lowercase_uuid() {
+        let upper = U.to_ascii_uppercase();
+        let mut s = set(&format!("{U}:1-4"));
+        ins(&mut s, &format!("{upper}:5"));
+        ins(&mut s, &format!("{U}:6"));
+        assert_eq!(s.to_string(), format!("{U}:1-6"));
+        assert!(s.contains(&format!("{upper}:6")));
+        assert!(!s.contains(&format!("{upper}:7")));
+        let mut fresh = GtidSet::new();
+        ins(&mut fresh, &format!("{upper}:9"));
+        assert_eq!(fresh, set(&format!("{U}:9")));
+        assert_eq!(GtidSet::single(&format!("{upper}:9")), Some(fresh));
+    }
+
+    /// Every number is written as its full decimal, at each digit count.
+    #[test]
+    fn interval_bounds_are_written_in_full() {
+        for (lo, hi) in
+            [(1, 9), (9, 10), (10, 99), (100, 1_000_000), (7, u64::MAX)]
+        {
+            let text = format!("{U}:{lo}-{hi}");
+            assert_eq!(set(&text).to_string(), text);
+            assert_eq!(
+                set(&format!("{U}:{hi}")).to_string(),
+                format!("{U}:{hi}")
+            );
+        }
     }
 }

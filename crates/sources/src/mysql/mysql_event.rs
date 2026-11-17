@@ -977,14 +977,16 @@ fn build_cdc_watermark_at(
 ) -> Option<std::sync::Arc<[u8]>> {
     use crate::durable_checkpoint::DurableWatermark;
     use crate::snapshot_generation::PersistedLineage;
-    let lineage = ctx.durable_lineage.clone()?;
-    let wm = match &lineage {
+    let lineage = ctx.durable_lineage.as_ref()?;
+    let wm = match lineage {
         PersistedLineage::MysqlGtid { .. } => {
-            DurableWatermark::mysql_gtid_commit(lineage, gtid?.to_string())
+            return Some(std::sync::Arc::from(
+                ctx.gtid_watermarks.bytes(lineage, gtid?),
+            ));
         }
         PersistedLineage::MysqlServer { .. } => {
             DurableWatermark::mysql_binlog_commit(
-                lineage,
+                lineage.clone(),
                 &ctx.last_file,
                 ctx.last_pos,
             )?
@@ -1894,6 +1896,7 @@ pub(crate) mod tests {
             txn_eval: None,
             txn_eval_cp: None,
             checkpoint_memo: Default::default(),
+            gtid_watermarks: Default::default(),
             table_keys: Default::default(),
             txn_anchor: None,
             last_event_start: 0,
