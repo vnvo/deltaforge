@@ -45,6 +45,7 @@ mod mysql_forward_proof;
 mod mysql_helpers;
 mod mysql_history;
 mod mysql_proof_scanner;
+mod mysql_read_ahead;
 mod mysql_selection;
 mod mysql_session;
 mod mysql_signature;
@@ -299,6 +300,9 @@ pub(crate) struct RunCtx {
     parser_table_maps_installed: u64,
     /// The source's fixed-label metric handles.
     meters: mysql_event::SourceMeters,
+    /// What the read loop emitted and has not sent yet
+    /// (see [`mysql_event::Outbox`]).
+    outbox: mysql_event::Outbox,
     last_file: String,
     last_pos: u64,
     /// The executed set through the last proven transaction boundary (GTID
@@ -1866,6 +1870,7 @@ impl MySqlSource {
             table_map: HashMap::new(),
             parser_table_maps_installed: 0,
             meters: mysql_event::SourceMeters::new(&self.pipeline, &self.id),
+            outbox: mysql_event::Outbox::new(),
             last_file: init_file,
             last_pos: init_pos,
             last_gtid: init_gtid,
@@ -1962,7 +1967,9 @@ impl MySqlSource {
         }
 
         info!(source_id=%self.id, "connecting for binlog stream ..");
-        let mut stream = connect_first_stream(&ctx, client).await?;
+        let mut stream = mysql_read_ahead::ReadAhead::spawn(
+            connect_first_stream(&ctx, client).await?,
+        );
         ctx.mark_transaction_boundary();
 
         // No schema is enumerated or loaded here (except the tables a
@@ -2056,7 +2063,16 @@ impl MySqlSource {
         let loop_result: SourceResult<()> = async {
             // The stream ended and no reconnect has succeeded yet.
             let mut lost = false;
+            // The loop's items go out in bursts (see `mysql_event::Outbox`).
+            ctx.outbox.set_hold(true);
             loop {
+                // Nothing held waits on a pause, a rotation or a reconnect.
+                if lost
+                    || rotation.is_some()
+                    || ctx.paused.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    mysql_event::flush(&ctx.tx, &mut ctx.outbox).await;
+                }
                 if !pause_until_resumed(
                     &ctx.cancel,
                     &ctx.paused,
@@ -2123,7 +2139,7 @@ impl MySqlSource {
                     }
                     match reconnect_stream(&mut ctx).await {
                         Ok(s) => {
-                            stream = s;
+                            stream = mysql_read_ahead::ReadAhead::spawn(s);
                             lost = false;
                             ctx.mark_transaction_boundary();
                         }
@@ -2207,6 +2223,11 @@ impl MySqlSource {
             Ok(())
         }
         .await;
+        // What the loop held goes out on every exit, before the teardown
+        // below: exactly what was sent before a stop or a failure without
+        // holding (a closed channel drops it, as it would have then).
+        ctx.outbox.set_hold(false);
+        mysql_event::flush(&ctx.tx, &mut ctx.outbox).await;
 
         // Cancel and join the rotation tasks on every exit path (normal or fatal).
         if let Some(rt) = rotation.take() {
@@ -2794,11 +2815,17 @@ impl RunCtx {
             "source" => self.source_id.clone(),
         )
         .increment(1);
-        if let Some(tx_id) = self.current_gtid.take() {
-            self.tx
-                .send(SourceItem::TxAbort { tx_id })
-                .await
-                .map_err(|e| SourceError::Other(e.into()))?;
+        if let Some(tx_id) = self.current_gtid.take()
+            && !mysql_event::emit(
+                &self.tx,
+                &mut self.outbox,
+                SourceItem::TxAbort { tx_id },
+            )
+            .await
+        {
+            return Err(SourceError::Other(anyhow::anyhow!(
+                "the coordinator channel is closed"
+            )));
         }
         self.in_explicit_txn = false;
         self.txn_anchor = None;

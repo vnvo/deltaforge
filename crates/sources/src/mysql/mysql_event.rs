@@ -11,7 +11,6 @@ use metrics::counter;
 use mysql_binlog_connector_rust::column::column_value::ColumnValue;
 use mysql_binlog_connector_rust::{
     binlog_parser::BinlogParser,
-    binlog_stream::BinlogStream,
     event::{
         event_data::EventData, event_header::EventHeader,
         table_map_event::TableMapEvent,
@@ -26,28 +25,105 @@ use crate::mysql::mysql_helpers::{
 
 use deltaforge_config::OUTBOX_SCHEMA_SENTINEL;
 
-/// Send an event to the coordinator channel.
-///
-/// Uses `try_send` (non-blocking) when the channel has capacity to avoid
-/// the overhead of the async state machine on every single row. Falls back
-/// to the async `send` only when the channel is full (backpressure).
-#[inline]
-async fn send_event(
-    tx: &tokio::sync::mpsc::Sender<SourceItem>,
-    ev: Event,
-) -> bool {
-    match tx.try_send(SourceItem::Event(ev)) {
-        Ok(()) => true,
-        Err(tokio::sync::mpsc::error::TrySendError::Full(item)) => {
-            // Channel full - apply backpressure via async wait.
-            tx.send(item).await.is_ok()
+/// Most items the read loop holds before it sends them.
+const OUTBOX_ITEMS: usize = 256;
+
+/// The source's items on their way to the coordinator's channel. While the
+/// binlog read loop holds ([`Outbox::set_hold`]) they are kept and sent in
+/// one burst - when the next binlog event is not already received, at
+/// [`OUTBOX_ITEMS`], and before any wait of the loop - so a coordinator on
+/// another worker is woken once per burst rather than once per item. Every
+/// other caller sends at once. Either way the channel receives the items
+/// in the order they were emitted.
+pub(crate) struct Outbox {
+    held: std::collections::VecDeque<SourceItem>,
+    hold: bool,
+}
+
+impl Outbox {
+    pub(crate) fn new() -> Self {
+        Self {
+            held: std::collections::VecDeque::new(),
+            hold: false,
         }
-        Err(_) => false, // channel closed
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+
+    /// Whether emitted items are held (the read loop) or sent at once.
+    pub(crate) fn set_hold(&mut self, hold: bool) {
+        self.hold = hold;
     }
 }
 
+/// Send one item: `try_send` while the channel has room (no async state
+/// machine per row), the awaiting `send` only when it is full
+/// (backpressure). False when the channel is closed (shutdown).
+#[inline]
+async fn send_item(
+    tx: &tokio::sync::mpsc::Sender<SourceItem>,
+    item: SourceItem,
+) -> bool {
+    match tx.try_send(item) {
+        Ok(()) => true,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(item)) => {
+            tx.send(item).await.is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
+/// Emit `item` after everything emitted before it: held while the read
+/// loop holds, else sent at once. False when the channel is closed
+/// (shutdown): what was held is dropped with it.
+pub(crate) async fn emit(
+    tx: &tokio::sync::mpsc::Sender<SourceItem>,
+    out: &mut Outbox,
+    item: SourceItem,
+) -> bool {
+    if out.hold {
+        out.held.push_back(item);
+        if out.held.len() >= OUTBOX_ITEMS {
+            return flush(tx, out).await;
+        }
+        return true;
+    }
+    flush(tx, out).await && send_item(tx, item).await
+}
+
+/// Send everything held, in order. False when the channel is closed: the
+/// rest is dropped (nothing reads it). Cancel-safe (a window's time bound
+/// can interrupt it): an item leaves the outbox only with the channel's
+/// room for it in hand, so an interrupted flush loses nothing.
+pub(crate) async fn flush(
+    tx: &tokio::sync::mpsc::Sender<SourceItem>,
+    out: &mut Outbox,
+) -> bool {
+    use tokio::sync::mpsc::error::TrySendError;
+    while let Some(item) = out.held.pop_front() {
+        match tx.try_send(item) {
+            Ok(()) => {}
+            Err(TrySendError::Full(item)) => {
+                out.held.push_front(item);
+                let Ok(room) = tx.reserve().await else {
+                    out.held.clear();
+                    return false;
+                };
+                room.send(out.held.pop_front().expect("the item put back"));
+            }
+            Err(TrySendError::Closed(_)) => {
+                out.held.clear();
+                return false;
+            }
+        }
+    }
+    true
+}
+
 pub(super) async fn read_next_event(
-    stream: &mut BinlogStream,
+    stream: &mut super::mysql_read_ahead::ReadAhead,
     ctx: &mut RunCtx,
 ) -> Result<(EventHeader, EventData), LoopControl> {
     // Test hook: the connection "dropped" right here.
@@ -65,14 +141,38 @@ pub(super) async fn read_next_event(
     let read = match ctx.prefetch_error.take() {
         Some(e) => Err(common::RetryOutcome::Failed(e)),
         None => {
-            watchdog(stream.read(), ctx.inactivity, &ctx.cancel, "binlog_read")
-                .await
+            // Held items go out before the loop would wait for the stream:
+            // an event already received is taken without waiting (the read
+            // is cancel-safe: the vendored channel keeps what it read).
+            let ready = if ctx.outbox.is_empty() {
+                None
+            } else {
+                tokio::select! {
+                    biased;
+                    r = stream.read() => Some(r),
+                    () = std::future::ready(()) => None,
+                }
+            };
+            match ready {
+                Some(Ok(event)) => Ok(event),
+                Some(Err(e)) => Err(common::RetryOutcome::Failed(e)),
+                None => {
+                    flush(&ctx.tx, &mut ctx.outbox).await;
+                    watchdog(
+                        stream.read(),
+                        ctx.inactivity,
+                        &ctx.cancel,
+                        "binlog_read",
+                    )
+                    .await
+                }
+            }
         }
     };
     match read {
         Ok(event) => {
             ctx.last_received = std::time::Instant::now();
-            note_parser_table_maps(ctx, &stream.parser, &event.1);
+            note_parser_table_maps(ctx, stream.table_maps(), &event.1);
             Ok(event)
         }
         Err(outcome) => {
@@ -329,7 +429,7 @@ pub(super) fn release_table_maps(ctx: &mut RunCtx) {
 /// installations since the last export) after a read that can change them.
 fn note_parser_table_maps(
     ctx: &mut RunCtx,
-    parser: &BinlogParser,
+    (installed, held): (u64, usize),
     data: &EventData,
 ) {
     if !matches!(
@@ -341,7 +441,6 @@ fn note_parser_table_maps(
     ) {
         return;
     }
-    let installed = parser.table_maps_installed;
     // A reopened stream's parser counts from zero.
     let new = installed
         .checked_sub(ctx.parser_table_maps_installed)
@@ -350,7 +449,7 @@ fn note_parser_table_maps(
     if new > 0 {
         ctx.meters.parser_maps_installed.increment(new);
     }
-    set_table_maps(ctx, "parser", parser.table_map_event_by_table_id.len());
+    set_table_maps(ctx, "parser", held);
 }
 
 /// Build SourceInfo for MySQL events
@@ -504,7 +603,7 @@ async fn handle_write_rows(
             ev.schema_version = Some(fingerprint_str.clone());
             ev.schema_sequence = Some(loaded.sequence);
 
-            if send_event(&ctx.tx, ev).await {
+            if emit(&ctx.tx, &mut ctx.outbox, SourceItem::Event(ev)).await {
                 sent += 1;
             } else {
                 error!(source_id=%ctx.source_id, "channel send failed (op=insert)");
@@ -614,7 +713,7 @@ async fn handle_update_rows(
             ev.schema_version = Some(fingerprint_str.clone());
             ev.schema_sequence = Some(sequence);
 
-            if send_event(&ctx.tx, ev).await {
+            if emit(&ctx.tx, &mut ctx.outbox, SourceItem::Event(ev)).await {
                 sent += 1;
             } else {
                 error!(source_id=%ctx.source_id, "channel send failed (op=update)");
@@ -711,7 +810,7 @@ async fn handle_delete_rows(
             ev.schema_version = Some(fingerprint_str.clone());
             ev.schema_sequence = Some(sequence);
 
-            if send_event(&ctx.tx, ev).await {
+            if emit(&ctx.tx, &mut ctx.outbox, SourceItem::Event(ev)).await {
                 sent += 1;
             } else {
                 error!(source_id=%ctx.source_id, "channel send failed (op=delete)");
@@ -830,9 +929,10 @@ async fn handle_xid(ctx: &mut RunCtx) {
 /// events and its closing `TxCommit`. Only emitted in GTID mode; without a GTID
 /// there is no stable per-transaction identity, so events flow as standalone
 /// boundaries and no markers are sent. Best-effort (a closed channel = shutdown).
-async fn emit_tx_begin(ctx: &RunCtx) {
+async fn emit_tx_begin(ctx: &mut RunCtx) {
     if let Some(tx_id) = ctx.current_gtid.clone() {
-        let _ = ctx.tx.send(SourceItem::TxBegin { tx_id }).await;
+        let _ =
+            emit(&ctx.tx, &mut ctx.outbox, SourceItem::TxBegin { tx_id }).await;
     }
 }
 
@@ -864,7 +964,12 @@ async fn emit_tx_commit(ctx: &mut RunCtx) {
         checkpoint,
         durable_watermark: build_cdc_watermark(ctx),
     };
-    let _ = ctx.tx.send(SourceItem::TxCommit { tx_id, boundary }).await;
+    let _ = emit(
+        &ctx.tx,
+        &mut ctx.outbox,
+        SourceItem::TxCommit { tx_id, boundary },
+    )
+    .await;
     // Transaction closed - the next transaction opens with its own GTID event.
     ctx.current_gtid = None;
 }
@@ -1131,7 +1236,7 @@ async fn emit_ddl_event(
         data_collection_order: None,
     });
 
-    if (ctx.tx.send(SourceItem::Event(ev)).await).is_err() {
+    if !emit(&ctx.tx, &mut ctx.outbox, SourceItem::Event(ev)).await {
         error!(source_id=%ctx.source_id, "channel send failed (op=ddl)");
     }
     // DDL is auto-committed (its own transaction) → emit its boundary.
@@ -1787,6 +1892,7 @@ pub(crate) mod tests {
             table_map,
             parser_table_maps_installed: 0,
             meters: SourceMeters::new("test-pipeline", "unit-test"),
+            outbox: Outbox::new(),
             last_file: "mysql-bin.000001".to_string(),
             last_pos: 1234,
             last_gtid: Some(
@@ -4413,7 +4519,14 @@ pub(crate) mod tests {
                     s.extend(query("shop", "BEGIN"));
                     s.extend(table_map(70, "shop", "orders"));
                     let events = parse_all(&mut parser, s);
-                    note_parser_table_maps(&mut ctx, &parser, &events[1].0);
+                    note_parser_table_maps(
+                        &mut ctx,
+                        (
+                            parser.table_maps_installed,
+                            parser.table_map_event_by_table_id.len(),
+                        ),
+                        &events[1].0,
+                    );
                     let (gauges, installed) = read(&snap);
                     assert_eq!(gauges.get("parser"), Some(&1.0));
                     assert_eq!(installed.get("parser"), Some(&1));
@@ -4427,5 +4540,134 @@ pub(crate) mod tests {
                 });
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod outbox_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    fn item(n: usize) -> SourceItem {
+        SourceItem::TxBegin {
+            tx_id: n.to_string(),
+        }
+    }
+
+    fn ids(items: &[SourceItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|i| match i {
+                SourceItem::TxBegin { tx_id } => tx_id.clone(),
+                other => panic!("unexpected item {other:?}"),
+            })
+            .collect()
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<SourceItem>) -> Vec<String> {
+        let mut got = Vec::new();
+        while let Ok(i) = rx.try_recv() {
+            got.push(i);
+        }
+        ids(&got)
+    }
+
+    fn numbers(r: std::ops::Range<usize>) -> Vec<String> {
+        r.map(|n| n.to_string()).collect()
+    }
+
+    /// Held items reach the channel only on a flush, all of them and in
+    /// emission order; without holding each goes at once.
+    #[tokio::test]
+    async fn held_items_go_out_in_order_on_a_flush() {
+        let (tx, mut rx) = mpsc::channel(1024);
+        let mut out = Outbox::new();
+        assert!(emit(&tx, &mut out, item(0)).await);
+        assert_eq!(drain(&mut rx), numbers(0..1));
+        out.set_hold(true);
+        for n in 1..6 {
+            assert!(emit(&tx, &mut out, item(n)).await);
+        }
+        assert!(drain(&mut rx).is_empty());
+        assert!(!out.is_empty());
+        assert!(flush(&tx, &mut out).await);
+        assert!(out.is_empty());
+        assert_eq!(drain(&mut rx), numbers(1..6));
+    }
+
+    /// The outbox never holds more than its bound: the item that reaches
+    /// it sends everything held, that item included.
+    #[tokio::test]
+    async fn the_bound_sends_what_is_held() {
+        let (tx, mut rx) = mpsc::channel(1024);
+        let mut out = Outbox::new();
+        out.set_hold(true);
+        for n in 0..OUTBOX_ITEMS - 1 {
+            assert!(emit(&tx, &mut out, item(n)).await);
+        }
+        assert!(drain(&mut rx).is_empty());
+        assert!(emit(&tx, &mut out, item(OUTBOX_ITEMS - 1)).await);
+        assert!(out.is_empty());
+        assert_eq!(drain(&mut rx), numbers(0..OUTBOX_ITEMS));
+    }
+
+    /// An item sent at once after holding ends goes after what was held.
+    #[tokio::test]
+    async fn an_immediate_item_follows_what_was_held() {
+        let (tx, mut rx) = mpsc::channel(1024);
+        let mut out = Outbox::new();
+        out.set_hold(true);
+        assert!(emit(&tx, &mut out, item(0)).await);
+        assert!(emit(&tx, &mut out, item(1)).await);
+        out.set_hold(false);
+        assert!(emit(&tx, &mut out, item(2)).await);
+        assert_eq!(drain(&mut rx), numbers(0..3));
+    }
+
+    /// A flush interrupted while the channel is full loses and repeats
+    /// nothing: the next flush sends the rest, in order.
+    #[tokio::test]
+    async fn an_interrupted_flush_loses_nothing() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let mut out = Outbox::new();
+        out.set_hold(true);
+        for n in 0..5 {
+            assert!(emit(&tx, &mut out, item(n)).await);
+        }
+        let cut = tokio::time::timeout(
+            Duration::from_millis(50),
+            flush(&tx, &mut out),
+        )
+        .await;
+        assert!(cut.is_err(), "the full channel holds the flush");
+        let mut got = drain(&mut rx);
+        assert_eq!(got, numbers(0..2));
+        let rest = tokio::spawn(async move {
+            let ok = flush(&tx, &mut out).await;
+            (ok, out.is_empty())
+        });
+        while got.len() < 5 {
+            match rx.recv().await {
+                Some(i) => got.extend(ids(&[i])),
+                None => break,
+            }
+        }
+        assert_eq!(rest.await.unwrap(), (true, true));
+        assert_eq!(got, numbers(0..5));
+    }
+
+    /// A closed channel ends the flush: false, and nothing stays held.
+    #[tokio::test]
+    async fn a_closed_channel_drops_what_is_held() {
+        let (tx, rx) = mpsc::channel(8);
+        drop(rx);
+        let mut out = Outbox::new();
+        out.set_hold(true);
+        assert!(emit(&tx, &mut out, item(0)).await);
+        assert!(!flush(&tx, &mut out).await);
+        assert!(out.is_empty());
+        out.set_hold(false);
+        assert!(!emit(&tx, &mut out, item(1)).await);
     }
 }
