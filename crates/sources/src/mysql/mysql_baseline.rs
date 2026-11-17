@@ -991,9 +991,10 @@ pub(crate) async fn establish_at(
     key: &SchemaKey,
     current: &Timeline,
 ) -> SourceResult<bool> {
-    let (Some(e), Some(mut e_cp)) =
-        (ctx.txn_eval.clone(), ctx.txn_eval_cp.clone())
-    else {
+    let (Some(e), Some(mut e_cp)) = (
+        ctx.txn_eval.as_ref().map(|p| p.pos().clone()),
+        ctx.txn_eval_cp.clone(),
+    ) else {
         return Ok(false);
     };
     let lineage = key.lineage_hash.clone();

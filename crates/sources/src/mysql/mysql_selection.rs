@@ -46,7 +46,7 @@ use super::mysql_signature::{
     SIGNATURE_FORMAT, Signature, Verdict, compare, is_full,
 };
 use super::mysql_table_schema::MySqlTableSchema;
-use crate::durable_checkpoint::{WmPos, order_positions};
+use crate::durable_checkpoint::{ParsedPos, WmPos, order_positions};
 
 /// Capture attempts for the live shape at a FULL fallback (retried only when
 /// a DDL or barrier affecting the table lands inside the capture interval).
@@ -81,6 +81,17 @@ impl Timeline {
         row: &WmPos,
     ) -> (Selection, Option<String>) {
         mysql_activation::select_decisive_in(
+            self.records.iter().chain(self.barriers()),
+            row,
+        )
+    }
+
+    /// [`Self::select_decisive`] at a row position already parsed.
+    pub(crate) fn select_decisive_at(
+        &self,
+        row: &ParsedPos,
+    ) -> (Selection, Option<String>) {
+        mysql_activation::select_decisive_at(
             self.records.iter().chain(self.barriers()),
             row,
         )
@@ -164,6 +175,68 @@ pub(crate) const METRIC_BYTES: &str = "deltaforge_mysql_selection_cache_bytes";
 /// `deltaforge_mysql_selection_cache_timelines{pipeline,source}`.
 pub(crate) const METRIC_TIMELINES: &str =
     "deltaforge_mysql_selection_cache_timelines";
+
+/// A table's registry key and its backend key, built once per scope: the
+/// per-row lookups of a table share them instead of re-encoding the key.
+#[derive(Debug)]
+pub(crate) struct TableKey {
+    pub(crate) key: SchemaKey,
+    pub(crate) backend: Arc<str>,
+}
+
+/// The most tables whose keys are held; past it the keys are dropped and
+/// built again as tables are reached (a key is a pure function of its scope
+/// and table).
+pub(crate) const TABLE_KEYS_MAX: usize = 4096;
+
+/// [`TableKey`]s of one registry scope. A key depends only on the scope and
+/// the table, and a scope never changes once published (a new lineage is a
+/// new scope): keys are dropped whenever the scope is another one.
+#[derive(Debug, Default)]
+pub(crate) struct TableKeys {
+    scope: Option<Arc<crate::registry_scope::RegistryScope>>,
+    by_table: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, Arc<TableKey>>,
+    >,
+    len: usize,
+}
+
+impl TableKeys {
+    pub(crate) fn get(
+        &mut self,
+        scope: &Arc<crate::registry_scope::RegistryScope>,
+        db: &str,
+        table: &str,
+    ) -> Arc<TableKey> {
+        if !self.scope.as_ref().is_some_and(|s| Arc::ptr_eq(s, scope)) {
+            self.by_table.clear();
+            self.len = 0;
+            self.scope = Some(scope.clone());
+        }
+        if let Some(k) = self.by_table.get(db).and_then(|t| t.get(table)) {
+            return k.clone();
+        }
+        if self.len >= TABLE_KEYS_MAX {
+            self.by_table.clear();
+            self.len = 0;
+        }
+        let key = scope.key(db, table);
+        let backend = key.backend_key().into();
+        let k = Arc::new(TableKey { key, backend });
+        self.by_table
+            .entry(db.to_string())
+            .or_default()
+            .insert(table.to_string(), k.clone());
+        self.len += 1;
+        k
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+}
 
 /// A cache key. Its strings are shared: a cached key's table string is the
 /// one its table's other keys and the index hold.
@@ -585,7 +658,15 @@ impl Caches {
     }
 
     pub(crate) fn timeline(&mut self, key: &str) -> Option<Arc<Timeline>> {
-        match self.entries.get(&CacheKey::Timeline(key.into()))? {
+        self.timeline_at(&key.into())
+    }
+
+    /// [`Self::timeline`] by a shared backend key (no key copy).
+    pub(crate) fn timeline_at(
+        &mut self,
+        key: &Arc<str>,
+    ) -> Option<Arc<Timeline>> {
+        match self.entries.get(&CacheKey::Timeline(key.clone()))? {
             Entry {
                 cached: Cached::Timeline(t, _),
                 ..
@@ -610,10 +691,15 @@ impl Caches {
 
     /// Whether the table's last selection proved a version since its
     /// timeline last changed.
+    #[cfg(test)]
     pub(crate) fn is_proven(&mut self, key: &SchemaKey) -> bool {
+        self.is_proven_at(&key.backend_key().into())
+    }
+
+    /// [`Self::is_proven`] by a shared backend key.
+    pub(crate) fn is_proven_at(&mut self, key: &Arc<str>) -> bool {
         matches!(
-            self.entries
-                .peek(&CacheKey::Timeline(key.backend_key().into())),
+            self.entries.peek(&CacheKey::Timeline(key.clone())),
             Some(Entry {
                 cached: Cached::Timeline(_, true),
                 ..
@@ -623,13 +709,17 @@ impl Caches {
 
     /// The table's last selection proved a version over its cached
     /// timeline (no extra entry: a flag on that timeline's).
+    #[cfg(test)]
     fn mark_proven(&mut self, key: &SchemaKey) {
+        self.mark_proven_at(&key.backend_key().into())
+    }
+
+    /// [`Self::mark_proven`] by a shared backend key.
+    fn mark_proven_at(&mut self, key: &Arc<str>) {
         if let Some(Entry {
             cached: Cached::Timeline(_, proven),
             ..
-        }) = self
-            .entries
-            .peek_mut(&CacheKey::Timeline(key.backend_key().into()))
+        }) = self.entries.peek_mut(&CacheKey::Timeline(key.clone()))
         {
             *proven = true;
         }
@@ -766,12 +856,12 @@ impl Caches {
         (charge, true, cached)
     }
 
-    fn selection(
+    fn selection<T: Clone + Into<Arc<str>>>(
         &mut self,
-        (table, decisive, signature): &(String, String, String),
+        (table, decisive, signature): &(T, String, String),
     ) -> Option<Arc<LoadedSchema>> {
         let key = CacheKey::Selection(
-            table.as_str().into(),
+            table.clone().into(),
             decisive.as_str().into(),
             signature.as_str().into(),
         );
@@ -814,9 +904,9 @@ impl Caches {
         )
     }
 
-    fn put_selection(
+    fn put_selection<T: Into<Arc<str>>>(
         &mut self,
-        (table, decisive, signature): (String, String, String),
+        (table, decisive, signature): (T, String, String),
         loaded: Arc<LoadedSchema>,
     ) {
         let bytes = super::mysql_cache_cost::loaded(&loaded);
@@ -1585,8 +1675,16 @@ pub(crate) async fn timeline(
     ctx: &mut RunCtx,
     key: &SchemaKey,
 ) -> SourceResult<Arc<Timeline>> {
-    let k = key.backend_key();
-    if let Some(t) = ctx.selection.timeline(&k) {
+    timeline_keyed(ctx, key, &key.backend_key().into()).await
+}
+
+/// [`timeline`] of `key`, whose backend key is `backend`.
+async fn timeline_keyed(
+    ctx: &mut RunCtx,
+    key: &SchemaKey,
+    backend: &Arc<str>,
+) -> SourceResult<Arc<Timeline>> {
+    if let Some(t) = ctx.selection.timeline_at(backend) {
         crate::perf_phases::cache_lookup("timeline", true);
         return Ok(t);
     }
@@ -1963,12 +2061,13 @@ pub(crate) async fn unproven_at(
     table: &str,
     at: &WmPos,
 ) -> SourceResult<bool> {
-    let key = ctx.registry_scope.current()?.key(db, table);
+    let scope = ctx.registry_scope.current()?;
+    let tk = ctx.table_keys.get(&scope, db, table);
     // Proven at its last selection, and unchanged since: still proven.
-    if ctx.selection.is_proven(&key) {
+    if ctx.selection.is_proven_at(&tk.backend) {
         return Ok(false);
     }
-    let t = timeline(ctx, &key).await?;
+    let t = timeline_keyed(ctx, &tk.key, &tk.backend).await?;
     Ok(matches!(t.select_decisive(at).0, Selection::Unproven(_)))
 }
 
@@ -1978,17 +2077,20 @@ pub(crate) async fn select_for_rows(
     tm: &TableMapEvent,
 ) -> SourceResult<Arc<LoadedSchema>> {
     let (db, table) = (tm.database_name.as_str(), tm.table_name.as_str());
-    let key = ctx.registry_scope.current()?.key(db, table);
-    let Some(row) = ctx.txn_eval.clone() else {
+    let scope = ctx.registry_scope.current()?;
+    let tk = ctx.table_keys.get(&scope, db, table);
+    let (key, backend) = (&tk.key, &tk.backend);
+    let Some(parsed) = ctx.txn_eval.clone() else {
         return Err(fail(db, table, "the rows have no evaluation position"));
     };
+    let row = parsed.pos();
     let sig_digest = ctx.selection.signatures.digest(tm);
-    let mut t = timeline(ctx, &key).await?;
+    let mut t = timeline_keyed(ctx, key, backend).await?;
     // After a failover, the table's drift policy applies before anything is
     // registered, baselined, decoded or emitted for these rows (once per
     // table and run: a checked table needs no copy of its timeline).
-    if let Some(row_cp) = ctx.txn_eval_cp.clone()
-        && !ctx.drift_checked.contains(&key.backend_key())
+    if !ctx.drift_checked.contains(&**backend)
+        && let Some(row_cp) = ctx.txn_eval_cp.clone()
     {
         let all = t.all();
         super::mysql_failover_drift::check_in_stream(
@@ -1996,33 +2098,33 @@ pub(crate) async fn select_for_rows(
             db,
             table,
             super::mysql_failover_drift::FirstEvent::Rows {
-                at: &row,
+                at: row,
                 at_cp: &row_cp,
                 timeline: &all,
             },
         )
         .await?;
     }
-    let (mut selection, mut decisive) = t.select_decisive(&row);
+    let (mut selection, mut decisive) = t.select_decisive_at(&parsed);
     // No positional proof yet: a lazy baseline at the rows' position, if it
     // can be proven and decides the rows (before any FULL fallback).
     if let Selection::Unproven(_) = selection
-        && super::mysql_baseline::establish_at(ctx, db, table, &key, &t).await?
+        && super::mysql_baseline::establish_at(ctx, db, table, key, &t).await?
     {
-        t = timeline(ctx, &key).await?;
-        (selection, decisive) = t.select_decisive(&row);
+        t = timeline_keyed(ctx, key, backend).await?;
+        (selection, decisive) = t.select_decisive_at(&parsed);
     }
     match selection {
         Selection::Proven { version } => {
-            ctx.selection.mark_proven(&key);
+            ctx.selection.mark_proven_at(backend);
             let decisive = decisive.unwrap_or_default();
-            let cache_key = (key.backend_key(), decisive, sig_digest);
+            let cache_key = (backend.clone(), decisive, sig_digest);
             if let Some(hit) = ctx.selection.selection(&cache_key) {
                 crate::perf_phases::cache_lookup("selection", true);
                 return Ok(hit);
             }
             crate::perf_phases::cache_lookup("selection", false);
-            let (loaded, schema) = loaded_cached(ctx, &key, version).await?;
+            let (loaded, schema) = loaded_cached(ctx, key, version).await?;
             // The proven version comes from authoritative complete-schema
             // evidence; it must not contradict the TableMap.
             if let Verdict::Mismatch(why) = compare(&schema, tm) {
@@ -2048,7 +2150,7 @@ pub(crate) async fn select_for_rows(
         Selection::Unproven(reason) => {
             info!(source_id = %ctx.source_id, %db, %table, ?reason, "no positional proof; FULL signature selection");
             let signature = Signature::of(tm);
-            full_fallback(ctx, tm, &key, &row, signature, sig_digest, &t).await
+            full_fallback(ctx, tm, key, row, signature, sig_digest, &t).await
         }
     }
 }
@@ -2578,7 +2680,7 @@ mod tests {
         ));
         for table in ["a", "b"] {
             caches.put_timeline(table.into(), t.clone());
-            caches.put_selection(
+            caches.put_selection::<String>(
                 (table.into(), "d".into(), "s".into()),
                 loaded.clone(),
             );
@@ -5108,5 +5210,70 @@ mod perf_tests {
                 "deltaforge_perf_selection_store_tables_total read=version 1",
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod table_key_tests {
+    use super::*;
+    use crate::registry_scope::RegistryScope;
+
+    fn scope(uuid: &str) -> Arc<RegistryScope> {
+        Arc::new(RegistryScope::detached(
+            "t1",
+            "src1",
+            storage::adapters::LineageRef::new(
+                storage::adapters::LineageDescriptor::mysql(uuid).unwrap(),
+            ),
+        ))
+    }
+
+    const A: &str = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+    const B: &str = "5f22fb58-82db-22f2-af44-d91bb0530673";
+
+    #[test]
+    fn a_table_key_is_its_scope_key_and_backend_key() {
+        let s = scope(A);
+        let mut keys = TableKeys::default();
+        for (db, table) in
+            [("shop", "orders"), ("sh/op", "or%ders"), ("shop", "items")]
+        {
+            let k = keys.get(&s, db, table);
+            assert_eq!(k.key, s.key(db, table));
+            assert_eq!(&*k.backend, s.key(db, table).backend_key());
+        }
+    }
+
+    #[test]
+    fn a_table_is_keyed_once_per_scope() {
+        let s = scope(A);
+        let mut keys = TableKeys::default();
+        let a = keys.get(&s, "shop", "orders");
+        let b = keys.get(&s, "shop", "orders");
+        assert!(Arc::ptr_eq(&a, &b));
+        // Another scope (a republished lineage) keys the table again.
+        let s2 = scope(B);
+        let c = keys.get(&s2, "shop", "orders");
+        assert_eq!(c.key, s2.key("shop", "orders"));
+        assert_ne!(c.key, a.key);
+        // An equal scope published again is another scope.
+        let s3 = scope(A);
+        let d = keys.get(&s3, "shop", "orders");
+        assert!(!Arc::ptr_eq(&a, &d));
+        assert_eq!(d.key, a.key);
+    }
+
+    #[test]
+    fn the_keys_held_stay_bounded_and_correct() {
+        let s = scope(A);
+        let mut keys = TableKeys::default();
+        for i in 0..(TABLE_KEYS_MAX * 2 + 7) {
+            let t = format!("t{i}");
+            let k = keys.get(&s, "shop", &t);
+            assert_eq!(k.key, s.key("shop", &t));
+            assert!(keys.len() <= TABLE_KEYS_MAX);
+        }
+        let k = keys.get(&s, "shop", "t0");
+        assert_eq!(&*k.backend, s.key("shop", "t0").backend_key());
     }
 }

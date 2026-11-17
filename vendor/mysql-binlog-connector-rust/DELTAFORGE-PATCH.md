@@ -149,3 +149,14 @@ Files: `src/binlog_parser.rs`, `src/binlog_error.rs`, `src/binlog_client.rs`,
 `src/event/update_rows_event.rs`, `src/event/delete_rows_event.rs`. Tested by
 DeltaForge (`mysql_event::tests::table_map_retention`, and the live
 `mysql_reconnect_boundaries_e2e` churn cases).
+
+## GTID text in one buffer
+
+`GtidEvent::parse` writes the event's `uuid:gno` text into one buffer: the
+UUID's 16 bytes as lowercase hex digits with hyphens after the 4th, 6th, 8th
+and 10th byte, then `:` and the decimal transaction number. It formatted
+each byte with `write!` into its own string and joined them with `format!`,
+which ran for every transaction. The text is unchanged; `read_uuid` (used by
+`PreviousGtidsEvent`) shares the writer. File: `src/event/gtid_event.rs`, with
+unit tests of the exact text (a real server UUID, every byte value, the
+number extremes) and of a truncated event.

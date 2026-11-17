@@ -437,6 +437,55 @@ pub(crate) fn make_checkpoint_meta(
     CheckpointMeta::from_vec(bytes)
 }
 
+/// The last checkpoint built, by its inputs. A checkpoint's bytes are a
+/// function of (file, position, GTID set, lineage) alone, and a
+/// transaction's rows resume from the boundary its predecessor's commit
+/// just built: they share those bytes instead of serializing them again.
+#[derive(Debug, Default)]
+pub(crate) struct CheckpointMemo {
+    last: Option<Memoized>,
+}
+
+/// A built checkpoint with the inputs it was built from.
+#[derive(Debug)]
+struct Memoized {
+    file: String,
+    pos: u64,
+    gtid: Option<String>,
+    lineage: Option<String>,
+    meta: CheckpointMeta,
+}
+
+impl CheckpointMemo {
+    pub(crate) fn get(
+        &mut self,
+        file: &str,
+        pos: u64,
+        gtid: Option<&str>,
+        lineage: Option<&str>,
+    ) -> CheckpointMeta {
+        if let Some(m) = &self.last
+            && m.file == file
+            && m.pos == pos
+            && m.gtid.as_deref() == gtid
+            && m.lineage.as_deref() == lineage
+        {
+            return m.meta.clone();
+        }
+        let gtid = gtid.map(str::to_string);
+        let lineage = lineage.map(str::to_string);
+        let meta = make_checkpoint_meta(file, pos, &gtid, lineage.clone());
+        self.last = Some(Memoized {
+            file: file.to_string(),
+            pos,
+            gtid,
+            lineage,
+            meta: meta.clone(),
+        });
+        meta
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,5 +562,52 @@ mod tests {
             parse_log_status(UUID, "not json", UUID),
             Err(MySqlSourceError::Incompatible(_))
         ));
+    }
+
+    #[test]
+    fn a_memoized_checkpoint_is_the_one_built_from_its_inputs() {
+        let gtid = "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5";
+        let mut memo = CheckpointMemo::default();
+        let built = |f: &str, p: u64, g: Option<&str>, l: Option<&str>| {
+            make_checkpoint_meta(
+                f,
+                p,
+                &g.map(str::to_string),
+                l.map(str::to_string),
+            )
+        };
+        let inputs = [
+            ("mysql-bin.000003", 900, Some(gtid), Some("lin-a")),
+            ("mysql-bin.000003", 900, Some(gtid), Some("lin-a")),
+            ("mysql-bin.000004", 900, Some(gtid), Some("lin-a")),
+            ("mysql-bin.000004", 901, Some(gtid), Some("lin-a")),
+            (
+                "mysql-bin.000004",
+                901,
+                Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-6"),
+                Some("lin-a"),
+            ),
+            ("mysql-bin.000004", 901, None, Some("lin-a")),
+            ("mysql-bin.000004", 901, None, Some("lin-b")),
+            ("mysql-bin.000004", 901, None, None),
+            ("mysql-bin.000003", 900, Some(gtid), Some("lin-a")),
+        ];
+        for (f, p, g, l) in inputs {
+            let got = memo.get(f, p, g, l);
+            assert_eq!(
+                got.as_bytes(),
+                built(f, p, g, l).as_bytes(),
+                "{f} {p} {g:?} {l:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_inputs_share_one_checkpoint() {
+        let mut memo = CheckpointMemo::default();
+        let a = memo.get("mysql-bin.000001", 4, Some("u:1-2"), None);
+        let b = memo.get("mysql-bin.000001", 4, Some("u:1-2"), None);
+        let (CheckpointMeta::Opaque(a), CheckpointMeta::Opaque(b)) = (a, b);
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
     }
 }

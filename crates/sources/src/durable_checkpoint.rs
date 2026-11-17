@@ -355,6 +355,70 @@ fn parsed_gtid_set(text: &str) -> Option<std::rc::Rc<GtidSet>> {
     })
 }
 
+/// Two GTID sets ordered by inclusion; a set that did not parse orders
+/// against nothing.
+fn order_gtid_sets(
+    a: Option<&GtidSet>,
+    b: Option<&GtidSet>,
+) -> CheckpointOrder {
+    match (a, b) {
+        (Some(a), Some(b)) => order_from_subset(a.is_subset(b), b.is_subset(a)),
+        _ => CheckpointOrder::Incomparable,
+    }
+}
+
+/// A position with its GTID set already in hand, so ordering against it
+/// never parses its text: what a stream evaluates every row of a
+/// transaction at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedPos {
+    pos: WmPos,
+    /// The set of a `MysqlGtid` position (`None` when its text does not
+    /// parse, or for any other kind).
+    gtid: Option<std::sync::Arc<GtidSet>>,
+}
+
+impl ParsedPos {
+    /// `pos`, parsed once.
+    pub fn new(pos: WmPos) -> Self {
+        let gtid = match &pos {
+            WmPos::MysqlGtid { gtid_set } => {
+                GtidSet::parse(gtid_set).map(std::sync::Arc::new)
+            }
+            _ => None,
+        };
+        Self { pos, gtid }
+    }
+
+    /// The GTID position of `set`, as its canonical text: the text parses
+    /// back to the same transactions, so it orders exactly as the set.
+    pub fn gtid(set: GtidSet) -> Self {
+        Self {
+            pos: WmPos::MysqlGtid {
+                gtid_set: set.to_string(),
+            },
+            gtid: Some(std::sync::Arc::new(set)),
+        }
+    }
+
+    pub fn pos(&self) -> &WmPos {
+        &self.pos
+    }
+}
+
+/// [`order_positions`] of `a` against a position already parsed.
+pub fn order_against(a: &WmPos, b: &ParsedPos) -> CheckpointOrder {
+    match (a, &b.pos) {
+        (WmPos::MysqlGtid { gtid_set }, WmPos::MysqlGtid { .. }) => {
+            order_gtid_sets(
+                parsed_gtid_set(gtid_set).as_deref(),
+                b.gtid.as_deref(),
+            )
+        }
+        _ => order_positions(a, &b.pos),
+    }
+}
+
 /// Order two positions known to belong to the SAME lineage (the caller has
 /// established that; [`order`] checks it for watermarks). The single position
 /// comparator shared by durable watermarks, MySQL checkpoint selection and
@@ -395,12 +459,10 @@ pub fn order_positions(a: &WmPos, b: &WmPos) -> CheckpointOrder {
         (
             WmPos::MysqlGtid { gtid_set: ga },
             WmPos::MysqlGtid { gtid_set: gb },
-        ) => match (parsed_gtid_set(ga), parsed_gtid_set(gb)) {
-            (Some(sa), Some(sb)) => {
-                order_from_subset(sa.is_subset(&sb), sb.is_subset(&sa))
-            }
-            _ => CheckpointOrder::Incomparable,
-        },
+        ) => order_gtid_sets(
+            parsed_gtid_set(ga).as_deref(),
+            parsed_gtid_set(gb).as_deref(),
+        ),
         (
             WmPos::MysqlBinlog {
                 file_base: ba,
@@ -1962,6 +2024,86 @@ mod snapshot_chain_watermark_tests {
                     };
                     assert_eq!(order_positions(&pa, &pb), direct, "{a} vs {b}");
                 }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod parsed_position_tests {
+    use super::*;
+
+    fn text(s: &str) -> WmPos {
+        WmPos::MysqlGtid { gtid_set: s.into() }
+    }
+
+    /// A row position built from the set the stream holds orders every
+    /// record exactly as the same position written as text and parsed.
+    #[test]
+    fn a_held_set_orders_as_its_text() {
+        let sets = [
+            "",
+            "a:1-5",
+            "a:1-4",
+            "a:1-5:7",
+            "a:1-7",
+            "a:1-5,b:1-3",
+            "b:1-3",
+            "a:2-5",
+        ];
+        let records = sets
+            .iter()
+            .map(|s| text(s))
+            .chain([
+                text("not a set"),
+                WmPos::MysqlBinlog {
+                    file_base: "bin".into(),
+                    file_index: 1,
+                    pos: 4,
+                },
+            ])
+            .collect::<Vec<_>>();
+        for row in sets {
+            let held = ParsedPos::gtid(GtidSet::parse(row).unwrap());
+            assert_eq!(
+                held.pos(),
+                &text(&GtidSet::parse(row).unwrap().to_string())
+            );
+            for r in &records {
+                assert_eq!(
+                    order_against(r, &held),
+                    order_positions(r, &text(row)),
+                    "{r:?} against {row:?}"
+                );
+            }
+        }
+    }
+
+    /// A position given as text is parsed once, and orders as the text.
+    #[test]
+    fn a_parsed_position_orders_as_its_text() {
+        let positions = [
+            text("a:1-5"),
+            text("a:1-3"),
+            text("garbage"),
+            WmPos::MysqlBinlog {
+                file_base: "bin".into(),
+                file_index: 2,
+                pos: 9,
+            },
+            WmPos::MysqlBinlog {
+                file_base: "bin".into(),
+                file_index: 2,
+                pos: 4,
+            },
+        ];
+        for a in &positions {
+            for b in &positions {
+                assert_eq!(
+                    order_against(a, &ParsedPos::new(b.clone())),
+                    order_positions(a, b),
+                    "{a:?} against {b:?}"
+                );
             }
         }
     }

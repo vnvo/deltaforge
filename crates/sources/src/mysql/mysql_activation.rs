@@ -31,7 +31,9 @@ use std::collections::HashMap;
 use storage::adapters::SchemaKey;
 use storage::{AppendStatus, ArcStorageBackend, DurableSchemaRegistry};
 
-use crate::durable_checkpoint::{WmPos, order_positions};
+use crate::durable_checkpoint::{
+    ParsedPos, WmPos, order_against, order_positions,
+};
 
 /// Per-table activation streams.
 pub(crate) const ACTIVATION_NS: &str = "schemas.v1.activation";
@@ -856,17 +858,26 @@ pub(crate) fn select_decisive_in<'a>(
     records: impl IntoIterator<Item = &'a Stored>,
     row: &WmPos,
 ) -> (Selection, Option<String>) {
+    select_decisive_at(records, &ParsedPos::new(row.clone()))
+}
+
+/// [`select_decisive_in`] at a row position already parsed (a stream's
+/// evaluation position, shared by every row of its transaction).
+pub(crate) fn select_decisive_at<'a>(
+    records: impl IntoIterator<Item = &'a Stored>,
+    row: &ParsedPos,
+) -> (Selection, Option<String>) {
     let (selection, decisive) = select_inner(records, row);
     (selection, decisive.map(|d| d.capture_id.clone()))
 }
 
 fn select_inner<'a>(
     records: impl IntoIterator<Item = &'a Stored>,
-    row: &WmPos,
+    row: &ParsedPos,
 ) -> (Selection, Option<&'a Stored>) {
     let mut applicable: Vec<&Stored> = Vec::new();
     for r in records {
-        match order_positions(&r.record.position, row) {
+        match order_against(&r.record.position, row) {
             CheckpointOrder::Before | CheckpointOrder::Equal => {
                 applicable.push(r)
             }
@@ -884,6 +895,16 @@ fn select_inner<'a>(
     for a in &applicable {
         let mut dominated = false;
         for b in &applicable {
+            // A GTID set or binlog coordinate that ordered against the row
+            // orders Equal to itself: no need to compare it with itself.
+            if std::ptr::eq(*a, *b)
+                && matches!(
+                    a.record.position,
+                    WmPos::MysqlGtid { .. } | WmPos::MysqlBinlog { .. }
+                )
+            {
+                continue;
+            }
             match order_positions(&a.record.position, &b.record.position) {
                 CheckpointOrder::Before => {
                     dominated = true;

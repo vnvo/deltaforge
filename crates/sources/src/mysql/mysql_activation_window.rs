@@ -262,7 +262,9 @@ pub(crate) fn touched(
 fn head_tables(
     table_map: &HashMap<
         u64,
-        mysql_binlog_connector_rust::event::table_map_event::TableMapEvent,
+        std::sync::Arc<
+            mysql_binlog_connector_rust::event::table_map_event::TableMapEvent,
+        >,
     >,
     data: &EventData,
     at: &MySqlCheckpoint,
@@ -343,13 +345,13 @@ async fn prefetch_histories(
                keys: &mut Vec<storage::adapters::SchemaKey>,
                db: &str,
                table: &str| {
-        let k = scope.key(db, table);
-        if keys.len() < max
-            && ctx.allow.matches(db, table)
-            && !keys.contains(&k)
-            && ctx.selection.timeline(&k.backend_key()).is_none()
-        {
-            keys.push(k);
+        if keys.len() < max && ctx.allow.matches(db, table) {
+            let k = ctx.table_keys.get(&scope, db, table);
+            if !keys.contains(&k.key)
+                && ctx.selection.timeline_at(&k.backend).is_none()
+            {
+                keys.push(k.key.clone());
+            }
         }
     };
     for (db, table, _) in head {

@@ -346,7 +346,11 @@ async fn handle_table_map(
     // Every table's map is kept, captured or not: a rows event is skipped
     // by the allow-list only once its table is known. The map lives until
     // the transaction's commit boundary (`release_table_maps`).
-    if ctx.table_map.insert(tm.table_id, tm).is_none() {
+    if ctx
+        .table_map
+        .insert(tm.table_id, std::sync::Arc::new(tm))
+        .is_none()
+    {
         ctx.meters.source_maps_installed.increment(1);
         set_table_maps(ctx, "source", ctx.table_map.len());
     }
@@ -525,7 +529,7 @@ async fn handle_write_rows(
     wr: mysql_binlog_connector_rust::event::write_rows_event::WriteRowsEvent,
 ) -> SourceResult<()> {
     if let Some(tm) = ctx.table_map.get(&wr.table_id).cloned() {
-        let tm = &tm;
+        let tm: &TableMapEvent = &tm;
         if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
             return Ok(());
         }
@@ -547,13 +551,7 @@ async fn handle_write_rows(
         // Inside a transaction a row's checkpoint is the last proven
         // boundary: a resume from it re-reads the transaction, never starts
         // inside it.
-        let (cp_file, cp_pos, cp_gtid) = ctx.resume_point();
-        let checkpoint = make_checkpoint_meta(
-            &cp_file,
-            cp_pos,
-            &cp_gtid,
-            checkpoint_lineage(&ctx.registry_scope),
-        );
+        let checkpoint = ctx.row_checkpoint();
         let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
             id: gtid.clone(),
             total_order: None,
@@ -630,7 +628,7 @@ async fn handle_update_rows(
     ur: mysql_binlog_connector_rust::event::update_rows_event::UpdateRowsEvent,
 ) -> SourceResult<()> {
     if let Some(tm) = ctx.table_map.get(&ur.table_id).cloned() {
-        let tm = &tm;
+        let tm: &TableMapEvent = &tm;
         if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
             return Ok(());
         }
@@ -658,13 +656,7 @@ async fn handle_update_rows(
         // Inside a transaction a row's checkpoint is the last proven
         // boundary: a resume from it re-reads the transaction, never starts
         // inside it.
-        let (cp_file, cp_pos, cp_gtid) = ctx.resume_point();
-        let checkpoint = make_checkpoint_meta(
-            &cp_file,
-            cp_pos,
-            &cp_gtid,
-            checkpoint_lineage(&ctx.registry_scope),
-        );
+        let checkpoint = ctx.row_checkpoint();
         let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
             id: gtid.clone(),
             total_order: None,
@@ -739,7 +731,7 @@ async fn handle_delete_rows(
     dr: mysql_binlog_connector_rust::event::delete_rows_event::DeleteRowsEvent,
 ) -> SourceResult<()> {
     if let Some(tm) = ctx.table_map.get(&dr.table_id).cloned() {
-        let tm = &tm;
+        let tm: &TableMapEvent = &tm;
         if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
             return Ok(());
         }
@@ -759,13 +751,7 @@ async fn handle_delete_rows(
         // Inside a transaction a row's checkpoint is the last proven
         // boundary: a resume from it re-reads the transaction, never starts
         // inside it.
-        let (cp_file, cp_pos, cp_gtid) = ctx.resume_point();
-        let checkpoint = make_checkpoint_meta(
-            &cp_file,
-            cp_pos,
-            &cp_gtid,
-            checkpoint_lineage(&ctx.registry_scope),
-        );
+        let checkpoint = ctx.row_checkpoint();
         let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
             id: gtid.clone(),
             total_order: None,
@@ -945,24 +931,25 @@ async fn emit_tx_commit(ctx: &mut RunCtx) {
     // Any close ends the explicit-transaction state (safe even in non-GTID mode,
     // where the early return below skips the marker).
     ctx.in_explicit_txn = false;
-    // The transaction is complete: only now does it join the committed set.
-    ctx.last_gtid = ctx.executed_through_current();
+    // The transaction is complete: only now does it join the committed set
+    // (in place: [`RunCtx::executed_through_current`] without the copy).
+    if let Some(g) = &ctx.current_gtid {
+        // `handle_gtid` admits only well-formed GTIDs.
+        let added = ctx.last_gtid.get_or_insert_default().insert(g);
+        debug_assert!(added, "current GTID {g:?} is well formed");
+    }
     // Rows of the next transaction are evaluated at this boundary.
-    ctx.mark_transaction_boundary();
+    let gtid = ctx.mark_transaction_boundary();
     release_table_maps(ctx);
     let Some(tx_id) = ctx.current_gtid.clone() else {
         return;
     };
-    let checkpoint = make_checkpoint_meta(
-        &ctx.last_file,
-        ctx.last_pos,
-        &ctx.gtid_text(),
-        checkpoint_lineage(&ctx.registry_scope),
-    );
     // Watermark and checkpoint describe the SAME commit boundary.
+    let durable_watermark = build_cdc_watermark_at(ctx, gtid.as_deref());
+    let checkpoint = ctx.boundary_checkpoint(gtid.as_deref());
     let boundary = deltaforge_core::SourceBoundary {
         checkpoint,
-        durable_watermark: build_cdc_watermark(ctx),
+        durable_watermark,
     };
     let _ = emit(
         &ctx.tx,
@@ -995,12 +982,21 @@ fn standalone_row_watermark(
 /// position. `None` if lineage is unavailable - durable mode fails closed at the
 /// sink; we never synthesize a lineage.
 fn build_cdc_watermark(ctx: &RunCtx) -> Option<std::sync::Arc<[u8]>> {
+    build_cdc_watermark_at(ctx, ctx.gtid_text().as_deref())
+}
+
+/// [`build_cdc_watermark`] with the executed set's text already written
+/// (`gtid`, [`RunCtx::gtid_text`]).
+fn build_cdc_watermark_at(
+    ctx: &RunCtx,
+    gtid: Option<&str>,
+) -> Option<std::sync::Arc<[u8]>> {
     use crate::durable_checkpoint::DurableWatermark;
     use crate::snapshot_generation::PersistedLineage;
     let lineage = ctx.durable_lineage.clone()?;
     let wm = match &lineage {
         PersistedLineage::MysqlGtid { .. } => {
-            DurableWatermark::mysql_gtid_commit(lineage, ctx.gtid_text()?)
+            DurableWatermark::mysql_gtid_commit(lineage, gtid?.to_string())
         }
         PersistedLineage::MysqlServer { .. } => {
             DurableWatermark::mysql_binlog_commit(
@@ -1846,7 +1842,7 @@ pub(crate) mod tests {
         let mut table_map = HashMap::new();
         table_map.insert(
             TABLE_ID,
-            TableMapEvent {
+            Arc::new(TableMapEvent {
                 table_id: TABLE_ID,
                 database_name: "shop".to_string(),
                 table_name: "orders".to_string(),
@@ -1860,7 +1856,7 @@ pub(crate) mod tests {
                 column_metas: vec![0, 255],
                 null_bits: vec![true, true],
                 table_metadata: None,
-            },
+            }),
         );
 
         RunCtx {
@@ -1913,6 +1909,8 @@ pub(crate) mod tests {
             lower_case_table_names: 0,
             txn_eval: None,
             txn_eval_cp: None,
+            checkpoint_memo: Default::default(),
+            table_keys: Default::default(),
             txn_anchor: None,
             last_event_start: 0,
             lookahead: Default::default(),
@@ -2056,13 +2054,11 @@ pub(crate) mod tests {
         // The binlog recorded three columns (a row written before a column was
         // dropped); the schema used for decoding has two. The reload of the live
         // schema cannot fix it, so the rows must be refused.
-        ctx.table_map.get_mut(&TABLE_ID).unwrap().column_types.push(
+        Arc::make_mut(ctx.table_map.get_mut(&TABLE_ID).unwrap()).column_types.push(
             mysql_binlog_connector_rust::column::column_type::ColumnType::VarChar
                 as u8,
         );
-        ctx.table_map
-            .get_mut(&TABLE_ID)
-            .unwrap()
+        Arc::make_mut(ctx.table_map.get_mut(&TABLE_ID).unwrap())
             .column_metas
             .push(255);
 
@@ -2279,6 +2275,89 @@ pub(crate) mod tests {
             "position.gtid must be the exact per-tx GTID, not the merged set"
         );
         assert_eq!(produced.source.position.row, Some(0));
+    }
+
+    /// Rows read inside a transaction carry the checkpoint of the boundary
+    /// before it (a resume reads the whole transaction again), never the
+    /// stream position past the rows already read; the next transaction's
+    /// rows carry the boundary its predecessor's commit wrote, byte for byte.
+    #[tokio::test]
+    async fn rows_inside_a_transaction_carry_the_boundary_before_it() {
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(16);
+        let mut ctx = make_runctx(tx);
+        ctx.current_gtid = None;
+        ctx.in_explicit_txn = false;
+        ctx.last_gtid = Some(GtidSet::parse(&format!("{UUID}:1-5")).unwrap());
+        ctx.last_file = "mysql-bin.000004".into();
+        ctx.last_pos = 1000;
+        prove_orders(&mut ctx).await;
+        // A commit releases its table maps: each transaction maps its table.
+        let map = (*ctx.table_map[&TABLE_ID]).clone();
+        let rows = |id: i64| WriteRowsEvent {
+            table_id: TABLE_ID,
+            included_columns: vec![true, true],
+            rows: vec![RowEvent {
+                column_values: vec![
+                    ColumnValue::LongLong(id),
+                    ColumnValue::String(b"sku".to_vec()),
+                ],
+            }],
+        };
+        let checkpoint_of = |ev: &Event| -> MySqlCheckpoint {
+            serde_json::from_slice(ev.checkpoint().unwrap().as_bytes()).unwrap()
+        };
+
+        handle_gtid(
+            &mut ctx,
+            GtidEvent {
+                flags: 0,
+                gtid: format!("{UUID}:6"),
+            },
+        )
+        .await
+        .unwrap();
+        ctx.last_pos = 1600;
+        handle_write_rows(&mut ctx, &make_header(), rows(1))
+            .await
+            .unwrap();
+        let first = recv_event(&mut rx).await.expect("a row");
+        let cp = checkpoint_of(&first);
+        assert_eq!(
+            (cp.file.as_str(), cp.pos, cp.gtid_set.clone()),
+            ("mysql-bin.000004", 1000, Some(format!("{UUID}:1-5")))
+        );
+
+        ctx.last_pos = 1650;
+        emit_tx_commit(&mut ctx).await;
+        let commit = loop {
+            match rx.recv().await.expect("the commit") {
+                SourceItem::TxCommit { boundary, .. } => {
+                    break boundary.checkpoint;
+                }
+                _ => continue,
+            }
+        };
+        handle_gtid(
+            &mut ctx,
+            GtidEvent {
+                flags: 0,
+                gtid: format!("{UUID}:7"),
+            },
+        )
+        .await
+        .unwrap();
+        handle_table_map(&mut ctx, map).await.unwrap();
+        ctx.last_pos = 2200;
+        handle_write_rows(&mut ctx, &make_header(), rows(2))
+            .await
+            .unwrap();
+        let second = recv_event(&mut rx).await.expect("a row");
+        assert_eq!(second.checkpoint().unwrap().as_bytes(), commit.as_bytes());
+        let cp = checkpoint_of(&second);
+        assert_eq!(
+            (cp.file.as_str(), cp.pos, cp.gtid_set.clone()),
+            ("mysql-bin.000004", 1650, Some(format!("{UUID}:1-6")))
+        );
     }
 
     #[tokio::test]
@@ -2631,13 +2710,17 @@ pub(crate) mod tests {
         // GTID position when the fixture's GTID text is a placeholder.
         ctx.mark_transaction_boundary();
         let comparable = ctx.txn_eval.as_ref().is_some_and(|p| {
-            crate::durable_checkpoint::order_positions(p, p)
+            crate::durable_checkpoint::order_positions(p.pos(), p.pos())
                 == deltaforge_core::CheckpointOrder::Equal
         });
         if !comparable {
-            ctx.txn_eval = Some(crate::durable_checkpoint::WmPos::MysqlGtid {
-                gtid_set: format!("{UUID}:1-5"),
-            });
+            ctx.txn_eval = Some(std::sync::Arc::new(
+                crate::durable_checkpoint::ParsedPos::new(
+                    crate::durable_checkpoint::WmPos::MysqlGtid {
+                        gtid_set: format!("{UUID}:1-5"),
+                    },
+                ),
+            ));
         }
         prove_table(ctx, "orders").await;
     }
@@ -2651,7 +2734,7 @@ pub(crate) mod tests {
             table_stream,
         };
         use crate::mysql::mysql_table_schema::{MySqlColumn, MySqlTableSchema};
-        let r0 = ctx.txn_eval.clone().unwrap();
+        let r0 = ctx.txn_eval.as_ref().unwrap().pos().clone();
         let mut sku =
             MySqlColumn::new("sku", "varchar(255)", "varchar", true, 2);
         sku.char_octet_length = Some(255);
@@ -2708,7 +2791,7 @@ pub(crate) mod tests {
         use deltaforge_core::table_metrics::{PerTablePolicy, TableMetrics};
         let (tx, _rx) = mpsc::channel::<SourceItem>(8);
         let mut ctx = make_runctx(tx);
-        let tm = ctx.table_map[&TABLE_ID].clone();
+        let tm = (*ctx.table_map[&TABLE_ID]).clone();
         let keys = |labels: Vec<metrics::Label>| {
             labels
                 .iter()
@@ -2740,7 +2823,7 @@ pub(crate) mod tests {
         let mut ctx = make_runctx(tx);
         prove_orders(&mut ctx).await;
         prove_table(&mut ctx, "items").await;
-        let orders = ctx.table_map[&TABLE_ID].clone();
+        let orders = (*ctx.table_map[&TABLE_ID]).clone();
         let items = TableMapEvent {
             table_id: TABLE_ID + 1,
             table_name: "items".into(),
@@ -2791,7 +2874,7 @@ pub(crate) mod tests {
         let (tx, _rx) = mpsc::channel::<SourceItem>(8);
         let mut ctx = make_runctx(tx);
         prove_orders(&mut ctx).await;
-        let orders = ctx.table_map[&TABLE_ID].clone();
+        let orders = (*ctx.table_map[&TABLE_ID]).clone();
         ctx.selection = Caches::default();
         ctx.selection.set_limit_for_test(1);
         let first = select_for_rows(&mut ctx, &orders).await.unwrap();
@@ -4241,7 +4324,7 @@ pub(crate) mod tests {
                 items
             });
             let mut ctx = make_runctx(tx);
-            let template = ctx.table_map[&TABLE_ID].clone();
+            let template = (*ctx.table_map[&TABLE_ID]).clone();
             ctx.table_map.clear();
             with_scope(&mut ctx).await;
             ctx.current_gtid = None;

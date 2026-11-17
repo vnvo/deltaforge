@@ -294,7 +294,7 @@ pub(crate) struct RunCtx {
     /// The table maps of the transaction being dispatched, by table id:
     /// cleared at its commit boundary and when a stream is reopened (see
     /// `mysql_event::handle_table_map`).
-    table_map: HashMap<u64, TableMapEvent>,
+    table_map: HashMap<u64, Arc<TableMapEvent>>,
     /// The stream parser's installed-table-map count last exported
     /// (`deltaforge_mysql_table_maps_installed_total{map="parser"}`).
     parser_table_maps_installed: u64,
@@ -342,10 +342,16 @@ pub(crate) struct RunCtx {
     /// Evaluation position of rows (spec 7.3): the executed state immediately
     /// before the current transaction - the stream position after the last
     /// commit boundary (or the position the stream (re)started from).
-    txn_eval: Option<crate::durable_checkpoint::WmPos>,
+    /// Held with its GTID set, so the rows' selection never parses it.
+    txn_eval: Option<Arc<crate::durable_checkpoint::ParsedPos>>,
     /// The same position as binlog coordinates (lineage left unset): where a
     /// lazy baseline's scan starts.
     txn_eval_cp: Option<MySqlCheckpoint>,
+    /// The last checkpoint built (rows and commits): a transaction's rows
+    /// share the bytes its predecessor's commit built.
+    checkpoint_memo: mysql_helpers::CheckpointMemo,
+    /// Each table's registry and backend keys under the current scope.
+    table_keys: mysql_selection::TableKeys,
     /// GTID mode: the physical start of the current transaction (its GTID
     /// event), the first transaction after `txn_eval_cp`, observed on this
     /// stream (a stream anchor, `docs/design/mysql-proof-seek.md`). Its
@@ -1883,6 +1889,8 @@ impl MySqlSource {
             lower_case_table_names,
             txn_eval: None,
             txn_eval_cp: None,
+            checkpoint_memo: Default::default(),
+            table_keys: Default::default(),
             txn_anchor: None,
             last_event_start: 0,
             lookahead: Default::default(),
@@ -2779,6 +2787,42 @@ impl RunCtx {
         }
     }
 
+    /// The checkpoint of the rows read now: [`Self::resume_point`] under the
+    /// current lineage, shared with the last checkpoint built when that is
+    /// the same boundary (the commit that opened the rows' transaction).
+    pub(crate) fn row_checkpoint(&mut self) -> deltaforge_core::CheckpointMeta {
+        let scope = self.registry_scope.current().ok();
+        let lineage = scope.as_ref().map(|s| s.lineage().lineage_hash.as_str());
+        if let (Some(cp), true) = (&self.txn_eval_cp, self.transaction_open()) {
+            return self.checkpoint_memo.get(
+                &cp.file,
+                cp.pos,
+                cp.gtid_set.as_deref(),
+                lineage,
+            );
+        }
+        let gtid = self.gtid_text();
+        self.checkpoint_memo.get(
+            &self.last_file,
+            self.last_pos,
+            gtid.as_deref(),
+            lineage,
+        )
+    }
+
+    /// The checkpoint of the commit boundary at the stream's position with
+    /// `gtid` executed, under the current lineage (shared with the rows of
+    /// the next transaction).
+    pub(crate) fn boundary_checkpoint(
+        &mut self,
+        gtid: Option<&str>,
+    ) -> deltaforge_core::CheckpointMeta {
+        let scope = self.registry_scope.current().ok();
+        let lineage = scope.as_ref().map(|s| s.lineage().lineage_hash.as_str());
+        self.checkpoint_memo
+            .get(&self.last_file, self.last_pos, gtid, lineage)
+    }
+
     /// Before a stream is reopened: a transaction cut short by the
     /// disconnect is abandoned - the coordinator drops its buffered prefix
     /// (`TxAbort`), the decoder state is discarded and the cursor returns to
@@ -2847,24 +2891,35 @@ impl RunCtx {
     }
 
     /// The stream is at a transaction boundary: rows of the next transaction
-    /// are evaluated at the current position.
-    pub(crate) fn mark_transaction_boundary(&mut self) {
+    /// are evaluated at the current position. Returns the executed GTID set
+    /// as text ([`Self::gtid_text`], written once here).
+    pub(crate) fn mark_transaction_boundary(&mut self) -> Option<String> {
+        use crate::durable_checkpoint::{ParsedPos, WmPos};
         self.rows_ordinal = 0;
         self.txn_anchor = None;
-        let gtid = self.gtid_text();
-        self.txn_eval = crate::durable_checkpoint::mysql_checkpoint_position(
-            &self.last_file,
-            self.last_pos,
-            gtid.as_deref(),
-        );
+        let eval = match &self.last_gtid {
+            Some(set) => Some(ParsedPos::gtid(set.clone())),
+            None => crate::durable_checkpoint::mysql_checkpoint_position(
+                &self.last_file,
+                self.last_pos,
+                None,
+            )
+            .map(ParsedPos::new),
+        };
+        let gtid = match eval.as_ref().map(ParsedPos::pos) {
+            Some(WmPos::MysqlGtid { gtid_set }) => Some(gtid_set.clone()),
+            _ => None,
+        };
+        self.txn_eval = eval.map(Arc::new);
         self.txn_eval_cp = Some(MySqlCheckpoint {
             file: self.last_file.clone(),
             pos: self.last_pos,
-            gtid_set: gtid,
+            gtid_set: gtid.clone(),
             lineage: None,
             snapshot_completed: None,
             snapshot_chain: None,
         });
+        gtid
     }
 
     /// The stream anchor at `txn_eval_cp`, of the verified identity
