@@ -28,6 +28,7 @@ patched vendor/mysql-binlog-connector-rust src/column/column_value.rs
 patched vendor/mysql-binlog-connector-rust src/command/command_util.rs
 patched vendor/mysql-binlog-connector-rust src/command/dump_binlog_gtid_command.rs
 patched vendor/mysql-binlog-connector-rust src/event/delete_rows_event.rs
+patched vendor/mysql-binlog-connector-rust src/event/event_data.rs
 patched vendor/mysql-binlog-connector-rust src/event/gtid_event.rs
 patched vendor/mysql-binlog-connector-rust src/event/table_map/default_charset.rs
 patched vendor/mysql-binlog-connector-rust src/event/table_map/table_metadata.rs

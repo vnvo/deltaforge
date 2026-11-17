@@ -682,7 +682,7 @@ mod tests {
                 let (_, data) = s.read().await.unwrap();
                 if let EventData::TableMap(tm) = data {
                     if tm.table_name == table {
-                        return tm;
+                        return (*tm).clone();
                     }
                 }
             }

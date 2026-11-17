@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use super::{
     delete_rows_event::DeleteRowsEvent, format_description_event::FormatDescriptionEvent,
@@ -15,7 +16,7 @@ pub enum EventData {
     PreviousGtids(PreviousGtidsEvent),
     Gtid(GtidEvent),
     Query(QueryEvent),
-    TableMap(TableMapEvent),
+    TableMap(Arc<TableMapEvent>),
     WriteRows(WriteRowsEvent),
     UpdateRows(UpdateRowsEvent),
     DeleteRows(DeleteRowsEvent),

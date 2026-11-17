@@ -30,7 +30,6 @@ use storage::adapters::incidents::IncidentStore;
 use crate::snapshot_generation::PersistedLineage;
 use postgres_snapshot::IdentitySpec;
 
-mod event_counters;
 mod feedback_delay;
 mod postgres_errors;
 mod postgres_toast;
@@ -407,7 +406,7 @@ pub(crate) struct RunCtx {
     /// Backend holding the durable source-lineage record.
     pub registry_backend: ArcStorageBackend,
     /// Cached event counter handles (bounded by the per-table policy).
-    pub(crate) event_counters: event_counters::EventCounters,
+    pub(crate) event_counters: crate::event_counters::EventCounters,
     /// Cached LSN string to avoid re-formatting the same LSN on consecutive events.
     pub cached_lsn: Option<(Lsn, String)>,
     /// The continuity stamp of the authoritative stream, set only when a
@@ -1812,7 +1811,7 @@ impl PostgresSource {
             identity_store: IdentityStore::new(Arc::clone(&backend)),
             registry_scope: self.registry_scope.clone(),
             registry_backend: Arc::clone(&backend),
-            event_counters: event_counters::EventCounters::new(
+            event_counters: crate::event_counters::EventCounters::new(
                 &self.pipeline,
                 &self.id,
                 deltaforge_core::table_metrics::for_pipeline(&self.pipeline),

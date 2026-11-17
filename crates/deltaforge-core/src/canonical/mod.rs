@@ -815,6 +815,35 @@ impl ArrayValue {
 // Rows
 // ---------------------------------------------------------------------------
 
+/// The first name `names` repeats. A narrow list is checked by comparison
+/// (no allocation), a wide one with a set sized up front.
+fn duplicate_name<'a>(
+    names: impl ExactSizeIterator<Item = &'a str> + Clone,
+) -> Option<&'a str> {
+    if names.len() <= 32 {
+        names.clone().enumerate().find_map(|(i, name)| {
+            names.clone().take(i).any(|n| n == name).then_some(name)
+        })
+    } else {
+        let mut seen = std::collections::HashSet::with_capacity(names.len());
+        names.into_iter().find(|n| !seen.insert(*n))
+    }
+}
+
+/// Evidence that a list of column names was checked distinct, once, so the
+/// rows built from it ([`CanonicalRow::from_distinct`]) need no check each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DistinctNames(());
+
+impl DistinctNames {
+    /// `Some` when no name in `names` repeats.
+    pub fn check<'a>(
+        names: impl ExactSizeIterator<Item = &'a str> + Clone,
+    ) -> Option<DistinctNames> {
+        duplicate_name(names).is_none().then_some(DistinctNames(()))
+    }
+}
+
 /// A row image: its declared columns (values in source order, names
 /// unique) and its processor-added document extensions.
 ///
@@ -833,27 +862,32 @@ impl CanonicalRow {
     pub fn new(
         columns: Vec<(String, CanonicalValue)>,
     ) -> Result<CanonicalRow, CanonicalError> {
-        // Rows are built per event: a narrow row is checked by comparison
-        // (no allocation), a wide one with a set sized up front.
-        let duplicate = if columns.len() <= 32 {
-            columns.iter().enumerate().find_map(|(i, (name, _))| {
-                columns[..i].iter().any(|(n, _)| n == name).then_some(name)
-            })
-        } else {
-            let mut seen =
-                std::collections::HashSet::with_capacity(columns.len());
-            columns
-                .iter()
-                .map(|(n, _)| n)
-                .find(|n| !seen.insert(n.as_str()))
-        };
-        if let Some(name) = duplicate {
+        if let Some(name) =
+            duplicate_name(columns.iter().map(|(n, _)| n.as_str()))
+        {
             return invalid(format!("duplicate column {name}"));
         }
         Ok(CanonicalRow {
             columns,
             extensions: Default::default(),
         })
+    }
+
+    /// [`Self::new`] without the per-row duplicate check, for a row whose
+    /// columns are taken, each at most once, from a name list `_names` was
+    /// checked on (a table schema's, checked once when its decoder is built).
+    pub fn from_distinct(
+        columns: Vec<(String, CanonicalValue)>,
+        _names: DistinctNames,
+    ) -> CanonicalRow {
+        debug_assert!(
+            duplicate_name(columns.iter().map(|(n, _)| n.as_str())).is_none(),
+            "a row built from distinct names repeats a column"
+        );
+        CanonicalRow {
+            columns,
+            extensions: Default::default(),
+        }
     }
 
     /// A row with document extensions (checked like

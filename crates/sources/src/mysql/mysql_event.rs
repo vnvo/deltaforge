@@ -335,7 +335,7 @@ async fn dispatch_kind(
 #[instrument(skip_all, fields(source_id=%ctx.source_id))]
 async fn handle_table_map(
     ctx: &mut RunCtx,
-    tm: TableMapEvent,
+    tm: std::sync::Arc<TableMapEvent>,
 ) -> SourceResult<()> {
     debug!(
         table_id = tm.table_id,
@@ -346,11 +346,7 @@ async fn handle_table_map(
     // Every table's map is kept, captured or not: a rows event is skipped
     // by the allow-list only once its table is known. The map lives until
     // the transaction's commit boundary (`release_table_maps`).
-    if ctx
-        .table_map
-        .insert(tm.table_id, std::sync::Arc::new(tm))
-        .is_none()
-    {
+    if ctx.table_map.insert(tm.table_id, tm).is_none() {
         ctx.meters.source_maps_installed.increment(1);
         set_table_maps(ctx, "source", ctx.table_map.len());
     }
@@ -610,11 +606,7 @@ async fn handle_write_rows(
 
         // Batch metrics: one counter increment per binlog event instead of per row.
         if sent > 0 {
-            counter!(
-                "deltaforge_source_events_total",
-                source_event_labels(ctx, tm, "c"),
-            )
-            .increment(sent);
+            count_source_events(ctx, tm, "c", sent);
         }
     } else {
         return Err(super::mysql_errors::unmapped_table_id(wr.table_id));
@@ -713,11 +705,7 @@ async fn handle_update_rows(
         }
 
         if sent > 0 {
-            counter!(
-                "deltaforge_source_events_total",
-                source_event_labels(ctx, tm, "u"),
-            )
-            .increment(sent);
+            count_source_events(ctx, tm, "u", sent);
         }
     } else {
         return Err(super::mysql_errors::unmapped_table_id(ur.table_id));
@@ -804,11 +792,7 @@ async fn handle_delete_rows(
         }
 
         if sent > 0 {
-            counter!(
-                "deltaforge_source_events_total",
-                source_event_labels(ctx, tm, "d"),
-            )
-            .increment(sent);
+            count_source_events(ctx, tm, "d", sent);
         }
     } else {
         return Err(super::mysql_errors::unmapped_table_id(dr.table_id));
@@ -1754,20 +1738,16 @@ pub(crate) fn ddl_identity(
 
 /// `deltaforge_source_events_total` labels for `tm`'s table (table labels
 /// only when the pipeline enables per-table detail).
-fn source_event_labels(
-    ctx: &RunCtx,
+/// `deltaforge_source_events_total` += `n` for `op` rows of `tm`'s table
+/// (`db.table` under the per-table label policy).
+fn count_source_events(
+    ctx: &mut RunCtx,
     tm: &TableMapEvent,
     op: &'static str,
-) -> Vec<metrics::Label> {
-    let table = format!("{}.{}", tm.database_name, tm.table_name);
-    deltaforge_core::table_metrics::with_table(
-        vec![
-            metrics::Label::new("pipeline", ctx.pipeline.clone()),
-            metrics::Label::new("source", ctx.source_id.clone()),
-            metrics::Label::new("op", op),
-        ],
-        ctx.table_metrics.label(&table).as_ref(),
-    )
+    n: u64,
+) {
+    ctx.event_counters
+        .add_qualified(&tm.database_name, &tm.table_name, op, n);
 }
 
 #[cfg(test)]
@@ -1862,9 +1842,13 @@ pub(crate) mod tests {
         RunCtx {
             source_id: "unit-test".to_string(),
             pipeline: "test-pipeline".to_string(),
-            table_metrics: Arc::new(
-                deltaforge_core::table_metrics::TableMetrics::disabled(
-                    "test-pipeline",
+            event_counters: crate::event_counters::EventCounters::new(
+                "test-pipeline",
+                "unit-test",
+                Arc::new(
+                    deltaforge_core::table_metrics::TableMetrics::disabled(
+                        "test-pipeline",
+                    ),
                 ),
             ),
             tenant: "test-tenant".to_string(),
@@ -2346,7 +2330,7 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        handle_table_map(&mut ctx, map).await.unwrap();
+        handle_table_map(&mut ctx, Arc::new(map)).await.unwrap();
         ctx.last_pos = 2200;
         handle_write_rows(&mut ctx, &make_header(), rows(2))
             .await
@@ -2787,29 +2771,74 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn source_event_labels_follow_the_per_table_policy() {
+    fn source_events_are_counted_under_the_per_table_policy() {
         use deltaforge_core::table_metrics::{PerTablePolicy, TableMetrics};
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
         let (tx, _rx) = mpsc::channel::<SourceItem>(8);
         let mut ctx = make_runctx(tx);
         let tm = (*ctx.table_map[&TABLE_ID]).clone();
-        let keys = |labels: Vec<metrics::Label>| {
-            labels
-                .iter()
-                .map(|l| (l.key().to_string(), l.value().to_string()))
-                .collect::<Vec<_>>()
+        let rec = DebuggingRecorder::new();
+        metrics::with_local_recorder(&rec, || {
+            count_source_events(&mut ctx, &tm, "c", 2);
+            count_source_events(&mut ctx, &tm, "c", 3);
+            ctx.event_counters = crate::event_counters::EventCounters::new(
+                "test-pipeline",
+                "unit-test",
+                Arc::new(TableMetrics::new(
+                    "test-pipeline",
+                    Some(PerTablePolicy {
+                        max_tables: 1,
+                        lag_idle: Duration::from_secs(300),
+                    }),
+                )),
+            );
+            count_source_events(&mut ctx, &tm, "c", 4);
+        });
+        let mut series: Vec<(Vec<(String, String)>, u64)> = rec
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| {
+                k.key().name() == "deltaforge_source_events_total"
+            })
+            .map(|(k, _, _, v)| {
+                let mut labels: Vec<_> = k
+                    .key()
+                    .labels()
+                    .map(|l| (l.key().to_string(), l.value().to_string()))
+                    .collect();
+                labels.sort();
+                let DebugValue::Counter(n) = v else {
+                    panic!("a counter")
+                };
+                (labels, n)
+            })
+            .collect();
+        series.sort();
+        let base = |extra: &[(&str, &str)]| {
+            let mut l: Vec<(String, String)> = [
+                ("op", "c"),
+                ("pipeline", "test-pipeline"),
+                ("source", "unit-test"),
+            ]
+            .iter()
+            .chain(extra)
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+            l.sort();
+            l
         };
-        let off = keys(source_event_labels(&ctx, &tm, "c"));
-        assert!(off.iter().all(|(k, _)| k != "table" && k != "table_scope"));
-        ctx.table_metrics = Arc::new(TableMetrics::new(
-            "test-pipeline",
-            Some(PerTablePolicy {
-                max_tables: 1,
-                lag_idle: Duration::from_secs(300),
-            }),
-        ));
-        let on = keys(source_event_labels(&ctx, &tm, "c"));
-        assert!(on.contains(&("table".into(), "shop.orders".into())));
-        assert!(on.contains(&("table_scope".into(), "exact".into())));
+        assert_eq!(
+            series,
+            [
+                (base(&[]), 5),
+                (
+                    base(&[("table", "shop.orders"), ("table_scope", "exact")]),
+                    4
+                ),
+            ]
+        );
     }
 
     /// An entry evicted by the shared cache budget is rebuilt from the
@@ -4150,6 +4179,48 @@ pub(crate) mod tests {
             assert_eq!(rows, TRANSACTIONS);
             assert_eq!(parser.table_map_event_by_table_id.len(), 0);
             assert_eq!(parser.table_maps_installed, TRANSACTIONS);
+            assert!(
+                parser.reusable_table_maps()
+                    <= mysql_binlog_connector_rust::binlog_parser::TABLE_MAP_REUSE_MAX
+            );
+        }
+
+        #[test]
+        fn a_repeated_table_map_is_reused_and_a_changed_one_parsed_again() {
+            let mut stream = Vec::new();
+            for (i, table) in
+                ["orders", "orders", "items", "items"].iter().enumerate()
+            {
+                stream.extend(gtid(true, i as u64 + 1));
+                stream.extend(query("shop", "BEGIN"));
+                stream.extend(table_map(7, "shop", table));
+                stream.extend(write_rows(7, i as i64, true));
+                stream.extend(xid(i as u64));
+            }
+            let mut parser = parser();
+            let events = parse_all(&mut parser, stream);
+            let maps: Vec<_> = events
+                .iter()
+                .filter_map(|(d, _)| match d {
+                    EventData::TableMap(tm) => Some(tm.clone()),
+                    _ => None,
+                })
+                .collect();
+            let names: Vec<_> =
+                maps.iter().map(|m| m.table_name.as_str()).collect();
+            assert_eq!(names, ["orders", "orders", "items", "items"]);
+            // The same bytes give the same parsed map; other bytes under the
+            // same table id are parsed afresh.
+            assert!(Arc::ptr_eq(&maps[0], &maps[1]));
+            assert!(!Arc::ptr_eq(&maps[1], &maps[2]));
+            assert!(Arc::ptr_eq(&maps[2], &maps[3]));
+            let rows: Vec<_> =
+                events.iter().filter_map(|(d, _)| decoded(d)).collect();
+            assert_eq!(rows, [(7, 0), (7, 1), (7, 2), (7, 3)]);
+            // Reuse never keeps a table map past its transaction.
+            assert_eq!(parser.table_map_event_by_table_id.len(), 0);
+            assert_eq!(parser.table_maps_installed, 4);
+            assert_eq!(parser.reusable_table_maps(), 1);
         }
 
         #[test]
@@ -4336,12 +4407,12 @@ pub(crate) mod tests {
         /// A table outside the allow-list (its rows are skipped, its table
         /// map is kept like any other) under `table_id`.
         fn filtered(template: &TableMapEvent, table_id: u64) -> EventData {
-            EventData::TableMap(TableMapEvent {
+            EventData::TableMap(Arc::new(TableMapEvent {
                 table_id,
                 database_name: "other".to_string(),
                 table_name: "audit".to_string(),
                 ..template.clone()
-            })
+            }))
         }
 
         fn rows(table_id: u64, id: i64) -> EventData {

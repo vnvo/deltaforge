@@ -11,6 +11,7 @@
 pub mod credentials;
 pub mod declared_types;
 pub mod durable_checkpoint;
+pub(crate) mod event_counters;
 pub mod failover;
 pub mod gtid_set;
 pub mod identity_resolution;

@@ -3069,7 +3069,7 @@ pub(crate) mod tests {
                 (2, query("ALTER TABLE t ADD c INT")),
                 (
                     19,
-                    EventData::TableMap(TableMapEvent {
+                    EventData::TableMap(std::sync::Arc::new(TableMapEvent {
                         table_id: 1,
                         database_name: "d".into(),
                         table_name: "t".into(),
@@ -3077,7 +3077,7 @@ pub(crate) mod tests {
                         column_metas: vec![],
                         null_bits: vec![],
                         table_metadata: None,
-                    }),
+                    })),
                 ),
                 (
                     30,

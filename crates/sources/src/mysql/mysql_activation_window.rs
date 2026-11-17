@@ -3864,7 +3864,7 @@ mod tests {
             event_flags: 0,
         };
         let map = |id: u64, table: &str| {
-            EventData::TableMap(TableMapEvent {
+            EventData::TableMap(std::sync::Arc::new(TableMapEvent {
                 table_id: id,
                 database_name: "d".into(),
                 table_name: table.into(),
@@ -3872,7 +3872,7 @@ mod tests {
                 column_metas: vec![0],
                 null_bits: vec![true],
                 table_metadata: None,
-            })
+            }))
         };
         let rows = |id: u64| {
             EventData::WriteRows(WriteRowsEvent {

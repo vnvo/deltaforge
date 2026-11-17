@@ -272,8 +272,9 @@ pub(crate) const READ_TIMEOUT: u64 = 90;
 pub(crate) struct RunCtx {
     source_id: String,
     pipeline: String,
-    /// The pipeline's per-table label policy.
-    table_metrics: Arc<deltaforge_core::table_metrics::TableMetrics>,
+    /// `deltaforge_source_events_total` handles, labelled by the pipeline's
+    /// per-table label policy.
+    event_counters: crate::event_counters::EventCounters,
     tenant: String,
     dsn: crate::credentials::SharedDsn,
     /// The run's capture context: the same DSN and the run's stop.
@@ -1848,8 +1849,10 @@ impl MySqlSource {
         let mut ctx = RunCtx {
             source_id: self.id.clone(),
             pipeline: self.pipeline.clone(),
-            table_metrics: deltaforge_core::table_metrics::for_pipeline(
+            event_counters: crate::event_counters::EventCounters::new(
                 &self.pipeline,
+                &self.id,
+                deltaforge_core::table_metrics::for_pipeline(&self.pipeline),
             ),
             tenant: self.tenant.clone(),
             dsn: run_dsn,
@@ -2565,7 +2568,7 @@ async fn connect_first_stream(
                 &expected,
             )
             .await?;
-            Ok(stream)
+            Ok(*stream)
         }
         // Startup verified this server on every earlier connection: a
         // replication session elsewhere is split routing, never a failover.
@@ -2650,7 +2653,7 @@ async fn reconnect_stream(
         Opened::Stream(stream) => {
             ctx.retry.reset();
             check_identity_post_reconnect(ctx, None, &resume).await?;
-            return Ok(stream);
+            return Ok(*stream);
         }
         Opened::OtherServer(found) => found,
     };
@@ -2697,7 +2700,7 @@ async fn reconnect_stream(
                 &expected,
             )
             .await?;
-            Ok(stream)
+            Ok(*stream)
         }
         Opened::OtherServer(other) => Err(SourceError::Lineage {
             details: format!(

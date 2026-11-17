@@ -98,7 +98,7 @@ pub(super) async fn prepare_client(
 /// A replication session opened by [`connect_binlog_with_retries`].
 pub(super) enum Opened {
     /// Verified as the expected server; the dump command was issued.
-    Stream(super::mysql_session::Session),
+    Stream(Box<super::mysql_session::Session>),
     /// The session reached another server (its `server_uuid`) and was closed
     /// before the dump command: no event was read.
     OtherServer(String),
@@ -202,7 +202,7 @@ async fn connect_binlog(
                 ms = t0.elapsed().as_millis() as u64,
                 "connected to binlog (server identity verified)"
             );
-            Ok(Opened::Stream(stream))
+            Ok(Opened::Stream(Box::new(stream)))
         }
         Ok(Err(SessionError::OtherServer { found })) => {
             warn!(

@@ -828,6 +828,29 @@ fn duplicate_columns_are_refused_in_narrow_and_wide_rows() {
     }
 }
 
+#[test]
+fn distinct_names_are_checked_in_narrow_and_wide_lists() {
+    use crate::canonical::DistinctNames;
+    for width in [0, 1, 2, 32, 33, 200] {
+        let mut names: Vec<String> =
+            (0..width).map(|i| format!("c{i}")).collect();
+        assert!(
+            DistinctNames::check(names.iter().map(String::as_str)).is_some()
+        );
+        names.push(names.first().cloned().unwrap_or_else(|| "c0".into()));
+        let expect = width == 0;
+        assert_eq!(
+            DistinctNames::check(names.iter().map(String::as_str)).is_some(),
+            expect,
+            "width {width}"
+        );
+        names.push(names[0].clone());
+        assert!(
+            DistinctNames::check(names.iter().map(String::as_str)).is_none()
+        );
+    }
+}
+
 // ----- JSON output ----------------------------------------------------------
 
 /// Every value, in before and after images, through every envelope under

@@ -286,7 +286,7 @@ async fn open_binlog(
             match super::require_supported_server(control, dsn, expected_uuid)
                 .await
             {
-                Ok(()) => Ok(stream),
+                Ok(()) => Ok(*stream),
                 Err(_) => Err(RotationReject::ReplacementOpenFailed),
             }
         }
