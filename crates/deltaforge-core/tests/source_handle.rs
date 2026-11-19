@@ -103,7 +103,7 @@ impl Source for FakeSource {
                 .with_tenant(tenant.clone());
 
                 // If the receiver is dropped, end the task.
-                if tx.send(SourceItem::Event(ev)).await.is_err() {
+                if tx.send(SourceItem::event(ev)).await.is_err() {
                     break;
                 }
                 n += 1;

@@ -15,11 +15,12 @@ use crate::{
 use std::{
     collections::HashMap,
     io::{Cursor, Read, Seek, SeekFrom},
+    sync::Arc,
 };
 
 pub struct BinlogParser {
     pub checksum_length: u8,
-    pub table_map_event_by_table_id: HashMap<u64, TableMapEvent>,
+    pub table_map_event_by_table_id: HashMap<u64, Arc<TableMapEvent>>,
     /// DeltaForge patch: decides, for each parsed event, whether it ends the
     /// transaction the events before it belong to. When it does, the table
     /// maps are released: a rows event only references a table map of its
@@ -30,7 +31,18 @@ pub struct BinlogParser {
     /// table id was not mapped at the time). Counts installations, not
     /// distinct ids: an id mapped again after a release counts again.
     pub table_maps_installed: u64,
+    /// DeltaForge patch: the last TABLE_MAP parsed for each table id, with
+    /// its event bytes. The same bytes again (the table's next transaction)
+    /// reuse the parsed map instead of parsing and copying it: parsing is a
+    /// function of those bytes alone. Kept across transaction ends, unlike
+    /// the table maps above; emptied when it holds
+    /// [`TABLE_MAP_REUSE_MAX`] ids and a new one arrives.
+    parsed_table_maps: HashMap<u64, (Vec<u8>, Arc<TableMapEvent>)>,
 }
+
+/// DeltaForge patch: the most table ids [`BinlogParser`] keeps a parsed
+/// TABLE_MAP for, for reuse.
+pub const TABLE_MAP_REUSE_MAX: usize = 4096;
 
 /// See [`BinlogParser::transaction_end`].
 pub type TransactionEnd = Box<dyn FnMut(&EventData) -> bool + Send>;
@@ -46,6 +58,7 @@ impl BinlogParser {
             table_map_event_by_table_id: HashMap::new(),
             transaction_end: None,
             table_maps_installed: 0,
+            parsed_table_maps: HashMap::new(),
         }
     }
 
@@ -69,6 +82,32 @@ impl BinlogParser {
             }
         }
         Ok((header, data))
+    }
+
+    /// DeltaForge patch: the table ids a parsed TABLE_MAP is kept for, for
+    /// reuse (at most [`TABLE_MAP_REUSE_MAX`]).
+    pub fn reusable_table_maps(&self) -> usize {
+        self.parsed_table_maps.len()
+    }
+
+    /// DeltaForge patch: the parsed TABLE_MAP kept for exactly these event
+    /// bytes, if any.
+    fn reusable_table_map(&self, buf: &[u8]) -> Option<Arc<TableMapEvent>> {
+        let id: [u8; 6] = buf.get(..6)?.try_into().ok()?;
+        let mut le = [0u8; 8];
+        le[..6].copy_from_slice(&id);
+        let (bytes, tm) = self.parsed_table_maps.get(&u64::from_le_bytes(le))?;
+        (bytes[..] == *buf).then(|| tm.clone())
+    }
+
+    /// DeltaForge patch: keep `tm`, parsed from `buf`, for reuse.
+    fn keep_table_map(&mut self, buf: Vec<u8>, tm: Arc<TableMapEvent>) {
+        if self.parsed_table_maps.len() >= TABLE_MAP_REUSE_MAX
+            && !self.parsed_table_maps.contains_key(&tm.table_id)
+        {
+            self.parsed_table_maps.clear();
+        }
+        self.parsed_table_maps.insert(tm.table_id, (buf, tm));
     }
 
     fn parse_next<S: Read + Seek>(
@@ -101,7 +140,14 @@ impl BinlogParser {
             EventType::Query => Ok((header, EventData::Query(QueryEvent::parse(&mut cursor)?))),
 
             EventType::TableMap => {
-                let event_data = TableMapEvent::parse(&mut cursor)?;
+                let event_data = match self.reusable_table_map(&buf) {
+                    Some(tm) => tm,
+                    None => {
+                        let tm = Arc::new(TableMapEvent::parse(&mut cursor)?);
+                        self.keep_table_map(buf, tm.clone());
+                        tm
+                    }
+                };
                 if self
                     .table_map_event_by_table_id
                     .insert(event_data.table_id, event_data.clone())

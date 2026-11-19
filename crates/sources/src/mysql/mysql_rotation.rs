@@ -286,7 +286,7 @@ async fn open_binlog(
             match super::require_supported_server(control, dsn, expected_uuid)
                 .await
             {
-                Ok(()) => Ok(stream),
+                Ok(()) => Ok(*stream),
                 Err(_) => Err(RotationReject::ReplacementOpenFailed),
             }
         }
@@ -394,9 +394,9 @@ impl MySqlRotationRuntime {
     pub(crate) async fn apply_at_boundary(
         &mut self,
         ctx: &mut RunCtx,
-        stream: super::mysql_session::Session,
+        stream: super::mysql_read_ahead::ReadAhead,
         lost: bool,
-    ) -> SourceResult<(super::mysql_session::Session, bool)> {
+    ) -> SourceResult<(super::mysql_read_ahead::ReadAhead, bool)> {
         let Some(ready) = self.mgr.take_ready() else {
             return Ok((stream, false));
         };
@@ -497,17 +497,19 @@ impl MySqlRotationRuntime {
             let frozen = frozen_gtid.clone();
             let control = self.control.clone();
             move || async move {
-                let mut s = open_binlog(
-                    &control,
-                    new_dsn.expose(),
-                    &expected,
-                    &source_id,
-                    server_id,
-                    &frozen,
-                    &default_db,
-                    &cancel,
-                )
-                .await?;
+                let mut s = super::mysql_read_ahead::ReadAhead::spawn(
+                    open_binlog(
+                        &control,
+                        new_dsn.expose(),
+                        &expected,
+                        &source_id,
+                        server_id,
+                        &frozen,
+                        &default_db,
+                        &cancel,
+                    )
+                    .await?,
+                );
                 // The candidate must deliver its first event before it can
                 // replace anything; refused, it is closed and the old
                 // credentials recover the stream.
@@ -540,17 +542,19 @@ impl MySqlRotationRuntime {
             let frozen = frozen_gtid.clone();
             let control = self.control.clone();
             move || async move {
-                let s = open_binlog(
-                    &control,
-                    old_dsn.expose(),
-                    &expected,
-                    &source_id,
-                    server_id,
-                    &frozen,
-                    &default_db,
-                    &cancel,
-                )
-                .await?;
+                let s = super::mysql_read_ahead::ReadAhead::spawn(
+                    open_binlog(
+                        &control,
+                        old_dsn.expose(),
+                        &expected,
+                        &source_id,
+                        server_id,
+                        &frozen,
+                        &default_db,
+                        &cancel,
+                    )
+                    .await?,
+                );
                 *holder.lock().await = Some(s);
                 replaced.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok::<(), RotationReject>(())

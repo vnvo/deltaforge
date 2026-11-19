@@ -209,7 +209,7 @@ impl HttpSink {
             return Ok(self.url.clone());
         }
         // Resolve template against event JSON.
-        let event_json = crate::payload::route_view(event);
+        let event_json = crate::payload::RouteView::new(event);
         self.url_template.resolve_strict(&event_json).map_err(|e| {
             SinkError::Routing {
                 details: e.to_string().into(),

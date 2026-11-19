@@ -306,7 +306,7 @@ where
         let remaining = deadline.saturating_duration_since(Instant::now());
         match timeout(remaining, rx.recv()).await {
             Ok(Some(SourceItem::Event(e))) => {
-                events.push(e);
+                events.push(*e);
                 if cond(&events) {
                     break;
                 }

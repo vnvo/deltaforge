@@ -3731,7 +3731,7 @@ mod tests {
             let mut emitted = Vec::new();
             while let Ok(item) = r.rx.try_recv() {
                 if let SourceItem::Event(e) = item {
-                    emitted.push(e);
+                    emitted.push(*e);
                 }
             }
             assert!(
@@ -4778,7 +4778,7 @@ mod tests {
                         Some(SourceItem::Event(e))
                             if e.ddl.is_none() && e.source.table == table =>
                         {
-                            break e;
+                            break *e;
                         }
                         Some(_) => {}
                         None => panic!("the source ended"),
@@ -4950,7 +4950,7 @@ mod tests {
             let mut emitted = Vec::new();
             while let Ok(item) = r.rx.try_recv() {
                 if let SourceItem::Event(e) = item {
-                    emitted.push(e);
+                    emitted.push(*e);
                 }
             }
             assert!(

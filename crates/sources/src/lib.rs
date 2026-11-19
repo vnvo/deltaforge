@@ -11,10 +11,12 @@
 pub mod credentials;
 pub mod declared_types;
 pub mod durable_checkpoint;
+pub(crate) mod event_counters;
 pub mod failover;
 pub mod gtid_set;
 pub mod identity_resolution;
 pub(crate) mod incident_drafts;
+pub(crate) mod json_template;
 pub mod mysql;
 pub(crate) mod perf_phases;
 pub mod postgres;

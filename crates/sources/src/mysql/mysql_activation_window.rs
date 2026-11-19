@@ -34,7 +34,6 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use deltaforge_core::{CheckpointOrder, SourceError};
-use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
 use mysql_binlog_connector_rust::event::event_data::EventData;
 use mysql_binlog_connector_rust::event::event_header::EventHeader;
 use schema_registry::SourceSchema as _;
@@ -263,7 +262,9 @@ pub(crate) fn touched(
 fn head_tables(
     table_map: &HashMap<
         u64,
-        mysql_binlog_connector_rust::event::table_map_event::TableMapEvent,
+        std::sync::Arc<
+            mysql_binlog_connector_rust::event::table_map_event::TableMapEvent,
+        >,
     >,
     data: &EventData,
     at: &MySqlCheckpoint,
@@ -326,7 +327,7 @@ fn head_tables(
 /// read next.
 async fn prefetch_histories(
     ctx: &mut RunCtx,
-    stream: &mut BinlogStream,
+    stream: &mut super::mysql_read_ahead::ReadAhead,
     head: &[(String, String, MySqlCheckpoint)],
 ) -> Result<(), LoopControl> {
     if ctx.pending.is_some()
@@ -344,13 +345,13 @@ async fn prefetch_histories(
                keys: &mut Vec<storage::adapters::SchemaKey>,
                db: &str,
                table: &str| {
-        let k = scope.key(db, table);
-        if keys.len() < max
-            && ctx.allow.matches(db, table)
-            && !keys.contains(&k)
-            && ctx.selection.timeline(&k.backend_key()).is_none()
-        {
-            keys.push(k);
+        if keys.len() < max && ctx.allow.matches(db, table) {
+            let k = ctx.table_keys.get(&scope, db, table);
+            if !keys.contains(&k.key)
+                && ctx.selection.timeline_at(&k.backend).is_none()
+            {
+                keys.push(k.key.clone());
+            }
         }
     };
     for (db, table, _) in head {
@@ -359,6 +360,8 @@ async fn prefetch_histories(
     if keys.is_empty() {
         return Ok(());
     }
+    // Nothing held waits on the read-ahead below.
+    super::mysql_event::flush(&ctx.tx, &mut ctx.outbox).await;
     let cfg = ctx.proofs.clone();
     let deadline =
         ctx.last_received + Duration::from_millis(cfg.activation_window_ms);
@@ -442,7 +445,7 @@ pub(super) enum Head {
 /// failed closed.
 pub(super) async fn maybe_window(
     ctx: &mut RunCtx,
-    stream: &mut BinlogStream,
+    stream: &mut super::mysql_read_ahead::ReadAhead,
     header: &EventHeader,
     data: &EventData,
 ) -> Result<Head, LoopControl> {
@@ -508,6 +511,8 @@ pub(super) async fn maybe_window(
     if batch.is_empty() && !at_pending_head {
         return not_here(ctx);
     }
+    // A window opens here: nothing held waits on its read-ahead.
+    super::mysql_event::flush(&ctx.tx, &mut ctx.outbox).await;
     let pending = if at_pending_head {
         ctx.pending.take()
     } else if ctx.pending.is_some() {
@@ -911,7 +916,7 @@ impl Prefetch {
     /// admission is dropped).
     async fn during<T>(
         &mut self,
-        stream: &mut BinlogStream,
+        stream: &mut super::mysql_read_ahead::ReadAhead,
         admission: impl std::future::Future<Output = T>,
         collector: &mut Collector,
         cancel: &tokio_util::sync::CancellationToken,
@@ -3859,7 +3864,7 @@ mod tests {
             event_flags: 0,
         };
         let map = |id: u64, table: &str| {
-            EventData::TableMap(TableMapEvent {
+            EventData::TableMap(std::sync::Arc::new(TableMapEvent {
                 table_id: id,
                 database_name: "d".into(),
                 table_name: table.into(),
@@ -3867,7 +3872,7 @@ mod tests {
                 column_metas: vec![0],
                 null_bits: vec![true],
                 table_metadata: None,
-            })
+            }))
         };
         let rows = |id: u64| {
             EventData::WriteRows(WriteRowsEvent {

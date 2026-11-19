@@ -45,6 +45,7 @@ mod mysql_forward_proof;
 mod mysql_helpers;
 mod mysql_history;
 mod mysql_proof_scanner;
+mod mysql_read_ahead;
 mod mysql_selection;
 mod mysql_session;
 mod mysql_signature;
@@ -271,8 +272,9 @@ pub(crate) const READ_TIMEOUT: u64 = 90;
 pub(crate) struct RunCtx {
     source_id: String,
     pipeline: String,
-    /// The pipeline's per-table label policy.
-    table_metrics: Arc<deltaforge_core::table_metrics::TableMetrics>,
+    /// `deltaforge_source_events_total` handles, labelled by the pipeline's
+    /// per-table label policy.
+    event_counters: crate::event_counters::EventCounters,
     tenant: String,
     dsn: crate::credentials::SharedDsn,
     /// The run's capture context: the same DSN and the run's stop.
@@ -293,10 +295,15 @@ pub(crate) struct RunCtx {
     /// The table maps of the transaction being dispatched, by table id:
     /// cleared at its commit boundary and when a stream is reopened (see
     /// `mysql_event::handle_table_map`).
-    table_map: HashMap<u64, TableMapEvent>,
+    table_map: HashMap<u64, Arc<TableMapEvent>>,
     /// The stream parser's installed-table-map count last exported
     /// (`deltaforge_mysql_table_maps_installed_total{map="parser"}`).
     parser_table_maps_installed: u64,
+    /// The source's fixed-label metric handles.
+    meters: mysql_event::SourceMeters,
+    /// What the read loop emitted and has not sent yet
+    /// (see [`mysql_event::Outbox`]).
+    outbox: mysql_event::Outbox,
     last_file: String,
     last_pos: u64,
     /// The executed set through the last proven transaction boundary (GTID
@@ -336,10 +343,18 @@ pub(crate) struct RunCtx {
     /// Evaluation position of rows (spec 7.3): the executed state immediately
     /// before the current transaction - the stream position after the last
     /// commit boundary (or the position the stream (re)started from).
-    txn_eval: Option<crate::durable_checkpoint::WmPos>,
+    /// Held with its GTID set, so the rows' selection never parses it.
+    txn_eval: Option<Arc<crate::durable_checkpoint::ParsedPos>>,
     /// The same position as binlog coordinates (lineage left unset): where a
     /// lazy baseline's scan starts.
     txn_eval_cp: Option<MySqlCheckpoint>,
+    /// The last checkpoint built (rows and commits): a transaction's rows
+    /// share the bytes its predecessor's commit built.
+    checkpoint_memo: mysql_helpers::CheckpointMemo,
+    /// The GTID commit watermarks of [`Self::durable_lineage`].
+    gtid_watermarks: crate::durable_checkpoint::GtidCommitWatermarks,
+    /// Each table's registry and backend keys under the current scope.
+    table_keys: mysql_selection::TableKeys,
     /// GTID mode: the physical start of the current transaction (its GTID
     /// event), the first transaction after `txn_eval_cp`, observed on this
     /// stream (a stream anchor, `docs/design/mysql-proof-seek.md`). Its
@@ -1836,8 +1851,10 @@ impl MySqlSource {
         let mut ctx = RunCtx {
             source_id: self.id.clone(),
             pipeline: self.pipeline.clone(),
-            table_metrics: deltaforge_core::table_metrics::for_pipeline(
+            event_counters: crate::event_counters::EventCounters::new(
                 &self.pipeline,
+                &self.id,
+                deltaforge_core::table_metrics::for_pipeline(&self.pipeline),
             ),
             tenant: self.tenant.clone(),
             dsn: run_dsn,
@@ -1863,6 +1880,8 @@ impl MySqlSource {
             inactivity: Duration::from_secs(60),
             table_map: HashMap::new(),
             parser_table_maps_installed: 0,
+            meters: mysql_event::SourceMeters::new(&self.pipeline, &self.id),
+            outbox: mysql_event::Outbox::new(),
             last_file: init_file,
             last_pos: init_pos,
             last_gtid: init_gtid,
@@ -1875,6 +1894,9 @@ impl MySqlSource {
             lower_case_table_names,
             txn_eval: None,
             txn_eval_cp: None,
+            checkpoint_memo: Default::default(),
+            gtid_watermarks: Default::default(),
+            table_keys: Default::default(),
             txn_anchor: None,
             last_event_start: 0,
             lookahead: Default::default(),
@@ -1959,7 +1981,9 @@ impl MySqlSource {
         }
 
         info!(source_id=%self.id, "connecting for binlog stream ..");
-        let mut stream = connect_first_stream(&ctx, client).await?;
+        let mut stream = mysql_read_ahead::ReadAhead::spawn(
+            connect_first_stream(&ctx, client).await?,
+        );
         ctx.mark_transaction_boundary();
 
         // No schema is enumerated or loaded here (except the tables a
@@ -2053,7 +2077,16 @@ impl MySqlSource {
         let loop_result: SourceResult<()> = async {
             // The stream ended and no reconnect has succeeded yet.
             let mut lost = false;
+            // The loop's items go out in bursts (see `mysql_event::Outbox`).
+            ctx.outbox.set_hold(true);
             loop {
+                // Nothing held waits on a pause, a rotation or a reconnect.
+                if lost
+                    || rotation.is_some()
+                    || ctx.paused.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    mysql_event::flush(&ctx.tx, &mut ctx.outbox).await;
+                }
                 if !pause_until_resumed(
                     &ctx.cancel,
                     &ctx.paused,
@@ -2120,7 +2153,7 @@ impl MySqlSource {
                     }
                     match reconnect_stream(&mut ctx).await {
                         Ok(s) => {
-                            stream = s;
+                            stream = mysql_read_ahead::ReadAhead::spawn(s);
                             lost = false;
                             ctx.mark_transaction_boundary();
                         }
@@ -2204,6 +2237,11 @@ impl MySqlSource {
             Ok(())
         }
         .await;
+        // What the loop held goes out on every exit, before the teardown
+        // below: exactly what was sent before a stop or a failure without
+        // holding (a closed channel drops it, as it would have then).
+        ctx.outbox.set_hold(false);
+        mysql_event::flush(&ctx.tx, &mut ctx.outbox).await;
 
         // Cancel and join the rotation tasks on every exit path (normal or fatal).
         if let Some(rt) = rotation.take() {
@@ -2533,7 +2571,7 @@ async fn connect_first_stream(
                 &expected,
             )
             .await?;
-            Ok(stream)
+            Ok(*stream)
         }
         // Startup verified this server on every earlier connection: a
         // replication session elsewhere is split routing, never a failover.
@@ -2618,7 +2656,7 @@ async fn reconnect_stream(
         Opened::Stream(stream) => {
             ctx.retry.reset();
             check_identity_post_reconnect(ctx, None, &resume).await?;
-            return Ok(stream);
+            return Ok(*stream);
         }
         Opened::OtherServer(found) => found,
     };
@@ -2665,7 +2703,7 @@ async fn reconnect_stream(
                 &expected,
             )
             .await?;
-            Ok(stream)
+            Ok(*stream)
         }
         Opened::OtherServer(other) => Err(SourceError::Lineage {
             details: format!(
@@ -2723,7 +2761,7 @@ impl RunCtx {
     /// transaction is open.
     /// The canonical text of the executed set through the last boundary.
     pub(crate) fn gtid_text(&self) -> Option<String> {
-        self.last_gtid.as_ref().map(GtidSet::to_string)
+        self.last_gtid.as_ref().map(GtidSet::text)
     }
 
     pub(crate) fn executed_through_current(&self) -> Option<GtidSet> {
@@ -2753,6 +2791,42 @@ impl RunCtx {
             (Some(cp), true) => (cp.file.clone(), cp.pos, cp.gtid_set.clone()),
             _ => (self.last_file.clone(), self.last_pos, self.gtid_text()),
         }
+    }
+
+    /// The checkpoint of the rows read now: [`Self::resume_point`] under the
+    /// current lineage, shared with the last checkpoint built when that is
+    /// the same boundary (the commit that opened the rows' transaction).
+    pub(crate) fn row_checkpoint(&mut self) -> deltaforge_core::CheckpointMeta {
+        let scope = self.registry_scope.current().ok();
+        let lineage = scope.as_ref().map(|s| s.lineage().lineage_hash.as_str());
+        if let (Some(cp), true) = (&self.txn_eval_cp, self.transaction_open()) {
+            return self.checkpoint_memo.get(
+                &cp.file,
+                cp.pos,
+                cp.gtid_set.as_deref(),
+                lineage,
+            );
+        }
+        let gtid = self.gtid_text();
+        self.checkpoint_memo.get(
+            &self.last_file,
+            self.last_pos,
+            gtid.as_deref(),
+            lineage,
+        )
+    }
+
+    /// The checkpoint of the commit boundary at the stream's position with
+    /// `gtid` executed, under the current lineage (shared with the rows of
+    /// the next transaction).
+    pub(crate) fn boundary_checkpoint(
+        &mut self,
+        gtid: Option<&str>,
+    ) -> deltaforge_core::CheckpointMeta {
+        let scope = self.registry_scope.current().ok();
+        let lineage = scope.as_ref().map(|s| s.lineage().lineage_hash.as_str());
+        self.checkpoint_memo
+            .get(&self.last_file, self.last_pos, gtid, lineage)
     }
 
     /// Before a stream is reopened: a transaction cut short by the
@@ -2791,11 +2865,17 @@ impl RunCtx {
             "source" => self.source_id.clone(),
         )
         .increment(1);
-        if let Some(tx_id) = self.current_gtid.take() {
-            self.tx
-                .send(SourceItem::TxAbort { tx_id })
-                .await
-                .map_err(|e| SourceError::Other(e.into()))?;
+        if let Some(tx_id) = self.current_gtid.take()
+            && !mysql_event::emit(
+                &self.tx,
+                &mut self.outbox,
+                SourceItem::TxAbort { tx_id },
+            )
+            .await
+        {
+            return Err(SourceError::Other(anyhow::anyhow!(
+                "the coordinator channel is closed"
+            )));
         }
         self.in_explicit_txn = false;
         self.txn_anchor = None;
@@ -2817,24 +2897,35 @@ impl RunCtx {
     }
 
     /// The stream is at a transaction boundary: rows of the next transaction
-    /// are evaluated at the current position.
-    pub(crate) fn mark_transaction_boundary(&mut self) {
+    /// are evaluated at the current position. Returns the executed GTID set
+    /// as text ([`Self::gtid_text`], written once here).
+    pub(crate) fn mark_transaction_boundary(&mut self) -> Option<String> {
+        use crate::durable_checkpoint::{ParsedPos, WmPos};
         self.rows_ordinal = 0;
         self.txn_anchor = None;
-        let gtid = self.gtid_text();
-        self.txn_eval = crate::durable_checkpoint::mysql_checkpoint_position(
-            &self.last_file,
-            self.last_pos,
-            gtid.as_deref(),
-        );
+        let eval = match &self.last_gtid {
+            Some(set) => Some(ParsedPos::gtid(set.clone())),
+            None => crate::durable_checkpoint::mysql_checkpoint_position(
+                &self.last_file,
+                self.last_pos,
+                None,
+            )
+            .map(ParsedPos::new),
+        };
+        let gtid = match eval.as_ref().map(ParsedPos::pos) {
+            Some(WmPos::MysqlGtid { gtid_set }) => Some(gtid_set.clone()),
+            _ => None,
+        };
+        self.txn_eval = eval.map(Arc::new);
         self.txn_eval_cp = Some(MySqlCheckpoint {
             file: self.last_file.clone(),
             pos: self.last_pos,
-            gtid_set: gtid,
+            gtid_set: gtid.clone(),
             lineage: None,
             snapshot_completed: None,
             snapshot_chain: None,
         });
+        gtid
     }
 
     /// The stream anchor at `txn_eval_cp`, of the verified identity

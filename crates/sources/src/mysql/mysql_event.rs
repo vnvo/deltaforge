@@ -11,7 +11,6 @@ use metrics::counter;
 use mysql_binlog_connector_rust::column::column_value::ColumnValue;
 use mysql_binlog_connector_rust::{
     binlog_parser::BinlogParser,
-    binlog_stream::BinlogStream,
     event::{
         event_data::EventData, event_header::EventHeader,
         table_map_event::TableMapEvent,
@@ -26,28 +25,105 @@ use crate::mysql::mysql_helpers::{
 
 use deltaforge_config::OUTBOX_SCHEMA_SENTINEL;
 
-/// Send an event to the coordinator channel.
-///
-/// Uses `try_send` (non-blocking) when the channel has capacity to avoid
-/// the overhead of the async state machine on every single row. Falls back
-/// to the async `send` only when the channel is full (backpressure).
-#[inline]
-async fn send_event(
-    tx: &tokio::sync::mpsc::Sender<SourceItem>,
-    ev: Event,
-) -> bool {
-    match tx.try_send(SourceItem::Event(ev)) {
-        Ok(()) => true,
-        Err(tokio::sync::mpsc::error::TrySendError::Full(item)) => {
-            // Channel full - apply backpressure via async wait.
-            tx.send(item).await.is_ok()
+/// Most items the read loop holds before it sends them.
+const OUTBOX_ITEMS: usize = 256;
+
+/// The source's items on their way to the coordinator's channel. While the
+/// binlog read loop holds ([`Outbox::set_hold`]) they are kept and sent in
+/// one burst - when the next binlog event is not already received, at
+/// [`OUTBOX_ITEMS`], and before any wait of the loop - so a coordinator on
+/// another worker is woken once per burst rather than once per item. Every
+/// other caller sends at once. Either way the channel receives the items
+/// in the order they were emitted.
+pub(crate) struct Outbox {
+    held: std::collections::VecDeque<SourceItem>,
+    hold: bool,
+}
+
+impl Outbox {
+    pub(crate) fn new() -> Self {
+        Self {
+            held: std::collections::VecDeque::new(),
+            hold: false,
         }
-        Err(_) => false, // channel closed
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+
+    /// Whether emitted items are held (the read loop) or sent at once.
+    pub(crate) fn set_hold(&mut self, hold: bool) {
+        self.hold = hold;
     }
 }
 
+/// Send one item: `try_send` while the channel has room (no async state
+/// machine per row), the awaiting `send` only when it is full
+/// (backpressure). False when the channel is closed (shutdown).
+#[inline]
+async fn send_item(
+    tx: &tokio::sync::mpsc::Sender<SourceItem>,
+    item: SourceItem,
+) -> bool {
+    match tx.try_send(item) {
+        Ok(()) => true,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(item)) => {
+            tx.send(item).await.is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
+/// Emit `item` after everything emitted before it: held while the read
+/// loop holds, else sent at once. False when the channel is closed
+/// (shutdown): what was held is dropped with it.
+pub(crate) async fn emit(
+    tx: &tokio::sync::mpsc::Sender<SourceItem>,
+    out: &mut Outbox,
+    item: SourceItem,
+) -> bool {
+    if out.hold {
+        out.held.push_back(item);
+        if out.held.len() >= OUTBOX_ITEMS {
+            return flush(tx, out).await;
+        }
+        return true;
+    }
+    flush(tx, out).await && send_item(tx, item).await
+}
+
+/// Send everything held, in order. False when the channel is closed: the
+/// rest is dropped (nothing reads it). Cancel-safe (a window's time bound
+/// can interrupt it): an item leaves the outbox only with the channel's
+/// room for it in hand, so an interrupted flush loses nothing.
+pub(crate) async fn flush(
+    tx: &tokio::sync::mpsc::Sender<SourceItem>,
+    out: &mut Outbox,
+) -> bool {
+    use tokio::sync::mpsc::error::TrySendError;
+    while let Some(item) = out.held.pop_front() {
+        match tx.try_send(item) {
+            Ok(()) => {}
+            Err(TrySendError::Full(item)) => {
+                out.held.push_front(item);
+                let Ok(room) = tx.reserve().await else {
+                    out.held.clear();
+                    return false;
+                };
+                room.send(out.held.pop_front().expect("the item put back"));
+            }
+            Err(TrySendError::Closed(_)) => {
+                out.held.clear();
+                return false;
+            }
+        }
+    }
+    true
+}
+
 pub(super) async fn read_next_event(
-    stream: &mut BinlogStream,
+    stream: &mut super::mysql_read_ahead::ReadAhead,
     ctx: &mut RunCtx,
 ) -> Result<(EventHeader, EventData), LoopControl> {
     // Test hook: the connection "dropped" right here.
@@ -65,14 +141,38 @@ pub(super) async fn read_next_event(
     let read = match ctx.prefetch_error.take() {
         Some(e) => Err(common::RetryOutcome::Failed(e)),
         None => {
-            watchdog(stream.read(), ctx.inactivity, &ctx.cancel, "binlog_read")
-                .await
+            // Held items go out before the loop would wait for the stream:
+            // an event already received is taken without waiting (the read
+            // is cancel-safe: the vendored channel keeps what it read).
+            let ready = if ctx.outbox.is_empty() {
+                None
+            } else {
+                tokio::select! {
+                    biased;
+                    r = stream.read() => Some(r),
+                    () = std::future::ready(()) => None,
+                }
+            };
+            match ready {
+                Some(Ok(event)) => Ok(event),
+                Some(Err(e)) => Err(common::RetryOutcome::Failed(e)),
+                None => {
+                    flush(&ctx.tx, &mut ctx.outbox).await;
+                    watchdog(
+                        stream.read(),
+                        ctx.inactivity,
+                        &ctx.cancel,
+                        "binlog_read",
+                    )
+                    .await
+                }
+            }
         }
     };
     match read {
         Ok(event) => {
             ctx.last_received = std::time::Instant::now();
-            note_parser_table_maps(ctx, &stream.parser, &event.1);
+            note_parser_table_maps(ctx, stream.table_maps(), &event.1);
             Ok(event)
         }
         Err(outcome) => {
@@ -136,12 +236,7 @@ pub(super) async fn dispatch_event(
         "event received"
     );
 
-    counter!(
-        "deltaforge_source_bytes_total",
-        "pipeline" => ctx.pipeline.clone(),
-        "source" => ctx.source_id.clone(),
-    )
-    .increment(header.event_length as u64);
+    ctx.meters.bytes.increment(header.event_length as u64);
 
     match data {
         // A compressed transaction: its events, in order. They have no
@@ -240,7 +335,7 @@ async fn dispatch_kind(
 #[instrument(skip_all, fields(source_id=%ctx.source_id))]
 async fn handle_table_map(
     ctx: &mut RunCtx,
-    tm: TableMapEvent,
+    tm: std::sync::Arc<TableMapEvent>,
 ) -> SourceResult<()> {
     debug!(
         table_id = tm.table_id,
@@ -252,13 +347,7 @@ async fn handle_table_map(
     // by the allow-list only once its table is known. The map lives until
     // the transaction's commit boundary (`release_table_maps`).
     if ctx.table_map.insert(tm.table_id, tm).is_none() {
-        counter!(
-            "deltaforge_mysql_table_maps_installed_total",
-            "pipeline" => ctx.pipeline.clone(),
-            "source" => ctx.source_id.clone(),
-            "map" => "source",
-        )
-        .increment(1);
+        ctx.meters.source_maps_installed.increment(1);
         set_table_maps(ctx, "source", ctx.table_map.len());
     }
     Ok(())
@@ -268,13 +357,59 @@ async fn handle_table_map(
 /// stream's binlog parser (`parser`) or by the dispatching source
 /// (`source`). Both are bounded by the open transaction's tables.
 fn set_table_maps(ctx: &RunCtx, map: &'static str, n: usize) {
-    metrics::gauge!(
-        "deltaforge_mysql_table_maps",
-        "pipeline" => ctx.pipeline.clone(),
-        "source" => ctx.source_id.clone(),
-        "map" => map,
-    )
-    .set(n as f64);
+    match map {
+        "source" => ctx.meters.source_maps.set(n as f64),
+        "parser" => ctx.meters.parser_maps.set(n as f64),
+        _ => metrics::gauge!(
+            "deltaforge_mysql_table_maps",
+            "pipeline" => ctx.pipeline.clone(),
+            "source" => ctx.source_id.clone(),
+            "map" => map,
+        )
+        .set(n as f64),
+    }
+}
+
+/// The source's metrics whose labels never change, registered once (not
+/// looked up again for every binlog event).
+pub(crate) struct SourceMeters {
+    bytes: metrics::Counter,
+    source_maps_installed: metrics::Counter,
+    parser_maps_installed: metrics::Counter,
+    source_maps: metrics::Gauge,
+    parser_maps: metrics::Gauge,
+}
+
+impl SourceMeters {
+    pub(crate) fn new(pipeline: &str, source: &str) -> Self {
+        let installed = |map: &'static str| {
+            counter!(
+                "deltaforge_mysql_table_maps_installed_total",
+                "pipeline" => pipeline.to_string(),
+                "source" => source.to_string(),
+                "map" => map,
+            )
+        };
+        let maps = |map: &'static str| {
+            metrics::gauge!(
+                "deltaforge_mysql_table_maps",
+                "pipeline" => pipeline.to_string(),
+                "source" => source.to_string(),
+                "map" => map,
+            )
+        };
+        Self {
+            bytes: counter!(
+                "deltaforge_source_bytes_total",
+                "pipeline" => pipeline.to_string(),
+                "source" => source.to_string(),
+            ),
+            source_maps_installed: installed("source"),
+            parser_maps_installed: installed("parser"),
+            source_maps: maps("source"),
+            parser_maps: maps("parser"),
+        }
+    }
 }
 
 /// Release the dispatching source's table maps. At a transaction's commit
@@ -294,7 +429,7 @@ pub(super) fn release_table_maps(ctx: &mut RunCtx) {
 /// installations since the last export) after a read that can change them.
 fn note_parser_table_maps(
     ctx: &mut RunCtx,
-    parser: &BinlogParser,
+    (installed, held): (u64, usize),
     data: &EventData,
 ) {
     if !matches!(
@@ -306,22 +441,15 @@ fn note_parser_table_maps(
     ) {
         return;
     }
-    let installed = parser.table_maps_installed;
     // A reopened stream's parser counts from zero.
     let new = installed
         .checked_sub(ctx.parser_table_maps_installed)
         .unwrap_or(installed);
     ctx.parser_table_maps_installed = installed;
     if new > 0 {
-        counter!(
-            "deltaforge_mysql_table_maps_installed_total",
-            "pipeline" => ctx.pipeline.clone(),
-            "source" => ctx.source_id.clone(),
-            "map" => "parser",
-        )
-        .increment(new);
+        ctx.meters.parser_maps_installed.increment(new);
     }
-    set_table_maps(ctx, "parser", parser.table_map_event_by_table_id.len());
+    set_table_maps(ctx, "parser", held);
 }
 
 /// Build SourceInfo for MySQL events
@@ -397,7 +525,7 @@ async fn handle_write_rows(
     wr: mysql_binlog_connector_rust::event::write_rows_event::WriteRowsEvent,
 ) -> SourceResult<()> {
     if let Some(tm) = ctx.table_map.get(&wr.table_id).cloned() {
-        let tm = &tm;
+        let tm: &TableMapEvent = &tm;
         if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
             return Ok(());
         }
@@ -419,13 +547,7 @@ async fn handle_write_rows(
         // Inside a transaction a row's checkpoint is the last proven
         // boundary: a resume from it re-reads the transaction, never starts
         // inside it.
-        let (cp_file, cp_pos, cp_gtid) = ctx.resume_point();
-        let checkpoint = make_checkpoint_meta(
-            &cp_file,
-            cp_pos,
-            &cp_gtid,
-            checkpoint_lineage(&ctx.registry_scope),
-        );
+        let checkpoint = ctx.row_checkpoint();
         let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
             id: gtid.clone(),
             total_order: None,
@@ -475,7 +597,7 @@ async fn handle_write_rows(
             ev.schema_version = Some(fingerprint_str.clone());
             ev.schema_sequence = Some(loaded.sequence);
 
-            if send_event(&ctx.tx, ev).await {
+            if emit(&ctx.tx, &mut ctx.outbox, SourceItem::event(ev)).await {
                 sent += 1;
             } else {
                 error!(source_id=%ctx.source_id, "channel send failed (op=insert)");
@@ -484,11 +606,7 @@ async fn handle_write_rows(
 
         // Batch metrics: one counter increment per binlog event instead of per row.
         if sent > 0 {
-            counter!(
-                "deltaforge_source_events_total",
-                source_event_labels(ctx, tm, "c"),
-            )
-            .increment(sent);
+            count_source_events(ctx, tm, "c", sent);
         }
     } else {
         return Err(super::mysql_errors::unmapped_table_id(wr.table_id));
@@ -502,7 +620,7 @@ async fn handle_update_rows(
     ur: mysql_binlog_connector_rust::event::update_rows_event::UpdateRowsEvent,
 ) -> SourceResult<()> {
     if let Some(tm) = ctx.table_map.get(&ur.table_id).cloned() {
-        let tm = &tm;
+        let tm: &TableMapEvent = &tm;
         if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
             return Ok(());
         }
@@ -530,13 +648,7 @@ async fn handle_update_rows(
         // Inside a transaction a row's checkpoint is the last proven
         // boundary: a resume from it re-reads the transaction, never starts
         // inside it.
-        let (cp_file, cp_pos, cp_gtid) = ctx.resume_point();
-        let checkpoint = make_checkpoint_meta(
-            &cp_file,
-            cp_pos,
-            &cp_gtid,
-            checkpoint_lineage(&ctx.registry_scope),
-        );
+        let checkpoint = ctx.row_checkpoint();
         let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
             id: gtid.clone(),
             total_order: None,
@@ -585,7 +697,7 @@ async fn handle_update_rows(
             ev.schema_version = Some(fingerprint_str.clone());
             ev.schema_sequence = Some(sequence);
 
-            if send_event(&ctx.tx, ev).await {
+            if emit(&ctx.tx, &mut ctx.outbox, SourceItem::event(ev)).await {
                 sent += 1;
             } else {
                 error!(source_id=%ctx.source_id, "channel send failed (op=update)");
@@ -593,11 +705,7 @@ async fn handle_update_rows(
         }
 
         if sent > 0 {
-            counter!(
-                "deltaforge_source_events_total",
-                source_event_labels(ctx, tm, "u"),
-            )
-            .increment(sent);
+            count_source_events(ctx, tm, "u", sent);
         }
     } else {
         return Err(super::mysql_errors::unmapped_table_id(ur.table_id));
@@ -611,7 +719,7 @@ async fn handle_delete_rows(
     dr: mysql_binlog_connector_rust::event::delete_rows_event::DeleteRowsEvent,
 ) -> SourceResult<()> {
     if let Some(tm) = ctx.table_map.get(&dr.table_id).cloned() {
-        let tm = &tm;
+        let tm: &TableMapEvent = &tm;
         if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
             return Ok(());
         }
@@ -631,13 +739,7 @@ async fn handle_delete_rows(
         // Inside a transaction a row's checkpoint is the last proven
         // boundary: a resume from it re-reads the transaction, never starts
         // inside it.
-        let (cp_file, cp_pos, cp_gtid) = ctx.resume_point();
-        let checkpoint = make_checkpoint_meta(
-            &cp_file,
-            cp_pos,
-            &cp_gtid,
-            checkpoint_lineage(&ctx.registry_scope),
-        );
+        let checkpoint = ctx.row_checkpoint();
         let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
             id: gtid.clone(),
             total_order: None,
@@ -682,7 +784,7 @@ async fn handle_delete_rows(
             ev.schema_version = Some(fingerprint_str.clone());
             ev.schema_sequence = Some(sequence);
 
-            if send_event(&ctx.tx, ev).await {
+            if emit(&ctx.tx, &mut ctx.outbox, SourceItem::event(ev)).await {
                 sent += 1;
             } else {
                 error!(source_id=%ctx.source_id, "channel send failed (op=delete)");
@@ -690,11 +792,7 @@ async fn handle_delete_rows(
         }
 
         if sent > 0 {
-            counter!(
-                "deltaforge_source_events_total",
-                source_event_labels(ctx, tm, "d"),
-            )
-            .increment(sent);
+            count_source_events(ctx, tm, "d", sent);
         }
     } else {
         return Err(super::mysql_errors::unmapped_table_id(dr.table_id));
@@ -801,9 +899,10 @@ async fn handle_xid(ctx: &mut RunCtx) {
 /// events and its closing `TxCommit`. Only emitted in GTID mode; without a GTID
 /// there is no stable per-transaction identity, so events flow as standalone
 /// boundaries and no markers are sent. Best-effort (a closed channel = shutdown).
-async fn emit_tx_begin(ctx: &RunCtx) {
+async fn emit_tx_begin(ctx: &mut RunCtx) {
     if let Some(tx_id) = ctx.current_gtid.clone() {
-        let _ = ctx.tx.send(SourceItem::TxBegin { tx_id }).await;
+        let _ =
+            emit(&ctx.tx, &mut ctx.outbox, SourceItem::TxBegin { tx_id }).await;
     }
 }
 
@@ -816,26 +915,32 @@ async fn emit_tx_commit(ctx: &mut RunCtx) {
     // Any close ends the explicit-transaction state (safe even in non-GTID mode,
     // where the early return below skips the marker).
     ctx.in_explicit_txn = false;
-    // The transaction is complete: only now does it join the committed set.
-    ctx.last_gtid = ctx.executed_through_current();
+    // The transaction is complete: only now does it join the committed set
+    // (in place: [`RunCtx::executed_through_current`] without the copy).
+    if let Some(g) = &ctx.current_gtid {
+        // `handle_gtid` admits only well-formed GTIDs.
+        let added = ctx.last_gtid.get_or_insert_default().insert(g);
+        debug_assert!(added, "current GTID {g:?} is well formed");
+    }
     // Rows of the next transaction are evaluated at this boundary.
-    ctx.mark_transaction_boundary();
+    let gtid = ctx.mark_transaction_boundary();
     release_table_maps(ctx);
     let Some(tx_id) = ctx.current_gtid.clone() else {
         return;
     };
-    let checkpoint = make_checkpoint_meta(
-        &ctx.last_file,
-        ctx.last_pos,
-        &ctx.gtid_text(),
-        checkpoint_lineage(&ctx.registry_scope),
-    );
     // Watermark and checkpoint describe the SAME commit boundary.
+    let durable_watermark = build_cdc_watermark_at(ctx, gtid.as_deref());
+    let checkpoint = ctx.boundary_checkpoint(gtid.as_deref());
     let boundary = deltaforge_core::SourceBoundary {
         checkpoint,
-        durable_watermark: build_cdc_watermark(ctx),
+        durable_watermark,
     };
-    let _ = ctx.tx.send(SourceItem::TxCommit { tx_id, boundary }).await;
+    let _ = emit(
+        &ctx.tx,
+        &mut ctx.outbox,
+        SourceItem::TxCommit { tx_id, boundary },
+    )
+    .await;
     // Transaction closed - the next transaction opens with its own GTID event.
     ctx.current_gtid = None;
 }
@@ -861,16 +966,27 @@ fn standalone_row_watermark(
 /// position. `None` if lineage is unavailable - durable mode fails closed at the
 /// sink; we never synthesize a lineage.
 fn build_cdc_watermark(ctx: &RunCtx) -> Option<std::sync::Arc<[u8]>> {
+    build_cdc_watermark_at(ctx, ctx.gtid_text().as_deref())
+}
+
+/// [`build_cdc_watermark`] with the executed set's text already written
+/// (`gtid`, [`RunCtx::gtid_text`]).
+fn build_cdc_watermark_at(
+    ctx: &RunCtx,
+    gtid: Option<&str>,
+) -> Option<std::sync::Arc<[u8]>> {
     use crate::durable_checkpoint::DurableWatermark;
     use crate::snapshot_generation::PersistedLineage;
-    let lineage = ctx.durable_lineage.clone()?;
-    let wm = match &lineage {
+    let lineage = ctx.durable_lineage.as_ref()?;
+    let wm = match lineage {
         PersistedLineage::MysqlGtid { .. } => {
-            DurableWatermark::mysql_gtid_commit(lineage, ctx.gtid_text()?)
+            return Some(std::sync::Arc::from(
+                ctx.gtid_watermarks.bytes(lineage, gtid?),
+            ));
         }
         PersistedLineage::MysqlServer { .. } => {
             DurableWatermark::mysql_binlog_commit(
-                lineage,
+                lineage.clone(),
                 &ctx.last_file,
                 ctx.last_pos,
             )?
@@ -1102,7 +1218,7 @@ async fn emit_ddl_event(
         data_collection_order: None,
     });
 
-    if (ctx.tx.send(SourceItem::Event(ev)).await).is_err() {
+    if !emit(&ctx.tx, &mut ctx.outbox, SourceItem::event(ev)).await {
         error!(source_id=%ctx.source_id, "channel send failed (op=ddl)");
     }
     // DDL is auto-committed (its own transaction) → emit its boundary.
@@ -1624,20 +1740,16 @@ pub(crate) fn ddl_identity(
 
 /// `deltaforge_source_events_total` labels for `tm`'s table (table labels
 /// only when the pipeline enables per-table detail).
-fn source_event_labels(
-    ctx: &RunCtx,
+/// `deltaforge_source_events_total` += `n` for `op` rows of `tm`'s table
+/// (`db.table` under the per-table label policy).
+fn count_source_events(
+    ctx: &mut RunCtx,
     tm: &TableMapEvent,
     op: &'static str,
-) -> Vec<metrics::Label> {
-    let table = format!("{}.{}", tm.database_name, tm.table_name);
-    deltaforge_core::table_metrics::with_table(
-        vec![
-            metrics::Label::new("pipeline", ctx.pipeline.clone()),
-            metrics::Label::new("source", ctx.source_id.clone()),
-            metrics::Label::new("op", op),
-        ],
-        ctx.table_metrics.label(&table).as_ref(),
-    )
+    n: u64,
+) {
+    ctx.event_counters
+        .add_qualified(&tm.database_name, &tm.table_name, op, n);
 }
 
 #[cfg(test)]
@@ -1679,7 +1791,7 @@ pub(crate) mod tests {
         tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(item) = rx.recv().await {
                 if let SourceItem::Event(ev) = item {
-                    return Some(ev);
+                    return Some(*ev);
                 }
             }
             None
@@ -1712,7 +1824,7 @@ pub(crate) mod tests {
         let mut table_map = HashMap::new();
         table_map.insert(
             TABLE_ID,
-            TableMapEvent {
+            Arc::new(TableMapEvent {
                 table_id: TABLE_ID,
                 database_name: "shop".to_string(),
                 table_name: "orders".to_string(),
@@ -1726,15 +1838,19 @@ pub(crate) mod tests {
                 column_metas: vec![0, 255],
                 null_bits: vec![true, true],
                 table_metadata: None,
-            },
+            }),
         );
 
         RunCtx {
             source_id: "unit-test".to_string(),
             pipeline: "test-pipeline".to_string(),
-            table_metrics: Arc::new(
-                deltaforge_core::table_metrics::TableMetrics::disabled(
-                    "test-pipeline",
+            event_counters: crate::event_counters::EventCounters::new(
+                "test-pipeline",
+                "unit-test",
+                Arc::new(
+                    deltaforge_core::table_metrics::TableMetrics::disabled(
+                        "test-pipeline",
+                    ),
                 ),
             ),
             tenant: "test-tenant".to_string(),
@@ -1757,6 +1873,8 @@ pub(crate) mod tests {
             type_mapping: deltaforge_core::TypeMapping::V2,
             table_map,
             parser_table_maps_installed: 0,
+            meters: SourceMeters::new("test-pipeline", "unit-test"),
+            outbox: Outbox::new(),
             last_file: "mysql-bin.000001".to_string(),
             last_pos: 1234,
             last_gtid: Some(
@@ -1777,6 +1895,9 @@ pub(crate) mod tests {
             lower_case_table_names: 0,
             txn_eval: None,
             txn_eval_cp: None,
+            checkpoint_memo: Default::default(),
+            gtid_watermarks: Default::default(),
+            table_keys: Default::default(),
             txn_anchor: None,
             last_event_start: 0,
             lookahead: Default::default(),
@@ -1920,13 +2041,11 @@ pub(crate) mod tests {
         // The binlog recorded three columns (a row written before a column was
         // dropped); the schema used for decoding has two. The reload of the live
         // schema cannot fix it, so the rows must be refused.
-        ctx.table_map.get_mut(&TABLE_ID).unwrap().column_types.push(
+        Arc::make_mut(ctx.table_map.get_mut(&TABLE_ID).unwrap()).column_types.push(
             mysql_binlog_connector_rust::column::column_type::ColumnType::VarChar
                 as u8,
         );
-        ctx.table_map
-            .get_mut(&TABLE_ID)
-            .unwrap()
+        Arc::make_mut(ctx.table_map.get_mut(&TABLE_ID).unwrap())
             .column_metas
             .push(255);
 
@@ -2143,6 +2262,89 @@ pub(crate) mod tests {
             "position.gtid must be the exact per-tx GTID, not the merged set"
         );
         assert_eq!(produced.source.position.row, Some(0));
+    }
+
+    /// Rows read inside a transaction carry the checkpoint of the boundary
+    /// before it (a resume reads the whole transaction again), never the
+    /// stream position past the rows already read; the next transaction's
+    /// rows carry the boundary its predecessor's commit wrote, byte for byte.
+    #[tokio::test]
+    async fn rows_inside_a_transaction_carry_the_boundary_before_it() {
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(16);
+        let mut ctx = make_runctx(tx);
+        ctx.current_gtid = None;
+        ctx.in_explicit_txn = false;
+        ctx.last_gtid = Some(GtidSet::parse(&format!("{UUID}:1-5")).unwrap());
+        ctx.last_file = "mysql-bin.000004".into();
+        ctx.last_pos = 1000;
+        prove_orders(&mut ctx).await;
+        // A commit releases its table maps: each transaction maps its table.
+        let map = (*ctx.table_map[&TABLE_ID]).clone();
+        let rows = |id: i64| WriteRowsEvent {
+            table_id: TABLE_ID,
+            included_columns: vec![true, true],
+            rows: vec![RowEvent {
+                column_values: vec![
+                    ColumnValue::LongLong(id),
+                    ColumnValue::String(b"sku".to_vec()),
+                ],
+            }],
+        };
+        let checkpoint_of = |ev: &Event| -> MySqlCheckpoint {
+            serde_json::from_slice(ev.checkpoint().unwrap().as_bytes()).unwrap()
+        };
+
+        handle_gtid(
+            &mut ctx,
+            GtidEvent {
+                flags: 0,
+                gtid: format!("{UUID}:6"),
+            },
+        )
+        .await
+        .unwrap();
+        ctx.last_pos = 1600;
+        handle_write_rows(&mut ctx, &make_header(), rows(1))
+            .await
+            .unwrap();
+        let first = recv_event(&mut rx).await.expect("a row");
+        let cp = checkpoint_of(&first);
+        assert_eq!(
+            (cp.file.as_str(), cp.pos, cp.gtid_set.clone()),
+            ("mysql-bin.000004", 1000, Some(format!("{UUID}:1-5")))
+        );
+
+        ctx.last_pos = 1650;
+        emit_tx_commit(&mut ctx).await;
+        let commit = loop {
+            match rx.recv().await.expect("the commit") {
+                SourceItem::TxCommit { boundary, .. } => {
+                    break boundary.checkpoint;
+                }
+                _ => continue,
+            }
+        };
+        handle_gtid(
+            &mut ctx,
+            GtidEvent {
+                flags: 0,
+                gtid: format!("{UUID}:7"),
+            },
+        )
+        .await
+        .unwrap();
+        handle_table_map(&mut ctx, Arc::new(map)).await.unwrap();
+        ctx.last_pos = 2200;
+        handle_write_rows(&mut ctx, &make_header(), rows(2))
+            .await
+            .unwrap();
+        let second = recv_event(&mut rx).await.expect("a row");
+        assert_eq!(second.checkpoint().unwrap().as_bytes(), commit.as_bytes());
+        let cp = checkpoint_of(&second);
+        assert_eq!(
+            (cp.file.as_str(), cp.pos, cp.gtid_set.clone()),
+            ("mysql-bin.000004", 1650, Some(format!("{UUID}:1-6")))
+        );
     }
 
     #[tokio::test]
@@ -2495,13 +2697,17 @@ pub(crate) mod tests {
         // GTID position when the fixture's GTID text is a placeholder.
         ctx.mark_transaction_boundary();
         let comparable = ctx.txn_eval.as_ref().is_some_and(|p| {
-            crate::durable_checkpoint::order_positions(p, p)
+            crate::durable_checkpoint::order_positions(p.pos(), p.pos())
                 == deltaforge_core::CheckpointOrder::Equal
         });
         if !comparable {
-            ctx.txn_eval = Some(crate::durable_checkpoint::WmPos::MysqlGtid {
-                gtid_set: format!("{UUID}:1-5"),
-            });
+            ctx.txn_eval = Some(std::sync::Arc::new(
+                crate::durable_checkpoint::ParsedPos::new(
+                    crate::durable_checkpoint::WmPos::MysqlGtid {
+                        gtid_set: format!("{UUID}:1-5"),
+                    },
+                ),
+            ));
         }
         prove_table(ctx, "orders").await;
     }
@@ -2515,7 +2721,7 @@ pub(crate) mod tests {
             table_stream,
         };
         use crate::mysql::mysql_table_schema::{MySqlColumn, MySqlTableSchema};
-        let r0 = ctx.txn_eval.clone().unwrap();
+        let r0 = ctx.txn_eval.as_ref().unwrap().pos().clone();
         let mut sku =
             MySqlColumn::new("sku", "varchar(255)", "varchar", true, 2);
         sku.char_octet_length = Some(255);
@@ -2568,29 +2774,74 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn source_event_labels_follow_the_per_table_policy() {
+    fn source_events_are_counted_under_the_per_table_policy() {
         use deltaforge_core::table_metrics::{PerTablePolicy, TableMetrics};
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
         let (tx, _rx) = mpsc::channel::<SourceItem>(8);
         let mut ctx = make_runctx(tx);
-        let tm = ctx.table_map[&TABLE_ID].clone();
-        let keys = |labels: Vec<metrics::Label>| {
-            labels
-                .iter()
-                .map(|l| (l.key().to_string(), l.value().to_string()))
-                .collect::<Vec<_>>()
+        let tm = (*ctx.table_map[&TABLE_ID]).clone();
+        let rec = DebuggingRecorder::new();
+        metrics::with_local_recorder(&rec, || {
+            count_source_events(&mut ctx, &tm, "c", 2);
+            count_source_events(&mut ctx, &tm, "c", 3);
+            ctx.event_counters = crate::event_counters::EventCounters::new(
+                "test-pipeline",
+                "unit-test",
+                Arc::new(TableMetrics::new(
+                    "test-pipeline",
+                    Some(PerTablePolicy {
+                        max_tables: 1,
+                        lag_idle: Duration::from_secs(300),
+                    }),
+                )),
+            );
+            count_source_events(&mut ctx, &tm, "c", 4);
+        });
+        let mut series: Vec<(Vec<(String, String)>, u64)> = rec
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| {
+                k.key().name() == "deltaforge_source_events_total"
+            })
+            .map(|(k, _, _, v)| {
+                let mut labels: Vec<_> = k
+                    .key()
+                    .labels()
+                    .map(|l| (l.key().to_string(), l.value().to_string()))
+                    .collect();
+                labels.sort();
+                let DebugValue::Counter(n) = v else {
+                    panic!("a counter")
+                };
+                (labels, n)
+            })
+            .collect();
+        series.sort();
+        let base = |extra: &[(&str, &str)]| {
+            let mut l: Vec<(String, String)> = [
+                ("op", "c"),
+                ("pipeline", "test-pipeline"),
+                ("source", "unit-test"),
+            ]
+            .iter()
+            .chain(extra)
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+            l.sort();
+            l
         };
-        let off = keys(source_event_labels(&ctx, &tm, "c"));
-        assert!(off.iter().all(|(k, _)| k != "table" && k != "table_scope"));
-        ctx.table_metrics = Arc::new(TableMetrics::new(
-            "test-pipeline",
-            Some(PerTablePolicy {
-                max_tables: 1,
-                lag_idle: Duration::from_secs(300),
-            }),
-        ));
-        let on = keys(source_event_labels(&ctx, &tm, "c"));
-        assert!(on.contains(&("table".into(), "shop.orders".into())));
-        assert!(on.contains(&("table_scope".into(), "exact".into())));
+        assert_eq!(
+            series,
+            [
+                (base(&[]), 5),
+                (
+                    base(&[("table", "shop.orders"), ("table_scope", "exact")]),
+                    4
+                ),
+            ]
+        );
     }
 
     /// An entry evicted by the shared cache budget is rebuilt from the
@@ -2604,7 +2855,7 @@ pub(crate) mod tests {
         let mut ctx = make_runctx(tx);
         prove_orders(&mut ctx).await;
         prove_table(&mut ctx, "items").await;
-        let orders = ctx.table_map[&TABLE_ID].clone();
+        let orders = (*ctx.table_map[&TABLE_ID]).clone();
         let items = TableMapEvent {
             table_id: TABLE_ID + 1,
             table_name: "items".into(),
@@ -2655,7 +2906,7 @@ pub(crate) mod tests {
         let (tx, _rx) = mpsc::channel::<SourceItem>(8);
         let mut ctx = make_runctx(tx);
         prove_orders(&mut ctx).await;
-        let orders = ctx.table_map[&TABLE_ID].clone();
+        let orders = (*ctx.table_map[&TABLE_ID]).clone();
         ctx.selection = Caches::default();
         ctx.selection.set_limit_for_test(1);
         let first = select_for_rows(&mut ctx, &orders).await.unwrap();
@@ -3931,6 +4182,48 @@ pub(crate) mod tests {
             assert_eq!(rows, TRANSACTIONS);
             assert_eq!(parser.table_map_event_by_table_id.len(), 0);
             assert_eq!(parser.table_maps_installed, TRANSACTIONS);
+            assert!(
+                parser.reusable_table_maps()
+                    <= mysql_binlog_connector_rust::binlog_parser::TABLE_MAP_REUSE_MAX
+            );
+        }
+
+        #[test]
+        fn a_repeated_table_map_is_reused_and_a_changed_one_parsed_again() {
+            let mut stream = Vec::new();
+            for (i, table) in
+                ["orders", "orders", "items", "items"].iter().enumerate()
+            {
+                stream.extend(gtid(true, i as u64 + 1));
+                stream.extend(query("shop", "BEGIN"));
+                stream.extend(table_map(7, "shop", table));
+                stream.extend(write_rows(7, i as i64, true));
+                stream.extend(xid(i as u64));
+            }
+            let mut parser = parser();
+            let events = parse_all(&mut parser, stream);
+            let maps: Vec<_> = events
+                .iter()
+                .filter_map(|(d, _)| match d {
+                    EventData::TableMap(tm) => Some(tm.clone()),
+                    _ => None,
+                })
+                .collect();
+            let names: Vec<_> =
+                maps.iter().map(|m| m.table_name.as_str()).collect();
+            assert_eq!(names, ["orders", "orders", "items", "items"]);
+            // The same bytes give the same parsed map; other bytes under the
+            // same table id are parsed afresh.
+            assert!(Arc::ptr_eq(&maps[0], &maps[1]));
+            assert!(!Arc::ptr_eq(&maps[1], &maps[2]));
+            assert!(Arc::ptr_eq(&maps[2], &maps[3]));
+            let rows: Vec<_> =
+                events.iter().filter_map(|(d, _)| decoded(d)).collect();
+            assert_eq!(rows, [(7, 0), (7, 1), (7, 2), (7, 3)]);
+            // Reuse never keeps a table map past its transaction.
+            assert_eq!(parser.table_map_event_by_table_id.len(), 0);
+            assert_eq!(parser.table_maps_installed, 4);
+            assert_eq!(parser.reusable_table_maps(), 1);
         }
 
         #[test]
@@ -4105,7 +4398,7 @@ pub(crate) mod tests {
                 items
             });
             let mut ctx = make_runctx(tx);
-            let template = ctx.table_map[&TABLE_ID].clone();
+            let template = (*ctx.table_map[&TABLE_ID]).clone();
             ctx.table_map.clear();
             with_scope(&mut ctx).await;
             ctx.current_gtid = None;
@@ -4117,12 +4410,12 @@ pub(crate) mod tests {
         /// A table outside the allow-list (its rows are skipped, its table
         /// map is kept like any other) under `table_id`.
         fn filtered(template: &TableMapEvent, table_id: u64) -> EventData {
-            EventData::TableMap(TableMapEvent {
+            EventData::TableMap(Arc::new(TableMapEvent {
                 table_id,
                 database_name: "other".to_string(),
                 table_name: "audit".to_string(),
                 ..template.clone()
-            })
+            }))
         }
 
         fn rows(table_id: u64, id: i64) -> EventData {
@@ -4348,13 +4641,49 @@ pub(crate) mod tests {
                     .await
                     .unwrap();
                     assert_eq!(read(&snap).0.get("source"), Some(&0.0));
+                    // Every dispatched event's bytes, in the source's series.
+                    let bytes: Vec<_> = snap
+                        .snapshot()
+                        .into_vec()
+                        .into_iter()
+                        .filter(|(k, ..)| {
+                            k.key().name() == "deltaforge_source_bytes_total"
+                        })
+                        .map(|(k, _, _, v)| {
+                            let labels: Vec<(String, String)> = k
+                                .key()
+                                .labels()
+                                .map(|l| {
+                                    (l.key().to_string(), l.value().to_string())
+                                })
+                                .collect();
+                            (labels, v)
+                        })
+                        .collect();
+                    assert_eq!(
+                        bytes,
+                        vec![(
+                            vec![
+                                ("pipeline".into(), ctx.pipeline.clone()),
+                                ("source".into(), ctx.source_id.clone()),
+                            ],
+                            DebugValue::Counter(400)
+                        )]
+                    );
                     // The parser's own series, from the parser's counts.
                     let mut parser = parser();
                     let mut s = Vec::new();
                     s.extend(query("shop", "BEGIN"));
                     s.extend(table_map(70, "shop", "orders"));
                     let events = parse_all(&mut parser, s);
-                    note_parser_table_maps(&mut ctx, &parser, &events[1].0);
+                    note_parser_table_maps(
+                        &mut ctx,
+                        (
+                            parser.table_maps_installed,
+                            parser.table_map_event_by_table_id.len(),
+                        ),
+                        &events[1].0,
+                    );
                     let (gauges, installed) = read(&snap);
                     assert_eq!(gauges.get("parser"), Some(&1.0));
                     assert_eq!(installed.get("parser"), Some(&1));
@@ -4368,5 +4697,134 @@ pub(crate) mod tests {
                 });
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod outbox_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    fn item(n: usize) -> SourceItem {
+        SourceItem::TxBegin {
+            tx_id: n.to_string(),
+        }
+    }
+
+    fn ids(items: &[SourceItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|i| match i {
+                SourceItem::TxBegin { tx_id } => tx_id.clone(),
+                other => panic!("unexpected item {other:?}"),
+            })
+            .collect()
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<SourceItem>) -> Vec<String> {
+        let mut got = Vec::new();
+        while let Ok(i) = rx.try_recv() {
+            got.push(i);
+        }
+        ids(&got)
+    }
+
+    fn numbers(r: std::ops::Range<usize>) -> Vec<String> {
+        r.map(|n| n.to_string()).collect()
+    }
+
+    /// Held items reach the channel only on a flush, all of them and in
+    /// emission order; without holding each goes at once.
+    #[tokio::test]
+    async fn held_items_go_out_in_order_on_a_flush() {
+        let (tx, mut rx) = mpsc::channel(1024);
+        let mut out = Outbox::new();
+        assert!(emit(&tx, &mut out, item(0)).await);
+        assert_eq!(drain(&mut rx), numbers(0..1));
+        out.set_hold(true);
+        for n in 1..6 {
+            assert!(emit(&tx, &mut out, item(n)).await);
+        }
+        assert!(drain(&mut rx).is_empty());
+        assert!(!out.is_empty());
+        assert!(flush(&tx, &mut out).await);
+        assert!(out.is_empty());
+        assert_eq!(drain(&mut rx), numbers(1..6));
+    }
+
+    /// The outbox never holds more than its bound: the item that reaches
+    /// it sends everything held, that item included.
+    #[tokio::test]
+    async fn the_bound_sends_what_is_held() {
+        let (tx, mut rx) = mpsc::channel(1024);
+        let mut out = Outbox::new();
+        out.set_hold(true);
+        for n in 0..OUTBOX_ITEMS - 1 {
+            assert!(emit(&tx, &mut out, item(n)).await);
+        }
+        assert!(drain(&mut rx).is_empty());
+        assert!(emit(&tx, &mut out, item(OUTBOX_ITEMS - 1)).await);
+        assert!(out.is_empty());
+        assert_eq!(drain(&mut rx), numbers(0..OUTBOX_ITEMS));
+    }
+
+    /// An item sent at once after holding ends goes after what was held.
+    #[tokio::test]
+    async fn an_immediate_item_follows_what_was_held() {
+        let (tx, mut rx) = mpsc::channel(1024);
+        let mut out = Outbox::new();
+        out.set_hold(true);
+        assert!(emit(&tx, &mut out, item(0)).await);
+        assert!(emit(&tx, &mut out, item(1)).await);
+        out.set_hold(false);
+        assert!(emit(&tx, &mut out, item(2)).await);
+        assert_eq!(drain(&mut rx), numbers(0..3));
+    }
+
+    /// A flush interrupted while the channel is full loses and repeats
+    /// nothing: the next flush sends the rest, in order.
+    #[tokio::test]
+    async fn an_interrupted_flush_loses_nothing() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let mut out = Outbox::new();
+        out.set_hold(true);
+        for n in 0..5 {
+            assert!(emit(&tx, &mut out, item(n)).await);
+        }
+        let cut = tokio::time::timeout(
+            Duration::from_millis(50),
+            flush(&tx, &mut out),
+        )
+        .await;
+        assert!(cut.is_err(), "the full channel holds the flush");
+        let mut got = drain(&mut rx);
+        assert_eq!(got, numbers(0..2));
+        let rest = tokio::spawn(async move {
+            let ok = flush(&tx, &mut out).await;
+            (ok, out.is_empty())
+        });
+        while got.len() < 5 {
+            match rx.recv().await {
+                Some(i) => got.extend(ids(&[i])),
+                None => break,
+            }
+        }
+        assert_eq!(rest.await.unwrap(), (true, true));
+        assert_eq!(got, numbers(0..5));
+    }
+
+    /// A closed channel ends the flush: false, and nothing stays held.
+    #[tokio::test]
+    async fn a_closed_channel_drops_what_is_held() {
+        let (tx, rx) = mpsc::channel(8);
+        drop(rx);
+        let mut out = Outbox::new();
+        out.set_hold(true);
+        assert!(emit(&tx, &mut out, item(0)).await);
+        assert!(!flush(&tx, &mut out).await);
+        assert!(out.is_empty());
+        out.set_hold(false);
+        assert!(!emit(&tx, &mut out, item(1)).await);
     }
 }

@@ -52,6 +52,20 @@ pub fn row_view(
     m
 }
 
+/// One entry of [`row_view`], without building the others: the column's
+/// view, or the extension of that name when the column is absent or
+/// unchanged.
+pub fn column_view(
+    row: &CanonicalRow,
+    name: &str,
+    mapping: TypeMapping,
+) -> Option<Value> {
+    row.iter()
+        .find(|(n, _)| *n == name)
+        .and_then(|(_, v)| value_view(v, mapping))
+        .or_else(|| row.extensions().get(name).map(|d| d.value().clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

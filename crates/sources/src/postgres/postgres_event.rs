@@ -396,7 +396,7 @@ pub(super) async fn dispatch_event(
                 ctx.type_mapping,
             );
             ctx.tx
-                .send(SourceItem::Event(event))
+                .send(SourceItem::event(event))
                 .await
                 .map_err(|e| LoopControl::Fail(SourceError::Other(e.into())))?;
             if transactional {
@@ -1391,7 +1391,7 @@ async fn handle_truncate(
             });
         }
 
-        if ctx.tx.send(SourceItem::Event(ev)).await.is_ok()
+        if ctx.tx.send(SourceItem::event(ev)).await.is_ok()
             && ctx.current_tx_id.is_some()
         {
             ctx.open_tx_events += 1;
@@ -1414,7 +1414,7 @@ async fn send_event(
     table_name: &Arc<str>,
     op: &'static str,
 ) {
-    let ok = match ctx.tx.try_send(SourceItem::Event(ev)) {
+    let ok = match ctx.tx.try_send(SourceItem::event(ev)) {
         Ok(()) => true,
         Err(tokio::sync::mpsc::error::TrySendError::Full(item)) => {
             ctx.tx.send(item).await.is_ok()

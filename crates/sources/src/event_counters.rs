@@ -1,5 +1,5 @@
-//! Cached `deltaforge_source_events_total` handles for the PostgreSQL
-//! stream, keyed by (table labels, op) so the hot path skips a
+//! Cached `deltaforge_source_events_total` handles for the PostgreSQL and
+//! MySQL streams, keyed by (table labels, op) so the hot path skips a
 //! metrics-registry lookup per event.
 
 use std::collections::HashMap;
@@ -34,10 +34,34 @@ impl EventCounters {
 
     /// Count one `op` event on `table`.
     pub(crate) fn increment(&mut self, table: &str, op: &'static str) {
-        let key = (self.tables.label(table), op);
+        let label = self.tables.label(table);
+        self.handle(label, op).increment(1);
+    }
+
+    /// Count `n` `op` events on table `db.table`; the name is built only
+    /// while per-table detail is on.
+    pub(crate) fn add_qualified(
+        &mut self,
+        db: &str,
+        table: &str,
+        op: &'static str,
+        n: u64,
+    ) {
+        let label = match self.tables.policy() {
+            Some(_) => self.tables.label(&format!("{db}.{table}")),
+            None => None,
+        };
+        self.handle(label, op).increment(n);
+    }
+
+    fn handle(
+        &mut self,
+        label: Option<TableLabel>,
+        op: &'static str,
+    ) -> &Counter {
         let (pipeline, source) = (&self.pipeline, &self.source);
         self.cache
-            .entry(key)
+            .entry((label, op))
             .or_insert_with_key(|(table, op)| {
                 let labels = with_table(
                     vec![
@@ -49,7 +73,6 @@ impl EventCounters {
                 );
                 counter!("deltaforge_source_events_total", labels)
             })
-            .increment(1);
     }
 
     #[cfg(test)]

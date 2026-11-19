@@ -86,6 +86,118 @@ impl Signature {
     }
 }
 
+/// The bytes [`SignatureMemo`] may hold: its signatures are outside the
+/// schema cache's bound, so they have one of their own.
+const MEMO_BYTES: u64 = 8 * 1024 * 1024;
+/// One entry's bookkeeping beyond its signature and digest (the map slot,
+/// the list node, the digest's string header).
+const MEMO_ENTRY: u64 = 128;
+
+/// Each table id's last signature and its digest: a TableMap identical in
+/// every signature field reuses the digest instead of serializing and
+/// hashing it again (a digest is a function of the signature alone).
+/// Bounded by bytes ([`MEMO_BYTES`]), least recently used first out; a
+/// signature that would take more than a sixteenth of it is not kept.
+/// Nothing is allocated before the first digest.
+pub(crate) struct SignatureMemo {
+    by_table: lru::LruCache<u64, (Signature, String, u64)>,
+    bytes: u64,
+    budget: u64,
+}
+
+impl SignatureMemo {
+    pub(crate) fn new() -> Self {
+        Self::within(MEMO_BYTES)
+    }
+
+    fn within(budget: u64) -> Self {
+        Self {
+            by_table: lru::LruCache::unbounded(),
+            bytes: 0,
+            budget,
+        }
+    }
+
+    /// `Signature::of(tm).digest()`.
+    pub(crate) fn digest(&mut self, tm: &TableMapEvent) -> String {
+        if let Some((sig, digest, _)) = self.by_table.get(&tm.table_id)
+            && sig.is_of(tm)
+        {
+            return digest.clone();
+        }
+        let sig = Signature::of(tm);
+        let digest = sig.digest();
+        let cost = sig.held_bytes() + digest.len() as u64 + MEMO_ENTRY;
+        if let Some((_, _, was)) = self.by_table.pop(&tm.table_id) {
+            self.bytes -= was;
+        }
+        if cost <= self.budget / 16 {
+            self.by_table.put(tm.table_id, (sig, digest.clone(), cost));
+            self.bytes += cost;
+            while self.bytes > self.budget {
+                let (_, (_, _, out)) =
+                    self.by_table.pop_lru().expect("over budget is not empty");
+                self.bytes -= out;
+            }
+        }
+        digest
+    }
+
+    /// The bytes held now (as counted against the budget).
+    #[cfg(test)]
+    fn held(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Signature {
+    /// The heap this signature holds (an estimate at or above it).
+    fn held_bytes(&self) -> u64 {
+        use super::mysql_cache_cost::allocated;
+        let strings = |v: &Option<Vec<String>>| {
+            v.as_ref().map_or(0, |v| {
+                allocated((v.capacity() * size_of::<String>()) as u64)
+                    + v.iter()
+                        .map(|s| allocated(s.capacity() as u64))
+                        .sum::<u64>()
+            })
+        };
+        let meta = self.table_metadata.as_ref().map_or(0, |m| {
+            let charsets = |c: &Option<mysql_binlog_connector_rust::event::table_map::default_charset::DefaultCharset>| {
+                c.as_ref().map_or(0, |c| {
+                    allocated((c.charset_collations.capacity() * 8) as u64)
+                })
+            };
+            allocated((m.columns.capacity() * size_of::<mysql_binlog_connector_rust::event::table_map::table_metadata::ColumnMetadata>()) as u64) + m
+                .columns
+                .iter()
+                .map(|c| {
+                    c.column_name
+                        .as_ref()
+                        .map_or(0, |n| allocated(n.capacity() as u64))
+                        + strings(&c.enum_string_values)
+                        + strings(&c.set_string_values)
+                })
+                .sum::<u64>()
+                + allocated((m.primary_key.capacity() * 16) as u64)
+                + charsets(&m.default_charset)
+                + charsets(&m.enum_and_set_default_charset)
+        });
+        allocated(self.column_types.capacity() as u64)
+            + allocated((self.column_metas.capacity() * 2) as u64)
+            + allocated(self.null_bits.capacity() as u64)
+            + meta
+    }
+
+    /// Whether `tm` has this signature.
+    fn is_of(&self, tm: &TableMapEvent) -> bool {
+        self.column_types == tm.column_types
+            && self.column_metas == tm.column_metas
+            && self.null_bits == tm.null_bits
+            && self.table_metadata == tm.table_metadata
+    }
+}
+
 /// Base type, lower-cased, without length/attributes ("varchar", "int").
 fn base(c: &MySqlColumn) -> String {
     c.data_type.trim().to_ascii_lowercase()
@@ -570,7 +682,7 @@ mod tests {
                 let (_, data) = s.read().await.unwrap();
                 if let EventData::TableMap(tm) = data {
                     if tm.table_name == table {
-                        return tm;
+                        return (*tm).clone();
                     }
                 }
             }
@@ -686,5 +798,105 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn memo_digest_is_the_signature_digest_and_follows_every_field() {
+        use mysql_binlog_connector_rust::event::table_map::table_metadata::{
+            ColumnMetadata, TableMetadata,
+        };
+        let fresh = |t: &TableMapEvent| Signature::of(t).digest();
+        let base = tm(&[(3, 0), (15, 40)]);
+        let full = |name: &str| {
+            let mut t = base.clone();
+            t.table_metadata = Some(TableMetadata {
+                default_charset: None,
+                enum_and_set_default_charset: None,
+                columns: vec![
+                    ColumnMetadata {
+                        column_name: Some("id".into()),
+                        ..Default::default()
+                    },
+                    ColumnMetadata {
+                        column_name: Some(name.into()),
+                        ..Default::default()
+                    },
+                ],
+                primary_key: vec![(0, 0)],
+            });
+            t
+        };
+        let mut types = base.clone();
+        types.column_types[1] = 253;
+        let mut metas = base.clone();
+        metas.column_metas[1] = 80;
+        let mut nulls = base.clone();
+        nulls.null_bits[0] = false;
+        let mut other_table = base.clone();
+        other_table.table_name = "u".into();
+        let mut memo = SignatureMemo::new();
+        // The same table id through every change and back: each digest is
+        // the fresh one, a change is never answered from the memo.
+        for t in [
+            &base,
+            &base,
+            &types,
+            &base,
+            &metas,
+            &base,
+            &nulls,
+            &base,
+            &full("a"),
+            &full("a"),
+            &full("b"),
+            &base,
+            &other_table,
+        ] {
+            assert_eq!(memo.digest(t), fresh(t));
+        }
+        assert_ne!(fresh(&full("a")), fresh(&full("b")));
+        assert_ne!(fresh(&base), fresh(&types));
+    }
+
+    /// Wide signatures of many tables: what the memo holds never passes
+    /// its budget, its count covers each signature's names, the newest
+    /// stay, and one too large to keep is still answered.
+    #[test]
+    fn the_memo_holds_within_its_budget() {
+        use mysql_binlog_connector_rust::event::table_map::table_metadata::{
+            ColumnMetadata, TableMetadata,
+        };
+        let wide = |id: u64, name_len: usize, columns: usize| {
+            let mut t = tm(&vec![(15, 40); columns]);
+            t.table_id = id;
+            t.table_metadata = Some(TableMetadata {
+                default_charset: None,
+                enum_and_set_default_charset: None,
+                columns: (0..columns)
+                    .map(|c| ColumnMetadata {
+                        column_name: Some(format!("{c:0name_len$}")),
+                        ..Default::default()
+                    })
+                    .collect(),
+                primary_key: vec![(0, 0)],
+            });
+            t
+        };
+        let budget = 1024 * 1024;
+        let mut memo = SignatureMemo::within(budget);
+        let one = wide(0, 100, 40);
+        memo.digest(&one);
+        // 40 names of 100 bytes are counted.
+        assert!(memo.held() >= 4000, "{}", memo.held());
+        for id in 1..2000u64 {
+            let t = wide(id, 100, 40);
+            assert_eq!(memo.digest(&t), Signature::of(&t).digest());
+            assert!(memo.held() <= budget, "{} > {budget}", memo.held());
+        }
+        assert!(memo.by_table.contains(&1999));
+        assert!(!memo.by_table.contains(&1));
+        let huge = wide(5000, 1000, budget as usize / 16 / 1000 + 1);
+        assert_eq!(memo.digest(&huge), Signature::of(&huge).digest());
+        assert!(!memo.by_table.contains(&5000));
     }
 }

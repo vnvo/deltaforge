@@ -147,7 +147,7 @@ async fn start(
             inserted = true;
         }
         match timeout(Duration::from_millis(250), rx.recv()).await {
-            Ok(Some(SourceItem::Event(e))) => events.push(e),
+            Ok(Some(SourceItem::Event(e))) => events.push(*e),
             Ok(Some(_)) | Err(_) => continue,
             Ok(None) => {
                 closed = true;

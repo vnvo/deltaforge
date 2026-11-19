@@ -8,7 +8,9 @@
 //!
 //! The source runs on a single-thread runtime, so the thread's allocation
 //! peak (`thread.peak`) is everything the source, the driver and the
-//! store allocate meanwhile.
+//! store allocate meanwhile, except the stream's events: those are read
+//! and parsed on the stream's reader thread (`mysql_read_ahead`, bounded by
+//! its own byte budget and tested there), a few KiB in this burst.
 
 // Reading jemalloc's statistics is a foreign call.
 #![allow(unsafe_code)]

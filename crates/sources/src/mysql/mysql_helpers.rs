@@ -98,7 +98,7 @@ pub(super) async fn prepare_client(
 /// A replication session opened by [`connect_binlog_with_retries`].
 pub(super) enum Opened {
     /// Verified as the expected server; the dump command was issued.
-    Stream(super::mysql_session::Session),
+    Stream(Box<super::mysql_session::Session>),
     /// The session reached another server (its `server_uuid`) and was closed
     /// before the dump command: no event was read.
     OtherServer(String),
@@ -202,7 +202,7 @@ async fn connect_binlog(
                 ms = t0.elapsed().as_millis() as u64,
                 "connected to binlog (server identity verified)"
             );
-            Ok(Opened::Stream(stream))
+            Ok(Opened::Stream(Box::new(stream)))
         }
         Ok(Err(SessionError::OtherServer { found })) => {
             warn!(
@@ -430,11 +430,138 @@ pub(crate) fn make_checkpoint_meta(
         snapshot_chain: None,
     };
 
-    let bytes = serde_json::to_vec(&cp).unwrap_or_else(|e| {
+    let bytes = deltaforge_core::json_out::to_vec(&cp).unwrap_or_else(|e| {
         tracing::error!(error=%e, "failed to serialize checkpoint");
         Vec::new()
     });
     CheckpointMeta::from_vec(bytes)
+}
+
+/// The last checkpoint built, by its inputs. A checkpoint's bytes are a
+/// function of (file, position, GTID set, lineage) alone, and a
+/// transaction's rows resume from the boundary its predecessor's commit
+/// just built: they share those bytes instead of serializing them again.
+#[derive(Debug, Default)]
+pub(crate) struct CheckpointMemo {
+    last: Option<Memoized>,
+    /// The checkpoint document of the last file, lineage and GTID mode,
+    /// with its position and GTID set open: a commit moves only those.
+    template: Option<Template>,
+}
+
+/// [`make_checkpoint_meta`]'s document for one file, lineage and GTID mode,
+/// cut at its position and GTID set (`None` when it could not be cut: each
+/// checkpoint is then written whole).
+#[derive(Debug)]
+struct Template {
+    file: String,
+    lineage: Option<String>,
+    gtid_mode: bool,
+    doc: Option<crate::json_template::JsonTemplate>,
+}
+
+impl Template {
+    fn new(file: &str, lineage: Option<&str>, gtid_mode: bool) -> Self {
+        use crate::json_template::{JsonTemplate, MARK_STR, MARK_U64, Open};
+        let gtid = gtid_mode.then(|| MARK_STR.to_string());
+        let marked = make_checkpoint_meta(
+            file,
+            MARK_U64,
+            &gtid,
+            lineage.map(str::to_string),
+        );
+        let open: &[Open] = if gtid_mode {
+            &[Open::U64("pos"), Open::Str("gtid_set")]
+        } else {
+            &[Open::U64("pos")]
+        };
+        Self {
+            file: file.to_string(),
+            lineage: lineage.map(str::to_string),
+            gtid_mode,
+            doc: JsonTemplate::cut(marked.as_bytes(), open),
+        }
+    }
+
+    fn of(&self, file: &str, lineage: Option<&str>, gtid_mode: bool) -> bool {
+        self.file == file
+            && self.lineage.as_deref() == lineage
+            && self.gtid_mode == gtid_mode
+    }
+
+    /// The checkpoint at `pos` and `gtid` ([`make_checkpoint_meta`]'s
+    /// bytes), or `None` without a cut document.
+    fn fill(&self, pos: u64, gtid: Option<&str>) -> Option<CheckpointMeta> {
+        use crate::json_template::Fill;
+        let doc = self.doc.as_ref()?;
+        let bytes = match gtid {
+            Some(g) => doc.fill(&[Fill::U64(pos), Fill::Str(g)]),
+            None => doc.fill(&[Fill::U64(pos)]),
+        }?;
+        Some(CheckpointMeta::from_vec(bytes))
+    }
+}
+
+/// A built checkpoint with the inputs it was built from.
+#[derive(Debug)]
+struct Memoized {
+    file: String,
+    pos: u64,
+    gtid: Option<String>,
+    lineage: Option<String>,
+    meta: CheckpointMeta,
+}
+
+impl CheckpointMemo {
+    pub(crate) fn get(
+        &mut self,
+        file: &str,
+        pos: u64,
+        gtid: Option<&str>,
+        lineage: Option<&str>,
+    ) -> CheckpointMeta {
+        if let Some(m) = &self.last
+            && m.file == file
+            && m.pos == pos
+            && m.gtid.as_deref() == gtid
+            && m.lineage.as_deref() == lineage
+        {
+            return m.meta.clone();
+        }
+        let gtid_mode = gtid.is_some();
+        if !self
+            .template
+            .as_ref()
+            .is_some_and(|t| t.of(file, lineage, gtid_mode))
+        {
+            self.template = Some(Template::new(file, lineage, gtid_mode));
+        }
+        let template = self.template.as_ref().expect("just kept");
+        let meta = template.fill(pos, gtid).unwrap_or_else(|| {
+            make_checkpoint_meta(
+                file,
+                pos,
+                &gtid.map(str::to_string),
+                lineage.map(str::to_string),
+            )
+        });
+        // A commit moves only the position and GTID set: the file and
+        // lineage text kept for the last checkpoint are kept again.
+        let (file, lineage) = match self.last.take() {
+            Some(m) if m.file == file && m.lineage.as_deref() == lineage => {
+                (m.file, m.lineage)
+            }
+            _ => (file.to_string(), lineage.map(str::to_string)),
+        };
+        self.last = Some(Memoized {
+            file,
+            pos,
+            gtid: gtid.map(str::to_string),
+            lineage,
+            meta: meta.clone(),
+        });
+        meta
+    }
 }
 
 #[cfg(test)]
@@ -458,6 +585,51 @@ mod tests {
                 "  5) FLUSH PRIVILEGES;",
             ]
         );
+    }
+
+    /// Every checkpoint the memo hands out is the one written whole, as
+    /// the file, lineage, GTID mode, position and set move.
+    #[test]
+    fn memo_checkpoints_are_written_as_whole_ones() {
+        let files = ["mysql-bin.000001", "b\"in\\.0\u{1}é"];
+        let lineages = [None, Some("ab12"), Some("\"pos\":1")];
+        let gtids = [
+            None,
+            Some("37b3bf36-d624-11f1-a18e-0242ac110003:1-5"),
+            Some("q\"\\\n\u{0}"),
+        ];
+        // Three walks over every case, each moving one of file, lineage
+        // and GTID set alone (innermost).
+        let mut walks: [Vec<(usize, usize, usize)>; 3] = Default::default();
+        for a in 0..3 {
+            for b in 0..3 {
+                for c in 0..3 {
+                    walks[0].push((a % 2, b, c)); // the GTID set moves
+                    walks[1].push((a % 2, c, b)); // the lineage moves
+                    walks[2].push((c % 2, a, b)); // the file moves
+                }
+            }
+        }
+        for walk in walks {
+            let mut memo = CheckpointMemo::default();
+            for (f, l, g) in walk {
+                let (file, lineage, gtid) = (files[f], lineages[l], gtids[g]);
+                for pos in [0, 4, u64::MAX - 1, u64::MAX, 4] {
+                    let whole = make_checkpoint_meta(
+                        file,
+                        pos,
+                        &gtid.map(str::to_string),
+                        lineage.map(str::to_string),
+                    );
+                    let got = memo.get(file, pos, gtid, lineage);
+                    assert_eq!(
+                        got.as_bytes(),
+                        whole.as_bytes(),
+                        "{file:?} {lineage:?} {gtid:?} {pos}"
+                    );
+                }
+            }
+        }
     }
 
     const UUID: &str = "37b3bf36-d624-11f1-a18e-0242ac110003";
@@ -513,5 +685,52 @@ mod tests {
             parse_log_status(UUID, "not json", UUID),
             Err(MySqlSourceError::Incompatible(_))
         ));
+    }
+
+    #[test]
+    fn a_memoized_checkpoint_is_the_one_built_from_its_inputs() {
+        let gtid = "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5";
+        let mut memo = CheckpointMemo::default();
+        let built = |f: &str, p: u64, g: Option<&str>, l: Option<&str>| {
+            make_checkpoint_meta(
+                f,
+                p,
+                &g.map(str::to_string),
+                l.map(str::to_string),
+            )
+        };
+        let inputs = [
+            ("mysql-bin.000003", 900, Some(gtid), Some("lin-a")),
+            ("mysql-bin.000003", 900, Some(gtid), Some("lin-a")),
+            ("mysql-bin.000004", 900, Some(gtid), Some("lin-a")),
+            ("mysql-bin.000004", 901, Some(gtid), Some("lin-a")),
+            (
+                "mysql-bin.000004",
+                901,
+                Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-6"),
+                Some("lin-a"),
+            ),
+            ("mysql-bin.000004", 901, None, Some("lin-a")),
+            ("mysql-bin.000004", 901, None, Some("lin-b")),
+            ("mysql-bin.000004", 901, None, None),
+            ("mysql-bin.000003", 900, Some(gtid), Some("lin-a")),
+        ];
+        for (f, p, g, l) in inputs {
+            let got = memo.get(f, p, g, l);
+            assert_eq!(
+                got.as_bytes(),
+                built(f, p, g, l).as_bytes(),
+                "{f} {p} {g:?} {l:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_inputs_share_one_checkpoint() {
+        let mut memo = CheckpointMemo::default();
+        let a = memo.get("mysql-bin.000001", 4, Some("u:1-2"), None);
+        let b = memo.get("mysql-bin.000001", 4, Some("u:1-2"), None);
+        let (CheckpointMeta::Opaque(a), CheckpointMeta::Opaque(b)) = (a, b);
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
     }
 }

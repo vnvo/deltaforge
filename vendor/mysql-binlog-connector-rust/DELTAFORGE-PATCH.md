@@ -149,3 +149,31 @@ Files: `src/binlog_parser.rs`, `src/binlog_error.rs`, `src/binlog_client.rs`,
 `src/event/update_rows_event.rs`, `src/event/delete_rows_event.rs`. Tested by
 DeltaForge (`mysql_event::tests::table_map_retention`, and the live
 `mysql_reconnect_boundaries_e2e` churn cases).
+
+## GTID text in one buffer
+
+`GtidEvent::parse` writes the event's `uuid:gno` text into one buffer: the
+UUID's 16 bytes as lowercase hex digits with hyphens after the 4th, 6th, 8th
+and 10th byte, then `:` and the decimal transaction number. It formatted
+each byte with `write!` into its own string and joined them with `format!`,
+which ran for every transaction. The text is unchanged; `read_uuid` (used by
+`PreviousGtidsEvent`) shares the writer. File: `src/event/gtid_event.rs`, with
+unit tests of the exact text (a real server UUID, every byte value, the
+number extremes) and of a truncated event.
+
+## Shared and reused table maps
+
+Table maps are shared, not copied: `BinlogParser::table_map_event_by_table_id`
+holds `Arc<TableMapEvent>` and `EventData::TableMap` carries the same `Arc`
+(serde's `rc` feature serializes it as the map itself). The parser also keeps
+the last TABLE_MAP it parsed for each table id with the event's bytes, across
+transaction ends; the same bytes again (the table's next transaction) reuse
+that parsed map instead of parsing it, since parsing depends on those bytes
+alone. Different bytes under the id are parsed and replace it. The kept maps
+are emptied when they hold `TABLE_MAP_REUSE_MAX` (4096) ids and a new one
+arrives; `BinlogParser::reusable_table_maps` reports how many are kept. The
+table maps a rows event can use are unchanged: still released at each
+transaction end. Files: `src/binlog_parser.rs`, `src/event/event_data.rs`,
+`src/event/write_rows_event.rs`, `src/event/update_rows_event.rs`,
+`src/event/delete_rows_event.rs`, `Cargo.toml`. Tested by
+DeltaForge (`mysql_event::tests::table_map_retention`).

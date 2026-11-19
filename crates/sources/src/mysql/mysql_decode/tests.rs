@@ -206,7 +206,7 @@ fn enum_and_set_decode_from_the_stored_number() {
     assert!(cdc(&s, Cdc::Set(0b1000)).is_err());
     let d = dec(&s);
     assert!(
-        TableDecoder { columns: vec![d] }
+        TableDecoder::from_columns(vec![d])
             .snapshot_select_list()
             .contains("CAST(`c` AS UNSIGNED) AS `c`")
     );
@@ -398,4 +398,19 @@ fn rows_decode_by_ordinal_with_the_image_bitmap() {
         Some(json!("b"))
     );
     assert!(t.decode_snapshot_row(&[Snap::Int(7)]).is_err());
+}
+
+#[test]
+fn a_schema_repeating_a_column_name_fails_every_binlog_row() {
+    let schema = MySqlTableSchema::new(vec![
+        MySqlColumn::new("id", "int", "int", false, 1),
+        MySqlColumn::new("id", "int", "int", true, 2),
+    ]);
+    let t = TableDecoder::new(&schema);
+    let err = t
+        .decode_binlog_row(&[true, true], &[Cdc::Long(1), Cdc::Long(2)])
+        .unwrap_err();
+    assert!(err.reason.contains("duplicate column id"), "{err:?}");
+    // One of the two is no repeat.
+    assert!(t.decode_binlog_row(&[true, false], &[Cdc::Long(1)]).is_ok());
 }

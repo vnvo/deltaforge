@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::{collections::HashMap, io::Cursor};
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +17,7 @@ pub struct DeleteRowsEvent {
 impl DeleteRowsEvent {
     pub fn parse(
         cursor: &mut Cursor<&Vec<u8>>,
-        table_map_event_by_table_id: &mut HashMap<u64, TableMapEvent>,
+        table_map_event_by_table_id: &mut HashMap<u64, Arc<TableMapEvent>>,
         row_event_version: u8,
     ) -> Result<Self, BinlogError> {
         let (table_id, _column_count, included_columns) =

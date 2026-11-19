@@ -543,7 +543,7 @@ async fn collect(
         let left = deadline.saturating_duration_since(Instant::now());
         match timeout(left, rx.recv()).await {
             Ok(Some(SourceItem::Event(e))) => {
-                events.push(e);
+                events.push(*e);
                 if until(&ids(&events)) {
                     break;
                 }

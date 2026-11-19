@@ -1942,13 +1942,13 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                             // Accumulate the raw event for replay before
                             // it is moved into the batch.
                             if replay_on {
-                                capture_accum.push(ev.clone());
+                                capture_accum.push((*ev).clone());
                             }
                             // In-transaction event: buffer without
                             // splitting; enforce the hard caps.
                             if let Err(o) = push_tx_event(
                                 b,
-                                ev,
+                                *ev,
                                 max_tx_events,
                                 max_tx_bytes,
                             ) {
@@ -1988,7 +1988,7 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                                 None
                             };
                             if replay_on {
-                                capture_accum.push(ev.clone());
+                                capture_accum.push((*ev).clone());
                             }
                             // A snapshot chunk is one unit, like a
                             // transaction: only its final row carries
@@ -2001,7 +2001,7 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                             let open_chunk_row = ev.source.snapshot.is_some()
                                 && ev.boundary.is_none();
                             b.bytes += event_size_hint(&ev);
-                            b.raw.push(ev);
+                            b.raw.push(*ev);
                             if !open_chunk_row {
                                 commit_standalone(b);
                             }
@@ -2194,7 +2194,7 @@ impl<Tok: Send + Clone + From<CheckpointMeta> + 'static> Coordinator<Tok> {
                     .await?;
                 }
                 if let Some(full) =
-                    check_and_split(b, ev, max_events, max_bytes)
+                    check_and_split(b, *ev, max_events, max_bytes)
                 {
                     send_to_delivery(deliver_tx, inflight, full, "limits")
                         .await?;
@@ -3508,10 +3508,10 @@ mod tests {
         let run = tokio::spawn(coord.run(rx, cancel.clone(), pause_rx));
 
         // Snapshot chunk in progress (rows without a chunk-final boundary).
-        tx.send(SourceItem::Event(snap_event(1, None)))
+        tx.send(SourceItem::event(snap_event(1, None)))
             .await
             .unwrap();
-        tx.send(SourceItem::Event(snap_event(2, None)))
+        tx.send(SourceItem::event(snap_event(2, None)))
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -3526,7 +3526,7 @@ mod tests {
         assert!(early.is_err(), "quiesce acked mid snapshot chunk");
 
         // Chunk-final boundary closes the unit; now the quiesce can ack.
-        tx.send(SourceItem::Event(snap_event(3, Some(b"chunk-cp"))))
+        tx.send(SourceItem::event(snap_event(3, Some(b"chunk-cp"))))
             .await
             .unwrap();
         wait_ack(&mut ack_rx)
@@ -3569,7 +3569,7 @@ mod tests {
 
         // Open a transaction (no commit yet).
         tx.send(begin("g1")).await.unwrap();
-        tx.send(SourceItem::Event(tx_event(1, "g1", b"row")))
+        tx.send(SourceItem::event(tx_event(1, "g1", b"row")))
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -3673,9 +3673,9 @@ mod tests {
 
         let mut items = Vec::new();
         for i in 1..=4 {
-            items.push(SourceItem::Event(snap_event(i, None)));
+            items.push(SourceItem::event(snap_event(i, None)));
         }
-        items.push(SourceItem::Event(snap_event(5, Some(b"chunk-cp"))));
+        items.push(SourceItem::event(snap_event(5, Some(b"chunk-cp"))));
         feed_and_run(coord, items).await.unwrap();
 
         let envs =
@@ -3713,7 +3713,7 @@ mod tests {
             coord,
             vec![
                 begin("g1"),
-                SourceItem::Event(tx_event(1, "g1", b"row")),
+                SourceItem::event(tx_event(1, "g1", b"row")),
                 commit("g1", b"cp-1"),
             ],
         )
@@ -3749,8 +3749,8 @@ mod tests {
         feed_and_run(
             coord,
             vec![
-                SourceItem::Event(snap_event(1, None)),
-                SourceItem::Event(snap_event(2, None)),
+                SourceItem::event(snap_event(1, None)),
+                SourceItem::event(snap_event(2, None)),
             ],
         )
         .await
@@ -3770,9 +3770,9 @@ mod tests {
             Arc::new(storage::MemoryStorageBackend::new());
         let chunk = || {
             vec![
-                SourceItem::Event(snap_event(1, None)),
-                SourceItem::Event(snap_event(2, None)),
-                SourceItem::Event(snap_event(3, Some(b"chunk-cp"))),
+                SourceItem::event(snap_event(1, None)),
+                SourceItem::event(snap_event(2, None)),
+                SourceItem::event(snap_event(3, Some(b"chunk-cp"))),
             ]
         };
         for _ in 0..2 {
@@ -3836,7 +3836,7 @@ mod tests {
             coord,
             vec![
                 begin("g1"),
-                SourceItem::Event(tx_event(1, "g1", b"row")),
+                SourceItem::event(tx_event(1, "g1", b"row")),
                 commit("g1", b"cp-1"),
             ],
         )
@@ -3945,7 +3945,7 @@ mod tests {
         feed_and_run(
             coord,
             vec![
-                SourceItem::Event(snap_event(1, Some(b"chunk-cp"))),
+                SourceItem::event(snap_event(1, Some(b"chunk-cp"))),
                 // The source re-emits the completion checkpoint as a data-less boundary.
                 SourceItem::Boundary {
                     boundary: deltaforge_core::SourceBoundary::checkpoint_only(
@@ -4032,7 +4032,7 @@ mod tests {
         );
         let mut ev = snap_event(1, Some(b"chunk-cp"));
         ev.event_id = None;
-        let res = feed_and_run(coord, vec![SourceItem::Event(ev)]).await;
+        let res = feed_and_run(coord, vec![SourceItem::event(ev)]).await;
         let err = res.expect_err("missing event_id must fail capture");
         assert!(
             err.downcast_ref::<ReplayCaptureError>().is_some(),
@@ -4081,7 +4081,7 @@ mod tests {
         .await
         .unwrap();
         for i in 0..10 {
-            tx.send(SourceItem::Event(tx_event(
+            tx.send(SourceItem::event(tx_event(
                 i,
                 "gtid:1",
                 format!("row-{i}").as_bytes(),
@@ -4143,7 +4143,7 @@ mod tests {
                 .await
                 .unwrap();
             for i in 0..2 {
-                tx.send(SourceItem::Event(tx_event(i, txn, b"row")))
+                tx.send(SourceItem::event(tx_event(i, txn, b"row")))
                     .await
                     .unwrap();
             }
@@ -4199,7 +4199,7 @@ mod tests {
         .await
         .unwrap();
         for i in 0..4 {
-            tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
+            tx.send(SourceItem::event(tx_event(i, "gtid:1", b"row")))
                 .await
                 .unwrap();
         }
@@ -4276,7 +4276,7 @@ mod tests {
         .await
         .unwrap();
         for i in 0..2 {
-            tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
+            tx.send(SourceItem::event(tx_event(i, "gtid:1", b"row")))
                 .await
                 .unwrap();
         }
@@ -4294,7 +4294,7 @@ mod tests {
         })
         .await
         .unwrap();
-        tx.send(SourceItem::Event(tx_event(99, "gtid:2", b"row")))
+        tx.send(SourceItem::event(tx_event(99, "gtid:2", b"row")))
             .await
             .unwrap();
         drop(tx);
@@ -4354,7 +4354,7 @@ mod tests {
         })
         .await
         .unwrap();
-        tx.send(SourceItem::Event(tx_event(1, "gtid:2", b"row")))
+        tx.send(SourceItem::event(tx_event(1, "gtid:2", b"row")))
             .await
             .unwrap();
         tx.send(SourceItem::TxCommit {
@@ -4436,7 +4436,7 @@ mod tests {
     async fn duplicate_commit_is_rejected() {
         let (res, _) = run_items(vec![
             begin("gtid:1"),
-            SourceItem::Event(tx_event(1, "gtid:1", b"row")),
+            SourceItem::event(tx_event(1, "gtid:1", b"row")),
             commit("gtid:1", b"cp-1"),
             commit("gtid:1", b"cp-1"), // duplicate
         ])
@@ -4456,7 +4456,7 @@ mod tests {
         let mut standalone = tx_event(1, "gtid:1", b"row");
         standalone.transaction = None; // simulate an unstamped in-tx event
         let (res, store) =
-            run_items(vec![begin("gtid:1"), SourceItem::Event(standalone)])
+            run_items(vec![begin("gtid:1"), SourceItem::event(standalone)])
                 .await;
         let err = res
             .expect_err("standalone event inside an open tx must be rejected");
@@ -4483,7 +4483,7 @@ mod tests {
     async fn commit_id_mismatch_is_rejected() {
         let (res, _) = run_items(vec![
             begin("gtid:1"),
-            SourceItem::Event(tx_event(1, "gtid:1", b"row")),
+            SourceItem::event(tx_event(1, "gtid:1", b"row")),
             commit("gtid:2", b"cp"), // wrong id
         ])
         .await;
@@ -4497,7 +4497,7 @@ mod tests {
     async fn event_tx_mismatch_is_rejected() {
         let (res, _) = run_items(vec![
             begin("gtid:1"),
-            SourceItem::Event(tx_event(1, "gtid:2", b"row")),
+            SourceItem::event(tx_event(1, "gtid:2", b"row")),
         ])
         .await;
         let err = res.expect_err("mismatched event must be rejected");
@@ -4508,7 +4508,7 @@ mod tests {
     #[tokio::test]
     async fn event_without_begin_is_rejected() {
         let (res, _) =
-            run_items(vec![SourceItem::Event(tx_event(1, "gtid:1", b"row"))])
+            run_items(vec![SourceItem::event(tx_event(1, "gtid:1", b"row"))])
                 .await;
         let err = res.expect_err("event without begin must be rejected");
         assert!(err.to_string().contains("no open transaction"));
@@ -4519,7 +4519,7 @@ mod tests {
     async fn well_formed_transaction_is_accepted() {
         let (res, store) = run_items(vec![
             begin("gtid:1"),
-            SourceItem::Event(tx_event(1, "gtid:1", b"row")),
+            SourceItem::event(tx_event(1, "gtid:1", b"row")),
             commit("gtid:1", b"cp-1"),
         ])
         .await;
@@ -4572,7 +4572,7 @@ mod tests {
             coord,
             vec![
                 begin("g1"),
-                SourceItem::Event(tx_event(1, "g1", b"row")),
+                SourceItem::event(tx_event(1, "g1", b"row")),
                 commit("g1", b"cp-1"),
             ],
         )
@@ -4629,7 +4629,7 @@ mod tests {
 
         // Feed one whole transaction; with a long timer it stays in `building`.
         tx.send(begin("g1")).await.unwrap();
-        tx.send(SourceItem::Event(tx_event(1, "g1", b"row")))
+        tx.send(SourceItem::event(tx_event(1, "g1", b"row")))
             .await
             .unwrap();
         tx.send(commit("g1", b"cp-1")).await.unwrap();
@@ -4716,7 +4716,7 @@ mod tests {
         .await
         .unwrap();
         for i in 0..3 {
-            tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
+            tx.send(SourceItem::event(tx_event(i, "gtid:1", b"row")))
                 .await
                 .unwrap();
         }
@@ -4772,7 +4772,7 @@ mod tests {
         .await
         .unwrap();
         for i in 0..2 {
-            tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
+            tx.send(SourceItem::event(tx_event(i, "gtid:1", b"row")))
                 .await
                 .unwrap();
         }
@@ -4845,7 +4845,7 @@ mod tests {
                 .await
                 .unwrap();
             for i in 0..2 {
-                tx.send(SourceItem::Event(tx_event(i, txn, b"row")))
+                tx.send(SourceItem::event(tx_event(i, txn, b"row")))
                     .await
                     .unwrap();
             }
@@ -4875,8 +4875,8 @@ mod tests {
     async fn disconnect_before_commit_discards_and_no_checkpoint() {
         let (res, store) = run_items(vec![
             begin("gtid:1"),
-            SourceItem::Event(tx_event(1, "gtid:1", b"r1")),
-            SourceItem::Event(tx_event(2, "gtid:1", b"r2")),
+            SourceItem::event(tx_event(1, "gtid:1", b"r1")),
+            SourceItem::event(tx_event(2, "gtid:1", b"r2")),
             // stream ends here: no commit marker
         ])
         .await;
@@ -4943,16 +4943,16 @@ mod tests {
         let (res, ids, cp) = deliver(
             vec![
                 begin("t1"),
-                SourceItem::Event(tx_event(1, "t1", b"r1")),
+                SourceItem::event(tx_event(1, "t1", b"r1")),
                 commit("t1", b"cp-1"),
                 begin("t2"),
-                SourceItem::Event(tx_event(10, "t2", b"r10")),
-                SourceItem::Event(tx_event(11, "t2", b"r11")),
+                SourceItem::event(tx_event(10, "t2", b"r10")),
+                SourceItem::event(tx_event(11, "t2", b"r11")),
                 abort("t2"),
                 begin("t2"),
-                SourceItem::Event(tx_event(10, "t2", b"r10")),
-                SourceItem::Event(tx_event(11, "t2", b"r11")),
-                SourceItem::Event(tx_event(12, "t2", b"r12")),
+                SourceItem::event(tx_event(10, "t2", b"r10")),
+                SourceItem::event(tx_event(11, "t2", b"r11")),
+                SourceItem::event(tx_event(12, "t2", b"r12")),
                 commit("t2", b"cp-2"),
             ],
             true,
@@ -4981,11 +4981,11 @@ mod tests {
             coord,
             vec![
                 begin("t2"),
-                SourceItem::Event(tx_event(10, "t2", b"r10")),
+                SourceItem::event(tx_event(10, "t2", b"r10")),
                 abort("t2"),
                 begin("t2"),
-                SourceItem::Event(tx_event(10, "t2", b"r10")),
-                SourceItem::Event(tx_event(11, "t2", b"r11")),
+                SourceItem::event(tx_event(10, "t2", b"r10")),
+                SourceItem::event(tx_event(11, "t2", b"r11")),
                 commit("t2", b"cp-2"),
             ],
         )
@@ -5016,14 +5016,14 @@ mod tests {
     fn abandoned_and_replayed() -> Vec<SourceItem> {
         vec![
             begin("t2"),
-            SourceItem::Event(tx_event(10, "t2", b"r10")),
-            SourceItem::Event(tx_event(11, "t2", b"r11")),
-            SourceItem::Event(tx_event(12, "t2", b"r12")),
+            SourceItem::event(tx_event(10, "t2", b"r10")),
+            SourceItem::event(tx_event(11, "t2", b"r11")),
+            SourceItem::event(tx_event(12, "t2", b"r12")),
             abort("t2"),
             begin("t2"),
-            SourceItem::Event(tx_event(10, "t2", b"r10")),
-            SourceItem::Event(tx_event(11, "t2", b"r11")),
-            SourceItem::Event(tx_event(12, "t2", b"r12")),
+            SourceItem::event(tx_event(10, "t2", b"r10")),
+            SourceItem::event(tx_event(11, "t2", b"r11")),
+            SourceItem::event(tx_event(12, "t2", b"r12")),
             commit("t2", b"cp-2"),
         ]
     }
@@ -5067,10 +5067,10 @@ mod tests {
         let (res, ids, cp) = deliver(
             vec![
                 begin("t1"),
-                SourceItem::Event(tx_event(1, "t1", b"r1")),
+                SourceItem::event(tx_event(1, "t1", b"r1")),
                 commit("t1", b"cp-1"),
                 begin("t2"),
-                SourceItem::Event(tx_event(10, "t2", b"r10")),
+                SourceItem::event(tx_event(10, "t2", b"r10")),
                 abort("t2"),
             ],
             true,
@@ -5107,14 +5107,14 @@ mod tests {
         let (res, ids, _) = deliver(
             vec![
                 begin("t2"),
-                SourceItem::Event(tx_event(10, "t2", b"r10")),
-                SourceItem::Event(tx_event(11, "t2", b"r11")),
-                SourceItem::Event(tx_event(12, "t2", b"r12")),
+                SourceItem::event(tx_event(10, "t2", b"r10")),
+                SourceItem::event(tx_event(11, "t2", b"r11")),
+                SourceItem::event(tx_event(12, "t2", b"r12")),
                 abort("t2"),
                 begin("t2"),
-                SourceItem::Event(tx_event(10, "t2", b"r10")),
-                SourceItem::Event(tx_event(11, "t2", b"r11")),
-                SourceItem::Event(tx_event(12, "t2", b"r12")),
+                SourceItem::event(tx_event(10, "t2", b"r10")),
+                SourceItem::event(tx_event(11, "t2", b"r11")),
+                SourceItem::event(tx_event(12, "t2", b"r12")),
                 commit("t2", b"cp-2"),
             ],
             false,
@@ -5131,7 +5131,7 @@ mod tests {
     async fn disconnect_after_commit_flushes_and_checkpoints() {
         let (res, store) = run_items(vec![
             begin("gtid:1"),
-            SourceItem::Event(tx_event(1, "gtid:1", b"r1")),
+            SourceItem::event(tx_event(1, "gtid:1", b"r1")),
             commit("gtid:1", b"cp-1"),
             // stream ends right after the commit marker
         ])
@@ -5170,7 +5170,7 @@ mod tests {
 
         tx.send(begin("gtid:1")).await.unwrap();
         for i in 0..2 {
-            tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
+            tx.send(SourceItem::event(tx_event(i, "gtid:1", b"row")))
                 .await
                 .unwrap();
         }
@@ -5227,7 +5227,7 @@ mod tests {
                 tokio::sync::watch::channel(PauseState::default());
             tx.send(begin("gtid:1")).await.unwrap();
             for i in 0..4 {
-                tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
+                tx.send(SourceItem::event(tx_event(i, "gtid:1", b"row")))
                     .await
                     .unwrap();
             }
@@ -5261,7 +5261,7 @@ mod tests {
                 tokio::sync::watch::channel(PauseState::default());
             tx.send(begin("gtid:1")).await.unwrap();
             for i in 0..4 {
-                tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
+                tx.send(SourceItem::event(tx_event(i, "gtid:1", b"row")))
                     .await
                     .unwrap();
             }
@@ -5308,7 +5308,7 @@ mod tests {
         // splits the events by count into [2, 1].
         tx.send(begin("gtid:1")).await.unwrap();
         for i in 0..3 {
-            tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
+            tx.send(SourceItem::event(tx_event(i, "gtid:1", b"row")))
                 .await
                 .unwrap();
         }
@@ -5437,7 +5437,7 @@ mod tests {
 
     /// Rows of an open transaction carry the boundary before it ("before").
     fn split_rows(tx_id: &str, ids: std::ops::Range<i64>) -> Vec<SourceItem> {
-        ids.map(|i| SourceItem::Event(tx_event(i, tx_id, b"before")))
+        ids.map(|i| SourceItem::event(tx_event(i, tx_id, b"before")))
             .collect()
     }
 
@@ -5542,7 +5542,7 @@ mod tests {
         r.send(vec![begin("gtid:2")]).await;
         r.send(
             (3..5)
-                .map(|i| SourceItem::Event(tx_event(i, "gtid:2", b"after")))
+                .map(|i| SourceItem::event(tx_event(i, "gtid:2", b"after")))
                 .collect(),
         )
         .await;
@@ -5732,7 +5732,7 @@ mod tests {
         let id = format!("gtid:{k}");
         vec![
             begin(&id),
-            SourceItem::Event(tx_event(
+            SourceItem::event(tx_event(
                 k as i64,
                 &id,
                 (k - 1).to_string().as_bytes(),
@@ -6290,7 +6290,7 @@ mod tests {
             coord,
             vec![
                 begin("t1"),
-                SourceItem::Event(tx_event(1, "t1", b"r1")),
+                SourceItem::event(tx_event(1, "t1", b"r1")),
                 commit("t1", b"cp-1"),
             ],
         )
@@ -6386,7 +6386,7 @@ mod tests {
                     coord,
                     vec![
                         begin("t1"),
-                        SourceItem::Event(tx_event(1, "t1", b"r1")),
+                        SourceItem::event(tx_event(1, "t1", b"r1")),
                         commit("t1", b"cp-1"),
                     ],
                 )
@@ -6502,7 +6502,7 @@ mod tests {
         );
         event.set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":7}".to_vec()));
         event.tx_end = true;
-        tx.send(SourceItem::Event(event)).await.unwrap();
+        tx.send(SourceItem::event(event)).await.unwrap();
         drop(tx);
         let _ = coord
             .run(rx, tokio_util::sync::CancellationToken::new(), pause_rx)
@@ -6602,7 +6602,7 @@ mod tests {
         event
             .set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":42}".to_vec()));
         event.tx_end = true;
-        tx.send(SourceItem::Event(event)).await.unwrap();
+        tx.send(SourceItem::event(event)).await.unwrap();
         drop(tx); // Close channel so coordinator exits after processing.
 
         let _ = coord.run(rx, cancel, pause_rx).await;
@@ -6694,7 +6694,7 @@ mod tests {
         event
             .set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":42}".to_vec()));
         event.tx_end = true;
-        tx.send(SourceItem::Event(event)).await.unwrap();
+        tx.send(SourceItem::event(event)).await.unwrap();
         drop(tx);
 
         let result = coord.run(rx, cancel, pause_rx).await;
@@ -6784,7 +6784,7 @@ mod tests {
                 ));
                 ev.tx_end = true;
             }
-            tx.send(SourceItem::Event(ev)).await.unwrap();
+            tx.send(SourceItem::event(ev)).await.unwrap();
         }
 
         // Don't close the channel - simulate source idle at WAL tail.
@@ -7075,7 +7075,7 @@ mod tests {
                 ));
                 ev.tx_end = true;
             }
-            tx.send(SourceItem::Event(ev)).await.unwrap();
+            tx.send(SourceItem::event(ev)).await.unwrap();
         }
         drop(tx);
 
@@ -7190,7 +7190,7 @@ mod tests {
                 ));
                 ev.tx_end = true;
             }
-            tx.send(SourceItem::Event(ev)).await.unwrap();
+            tx.send(SourceItem::event(ev)).await.unwrap();
         }
         drop(tx);
         let result = coord.run(rx, cancel, pause_rx).await;
@@ -7479,7 +7479,7 @@ mod tests {
         );
         ev.set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":10}".to_vec()));
         ev.tx_end = true;
-        tx.send(SourceItem::Event(ev)).await.unwrap();
+        tx.send(SourceItem::event(ev)).await.unwrap();
         drop(tx);
 
         let result = coord.run(rx, cancel, pause_rx).await;
@@ -7567,7 +7567,7 @@ mod tests {
         );
         ev.set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":10}".to_vec()));
         ev.tx_end = true;
-        tx.send(SourceItem::Event(ev)).await.unwrap();
+        tx.send(SourceItem::event(ev)).await.unwrap();
         drop(tx);
 
         // Pipeline continues (optional failure does not stop it under the
@@ -7658,7 +7658,7 @@ mod tests {
         );
         ev.set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":10}".to_vec()));
         ev.tx_end = true;
-        tx.send(SourceItem::Event(ev)).await.unwrap();
+        tx.send(SourceItem::event(ev)).await.unwrap();
         drop(tx);
 
         let result = coord.run(rx, cancel, pause_rx).await;
@@ -7754,7 +7754,7 @@ mod tests {
                 ));
                 ev.tx_end = true;
             }
-            tx.send(SourceItem::Event(ev)).await.unwrap();
+            tx.send(SourceItem::event(ev)).await.unwrap();
         }
         drop(tx);
 
@@ -7838,7 +7838,7 @@ mod tests {
         );
         ev.set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":10}".to_vec()));
         ev.tx_end = true;
-        tx.send(SourceItem::Event(ev)).await.unwrap();
+        tx.send(SourceItem::event(ev)).await.unwrap();
         drop(tx);
 
         // R3-C1: a required sink with a per-row failure and NO DLQ has no
@@ -7960,7 +7960,7 @@ mod tests {
         );
         ev.set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":1}".to_vec()));
         ev.tx_end = true;
-        tx.send(SourceItem::Event(ev)).await.unwrap();
+        tx.send(SourceItem::event(ev)).await.unwrap();
         drop(tx);
 
         // Give the coordinator enough time to trip the deadline (50ms) and
@@ -8060,7 +8060,7 @@ mod tests {
         );
         ev.set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":1}".to_vec()));
         ev.tx_end = true;
-        tx.send(SourceItem::Event(ev)).await.unwrap();
+        tx.send(SourceItem::event(ev)).await.unwrap();
         drop(tx);
 
         let cancel_clone = cancel.clone();
@@ -8241,7 +8241,7 @@ mod tests {
                     )),
                 });
             }
-            tx.send(SourceItem::Event(ev)).await.unwrap();
+            tx.send(SourceItem::event(ev)).await.unwrap();
         }
         drop(tx);
         coord.run(rx, cancel, pause_rx).await.unwrap();
@@ -8315,7 +8315,7 @@ mod tests {
         })
         .await
         .unwrap();
-        tx.send(SourceItem::Event(tx_event(1, "gtid:1", b"row")))
+        tx.send(SourceItem::event(tx_event(1, "gtid:1", b"row")))
             .await
             .unwrap();
         tx.send(SourceItem::TxCommit {
@@ -8386,7 +8386,7 @@ mod tests {
                 b"BINLOG-WM".to_vec(),
             )),
         });
-        tx.send(SourceItem::Event(ev)).await.unwrap();
+        tx.send(SourceItem::event(ev)).await.unwrap();
         drop(tx);
         coord.run(rx, cancel, pause_rx).await.unwrap();
 
@@ -8441,7 +8441,7 @@ mod tests {
     fn standalone_row(id: i64) -> SourceItem {
         let mut ev = tx_event(id, "unused", b"unused");
         ev.transaction = None;
-        SourceItem::Event(ev)
+        SourceItem::event(ev)
     }
 
     /// Snapshot rows of one chunk; only the last carries the chunk's
@@ -8466,7 +8466,7 @@ mod tests {
                         )),
                     });
                 }
-                SourceItem::Event(ev)
+                SourceItem::event(ev)
             })
             .collect()
     }
@@ -8548,7 +8548,7 @@ mod tests {
         let txn = format!("gtid:{n}");
         let mut items = vec![SourceItem::TxBegin { tx_id: txn.clone() }];
         for i in 0..rows {
-            items.push(SourceItem::Event(tx_event(n * 100 + i, &txn, b"row")));
+            items.push(SourceItem::event(tx_event(n * 100 + i, &txn, b"row")));
         }
         items.push(SourceItem::TxCommit {
             tx_id: txn,
@@ -9160,7 +9160,7 @@ mod tests {
         );
         event.set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":9}".to_vec()));
         event.tx_end = true;
-        tx.send(SourceItem::Event(event)).await.unwrap();
+        tx.send(SourceItem::event(event)).await.unwrap();
         drop(tx);
 
         let result = coord.run(rx, cancel, pause_rx).await;
@@ -9433,8 +9433,8 @@ mod barrier_tests {
                 &[("a", true, false), ("b", true, false)],
                 &[],
                 vec![
-                    SourceItem::Event(row(1, None)),
-                    SourceItem::Event(row(2, Some(b"rows"))),
+                    SourceItem::event(row(1, None)),
+                    SourceItem::event(row(2, Some(b"rows"))),
                     barrier(BarrierKind::Terminal, b"terminal"),
                 ],
             )
@@ -9502,7 +9502,7 @@ mod barrier_tests {
             &[],
             vec![
                 barrier(start_kind(), b"start-barrier"),
-                SourceItem::Event(row(1, Some(b"rows"))),
+                SourceItem::event(row(1, Some(b"rows"))),
                 barrier(BarrierKind::Terminal, b"terminal"),
                 barrier(start_kind(), b"start-barrier"),
                 barrier(BarrierKind::Terminal, b"terminal"),
@@ -9526,7 +9526,7 @@ mod barrier_tests {
             &[],
             vec![
                 barrier(start_kind(), b"start-barrier"),
-                SourceItem::Event(row(1, Some(b"rows"))),
+                SourceItem::event(row(1, Some(b"rows"))),
                 barrier(BarrierKind::Terminal, b"terminal"),
             ],
         )
@@ -9617,7 +9617,7 @@ mod barrier_tests {
             &[],
             vec![
                 SourceItem::TxBegin { tx_id: "t1".into() },
-                SourceItem::Event(ev),
+                SourceItem::event(ev),
                 barrier(BarrierKind::Terminal, b"terminal"),
             ],
         )

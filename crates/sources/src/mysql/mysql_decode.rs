@@ -12,8 +12,8 @@
 
 use deltaforge_core::canonical::{
     Bits, CanonicalRow, CanonicalValue, CivilDate, DateTimeValue, DateValue,
-    DbValue, Decimal, EnumValue, IntWidth, JsonText, Precision, SetValue,
-    TimeValue, TimestampValue,
+    DbValue, Decimal, DistinctNames, EnumValue, IntWidth, JsonText, Precision,
+    SetValue, TimeValue, TimestampValue,
 };
 use mysql_binlog_connector_rust::column::column_value::ColumnValue;
 
@@ -688,13 +688,22 @@ fn clock_micros(
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableDecoder {
     pub columns: Vec<ColumnDecoder>,
+    /// Set when no column name repeats: a binlog row takes each column at
+    /// most once, so its row is then built without a check per row.
+    distinct: Option<DistinctNames>,
 }
 
 impl TableDecoder {
     pub fn new(schema: &MySqlTableSchema) -> TableDecoder {
-        TableDecoder {
-            columns: schema.columns.iter().map(ColumnDecoder::new).collect(),
-        }
+        TableDecoder::from_columns(
+            schema.columns.iter().map(ColumnDecoder::new).collect(),
+        )
+    }
+
+    pub fn from_columns(columns: Vec<ColumnDecoder>) -> TableDecoder {
+        let distinct =
+            DistinctNames::check(columns.iter().map(|c| c.name.as_str()));
+        TableDecoder { columns, distinct }
     }
 
     /// Decode a binlog row image: `included` is the image's column bitmap
@@ -722,6 +731,10 @@ impl TableDecoder {
                 col.fail("the row image is missing the column's value")
             })?;
             out.push((col.name.clone(), col.decode(Raw::from_binlog(v))?));
+        }
+        // Columns are taken by increasing ordinal, so each at most once.
+        if let Some(distinct) = self.distinct {
+            return Ok(CanonicalRow::from_distinct(out, distinct));
         }
         CanonicalRow::new(out).map_err(|err| DecodeError {
             column: String::new(),

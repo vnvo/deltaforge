@@ -246,7 +246,7 @@ impl RedisSink {
         if self.stream_template.is_static() {
             return Ok(self.stream.clone());
         }
-        let event_json = crate::payload::route_view(event);
+        let event_json = crate::payload::RouteView::new(event);
         self.stream_template
             .resolve_strict(&event_json)
             .map_err(|e| SinkError::Routing {
@@ -264,7 +264,7 @@ impl RedisSink {
                 return tmpl.resolve_lenient(&serde_json::Value::Null);
             }
             {
-                let event_json = crate::payload::route_view(event);
+                let event_json = crate::payload::RouteView::new(event);
                 let resolved = tmpl.resolve_lenient(&event_json);
                 if !resolved.is_empty() {
                     return resolved;

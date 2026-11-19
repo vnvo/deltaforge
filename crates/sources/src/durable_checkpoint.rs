@@ -231,7 +231,7 @@ impl DurableWatermark {
 
     /// Serialize for storage in HEAD.
     pub fn to_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("watermark serializes")
+        deltaforge_core::json_out::to_vec(self).expect("watermark serializes")
     }
 
     /// Parse, returning `None` on any malformed / unknown-version / missing-field
@@ -243,6 +243,49 @@ impl DurableWatermark {
             return None;
         }
         Some(w)
+    }
+}
+
+/// MySQL GTID commit watermarks of one lineage. Every commit writes the
+/// same document with only the GTID set changed: it is written once with
+/// the set open ([`crate::json_template`]) and filled per commit, with the
+/// bytes [`DurableWatermark::to_bytes`] writes.
+#[derive(Debug, Default)]
+pub(crate) struct GtidCommitWatermarks(
+    std::sync::OnceLock<(
+        PersistedLineage,
+        Option<crate::json_template::JsonTemplate>,
+    )>,
+);
+
+impl GtidCommitWatermarks {
+    /// `DurableWatermark::mysql_gtid_commit(lineage, gtid_set).to_bytes()`.
+    pub(crate) fn bytes(
+        &self,
+        lineage: &PersistedLineage,
+        gtid_set: &str,
+    ) -> Vec<u8> {
+        use crate::json_template::{Fill, JsonTemplate, MARK_STR, Open};
+        let (kept, doc) = self.0.get_or_init(|| {
+            let marked = DurableWatermark::mysql_gtid_commit(
+                lineage.clone(),
+                MARK_STR.to_string(),
+            );
+            let doc =
+                JsonTemplate::cut(&marked.to_bytes(), &[Open::Str("gtid_set")]);
+            (lineage.clone(), doc)
+        });
+        if kept == lineage
+            && let Some(bytes) =
+                doc.as_ref().and_then(|d| d.fill(&[Fill::Str(gtid_set)]))
+        {
+            return bytes;
+        }
+        DurableWatermark::mysql_gtid_commit(
+            lineage.clone(),
+            gtid_set.to_string(),
+        )
+        .to_bytes()
     }
 }
 
@@ -331,6 +374,178 @@ pub fn mysql_checkpoint_position(
     }
 }
 
+/// How many GTID set texts [`parsed_gtid_set`] keeps parsed, per thread.
+const PARSED_GTID_SETS: usize = 256;
+
+/// `GtidSet::parse(text)`, remembered: selection compares the same few
+/// positions again and again (a pure function of the text).
+fn parsed_gtid_set(text: &str) -> Option<std::rc::Rc<GtidSet>> {
+    thread_local! {
+        static PARSED: std::cell::RefCell<
+            lru::LruCache<String, Option<std::rc::Rc<GtidSet>>>,
+        > = std::cell::RefCell::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(PARSED_GTID_SETS).expect("nonzero"),
+        ));
+    }
+    PARSED.with(|p| {
+        let mut p = p.borrow_mut();
+        if let Some(set) = p.get(text) {
+            return set.clone();
+        }
+        let set = GtidSet::parse(text).map(std::rc::Rc::new);
+        p.put(text.to_string(), set.clone());
+        set
+    })
+}
+
+/// Two GTID sets ordered by inclusion; a set that did not parse orders
+/// against nothing.
+fn order_gtid_sets(
+    a: Option<&GtidSet>,
+    b: Option<&GtidSet>,
+) -> CheckpointOrder {
+    match (a, b) {
+        (Some(a), Some(b)) => order_from_subset(a.is_subset(b), b.is_subset(a)),
+        _ => CheckpointOrder::Incomparable,
+    }
+}
+
+/// A position with its GTID set already in hand, so ordering against it
+/// never parses its text: what a stream evaluates every row of a
+/// transaction at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedPos {
+    pos: WmPos,
+    /// The set of a `MysqlGtid` position (`None` when its text does not
+    /// parse, or for any other kind).
+    gtid: Option<std::sync::Arc<GtidSet>>,
+}
+
+impl ParsedPos {
+    /// `pos`, parsed once.
+    pub fn new(pos: WmPos) -> Self {
+        let gtid = match &pos {
+            WmPos::MysqlGtid { gtid_set } => {
+                GtidSet::parse(gtid_set).map(std::sync::Arc::new)
+            }
+            _ => None,
+        };
+        Self { pos, gtid }
+    }
+
+    /// The GTID position of `set`, as its canonical text: the text parses
+    /// back to the same transactions, so it orders exactly as the set.
+    pub fn gtid(set: GtidSet) -> Self {
+        Self {
+            pos: WmPos::MysqlGtid {
+                gtid_set: set.text(),
+            },
+            gtid: Some(std::sync::Arc::new(set)),
+        }
+    }
+
+    pub fn pos(&self) -> &WmPos {
+        &self.pos
+    }
+}
+
+/// The GTID set of a stored position, parsed on first use and kept with
+/// it: selection orders the same records against every row, so their text
+/// is parsed once rather than looked up again for each row. It holds the
+/// text it parsed, and a use with any other text parses that text instead,
+/// so a set can never answer for a position it was not parsed from.
+#[derive(Default)]
+pub struct GtidMemo(
+    std::sync::OnceLock<(String, Option<std::sync::Arc<GtidSet>>)>,
+);
+
+impl GtidMemo {
+    /// `f` of the set `text` parses to (`None` when it does not parse).
+    fn with<R>(&self, text: &str, f: impl FnOnce(Option<&GtidSet>) -> R) -> R {
+        let (kept, set) = self.0.get_or_init(|| {
+            (
+                text.to_string(),
+                GtidSet::parse(text).map(std::sync::Arc::new),
+            )
+        });
+        if kept == text {
+            f(set.as_deref())
+        } else {
+            f(parsed_gtid_set(text).as_deref())
+        }
+    }
+}
+
+impl Clone for GtidMemo {
+    fn clone(&self) -> Self {
+        let memo = GtidMemo::default();
+        if let Some(kept) = self.0.get() {
+            let _ = memo.0.set(kept.clone());
+        }
+        memo
+    }
+}
+
+/// A memo is a function of its position's text: it never makes two
+/// positions differ.
+impl PartialEq for GtidMemo {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for GtidMemo {}
+
+impl std::fmt::Debug for GtidMemo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GtidMemo")
+    }
+}
+
+/// [`order_against`] of a stored position `a`, its GTID set kept in `memo`.
+pub fn order_kept_against(
+    a: &WmPos,
+    memo: &GtidMemo,
+    b: &ParsedPos,
+) -> CheckpointOrder {
+    match (a, &b.pos) {
+        (WmPos::MysqlGtid { gtid_set }, WmPos::MysqlGtid { .. }) => {
+            memo.with(gtid_set, |a| order_gtid_sets(a, b.gtid.as_deref()))
+        }
+        _ => order_positions(a, &b.pos),
+    }
+}
+
+/// [`order_positions`] of two stored positions, their GTID sets kept in
+/// their memos.
+pub fn order_kept(
+    a: &WmPos,
+    a_memo: &GtidMemo,
+    b: &WmPos,
+    b_memo: &GtidMemo,
+) -> CheckpointOrder {
+    match (a, b) {
+        (
+            WmPos::MysqlGtid { gtid_set: ga },
+            WmPos::MysqlGtid { gtid_set: gb },
+        ) => a_memo.with(ga, |a| b_memo.with(gb, |b| order_gtid_sets(a, b))),
+        _ => order_positions(a, b),
+    }
+}
+
+/// [`order_positions`] of `a` against a position already parsed.
+pub fn order_against(a: &WmPos, b: &ParsedPos) -> CheckpointOrder {
+    match (a, &b.pos) {
+        (WmPos::MysqlGtid { gtid_set }, WmPos::MysqlGtid { .. }) => {
+            order_gtid_sets(
+                parsed_gtid_set(gtid_set).as_deref(),
+                b.gtid.as_deref(),
+            )
+        }
+        _ => order_positions(a, &b.pos),
+    }
+}
+
 /// Order two positions known to belong to the SAME lineage (the caller has
 /// established that; [`order`] checks it for watermarks). The single position
 /// comparator shared by durable watermarks, MySQL checkpoint selection and
@@ -371,12 +586,10 @@ pub fn order_positions(a: &WmPos, b: &WmPos) -> CheckpointOrder {
         (
             WmPos::MysqlGtid { gtid_set: ga },
             WmPos::MysqlGtid { gtid_set: gb },
-        ) => match (GtidSet::parse(ga), GtidSet::parse(gb)) {
-            (Some(sa), Some(sb)) => {
-                order_from_subset(sa.is_subset(&sb), sb.is_subset(&sa))
-            }
-            _ => CheckpointOrder::Incomparable,
-        },
+        ) => order_gtid_sets(
+            parsed_gtid_set(ga).as_deref(),
+            parsed_gtid_set(gb).as_deref(),
+        ),
         (
             WmPos::MysqlBinlog {
                 file_base: ba,
@@ -1896,5 +2109,205 @@ mod snapshot_chain_watermark_tests {
             DurableWatermark::pg_commit(7, 10, None).version,
             WATERMARK_VERSION
         );
+    }
+
+    #[test]
+    fn remembered_gtid_set_parse_is_the_parse() {
+        let u = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+        let w = "4e11fa47-71ca-11e1-9e33-c80aa9429562";
+        let texts = [
+            format!("{u}:1-5"),
+            format!("{u}:1-5"),
+            format!("{u}:1-7"),
+            format!("{u}:1-5,{w}:1-2"),
+            format!("{w}:1-2,{u}:1-5"),
+            String::new(),
+            "not a gtid set".to_string(),
+            "not a gtid set".to_string(),
+            format!("{u}:1-5:7-9"),
+        ];
+        // Through the memo twice (a miss, then hits): each answer is the
+        // parse's, and the ordering every pair gets is the parsed one.
+        for _ in 0..2 {
+            for a in &texts {
+                assert_eq!(
+                    parsed_gtid_set(a).as_deref(),
+                    GtidSet::parse(a).as_ref(),
+                    "{a}"
+                );
+                for b in &texts {
+                    let direct = match (GtidSet::parse(a), GtidSet::parse(b)) {
+                        (Some(sa), Some(sb)) => order_from_subset(
+                            sa.is_subset(&sb),
+                            sb.is_subset(&sa),
+                        ),
+                        _ => CheckpointOrder::Incomparable,
+                    };
+                    let pa = WmPos::MysqlGtid {
+                        gtid_set: a.clone(),
+                    };
+                    let pb = WmPos::MysqlGtid {
+                        gtid_set: b.clone(),
+                    };
+                    assert_eq!(order_positions(&pa, &pb), direct, "{a} vs {b}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod parsed_position_tests {
+    use super::*;
+
+    fn text(s: &str) -> WmPos {
+        WmPos::MysqlGtid { gtid_set: s.into() }
+    }
+
+    /// A row position built from the set the stream holds orders every
+    /// record exactly as the same position written as text and parsed.
+    #[test]
+    fn a_held_set_orders_as_its_text() {
+        let sets = [
+            "",
+            "a:1-5",
+            "a:1-4",
+            "a:1-5:7",
+            "a:1-7",
+            "a:1-5,b:1-3",
+            "b:1-3",
+            "a:2-5",
+        ];
+        let records = sets
+            .iter()
+            .map(|s| text(s))
+            .chain([
+                text("not a set"),
+                WmPos::MysqlBinlog {
+                    file_base: "bin".into(),
+                    file_index: 1,
+                    pos: 4,
+                },
+            ])
+            .collect::<Vec<_>>();
+        for row in sets {
+            let held = ParsedPos::gtid(GtidSet::parse(row).unwrap());
+            assert_eq!(
+                held.pos(),
+                &text(&GtidSet::parse(row).unwrap().to_string())
+            );
+            for r in &records {
+                assert_eq!(
+                    order_against(r, &held),
+                    order_positions(r, &text(row)),
+                    "{r:?} against {row:?}"
+                );
+            }
+        }
+    }
+
+    /// A position given as text is parsed once, and orders as the text.
+    #[test]
+    fn a_parsed_position_orders_as_its_text() {
+        let positions = [
+            text("a:1-5"),
+            text("a:1-3"),
+            text("garbage"),
+            WmPos::MysqlBinlog {
+                file_base: "bin".into(),
+                file_index: 2,
+                pos: 9,
+            },
+            WmPos::MysqlBinlog {
+                file_base: "bin".into(),
+                file_index: 2,
+                pos: 4,
+            },
+        ];
+        for a in &positions {
+            for b in &positions {
+                assert_eq!(
+                    order_against(a, &ParsedPos::new(b.clone())),
+                    order_positions(a, b),
+                    "{a:?} against {b:?}"
+                );
+            }
+        }
+    }
+
+    /// A stored position orders through its kept set exactly as its text,
+    /// on first use and every use after; a memo first used for another
+    /// position's text never answers for it.
+    /// The commit watermark filled from the kept document is the one
+    /// written whole, and a different lineage is written whole.
+    #[test]
+    fn gtid_commit_watermarks_are_written_as_whole_ones() {
+        let a = PersistedLineage::MysqlGtid {
+            source_uuid: [7; 16],
+        };
+        let b = PersistedLineage::MysqlGtid {
+            source_uuid: [9; 16],
+        };
+        let w = GtidCommitWatermarks::default();
+        for (lineage, set) in [
+            (&a, "37b3bf36-d624-11f1-a18e-0242ac110003:1-5"),
+            (&a, "x\"\\\u{1}"),
+            (&b, "37b3bf36-d624-11f1-a18e-0242ac110003:1-6"),
+        ] {
+            assert_eq!(
+                w.bytes(lineage, set),
+                DurableWatermark::mysql_gtid_commit(
+                    lineage.clone(),
+                    set.to_string()
+                )
+                .to_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn a_kept_set_orders_as_its_text() {
+        let positions = [
+            text("a:1-5"),
+            text("a:1-3"),
+            text("a:1-5,b:1-2"),
+            text("garbage"),
+            WmPos::MysqlBinlog {
+                file_base: "bin".into(),
+                file_index: 2,
+                pos: 9,
+            },
+        ];
+        let memos: Vec<GtidMemo> =
+            positions.iter().map(|_| GtidMemo::default()).collect();
+        for _ in 0..2 {
+            for (a, am) in positions.iter().zip(&memos) {
+                for (b, bm) in positions.iter().zip(&memos) {
+                    let row = ParsedPos::new(b.clone());
+                    assert_eq!(
+                        order_kept_against(a, am, &row),
+                        order_positions(a, b),
+                        "{a:?} against {b:?}"
+                    );
+                    assert_eq!(
+                        order_kept(a, am, b, bm),
+                        order_positions(a, b),
+                        "{a:?} and {b:?}"
+                    );
+                }
+            }
+        }
+        let wide = GtidMemo::default();
+        let row = ParsedPos::new(text("a:1-4"));
+        assert_eq!(
+            order_kept_against(&text("a:1-5"), &wide, &row),
+            CheckpointOrder::After
+        );
+        assert_eq!(
+            order_kept_against(&text("a:1-3"), &wide, &row),
+            CheckpointOrder::Before,
+            "the memo kept a:1-5 and must not answer for a:1-3"
+        );
+        assert_eq!(wide.clone(), GtidMemo::default());
     }
 }
