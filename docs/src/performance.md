@@ -127,6 +127,7 @@ MySQL binlog is inherently efficient because `WriteRowsEvent` batches multiple r
 **DeltaForge settings for MySQL:**
 
 - **`tables`** — be specific. Subscribing to `*.*` forces DeltaForge to process table map events for every table, even those it discards.
+- **`decode_workers`** - row images are decoded on worker threads and put back in binlog order before they leave the source. The default (cores minus two, at most four) suits most hosts; `0` keeps decoding on the source task, which uses less CPU and memory at a lower drain rate. With many rows per transaction, expect more memory while draining a backlog: more decoded rows wait for the sink, within the existing source channel and batch limits.
 - **`snapshot.chunk_size`** — for initial snapshots of large tables, increase chunk size (default 10,000) to reduce round trips.
 
 ### PostgreSQL

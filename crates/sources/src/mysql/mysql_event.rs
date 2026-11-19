@@ -2,13 +2,11 @@ use crate::gtid_set::GtidSet;
 use crate::mysql::LoopControl;
 use crate::mysql::RunCtx;
 use common::{ts_sec_to_ms, watchdog};
-use deltaforge_core::CanonicalRow;
 use deltaforge_core::{
     Event, Op, SourceError, SourceInfo, SourceItem, SourcePosition,
     SourceResult, Transaction,
 };
 use metrics::counter;
-use mysql_binlog_connector_rust::column::column_value::ColumnValue;
 use mysql_binlog_connector_rust::{
     binlog_parser::BinlogParser,
     event::{
@@ -25,8 +23,13 @@ use crate::mysql::mysql_helpers::{
 
 use deltaforge_config::OUTBOX_SCHEMA_SENTINEL;
 
+use super::mysql_decode_pool::{DecodePool, Done, Images, Pending, RowsJob};
+
 /// Most items the read loop holds before it sends them.
 const OUTBOX_ITEMS: usize = 256;
+
+/// Most rows a batch for the decode workers holds.
+const BATCH_ROWS: usize = 256;
 
 /// The source's items on their way to the coordinator's channel. While the
 /// binlog read loop holds ([`Outbox::set_hold`]) they are kept and sent in
@@ -35,9 +38,26 @@ const OUTBOX_ITEMS: usize = 256;
 /// another worker is woken once per burst rather than once per item. Every
 /// other caller sends at once. Either way the channel receives the items
 /// in the order they were emitted.
+///
+/// With decode workers ([`super::mysql_decode_pool`]) the items are first
+/// gathered into batches (at most [`OUTBOX_ITEMS`] items or [`BATCH_ROWS`]
+/// rows), whose rows events the workers decode; finished batches are held
+/// in the order they were queued, so the channel still receives every item
+/// in emission order. A sending at once (outside the read loop's hold), a
+/// [`flush`] and a [`barrier`] first wait for every queued batch.
 pub(crate) struct Outbox {
     held: std::collections::VecDeque<SourceItem>,
     hold: bool,
+    /// The decode workers; `None` decodes on the source task.
+    pool: Option<DecodePool>,
+    /// The batch being gathered for the workers.
+    building: Vec<Pending>,
+    building_rows: usize,
+    /// A rows event failed to decode on a worker. Everything emitted before
+    /// it is held; nothing emitted after it is ever sent. Taken once by
+    /// [`Outbox::take_failure`] (the source then fails with it).
+    failure: Option<SourceError>,
+    failed: bool,
 }
 
 impl Outbox {
@@ -45,16 +65,95 @@ impl Outbox {
         Self {
             held: std::collections::VecDeque::new(),
             hold: false,
+            pool: None,
+            building: Vec::new(),
+            building_rows: 0,
+            failure: None,
+            failed: false,
         }
     }
 
+    /// An outbox whose rows events are decoded by `workers` threads (none:
+    /// on the source task, as [`Outbox::new`]).
+    pub(crate) fn with_workers(workers: usize) -> Self {
+        let mut out = Self::new();
+        if workers > 0 {
+            out.pool = Some(DecodePool::new(workers, 2 * workers));
+        }
+        out
+    }
+
+    /// Nothing held, gathered or with the workers.
     pub(crate) fn is_empty(&self) -> bool {
         self.held.is_empty()
+            && self.building.is_empty()
+            && self.pool.as_ref().is_none_or(DecodePool::is_idle)
+    }
+
+    /// Whether rows events go to the decode workers.
+    pub(crate) fn parallel(&self) -> bool {
+        self.pool.is_some() && !self.failed
+    }
+
+    /// The decode failure a worker found, once.
+    pub(crate) fn take_failure(&mut self) -> Option<SourceError> {
+        self.failure.take()
     }
 
     /// Whether emitted items are held (the read loop) or sent at once.
     pub(crate) fn set_hold(&mut self, hold: bool) {
         self.hold = hold;
+    }
+
+    /// A finished batch, in queue order: its items are held; a failure
+    /// ends the workers and drops everything gathered after it.
+    fn absorb(&mut self, done: Done) {
+        self.held.extend(done.items);
+        if let Some(e) = done.failure {
+            self.failure = Some(e);
+            self.failed = true;
+            self.pool = None;
+            self.building.clear();
+            self.building_rows = 0;
+        }
+    }
+
+    /// Every finished batch that is next in order, without waiting.
+    fn collect(&mut self) {
+        while let Some(done) = self.pool.as_mut().and_then(DecodePool::ready) {
+            self.absorb(done);
+        }
+    }
+
+    /// Queue the gathered batch, waiting for room. Cancel-safe: the batch
+    /// leaves `building` only when it is queued.
+    async fn submit(&mut self) {
+        while !self.building.is_empty() {
+            let Some(pool) = self.pool.as_mut() else {
+                return;
+            };
+            if pool.has_room() {
+                let batch = std::mem::take(&mut self.building);
+                self.building_rows = 0;
+                pool.submit(batch);
+                return;
+            }
+            pool.room().await;
+            self.collect();
+        }
+    }
+
+    /// Queue the gathered batch and hold every batch queued so far.
+    /// Cancel-safe (see [`Outbox::submit`]; a batch received while waiting
+    /// is kept by the pool).
+    async fn drain(&mut self) {
+        self.submit().await;
+        while let Some(done) = match self.pool.as_mut() {
+            Some(pool) => pool.next().await,
+            None => None,
+        } {
+            self.absorb(done);
+        }
     }
 }
 
@@ -83,6 +182,14 @@ pub(crate) async fn emit(
     out: &mut Outbox,
     item: SourceItem,
 ) -> bool {
+    if out.failed {
+        // Past a decode failure nothing is sent (the source fails with it).
+        return true;
+    }
+    if out.pool.is_some() {
+        out.building.push(Pending::Ready(item));
+        return gathered(tx, out).await;
+    }
     if out.hold {
         out.held.push_back(item);
         if out.held.len() >= OUTBOX_ITEMS {
@@ -93,11 +200,68 @@ pub(crate) async fn emit(
     flush(tx, out).await && send_item(tx, item).await
 }
 
-/// Send everything held, in order. False when the channel is closed: the
+/// Queue a rows event for the decode workers (only while
+/// [`Outbox::parallel`]), after everything emitted before it.
+pub(super) async fn queue_rows(
+    tx: &tokio::sync::mpsc::Sender<SourceItem>,
+    out: &mut Outbox,
+    job: RowsJob,
+) -> bool {
+    out.building_rows += job.images.rows();
+    out.building.push(Pending::Rows(job));
+    gathered(tx, out).await
+}
+
+/// After an item was gathered: outside the read loop's hold everything goes
+/// out now; inside it a full batch is queued, finished batches are held,
+/// and a full hold is sent.
+async fn gathered(
+    tx: &tokio::sync::mpsc::Sender<SourceItem>,
+    out: &mut Outbox,
+) -> bool {
+    if !out.hold {
+        return flush(tx, out).await;
+    }
+    if out.building.len() >= OUTBOX_ITEMS || out.building_rows >= BATCH_ROWS {
+        out.submit().await;
+    }
+    out.collect();
+    if out.held.len() >= OUTBOX_ITEMS {
+        return send_held(tx, out).await;
+    }
+    true
+}
+
+/// Send everything emitted so far, in order: with decode workers, every
+/// queued batch is waited for first. False when the channel is closed: the
 /// rest is dropped (nothing reads it). Cancel-safe (a window's time bound
 /// can interrupt it): an item leaves the outbox only with the channel's
-/// room for it in hand, so an interrupted flush loses nothing.
+/// room for it in hand, so an interrupted flush loses nothing. A decode
+/// failure found here is left for [`Outbox::take_failure`].
 pub(crate) async fn flush(
+    tx: &tokio::sync::mpsc::Sender<SourceItem>,
+    out: &mut Outbox,
+) -> bool {
+    out.drain().await;
+    send_held(tx, out).await
+}
+
+/// Before a step the source cannot take back (a durable write, a wait for
+/// the stream): every item emitted so far is sent, and a decode failure
+/// among them is returned - the step is never taken past it, as without
+/// decode workers. A no-op without them.
+pub(crate) async fn barrier(ctx: &mut RunCtx) -> SourceResult<()> {
+    if ctx.outbox.parallel() {
+        flush(&ctx.tx, &mut ctx.outbox).await;
+    }
+    match ctx.outbox.take_failure() {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Send what is held, in order (see [`flush`]).
+async fn send_held(
     tx: &tokio::sync::mpsc::Sender<SourceItem>,
     out: &mut Outbox,
 ) -> bool {
@@ -122,10 +286,74 @@ pub(crate) async fn flush(
     true
 }
 
+/// With decode workers, when the stream has no event at hand: every batch
+/// that finishes (in order) goes out, and what is gathered goes to the
+/// workers once they are idle (while they are busy it keeps gathering, so
+/// batches grow with the load), until the stream yields its next event or
+/// nothing is left. The event, or `None` once everything is decoded and
+/// sent (the caller then waits on the stream as without workers). A decode
+/// failure ends it, as at any other point the batch is taken back.
+/// Cancel-safe: the read keeps what it received, a finished batch is kept
+/// by the pool until taken, a gathered batch leaves only when queued.
+async fn idle_read(
+    stream: &mut super::mysql_read_ahead::ReadAhead,
+    ctx: &mut RunCtx,
+) -> Result<
+    Option<
+        Result<
+            (EventHeader, EventData),
+            common::RetryOutcome<
+                mysql_binlog_connector_rust::binlog_error::BinlogError,
+            >,
+        >,
+    >,
+    LoopControl,
+> {
+    enum Next<R> {
+        Read(R),
+        Done(Option<Done>),
+    }
+    loop {
+        ctx.outbox.collect();
+        send_held(&ctx.tx, &mut ctx.outbox).await;
+        if let Some(e) = ctx.outbox.take_failure() {
+            return Err(LoopControl::Fail(e));
+        }
+        let idle = ctx.outbox.pool.as_ref().is_none_or(DecodePool::is_idle);
+        if idle {
+            if ctx.outbox.building.is_empty() {
+                return Ok(None);
+            }
+            ctx.outbox.submit().await;
+            continue;
+        }
+        let Some(pool) = ctx.outbox.pool.as_mut() else {
+            return Ok(None);
+        };
+        let next = tokio::select! {
+            biased;
+            r = stream.read() => Next::Read(r),
+            d = pool.next() => Next::Done(d),
+        };
+        match next {
+            Next::Read(r) => {
+                return Ok(Some(r.map_err(common::RetryOutcome::Failed)));
+            }
+            Next::Done(Some(done)) => ctx.outbox.absorb(done),
+            Next::Done(None) => {}
+        }
+    }
+}
+
 pub(super) async fn read_next_event(
     stream: &mut super::mysql_read_ahead::ReadAhead,
     ctx: &mut RunCtx,
 ) -> Result<(EventHeader, EventData), LoopControl> {
+    // A rows event a decode worker could not decode ends the stream where
+    // it would have without workers: before anything read after it.
+    if let Some(e) = ctx.outbox.take_failure() {
+        return Err(LoopControl::Fail(e));
+    }
     // Test hook: the connection "dropped" right here.
     if crate::stream_probe::take_disconnect() {
         return Err(LoopControl::Reconnect);
@@ -157,14 +385,30 @@ pub(super) async fn read_next_event(
                 Some(Ok(event)) => Ok(event),
                 Some(Err(e)) => Err(common::RetryOutcome::Failed(e)),
                 None => {
-                    flush(&ctx.tx, &mut ctx.outbox).await;
-                    watchdog(
-                        stream.read(),
-                        ctx.inactivity,
-                        &ctx.cancel,
-                        "binlog_read",
-                    )
-                    .await
+                    // With decode workers: the next event or a finished
+                    // batch, whichever comes first; the stream is never held
+                    // up by batches still decoding.
+                    let early = if ctx.outbox.parallel() {
+                        idle_read(stream, ctx).await?
+                    } else {
+                        None
+                    };
+                    match early {
+                        Some(read) => read,
+                        None => {
+                            flush(&ctx.tx, &mut ctx.outbox).await;
+                            if let Some(e) = ctx.outbox.take_failure() {
+                                return Err(LoopControl::Fail(e));
+                            }
+                            watchdog(
+                                stream.read(),
+                                ctx.inactivity,
+                                &ctx.cancel,
+                                "binlog_read",
+                            )
+                            .await
+                        }
+                    }
                 }
             }
         }
@@ -490,33 +734,148 @@ fn build_source_info(
     Ok((source, id))
 }
 
-/// Decode every row image of one rows event (`images`: the image bitmap and
-/// values of each row) before any of its events is sent, so a value that
-/// cannot be decoded emits nothing from the event. A failure is the
-/// `source_decode_failed` incident.
-fn decode_images<'a>(
-    ctx: &RunCtx,
-    tm: &TableMapEvent,
-    loaded: &super::mysql_schema_loader::LoadedSchema,
-    images: impl IntoIterator<Item = (&'a [bool], &'a [ColumnValue])>,
-) -> SourceResult<Vec<CanonicalRow>> {
-    images
-        .into_iter()
-        .map(|(included, values)| {
-            loaded
-                .decoder
-                .decode_binlog_row(included, values)
-                .map_err(|e| {
-                    crate::incident_drafts::source_decode_failed(
-                        &ctx.source_id,
-                        &format!("{}.{}", tm.database_name, tm.table_name),
-                        &e.column,
-                        &e.column_type,
-                        &e.reason,
-                    )
-                })
-        })
-        .collect()
+/// The rows of one rows event, as the three rows handlers share them: the
+/// table's selection, then one event per row built here without its row
+/// image (position, identity, checkpoint, transaction, schema version),
+/// then the images decoded into them - on the decode workers when the
+/// outbox has them, else here ([`emit_rows`]). Every image of the event is
+/// decoded before any of its events is sent, so a value that cannot be
+/// decoded emits nothing from the event (the `source_decode_failed`
+/// incident).
+async fn handle_rows(
+    ctx: &mut RunCtx,
+    header: &EventHeader,
+    table_id: u64,
+    op: Op,
+    images: Images,
+) -> SourceResult<()> {
+    let Some(tm) = ctx.table_map.get(&table_id).cloned() else {
+        return Err(super::mysql_errors::unmapped_table_id(table_id));
+    };
+    let tm: &TableMapEvent = &tm;
+    if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
+        return Ok(());
+    }
+    let loaded = super::mysql_selection::select_for_rows(ctx, tm).await?;
+    let (label, code) = match op {
+        Op::Update => ("update", "u"),
+        Op::Delete => ("delete", "d"),
+        _ => ("insert", "c"),
+    };
+    debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=images.rows(), op=label, "rows");
+
+    // Shared by every row of this event.
+    let ts_ms = ts_sec_to_ms(header.timestamp);
+    let event_len = header.event_length as usize;
+    // Inside a transaction a row's checkpoint is the last proven boundary:
+    // a resume from it re-reads the transaction, never starts inside it.
+    let checkpoint = ctx.row_checkpoint();
+    let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
+        id: gtid.clone(),
+        total_order: None,
+        data_collection_order: None,
+    });
+    // Standalone (non-GTID) rows carry their binlog watermark atomically
+    // with their checkpoint; shared across every row in this binlog event.
+    let standalone_wm = standalone_row_watermark(ctx, &transaction);
+    let fingerprint_str = loaded.fingerprint.to_string();
+    let is_outbox = op == Op::Create
+        && !ctx.outbox_tables.is_empty()
+        && ctx.outbox_tables.matches(&tm.database_name, &tm.table_name);
+    let table = format!("{}.{}", tm.database_name, tm.table_name);
+
+    // Row ordinal resets per rows event and increments per row (an update's
+    // before/after pair is one row); with the event's end_log_pos it
+    // uniquely identifies each row change.
+    let mut shells = Vec::with_capacity(images.rows());
+    for row_ordinal in 0..images.rows() {
+        let (source_info, event_id) = match build_source_info(
+            ctx,
+            header,
+            &tm.database_name,
+            &tm.table_name,
+            row_ordinal as u32,
+        ) {
+            Ok(built) => built,
+            // The images are decoded before any identity is derived: a
+            // value that cannot be decoded is the event's failure.
+            Err(e) => {
+                return Err(RowsJob::decode_failure(
+                    &loaded.decoder,
+                    &ctx.source_id,
+                    &table,
+                    &images,
+                )
+                .unwrap_or(e));
+            }
+        };
+        let mut ev = Event::new_row(
+            event_id,
+            source_info,
+            op,
+            None,
+            None,
+            ctx.type_mapping,
+            ts_ms,
+            event_len,
+        )
+        .with_tenant(ctx.tenant.clone())
+        .with_checkpoint(checkpoint.clone());
+        ev.transaction = transaction.clone();
+        if let Some(wm) = &standalone_wm {
+            ev.set_boundary(deltaforge_core::SourceBoundary {
+                checkpoint: checkpoint.clone(),
+                durable_watermark: Some(wm.clone()),
+            });
+        }
+        if is_outbox {
+            ev.source.schema = Some(OUTBOX_SCHEMA_SENTINEL.into());
+        }
+        ev.schema_version = Some(fingerprint_str.clone());
+        ev.schema_sequence = Some(loaded.sequence);
+        shells.push(ev);
+    }
+    let job = RowsJob {
+        decoder: loaded.decoder.clone(),
+        source_id: ctx.source_id.clone(),
+        table,
+        images,
+        shells,
+    };
+    let sent = emit_rows(ctx, job, label).await?;
+    // Batch metrics: one counter increment per binlog event, not per row.
+    if sent > 0 {
+        count_source_events(ctx, tm, code, sent);
+    }
+    Ok(())
+}
+
+/// Emit a rows event's events: queued for the decode workers when the
+/// outbox has them (counted as they are queued: a closed channel is
+/// shutdown, when the count is not read), else decoded here and sent one
+/// by one. Returns how many were handed on.
+async fn emit_rows(
+    ctx: &mut RunCtx,
+    job: RowsJob,
+    label: &str,
+) -> SourceResult<u64> {
+    if ctx.outbox.parallel() {
+        let rows = job.images.rows() as u64;
+        if !queue_rows(&ctx.tx, &mut ctx.outbox, job).await {
+            error!(source_id=%ctx.source_id, "channel send failed (op={label})");
+            return Ok(0);
+        }
+        return Ok(rows);
+    }
+    let mut sent = 0u64;
+    for ev in job.fill()? {
+        if emit(&ctx.tx, &mut ctx.outbox, SourceItem::event(ev)).await {
+            sent += 1;
+        } else {
+            error!(source_id=%ctx.source_id, "channel send failed (op={label})");
+        }
+    }
+    Ok(sent)
 }
 
 async fn handle_write_rows(
@@ -524,94 +883,11 @@ async fn handle_write_rows(
     header: &EventHeader,
     wr: mysql_binlog_connector_rust::event::write_rows_event::WriteRowsEvent,
 ) -> SourceResult<()> {
-    if let Some(tm) = ctx.table_map.get(&wr.table_id).cloned() {
-        let tm: &TableMapEvent = &tm;
-        if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
-            return Ok(());
-        }
-        let loaded = super::mysql_selection::select_for_rows(ctx, tm).await?;
-        let afters = decode_images(
-            ctx,
-            tm,
-            &loaded,
-            wr.rows
-                .iter()
-                .map(|r| (&wr.included_columns[..], &r.column_values[..])),
-        )?;
-        let row_count = wr.rows.len();
-        debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=row_count, "write_rows");
-
-        // Pre-compute values shared across all rows in this event.
-        let ts_ms = ts_sec_to_ms(header.timestamp);
-        let event_len = header.event_length as usize;
-        // Inside a transaction a row's checkpoint is the last proven
-        // boundary: a resume from it re-reads the transaction, never starts
-        // inside it.
-        let checkpoint = ctx.row_checkpoint();
-        let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
-            id: gtid.clone(),
-            total_order: None,
-            data_collection_order: None,
-        });
-        // Standalone (non-GTID) rows carry their binlog watermark atomically
-        // with their checkpoint; shared across every row in this binlog event.
-        let standalone_wm = standalone_row_watermark(ctx, &transaction);
-        let fingerprint_str = loaded.fingerprint.to_string();
-        let is_outbox = !ctx.outbox_tables.is_empty()
-            && ctx.outbox_tables.matches(&tm.database_name, &tm.table_name);
-
-        let mut sent = 0u64;
-        // Row ordinal resets per rows event and increments per row; combined
-        // with the event's end_log_pos it uniquely identifies each row change.
-        for (row_ordinal, after) in afters.into_iter().enumerate() {
-            let (source_info, event_id) = build_source_info(
-                ctx,
-                header,
-                &tm.database_name,
-                &tm.table_name,
-                row_ordinal as u32,
-            )?;
-            let mut ev = Event::new_row(
-                event_id,
-                source_info,
-                Op::Create,
-                None,
-                Some(after),
-                ctx.type_mapping,
-                ts_ms,
-                event_len,
-            )
-            .with_tenant(ctx.tenant.clone())
-            .with_checkpoint(checkpoint.clone());
-
-            ev.transaction = transaction.clone();
-            if let Some(wm) = &standalone_wm {
-                ev.set_boundary(deltaforge_core::SourceBoundary {
-                    checkpoint: checkpoint.clone(),
-                    durable_watermark: Some(wm.clone()),
-                });
-            }
-            if is_outbox {
-                ev.source.schema = Some(OUTBOX_SCHEMA_SENTINEL.into());
-            }
-            ev.schema_version = Some(fingerprint_str.clone());
-            ev.schema_sequence = Some(loaded.sequence);
-
-            if emit(&ctx.tx, &mut ctx.outbox, SourceItem::event(ev)).await {
-                sent += 1;
-            } else {
-                error!(source_id=%ctx.source_id, "channel send failed (op=insert)");
-            }
-        }
-
-        // Batch metrics: one counter increment per binlog event instead of per row.
-        if sent > 0 {
-            count_source_events(ctx, tm, "c", sent);
-        }
-    } else {
-        return Err(super::mysql_errors::unmapped_table_id(wr.table_id));
-    }
-    Ok(())
+    let images = Images::Insert {
+        included: wr.included_columns,
+        rows: wr.rows.into_iter().map(|r| r.column_values).collect(),
+    };
+    handle_rows(ctx, header, wr.table_id, Op::Create, images).await
 }
 
 async fn handle_update_rows(
@@ -619,98 +895,16 @@ async fn handle_update_rows(
     header: &EventHeader,
     ur: mysql_binlog_connector_rust::event::update_rows_event::UpdateRowsEvent,
 ) -> SourceResult<()> {
-    if let Some(tm) = ctx.table_map.get(&ur.table_id).cloned() {
-        let tm: &TableMapEvent = &tm;
-        if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
-            return Ok(());
-        }
-        let loaded = super::mysql_selection::select_for_rows(ctx, tm).await?;
-        let befores = decode_images(
-            ctx,
-            tm,
-            &loaded,
-            ur.rows.iter().map(|(b, _)| {
-                (&ur.included_columns_before[..], &b.column_values[..])
-            }),
-        )?;
-        let afters = decode_images(
-            ctx,
-            tm,
-            &loaded,
-            ur.rows.iter().map(|(_, a)| {
-                (&ur.included_columns_after[..], &a.column_values[..])
-            }),
-        )?;
-        debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=ur.rows.len(), "update_rows");
-
-        let ts_ms = ts_sec_to_ms(header.timestamp);
-        let event_len = header.event_length as usize;
-        // Inside a transaction a row's checkpoint is the last proven
-        // boundary: a resume from it re-reads the transaction, never starts
-        // inside it.
-        let checkpoint = ctx.row_checkpoint();
-        let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
-            id: gtid.clone(),
-            total_order: None,
-            data_collection_order: None,
-        });
-        // Standalone (non-GTID) rows carry their binlog watermark atomically
-        // with their checkpoint; shared across every row in this binlog event.
-        let standalone_wm = standalone_row_watermark(ctx, &transaction);
-        let fingerprint_str = loaded.fingerprint.to_string();
-        // The selected version's own registry sequence.
-        let sequence = loaded.sequence;
-
-        let mut sent = 0u64;
-        // One ordinal per before/after pair - an update is a single row change,
-        // not two images.
-        for (row_ordinal, (before, after)) in
-            befores.into_iter().zip(afters).enumerate()
-        {
-            let (source_info, event_id) = build_source_info(
-                ctx,
-                header,
-                &tm.database_name,
-                &tm.table_name,
-                row_ordinal as u32,
-            )?;
-            let mut ev = Event::new_row(
-                event_id,
-                source_info,
-                Op::Update,
-                Some(before),
-                Some(after),
-                ctx.type_mapping,
-                ts_ms,
-                event_len,
-            )
-            .with_tenant(ctx.tenant.clone())
-            .with_checkpoint(checkpoint.clone());
-
-            ev.transaction = transaction.clone();
-            if let Some(wm) = &standalone_wm {
-                ev.set_boundary(deltaforge_core::SourceBoundary {
-                    checkpoint: checkpoint.clone(),
-                    durable_watermark: Some(wm.clone()),
-                });
-            }
-            ev.schema_version = Some(fingerprint_str.clone());
-            ev.schema_sequence = Some(sequence);
-
-            if emit(&ctx.tx, &mut ctx.outbox, SourceItem::event(ev)).await {
-                sent += 1;
-            } else {
-                error!(source_id=%ctx.source_id, "channel send failed (op=update)");
-            }
-        }
-
-        if sent > 0 {
-            count_source_events(ctx, tm, "u", sent);
-        }
-    } else {
-        return Err(super::mysql_errors::unmapped_table_id(ur.table_id));
-    }
-    Ok(())
+    let images = Images::Update {
+        before: ur.included_columns_before,
+        after: ur.included_columns_after,
+        rows: ur
+            .rows
+            .into_iter()
+            .map(|(b, a)| (b.column_values, a.column_values))
+            .collect(),
+    };
+    handle_rows(ctx, header, ur.table_id, Op::Update, images).await
 }
 
 async fn handle_delete_rows(
@@ -718,86 +912,11 @@ async fn handle_delete_rows(
     header: &EventHeader,
     dr: mysql_binlog_connector_rust::event::delete_rows_event::DeleteRowsEvent,
 ) -> SourceResult<()> {
-    if let Some(tm) = ctx.table_map.get(&dr.table_id).cloned() {
-        let tm: &TableMapEvent = &tm;
-        if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
-            return Ok(());
-        }
-        let loaded = super::mysql_selection::select_for_rows(ctx, tm).await?;
-        let befores = decode_images(
-            ctx,
-            tm,
-            &loaded,
-            dr.rows
-                .iter()
-                .map(|r| (&dr.included_columns[..], &r.column_values[..])),
-        )?;
-        debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=dr.rows.len(), "delete_rows");
-
-        let ts_ms = ts_sec_to_ms(header.timestamp);
-        let event_len = header.event_length as usize;
-        // Inside a transaction a row's checkpoint is the last proven
-        // boundary: a resume from it re-reads the transaction, never starts
-        // inside it.
-        let checkpoint = ctx.row_checkpoint();
-        let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
-            id: gtid.clone(),
-            total_order: None,
-            data_collection_order: None,
-        });
-        // Standalone (non-GTID) rows carry their binlog watermark atomically
-        // with their checkpoint; shared across every row in this binlog event.
-        let standalone_wm = standalone_row_watermark(ctx, &transaction);
-        let fingerprint_str = loaded.fingerprint.to_string();
-        // The selected version's own registry sequence.
-        let sequence = loaded.sequence;
-
-        let mut sent = 0u64;
-        for (row_ordinal, before) in befores.into_iter().enumerate() {
-            let (source_info, event_id) = build_source_info(
-                ctx,
-                header,
-                &tm.database_name,
-                &tm.table_name,
-                row_ordinal as u32,
-            )?;
-            let mut ev = Event::new_row(
-                event_id,
-                source_info,
-                Op::Delete,
-                Some(before),
-                None,
-                ctx.type_mapping,
-                ts_ms,
-                event_len,
-            )
-            .with_tenant(ctx.tenant.clone())
-            .with_checkpoint(checkpoint.clone());
-
-            ev.transaction = transaction.clone();
-            if let Some(wm) = &standalone_wm {
-                ev.set_boundary(deltaforge_core::SourceBoundary {
-                    checkpoint: checkpoint.clone(),
-                    durable_watermark: Some(wm.clone()),
-                });
-            }
-            ev.schema_version = Some(fingerprint_str.clone());
-            ev.schema_sequence = Some(sequence);
-
-            if emit(&ctx.tx, &mut ctx.outbox, SourceItem::event(ev)).await {
-                sent += 1;
-            } else {
-                error!(source_id=%ctx.source_id, "channel send failed (op=delete)");
-            }
-        }
-
-        if sent > 0 {
-            count_source_events(ctx, tm, "d", sent);
-        }
-    } else {
-        return Err(super::mysql_errors::unmapped_table_id(dr.table_id));
-    }
-    Ok(())
+    let images = Images::Delete {
+        included: dr.included_columns,
+        rows: dr.rows.into_iter().map(|r| r.column_values).collect(),
+    };
+    handle_rows(ctx, header, dr.table_id, Op::Delete, images).await
 }
 
 fn source_error_kind(e: &SourceError) -> &'static str {
@@ -1381,7 +1500,9 @@ async fn handle_query(
         credential_ddl_operation(&q.query, ctx.binlog_server_version);
 
     // The activation records this statement implies are durable before its
-    // DDL event or its commit boundary is emitted.
+    // DDL event or its commit boundary is emitted, and never past a row a
+    // decode worker could not decode.
+    barrier(ctx).await?;
     record_query(ctx, &q, &classified, credential.is_none()).await?;
 
     // Credential-bearing account statements first: never log or emit their raw

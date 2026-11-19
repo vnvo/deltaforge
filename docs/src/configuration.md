@@ -92,6 +92,7 @@ source:
 | `snapshot.max_plan_bytes` / `snapshot.max_plan_items` | int | Bounds of a generation's durable table plan; discovery blocks before sealing at either (default: 256 MiB / `1000000`). See [Initial Snapshots](snapshots.md#bounds-and-blocking) |
 | `on_schema_drift` | string | `adapt` (default) - reload schema and continue after failover drift; `halt` — stop and require operator intervention. See [Failover Handling](failover.md). |
 | `type_mapping` | string | `v2` (default) or the deprecated `v1`, stamped on every event. See [Data Types](types.md). |
+| `decode_workers` | int | Threads that decode row images off the source task, results kept in binlog order (default: the available cores minus two, at most `4`; `0` decodes on the source task; at most `64`). See [MySQL](sources/mysql.md#configuration). |
 
 </td>
 </tr>

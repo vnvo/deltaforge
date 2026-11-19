@@ -722,6 +722,11 @@ pub(super) async fn maybe_window(
     let cancel = ctx.cancel.clone();
     // Measurement only: the admission order, to trace each table's release.
     let admitted_order = trace_enabled().then(|| order.clone());
+    // The admission is durable: it is never made past a row the decode
+    // workers could not decode, whichever way the window closed.
+    super::mysql_event::barrier(ctx)
+        .await
+        .map_err(LoopControl::Fail)?;
     let admission = async {
         match pending {
             Some(p) => admit_speculated(ctx, p, &lineage, &batch, order).await,
