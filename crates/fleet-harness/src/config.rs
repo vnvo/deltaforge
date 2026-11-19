@@ -193,6 +193,33 @@ pub struct Topology {
     /// value and the budget are recorded in the result).
     #[serde(default)]
     pub redo_log_capacity_max_bytes: Option<u64>,
+    /// Where the fixture's tables live: `file_per_table` (the default, one
+    /// file per table) or `general_per_database` (one general tablespace
+    /// per database, far less disk per empty table).
+    #[serde(default)]
+    pub tablespace: TablespaceLayout,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TablespaceLayout {
+    #[default]
+    FilePerTable,
+    GeneralPerDatabase,
+}
+
+impl TablespaceLayout {
+    /// The general tablespace `database`'s tables are created in, if any.
+    pub fn tablespace(&self, database: &str) -> Option<String> {
+        match self {
+            TablespaceLayout::FilePerTable => None,
+            TablespaceLayout::GeneralPerDatabase => {
+                Some(format!("{database}_ts"))
+            }
+        }
+    }
 }
 
 fn default_db_prefix() -> String {

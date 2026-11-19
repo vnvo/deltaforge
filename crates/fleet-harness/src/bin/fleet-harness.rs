@@ -30,6 +30,10 @@ enum Cmd {
         servers: Option<usize>,
         #[arg(long, default_value_t = 8)]
         concurrency: usize,
+        /// Grow a complete fixture with fewer tables per database to the
+        /// configured size (only the missing tables are created).
+        #[arg(long)]
+        grow: bool,
     },
     /// Print the pipeline specs the run would create.
     Render { config: String },
@@ -104,11 +108,12 @@ async fn main() -> Result<()> {
             config,
             servers,
             concurrency,
+            grow,
         } => {
             let cfg = RunConfig::load(&config)?;
             let n = servers.unwrap_or(cfg.topology.servers.len());
             for s in &cfg.topology.servers[..n] {
-                let r = fixture::build(&cfg, s, concurrency, true)
+                let r = fixture::build(&cfg, s, concurrency, true, grow)
                     .await
                     .with_context(|| format!("fixture on {}", s.name))?;
                 println!("{}", serde_json::to_string(&r)?);

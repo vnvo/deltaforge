@@ -4,6 +4,11 @@
 //! (`IF NOT EXISTS`) and resumable, and `harness_meta.fixture` records the
 //! spec it was built from, so a server holding a different fixture is never
 //! silently reused. Tables start empty; the workload driver writes the rows.
+//!
+//! A complete fixture can grow to more tables per database when asked to
+//! (`--grow`): only the missing tables are created, and the growth itself
+//! is resumable. Tables live in one file each or, with the
+//! `general_per_database` layout, in one general tablespace per database.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -15,7 +20,7 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts};
 use serde::Serialize;
 
-use crate::config::{RunConfig, Server};
+use crate::config::{RunConfig, Server, TablespaceLayout};
 use crate::topology::{Naming, Template};
 
 /// Template format version: bump when generated DDL changes.
@@ -30,6 +35,7 @@ pub struct FixtureSpec {
     pub prefix: String,
     pub seed: u64,
     pub format: u32,
+    pub layout: TablespaceLayout,
 }
 
 impl FixtureSpec {
@@ -40,15 +46,146 @@ impl FixtureSpec {
             prefix: cfg.topology.database_prefix.clone(),
             seed: cfg.topology.seed,
             format: FORMAT,
+            layout: cfg.topology.tablespace,
         }
     }
 
+    /// `<databases>x<tables>:<prefix>:<seed>:v<format>`, plus `:gts` for
+    /// the general-tablespace layout (file-per-table ids are unchanged, so
+    /// fixtures built before layouts existed are still recognised).
     pub fn id(&self) -> String {
-        format!(
+        let id = format!(
             "{}x{}:{}:{}:v{}",
             self.databases, self.tables, self.prefix, self.seed, self.format
-        )
+        );
+        match self.layout {
+            TablespaceLayout::FilePerTable => id,
+            TablespaceLayout::GeneralPerDatabase => format!("{id}:gts"),
+        }
     }
+
+    /// The spec an [`id`](Self::id) was made from, if it is one.
+    pub fn parse(id: &str) -> Option<FixtureSpec> {
+        let parts: Vec<&str> = id.split(':').collect();
+        let layout = match parts.get(4) {
+            None => TablespaceLayout::FilePerTable,
+            Some(&"gts") if parts.len() == 5 => {
+                TablespaceLayout::GeneralPerDatabase
+            }
+            Some(_) => return None,
+        };
+        if parts.len() < 4 {
+            return None;
+        }
+        let (databases, tables) = parts[0].split_once('x')?;
+        Some(FixtureSpec {
+            databases: databases.parse().ok()?,
+            tables: tables.parse().ok()?,
+            prefix: parts[1].to_string(),
+            seed: parts[2].parse().ok()?,
+            format: parts[3].strip_prefix('v')?.parse().ok()?,
+            layout,
+        })
+    }
+}
+
+/// What to do with the fixture a server holds (`harness_meta.fixture`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Decision {
+    /// The wanted fixture, complete.
+    Reuse,
+    /// Build it, or resume an interrupted build or growth.
+    Build,
+    /// Grow a complete fixture of `from_tables` tables per database.
+    Grow { from_tables: u32 },
+}
+
+fn decide(
+    held: Option<(String, bool)>,
+    want: &FixtureSpec,
+    allow_grow: bool,
+) -> Result<Decision> {
+    let Some((id, complete)) = held else {
+        return Ok(Decision::Build);
+    };
+    if id == want.id() {
+        return Ok(if complete {
+            Decision::Reuse
+        } else {
+            Decision::Build
+        });
+    }
+    let growable = complete
+        && FixtureSpec::parse(&id).is_some_and(|h| {
+            h.tables < want.tables
+                && FixtureSpec {
+                    tables: want.tables,
+                    ..h
+                } == *want
+        });
+    match (growable, allow_grow) {
+        (true, true) => Ok(Decision::Grow {
+            from_tables: FixtureSpec::parse(&id).expect("parsed").tables,
+        }),
+        (true, false) => bail!(
+            "holds fixture {id}, not {}: grow it (--grow), use another server or drop it",
+            want.id()
+        ),
+        (false, _) => bail!(
+            "holds fixture {id}, not {}: use another server or drop it",
+            want.id()
+        ),
+    }
+}
+
+/// Create `name` (idempotent) and, with a general layout, its tablespace;
+/// returns the tablespace its tables go in.
+pub async fn create_database(
+    conn: &mut mysql_async::Conn,
+    name: &str,
+    layout: TablespaceLayout,
+) -> Result<Option<String>> {
+    conn.query_drop(format!("CREATE DATABASE IF NOT EXISTS `{name}`"))
+        .await?;
+    let Some(ts) = layout.tablespace(name) else {
+        return Ok(None);
+    };
+    let exists: Option<u64> = conn
+        .exec_first(
+            "SELECT COUNT(*) FROM information_schema.INNODB_TABLESPACES WHERE NAME = ?",
+            (ts.as_str(),),
+        )
+        .await?;
+    if exists.unwrap_or(0) == 0 {
+        conn.query_drop(format!(
+            "CREATE TABLESPACE `{ts}` ADD DATAFILE '{ts}.ibd' ENGINE=InnoDB"
+        ))
+        .await
+        .with_context(|| format!("create tablespace {ts}"))?;
+    }
+    Ok(Some(ts))
+}
+
+/// Drop `name` and, with a general layout, its tablespace (idempotent).
+pub async fn drop_database(
+    conn: &mut mysql_async::Conn,
+    name: &str,
+    layout: TablespaceLayout,
+) -> Result<()> {
+    conn.query_drop(format!("DROP DATABASE IF EXISTS `{name}`"))
+        .await?;
+    if let Some(ts) = layout.tablespace(name) {
+        let exists: Option<u64> = conn
+            .exec_first(
+                "SELECT COUNT(*) FROM information_schema.INNODB_TABLESPACES WHERE NAME = ?",
+                (ts.as_str(),),
+            )
+            .await?;
+        if exists.unwrap_or(0) > 0 {
+            conn.query_drop(format!("DROP TABLESPACE `{ts}`")).await?;
+        }
+    }
+    Ok(())
 }
 
 /// A pool to `server` as the harness admin.
@@ -73,16 +210,20 @@ pub struct FixtureReport {
     pub server: String,
     pub spec: String,
     pub reused: bool,
+    /// The fixture this build grew from, when it grew one.
+    pub grown_from: Option<String>,
     pub tables: u64,
     pub build_secs: f64,
 }
 
-/// Build (or resume, or reuse) the fixture on `server`.
+/// Build (or resume, or reuse) the fixture on `server`; with `allow_grow`,
+/// a complete fixture with fewer tables per database grows to the spec.
 pub async fn build(
     cfg: &RunConfig,
     server: &Server,
     concurrency: usize,
     progress: bool,
+    allow_grow: bool,
 ) -> Result<FixtureReport> {
     let spec = FixtureSpec::of(cfg);
     let pool = admin_pool(cfg, server, concurrency + 1)?;
@@ -100,24 +241,30 @@ pub async fn build(
             "SELECT spec, complete, build_secs FROM `{META_DB}`.`fixture` WHERE id = 1"
         ))
         .await?;
-    match existing {
-        Some((s, true, secs)) if s == spec.id() => {
+    let decision = decide(
+        existing.as_ref().map(|(s, c, _)| (s.clone(), *c)),
+        &spec,
+        allow_grow,
+    )
+    .with_context(|| format!("server {}", server.name))?;
+    let first_table = match decision {
+        Decision::Reuse => {
             let tables = count_tables(&mut conn, &spec.prefix).await?;
             return Ok(FixtureReport {
                 server: server.name.clone(),
                 spec: spec.id(),
                 reused: true,
+                grown_from: None,
                 tables,
-                build_secs: secs,
+                build_secs: existing.map_or(0.0, |(_, _, s)| s),
             });
         }
-        Some((s, _, _)) if s != spec.id() => bail!(
-            "server {} holds fixture {s}, not {}: use another server or drop it",
-            server.name,
-            spec.id()
-        ),
-        _ => {}
-    }
+        Decision::Build => 0,
+        Decision::Grow { from_tables } => from_tables,
+    };
+    let grown_from = matches!(decision, Decision::Grow { .. })
+        .then(|| existing.as_ref().map(|(s, _, _)| s.clone()))
+        .flatten();
     conn.query_drop(format!(
         "REPLACE INTO `{META_DB}`.`fixture` VALUES (1, '{}', FALSE, 0)",
         spec.id()
@@ -130,10 +277,11 @@ pub async fn build(
         database_prefix: spec.prefix.clone(),
     };
     let templates: Arc<Vec<Template>> = Arc::new(
-        (0..spec.tables)
+        (first_table..spec.tables)
             .map(|t| Template::generate(spec.seed, t as u16))
             .collect(),
     );
+    let layout = spec.layout;
     let next = Arc::new(AtomicU32::new(0));
     let mut workers = Vec::new();
     for _ in 0..concurrency.max(1) {
@@ -152,14 +300,13 @@ pub async fn build(
                     return Ok::<_, anyhow::Error>(());
                 }
                 let name = naming.database(db);
-                conn.query_drop(format!(
-                    "CREATE DATABASE IF NOT EXISTS `{name}`"
-                ))
-                .await?;
+                let ts = create_database(&mut conn, &name, layout).await?;
                 for t in templates.iter() {
-                    conn.query_drop(
-                        t.create_sql(&name, &naming.table(t.index)),
-                    )
+                    conn.query_drop(t.create_sql(
+                        &name,
+                        &naming.table(t.index),
+                        ts.as_deref(),
+                    ))
                     .await
                     .with_context(|| {
                         format!("create {name}.t{:03}", t.index)
@@ -194,6 +341,7 @@ pub async fn build(
         server: server.name.clone(),
         spec: spec.id(),
         reused: false,
+        grown_from,
         tables,
         build_secs,
     })
@@ -274,5 +422,86 @@ mod tests {
         let mut b = a.clone();
         b.seed = 2;
         assert_ne!(a.id(), b.id());
+        let mut c = a.clone();
+        c.layout = TablespaceLayout::GeneralPerDatabase;
+        assert_eq!(c.id(), "2000x200:cust_:1:v1:gts");
+    }
+
+    #[test]
+    fn a_fixture_id_parses_back_to_its_spec() {
+        let cfg: RunConfig = serde_yaml::from_str(EXAMPLE).unwrap();
+        let a = FixtureSpec::of(&cfg);
+        assert_eq!(FixtureSpec::parse(&a.id()), Some(a.clone()));
+        let mut g = a;
+        g.layout = TablespaceLayout::GeneralPerDatabase;
+        assert_eq!(FixtureSpec::parse(&g.id()), Some(g));
+        assert_eq!(FixtureSpec::parse("2000x200:cust_:1"), None);
+        assert_eq!(FixtureSpec::parse("2000x200:cust_:1:v1:xyz"), None);
+    }
+
+    fn spec(databases: u32, tables: u32) -> FixtureSpec {
+        FixtureSpec {
+            databases,
+            tables,
+            prefix: "cust_".into(),
+            seed: 1,
+            format: FORMAT,
+            layout: TablespaceLayout::GeneralPerDatabase,
+        }
+    }
+
+    #[test]
+    fn a_complete_smaller_fixture_grows_only_when_allowed() {
+        let want = spec(2000, 200);
+        let held = Some((spec(2000, 50).id(), true));
+        assert_eq!(
+            decide(held.clone(), &want, true).unwrap(),
+            Decision::Grow { from_tables: 50 }
+        );
+        let err = decide(held, &want, false).unwrap_err().to_string();
+        assert!(err.contains("holds fixture 2000x50"), "{err}");
+    }
+
+    #[test]
+    fn the_same_fixture_is_reused_or_resumed_and_nothing_else_grows() {
+        let want = spec(2000, 200);
+        assert_eq!(decide(None, &want, false).unwrap(), Decision::Build);
+        assert_eq!(
+            decide(Some((want.id(), true)), &want, false).unwrap(),
+            Decision::Reuse
+        );
+        assert_eq!(
+            decide(Some((want.id(), false)), &want, true).unwrap(),
+            Decision::Build,
+            "an interrupted build (or growth) resumes"
+        );
+        let refused = |held: FixtureSpec, complete: bool| {
+            decide(Some((held.id(), complete)), &want, true).is_err()
+        };
+        assert!(refused(spec(2000, 300), true), "never shrinks");
+        assert!(refused(spec(2000, 50), false), "an incomplete build");
+        assert!(refused(spec(1000, 50), true), "other databases");
+        let mut other = spec(2000, 50);
+        other.layout = TablespaceLayout::FilePerTable;
+        assert!(refused(other, true), "another layout");
+        let mut other = spec(2000, 50);
+        other.seed = 2;
+        assert!(refused(other, true), "other templates");
+        assert!(
+            decide(Some(("legacy".into(), true)), &want, true).is_err(),
+            "an id it cannot read"
+        );
+    }
+
+    #[test]
+    fn a_general_layout_names_one_tablespace_per_database() {
+        assert_eq!(
+            TablespaceLayout::GeneralPerDatabase.tablespace("cust_00007"),
+            Some("cust_00007_ts".into())
+        );
+        assert_eq!(
+            TablespaceLayout::FilePerTable.tablespace("cust_00007"),
+            None
+        );
     }
 }

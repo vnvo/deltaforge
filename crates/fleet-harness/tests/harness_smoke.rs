@@ -400,7 +400,7 @@ async fn the_harness_runs_scenarios_end_to_end() {
 
     // S3: a migration with probes, keys checked as primary keys.
     let cfg = config("S3", &env, "primary_key");
-    let built = fixture::build(&cfg, &cfg.topology.servers[0], 2, false)
+    let built = fixture::build(&cfg, &cfg.topology.servers[0], 2, false, false)
         .await
         .unwrap();
     assert_eq!(built.tables, 12);
@@ -746,4 +746,84 @@ async fn the_harness_runs_scenarios_end_to_end() {
         .map(|id| result(out_s, id)["run_tag"].as_u64().unwrap())
         .collect();
     assert_eq!(tags.len(), 9, "{tags:?}");
+}
+
+/// A general-layout fixture: one tablespace per database, growth only with
+/// `--grow` and only of the missing tables, and an offboarded database
+/// takes its tablespace with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "docker: MySQL"]
+async fn a_fixture_grows_in_general_tablespaces() {
+    let (_mysql, port) = start_mysql().await;
+    let env = Env {
+        port,
+        brokers: "127.0.0.1:1",
+        api: "http://127.0.0.1:1",
+        store: "postgres://unused",
+        trace: "/dev/null",
+        out: "/tmp",
+        work: "/tmp",
+    };
+    let mut cfg = config("S1", &env, "primary_key");
+    cfg.topology.tablespace =
+        fleet_harness::config::TablespaceLayout::GeneralPerDatabase;
+    cfg.topology.tables_per_database.value = 2;
+    let server = cfg.topology.servers[0].clone();
+    let small = fixture::build(&cfg, &server, 2, false, false)
+        .await
+        .unwrap();
+    assert_eq!((small.tables, small.reused), (6, false));
+    assert_eq!(small.spec, "3x2:cust_:3:v1:gts");
+
+    cfg.topology.tables_per_database.value = 4;
+    let err = fixture::build(&cfg, &server, 2, false, false)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("--grow"), "{err:#}");
+    let grown = fixture::build(&cfg, &server, 2, false, true).await.unwrap();
+    assert_eq!(grown.tables, 12);
+    assert_eq!(grown.grown_from.as_deref(), Some("3x2:cust_:3:v1:gts"));
+    let again = fixture::build(&cfg, &server, 2, false, false)
+        .await
+        .unwrap();
+    assert!(again.reused, "the grown fixture is the configured one");
+
+    let opts = mysql_async::Opts::from_url(&format!(
+        "mysql://root:rootpw@127.0.0.1:{port}/"
+    ))
+    .unwrap();
+    let mut conn = mysql_async::Conn::new(opts).await.unwrap();
+    // Every table is in its own database's tablespace.
+    let placed: Vec<(String, String)> = conn
+        .query(
+            "SELECT t.NAME, s.NAME FROM information_schema.INNODB_TABLES t \
+             JOIN information_schema.INNODB_TABLESPACES s ON s.SPACE = t.SPACE \
+             WHERE t.NAME LIKE 'cust\\_%' ORDER BY t.NAME",
+        )
+        .await
+        .unwrap();
+    assert_eq!(placed.len(), 12, "{placed:?}");
+    for (table, space) in &placed {
+        let db = table.split('/').next().unwrap();
+        assert_eq!(space, &format!("{db}_ts"), "{table}");
+    }
+
+    let naming = Naming {
+        database_prefix: "cust_".into(),
+    };
+    fixture::drop_database(
+        &mut conn,
+        &naming.database(2),
+        cfg.topology.tablespace,
+    )
+    .await
+    .unwrap();
+    let spaces: Vec<String> = conn
+        .query(
+            "SELECT NAME FROM information_schema.INNODB_TABLESPACES \
+             WHERE NAME LIKE 'cust\\_%' ORDER BY NAME",
+        )
+        .await
+        .unwrap();
+    assert_eq!(spaces, ["cust_00000_ts", "cust_00001_ts"]);
 }

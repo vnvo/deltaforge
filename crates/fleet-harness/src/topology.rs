@@ -194,7 +194,14 @@ impl Template {
         }
     }
 
-    pub fn create_sql(&self, database: &str, table: &str) -> String {
+    /// `CREATE TABLE IF NOT EXISTS`, in general tablespace `tablespace`
+    /// when one is given.
+    pub fn create_sql(
+        &self,
+        database: &str,
+        table: &str,
+        tablespace: Option<&str>,
+    ) -> String {
         let mut cols = vec![
             "`id` BIGINT NOT NULL".to_string(),
             "`version` BIGINT NOT NULL".to_string(),
@@ -210,10 +217,14 @@ impl Template {
         cols.extend(
             self.indexed.iter().map(|c| format!("KEY `ix_{c}` (`{c}`)")),
         );
-        format!(
+        let sql = format!(
             "CREATE TABLE IF NOT EXISTS `{database}`.`{table}` ({}) ENGINE=InnoDB",
             cols.join(", ")
-        )
+        );
+        match tablespace {
+            Some(ts) => format!("{sql} TABLESPACE `{ts}`"),
+            None => sql,
+        }
     }
 }
 
@@ -270,10 +281,17 @@ mod tests {
         let a = Template::generate(1, 5);
         assert_eq!(a, Template::generate(1, 5));
         assert_ne!(a, Template::generate(2, 5));
-        let sql = a.create_sql("cust_00001", "t005");
+        let sql = a.create_sql("cust_00001", "t005", None);
         assert!(
             sql.contains("`id` BIGINT NOT NULL")
                 && sql.contains("PRIMARY KEY (`id`)")
+                && sql.ends_with(") ENGINE=InnoDB")
+        );
+        let in_ts = a.create_sql("cust_00001", "t005", Some("cust_00001_ts"));
+        assert_eq!(
+            in_ts,
+            format!("{sql} TABLESPACE `cust_00001_ts`"),
+            "the same table, in the database's tablespace"
         );
         let kinds: std::collections::HashSet<_> = (0..200)
             .flat_map(|i| {
