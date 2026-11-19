@@ -91,6 +91,9 @@ pub struct Plan {
     pub scenario: String,
     pub active_set: Option<ActiveSetPattern>,
     pub steps: Vec<Step>,
+    /// The writers start only once the first step (the backlog pause) has
+    /// run, so every write is in the backlog (`D2`).
+    pub hold_writers: bool,
 }
 
 /// Disruptions repeated inside a soak of `duration` seconds.
@@ -251,14 +254,18 @@ pub fn plan(cfg: &RunConfig) -> Result<Plan> {
         // The backlog drain: the pipelines run for the first third, then
         // stop while the writers go on; resumed after the writers finish.
         "D1" => (None, vec![at(d / 3, Action::BacklogPause)]),
+        // The backlog drain from the first write: the pipelines start and
+        // pause at once, and the writers start only after the pause.
+        "D2" => (None, vec![at(0, Action::BacklogPause)]),
         other => {
-            bail!("unknown scenario {other} (S1-S17, A1-A5, F0, F1 or D1)")
+            bail!("unknown scenario {other} (S1-S17, A1-A5, F0, F1, D1 or D2)")
         }
     };
     Ok(Plan {
         scenario: id.to_string(),
         active_set,
         steps,
+        hold_writers: id == "D2",
     })
 }
 
@@ -293,6 +300,23 @@ mod tests {
         c.run.scenario = scenario.into();
         c.run.duration_secs = duration;
         c
+    }
+
+    /// D2 pauses at once and holds the writers until the pause; D1 pauses a
+    /// third of the way in and does not hold them.
+    #[test]
+    fn d2_pauses_before_any_write() {
+        let p = plan(&cfg("D2", 900)).unwrap();
+        assert!(p.hold_writers);
+        assert_eq!(p.steps.len(), 1);
+        assert_eq!(
+            (p.steps[0].at_secs, &p.steps[0].action),
+            (0, &Action::BacklogPause)
+        );
+        let p = plan(&cfg("D1", 900)).unwrap();
+        assert!(!p.hold_writers);
+        assert_eq!(p.steps[0].at_secs, 300);
+        assert!(!plan(&cfg("F0", 900)).unwrap().hold_writers);
     }
 
     /// F1's steps set each rate in turn from the end of warm-up, on every

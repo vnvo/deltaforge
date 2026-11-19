@@ -304,6 +304,28 @@ pub async fn run_once(
 }
 
 /// Wait until `until`, unless the run is aborted first (returns the reason).
+/// [`wait_or_abort`], returning early (with `None`) once `done` holds,
+/// checked every 250 ms.
+async fn wait_or_abort_unless(
+    until: tokio::time::Instant,
+    abort: &mut watch::Receiver<Option<String>>,
+    done: impl Fn() -> bool,
+) -> Option<String> {
+    loop {
+        if done() {
+            return None;
+        }
+        let next = (tokio::time::Instant::now() + Duration::from_millis(250))
+            .min(until);
+        if let Some(r) = wait_or_abort(next, abort).await {
+            return Some(r);
+        }
+        if tokio::time::Instant::now() >= until {
+            return None;
+        }
+    }
+}
+
 async fn wait_or_abort(
     until: tokio::time::Instant,
     abort: &mut watch::Receiver<Option<String>>,
@@ -578,10 +600,16 @@ async fn run_inner(
     progress.lock().readiness = Some(readiness.clone());
 
     // The servers' workload contexts (their counters are sampled).
+    let budget = cfg
+        .run
+        .backlog_changes
+        .map(|n| Arc::new(driver::ChangeBudget::new(n)));
     let ctxs: Vec<Arc<ServerCtx>> = servers
         .iter()
         .map(|(i, s)| {
-            Arc::new(ServerCtx::new(&cfg, *i, s, probes.clone(), run_tag))
+            let mut ctx = ServerCtx::new(&cfg, *i, s, probes.clone(), run_tag);
+            ctx.budget = budget.clone();
+            Arc::new(ctx)
         })
         .collect();
 
@@ -601,7 +629,6 @@ async fn run_inner(
     stage("writers");
     progress.lock().ctxs = ctxs.clone();
     let (driver_stop_tx, driver_stop) = watch::channel(false);
-    let mut writers: Vec<JoinHandle<Result<u64>>> = Vec::new();
     let integrators: Vec<JoinHandle<()>> = ctxs
         .iter()
         .map(|ctx| {
@@ -612,18 +639,29 @@ async fn run_inner(
             ))
         })
         .collect();
-    for ctx in &ctxs {
-        for w in 0..cfg.traffic.writers_per_server.max(1) {
-            let path = work.join(format!("w-{}-{w}.bin", ctx.server.name));
-            writers.push(tokio::spawn(driver::writer(
-                ctx.clone(),
-                cfg.clone(),
-                w,
-                path,
-                driver_stop.clone(),
-            )));
+    let spawn_writers = || {
+        let mut writers: Vec<JoinHandle<Result<u64>>> = Vec::new();
+        for ctx in &ctxs {
+            for w in 0..cfg.traffic.writers_per_server.max(1) {
+                let path = work.join(format!("w-{}-{w}.bin", ctx.server.name));
+                writers.push(tokio::spawn(driver::writer(
+                    ctx.clone(),
+                    cfg.clone(),
+                    w,
+                    path,
+                    driver_stop.clone(),
+                )));
+            }
         }
-    }
+        writers
+    };
+    // D2 holds the writers until its pause has run: every write is then in
+    // the backlog.
+    let mut writers = if plan.hold_writers {
+        Vec::new()
+    } else {
+        spawn_writers()
+    };
 
     // Warm-up, then the measured window.
     stage("window");
@@ -686,14 +724,26 @@ async fn run_inner(
         if let Some(t) = task {
             background.push((steps.len(), t));
         }
+        let paused =
+            step.action == Action::BacklogPause && outcome.error.is_none();
         steps.push(outcome);
+        if plan.hold_writers && writers.is_empty() && paused {
+            writers = spawn_writers();
+        }
     }
     if aborted.is_none() {
-        aborted = wait_or_abort(
-            (window_start + Duration::from_secs(cfg.run.duration_secs)).into(),
-            &mut abort,
-        )
-        .await;
+        let end = window_start + Duration::from_secs(cfg.run.duration_secs);
+        aborted = match &budget {
+            // A change budget ends the window once it is spent and every
+            // writer has finished, or at the duration if that comes first.
+            Some(b) => {
+                wait_or_abort_unless(end.into(), &mut abort, || {
+                    b.exhausted() && writers.iter().all(|w| w.is_finished())
+                })
+                .await
+            }
+            None => wait_or_abort(end.into(), &mut abort).await,
+        };
     }
     let measured_secs = window_start.elapsed().as_secs_f64();
     let counters: Vec<CountersSnapshot> =
@@ -724,7 +774,7 @@ async fn run_inner(
                     metrics_url: cfg.deltaforge.metrics_url.clone(),
                     http: reqwest::Client::new(),
                 };
-                let report = crate::backlog::drain(
+                let mut report = crate::backlog::drain(
                     &ops,
                     &names,
                     paused,
@@ -735,6 +785,19 @@ async fn run_inner(
                     Duration::from_millis(250),
                 )
                 .await;
+                if cfg.run.restart_after_drain && report.outcome == "drained" {
+                    match crate::backlog::restart(
+                        &ops,
+                        &names,
+                        Duration::from_millis(250),
+                        opts.start_timeout,
+                    )
+                    .await
+                    {
+                        Ok(r) => report.restart = Some(r),
+                        Err(e) => report.restart_failure = Some(format!("{e:#}")),
+                    }
+                }
                 match serde_json::to_vec_pretty(&report) {
                     Ok(b) => {
                         if let Err(e) =
@@ -880,6 +943,7 @@ async fn run_inner(
         environment,
         fixture_tables,
         pipelines_running_secs,
+        change_budget_spent: budget.as_ref().map(|b| b.exhausted()),
         measured_secs,
         driver: servers
             .iter()

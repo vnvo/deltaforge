@@ -142,6 +142,37 @@ impl Counters {
     }
 }
 
+/// Changes the writers of a run may still write (`run.backlog_changes`),
+/// shared by every writer of every server.
+#[derive(Debug)]
+pub struct ChangeBudget {
+    left: AtomicU64,
+}
+
+impl ChangeBudget {
+    pub fn new(total: u64) -> ChangeBudget {
+        ChangeBudget {
+            left: AtomicU64::new(total),
+        }
+    }
+
+    /// Up to `want` changes for one transaction; 0 once the budget is spent.
+    pub fn take(&self, want: u32) -> u32 {
+        let mut granted = 0;
+        self.left
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                granted = left.min(u64::from(want)) as u32;
+                Some(left - u64::from(granted))
+            })
+            .ok();
+        granted
+    }
+
+    pub fn exhausted(&self) -> bool {
+        self.left.load(Ordering::Relaxed) == 0
+    }
+}
+
 /// Shared by the writers and DDL tasks of one server.
 pub struct ServerCtx {
     pub index: u16,
@@ -151,6 +182,8 @@ pub struct ServerCtx {
     pub templates: Arc<Vec<Template>>,
     /// Where onboarded databases put their tables, as the fixture does.
     pub layout: crate::config::TablespaceLayout,
+    /// The run's change budget, if it has one (shared by all servers).
+    pub budget: Option<Arc<ChangeBudget>>,
     pub active: Arc<ActiveSet>,
     pub rate: Arc<Rate>,
     pub seq: Arc<AtomicU64>,
@@ -192,6 +225,7 @@ impl ServerCtx {
             },
             templates,
             layout: t.tablespace,
+            budget: None,
             active: Arc::new(ActiveSet::new(
                 index,
                 t.databases_per_server.value,
@@ -483,11 +517,20 @@ pub async fn writer(
             continue;
         }
 
+        // With a change budget, the run stops writing once it is spent; the
+        // last transaction may be shorter.
+        let rows_now = match &ctx.budget {
+            Some(b) => match b.take(rows_per_txn) {
+                0 => break 'run,
+                n => n,
+            },
+            None => rows_per_txn,
+        };
         let mut sql = Vec::new();
         let mut records = Vec::new();
         let mut kinds = Vec::new();
         let mut planned: Vec<Planned> = Vec::new();
-        for _ in 0..rows_per_txn {
+        for _ in 0..rows_now {
             // Nothing of this transaction has run yet: on stop, its plan is
             // dropped.
             let Some(table) = next_table(
@@ -1054,6 +1097,34 @@ mod tests {
             .filter(|t| owner(t, 8) == w)
             .collect();
         assert!(!owns_active(&set, 0, w, 8, &poisoned));
+    }
+
+    /// A change budget shared by concurrent writers grants exactly its total,
+    /// the last grant cut to what is left, then nothing.
+    #[test]
+    fn a_change_budget_grants_exactly_its_total() {
+        let b = Arc::new(ChangeBudget::new(10_001));
+        let granted: u64 = (0..8)
+            .map(|_| {
+                let b = b.clone();
+                std::thread::spawn(move || {
+                    let mut n = 0u64;
+                    loop {
+                        match b.take(7) {
+                            0 => return n,
+                            g => {
+                                assert!(g <= 7);
+                                n += u64::from(g);
+                            }
+                        }
+                    }
+                })
+            })
+            .map(|h| h.join().unwrap())
+            .sum();
+        assert_eq!(granted, 10_001);
+        assert!(b.exhausted());
+        assert_eq!(b.take(1), 0);
     }
 
     /// The activation sweep: across the writers, every active table exactly

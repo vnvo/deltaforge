@@ -679,6 +679,106 @@ async fn the_harness_runs_scenarios_end_to_end() {
     assert_eq!(r["readiness"]["topics"]["fleet.c01"], 2, "{r}");
     assert_partial_counters(&r);
 
+    // D2: the pipeline pauses before the first write, a backlog of exactly
+    // 300 changes (an activation sweep first) is written, then drained and
+    // the pipeline restarted.
+    let mut cfg = config("D2", &env, "none");
+    cfg.run.duration_secs = 120;
+    cfg.run.warmup_secs = 0;
+    cfg.run.backlog_changes = Some(300);
+    cfg.run.restart_after_drain = true;
+    cfg.traffic.activation = fleet_harness::config::Activation::Sweep;
+    cfg.traffic.changes_per_sec_avg.value = 200.0;
+    cfg.traffic.changes_per_sec_peak.value = 200.0;
+    let before = run_ids(out_s);
+    let d2 = sweep(cfg, opts.clone()).await.unwrap();
+    let r = new_result(out_s, &before);
+    assert!(
+        d2.points[0].correctness_ok,
+        "stream {} completeness {} writer errors {}",
+        r["stream"], r["completeness"], r["writer_errors"]
+    );
+    assert_eq!(r["outcome"], "completed", "{r}");
+    assert_eq!(r["change_budget_spent"], true, "{r}");
+    assert!(
+        r["measured_secs"].as_f64().unwrap() < 60.0,
+        "the spent budget ended the window"
+    );
+    let ops: u64 = r["driver"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|c| c["ops"].as_u64().unwrap())
+        .sum();
+    assert_eq!(ops, 300, "{r}");
+    let drain: Value = serde_json::from_slice(
+        &std::fs::read(
+            Path::new(out_s)
+                .join("exploratory")
+                .join(r["run_id"].as_str().unwrap())
+                .join("backlog-drain.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(drain["outcome"], "drained", "{drain}");
+    assert_eq!(drain["delivered_at_settle"], 0, "no write before the pause");
+    assert_eq!(drain["backlog_events"], drain["expected_row_events"]);
+    // Every row the run wrote was written after the pause (its rows carry
+    // the run tag in the high bits of the id).
+    let paused_at = chrono::DateTime::parse_from_rfc3339(
+        drain["paused"]["at"].as_str().unwrap(),
+    )
+    .unwrap()
+    .naive_utc();
+    let tag = r["run_tag"].as_u64().unwrap();
+    let naming = Naming {
+        database_prefix: "cust_".into(),
+    };
+    let union: Vec<String> = (0..3)
+        .flat_map(|d| {
+            let naming = &naming;
+            (0..4u16).map(move |t| {
+                format!(
+                    "SELECT committed_at FROM `{}`.`{}` WHERE id >> 40 = {tag}",
+                    naming.database(d),
+                    naming.table(t)
+                )
+            })
+        })
+        .collect();
+    let mut conn = mysql_async::Conn::new(
+        mysql_async::Opts::from_url(&format!(
+            "mysql://root:rootpw@127.0.0.1:{port}/"
+        ))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let first: Option<String> = conn
+        .query_first(format!(
+            "SELECT DATE_FORMAT(MIN(committed_at), '%Y-%m-%d %H:%i:%s.%f') FROM ({}) w",
+            union.join(" UNION ALL ")
+        ))
+        .await
+        .unwrap()
+        .flatten();
+    let first = chrono::NaiveDateTime::parse_from_str(
+        &first.expect("the run's rows"),
+        "%Y-%m-%d %H:%M:%S%.f",
+    )
+    .unwrap();
+    assert!(
+        first > paused_at,
+        "a write at {first} before the pause at {paused_at}"
+    );
+    drop(conn);
+    let restarted = drain["restart"].as_object().expect("restart record");
+    assert_eq!(restarted.len(), 1, "{drain}");
+    for t in restarted.values() {
+        assert!(t["running_after_secs"].as_f64().unwrap() > 0.0, "{t}");
+    }
+
     // A pipeline that fails closed mid-run aborts the run with its
     // incidents: a table created, written and changed while the pipeline
     // was stopped leaves its row with no recorded shape and a live shape
@@ -738,14 +838,14 @@ async fn the_harness_runs_scenarios_end_to_end() {
     assert!(r["measured_secs"].as_f64().unwrap() < 60.0);
     assert_partial_counters(&r);
 
-    // Nine runs, each with its own evidence and row namespace.
+    // Ten runs, each with its own evidence and row namespace.
     let ids = run_ids(out_s);
-    assert_eq!(ids.len(), 9, "{ids:?}");
+    assert_eq!(ids.len(), 10, "{ids:?}");
     let tags: BTreeSet<u64> = ids
         .iter()
         .map(|id| result(out_s, id)["run_tag"].as_u64().unwrap())
         .collect();
-    assert_eq!(tags.len(), 9, "{tags:?}");
+    assert_eq!(tags.len(), 10, "{tags:?}");
 }
 
 /// A general-layout fixture: one tablespace per database, growth only with
