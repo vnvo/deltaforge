@@ -235,6 +235,9 @@ pub struct RunResult {
     pub environment: Environment,
     pub fixture_tables: BTreeMap<String, u64>,
     pub pipelines_running_secs: Option<f64>,
+    /// With `run.backlog_changes`: whether the writers spent it before the
+    /// run's duration ended.
+    pub change_budget_spent: Option<bool>,
     pub measured_secs: f64,
     pub driver: BTreeMap<String, CountersSnapshot>,
     /// Committed operations per second per server over the measured window.
@@ -600,6 +603,7 @@ mod tests {
             environment: Environment::default(),
             fixture_tables: BTreeMap::new(),
             pipelines_running_secs: None,
+            change_budget_spent: None,
             measured_secs: 60.0,
             driver: BTreeMap::from([(
                 "c01".to_string(),

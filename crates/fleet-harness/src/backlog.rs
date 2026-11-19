@@ -138,6 +138,64 @@ pub struct Report {
     pub metrics_at_end: Option<Scrape>,
     /// Delivery polls this often: the completion time's resolution.
     pub poll_secs: f64,
+    /// `run.restart_after_drain`: each pipeline stopped and resumed once
+    /// drained, or why that failed.
+    pub restart: Option<BTreeMap<String, Restarted>>,
+    pub restart_failure: Option<String>,
+}
+
+/// One pipeline's restart after the drain, from its stop request.
+#[derive(Debug, Clone, Serialize)]
+pub struct Restarted {
+    pub stopped_after_secs: f64,
+    pub running_after_secs: f64,
+}
+
+/// Stop and resume each of `pipelines` in turn, waiting for `stopped` and
+/// then `running` (polled every `poll`, each bounded by `max`); a pipeline
+/// that fails, or misses the bound, ends it with an error.
+pub async fn restart(
+    ops: &dyn Ops,
+    pipelines: &[String],
+    poll: Duration,
+    max: Duration,
+) -> Result<BTreeMap<String, Restarted>> {
+    async fn until(
+        ops: &dyn Ops,
+        name: &str,
+        want: &str,
+        poll: Duration,
+        deadline: Instant,
+    ) -> Result<()> {
+        loop {
+            match ops.status(name).await?.as_str() {
+                s if s == want => return Ok(()),
+                "failed" => bail!("pipeline {name} failed waiting for {want}"),
+                _ => {}
+            }
+            if Instant::now() >= deadline {
+                bail!("pipeline {name} not {want} within the bound");
+            }
+            tokio::time::sleep(poll).await;
+        }
+    }
+    let mut out = BTreeMap::new();
+    for name in pipelines {
+        let started = Instant::now();
+        ops.stop(name).await?;
+        until(ops, name, "stopped", poll, started + max).await?;
+        let stopped_after_secs = started.elapsed().as_secs_f64();
+        ops.resume(name).await?;
+        until(ops, name, "running", poll, started + max).await?;
+        out.insert(
+            name.clone(),
+            Restarted {
+                stopped_after_secs,
+                running_after_secs: started.elapsed().as_secs_f64(),
+            },
+        );
+    }
+    Ok(out)
 }
 
 /// Stop the writers and join every one; `then` runs only after (the frozen
@@ -231,6 +289,8 @@ pub async fn drain(
         metrics_at_resume: None,
         metrics_at_end: None,
         poll_secs: poll.as_secs_f64(),
+        restart: None,
+        restart_failure: None,
     };
     if !preserved {
         r.failure = Some(
@@ -374,6 +434,103 @@ mod tests {
             settling: BTreeMap::new(),
             delivered_at_settle: 0,
         }
+    }
+
+    /// Pipelines that report `stopped` after `stops` status reads once
+    /// stopped, and `running` after `starts` reads once resumed.
+    struct Restartable {
+        state: Mutex<BTreeMap<String, (&'static str, u32)>>,
+        stops: u32,
+        starts: u32,
+        fail_on_resume: bool,
+    }
+
+    impl Ops for Restartable {
+        fn status<'a>(&'a self, name: &'a str) -> Fut<'a, String> {
+            Box::pin(async move {
+                let mut st = self.state.lock().unwrap();
+                let (s, n) = st.entry(name.into()).or_insert(("running", 0));
+                *n = n.saturating_sub(1);
+                Ok(match (*s, *n) {
+                    ("stopping", 0) => "stopped",
+                    ("stopping", _) => "running",
+                    ("starting", 0) if self.fail_on_resume => "failed",
+                    ("starting", 0) => "running",
+                    ("starting", _) => "stopped",
+                    (s, _) => s,
+                }
+                .into())
+            })
+        }
+        fn checkpoints<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Fut<'a, BTreeMap<String, String>> {
+            Box::pin(async { Ok(BTreeMap::new()) })
+        }
+        fn resume<'a>(&'a self, name: &'a str) -> Fut<'a, ()> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .unwrap()
+                    .insert(name.into(), ("starting", self.starts));
+                Ok(())
+            })
+        }
+        fn stop<'a>(&'a self, name: &'a str) -> Fut<'a, ()> {
+            Box::pin(async move {
+                self.state
+                    .lock()
+                    .unwrap()
+                    .insert(name.into(), ("stopping", self.stops));
+                Ok(())
+            })
+        }
+        fn metrics(&self) -> Fut<'_, String> {
+            Box::pin(async { Ok(String::new()) })
+        }
+    }
+
+    /// After a drain, each pipeline is stopped and resumed in turn, and the
+    /// time to `stopped` and back to `running` is recorded; a pipeline that
+    /// fails on resume fails the restart.
+    #[tokio::test]
+    async fn a_restart_records_each_pipeline_back_running() {
+        let ops = Restartable {
+            state: Mutex::new(BTreeMap::new()),
+            stops: 2,
+            starts: 3,
+            fail_on_resume: false,
+        };
+        let names = vec!["p1".to_string(), "p2".to_string()];
+        let r = restart(
+            &ops,
+            &names,
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.keys().cloned().collect::<Vec<_>>(), names);
+        for t in r.values() {
+            assert!(t.stopped_after_secs > 0.0);
+            assert!(t.running_after_secs > t.stopped_after_secs);
+        }
+        let failing = Restartable {
+            fail_on_resume: true,
+            state: Mutex::new(BTreeMap::new()),
+            stops: 1,
+            starts: 1,
+        };
+        let err = restart(
+            &failing,
+            &names,
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("failed"), "{err}");
     }
 
     /// A stopped pipeline whose checkpoint reads follow `script` (the last

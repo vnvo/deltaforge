@@ -525,6 +525,15 @@ pub struct Run {
     /// or loses data (later counts are not attempted).
     #[serde(default = "default_true")]
     pub stop_sweep_on_failure: bool,
+    /// The writers stop once the run has written this many changes in all
+    /// (`duration_secs` stays the upper bound); none: written for the
+    /// whole duration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backlog_changes: Option<u64>,
+    /// A backlog drain (`D1`, `D2`): once drained, stop and resume each
+    /// pipeline and record the time back to running.
+    #[serde(default)]
+    pub restart_after_drain: bool,
 }
 
 fn default_reps() -> u32 {
@@ -589,6 +598,14 @@ impl RunConfig {
             )
         {
             bail!("traffic.activation: sweep needs a fixed active set");
+        }
+        if self.run.backlog_changes == Some(0) {
+            bail!("run.backlog_changes must be positive");
+        }
+        if self.run.restart_after_drain
+            && !matches!(self.run.scenario.as_str(), "D1" | "D2")
+        {
+            bail!("run.restart_after_drain needs a backlog drain (D1 or D2)");
         }
         Ok(())
     }
@@ -743,6 +760,22 @@ pub(crate) mod tests {
                 .iter()
                 .any(|p| p.starts_with("budgets.lag_p99_secs"))
         );
+    }
+
+    #[test]
+    fn a_restart_after_the_drain_needs_a_backlog_drain() {
+        let mut cfg: RunConfig = serde_yaml::from_str(EXAMPLE).unwrap();
+        assert_eq!(cfg.run.backlog_changes, None, "unbounded by default");
+        assert!(!cfg.run.restart_after_drain);
+        cfg.run.restart_after_drain = true;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("restart_after_drain"), "{err}");
+        for s in ["D1", "D2"] {
+            cfg.run.scenario = s.into();
+            cfg.validate().unwrap();
+        }
+        cfg.run.backlog_changes = Some(0);
+        assert!(cfg.validate().is_err(), "an empty budget");
     }
 
     #[test]
