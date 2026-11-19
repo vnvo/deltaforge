@@ -362,6 +362,11 @@ pub struct Traffic {
     /// Skew within the active set (Zipf exponent; 0 = uniform).
     pub zipf_exponent: Param<f64>,
     pub active_set: Param<ActiveSetPattern>,
+    /// How the active set first receives writes: `random` (the default,
+    /// every write drawn from the set) or `sweep` (each writer first writes
+    /// each active table it owns once, in the set's order, then draws).
+    #[serde(default)]
+    pub activation: Activation,
     /// Writer connections per server.
     #[serde(default = "default_writers")]
     pub writers_per_server: u32,
@@ -377,6 +382,19 @@ pub struct Traffic {
 
 fn default_writers() -> u32 {
     4
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Activation {
+    #[default]
+    Random,
+    /// Every active table is written once before random draws begin, so a
+    /// set of `n` tables is fully active after `n` writes (about `n ln n`
+    /// with random draws).
+    Sweep,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -564,6 +582,14 @@ impl RunConfig {
                 }
             }
         }
+        if self.traffic.activation == Activation::Sweep
+            && !matches!(
+                self.traffic.active_set.value,
+                ActiveSetPattern::Fixed { .. }
+            )
+        {
+            bail!("traffic.activation: sweep needs a fixed active set");
+        }
         Ok(())
     }
 
@@ -717,6 +743,24 @@ pub(crate) mod tests {
                 .iter()
                 .any(|p| p.starts_with("budgets.lag_p99_secs"))
         );
+    }
+
+    #[test]
+    fn an_activation_sweep_needs_a_fixed_active_set() {
+        let mut cfg: RunConfig = serde_yaml::from_str(EXAMPLE).unwrap();
+        assert_eq!(cfg.traffic.activation, Activation::Random, "the default");
+        cfg.traffic.activation = Activation::Sweep;
+        cfg.traffic.active_set.value =
+            ActiveSetPattern::Fixed { fraction: 0.1 };
+        cfg.validate().unwrap();
+        cfg.traffic.active_set.value = ActiveSetPattern::Moving {
+            fraction: 0.1,
+            period_secs: 60,
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("activation: sweep"), "{err}");
+        let t: Activation = serde_yaml::from_str("sweep").unwrap();
+        assert_eq!(t, Activation::Sweep);
     }
 
     #[test]

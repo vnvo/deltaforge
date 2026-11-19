@@ -278,6 +278,56 @@ async fn pick_owned(
     }
 }
 
+/// One writer's activation sweep: the active set's ranks in order, keeping
+/// the tables this writer owns and has not poisoned.
+#[derive(Debug, Default)]
+struct Sweep {
+    next_rank: u64,
+}
+
+impl Sweep {
+    /// The next table of the sweep, or `None` once it has covered the set.
+    fn next_owned(
+        &mut self,
+        active: &ActiveSet,
+        window: u64,
+        writer_index: u32,
+        writers: u32,
+        poisoned: &HashSet<TableRef>,
+    ) -> Option<TableRef> {
+        while self.next_rank < active.size() {
+            let t = active.table_at(window, self.next_rank);
+            self.next_rank += 1;
+            if owner(&t, writers) == writer_index && !poisoned.contains(&t) {
+                return Some(t);
+            }
+        }
+        None
+    }
+}
+
+/// The table a writer changes next: its sweep's next table while it has
+/// one, otherwise a draw ([`pick_owned`]). `None` on stop.
+#[allow(clippy::too_many_arguments)]
+async fn next_table(
+    sweep: &mut Option<Sweep>,
+    active: &ActiveSet,
+    window: u64,
+    writer_index: u32,
+    writers: u32,
+    poisoned: &HashSet<TableRef>,
+    rng: &mut impl Rng,
+    stop: &watch::Receiver<bool>,
+) -> Option<TableRef> {
+    if let Some(s) = sweep {
+        match s.next_owned(active, window, writer_index, writers, poisoned) {
+            Some(t) => return Some(t),
+            None => *sweep = None,
+        }
+    }
+    pick_owned(active, window, writer_index, writers, poisoned, rng, stop).await
+}
+
 fn now_micros() -> i64 {
     Utc::now().timestamp_micros()
 }
@@ -382,6 +432,9 @@ pub async fn writer(
     let mut next_at = Instant::now();
     // Whether this writer owns an active table, by window and poisoned count.
     let mut owns: Option<(u64, usize, bool)> = None;
+    let mut sweep = (cfg.traffic.activation
+        == crate::config::Activation::Sweep)
+        .then(Sweep::default);
     'run: loop {
         if *stop.borrow() {
             break;
@@ -437,7 +490,8 @@ pub async fn writer(
         for _ in 0..rows_per_txn {
             // Nothing of this transaction has run yet: on stop, its plan is
             // dropped.
-            let Some(table) = pick_owned(
+            let Some(table) = next_table(
+                &mut sweep,
                 &ctx.active,
                 window,
                 writer_index,
@@ -1000,6 +1054,77 @@ mod tests {
             .filter(|t| owner(t, 8) == w)
             .collect();
         assert!(!owns_active(&set, 0, w, 8, &poisoned));
+    }
+
+    /// The activation sweep: across the writers, every active table exactly
+    /// once, each by its owner, poisoned tables skipped.
+    #[test]
+    fn a_sweep_visits_every_active_table_once_across_writers() {
+        let set = ActiveSet::new(
+            0,
+            20,
+            50,
+            &ActiveSetPattern::Fixed { fraction: 0.5 },
+            1.0,
+            7,
+        );
+        let poisoned: HashSet<TableRef> =
+            HashSet::from([set.table_at(0, 3), set.table_at(0, 400)]);
+        let mut seen = HashSet::new();
+        for w in 0..3 {
+            let mut sweep = Sweep::default();
+            while let Some(t) = sweep.next_owned(&set, 0, w, 3, &poisoned) {
+                assert_eq!(owner(&t, 3), w, "only the owner writes a table");
+                assert!(seen.insert(t), "{t:?} twice");
+            }
+            assert_eq!(sweep.next_owned(&set, 0, w, 3, &poisoned), None);
+        }
+        let all: HashSet<TableRef> =
+            (0..set.size()).map(|r| set.table_at(0, r)).collect();
+        assert_eq!(all.len(), 500);
+        assert_eq!(seen, &all - &poisoned);
+    }
+
+    /// With a sweep, a writer first gets its sweep's tables in order, then
+    /// draws exactly as a writer without one.
+    #[tokio::test]
+    async fn after_its_sweep_a_writer_draws_as_without_one() {
+        let set = a1();
+        let none = HashSet::new();
+        let (_tx, stop) = watch::channel(false);
+        for w in (0..8).filter(|&w| owns_active(&set, 0, w, 8, &none)) {
+            let mut expected = Sweep::default();
+            let swept: Vec<TableRef> = std::iter::from_fn(|| {
+                expected.next_owned(&set, 0, w, 8, &none)
+            })
+            .collect();
+            assert!(!swept.is_empty());
+            let (mut a, mut b) =
+                (StdRng::seed_from_u64(9), StdRng::seed_from_u64(9));
+            let mut sweep = Some(Sweep::default());
+            for t in &swept {
+                let got =
+                    next_table(&mut sweep, &set, 0, w, 8, &none, &mut a, &stop)
+                        .await;
+                assert_eq!(got, Some(*t));
+            }
+            for _ in 0..100 {
+                let got =
+                    next_table(&mut sweep, &set, 0, w, 8, &none, &mut a, &stop)
+                        .await;
+                let plain =
+                    pick_owned(&set, 0, w, 8, &none, &mut b, &stop).await;
+                assert_eq!(got, plain);
+            }
+            let mut off = None;
+            let (mut c, mut d) =
+                (StdRng::seed_from_u64(5), StdRng::seed_from_u64(5));
+            assert_eq!(
+                next_table(&mut off, &set, 0, w, 8, &none, &mut c, &stop).await,
+                pick_owned(&set, 0, w, 8, &none, &mut d, &stop).await,
+                "no sweep: as before"
+            );
+        }
     }
 
     /// A writer that owns tables draws exactly what the unbounded loop drew.
