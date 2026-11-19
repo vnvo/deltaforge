@@ -128,6 +128,7 @@ fn my_cfg(
         rotation: None,
         type_mapping: Default::default(),
         proofs: Default::default(),
+        decode_workers: None,
     }
 }
 

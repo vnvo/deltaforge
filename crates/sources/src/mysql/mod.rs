@@ -54,6 +54,7 @@ mod mysql_window_speculation;
 use mysql_helpers::{checkpoint_lineage, prepare_client};
 
 pub mod mysql_decode;
+mod mysql_decode_pool;
 pub mod mysql_jsonb;
 
 mod mysql_schema_loader;
@@ -264,6 +265,9 @@ pub struct MySqlSource {
     pub snapshot_cohort: crate::SnapshotCohortSlot,
     /// Schema-proof bounds: the activation window and the binlog seek.
     pub proofs: deltaforge_config::MysqlProofCfg,
+    /// Threads that decode row images off the source task (`None`: derived
+    /// from the cores, `Some(0)`: decoded on the source task).
+    pub decode_workers: Option<usize>,
 }
 
 pub(crate) const HEARTBEAT_INTERVAL_SECS: u64 = 15;
@@ -1881,7 +1885,10 @@ impl MySqlSource {
             table_map: HashMap::new(),
             parser_table_maps_installed: 0,
             meters: mysql_event::SourceMeters::new(&self.pipeline, &self.id),
-            outbox: mysql_event::Outbox::new(),
+            outbox: mysql_event::Outbox::with_workers(
+                self.decode_workers
+                    .unwrap_or_else(mysql_decode_pool::default_workers),
+            ),
             last_file: init_file,
             last_pos: init_pos,
             last_gtid: init_gtid,
@@ -2085,6 +2092,7 @@ impl MySqlSource {
                     || rotation.is_some()
                     || ctx.paused.load(std::sync::atomic::Ordering::SeqCst)
                 {
+                    mysql_event::barrier(&mut ctx).await?;
                     mysql_event::flush(&ctx.tx, &mut ctx.outbox).await;
                 }
                 if !pause_until_resumed(
@@ -2242,6 +2250,13 @@ impl MySqlSource {
         // holding (a closed channel drops it, as it would have then).
         ctx.outbox.set_hold(false);
         mysql_event::flush(&ctx.tx, &mut ctx.outbox).await;
+        // A rows event a decode worker could not decode came before anything
+        // the loop did after it: that failure is the loop's result, as it
+        // would have been without workers.
+        let loop_result = match ctx.outbox.take_failure() {
+            Some(e) => Err(e),
+            None => loop_result,
+        };
 
         // Cancel and join the rotation tasks on every exit path (normal or fatal).
         if let Some(rt) = rotation.take() {

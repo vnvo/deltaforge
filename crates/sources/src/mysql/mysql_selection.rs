@@ -2092,6 +2092,8 @@ pub(crate) async fn select_for_rows(
     if !ctx.drift_checked.contains(&**backend)
         && let Some(row_cp) = ctx.txn_eval_cp.clone()
     {
+        // The drift check can persist; never past an undecodable row.
+        super::mysql_event::barrier(ctx).await?;
         let all = t.all();
         super::mysql_failover_drift::check_in_stream(
             ctx,
@@ -2108,11 +2110,13 @@ pub(crate) async fn select_for_rows(
     let (mut selection, mut decisive) = t.select_decisive_at(&parsed);
     // No positional proof yet: a lazy baseline at the rows' position, if it
     // can be proven and decides the rows (before any FULL fallback).
-    if let Selection::Unproven(_) = selection
-        && super::mysql_baseline::establish_at(ctx, db, table, key, &t).await?
-    {
-        t = timeline_keyed(ctx, key, backend).await?;
-        (selection, decisive) = t.select_decisive_at(&parsed);
+    if let Selection::Unproven(_) = selection {
+        // A baseline is durable; never past an undecodable row.
+        super::mysql_event::barrier(ctx).await?;
+        if super::mysql_baseline::establish_at(ctx, db, table, key, &t).await? {
+            t = timeline_keyed(ctx, key, backend).await?;
+            (selection, decisive) = t.select_decisive_at(&parsed);
+        }
     }
     match selection {
         Selection::Proven { version } => {
@@ -2150,6 +2154,9 @@ pub(crate) async fn select_for_rows(
         Selection::Unproven(reason) => {
             info!(source_id = %ctx.source_id, %db, %table, ?reason, "no positional proof; FULL signature selection");
             let signature = Signature::of(tm);
+            // The fallback persists an observation; never past an
+            // undecodable row.
+            super::mysql_event::barrier(ctx).await?;
             full_fallback(ctx, tm, key, row, signature, sig_digest, &t).await
         }
     }

@@ -554,6 +554,32 @@ pub struct MysqlSrcCfg {
     /// Schema-proof bounds: the activation window and the binlog seek.
     #[serde(default)]
     pub proofs: MysqlProofCfg,
+    /// Threads that decode row images off the source task: absent derives
+    /// them from the cores (the cores beyond two, at most four); `0` decodes
+    /// on the source task. At most [`MYSQL_DECODE_WORKERS_MAX`].
+    #[serde(
+        default,
+        deserialize_with = "bounded_decode_workers",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub decode_workers: Option<usize>,
+}
+
+/// Most decode workers a MySQL source may configure.
+pub const MYSQL_DECODE_WORKERS_MAX: usize = 64;
+
+fn bounded_decode_workers<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<usize>, D::Error> {
+    let v = Option::<usize>::deserialize(d)?;
+    if let Some(n) = v
+        && n > MYSQL_DECODE_WORKERS_MAX
+    {
+        return Err(serde::de::Error::custom(format!(
+            "decode_workers {n} is above {MYSQL_DECODE_WORKERS_MAX}"
+        )));
+    }
+    Ok(v)
 }
 
 /// Bounds of the MySQL schema proofs (`docs/src/sources/mysql.md`,

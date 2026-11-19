@@ -72,6 +72,7 @@ Set `spec.source.type` to `mysql` and provide a config object:
 | `dsn` | string | Yes | MySQL connection string with replication privileges |
 | `tables` | array | Yes | Table patterns to capture. The key is required, but an empty list `[]` captures all user tables. |
 | `proofs` | object | No | Bounds of the schema proofs: see [Schema proof bounds](#schema-proof-bounds). |
+| `decode_workers` | integer | No | Threads that decode row images off the source task. Absent: the available cores (the container's CPU quota counts) minus two, at most four. `0` decodes on the source task. At most 64. Events leave the source in binlog order whatever the value. |
 
 ### Table Patterns
 

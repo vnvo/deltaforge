@@ -291,6 +291,7 @@ fn source(
         snapshot_cohort: Default::default(),
         proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
+        decode_workers: None,
     }
 }
 
