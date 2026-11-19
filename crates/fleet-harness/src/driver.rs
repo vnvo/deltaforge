@@ -149,6 +149,8 @@ pub struct ServerCtx {
     pub opts: Opts,
     pub naming: Naming,
     pub templates: Arc<Vec<Template>>,
+    /// Where onboarded databases put their tables, as the fixture does.
+    pub layout: crate::config::TablespaceLayout,
     pub active: Arc<ActiveSet>,
     pub rate: Arc<Rate>,
     pub seq: Arc<AtomicU64>,
@@ -189,6 +191,7 @@ impl ServerCtx {
                 database_prefix: t.database_prefix.clone(),
             },
             templates,
+            layout: t.tablespace,
             active: Arc::new(ActiveSet::new(
                 index,
                 t.databases_per_server.value,
@@ -902,11 +905,13 @@ pub async fn lifecycle(
             let db = next_index;
             next_index += 1;
             let name = ctx.naming.database(db);
-            conn.query_drop(format!("CREATE DATABASE IF NOT EXISTS `{name}`"))
-                .await?;
+            let ts =
+                crate::fixture::create_database(&mut conn, &name, ctx.layout)
+                    .await?;
             for t in ctx.templates.iter() {
                 let tname = ctx.naming.table(t.index);
-                conn.query_drop(t.create_sql(&name, &tname)).await?;
+                conn.query_drop(t.create_sql(&name, &tname, ts.as_deref()))
+                    .await?;
                 let version = ctx.next_version();
                 let at = now_micros();
                 let id = id_base + u64::from(t.index);
@@ -946,10 +951,11 @@ pub async fn lifecycle(
         }
         if next_off == Some(due) {
             if let Some(db) = live.pop_front() {
-                conn.query_drop(format!(
-                    "DROP DATABASE IF EXISTS `{}`",
-                    ctx.naming.database(db)
-                ))
+                crate::fixture::drop_database(
+                    &mut conn,
+                    &ctx.naming.database(db),
+                    ctx.layout,
+                )
                 .await?;
                 report.offboarded += 1;
             }
