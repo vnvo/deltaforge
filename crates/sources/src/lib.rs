@@ -421,6 +421,7 @@ pub async fn build_source(
                 rotation,
                 snapshot_cohort: Default::default(),
                 proofs: c.proofs.clone(),
+                decode_workers: c.decode_workers,
             }))
         }
     }

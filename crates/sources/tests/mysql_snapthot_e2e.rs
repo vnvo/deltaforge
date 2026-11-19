@@ -63,6 +63,7 @@ async fn make_source(
         snapshot_cohort: Default::default(),
         proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
+        decode_workers: None,
     }
 }
 
@@ -686,6 +687,7 @@ async fn make_source_on(
         snapshot_cohort: Default::default(),
         proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
+        decode_workers: None,
     }
 }
 

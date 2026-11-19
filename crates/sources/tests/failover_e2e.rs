@@ -256,6 +256,7 @@ async fn make_mysql_source(
         snapshot_cohort: Default::default(),
         proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
+        decode_workers: None,
     }
 }
 
@@ -581,6 +582,7 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
             snapshot_cohort: Default::default(),
             proofs: Default::default(),
             type_mapping: deltaforge_core::TypeMapping::V2,
+            decode_workers: None,
         };
         let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -639,6 +641,7 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
             snapshot_cohort: Default::default(),
             proofs: Default::default(),
             type_mapping: deltaforge_core::TypeMapping::V2,
+            decode_workers: None,
         };
         let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -725,6 +728,7 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
             snapshot_cohort: Default::default(),
             proofs: Default::default(),
             type_mapping: deltaforge_core::TypeMapping::V2,
+            decode_workers: None,
         };
         let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -780,6 +784,7 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
             snapshot_cohort: Default::default(),
             proofs: Default::default(),
             type_mapping: deltaforge_core::TypeMapping::V2,
+            decode_workers: None,
         };
         let (tx, _rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -886,6 +891,7 @@ async fn mysql_failover_schema_drift_halt_no_drift_continues() -> Result<()> {
             snapshot_cohort: Default::default(),
             proofs: Default::default(),
             type_mapping: deltaforge_core::TypeMapping::V2,
+            decode_workers: None,
         };
         let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;

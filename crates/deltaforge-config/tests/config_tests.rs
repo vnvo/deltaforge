@@ -1336,3 +1336,27 @@ fn mysql_proof_bounds_are_validated() {
     assert!(parse(r#"{"activation_window": 5}"#).is_err());
     assert!(parse(r#"{"max_seek_ms": -1}"#).is_err());
 }
+
+/// `decode_workers` (MySQL): absent derives the count from the cores, `0`
+/// decodes on the source task, above the maximum is refused.
+#[test]
+fn mysql_decode_workers_are_bounded() {
+    let parse = |extra: &str| {
+        serde_json::from_str::<deltaforge_config::MysqlSrcCfg>(&format!(
+            r#"{{"id":"m","dsn":"mysql://h/db","tables":[]{extra}}}"#
+        ))
+    };
+    assert_eq!(parse("").unwrap().decode_workers, None);
+    let max = deltaforge_config::MYSQL_DECODE_WORKERS_MAX;
+    for ok in [0, 1, max] {
+        assert_eq!(
+            parse(&format!(r#","decode_workers":{ok}"#))
+                .unwrap()
+                .decode_workers,
+            Some(ok)
+        );
+    }
+    let err = parse(&format!(r#","decode_workers":{}"#, max + 1))
+        .expect_err("above the maximum must be refused");
+    assert!(err.to_string().contains("decode_workers"), "{err}");
+}

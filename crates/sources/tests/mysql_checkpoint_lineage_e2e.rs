@@ -127,6 +127,7 @@ async fn start(
         snapshot_cohort: Default::default(),
         proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
+        decode_workers: None,
     };
     let (tx, mut rx) = test_common::acked_channel(&src, &store, &src.id, 128);
     let handle = src.run(tx, store).await;

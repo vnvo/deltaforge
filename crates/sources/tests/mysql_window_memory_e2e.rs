@@ -173,6 +173,7 @@ async fn burst_peak(port: u16, id: &str, row: i64) -> u64 {
         snapshot_cohort: Default::default(),
         proofs: MysqlProofCfg::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
+        decode_workers: None,
     };
     let ckpt: Arc<dyn CheckpointStore> =
         Arc::new(MemCheckpointStore::new().unwrap());

@@ -264,6 +264,9 @@ pub struct MySqlSource {
     pub snapshot_cohort: crate::SnapshotCohortSlot,
     /// Schema-proof bounds: the activation window and the binlog seek.
     pub proofs: deltaforge_config::MysqlProofCfg,
+    /// Threads that decode row images off the source task (`None`: derived
+    /// from the cores, `Some(0)`: decoded on the source task).
+    pub decode_workers: Option<usize>,
 }
 
 pub(crate) const HEARTBEAT_INTERVAL_SECS: u64 = 15;

@@ -383,6 +383,7 @@ fn mysql_rotation_cfg(
         }),
         type_mapping: Default::default(),
         proofs: Default::default(),
+        decode_workers: None,
     }
 }
 
@@ -496,6 +497,7 @@ async fn start_rotation_harness_on(
         snapshot_cohort: Default::default(),
         proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
+        decode_workers: None,
     };
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);

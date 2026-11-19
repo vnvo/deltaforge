@@ -416,6 +416,7 @@ mod tests {
                         rotation: None,
                         type_mapping: Default::default(),
                         proofs: Default::default(),
+                        decode_workers: None,
                     }),
                     processors: vec![],
                     sinks: vec![],
