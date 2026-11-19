@@ -30,7 +30,13 @@
 # Results go to $GATE_DIR/<label> (default target/gate/<label>); the label is
 # a plain name, and an existing directory there is replaced only if a gate
 # wrote it. The gate stops if less than GATE_MIN_FREE_GB (default 15) is free
-# on the build disk; it never deletes build output itself.
+# on the build disk, and a suite is not started (it fails) below that.
+#
+# Disk: a gate builds each tree once, so it builds without incremental
+# compilation (CARGO_INCREMENTAL=0; the next incremental build of the
+# workspace crates recompiles them once). A suite that passes has its test
+# binary deleted after its run; a failing suite keeps it. No other build
+# output is deleted.
 #
 # Containers: every container of a run - the PostgreSQL the gate starts for
 # the `serial-pg` suites and every test container (started through
@@ -169,6 +175,8 @@ min_free=${GATE_MIN_FREE_GB:-15}
 free_gb=$(df --output=avail -BG -- "$ROOT" | tail -1 | tr -dc 0-9)
 [ "$free_gb" -ge "$min_free" ] ||
   die "only ${free_gb} GB free on the build disk (need ${min_free}); free space (for example \`cargo clean\`) or set GATE_MIN_FREE_GB, then rerun"
+export min_free ROOT
+export CARGO_INCREMENTAL=0
 
 if [ -e "$OUT" ]; then
   [ -f "$OUT/.gate-output" ] ||
@@ -299,7 +307,22 @@ suite() {
     *" -- "*) ;;
     *) args+=(-- --include-ignored --test-threads=1) ;;
   esac
-  run "$name" "$OUT/$(tr / _ <<<"$name").log" cargo test "${args[@]}"
+  local log free
+  log="$OUT/$(tr / _ <<<"$name").log"
+  free=$(df --output=avail -BG -- "$ROOT" | tail -1 | tr -dc 0-9)
+  if [ "$free" -lt "$min_free" ]; then
+    echo "$name rc=1 (not started: ${free} GB free, need ${min_free})" >> "$OUT/summary"
+    return
+  fi
+  run "$name" "$log" cargo test "${args[@]}"
+  # A passed suite's test binary is not needed again: delete it (only a
+  # file under this tree's target/, named on the log's `Running` line).
+  if grep -q "^$name rc=0 " "$OUT/summary"; then
+    sed -n 's/^ *Running [^ ]* (\(target\/[^)]*\))$/\1/p' "$log" | sort -u |
+      while read -r bin; do
+        [ -f "$ROOT/$bin" ] && rm -f -- "$ROOT/$bin"
+      done
+  fi
 }
 export -f run summ suite
 

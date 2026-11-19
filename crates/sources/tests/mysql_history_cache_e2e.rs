@@ -42,6 +42,11 @@ async fn start() -> (ContainerAsync<GenericImage>, u16) {
             "--binlog-format=ROW",
             "--gtid-mode=ON",
             "--enforce-gtid-consistency=ON",
+            // Commits without a flush each: a burst of separate
+            // transactions reaches the binlog in a moment, also on a busy
+            // host.
+            "--sync-binlog=0",
+            "--innodb-flush-log-at-trx-commit=0",
         ])
         .gate_owned()
         .start()
@@ -66,6 +71,16 @@ async fn sql(port: u16, stmts: &[String]) {
     for s in stmts {
         c.query_drop(s).await.unwrap_or_else(|e| panic!("{s}: {e}"));
     }
+    c.disconnect().await.ok();
+}
+
+/// `stmts` in one round trip (each still its own transaction): a burst
+/// written at once, received within the activation window's time bound.
+async fn sql_at_once(port: u16, stmts: &[String]) {
+    let mut c = mysql_async::Conn::from_url(dsn(port, "")).await.unwrap();
+    c.query_drop(stmts.join(";\n"))
+        .await
+        .unwrap_or_else(|e| panic!("burst: {e}"));
     c.disconnect().await.ok();
 }
 
@@ -332,7 +347,11 @@ async fn evicted_tables_return_in_batched_reads() {
     counting.reset();
     sources::stream_probe::record_history_batches(true);
     let (stop, peak) = sample_cache_bytes(snap, ID);
-    sql(port, &burst(2)).await;
+    // Written at once: the window is bounded in time from the receipt of
+    // its first event, so a burst received over more than the bound (a slow
+    // writer on a busy host) is cut by time, not by the batch room this
+    // test measures.
+    sql_at_once(port, &burst(2)).await;
     tokio::time::timeout(Duration::from_secs(60), reached.notified())
         .await
         .expect("held at the burst's first transaction");
