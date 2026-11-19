@@ -112,11 +112,21 @@ async fn main() -> Result<()> {
         } => {
             let cfg = RunConfig::load(&config)?;
             let n = servers.unwrap_or(cfg.topology.servers.len());
-            for s in &cfg.topology.servers[..n] {
-                let r = fixture::build(&cfg, s, concurrency, true, grow)
-                    .await
-                    .with_context(|| format!("fixture on {}", s.name))?;
-                println!("{}", serde_json::to_string(&r)?);
+            let build = async {
+                for s in &cfg.topology.servers[..n] {
+                    let r = fixture::build(&cfg, s, concurrency, true, grow)
+                        .await
+                        .with_context(|| format!("fixture on {}", s.name))?;
+                    println!("{}", serde_json::to_string(&r)?);
+                }
+                anyhow::Ok(())
+            };
+            // A stopped build resumes on the next invocation.
+            tokio::select! {
+                r = build => r?,
+                why = stop_signal() => {
+                    anyhow::bail!("{why}: fixture build stopped")
+                }
             }
         }
         Cmd::Render { config } => {
@@ -149,17 +159,7 @@ async fn main() -> Result<()> {
             {
                 let interrupted = interrupted.clone();
                 tokio::spawn(async move {
-                    use tokio::signal::unix::{SignalKind, signal};
-                    let mut term = signal(SignalKind::terminate()).ok();
-                    let why = tokio::select! {
-                        _ = tokio::signal::ctrl_c() => "interrupted (SIGINT)",
-                        _ = async {
-                            match term.as_mut() {
-                                Some(t) => { t.recv().await; }
-                                None => std::future::pending::<()>().await,
-                            }
-                        } => "interrupted (SIGTERM)",
-                    };
+                    let why = stop_signal().await;
                     eprintln!("{why}: aborting the run");
                     interrupted
                         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -238,4 +238,20 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The first SIGINT or SIGTERM. Installing the handler also overrides the
+/// ignored SIGINT a background job inherits (as under floor-watch).
+async fn stop_signal() -> &'static str {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).ok();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "interrupted (SIGINT)",
+        _ = async {
+            match term.as_mut() {
+                Some(t) => { t.recv().await; }
+                None => std::future::pending::<()>().await,
+            }
+        } => "interrupted (SIGTERM)",
+    }
 }
