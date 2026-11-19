@@ -119,6 +119,7 @@ pub async fn run(
     drain: Drain,
     expected: BTreeMap<String, usize>,
     ready: watch::Sender<bool>,
+    observed: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<Verifier> {
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", brokers)
@@ -165,6 +166,10 @@ pub async fn run(
                         m.payload().unwrap_or_default(),
                         Utc::now().timestamp_micros(),
                     )?;
+                    observed.store(
+                        verifier.report.row_events,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
                 Ok(Err(e)) => eprintln!("  verifier: kafka error: {e}"),
                 Err(_) if stopped_at.is_some() => break, // idle after stop

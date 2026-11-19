@@ -45,6 +45,11 @@ pub enum Action {
     /// Scrape the metrics endpoint every `interval_secs` for the rest of the
     /// run.
     ScrapeLoad { interval_secs: u64 },
+    /// Stop every pipeline through the REST API, each with a durable
+    /// checkpoint; the writers go on, building a backlog. The same
+    /// pipelines are resumed only after every writer has finished
+    /// (`backlog::after_writers`, then `backlog::drain`).
+    BacklogPause,
 }
 
 impl Action {
@@ -243,7 +248,12 @@ pub fn plan(cfg: &RunConfig) -> Result<Plan> {
         }
         "F0" => (None, Vec::new()),
         "F1" => (None, staircase(cfg)?),
-        other => bail!("unknown scenario {other} (S1-S17, A1-A5, F0 or F1)"),
+        // The backlog drain: the pipelines run for the first third, then
+        // stop while the writers go on; resumed after the writers finish.
+        "D1" => (None, vec![at(d / 3, Action::BacklogPause)]),
+        other => {
+            bail!("unknown scenario {other} (S1-S17, A1-A5, F0, F1 or D1)")
+        }
     };
     Ok(Plan {
         scenario: id.to_string(),
