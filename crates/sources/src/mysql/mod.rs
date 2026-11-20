@@ -39,6 +39,7 @@ mod mysql_checkpoint_lineage;
 pub mod mysql_connections;
 pub mod mysql_control;
 mod mysql_ddl_attribution;
+mod mysql_definitions;
 mod mysql_failover_drift;
 mod mysql_failure;
 mod mysql_forward_proof;

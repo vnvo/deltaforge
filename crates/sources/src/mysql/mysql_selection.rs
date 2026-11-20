@@ -138,8 +138,9 @@ impl Timeline {
 
 /// The cache's bound: at most this many estimated bytes
 /// ([`mysql_cache_cost`]) of entries (timelines, selected schemas and
-/// read-ahead versions, with their keys and list nodes), barrier streams
-/// (each once) and the maps' buckets. No count of tables: as many as fit.
+/// read-ahead versions, with their keys and list nodes), the definitions
+/// they share and barrier streams (each once), and the maps' buckets. No
+/// count of tables: as many as fit.
 ///
 /// [`mysql_cache_cost`]: super::mysql_cache_cost
 pub(crate) const SELECTION_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -287,8 +288,11 @@ enum Cached {
     /// A timeline, and whether the table's last selection over it proved a
     /// version (then an activation window need not select it again).
     Timeline(Arc<Timeline>, bool),
-    Selection(Arc<LoadedSchema>),
-    Version(Arc<schema_registry::SchemaVersion>),
+    /// A selected schema, and the key of its definition in the pool
+    /// ([`super::mysql_definitions`]); a read-ahead version likewise, as
+    /// the schema it selects.
+    Selection(Arc<LoadedSchema>, Arc<[u8]>),
+    Version(Arc<LoadedSchema>, Arc<[u8]>),
 }
 
 /// An entry: its value, its estimated bytes (key and node included), the
@@ -350,6 +354,8 @@ pub(crate) struct Caches {
     /// The current load, if one is admitting ([`Admission`]).
     load: u64,
     loading: bool,
+    /// The definitions the selections and versions held share, each once.
+    definitions: super::mysql_definitions::Definitions,
     /// The largest charge (a table with its version) the current load
     /// admitted, and the last finished load's: what a batch is sized by.
     load_charge: u64,
@@ -440,6 +446,7 @@ impl Caches {
             max_bytes,
             load: 0,
             loading: false,
+            definitions: Default::default(),
             load_charge: 0,
             pair_charge: 0,
             meters,
@@ -461,10 +468,11 @@ impl Caches {
         lru + table(buckets_for(barriers), BARRIER_SLOT)
     }
 
-    /// The estimated bytes held: entries, barrier streams, the index and
-    /// the maps' buckets.
+    /// The estimated bytes held: entries, barrier streams, the shared
+    /// definitions, the index and the maps' buckets.
     pub(crate) fn bytes(&self) -> u64 {
         self.held
+            + self.definitions.bytes()
             + self.index.bytes()
             + self.maps_at(self.peak, self.barriers.capacity())
     }
@@ -540,8 +548,11 @@ impl Caches {
                     }
                 }
             }
-            Cached::Version(_) => self.table_bytes -= e.bytes,
-            Cached::Selection(_) => {}
+            Cached::Version(_, d) => {
+                self.table_bytes -= e.bytes;
+                self.definitions.release(&d);
+            }
+            Cached::Selection(_, d) => self.definitions.release(&d),
         }
         self.publish();
     }
@@ -564,8 +575,8 @@ impl Caches {
         self.unindex(&key, e.slot);
         crate::perf_phases::cache_eviction(match &e.cached {
             Cached::Timeline(..) => "timeline",
-            Cached::Selection(_) => "selection",
-            Cached::Version(_) => "version",
+            Cached::Selection(..) => "selection",
+            Cached::Version(..) => "version",
         });
         self.forget(e);
         self.meters.evictions.increment(1);
@@ -591,7 +602,7 @@ impl Caches {
     /// Insert an entry that fits.
     fn push(&mut self, key: CacheKey, cached: Cached, bytes: u64) {
         self.held += bytes;
-        if !matches!(cached, Cached::Selection(_)) {
+        if !matches!(cached, Cached::Selection(..)) {
             self.table_bytes += bytes;
         }
         let load = if self.loading { self.load } else { 0 };
@@ -829,30 +840,53 @@ impl Caches {
         version: Option<schema_registry::SchemaVersion>,
     ) -> (u64, bool, Arc<Timeline>) {
         let tkey = CacheKey::Timeline(key.into());
-        let version = version.map(|v| {
+        // A version whose schema does not decode is not cached: it is read
+        // (and fails) when selected, as uncached.
+        let version = version.and_then(|v| {
             let vkey = CacheKey::Version(key.into(), v.version);
-            let bytes = super::mysql_cache_cost::version(&v);
-            (vkey, bytes, v)
+            let loaded = Arc::new(loaded_of(&v).ok()?);
+            let dkey = super::mysql_definitions::key_of(&loaded);
+            Some((vkey, loaded, dkey))
         });
         // The version's index growth is taken before the timeline indexes
         // the table: an upper bound (the table's string counted twice).
         let charge = self.timeline_cost(&tkey, &timeline)
-            + version.as_ref().map_or(0, |(vkey, bytes, _)| {
-                bytes + key_cost(vkey) + self.index.growth(vkey)
+            + version.as_ref().map_or(0, |(vkey, loaded, dkey)| {
+                super::mysql_cache_cost::loaded_own(loaded)
+                    + self.definitions.would_add(dkey, loaded)
+                    + key_cost(vkey)
+                    + self.index.growth(vkey)
             });
         if !self.admit(adm, charge) {
             return (charge, false, timeline);
         }
+        // The version's definition is held before the timeline is cached,
+        // so making room for the timeline cannot free it.
+        let version = match version {
+            None => None,
+            Some((vkey, loaded, dkey)) => {
+                match self.definitions.hold(dkey, &loaded) {
+                    Some((shared, dkey)) => Some((vkey, shared, dkey)),
+                    None => return (charge, false, timeline),
+                }
+            }
+        };
         let Some(cached) = self.put_timeline_as(tkey, timeline.clone()) else {
+            if let Some((_, _, dkey)) = version {
+                self.definitions.release(&dkey);
+                self.publish();
+            }
             return (charge, false, timeline);
         };
-        if let Some((vkey, bytes, v)) = version
-            && !self.put(vkey, Cached::Version(Arc::new(v)), bytes)
-        {
-            // Never a timeline without its version: the table is served
-            // uncached.
-            self.remove(&CacheKey::Timeline(key.into()));
-            return (charge, false, cached);
+        if let Some((vkey, shared, dkey)) = version {
+            let bytes = super::mysql_cache_cost::loaded_own(&shared);
+            if !self.put(vkey, Cached::Version(shared, dkey.clone()), bytes) {
+                // Never a timeline without its version: the table is
+                // served uncached.
+                self.definitions.release(&dkey);
+                self.remove(&CacheKey::Timeline(key.into()));
+                return (charge, false, cached);
+            }
         }
         self.load_charge = self.load_charge.max(charge);
         (charge, true, cached)
@@ -869,58 +903,85 @@ impl Caches {
         );
         match self.entries.get(&key)? {
             Entry {
-                cached: Cached::Selection(s),
+                cached: Cached::Selection(s, _),
                 ..
             } => Some(s.clone()),
             _ => None,
         }
     }
 
+    /// A read-ahead version, as the schema it selects.
     fn version(
         &mut self,
         table: &str,
         version: i32,
-    ) -> Option<Arc<schema_registry::SchemaVersion>> {
+    ) -> Option<Arc<LoadedSchema>> {
         match self
             .entries
             .get(&CacheKey::Version(table.into(), version))?
         {
             Entry {
-                cached: Cached::Version(v),
+                cached: Cached::Version(v, _),
                 ..
             } => Some(v.clone()),
             _ => None,
         }
     }
 
+    /// Cache a read-ahead version (one whose schema does not decode is
+    /// not cached); whether it was.
     fn put_version(
         &mut self,
         table: String,
         v: schema_registry::SchemaVersion,
     ) -> bool {
-        let bytes = super::mysql_cache_cost::version(&v);
-        self.put(
-            CacheKey::Version(table.into(), v.version),
-            Cached::Version(Arc::new(v)),
-            bytes,
-        )
+        let Ok(loaded) = loaded_of(&v) else {
+            return false;
+        };
+        let key = CacheKey::Version(table.into(), v.version);
+        self.put_shared(key, Arc::new(loaded), true).is_some()
     }
 
+    /// Cache a selection; the selected schema to use (on the shared
+    /// definition when it was cached).
     fn put_selection<T: Into<Arc<str>>>(
         &mut self,
         (table, decisive, signature): (T, String, String),
         loaded: Arc<LoadedSchema>,
-    ) {
-        let bytes = super::mysql_cache_cost::loaded(&loaded);
-        self.put(
-            CacheKey::Selection(
-                table.into(),
-                decisive.into(),
-                signature.into(),
-            ),
-            Cached::Selection(loaded),
-            bytes,
+    ) -> Arc<LoadedSchema> {
+        let key = CacheKey::Selection(
+            table.into(),
+            decisive.into(),
+            signature.into(),
         );
+        self.put_shared(key, loaded.clone(), false)
+            .unwrap_or(loaded)
+    }
+
+    /// Cache `loaded` under `key` (a version's or a selection's) on its
+    /// shared definition, held before room is made so making room cannot
+    /// free it; the cached schema, or `None` if it did not fit.
+    fn put_shared(
+        &mut self,
+        key: CacheKey,
+        loaded: Arc<LoadedSchema>,
+        version: bool,
+    ) -> Option<Arc<LoadedSchema>> {
+        let dkey = super::mysql_definitions::key_of(&loaded);
+        let (shared, dkey) = self.definitions.hold(dkey, &loaded)?;
+        let bytes = super::mysql_cache_cost::loaded_own(&shared);
+        let cached = if version {
+            Cached::Version(shared.clone(), dkey.clone())
+        } else {
+            Cached::Selection(shared.clone(), dkey.clone())
+        };
+        if self.put(key, cached, bytes) {
+            Some(shared)
+        } else {
+            self.definitions.release(&dkey);
+            self.publish();
+            None
+        }
     }
 
     /// Change the bound, keeping what is held (tests).
@@ -999,15 +1060,21 @@ impl Caches {
                         }
                         cost::timeline(t)
                     }
-                    Cached::Selection(l) => cost::loaded(l),
-                    Cached::Version(v) => cost::version(v),
+                    Cached::Selection(l, _) | Cached::Version(l, _) => {
+                        cost::loaded_own(l)
+                    }
                 };
             assert_eq!(e.bytes, bytes, "{key:?}");
             held += bytes;
-            if !matches!(e.cached, Cached::Selection(_)) {
+            if !matches!(e.cached, Cached::Selection(..)) {
                 table_bytes += bytes;
             }
         }
+        self.definitions
+            .audit(self.entries.iter().filter_map(|(_, e)| match &e.cached {
+                Cached::Selection(l, d) | Cached::Version(l, d) => Some((d, l)),
+                Cached::Timeline(..) => None,
+            }));
         held += self
             .barriers
             .values()
@@ -1098,6 +1165,7 @@ impl Caches {
         self.entries = lru::LruCache::unbounded();
         self.barriers = Default::default();
         self.index = Default::default();
+        self.definitions = Default::default();
         self.timelines = 0;
         self.held = 0;
         self.table_bytes = 0;
@@ -1110,7 +1178,8 @@ impl Caches {
 /// `databases` databases of one lineage, each with a timeline of `records`
 /// baselines (sharing the lineage's and its database's barrier streams, of
 /// 3 records each), and, when asked, a selected schema and a registered
-/// version of `columns` mixed columns.
+/// version of `columns` mixed columns: of `definitions` distinct
+/// definitions (registry hashes) over the tables, or one per table (0).
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
 pub struct ProbeMix {
@@ -1120,6 +1189,7 @@ pub struct ProbeMix {
     pub columns: usize,
     pub selections: bool,
     pub versions: bool,
+    pub definitions: usize,
 }
 
 /// A selection cache built as a loaded cache holds its entries, for
@@ -1295,6 +1365,10 @@ fn probe_fill(caches: &mut Caches, mix: ProbeMix) {
         );
         let json: serde_json::Value =
             serde_json::from_slice(&encoded).expect("decodes");
+        let hash = match mix.definitions {
+            0 => format!("{t:064x}"),
+            n => format!("{:064x}", t % n),
+        };
         if mix.selections {
             let schema = schema_of(&json).expect("a schema");
             caches.put_selection(
@@ -1302,7 +1376,7 @@ fn probe_fill(caches: &mut Caches, mix: ProbeMix) {
                 Arc::new(LoadedSchema::new(
                     schema,
                     1,
-                    format!("{t:064x}").into(),
+                    hash.as_str().into(),
                     t as u64,
                 )),
             );
@@ -1312,7 +1386,7 @@ fn probe_fill(caches: &mut Caches, mix: ProbeMix) {
                 bk,
                 schema_registry::SchemaVersion {
                     version: 1,
-                    hash: format!("{t:064x}"),
+                    hash,
                     schema_json: json,
                     registered_at: chrono::Utc::now(),
                     sequence: t as u64,
@@ -2007,11 +2081,12 @@ async fn loaded_cached(
     ctx: &mut RunCtx,
     key: &SchemaKey,
     version: i32,
-) -> SourceResult<(Arc<LoadedSchema>, MySqlTableSchema)> {
+) -> SourceResult<Arc<LoadedSchema>> {
     match ctx.selection.version(&key.backend_key(), version) {
         Some(v) => {
             crate::perf_phases::cache_lookup("version", true);
-            loaded_from(&v, version)
+            debug_assert_eq!(v.registry_version, version);
+            Ok(v)
         }
         None => {
             crate::perf_phases::cache_lookup("version", false);
@@ -2026,7 +2101,7 @@ async fn loaded(
     registry: &DurableSchemaRegistry,
     key: &SchemaKey,
     version: i32,
-) -> SourceResult<(Arc<LoadedSchema>, MySqlTableSchema)> {
+) -> SourceResult<Arc<LoadedSchema>> {
     let v = registry
         .get_version(key, version)
         .await
@@ -2034,23 +2109,19 @@ async fn loaded(
         .ok_or_else(|| {
             timeline_error(anyhow::anyhow!("version {version} is missing"))
         })?;
-    loaded_from(&v, version)
+    debug_assert_eq!(v.version, version);
+    Ok(Arc::new(loaded_of(&v).map_err(timeline_error)?))
 }
 
-fn loaded_from(
+/// The schema a registered version selects.
+fn loaded_of(
     v: &schema_registry::SchemaVersion,
-    version: i32,
-) -> SourceResult<(Arc<LoadedSchema>, MySqlTableSchema)> {
-    debug_assert_eq!(v.version, version);
-    let schema = schema_of(&v.schema_json).map_err(timeline_error)?;
-    Ok((
-        Arc::new(LoadedSchema::new(
-            schema.clone(),
-            v.version,
-            v.hash.as_str().into(),
-            v.sequence,
-        )),
-        schema,
+) -> anyhow::Result<LoadedSchema> {
+    Ok(LoadedSchema::new(
+        schema_of(&v.schema_json)?,
+        v.version,
+        v.hash.as_str().into(),
+        v.sequence,
     ))
 }
 
@@ -2130,10 +2201,10 @@ pub(crate) async fn select_for_rows(
                 return Ok(hit);
             }
             crate::perf_phases::cache_lookup("selection", false);
-            let (loaded, schema) = loaded_cached(ctx, key, version).await?;
+            let loaded = loaded_cached(ctx, key, version).await?;
             // The proven version comes from authoritative complete-schema
             // evidence; it must not contradict the TableMap.
-            if let Verdict::Mismatch(why) = compare(&schema, tm) {
+            if let Verdict::Mismatch(why) = compare(&loaded.schema, tm) {
                 return Err(fail(
                     db,
                     table,
@@ -2542,8 +2613,7 @@ async fn full_fallback(
     })?;
     ctx.selection.invalidate(key);
     warn!(source_id = %ctx.source_id, %db, %table, version, "schema version selected by its FULL TableMap signature");
-    let (loaded, _) = loaded(ctx.schema.registry(), key, version).await?;
-    Ok(loaded)
+    loaded(ctx.schema.registry(), key, version).await
 }
 
 #[cfg(test)]
@@ -5103,6 +5173,325 @@ mod tests {
             assert!(largest > held, "{largest} vs {held}");
             assert_eq!(c.batch_room(), ((2 << 20) / largest) as usize);
             c.audit();
+        }
+    }
+
+    mod shared_definitions {
+        //! Copies of one stored definition share it in the cache; every
+        //! table keeps its own version number and sequence.
+        use super::*;
+
+        const L: &str = "0123456789abcdef0123456789abcdef";
+
+        fn key(t: usize) -> SchemaKey {
+            SchemaKey::new(
+                "acme",
+                "s",
+                L,
+                format!("db{}", t / 10),
+                format!("t{t}"),
+            )
+        }
+
+        fn schema(cols: usize) -> MySqlTableSchema {
+            let mut s = MySqlTableSchema::new(
+                (0..cols)
+                    .map(|c| {
+                        let mut col =
+                            crate::mysql::mysql_table_schema::MySqlColumn::new(
+                                format!("c{c}"),
+                                "varchar(40)",
+                                "varchar",
+                                c % 2 == 0,
+                                c as u32 + 1,
+                            );
+                        col.comment = Some(format!("column {c}"));
+                        col
+                    })
+                    .collect(),
+            );
+            s.primary_key = vec!["c0".into()];
+            s.engine = Some("InnoDB".into());
+            s
+        }
+
+        fn loaded(
+            s: &MySqlTableSchema,
+            hash: &str,
+            version: i32,
+            sequence: u64,
+        ) -> Arc<LoadedSchema> {
+            Arc::new(LoadedSchema::new(
+                s.clone(),
+                version,
+                hash.into(),
+                sequence,
+            ))
+        }
+
+        fn version_of(
+            s: &MySqlTableSchema,
+            hash: &str,
+            version: i32,
+            sequence: u64,
+        ) -> schema_registry::SchemaVersion {
+            schema_registry::SchemaVersion {
+                version,
+                hash: hash.into(),
+                schema_json: serde_json::to_value(s).unwrap(),
+                registered_at: chrono::Utc::now(),
+                sequence,
+                checkpoint: None,
+            }
+        }
+
+        fn selection_key(t: usize) -> (String, String, String) {
+            (key(t).backend_key(), format!("d{t}"), format!("g{t}"))
+        }
+
+        /// The fields a caller sees, equal to an unshared build's.
+        fn assert_same(got: &LoadedSchema, want: &LoadedSchema) {
+            assert_eq!(*got.schema, *want.schema);
+            assert_eq!(got.registry_version, want.registry_version);
+            assert_eq!(got.sequence, want.sequence);
+            assert_eq!(got.fingerprint, want.fingerprint);
+            assert_eq!(got.column_names, want.column_names);
+            assert_eq!(*got.decoder, *want.decoder);
+        }
+
+        /// 1,000 tables of one definition: one definition is held, every
+        /// selected schema points at it with its own version and
+        /// sequence, and the cache counts the definition once.
+        #[test]
+        fn copies_of_one_definition_share_it() {
+            let mut c = Caches::default();
+            let s = schema(12);
+            let mut first: Option<Arc<LoadedSchema>> = None;
+            for t in 0..1000 {
+                let want = loaded(&s, "h", 1 + (t % 5) as i32, t as u64);
+                let got = c.put_selection(selection_key(t), want.clone());
+                assert_same(&got, &want);
+                let first = first.get_or_insert_with(|| got.clone());
+                assert!(Arc::ptr_eq(&first.schema, &got.schema));
+                assert!(Arc::ptr_eq(&first.decoder, &got.decoder));
+            }
+            assert_eq!(c.definitions.len(), 1);
+            c.audit();
+            let one = loaded(&s, "h", 1, 0);
+            let unshared = 1000
+                * (crate::mysql::mysql_cache_cost::loaded_own(&one)
+                    + crate::mysql::mysql_cache_cost::definition(&one));
+            assert!(c.bytes() * 4 < unshared, "{} vs {unshared}", c.bytes());
+        }
+
+        /// A read-ahead version and another table's selection of the same
+        /// definition share it; the version selects its own table's version.
+        #[test]
+        fn versions_and_selections_share_a_definition() {
+            let mut c = Caches::default();
+            let s = schema(6);
+            assert!(
+                c.put_version(key(1).backend_key(), version_of(&s, "h", 3, 30))
+            );
+            let sel = c.put_selection(selection_key(2), loaded(&s, "h", 1, 7));
+            let v = c.version(&key(1).backend_key(), 3).expect("cached");
+            assert_same(&v, &loaded(&s, "h", 3, 30));
+            assert_same(&sel, &loaded(&s, "h", 1, 7));
+            assert!(Arc::ptr_eq(&v.schema, &sel.schema));
+            assert_eq!(c.definitions.len(), 1);
+            c.audit();
+        }
+
+        /// Definitions that differ in any stored part, or in their hash,
+        /// are held apart.
+        #[test]
+        fn differing_definitions_stay_apart() {
+            let s = schema(4);
+            let mut variants = vec![(s.clone(), "h")];
+            variants.push((s.clone(), "h2"));
+            let mut e = s.clone();
+            e.engine = None;
+            variants.push((e, "h"));
+            let mut ch = s.clone();
+            ch.charset = Some("utf8mb4".into());
+            variants.push((ch, "h"));
+            let mut co = s.clone();
+            co.collation = Some("utf8mb4_bin".into());
+            variants.push((co, "h"));
+            let mut cm = s.clone();
+            cm.columns[1].comment = Some("other".into());
+            variants.push((cm, "h"));
+            let mut d = s.clone();
+            d.columns[2].default_value = Some("x".into());
+            variants.push((d, "h"));
+            let mut n = s.clone();
+            n.columns[3].nullable = !n.columns[3].nullable;
+            variants.push((n, "h"));
+            let mut c = Caches::default();
+            for (t, (s, h)) in variants.iter().enumerate() {
+                let want = loaded(s, h, 1, t as u64);
+                assert_same(
+                    &c.put_selection(selection_key(t), want.clone()),
+                    &want,
+                );
+            }
+            assert_eq!(c.definitions.len(), variants.len());
+            c.audit();
+        }
+
+        /// A definition stays while any entry holds it and goes with the
+        /// last; then the cache holds nothing.
+        #[test]
+        fn the_last_holder_frees_a_definition() {
+            let mut c = Caches::default();
+            let s = schema(8);
+            for t in 0..20 {
+                c.put_selection(selection_key(t), loaded(&s, "h", 1, t as u64));
+            }
+            for t in 0..19 {
+                c.invalidate(&key(t));
+                assert_eq!(c.definitions.len(), 1);
+                c.audit();
+            }
+            c.invalidate(&key(19));
+            assert_eq!(c.definitions.len(), 0);
+            // Only the maps' buckets, kept after invalidation, are left.
+            assert_eq!(c.held, 0);
+            assert_eq!(
+                c.bytes(),
+                c.index.bytes() + c.maps_at(c.peak, c.barriers.capacity())
+            );
+            c.audit();
+        }
+
+        /// A version whose stored schema does not decode is not cached.
+        #[test]
+        fn an_undecodable_version_is_not_cached() {
+            let mut c = Caches::default();
+            let mut v = version_of(&schema(2), "h", 1, 1);
+            v.schema_json = serde_json::json!({"columns": 7});
+            assert!(!c.put_version(key(0).backend_key(), v));
+            assert!(c.version(&key(0).backend_key(), 1).is_none());
+            assert_eq!(c.bytes(), 0);
+        }
+
+        /// A selection that cannot be cached gives its definition back:
+        /// nothing is held for it.
+        #[test]
+        fn a_selection_that_does_not_fit_holds_nothing() {
+            let mut c = Caches::default();
+            c.set_limit_for_test(4 * 1024);
+            let want = loaded(&schema(60), "h", 1, 1);
+            let got = c.put_selection(selection_key(0), want.clone());
+            assert!(Arc::ptr_eq(&got, &want), "served uncached");
+            assert_eq!(c.definitions.len(), 0);
+            assert_eq!(c.held, 0);
+            c.audit();
+        }
+
+        /// A load's table whose timeline cannot be cached (the cache is
+        /// full of what the load admitted, which it never evicts) gives its
+        /// version's definition back, and so does one whose version cannot
+        /// be cached after its timeline was.
+        #[test]
+        fn a_pair_that_is_not_cached_holds_nothing() {
+            let timeline = |bytes| {
+                Arc::new(Timeline {
+                    records: Vec::new(),
+                    table_head: 1,
+                    streams: Vec::new(),
+                    bytes,
+                })
+            };
+            let mut c = Caches::default();
+            c.set_limit_for_test(64 * 1024);
+            let mut adm = c.begin_load();
+            // The load fills the cache with entries it may not evict.
+            let mut t = 0;
+            while c
+                .put_timeline_as(
+                    CacheKey::Timeline(key(t).backend_key().into()),
+                    timeline(4096),
+                )
+                .is_some()
+            {
+                t += 1;
+            }
+            // Admitted by its charge, refused by the bound.
+            adm.left = u64::MAX;
+            adm.first = false;
+            let (_, cached, _) = c.admit_pair(
+                &mut adm,
+                &key(500).backend_key(),
+                timeline(4096),
+                Some(version_of(&schema(4), "h", 1, 1)),
+            );
+            assert!(!cached);
+            assert_eq!(c.definitions.len(), 0, "the timeline was refused");
+            c.audit();
+            // A timeline that fits, with a version that cannot.
+            let (_, cached, _) = c.admit_pair(
+                &mut adm,
+                &key(501).backend_key(),
+                timeline(0),
+                Some(version_of(&schema(400), "h", 1, 1)),
+            );
+            assert!(!cached);
+            assert_eq!(c.definitions.len(), 0, "the version was refused");
+            c.audit();
+            c.end_load();
+        }
+
+        /// Random selections, versions and invalidations over tables of a
+        /// few definitions, in a bound that keeps evicting: the accounting
+        /// always equals a recount, the bound holds, and every schema
+        /// returned equals an unshared build of it.
+        #[test]
+        fn churn_keeps_sharing_exact() {
+            let mut c = Caches::default();
+            c.set_limit_for_test(96 * 1024);
+            let defs: Vec<MySqlTableSchema> =
+                [3, 5, 8, 13].iter().map(|n| schema(*n)).collect();
+            let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+            let mut next = |m: u64| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x % m
+            };
+            for i in 0..20_000u64 {
+                let t = next(60) as usize;
+                let d = next(defs.len() as u64) as usize;
+                let h = format!("h{d}");
+                match next(10) {
+                    0..=5 => {
+                        let want = loaded(&defs[d], &h, 1 + (i % 4) as i32, i);
+                        assert_same(
+                            &c.put_selection(selection_key(t), want.clone()),
+                            &want,
+                        );
+                    }
+                    6..=8 => {
+                        let v = 1 + (i % 4) as i32;
+                        if c.put_version(
+                            key(t).backend_key(),
+                            version_of(&defs[d], &h, v, i),
+                        ) {
+                            let got = c
+                                .version(&key(t).backend_key(), v)
+                                .expect("cached");
+                            assert_same(&got, &loaded(&defs[d], &h, v, i));
+                        }
+                    }
+                    _ => c.invalidate(&key(t)),
+                }
+                assert!(c.bytes() <= 96 * 1024);
+                if i % 97 == 0 {
+                    c.audit();
+                }
+            }
+            c.audit();
+            assert!(c.definitions.len() <= defs.len());
         }
     }
 }

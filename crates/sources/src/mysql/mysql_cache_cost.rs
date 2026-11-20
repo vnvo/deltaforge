@@ -4,7 +4,8 @@
 //! Every allocation an entry keeps is counted at the size the allocator
 //! gives it (jemalloc's size classes): the structures themselves, their
 //! strings and vectors at capacity, the `Arc` headers, a selected schema's
-//! decoder, a read-ahead version's JSON tree, and the maps' buckets. A
+//! decoder, and the maps' buckets. A definition shared by several entries
+//! (`super::mysql_definitions`) is counted once. A
 //! record's own heap is taken from its stored size (what was read for it),
 //! which covers the strings it decodes into. The memory the cache's entries
 //! allocate is measured against this estimate in
@@ -167,57 +168,22 @@ fn decoder(d: &TableDecoder) -> u64 {
         + columns
 }
 
-/// A selected schema: its `Arc`, its columns, its column names, its
-/// fingerprint and its decoder.
-pub(crate) fn loaded(l: &LoadedSchema) -> u64 {
+/// A selected schema's own memory: its `Arc` (its definition is counted
+/// once, where it is held: [`definition`]).
+pub(crate) fn loaded_own(_l: &LoadedSchema) -> u64 {
     allocated(ARC_HEADER + size_of::<LoadedSchema>() as u64)
+}
+
+/// A selected schema's definition: its schema's `Arc` and columns, its
+/// column names, its fingerprint and its decoder.
+pub(crate) fn definition(l: &LoadedSchema) -> u64 {
+    allocated(ARC_HEADER + size_of::<MySqlTableSchema>() as u64)
         + schema(&l.schema)
         + allocated(ARC_HEADER + size_of::<Vec<String>>() as u64)
         + slots::<String>(l.column_names.capacity())
         + l.column_names.iter().map(owned).sum::<u64>()
         + allocated(ARC_HEADER + l.fingerprint.len() as u64)
         + decoder(&l.decoder)
-}
-
-/// A JSON value's heap: strings, arrays at capacity, and objects as an
-/// insertion-ordered map (the workspace builds `serde_json` with
-/// `preserve_order`): their entries at the map's capacity, its index
-/// table, and their keys.
-pub(crate) fn json(v: &serde_json::Value) -> u64 {
-    use serde_json::Value;
-    match v {
-        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
-        Value::String(s) => owned(s),
-        Value::Array(a) => {
-            slots::<Value>(a.capacity()) + a.iter().map(json).sum::<u64>()
-        }
-        Value::Object(m) => {
-            if m.is_empty() {
-                return 0;
-            }
-            let buckets = buckets_for(m.len());
-            let capacity = if buckets < 8 {
-                buckets - 1
-            } else {
-                buckets / 8 * 7
-            };
-            // An entry: its hash, its key and its value.
-            slots::<(usize, String, Value)>(capacity)
-                + table(buckets, size_of::<usize>())
-                + m.iter().map(|(k, v)| owned(k) + json(v)).sum::<u64>()
-        }
-    }
-}
-
-/// A registered version read ahead: its `Arc`, its hash, its checkpoint
-/// and its schema's JSON tree.
-pub(crate) fn version(v: &schema_registry::SchemaVersion) -> u64 {
-    allocated(ARC_HEADER + size_of::<schema_registry::SchemaVersion>() as u64)
-        + owned(&v.hash)
-        + v.checkpoint
-            .as_ref()
-            .map_or(0, |c| allocated(c.capacity() as u64))
-        + json(&v.schema_json)
 }
 
 #[cfg(test)]
@@ -262,26 +228,6 @@ mod tests {
             let slot = size_of::<(u64, u64)>();
             assert_eq!(got, table(buckets_for(n), slot), "{n}");
             drop(m);
-        }
-    }
-
-    /// A parsed JSON object allocates what [`json`] counts for it: its
-    /// entries, its index table and its keys.
-    #[test]
-    fn a_parsed_object_allocates_its_estimate() {
-        use crate::test_alloc::held;
-        for keys in 1..=60 {
-            let text = serde_json::to_string(
-                &(0..keys)
-                    .map(|i| (format!("key_{i}"), serde_json::Value::from(i)))
-                    .collect::<serde_json::Map<_, _>>(),
-            )
-            .unwrap();
-            let before = held();
-            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-            let got = (held() - before) as u64;
-            assert_eq!(got, json(&v), "{keys} keys");
-            drop(v);
         }
     }
 }

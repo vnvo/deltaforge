@@ -36,7 +36,9 @@ use deltaforge_core::{SourceError, SourceResult};
 /// Loaded schema with metadata.
 #[derive(Debug, Clone)]
 pub struct LoadedSchema {
-    pub schema: MySqlTableSchema,
+    /// The stored schema (shared by every table cached with the same
+    /// stored definition: [`crate::mysql::mysql_selection`]'s pool).
+    pub schema: Arc<MySqlTableSchema>,
     pub registry_version: i32,
     pub fingerprint: Arc<str>,
     pub sequence: u64,
@@ -58,7 +60,7 @@ impl LoadedSchema {
                 schema.columns.iter().map(|c| c.name.clone()).collect(),
             ),
             decoder: Arc::new(super::mysql_decode::TableDecoder::new(&schema)),
-            schema,
+            schema: Arc::new(schema),
             registry_version,
             fingerprint,
             sequence,
