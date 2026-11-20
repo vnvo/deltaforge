@@ -86,61 +86,75 @@ impl Signature {
     }
 }
 
-/// The bytes [`SignatureMemo`] may hold: its signatures are outside the
-/// schema cache's bound, so they have one of their own.
-const MEMO_BYTES: u64 = 8 * 1024 * 1024;
-/// One entry's bookkeeping beyond its signature and digest (the map slot,
-/// the list node, the digest's string header).
+/// The share of the selection cache's bound the memo may hold (its
+/// entries are outside that bound, and serve the same tables).
+const MEMO_SHARE: u64 = 8;
+/// One entry's bookkeeping beyond its encoded signature (the map slot, the
+/// list node, the boxed bytes' header and the digest).
 const MEMO_ENTRY: u64 = 128;
 
-/// Each table id's last signature and its digest: a TableMap identical in
-/// every signature field reuses the digest instead of serializing and
-/// hashing it again (a digest is a function of the signature alone).
-/// Bounded by bytes ([`MEMO_BYTES`]), least recently used first out; a
+/// Signatures in a compact exact encoding ([`encode`]) and their digests,
+/// keyed by the encoding itself: a TableMap whose encoding is held reuses
+/// the digest instead of serializing and hashing it again (a digest is a
+/// function of the signature alone, and equal encodings are equal
+/// signatures). It is not keyed by table: MySQL assigns a table a new id
+/// each time it reopens it, which at a large active set is most TableMaps,
+/// and copies of one definition share one entry. Bounded by bytes (an
+/// eighth of the selection cache's bound), least recently used first out; a
 /// signature that would take more than a sixteenth of it is not kept.
 /// Nothing is allocated before the first digest.
 pub(crate) struct SignatureMemo {
-    by_table: lru::LruCache<u64, (Signature, String, u64)>,
+    by_signature: lru::LruCache<Box<[u8]>, [u8; 32]>,
     bytes: u64,
     budget: u64,
+    /// The encoding of the TableMap being looked up (reused).
+    scratch: Vec<u8>,
 }
 
 impl SignatureMemo {
-    pub(crate) fn new() -> Self {
-        Self::within(MEMO_BYTES)
+    /// The memo for a selection cache bounded by `cache_bytes`.
+    pub(crate) fn for_cache(cache_bytes: u64) -> Self {
+        Self::within(cache_bytes / MEMO_SHARE)
     }
 
     fn within(budget: u64) -> Self {
         Self {
-            by_table: lru::LruCache::unbounded(),
+            by_signature: lru::LruCache::unbounded(),
             bytes: 0,
             budget,
+            scratch: Vec::new(),
         }
+    }
+
+    /// What an entry of an `len`-byte encoding counts against the budget.
+    fn cost(len: usize) -> u64 {
+        super::mysql_cache_cost::allocated(len as u64) + MEMO_ENTRY
     }
 
     /// `Signature::of(tm).digest()`.
     pub(crate) fn digest(&mut self, tm: &TableMapEvent) -> String {
-        if let Some((sig, digest, _)) = self.by_table.get(&tm.table_id)
-            && sig.is_of(tm)
-        {
-            return digest.clone();
+        encode(tm, &mut self.scratch);
+        if let Some(digest) = self.by_signature.get(self.scratch.as_slice()) {
+            return hex::encode(digest);
         }
-        let sig = Signature::of(tm);
-        let digest = sig.digest();
-        let cost = sig.held_bytes() + digest.len() as u64 + MEMO_ENTRY;
-        if let Some((_, _, was)) = self.by_table.pop(&tm.table_id) {
-            self.bytes -= was;
-        }
+        let hexed = Signature::of(tm).digest();
+        let mut digest = [0u8; 32];
+        hex::decode_to_slice(&hexed, &mut digest)
+            .expect("a SHA-256 hex digest");
+        let cost = Self::cost(self.scratch.len());
         if cost <= self.budget / 16 {
-            self.by_table.put(tm.table_id, (sig, digest.clone(), cost));
+            self.by_signature
+                .put(self.scratch.as_slice().into(), digest);
             self.bytes += cost;
             while self.bytes > self.budget {
-                let (_, (_, _, out)) =
-                    self.by_table.pop_lru().expect("over budget is not empty");
-                self.bytes -= out;
+                let (out, _) = self
+                    .by_signature
+                    .pop_lru()
+                    .expect("over budget is not empty");
+                self.bytes -= Self::cost(out.len());
             }
         }
-        digest
+        hexed
     }
 
     /// The bytes held now (as counted against the budget).
@@ -150,52 +164,133 @@ impl SignatureMemo {
     }
 }
 
-impl Signature {
-    /// The heap this signature holds (an estimate at or above it).
-    fn held_bytes(&self) -> u64 {
-        use super::mysql_cache_cost::allocated;
-        let strings = |v: &Option<Vec<String>>| {
-            v.as_ref().map_or(0, |v| {
-                allocated((v.capacity() * size_of::<String>()) as u64)
-                    + v.iter()
-                        .map(|s| allocated(s.capacity() as u64))
-                        .sum::<u64>()
-            })
-        };
-        let meta = self.table_metadata.as_ref().map_or(0, |m| {
-            let charsets = |c: &Option<mysql_binlog_connector_rust::event::table_map::default_charset::DefaultCharset>| {
-                c.as_ref().map_or(0, |c| {
-                    allocated((c.charset_collations.capacity() * 8) as u64)
-                })
-            };
-            allocated((m.columns.capacity() * size_of::<mysql_binlog_connector_rust::event::table_map::table_metadata::ColumnMetadata>()) as u64) + m
-                .columns
+/// `tm`'s signature fields ([`Signature`]: not the table id or names) in a
+/// compact encoding into `out`, which it replaces. Two TableMaps have the
+/// same encoding exactly when their signatures are equal: every field is
+/// written, each value self-delimiting (LEB128 integers, length-prefixed
+/// sequences and strings, a tag before each optional value), in a fixed
+/// order. Every struct is destructured in full, so a field added to the
+/// connector's types is a compile error here, never a field left out.
+fn encode(tm: &TableMapEvent, out: &mut Vec<u8>) {
+    use mysql_binlog_connector_rust::event::table_map::default_charset::DefaultCharset;
+    use mysql_binlog_connector_rust::event::table_map::table_metadata::{
+        ColumnMetadata, TableMetadata,
+    };
+    fn int(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let low = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(low);
+                return;
+            }
+            out.push(low | 0x80);
+        }
+    }
+    fn bytes(out: &mut Vec<u8>, b: &[u8]) {
+        int(out, b.len() as u64);
+        out.extend_from_slice(b);
+    }
+    fn opt<T>(
+        out: &mut Vec<u8>,
+        v: &Option<T>,
+        f: impl FnOnce(&mut Vec<u8>, &T),
+    ) {
+        match v {
+            None => out.push(0),
+            Some(v) => {
+                out.push(1);
+                f(out, v);
+            }
+        }
+    }
+    fn strings(out: &mut Vec<u8>, v: &[String]) {
+        int(out, v.len() as u64);
+        for s in v {
+            bytes(out, s.as_bytes());
+        }
+    }
+    fn charset(out: &mut Vec<u8>, c: &DefaultCharset) {
+        let DefaultCharset {
+            default_charset_collation,
+            charset_collations,
+        } = c;
+        int(out, u64::from(*default_charset_collation));
+        int(out, charset_collations.len() as u64);
+        for (column, collation) in charset_collations {
+            int(out, u64::from(*column));
+            int(out, u64::from(*collation));
+        }
+    }
+    fn column(out: &mut Vec<u8>, c: &ColumnMetadata) {
+        let ColumnMetadata {
+            column_name,
+            is_signed,
+            charset_collation,
+            enum_string_values,
+            set_string_values,
+            geometry_type,
+            is_simple_primary_key,
+            primary_key_prefix,
+            enum_and_set_charset_collation,
+            is_visible,
+        } = c;
+        let flag = |out: &mut Vec<u8>, b: &bool| out.push(u8::from(*b));
+        let n = |out: &mut Vec<u8>, v: &u32| int(out, u64::from(*v));
+        opt(out, column_name, |o, s| bytes(o, s.as_bytes()));
+        opt(out, is_signed, flag);
+        opt(out, charset_collation, n);
+        opt(out, enum_string_values, |o, v| strings(o, v));
+        opt(out, set_string_values, |o, v| strings(o, v));
+        opt(out, geometry_type, n);
+        opt(out, is_simple_primary_key, flag);
+        opt(out, primary_key_prefix, n);
+        opt(out, enum_and_set_charset_collation, n);
+        opt(out, is_visible, flag);
+    }
+    let TableMapEvent {
+        table_id: _,
+        database_name: _,
+        table_name: _,
+        column_types,
+        column_metas,
+        null_bits,
+        table_metadata,
+    } = tm;
+    out.clear();
+    bytes(out, column_types);
+    int(out, column_metas.len() as u64);
+    for m in column_metas {
+        int(out, u64::from(*m));
+    }
+    int(out, null_bits.len() as u64);
+    for chunk in null_bits.chunks(8) {
+        out.push(
+            chunk
                 .iter()
-                .map(|c| {
-                    c.column_name
-                        .as_ref()
-                        .map_or(0, |n| allocated(n.capacity() as u64))
-                        + strings(&c.enum_string_values)
-                        + strings(&c.set_string_values)
-                })
-                .sum::<u64>()
-                + allocated((m.primary_key.capacity() * 16) as u64)
-                + charsets(&m.default_charset)
-                + charsets(&m.enum_and_set_default_charset)
-        });
-        allocated(self.column_types.capacity() as u64)
-            + allocated((self.column_metas.capacity() * 2) as u64)
-            + allocated(self.null_bits.capacity() as u64)
-            + meta
+                .enumerate()
+                .fold(0u8, |b, (i, &set)| b | (u8::from(set) << i)),
+        );
     }
-
-    /// Whether `tm` has this signature.
-    fn is_of(&self, tm: &TableMapEvent) -> bool {
-        self.column_types == tm.column_types
-            && self.column_metas == tm.column_metas
-            && self.null_bits == tm.null_bits
-            && self.table_metadata == tm.table_metadata
-    }
+    opt(out, table_metadata, |out, m| {
+        let TableMetadata {
+            default_charset,
+            enum_and_set_default_charset,
+            columns,
+            primary_key,
+        } = m;
+        opt(out, default_charset, charset);
+        opt(out, enum_and_set_default_charset, charset);
+        int(out, columns.len() as u64);
+        for c in columns {
+            column(out, c);
+        }
+        int(out, primary_key.len() as u64);
+        for (index, prefix) in primary_key {
+            int(out, *index as u64);
+            int(out, u64::from(*prefix));
+        }
+    });
 }
 
 /// Base type, lower-cased, without length/attributes ("varchar", "int").
@@ -834,7 +929,9 @@ mod tests {
         nulls.null_bits[0] = false;
         let mut other_table = base.clone();
         other_table.table_name = "u".into();
-        let mut memo = SignatureMemo::new();
+        let mut memo = SignatureMemo::for_cache(
+            super::super::mysql_selection::SELECTION_CACHE_BYTES,
+        );
         // The same table id through every change and back: each digest is
         // the fresh one, a change is never answered from the memo.
         for t in [
@@ -858,9 +955,367 @@ mod tests {
         assert_ne!(fresh(&base), fresh(&types));
     }
 
-    /// Wide signatures of many tables: what the memo holds never passes
-    /// its budget, its count covers each signature's names, the newest
-    /// stay, and one too large to keep is still answered.
+    /// A FULL TableMap of two named columns, every metadata field set.
+    fn full_tm() -> TableMapEvent {
+        use mysql_binlog_connector_rust::event::table_map::default_charset::DefaultCharset;
+        use mysql_binlog_connector_rust::event::table_map::table_metadata::{
+            ColumnMetadata, TableMetadata,
+        };
+        let column = |name: &str| ColumnMetadata {
+            column_name: Some(name.into()),
+            is_signed: Some(true),
+            charset_collation: Some(45),
+            enum_string_values: Some(vec!["x".into(), "y".into()]),
+            set_string_values: Some(vec!["s".into()]),
+            geometry_type: Some(1),
+            is_simple_primary_key: Some(true),
+            primary_key_prefix: Some(4),
+            enum_and_set_charset_collation: Some(46),
+            is_visible: Some(true),
+        };
+        let mut t = tm(&[(3, 0), (15, 40)]);
+        t.table_metadata = Some(TableMetadata {
+            default_charset: Some(DefaultCharset {
+                default_charset_collation: 255,
+                charset_collations: vec![(1, 45)],
+            }),
+            enum_and_set_default_charset: Some(DefaultCharset {
+                default_charset_collation: 8,
+                charset_collations: vec![(1, 46)],
+            }),
+            columns: vec![column("id"), column("name")],
+            primary_key: vec![(0, 0)],
+        });
+        t
+    }
+
+    /// Each signature field changed alone, and pairs whose fields differ
+    /// only in how values are split: through one memo and one table id,
+    /// every digest is the fresh one (a change is never answered from the
+    /// memo, and no two of these share a digest).
+    #[test]
+    fn the_memo_follows_every_signature_field() {
+        type Change = fn(&mut TableMapEvent);
+        fn meta(t: &mut TableMapEvent)
+        -> &mut mysql_binlog_connector_rust::event::table_map::table_metadata::TableMetadata{
+            t.table_metadata.as_mut().expect("full")
+        }
+        let changes: Vec<(&str, Change)> = vec![
+            ("column type", |t| t.column_types[1] = 253),
+            ("column meta", |t| t.column_metas[1] = 80),
+            ("null bit", |t| t.null_bits[0] = false),
+            ("no metadata", |t| t.table_metadata = None),
+            ("column name", |t| {
+                meta(t).columns[1].column_name = Some("nam".into())
+            }),
+            ("no column name", |t| meta(t).columns[1].column_name = None),
+            ("empty column name", |t| {
+                meta(t).columns[1].column_name = Some(String::new())
+            }),
+            ("signedness", |t| meta(t).columns[0].is_signed = Some(false)),
+            ("no signedness", |t| meta(t).columns[0].is_signed = None),
+            ("collation", |t| {
+                meta(t).columns[1].charset_collation = Some(46)
+            }),
+            ("no collation", |t| {
+                meta(t).columns[1].charset_collation = None
+            }),
+            ("enum value", |t| {
+                meta(t).columns[1].enum_string_values =
+                    Some(vec!["x".into(), "z".into()])
+            }),
+            ("enum split", |t| {
+                meta(t).columns[1].enum_string_values = Some(vec!["xy".into()])
+            }),
+            ("no enum", |t| meta(t).columns[1].enum_string_values = None),
+            ("empty enum", |t| {
+                meta(t).columns[1].enum_string_values = Some(vec![])
+            }),
+            ("set value", |t| {
+                meta(t).columns[1].set_string_values = Some(vec!["t".into()])
+            }),
+            ("no set", |t| meta(t).columns[1].set_string_values = None),
+            ("geometry", |t| meta(t).columns[1].geometry_type = Some(2)),
+            ("simple key", |t| {
+                meta(t).columns[1].is_simple_primary_key = Some(false)
+            }),
+            ("key prefix", |t| {
+                meta(t).columns[1].primary_key_prefix = Some(5)
+            }),
+            ("enum collation", |t| {
+                meta(t).columns[1].enum_and_set_charset_collation = Some(47)
+            }),
+            ("visibility", |t| {
+                meta(t).columns[1].is_visible = Some(false)
+            }),
+            ("default charset", |t| {
+                meta(t)
+                    .default_charset
+                    .as_mut()
+                    .expect("set")
+                    .default_charset_collation = 33
+            }),
+            ("charset map", |t| {
+                meta(t)
+                    .default_charset
+                    .as_mut()
+                    .expect("set")
+                    .charset_collations = vec![(0, 45)]
+            }),
+            ("no default charset", |t| meta(t).default_charset = None),
+            ("enum default charset", |t| {
+                meta(t)
+                    .enum_and_set_default_charset
+                    .as_mut()
+                    .expect("set")
+                    .default_charset_collation = 9
+            }),
+            ("no enum default charset", |t| {
+                meta(t).enum_and_set_default_charset = None
+            }),
+            ("primary key", |t| meta(t).primary_key = vec![(1, 0)]),
+            ("primary key prefix", |t| meta(t).primary_key = vec![(0, 3)]),
+            ("no primary key", |t| meta(t).primary_key = vec![]),
+            ("names split", |t| {
+                meta(t).columns[0].column_name = Some("idn".into());
+                meta(t).columns[1].column_name = Some("ame".into());
+            }),
+            ("a third column", |t| {
+                t.column_types.push(3);
+                t.column_metas.push(0);
+                t.null_bits.push(true);
+            }),
+        ];
+        let base = full_tm();
+        let fresh = |t: &TableMapEvent| Signature::of(t).digest();
+        let mut memo = SignatureMemo::for_cache(
+            super::super::mysql_selection::SELECTION_CACHE_BYTES,
+        );
+        let mut seen = std::collections::HashMap::new();
+        seen.insert(fresh(&base), "base");
+        assert_eq!(memo.digest(&base), fresh(&base));
+        for (what, change) in changes {
+            let mut t = base.clone();
+            change(&mut t);
+            let d = fresh(&t);
+            assert_eq!(memo.digest(&t), d, "{what}");
+            assert_eq!(memo.digest(&t), d, "{what}, held");
+            assert_eq!(memo.digest(&base), fresh(&base), "back from {what}");
+            if let Some(other) = seen.insert(d, what) {
+                panic!("{what} has the digest of {other}");
+            }
+        }
+    }
+
+    /// Equal encodings only from equal signatures, over many TableMaps
+    /// built from values that a weaker framing would confuse: empty and
+    /// control-byte strings, values that need a second LEB128 byte, empty
+    /// and absent lists, and fields set or not.
+    #[test]
+    fn the_encoding_tells_every_signature_apart() {
+        use mysql_binlog_connector_rust::event::table_map::default_charset::DefaultCharset;
+        use mysql_binlog_connector_rust::event::table_map::table_metadata::{
+            ColumnMetadata, TableMetadata,
+        };
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(7);
+        let texts = ["", "\0", "\u{1}", "\u{1}\0", "a", "\0\0"];
+        let ints = [0u32, 1, 127, 128, 300];
+        let text =
+            |r: &mut StdRng| texts[r.random_range(0..texts.len())].to_string();
+        let int = |r: &mut StdRng| ints[r.random_range(0..ints.len())];
+        let some = |r: &mut StdRng| r.random_bool(0.5);
+        let list = |r: &mut StdRng| -> Option<Vec<String>> {
+            some(r)
+                .then(|| (0..r.random_range(0..3)).map(|_| text(r)).collect())
+        };
+        let mut seen: std::collections::HashMap<Vec<u8>, Signature> =
+            Default::default();
+        let mut buf = Vec::new();
+        for _ in 0..40_000 {
+            let r = &mut rng;
+            let n = r.random_range(1..3);
+            let mut t = tm(&vec![(15, 0); n]);
+            for i in 0..n {
+                t.column_types[i] = [3u8, 15, 253][r.random_range(0..3)];
+                t.column_metas[i] = int(r) as u16;
+                t.null_bits[i] = some(r);
+            }
+            if some(r) {
+                let charset = |r: &mut StdRng| {
+                    some(r).then(|| DefaultCharset {
+                        default_charset_collation: int(r),
+                        charset_collations: (0..r.random_range(0..2))
+                            .map(|_| (int(r), int(r)))
+                            .collect(),
+                    })
+                };
+                t.table_metadata = Some(TableMetadata {
+                    default_charset: charset(r),
+                    enum_and_set_default_charset: charset(r),
+                    columns: (0..r.random_range(0..3))
+                        .map(|_| ColumnMetadata {
+                            column_name: some(r).then(|| text(r)),
+                            is_signed: some(r).then(|| some(r)),
+                            charset_collation: some(r).then(|| int(r)),
+                            enum_string_values: list(r),
+                            set_string_values: list(r),
+                            geometry_type: some(r).then(|| int(r)),
+                            is_simple_primary_key: some(r).then(|| some(r)),
+                            primary_key_prefix: some(r).then(|| int(r)),
+                            enum_and_set_charset_collation: some(r)
+                                .then(|| int(r)),
+                            is_visible: some(r).then(|| some(r)),
+                        })
+                        .collect(),
+                    primary_key: (0..r.random_range(0..2))
+                        .map(|_| (int(r) as usize, int(r)))
+                        .collect(),
+                });
+            }
+            encode(&t, &mut buf);
+            let sig = Signature::of(&t);
+            if let Some(other) = seen.insert(buf.clone(), sig.clone()) {
+                assert_eq!(other, sig, "two signatures share an encoding");
+            }
+        }
+    }
+
+    /// Pairs of columns that a framing without string lengths or list
+    /// counts would encode alike (found by search): their encodings differ.
+    #[test]
+    fn lengths_and_counts_keep_columns_apart() {
+        use mysql_binlog_connector_rust::event::table_map::table_metadata::{
+            ColumnMetadata, TableMetadata,
+        };
+        let with = |c: ColumnMetadata| {
+            let mut t = tm(&[(15, 40)]);
+            t.table_metadata = Some(TableMetadata {
+                default_charset: None,
+                enum_and_set_default_charset: None,
+                columns: vec![c],
+                primary_key: vec![],
+            });
+            t
+        };
+        let pairs = [
+            // Without a string length: "\u{1}" then no signedness reads as
+            // "" then signed false.
+            (
+                ColumnMetadata {
+                    column_name: Some("\u{1}".into()),
+                    ..Default::default()
+                },
+                ColumnMetadata {
+                    column_name: Some(String::new()),
+                    is_signed: Some(false),
+                    ..Default::default()
+                },
+            ),
+            // Without a list count: an empty ENUM list, no SET and geometry
+            // 0 reads as one empty value, an empty SET and no geometry.
+            (
+                ColumnMetadata {
+                    enum_string_values: Some(vec![]),
+                    geometry_type: Some(0),
+                    ..Default::default()
+                },
+                ColumnMetadata {
+                    enum_string_values: Some(vec![String::new()]),
+                    set_string_values: Some(vec![]),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (a, b) in pairs {
+            let (a, b) = (with(a), with(b));
+            let (mut ea, mut eb) = (Vec::new(), Vec::new());
+            encode(&a, &mut ea);
+            encode(&b, &mut eb);
+            assert_ne!(ea, eb, "{a:?} and {b:?}");
+            assert_ne!(Signature::of(&a), Signature::of(&b));
+        }
+    }
+
+    /// The memo is keyed by the signature, not the table: copies of one
+    /// definition under any table id (MySQL assigns a new one when it
+    /// reopens a table) or name share one entry, answered from the memo.
+    #[test]
+    fn tables_of_one_definition_share_one_entry() {
+        let base = full_tm();
+        let mut memo = SignatureMemo::for_cache(
+            super::super::mysql_selection::SELECTION_CACHE_BYTES,
+        );
+        let want = Signature::of(&base).digest();
+        assert_eq!(memo.digest(&base), want);
+        let held = memo.held();
+        for id in 2..1000u64 {
+            let mut t = base.clone();
+            t.table_id = id;
+            t.database_name = format!("cust_{id:05}");
+            t.table_name = format!("t{}", id % 7);
+            assert_eq!(memo.digest(&t), want);
+        }
+        assert_eq!(memo.by_signature.len(), 1);
+        assert_eq!(memo.held(), held);
+        let mut other = base.clone();
+        other.column_types[0] = 8;
+        assert_eq!(memo.digest(&other), Signature::of(&other).digest());
+        assert_eq!(memo.by_signature.len(), 2);
+    }
+
+    /// The memo's budget is a share of the selection cache's bound, so it
+    /// is sized with the timelines it serves.
+    #[test]
+    fn the_memo_budget_follows_the_cache_bound() {
+        for bound in [64 * 1024 * 1024, 256 * 1024 * 1024, 1 << 30] {
+            assert_eq!(SignatureMemo::for_cache(bound).budget, bound / 8);
+        }
+    }
+
+    /// FULL signatures of 20 named columns, as in the fleet's tables:
+    /// 40,000 distinct ones stay within the memo of the default cache bound.
+    #[test]
+    fn the_default_memo_holds_a_large_active_set() {
+        use mysql_binlog_connector_rust::event::table_map::table_metadata::{
+            ColumnMetadata, TableMetadata,
+        };
+        let table = |id: u64| {
+            let mut t = tm(&[(15, 256); 20]);
+            t.table_id = id;
+            t.table_metadata = Some(TableMetadata {
+                default_charset: None,
+                enum_and_set_default_charset: None,
+                columns: (0..20)
+                    .map(|c| ColumnMetadata {
+                        column_name: Some(format!("c{c:02}_{id}")),
+                        is_signed: Some(true),
+                        charset_collation: Some(255),
+                        ..Default::default()
+                    })
+                    .collect(),
+                primary_key: vec![(0, 0)],
+            });
+            t
+        };
+        let mut memo = SignatureMemo::for_cache(
+            super::super::mysql_selection::SELECTION_CACHE_BYTES,
+        );
+        for id in 0..40_000u64 {
+            memo.digest(&table(id));
+        }
+        assert_eq!(
+            memo.by_signature.len(),
+            40_000,
+            "held {} bytes",
+            memo.held()
+        );
+    }
+
+    /// Wide distinct signatures: what the memo holds never passes its
+    /// budget, its count covers each signature's names, the newest stay,
+    /// and one too large to keep is still answered.
     #[test]
     fn the_memo_holds_within_its_budget() {
         use mysql_binlog_connector_rust::event::table_map::table_metadata::{
@@ -874,7 +1329,7 @@ mod tests {
                 enum_and_set_default_charset: None,
                 columns: (0..columns)
                     .map(|c| ColumnMetadata {
-                        column_name: Some(format!("{c:0name_len$}")),
+                        column_name: Some(format!("{id}.{c:0name_len$}")),
                         ..Default::default()
                     })
                     .collect(),
@@ -893,10 +1348,15 @@ mod tests {
             assert_eq!(memo.digest(&t), Signature::of(&t).digest());
             assert!(memo.held() <= budget, "{} > {budget}", memo.held());
         }
-        assert!(memo.by_table.contains(&1999));
-        assert!(!memo.by_table.contains(&1));
+        let held = |memo: &SignatureMemo, t: &TableMapEvent| {
+            let mut e = Vec::new();
+            encode(t, &mut e);
+            memo.by_signature.contains(e.as_slice())
+        };
+        assert!(held(&memo, &wide(1999, 100, 40)));
+        assert!(!held(&memo, &wide(1, 100, 40)));
         let huge = wide(5000, 1000, budget as usize / 16 / 1000 + 1);
         assert_eq!(memo.digest(&huge), Signature::of(&huge).digest());
-        assert!(!memo.by_table.contains(&5000));
+        assert!(!held(&memo, &huge));
     }
 }

@@ -355,8 +355,8 @@ pub(crate) struct Caches {
     load_charge: u64,
     pair_charge: u64,
     meters: Meters,
-    /// The TableMap signature digests (outside the byte bound: at most
-    /// [`super::mysql_signature::SignatureMemo`]'s tables).
+    /// The TableMap signature digests (outside the byte bound, within
+    /// their own: [`super::mysql_signature::SignatureMemo`]).
     pub(crate) signatures: super::mysql_signature::SignatureMemo,
 }
 
@@ -443,7 +443,9 @@ impl Caches {
             load_charge: 0,
             pair_charge: 0,
             meters,
-            signatures: super::mysql_signature::SignatureMemo::new(),
+            signatures: super::mysql_signature::SignatureMemo::for_cache(
+                max_bytes,
+            ),
         }
     }
 
