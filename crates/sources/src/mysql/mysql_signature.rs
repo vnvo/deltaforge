@@ -90,33 +90,25 @@ impl Signature {
 /// entries are outside that bound, and serve the same tables).
 const MEMO_SHARE: u64 = 8;
 /// One entry's bookkeeping beyond its encoded signature (the map slot, the
-/// list node, the boxed bytes' header, the digest and the cost).
+/// list node, the boxed bytes' header and the digest).
 const MEMO_ENTRY: u64 = 128;
 
-/// Each table id's last signature, in a compact exact encoding
-/// ([`encode`]), and its digest: a TableMap whose encoding is the held one
-/// reuses the digest instead of serializing and hashing it again (a digest
-/// is a function of the signature alone, and equal encodings are equal
-/// signatures). Bounded by bytes (an eighth of the selection cache's bound),
-/// least recently used first out; a signature that would take more than a
-/// sixteenth of it is not kept. Nothing is allocated before the first
-/// digest.
+/// Signatures in a compact exact encoding ([`encode`]) and their digests,
+/// keyed by the encoding itself: a TableMap whose encoding is held reuses
+/// the digest instead of serializing and hashing it again (a digest is a
+/// function of the signature alone, and equal encodings are equal
+/// signatures). It is not keyed by table: MySQL assigns a table a new id
+/// each time it reopens it, which at a large active set is most TableMaps,
+/// and copies of one definition share one entry. Bounded by bytes (an
+/// eighth of the selection cache's bound), least recently used first out; a
+/// signature that would take more than a sixteenth of it is not kept.
+/// Nothing is allocated before the first digest.
 pub(crate) struct SignatureMemo {
-    by_table: lru::LruCache<u64, Held>,
+    by_signature: lru::LruCache<Box<[u8]>, [u8; 32]>,
     bytes: u64,
     budget: u64,
     /// The encoding of the TableMap being looked up (reused).
     scratch: Vec<u8>,
-}
-
-/// One table id's memo entry.
-struct Held {
-    /// The signature's [`encode`]ing.
-    encoded: Box<[u8]>,
-    /// Its digest (the SHA-256 that [`Signature::digest`] hex-encodes).
-    digest: [u8; 32],
-    /// What it counts against the budget.
-    cost: u64,
 }
 
 impl SignatureMemo {
@@ -127,45 +119,39 @@ impl SignatureMemo {
 
     fn within(budget: u64) -> Self {
         Self {
-            by_table: lru::LruCache::unbounded(),
+            by_signature: lru::LruCache::unbounded(),
             bytes: 0,
             budget,
             scratch: Vec::new(),
         }
     }
 
+    /// What an entry of an `len`-byte encoding counts against the budget.
+    fn cost(len: usize) -> u64 {
+        super::mysql_cache_cost::allocated(len as u64) + MEMO_ENTRY
+    }
+
     /// `Signature::of(tm).digest()`.
     pub(crate) fn digest(&mut self, tm: &TableMapEvent) -> String {
         encode(tm, &mut self.scratch);
-        if let Some(held) = self.by_table.get(&tm.table_id)
-            && *held.encoded == *self.scratch
-        {
-            return hex::encode(held.digest);
+        if let Some(digest) = self.by_signature.get(self.scratch.as_slice()) {
+            return hex::encode(digest);
         }
         let hexed = Signature::of(tm).digest();
         let mut digest = [0u8; 32];
         hex::decode_to_slice(&hexed, &mut digest)
             .expect("a SHA-256 hex digest");
-        let cost = super::mysql_cache_cost::allocated(self.scratch.len() as u64)
-            + MEMO_ENTRY;
-        if let Some(was) = self.by_table.pop(&tm.table_id) {
-            self.bytes -= was.cost;
-        }
+        let cost = Self::cost(self.scratch.len());
         if cost <= self.budget / 16 {
-            let encoded = self.scratch.as_slice().into();
-            self.by_table.put(
-                tm.table_id,
-                Held {
-                    encoded,
-                    digest,
-                    cost,
-                },
-            );
+            self.by_signature
+                .put(self.scratch.as_slice().into(), digest);
             self.bytes += cost;
             while self.bytes > self.budget {
-                let (_, out) =
-                    self.by_table.pop_lru().expect("over budget is not empty");
-                self.bytes -= out.cost;
+                let (out, _) = self
+                    .by_signature
+                    .pop_lru()
+                    .expect("over budget is not empty");
+                self.bytes -= Self::cost(out.len());
             }
         }
         hexed
@@ -1252,6 +1238,33 @@ mod tests {
         }
     }
 
+    /// The memo is keyed by the signature, not the table: copies of one
+    /// definition under any table id (MySQL assigns a new one when it
+    /// reopens a table) or name share one entry, answered from the memo.
+    #[test]
+    fn tables_of_one_definition_share_one_entry() {
+        let base = full_tm();
+        let mut memo = SignatureMemo::for_cache(
+            super::super::mysql_selection::SELECTION_CACHE_BYTES,
+        );
+        let want = Signature::of(&base).digest();
+        assert_eq!(memo.digest(&base), want);
+        let held = memo.held();
+        for id in 2..1000u64 {
+            let mut t = base.clone();
+            t.table_id = id;
+            t.database_name = format!("cust_{id:05}");
+            t.table_name = format!("t{}", id % 7);
+            assert_eq!(memo.digest(&t), want);
+        }
+        assert_eq!(memo.by_signature.len(), 1);
+        assert_eq!(memo.held(), held);
+        let mut other = base.clone();
+        other.column_types[0] = 8;
+        assert_eq!(memo.digest(&other), Signature::of(&other).digest());
+        assert_eq!(memo.by_signature.len(), 2);
+    }
+
     /// The memo's budget is a share of the selection cache's bound, so it
     /// is sized with the timelines it serves.
     #[test]
@@ -1261,8 +1274,8 @@ mod tests {
         }
     }
 
-    /// A FULL signature of 20 named columns, as in the fleet's tables:
-    /// 40,000 of them stay within the memo of the default cache bound.
+    /// FULL signatures of 20 named columns, as in the fleet's tables:
+    /// 40,000 distinct ones stay within the memo of the default cache bound.
     #[test]
     fn the_default_memo_holds_a_large_active_set() {
         use mysql_binlog_connector_rust::event::table_map::table_metadata::{
@@ -1276,7 +1289,7 @@ mod tests {
                 enum_and_set_default_charset: None,
                 columns: (0..20)
                     .map(|c| ColumnMetadata {
-                        column_name: Some(format!("c{c:02}")),
+                        column_name: Some(format!("c{c:02}_{id}")),
                         is_signed: Some(true),
                         charset_collation: Some(255),
                         ..Default::default()
@@ -1292,12 +1305,17 @@ mod tests {
         for id in 0..40_000u64 {
             memo.digest(&table(id));
         }
-        assert_eq!(memo.by_table.len(), 40_000, "held {} bytes", memo.held());
+        assert_eq!(
+            memo.by_signature.len(),
+            40_000,
+            "held {} bytes",
+            memo.held()
+        );
     }
 
-    /// Wide signatures of many tables: what the memo holds never passes
-    /// its budget, its count covers each signature's names, the newest
-    /// stay, and one too large to keep is still answered.
+    /// Wide distinct signatures: what the memo holds never passes its
+    /// budget, its count covers each signature's names, the newest stay,
+    /// and one too large to keep is still answered.
     #[test]
     fn the_memo_holds_within_its_budget() {
         use mysql_binlog_connector_rust::event::table_map::table_metadata::{
@@ -1311,7 +1329,7 @@ mod tests {
                 enum_and_set_default_charset: None,
                 columns: (0..columns)
                     .map(|c| ColumnMetadata {
-                        column_name: Some(format!("{c:0name_len$}")),
+                        column_name: Some(format!("{id}.{c:0name_len$}")),
                         ..Default::default()
                     })
                     .collect(),
@@ -1330,10 +1348,15 @@ mod tests {
             assert_eq!(memo.digest(&t), Signature::of(&t).digest());
             assert!(memo.held() <= budget, "{} > {budget}", memo.held());
         }
-        assert!(memo.by_table.contains(&1999));
-        assert!(!memo.by_table.contains(&1));
+        let held = |memo: &SignatureMemo, t: &TableMapEvent| {
+            let mut e = Vec::new();
+            encode(t, &mut e);
+            memo.by_signature.contains(e.as_slice())
+        };
+        assert!(held(&memo, &wide(1999, 100, 40)));
+        assert!(!held(&memo, &wide(1, 100, 40)));
         let huge = wide(5000, 1000, budget as usize / 16 / 1000 + 1);
         assert_eq!(memo.digest(&huge), Signature::of(&huge).digest());
-        assert!(!memo.by_table.contains(&5000));
+        assert!(!held(&memo, &huge));
     }
 }
