@@ -443,7 +443,9 @@ impl Caches {
             load_charge: 0,
             pair_charge: 0,
             meters,
-            signatures: super::mysql_signature::SignatureMemo::new(),
+            signatures: super::mysql_signature::SignatureMemo::for_cache(
+                max_bytes,
+            ),
         }
     }
 
