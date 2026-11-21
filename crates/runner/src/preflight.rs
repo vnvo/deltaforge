@@ -417,6 +417,7 @@ mod tests {
                         type_mapping: Default::default(),
                         proofs: Default::default(),
                         decode_workers: None,
+                        selection_cache_bytes: None,
                     }),
                     processors: vec![],
                     sinks: vec![],

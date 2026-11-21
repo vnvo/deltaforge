@@ -147,6 +147,7 @@ async fn make_source(
         proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
         decode_workers: None,
+        selection_cache_bytes: None,
     }
 }
 
@@ -537,6 +538,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
         proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
         decode_workers: None,
+        selection_cache_bytes: None,
     };
     let (mut rx, handle) = start_source(src).await?;
 
@@ -677,6 +679,7 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
         proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
         decode_workers: None,
+        selection_cache_bytes: None,
     };
     let (mut rx, handle) = start_source(src).await?;
 
@@ -2032,6 +2035,7 @@ async fn startup_fails_closed_without_sink_checkpoints() -> Result<()> {
         proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
         decode_workers: None,
+        selection_cache_bytes: None,
     };
     let ckpt = test_common::unwritable_sink_checkpoints(
         Arc::new(src.clone()),

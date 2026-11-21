@@ -313,6 +313,7 @@ async fn spawn_pipeline(
         proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
         decode_workers: None,
+        selection_cache_bytes: None,
     };
     let src: Arc<dyn Source> = Arc::new(src);
     let checkpoint_generation = checkpoints::CheckpointGeneration::new();

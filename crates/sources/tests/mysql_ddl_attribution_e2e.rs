@@ -233,6 +233,7 @@ fn source(id: &str, port: u16, tables: &[String], st: &State) -> MySqlSource {
         proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
         decode_workers: None,
+        selection_cache_bytes: None,
     }
 }
 

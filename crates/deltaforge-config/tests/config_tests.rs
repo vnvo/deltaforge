@@ -1398,3 +1398,29 @@ fn mysql_decode_workers_are_bounded() {
         .expect_err("above the maximum must be refused");
     assert!(err.to_string().contains("decode_workers"), "{err}");
 }
+
+/// `selection_cache_bytes` (MySQL): absent keeps the default, a value
+/// within the bounds is taken and round-trips, one outside them is refused.
+#[test]
+fn mysql_selection_cache_bytes_are_bounded() {
+    let parse = |extra: &str| {
+        serde_json::from_str::<deltaforge_config::MysqlSrcCfg>(&format!(
+            r#"{{"id":"m","dsn":"mysql://h/db","tables":[]{extra}}}"#
+        ))
+    };
+    assert_eq!(parse("").unwrap().selection_cache_bytes, None);
+    let range = deltaforge_config::MYSQL_SELECTION_CACHE_BYTES;
+    for ok in [*range.start(), 1 << 30, *range.end()] {
+        let cfg = parse(&format!(r#","selection_cache_bytes":{ok}"#)).unwrap();
+        assert_eq!(cfg.selection_cache_bytes, Some(ok));
+        let again: deltaforge_config::MysqlSrcCfg =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap())
+                .unwrap();
+        assert_eq!(again.selection_cache_bytes, Some(ok), "round trip");
+    }
+    for bad in [*range.start() - 1, *range.end() + 1] {
+        let err = parse(&format!(r#","selection_cache_bytes":{bad}"#))
+            .expect_err("outside the bounds must be refused");
+        assert!(err.to_string().contains("selection_cache_bytes"), "{err}");
+    }
+}

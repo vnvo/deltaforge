@@ -422,6 +422,7 @@ pub async fn build_source(
                 snapshot_cohort: Default::default(),
                 proofs: c.proofs.clone(),
                 decode_workers: c.decode_workers,
+                selection_cache_bytes: c.selection_cache_bytes,
             }))
         }
     }

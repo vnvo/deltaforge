@@ -269,6 +269,8 @@ pub struct MySqlSource {
     /// Threads that decode row images off the source task (`None`: derived
     /// from the cores, `Some(0)`: decoded on the source task).
     pub decode_workers: Option<usize>,
+    /// The selection cache's byte bound (`None`: the default).
+    pub selection_cache_bytes: Option<u64>,
 }
 
 pub(crate) const HEARTBEAT_INTERVAL_SECS: u64 = 15;
@@ -1923,7 +1925,11 @@ impl MySqlSource {
             behind_capture: Default::default(),
             proofs: self.proofs.clone(),
             proof_scanner: Arc::new(proof_scanner),
-            selection: mysql_selection::Caches::new(&self.pipeline, &self.id),
+            selection: mysql_selection::Caches::new(
+                &self.pipeline,
+                &self.id,
+                self.selection_cache_bytes,
+            ),
             failover: None,
             drift_checked: Default::default(),
             drift_resolver: crate::incident_drafts::DriftResolver::new(

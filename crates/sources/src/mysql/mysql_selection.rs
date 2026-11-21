@@ -143,7 +143,12 @@ impl Timeline {
 /// count of tables: as many as fit.
 ///
 /// [`mysql_cache_cost`]: super::mysql_cache_cost
-pub(crate) const SELECTION_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const SELECTION_CACHE_BYTES: u64 =
+    deltaforge_config::MYSQL_SELECTION_CACHE_BYTES_DEFAULT;
+
+/// The shortest interval between two warnings that the cache is evicting.
+const EVICTION_WARNING_EVERY: std::time::Duration =
+    std::time::Duration::from_secs(300);
 
 /// One entry's node in the LRU list: its key, its value and two links.
 const NODE: u64 = (std::mem::size_of::<CacheKey>()
@@ -176,6 +181,10 @@ pub(crate) const METRIC_BYTES: &str = "deltaforge_mysql_selection_cache_bytes";
 /// `deltaforge_mysql_selection_cache_timelines{pipeline,source}`.
 pub(crate) const METRIC_TIMELINES: &str =
     "deltaforge_mysql_selection_cache_timelines";
+/// `deltaforge_mysql_selection_cache_limit_bytes{pipeline,source}`: the
+/// bound in force.
+pub(crate) const METRIC_LIMIT: &str =
+    "deltaforge_mysql_selection_cache_limit_bytes";
 
 /// A table's registry key and its backend key, built once per scope: the
 /// per-row lookups of a table share them instead of re-encoding the key.
@@ -361,6 +370,11 @@ pub(crate) struct Caches {
     load_charge: u64,
     pair_charge: u64,
     meters: Meters,
+    /// The pipeline and source, for the eviction warning.
+    who: String,
+    /// When the cache last warned that it evicts, and the evictions since.
+    warned_at: Option<std::time::Instant>,
+    unreported_evictions: u64,
     /// The TableMap signature digests (outside the byte bound, within
     /// their own: [`super::mysql_signature::SignatureMemo`]).
     pub(crate) signatures: super::mysql_signature::SignatureMemo,
@@ -401,28 +415,48 @@ impl Default for Caches {
 }
 
 impl Caches {
-    /// The source's caches, metered under its labels.
-    pub(crate) fn new(pipeline: &str, source: &str) -> Self {
-        Self::new_with(pipeline, source, |name| std::env::var(name).ok())
+    /// The source's caches, metered under its labels, bounded by
+    /// `configured` (the source's `selection_cache_bytes`) when set.
+    pub(crate) fn new(
+        pipeline: &str,
+        source: &str,
+        configured: Option<u64>,
+    ) -> Self {
+        Self::new_with(pipeline, source, configured, |name| {
+            std::env::var(name).ok()
+        })
     }
 
     /// [`Self::new`] with `var` for the process environment. The bound: a
     /// test's, else a measurement build's from `var` (perf-phases; a default
-    /// build ignores it), else the code's.
+    /// build ignores it), else the configured one, else the default.
     fn new_with(
         pipeline: &str,
         source: &str,
+        configured: Option<u64>,
         var: impl Fn(&str) -> Option<String>,
     ) -> Self {
-        let bytes = crate::stream_probe::selection_cache_bytes()
-            .or_else(|| crate::perf_phases::cache_bytes_override(var))
-            .unwrap_or(SELECTION_CACHE_BYTES);
+        let (bytes, origin) = crate::stream_probe::selection_cache_bytes()
+            .map(|b| (b, "test"))
+            .or_else(|| {
+                crate::perf_phases::cache_bytes_override(var)
+                    .map(|b| (b, "measurement override"))
+            })
+            .or(configured.map(|b| (b, "selection_cache_bytes")))
+            .unwrap_or((SELECTION_CACHE_BYTES, "default"));
         crate::perf_phases::cache_limit(bytes);
+        tracing::info!(
+            pipeline,
+            source,
+            bytes,
+            origin,
+            "mysql selection cache bound"
+        );
         let labels = [
             ("pipeline", pipeline.to_string()),
             ("source", source.to_string()),
         ];
-        let caches = Self::with_bytes(
+        let mut caches = Self::with_bytes(
             bytes,
             Meters {
                 evictions: metrics::counter!(METRIC_EVICTIONS, &labels),
@@ -430,6 +464,8 @@ impl Caches {
                 timelines: metrics::gauge!(METRIC_TIMELINES, &labels),
             },
         );
+        metrics::gauge!(METRIC_LIMIT, &labels).set(bytes as f64);
+        caches.who = format!("{pipeline}/{source}");
         caches.publish();
         caches
     }
@@ -450,6 +486,9 @@ impl Caches {
             load_charge: 0,
             pair_charge: 0,
             meters,
+            who: String::new(),
+            warned_at: None,
+            unreported_evictions: 0,
             signatures: super::mysql_signature::SignatureMemo::for_cache(
                 max_bytes,
             ),
@@ -580,6 +619,34 @@ impl Caches {
         });
         self.forget(e);
         self.meters.evictions.increment(1);
+        self.note_eviction(std::time::Instant::now());
+        true
+    }
+
+    /// Warn, at most once per [`EVICTION_WARNING_EVERY`] (the first
+    /// eviction at once), that the bound cannot hold the active tables:
+    /// every miss reloads a table from the state store on the source's path.
+    /// Whether it warned.
+    fn note_eviction(&mut self, now: std::time::Instant) -> bool {
+        self.unreported_evictions += 1;
+        if self
+            .warned_at
+            .is_some_and(|at| now.duration_since(at) < EVICTION_WARNING_EVERY)
+        {
+            return false;
+        }
+        tracing::warn!(
+            source = %self.who,
+            evictions = self.unreported_evictions,
+            timelines = self.timelines,
+            bytes = self.bytes(),
+            limit = self.max_bytes,
+            "mysql selection cache is full and evicting: the active tables do \
+             not fit its bound, and each miss reloads a table from the state \
+             store; raise the source's selection_cache_bytes"
+        );
+        self.warned_at = Some(now);
+        self.unreported_evictions = 0;
         true
     }
 
@@ -2628,7 +2695,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
         let rec = DebuggingRecorder::new();
         let puts = metrics::with_local_recorder(&rec, || {
-            let mut caches = Caches::new("p", "s");
+            let mut caches = Caches::new("p", "s", None);
             caches.max_bytes = 20 * 1024;
             let timeline = Arc::new(Timeline {
                 table_head: 0,
@@ -2698,7 +2765,7 @@ mod tests {
             (labels.collect(), v.into_inner())
         };
         metrics::with_local_recorder(&rec, || {
-            let mut caches = Caches::new("p", "s");
+            let mut caches = Caches::new("p", "s", None);
             caches.max_bytes = 20 * 1024;
             let stream = Arc::new(BarrierStream {
                 stream: "lineage/x".into(),
@@ -5512,7 +5579,31 @@ mod perf_tests {
     #[cfg(not(feature = "perf-phases"))]
     #[test]
     fn perf_default_builds_ignore_the_cache_override() {
-        let c = Caches::new_with("p", "s", env(Some("1024".into())));
+        let c = Caches::new_with("p", "s", None, env(Some("1024".into())));
+        assert_eq!(c.max_bytes, SELECTION_CACHE_BYTES);
+    }
+
+    /// The eviction warning: at the first eviction, then at most once per
+    /// interval, reporting the evictions since the last one.
+    #[test]
+    fn evicting_warns_at_once_then_at_most_once_per_interval() {
+        let mut c = Caches::default();
+        let t0 = std::time::Instant::now();
+        assert!(c.note_eviction(t0), "the first eviction warns");
+        assert!(!c.note_eviction(t0 + EVICTION_WARNING_EVERY / 2));
+        assert!(!c.note_eviction(t0 + EVICTION_WARNING_EVERY / 2));
+        assert_eq!(c.unreported_evictions, 2);
+        assert!(c.note_eviction(t0 + EVICTION_WARNING_EVERY));
+        assert_eq!(c.unreported_evictions, 0, "reported");
+    }
+
+    /// The source's setting bounds the cache; absent, the default does.
+    #[cfg(not(feature = "perf-phases"))]
+    #[test]
+    fn the_configured_bound_is_the_caches() {
+        let c = Caches::new_with("p", "s", Some(64 << 20), env(None));
+        assert_eq!(c.max_bytes, 64 << 20);
+        let c = Caches::new_with("p", "s", None, env(None));
         assert_eq!(c.max_bytes, SELECTION_CACHE_BYTES);
     }
 
@@ -5563,7 +5654,8 @@ mod perf_tests {
             c.bytes()
         };
         let seen = perf_metrics(|| {
-            let mut c = Caches::new_with("p", "s", env(Some(two.to_string())));
+            let mut c =
+                Caches::new_with("p", "s", None, env(Some(two.to_string())));
             assert_eq!(c.max_bytes, two);
             for t in ["a", "b", "c"] {
                 c.seed_for_test(&key(t));

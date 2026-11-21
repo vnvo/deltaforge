@@ -107,6 +107,7 @@ async fn replay(
         proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
         decode_workers: None,
+        selection_cache_bytes: None,
     };
 
     let (tx, mut rx) = test_common::acked_channel(&src, &store, &src.id, 128);
@@ -292,6 +293,7 @@ async fn replay_without_ddl_decodes_normally() -> Result<()> {
         proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
         decode_workers: None,
+        selection_cache_bytes: None,
     };
     let (tx, mut rx) = test_common::acked_channel(&src, &store, &src.id, 128);
     let handle = src.run(tx, store).await;

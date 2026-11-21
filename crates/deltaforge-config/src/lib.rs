@@ -563,10 +563,45 @@ pub struct MysqlSrcCfg {
         skip_serializing_if = "Option::is_none"
     )]
     pub decode_workers: Option<usize>,
+    /// The byte bound of the source's selection cache (validated timelines
+    /// and selected schemas of its active tables): absent keeps the default
+    /// ([`MYSQL_SELECTION_CACHE_BYTES_DEFAULT`]). Within
+    /// [`MYSQL_SELECTION_CACHE_BYTES`].
+    #[serde(
+        default,
+        deserialize_with = "bounded_selection_cache_bytes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub selection_cache_bytes: Option<u64>,
 }
 
 /// Most decode workers a MySQL source may configure.
 pub const MYSQL_DECODE_WORKERS_MAX: usize = 64;
+
+/// The selection cache's bound when a MySQL source sets none: 256 MiB.
+pub const MYSQL_SELECTION_CACHE_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
+
+/// The bounds a MySQL source's `selection_cache_bytes` may take: 16 MiB to
+/// 10 GiB, enough for about 1M active tables of distinct definitions (about
+/// 9.5 KB each; tables sharing a definition take about 2.7 KB).
+pub const MYSQL_SELECTION_CACHE_BYTES: std::ops::RangeInclusive<u64> =
+    16 * 1024 * 1024..=10 * 1024 * 1024 * 1024;
+
+fn bounded_selection_cache_bytes<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<u64>, D::Error> {
+    let v = Option::<u64>::deserialize(d)?;
+    if let Some(n) = v
+        && !MYSQL_SELECTION_CACHE_BYTES.contains(&n)
+    {
+        return Err(serde::de::Error::custom(format!(
+            "selection_cache_bytes {n} is outside {}..={}",
+            MYSQL_SELECTION_CACHE_BYTES.start(),
+            MYSQL_SELECTION_CACHE_BYTES.end()
+        )));
+    }
+    Ok(v)
+}
 
 fn bounded_decode_workers<'de, D: serde::Deserializer<'de>>(
     d: D,
