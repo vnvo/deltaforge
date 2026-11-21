@@ -64,6 +64,7 @@ async fn make_source(
         proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
         decode_workers: None,
+        selection_cache_bytes: None,
     }
 }
 
@@ -688,6 +689,7 @@ async fn make_source_on(
         proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
         decode_workers: None,
+        selection_cache_bytes: None,
     }
 }
 

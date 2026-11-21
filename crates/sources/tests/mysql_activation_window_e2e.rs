@@ -270,6 +270,7 @@ async fn run_on(
         proofs,
         type_mapping: deltaforge_core::TypeMapping::V2,
         decode_workers: None,
+        selection_cache_bytes: None,
     };
     let ckpt = store.ckpt.clone();
     let (tx, mut rx) = test_common::acked_channel(&src, &ckpt, &src.id, 8192);

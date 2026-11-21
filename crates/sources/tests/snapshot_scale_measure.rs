@@ -310,6 +310,7 @@ async fn mysql_snapshot_scale() -> Result<()> {
             proofs: Default::default(),
             type_mapping: deltaforge_core::TypeMapping::V2,
             decode_workers: None,
+            selection_cache_bytes: None,
         };
         let id = src.id.clone();
         runs.push(measure("mysql", src, &id, n, &backend).await);

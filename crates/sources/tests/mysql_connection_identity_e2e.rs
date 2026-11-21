@@ -491,6 +491,7 @@ fn source(
         proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
         decode_workers: None,
+        selection_cache_bytes: None,
     }
 }
 
@@ -1625,6 +1626,7 @@ async fn rotation_connections_prove_the_server() {
         type_mapping: Default::default(),
         proofs: Default::default(),
         decode_workers: None,
+        selection_cache_bytes: None,
     };
     let resolver: Arc<dyn SecretResolver> =
         Arc::new(FileResolver::new(FilePolicy {

@@ -1432,6 +1432,7 @@ mod tests {
                 proofs: Default::default(),
                 type_mapping: deltaforge_core::TypeMapping::V2,
                 decode_workers: None,
+                selection_cache_bytes: None,
             };
             // One required sink; its barriers commit through the runner's
             // own barrier commit, so a generation can start and complete.

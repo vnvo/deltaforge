@@ -326,6 +326,7 @@ async fn mysql_generation_operations_are_structurally_linear() -> Result<()> {
             proofs: Default::default(),
             type_mapping: deltaforge_core::TypeMapping::V2,
             decode_workers: None,
+            selection_cache_bytes: None,
         };
         // The connections of the generation, baselines included.
         let root = test_common::mysql_root_dsn().await;

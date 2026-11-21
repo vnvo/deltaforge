@@ -129,6 +129,7 @@ fn my_cfg(
         type_mapping: Default::default(),
         proofs: Default::default(),
         decode_workers: None,
+        selection_cache_bytes: None,
     }
 }
 

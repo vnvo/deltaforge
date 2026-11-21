@@ -82,6 +82,7 @@ async fn source_of(
         proofs: Default::default(),
         type_mapping: deltaforge_core::TypeMapping::V2,
         decode_workers: Some(workers),
+        selection_cache_bytes: None,
     }
 }
 
