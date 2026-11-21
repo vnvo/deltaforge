@@ -1391,6 +1391,213 @@ async fn stopping_with_two_windows_present_aborts_the_speculation() {
     container.rm().await.ok();
 }
 
+/// Three windows present (`activation_capture_concurrency` 2): the first
+/// window's capture waits for `t0000`, the first queued window's (`t0001`
+/// to `t0004`) for `t0004`, the second queued window's (`t0005`, `t0006`)
+/// for `t0006`. Returns the three lock holders.
+async fn three_windows_present(
+    port: u16,
+    r: &Running,
+    c: &mut mysql_async::Conn,
+) -> [mysql_async::Conn; 3] {
+    let (first, second) = two_windows_present(port, r, c).await;
+    c.query_drop(
+        "BEGIN; INSERT INTO t0005 VALUES (1, 5); INSERT INTO t0006 VALUES (1, 6); COMMIT",
+    )
+    .await
+    .unwrap();
+    let mut third = conn(port).await;
+    third.query_drop("LOCK TABLES t0006 WRITE").await.unwrap();
+    wait_for_waiter(port, "t0006").await;
+    [first, second, third]
+}
+
+/// A stop with three windows present: every capture is aborted (no
+/// metadata-lock wait remains) and a restart from the same store delivers
+/// every row exactly once. Meanwhile a fourth window's tables are never
+/// captured: at most two windows are collected ahead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn stopping_with_three_windows_present_aborts_every_capture() {
+    let (container, port) = start(true).await;
+    let mut c = conn(port).await;
+    tables(&mut c, 9).await;
+    let id = "spec-stop-three";
+    let store = Store::memory();
+    let r = run_on(port, id, MysqlProofCfg::default(), &store).await;
+    let mut held = three_windows_present(port, &r, &mut c).await;
+    c.query_drop(
+        "BEGIN; INSERT INTO t0007 VALUES (1, 7); INSERT INTO t0008 VALUES (1, 8); COMMIT",
+    )
+    .await
+    .unwrap();
+    let mut fourth = conn(port).await;
+    fourth.query_drop("LOCK TABLES t0008 WRITE").await.unwrap();
+    sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        mdl_waiters(port, "t0008").await.len(),
+        0,
+        "no fourth capture while two windows are queued"
+    );
+    r.handle.stop();
+    let (r, end) = ended(r, Duration::from_secs(15)).await;
+    assert!(end.is_ok(), "a clean stop: {end:?}");
+    for t in ["t0000", "t0004", "t0006"] {
+        wait_for_no_waiter(port, t).await;
+    }
+    assert_eq!(r.rows.load(std::sync::atomic::Ordering::SeqCst), 0);
+    r.drain.abort();
+    for h in &mut held {
+        h.query_drop("UNLOCK TABLES").await.unwrap();
+    }
+    fourth.query_drop("UNLOCK TABLES").await.unwrap();
+    let again = run_on(port, id, MysqlProofCfg::default(), &store).await;
+    again.delivered(9, Duration::from_secs(60)).await;
+    sleep(Duration::from_secs(1)).await;
+    assert_eq!(again.rows.load(std::sync::atomic::Ordering::SeqCst), 9);
+    again.stop().await;
+    container.rm().await.ok();
+}
+
+/// A multi-table RENAME spanning the tables of three windows while their
+/// three captures wait: the first window's capture holds `t0000` and waits
+/// for `t0003`, the queued windows' hold `t0001` (waiting for `t0004`) and
+/// `t0002` (waiting for `t0005`), and the RENAME names `t0000`, `t0001`
+/// and `t0002`. Every party locks in the global sorted order, so it
+/// completes once the captures do: no deadlock, one capture attempt per
+/// window, every row delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn a_rename_spanning_three_windows_never_deadlocks() {
+    let (container, port) = start(true).await;
+    let mut c = conn(port).await;
+    tables(&mut c, 6).await;
+    let id = "spec-rename-three";
+    let r = run(port, id, MysqlProofCfg::default()).await;
+    r.handle.pause();
+    c.query_drop("INSERT INTO t0000 VALUES (1, 0)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO t0003 VALUES (1, 3)")
+        .await
+        .unwrap();
+    let mut held = Vec::new();
+    let lock = |t: &'static str| async move {
+        let mut h = conn(port).await;
+        h.query_drop(format!("LOCK TABLES {t} WRITE"))
+            .await
+            .unwrap();
+        h
+    };
+    held.push(lock("t0003").await);
+    r.handle.resume();
+    wait_for_waiter(port, "t0003").await;
+    for (a, b) in [(1, 4), (2, 5)] {
+        c.query_drop(format!(
+            "BEGIN; INSERT INTO t{a:04} VALUES (1, {a}); \
+             INSERT INTO t{b:04} VALUES (1, {b}); COMMIT"
+        ))
+        .await
+        .unwrap();
+        held.push(lock(if b == 4 { "t0004" } else { "t0005" }).await);
+        wait_for_waiter(port, &format!("t{b:04}")).await;
+    }
+    let rename = tokio::spawn(async move {
+        let mut c = conn(port).await;
+        c.query_drop(
+            "RENAME TABLE t0000 TO r0000, t0001 TO r0001, t0002 TO r0002",
+        )
+        .await
+        .unwrap();
+    });
+    for mut h in held {
+        sleep(Duration::from_millis(300)).await;
+        h.query_drop("UNLOCK TABLES").await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(30), rename)
+        .await
+        .expect("the RENAME completes")
+        .unwrap();
+    r.delivered(6, Duration::from_secs(60)).await;
+    let got = r.firsts.lock().unwrap().clone();
+    for i in 0..6 {
+        assert_eq!(got.get(&format!("t{i:04}")), Some(&(1, i)), "t{i:04}");
+    }
+    r.stop().await;
+    container.rm().await.ok();
+    let windows = records(id, "window");
+    assert!(count(&windows[0], "queued") >= 1, "{windows:?}");
+    assert_eq!(count(&windows[1], "speculated"), 2, "{windows:?}");
+    assert_eq!(count(&windows[2], "speculated"), 2, "{windows:?}");
+    for w in &windows[..3] {
+        assert_eq!(count(w, "capture_attempts"), 1, "{w}");
+    }
+    assert!(records(id, "abandoned").is_empty(), "nothing abandoned");
+    let lazy = records(id, "proof")
+        .iter()
+        .filter(|p| p["kind"] == "lazy")
+        .count();
+    assert_eq!(lazy, 6, "no per-table capture");
+}
+
+/// The first window's plan bytes cut its prefix after its capture (bytes
+/// need the schema): its output is cut, so both windows queued behind it
+/// are abandoned unused, and ordinary windows then decide their tables.
+/// Every row is delivered once, in binary-log order, and each table has
+/// exactly one activation record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn a_cut_in_the_current_window_abandons_every_queued_window() {
+    let (container, port) = start(true).await;
+    let mut c = conn(port).await;
+    wide_tables(&mut c, 5).await;
+    let _caps = WindowCaps::set(110_000, 16_384, 110_000);
+    let id = "spec-cut-queue";
+    let store = Store::memory();
+    let r = run_on(port, id, MysqlProofCfg::default(), &store).await;
+    r.handle.pause();
+    c.query_drop(
+        "BEGIN; INSERT INTO t0000 (id, v) VALUES (1, 0); \
+         INSERT INTO t0001 (id, v) VALUES (1, 1); \
+         INSERT INTO t0002 (id, v) VALUES (1, 2); COMMIT",
+    )
+    .await
+    .unwrap();
+    let mut locker = conn(port).await;
+    locker.query_drop("LOCK TABLES t0000 WRITE").await.unwrap();
+    r.handle.resume();
+    wait_for_waiter(port, "t0000").await;
+    for i in [3, 4] {
+        c.query_drop(format!("INSERT INTO t{i:04} (id, v) VALUES (1, {i})"))
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(300)).await;
+    }
+    locker.query_drop("UNLOCK TABLES").await.unwrap();
+    r.delivered(5, Duration::from_secs(120)).await;
+    sleep(Duration::from_secs(1)).await;
+    let order = r.order.lock().unwrap().clone();
+    let want: Vec<(String, i64)> =
+        (0..5).map(|i| (format!("t{i:04}"), 1)).collect();
+    assert_eq!(order, want, "every row once, in binary-log order");
+    for i in 0..5 {
+        let t = format!("t{i:04}");
+        assert_eq!(store.activation(port, id, &t).await.len(), 1, "{t}");
+    }
+    r.stop().await;
+    container.rm().await.ok();
+    let windows = records(id, "window");
+    assert_eq!(count(&windows[0], "tables"), 2, "{windows:?}");
+    assert_eq!(windows[0]["cut"], true, "{windows:?}");
+    assert_eq!(windows[0]["next"], "abandoned", "{windows:?}");
+    let abandoned = records(id, "abandoned");
+    assert_eq!(abandoned.len(), 2, "{abandoned:?}");
+    assert!(
+        abandoned.iter().all(|a| a["reason"] == "cut"),
+        "{abandoned:?}"
+    );
+}
+
 /// A multi-table RENAME spanning both windows' tables while both captures
 /// wait: `t0000` and `t0002` are the first window's (its capture holds
 /// `t0000` and waits for `t0002`), `t0001` and `t0003` the second's (its
@@ -1458,18 +1665,21 @@ async fn a_rename_spanning_both_windows_never_deadlocks() {
     assert_eq!(lazy, 4, "no per-table capture");
 }
 
-/// Held events stay within one window's bounds, and every window makes one
-/// capture attempt: a burst much larger than the event bound while the
-/// first window waits.
+/// Held events stay within one window's bounds for each window collected
+/// ahead, at most `activation_capture_concurrency` windows are queued, and
+/// every window makes one capture attempt: a burst much larger than the
+/// event bound while the first window waits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires docker"]
-async fn held_events_stay_within_a_windows_bounds() {
+async fn held_events_stay_within_the_queued_windows_bounds() {
     let (container, port) = start(true).await;
     let mut c = conn(port).await;
     let n = 61;
     tables(&mut c, n).await;
     let id = "spec-bounds";
     let bound = 30;
+    let depth = MysqlProofCfg::default().activation_capture_concurrency;
+    assert_eq!(depth, 2, "the default");
     let r = run(
         port,
         id,
@@ -1501,11 +1711,22 @@ async fn held_events_stay_within_a_windows_bounds() {
     container.rm().await.ok();
     let windows = records(id, "window");
     for w in &windows {
-        assert!(count(w, "prefetched") <= bound as u64, "{w}");
+        assert!(count(w, "prefetched") <= (bound * depth) as u64, "{w}");
         assert!(count(w, "events") <= bound as u64, "{w}");
+        assert!(count(w, "queued") <= depth as u64, "{w}");
         assert_eq!(count(w, "capture_attempts"), 1, "{w}");
         assert!(count(w, "stream_openings") <= 2, "{w}");
     }
+    assert!(
+        windows.iter().any(|w| count(w, "queued") == depth as u64),
+        "the burst fills the queue: {windows:?}"
+    );
+    assert!(
+        windows
+            .iter()
+            .any(|w| count(w, "prefetched") > bound as u64),
+        "more than one window's events held: {windows:?}"
+    );
     let lazy = records(id, "proof")
         .iter()
         .filter(|p| p["kind"] == "lazy")
@@ -1738,6 +1959,89 @@ async fn held_events_after_a_statement_form_an_ordinary_window_by_receipt() {
         read_ms < 25.0,
         "the ordinary window over held events counts from receipt: {read_ms} ms"
     );
+}
+
+/// A queued window closes on a statement (`ALTER TABLE t0005`, which makes
+/// the proven `t0005` unproven once it is dispatched): no window is
+/// collected after it, even while the window before it is admitted with
+/// later rows already held. Those rows (`t0005` again, and `t0006`) are
+/// decided by an ordinary window after the statement: every row is
+/// delivered once, in order, and the source keeps running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn no_window_is_collected_after_a_queued_statement() {
+    let (container, port) = start(true).await;
+    let mut c = conn(port).await;
+    tables(&mut c, 7).await;
+    let id = "spec-queued-statement";
+    let r = run(port, id, MysqlProofCfg::default()).await;
+    c.query_drop("INSERT INTO t0005 VALUES (1, 5)")
+        .await
+        .unwrap();
+    r.delivered(1, Duration::from_secs(60)).await;
+    r.handle.pause();
+    c.query_drop("INSERT INTO t0000 VALUES (1, 0)")
+        .await
+        .unwrap();
+    let mut first = conn(port).await;
+    first.query_drop("LOCK TABLES t0000 WRITE").await.unwrap();
+    r.handle.resume();
+    wait_for_waiter(port, "t0000").await;
+    // The first queued window: its capture waits for `t0002`.
+    c.query_drop(
+        "BEGIN; INSERT INTO t0001 VALUES (1, 1); INSERT INTO t0002 VALUES (1, 2); COMMIT",
+    )
+    .await
+    .unwrap();
+    let mut second = conn(port).await;
+    second.query_drop("LOCK TABLES t0002 WRITE").await.unwrap();
+    wait_for_waiter(port, "t0002").await;
+    // The second queued window, closed by the statement.
+    c.query_drop(
+        "INSERT INTO t0003 VALUES (1, 3); ALTER TABLE t0005 ADD COLUMN w INT",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "BEGIN; INSERT INTO t0005 (id, v) VALUES (2, 5); INSERT INTO t0006 VALUES (1, 6); COMMIT",
+    )
+    .await
+    .unwrap();
+    sleep(Duration::from_millis(300)).await;
+    // The first window commits; the first queued one is admitted (its
+    // capture still waits) with the rows after the statement held.
+    first.query_drop("UNLOCK TABLES").await.unwrap();
+    sleep(Duration::from_millis(500)).await;
+    second.query_drop("UNLOCK TABLES").await.unwrap();
+    r.delivered(6, Duration::from_secs(60)).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while r.rows.load(std::sync::atomic::Ordering::SeqCst) < 7 {
+        assert!(!r.handle.join.is_finished(), "the source ended");
+        assert!(Instant::now() < deadline, "not every row delivered");
+        sleep(Duration::from_millis(50)).await;
+    }
+    sleep(Duration::from_secs(1)).await;
+    let want: Vec<(String, i64)> = [
+        ("t0005", 1),
+        ("t0000", 1),
+        ("t0001", 1),
+        ("t0002", 1),
+        ("t0003", 1),
+        ("t0005", 2),
+        ("t0006", 1),
+    ]
+    .iter()
+    .map(|(t, i)| (t.to_string(), *i))
+    .collect();
+    assert_eq!(*r.order.lock().unwrap(), want, "every row once, in order");
+    r.stop().await;
+    container.rm().await.ok();
+    let windows = records(id, "window");
+    let queued = windows
+        .iter()
+        .find(|w| w["speculated"].as_u64() == Some(2))
+        .expect("the first queued window");
+    assert_eq!(queued["next"], "full", "{windows:?}");
 }
 
 /// A DDL closes the current window, and new tables' rows arrive while it is

@@ -16,6 +16,14 @@
 //! nothing and changes no cache; it is aborted (its capture connection
 //! dropped, so the server rolls back and releases its metadata locks)
 //! whenever the window is abandoned or the run stops.
+//!
+//! Up to `activation_capture_concurrency` windows are collected ahead, in
+//! order (a [`Chain`]): each one after the last, reserving the tables of
+//! the current window and of every window before it. Each row of a
+//! reserved table is tagged with the window that reserved it and checked
+//! against that window's decisions when it commits ([`first_unheld`]);
+//! the first window that cannot hold such a row is abandoned with every
+//! window after it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -32,7 +40,7 @@ use super::mysql_activation_window::{
     Ahead, CaptureScan, CapturedWindow, capture_and_scan,
     is_transaction_control, touched, window_full,
 };
-use super::mysql_window_budget::Fill;
+use super::mysql_window_budget::{Caps, Fill};
 use crate::durable_checkpoint::{mysql_checkpoint_position, order_positions};
 use crate::gtid_set::GtidSet;
 use crate::registry_scope::RegistryScope;
@@ -40,6 +48,13 @@ use crate::registry_scope::RegistryScope;
 /// A held event: when it was received, its held sequence number (0: not
 /// held), its header and data.
 pub(crate) type Held = (Instant, u64, EventHeader, EventData);
+
+/// A window's number within a run: which window reserved a table.
+pub(crate) type WindowId = u64;
+
+/// A row of a reserved table in a window's events: the window that
+/// reserved the table, the table, and its transaction's start.
+pub(crate) type ReservedRow = (WindowId, (String, String), MySqlCheckpoint);
 
 /// What one decision covers of its table's other held rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +165,58 @@ pub(crate) fn check_required(
     Ok(())
 }
 
+/// After window `id` committed with `decisions`: the index of the first
+/// queued window (in order) holding a row of one of `id`'s tables that its
+/// decision does not cover. That window and every later one are abandoned
+/// (each later one was collected assuming the earlier ones decide as
+/// speculated). `None`: every queued window holds.
+pub(crate) fn first_unheld<'a>(
+    queue: impl IntoIterator<Item = &'a [ReservedRow]>,
+    id: WindowId,
+    decisions: &HashMap<(String, String), (MySqlCheckpoint, Governs)>,
+) -> Option<usize> {
+    queue.into_iter().position(|rows| {
+        rows.iter().any(|(owner, k, at)| {
+            *owner == id
+                && !decisions.get(k).is_some_and(|(decided, governs)| {
+                    covers_row(governs, decided, at)
+                })
+        })
+    })
+}
+
+/// How long a speculative capture task kept its sessions busy: until it
+/// finished, or so far.
+#[derive(Clone)]
+pub(crate) struct Busy {
+    started: Instant,
+    done_us: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Busy {
+    fn start() -> Self {
+        Self {
+            started: Instant::now(),
+            done_us: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    fn finish(&self) {
+        let us = self.started.elapsed().as_micros().max(1);
+        self.done_us.store(
+            u64::try_from(us).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    pub(crate) fn elapsed(&self) -> Duration {
+        match self.done_us.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => self.started.elapsed(),
+            us => Duration::from_micros(us),
+        }
+    }
+}
+
 /// A task aborted when dropped (a speculative capture never outlives its
 /// window).
 pub(crate) struct AbortOnDrop<T>(pub tokio::task::JoinHandle<T>);
@@ -170,6 +237,7 @@ pub(crate) struct SpecInputs {
 /// A speculative window that closed during the current admission and kept
 /// its capture task: held until the stream reaches its head.
 pub(crate) struct Pending {
+    pub id: WindowId,
     pub head_seq: u64,
     pub end_seq: u64,
     pub closed_by: &'static str,
@@ -178,11 +246,20 @@ pub(crate) struct Pending {
     /// The batch's tables in first-touch order: the capture's rank order.
     pub order: Vec<(String, String)>,
     pub task: AbortOnDrop<Result<CapturedWindow, SourceError>>,
+    pub busy: Busy,
+    /// Rows of tables reserved by earlier windows, in this window's events.
+    pub reserved_rows: Vec<ReservedRow>,
+    /// The tracker's state after its last event, and whether a window may
+    /// be collected after it (not after a statement or a heartbeat, which
+    /// may change what is proven, nor after broken framing).
+    pub ahead: Ahead,
+    pub chainable: bool,
 }
 
 impl std::fmt::Debug for Pending {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pending")
+            .field("id", &self.id)
             .field("head_seq", &self.head_seq)
             .field("end_seq", &self.end_seq)
             .field("tables", &self.batch.len())
@@ -206,6 +283,9 @@ pub(crate) enum NextWindow {
     /// It formed, then the admission's decisions left a held row of a
     /// reserved table uncovered (or cut the queue): discarded unused.
     Abandoned,
+    /// As many windows as allowed were already collected ahead, or the
+    /// last of them ended where nothing may follow it: none collected.
+    Full,
 }
 
 impl NextWindow {
@@ -216,17 +296,22 @@ impl NextWindow {
             NextWindow::Unclosed => "unclosed",
             NextWindow::GaveUp => "gave_up",
             NextWindow::Abandoned => "abandoned",
+            NextWindow::Full => "full",
         }
     }
 }
 
 /// The speculative window's collection over held events, in order.
 pub(crate) struct Collector {
+    id: WindowId,
+    /// Events up to this held sequence number belong to windows before it.
+    start_after: u64,
     ahead: Ahead,
     allow: AllowList,
     scope: Arc<RegistryScope>,
-    proven: HashSet<String>,
-    reserved: HashSet<(String, String)>,
+    proven: Arc<HashSet<String>>,
+    /// The tables reserved by the windows before it, each with its window.
+    reserved: HashMap<(String, String), WindowId>,
     /// The candidates taken, at their costs before capture.
     fill: Fill,
     bound: Duration,
@@ -243,25 +328,31 @@ pub(crate) struct Collector {
     closed: Option<&'static str>,
     gave_up: bool,
     /// Rows of reserved tables seen in the held events (by the time this
-    /// window closed): checked against the current window's decisions.
-    pub reserved_rows: Vec<((String, String), MySqlCheckpoint)>,
+    /// window closed): checked against their windows' decisions.
+    reserved_rows: Vec<ReservedRow>,
     inputs: SpecInputs,
-    task: Option<AbortOnDrop<Result<CapturedWindow, SourceError>>>,
+    task: Option<(AbortOnDrop<Result<CapturedWindow, SourceError>>, Busy)>,
 }
 
 impl Collector {
+    /// The window `id`, collected from the held events after `start_after`
+    /// (with the tracker state `ahead` there).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        id: WindowId,
+        start_after: u64,
         ahead: Ahead,
         allow: AllowList,
         scope: Arc<RegistryScope>,
-        proven: HashSet<String>,
-        reserved: HashSet<(String, String)>,
+        proven: Arc<HashSet<String>>,
+        reserved: HashMap<(String, String), WindowId>,
         fill: Fill,
         cfg: &deltaforge_config::MysqlProofCfg,
         inputs: SpecInputs,
     ) -> Self {
         Self {
+            id,
+            start_after,
             ahead,
             allow,
             scope,
@@ -277,13 +368,57 @@ impl Collector {
             order: Vec::new(),
             events: 0,
             bytes: 0,
-            end_seq: 0,
+            end_seq: start_after,
             closed: None,
             gave_up: false,
             reserved_rows: Vec::new(),
             inputs,
             task: None,
         }
+    }
+
+    /// The window after this closed one: from its last event, reserving
+    /// its tables too.
+    fn successor(&self, id: WindowId) -> Self {
+        let mut reserved = self.reserved.clone();
+        for k in &self.order {
+            reserved.insert(k.clone(), self.id);
+        }
+        Self {
+            id,
+            start_after: self.end_seq,
+            ahead: self.ahead.clone(),
+            allow: self.allow.clone(),
+            scope: Arc::clone(&self.scope),
+            proven: Arc::clone(&self.proven),
+            reserved,
+            fill: Fill::new(Caps::current(), self.fill.other_lineages()),
+            bound: self.bound,
+            max_events: self.max_events,
+            max_bytes: self.max_bytes,
+            head: None,
+            head_anchor: None,
+            batch: BTreeMap::new(),
+            order: Vec::new(),
+            events: 0,
+            bytes: 0,
+            end_seq: self.end_seq,
+            closed: None,
+            gave_up: false,
+            reserved_rows: Vec::new(),
+            inputs: self.inputs.clone(),
+            task: None,
+        }
+    }
+
+    /// Whether a window may be collected after this closed one: not after
+    /// a statement or a heartbeat (what is proven may change), nor after
+    /// broken framing.
+    fn chainable(&self) -> bool {
+        matches!(
+            self.closed,
+            Some("time" | "events" | "bytes" | "tables" | "budget")
+        )
     }
 
     fn done(&self) -> bool {
@@ -313,7 +448,7 @@ impl Collector {
         h: &EventHeader,
         d: &EventData,
     ) {
-        if self.done() {
+        if self.done() || seq <= self.start_after {
             return;
         }
         if let Some((_, head_at, _)) = &self.head
@@ -361,8 +496,8 @@ impl Collector {
         }
         for (db, table, at) in found {
             let k = (db, table);
-            if self.reserved.contains(&k) {
-                self.reserved_rows.push((k, at));
+            if let Some(owner) = self.reserved.get(&k) {
+                self.reserved_rows.push((*owner, k, at));
                 continue;
             }
             if self.batch.contains_key(&k)
@@ -430,9 +565,14 @@ impl Collector {
                 ..a
             }
         });
-        self.task = Some(AbortOnDrop(tokio::spawn(async move {
-            capture_and_scan(&capture, &tables, &froms, &head).await
-        })));
+        let busy = Busy::start();
+        let done = busy.clone();
+        let task = AbortOnDrop(tokio::spawn(async move {
+            let r = capture_and_scan(&capture, &tables, &froms, &head).await;
+            done.finish();
+            r
+        }));
+        self.task = Some((task, busy));
     }
 
     /// The outcome after the admission: a pending window, or what became
@@ -441,10 +581,12 @@ impl Collector {
         if self.gave_up {
             return (NextWindow::GaveUp, None);
         }
+        let chainable = self.chainable();
         match (self.closed, self.task.take(), self.head) {
-            (Some(closed_by), Some(task), Some((head_seq, _, _))) => (
+            (Some(closed_by), Some((task, busy)), Some((head_seq, _, _))) => (
                 NextWindow::Formed,
                 Some(Pending {
+                    id: self.id,
                     head_seq,
                     end_seq: self.end_seq,
                     closed_by,
@@ -452,6 +594,10 @@ impl Collector {
                     batch: self.batch,
                     order: self.order,
                     task,
+                    busy,
+                    reserved_rows: self.reserved_rows,
+                    ahead: self.ahead,
+                    chainable,
                 }),
             ),
             (None, _, Some(_)) => (NextWindow::Unclosed, None),
@@ -461,6 +607,120 @@ impl Collector {
 
     pub(crate) fn candidates(&self) -> usize {
         self.batch.len()
+    }
+
+    /// Whether the event `seq` was taken (not when the window closed on
+    /// time before it: it then belongs to whatever follows).
+    fn took(&self, seq: u64) -> bool {
+        self.end_seq >= seq
+    }
+}
+
+/// The windows collected ahead during one admission, in order: each closes
+/// and starts its capture, then the next is collected after it while there
+/// is room (`activation_capture_concurrency`, less the windows already
+/// queued).
+pub(crate) struct Chain {
+    active: Option<Collector>,
+    room: usize,
+    next_id: WindowId,
+    formed: Vec<Pending>,
+    /// What became of the first window collected here, and its candidates.
+    first: Option<(NextWindow, usize)>,
+}
+
+impl Chain {
+    /// `first`: the next window's collector, `None` when no room is left
+    /// or nothing may follow the last queued window. `next_id`: the id
+    /// after `first`'s, for its successors.
+    pub(crate) fn new(
+        first: Option<Collector>,
+        room: usize,
+        next_id: WindowId,
+    ) -> Self {
+        let none = first.is_none();
+        Self {
+            active: first,
+            room,
+            next_id,
+            formed: Vec::new(),
+            first: none.then_some((NextWindow::Full, 0)),
+        }
+    }
+
+    /// The next unused window id.
+    pub(crate) fn next_id(&self) -> WindowId {
+        self.next_id
+    }
+
+    /// One held event, in order.
+    pub(crate) fn observe(
+        &mut self,
+        seq: u64,
+        received: Instant,
+        h: &EventHeader,
+        d: &EventData,
+    ) {
+        while let Some(c) = self.active.as_mut() {
+            c.observe(seq, received, h, d);
+            if !c.done() {
+                return;
+            }
+            let took = c.took(seq);
+            self.roll();
+            if took {
+                return;
+            }
+        }
+    }
+
+    /// When the open window's time bound passes.
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.active.as_ref().and_then(Collector::deadline)
+    }
+
+    /// The open window's time bound passed.
+    pub(crate) fn time_up(&mut self) {
+        if let Some(c) = self.active.as_mut() {
+            c.time_up();
+            if c.done() {
+                self.roll();
+            }
+        }
+    }
+
+    /// The open window is done: queue it if it formed, and collect the
+    /// next one after it while there is room.
+    fn roll(&mut self) {
+        let Some(c) = self.active.take() else {
+            return;
+        };
+        let successor = (c.chainable() && self.room > 1).then(|| {
+            let id = self.next_id;
+            self.next_id += 1;
+            c.successor(id)
+        });
+        let candidates = c.candidates();
+        let (next, pending) = c.finish();
+        self.first.get_or_insert((next, candidates));
+        if let Some(p) = pending {
+            self.formed.push(p);
+            self.room = self.room.saturating_sub(1);
+            self.active = successor;
+        }
+    }
+
+    /// After the admission: what became of the first window collected
+    /// here, its candidates, and the windows formed (in order). A window
+    /// still open is dropped unformed; its events stay held.
+    pub(crate) fn finish(mut self) -> (NextWindow, usize, Vec<Pending>) {
+        if let Some(c) = self.active.take() {
+            let candidates = c.candidates();
+            let (next, _) = c.finish();
+            self.first.get_or_insert((next, candidates));
+        }
+        let (next, candidates) = self.first.unwrap_or_default();
+        (next, candidates, self.formed)
     }
 }
 
@@ -477,19 +737,6 @@ pub(crate) fn first_uncovered(
                 .is_some_and(|(decided, g)| !covers_row(g, decided, at))
         })
         .map(|(i, ..)| *i)
-}
-
-/// Whether every recorded row of a reserved table is covered by its
-/// table's decision.
-pub(crate) fn reserved_rows_covered(
-    rows: &[((String, String), MySqlCheckpoint)],
-    decisions: &HashMap<(String, String), (MySqlCheckpoint, Governs)>,
-) -> bool {
-    rows.iter().all(|(k, at)| {
-        decisions
-            .get(k)
-            .is_some_and(|(decided, governs)| covers_row(governs, decided, at))
-    })
 }
 
 #[cfg(test)]
@@ -670,7 +917,8 @@ mod tests {
         ]);
         assert_eq!(first_uncovered(&rows, &decisions), Some(2));
         assert!(!covers_row(&Governs::Deferred, &a, &a));
-        assert!(!reserved_rows_covered(&[(key("def"), later)], &decisions));
+        let rows = [(7, key("def"), later)];
+        assert_eq!(first_unheld([&rows[..]], 7, &decisions), Some(0));
     }
 
     #[test]
@@ -684,17 +932,48 @@ mod tests {
                 (a.clone(), Governs::Refused(Covers::Transaction)),
             ),
         ]);
-        assert!(reserved_rows_covered(
-            &[(key("adm"), later.clone())],
-            &decisions
-        ));
-        assert!(!reserved_rows_covered(
-            &[(key("spec"), later.clone())],
-            &decisions
-        ));
-        assert!(!reserved_rows_covered(
-            &[(key("unknown"), later)],
-            &decisions
-        ));
+        let held = |k: &str| [(1, key(k), later.clone())];
+        assert_eq!(first_unheld([&held("adm")[..]], 1, &decisions), None);
+        assert_eq!(first_unheld([&held("spec")[..]], 1, &decisions), Some(0));
+        // A reserved table the window did not decide (an extra candidate)
+        // is not held either.
+        assert_eq!(
+            first_unheld([&held("unknown")[..]], 1, &decisions),
+            Some(0)
+        );
+    }
+
+    /// Only the committing window's rows are checked, in each queued window
+    /// in order: the first queued window holding an uncovered one is where
+    /// the queue is abandoned, whatever follows it.
+    #[test]
+    fn the_first_queued_window_that_cannot_hold_ends_the_queue() {
+        let a = cp(&format!("{U}:1-3"));
+        let later = cp(&format!("{U}:1-4"));
+        let decisions = HashMap::from([
+            (key("adm"), (a.clone(), Governs::Admitted)),
+            (
+                key("ref"),
+                (a.clone(), Governs::Refused(Covers::Transaction)),
+            ),
+        ]);
+        // Window 1 commits; windows 2, 3 and 4 are queued.
+        let w2 = [
+            (1, key("adm"), later.clone()),
+            (5, key("ref"), later.clone()),
+        ];
+        let w3 = [(2, key("x"), later.clone()), (1, key("ref"), later.clone())];
+        let w4 = [(1, key("adm"), later.clone())];
+        assert_eq!(
+            first_unheld([&w2[..], &w3[..], &w4[..]], 1, &decisions),
+            Some(1),
+            "window 2's uncovered row belongs to window 5, not to window 1"
+        );
+        assert_eq!(first_unheld([&w2[..], &w4[..]], 1, &decisions), None);
+        assert_eq!(first_unheld([&w3[..], &w2[..]], 1, &decisions), Some(0));
+        assert_eq!(
+            first_unheld(std::iter::empty::<&[ReservedRow]>(), 1, &decisions),
+            None
+        );
     }
 }

@@ -120,6 +120,7 @@ configuration is loaded:
 | `capture_lock_wait_secs` | `30` | 1 to 300 | How long a window's capture waits for each table's metadata lock, on each of its three attempts. |
 | `max_seek_ms` | `10000` | 100 to 600,000 | A proof scan with no known start offset fails closed when the server sends no transaction within this bound. |
 | `control_connections` | `4` | 2 to 16 | The source's control-plane pool: at most this many SQL connections at once for schema captures, catalog reads, position queries and health checks. |
+| `activation_capture_concurrency` | `2` | 1 to 4, below `control_connections` | At most this many activation windows collected ahead of the one being decided, each captured on its own connection. Absent with `control_connections` of 2, it is 1. Held events are bounded by `activation_window_events` and `activation_window_bytes` for each of them. |
 
 ```yaml
 source:
@@ -497,13 +498,18 @@ locks their metadata in sorted order, which avoids deadlocking against a
 multi-table DDL, and reads every definition between the same two binlog
 positions. Meanwhile the source keeps reading the stream, holding what
 arrives for the next window without emitting it, so tables first touched
-during an admission are not held for a second full window. The next
-window's capture and proof scan also start while the current window is
-still being admitted. It is decided and written only after the current
-window commits, in stream order: tables it captured that turn out to be
-proven already are dropped, and any table it should have captured but did
-not stops the source (an internal error, never repaired by guessing). At
-most two windows exist at a time. One binlog
+during an admission are not held for a second full window. Up to
+`proofs.activation_capture_concurrency` next windows (default 2) are
+collected from those held events, one after another, and each one's
+capture and proof scan start, on its own connection, while the current
+window is still being admitted. Each is decided and written only after
+every window before it commits, in stream order: tables it captured that
+turn out to be proven already are dropped, and any table it should have
+captured but did not stops the source (an internal error, never repaired
+by guessing). A window collected ahead is discarded unused, with every
+window after it, when an earlier window's decisions leave one of its rows
+undecided. No window is collected ahead past a statement that can change
+a schema. One binlog
 scan proves them all, and each table is admitted or
 refused exactly as it would be on its own. The admitted tables' schema
 versions and proofs are then written in one state-store transaction: all of
@@ -527,6 +533,20 @@ per table measured on MySQL 8.4), and activating tens of thousands of
 tables takes tens of seconds. Raising `table_definition_cache` above the
 number of tables active together is expected to avoid most of those opens;
 its effect on activation time has not been measured.
+
+Windows collected ahead let several captures run at once: at most
+`activation_capture_concurrency` + 1 capture transactions, each holding
+shared metadata locks on its own tables (about 600) for about as long as a
+single capture takes. They never wait for each other. A schema change on a
+table being captured waits for that one capture to finish, as with a
+single window, and a capture that MySQL picks as a deadlock victim is
+retried within its three attempts. Each concurrent capture also opens
+table definitions on the server: lower the setting to 1 (one window ahead)
+on a server with little spare CPU. The source exports
+`deltaforge_mysql_activation_captures_in_flight`, and
+`deltaforge_mysql_activation_speculation_abandoned_total` (by `reason`)
+with `deltaforge_mysql_activation_speculation_abandoned_seconds` for the
+captures discarded unused.
 
 **Proof scans start where their interval starts.** A proof scan normally
 opens the binlog at a position the source observed in its own stream,
