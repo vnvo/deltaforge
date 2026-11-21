@@ -573,6 +573,11 @@ async fn dispatch_kind(
         | EventData::XaPrepare(_)
         | EventData::HeartBeat
         | EventData::NotSupported => Ok(()),
+        // The change stream's parser never skips row bodies; one it did not
+        // decode would lose rows, so it fails closed.
+        EventData::Skipped => Err(SourceError::Other(anyhow::anyhow!(
+            "mysql binlog: a rows or table map event was not parsed"
+        ))),
     }
 }
 

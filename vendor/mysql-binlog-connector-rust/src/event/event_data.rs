@@ -26,4 +26,8 @@ pub enum EventData {
     TransactionPayload(TransactionPayloadEvent),
     RowsQuery(RowsQueryEvent),
     HeartBeat,
+    /// DeltaForge patch: a TABLE_MAP or rows event whose body was not parsed
+    /// ([`BinlogParser::skip_rows`](crate::binlog_parser::BinlogParser::skip_rows));
+    /// its header is as received.
+    Skipped,
 }
