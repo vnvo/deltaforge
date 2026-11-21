@@ -518,6 +518,16 @@ emitted, the checkpoint stays before it, and a restart retries once the
 schema change holding the lock is done. There is no fallback to one
 capture per table.
 
+A window also closes once its tables fill one state-store transaction's
+read budget (about 600 tables for a source with a single lineage), so it
+captures only tables it can admit. Each capture's metadata lock opens the
+table's definition: when `table_definition_cache` holds far fewer tables
+than become active together, almost every lock is a cold open (about 1 ms
+per table measured on MySQL 8.4), and activating tens of thousands of
+tables takes tens of seconds. Raising `table_definition_cache` above the
+number of tables active together is expected to avoid most of those opens;
+its effect on activation time has not been measured.
+
 **Proof scans start where their interval starts.** A proof scan normally
 opens the binlog at a position the source observed in its own stream,
 either the transaction of the rows or the end of the last scan, and checks

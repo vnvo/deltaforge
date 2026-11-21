@@ -219,6 +219,73 @@ pub(crate) fn proof_table_cost(
     cost_of(schema_bytes, 0, 0, other_lineages, key_bytes)
 }
 
+/// The barrier streams every table reads
+/// ([`super::mysql_activation::barrier_streams`]): its lineage's and its
+/// database's.
+const BARRIER_STREAMS: u64 = 2;
+
+/// One table's cost known before its capture, from its registry key alone:
+/// its read items, read-key bytes and write ops exactly as [`table_cost`]
+/// counts them, its bytes a lower bound (no schema, no timeline records).
+pub(crate) fn before_capture(other_lineages: u64, key_bytes: u64) -> Cost {
+    cost_of(0, 0, BARRIER_STREAMS, other_lineages, key_bytes)
+}
+
+/// A window's fill while it reads ahead: the tables it has taken, at
+/// their costs before capture. Full once one more table as costly as the
+/// costliest taken so far would take the plan over a cap, so the window
+/// closes there instead of capturing tables its prefix would defer. Only a
+/// bound on what is captured: the prefix after the capture
+/// ([`Prefix`]) still decides what is admitted.
+#[derive(Debug)]
+pub(crate) struct Fill {
+    caps: Caps,
+    other_lineages: u64,
+    total: Cost,
+    costliest: Cost,
+}
+
+impl Fill {
+    pub(crate) fn new(caps: Caps, other_lineages: u64) -> Self {
+        Self {
+            caps,
+            other_lineages,
+            total: Cost::default(),
+            costliest: Cost::default(),
+        }
+    }
+
+    /// The source's other lineages its costs count.
+    pub(crate) fn other_lineages(&self) -> u64 {
+        self.other_lineages
+    }
+
+    /// Take a table (its registry key's length).
+    pub(crate) fn take(&mut self, key_bytes: u64) {
+        let c = before_capture(self.other_lineages, key_bytes);
+        self.total = self.total.plus(c);
+        let m = &mut self.costliest;
+        m.bytes = m.bytes.max(c.bytes);
+        m.read_items = m.read_items.max(c.read_items);
+        m.read_key_bytes = m.read_key_bytes.max(c.read_key_bytes);
+        m.write_ops = m.write_ops.max(c.write_ops);
+    }
+
+    /// Whether one more table as costly as the costliest taken would not
+    /// fit (never before the first table).
+    pub(crate) fn full(&self) -> bool {
+        if self.costliest == Cost::default() {
+            return false;
+        }
+        let next = self.total.plus(self.costliest);
+        let p = self.caps.plan;
+        next.bytes > p.bytes
+            || next.read_items > p.read_items
+            || next.read_key_bytes > p.read_key_bytes
+            || next.write_ops > p.write_ops
+    }
+}
+
 fn cost_of(
     schema_bytes: u64,
     timeline_bytes: u64,
@@ -284,6 +351,110 @@ mod tests {
             assert!(took[..admitted].iter().all(|t| *t));
             assert!(took[admitted..].iter().all(|t| !*t));
         }
+    }
+
+    /// Before its capture a table's read items, read-key bytes and write
+    /// ops are already what its complete cost counts; only its bytes grow.
+    #[test]
+    fn the_cost_before_capture_is_the_complete_cost_but_bytes() {
+        use super::super::mysql_activation::barrier_streams;
+        use super::super::mysql_history::BarrierStream;
+        use super::super::mysql_selection::Timeline;
+        let key =
+            storage::adapters::SchemaKey::new("tn", "src", "lin", "d", "t");
+        let streams = barrier_streams(&key)
+            .into_iter()
+            .map(|stream| {
+                std::sync::Arc::new(BarrierStream {
+                    stream,
+                    records: Vec::new(),
+                    head: 0,
+                    bytes: 0,
+                })
+            })
+            .collect();
+        let t = Timeline {
+            records: Vec::new(),
+            table_head: 0,
+            streams,
+            bytes: 0,
+        };
+        for lineages in [0, 3] {
+            let full = table_cost(900, &t, lineages, 40).unwrap();
+            let before = before_capture(lineages, 40);
+            assert_eq!(before.read_items, full.read_items);
+            assert_eq!(before.read_key_bytes, full.read_key_bytes);
+            assert_eq!(before.write_ops, full.write_ops);
+            assert!(before.bytes < full.bytes);
+        }
+    }
+
+    /// With the fixed caps, a source of one lineage fills a window at 606
+    /// tables: the read items cap (27 per table), where the 40,000-table
+    /// drain's windows were cut after their capture.
+    #[test]
+    fn a_window_fills_at_the_read_item_cap() {
+        let mut f = Fill::new(Caps::current(), 0);
+        let mut taken = 0;
+        while !f.full() {
+            f.take(60);
+            taken += 1;
+        }
+        assert_eq!(taken, 16_384 / 27);
+        assert_eq!(taken, 606);
+    }
+
+    /// Full exactly when one more of the costliest table taken would pass a
+    /// cap; never before the first table, so every window takes one.
+    #[test]
+    fn a_fill_is_full_when_the_costliest_table_would_not_fit_again() {
+        let one = before_capture(0, 10);
+        let caps = Caps {
+            plan: Cost {
+                bytes: 1 << 40,
+                read_items: 3 * one.read_items,
+                read_key_bytes: 1 << 40,
+                write_ops: 1 << 40,
+            },
+            table_bytes: 1 << 40,
+        };
+        let mut f = Fill::new(caps, 0);
+        assert!(!f.full());
+        f.take(10);
+        f.take(10);
+        assert!(!f.full(), "a third fits");
+        f.take(10);
+        assert!(f.full());
+        // A longer key is costlier in read-key bytes only.
+        let keys = Caps {
+            plan: Cost {
+                read_items: 1 << 40,
+                read_key_bytes: before_capture(0, 10).read_key_bytes
+                    + 2 * before_capture(0, 100).read_key_bytes,
+                ..caps.plan
+            },
+            ..caps
+        };
+        let mut f = Fill::new(keys, 0);
+        f.take(10);
+        f.take(100);
+        assert!(!f.full(), "one more of the longest key fits");
+        f.take(10);
+        assert!(f.full(), "the longest key taken would not fit again");
+        // A table alone over a cap: full at once, after it.
+        let mut f = Fill::new(
+            Caps {
+                plan: Cost {
+                    read_items: 1,
+                    ..caps.plan
+                },
+                ..caps
+            },
+            0,
+        );
+        assert!(!f.full());
+        f.take(10);
+        assert!(f.full());
     }
 
     /// A valid table always fits a plan alone: the first table offered is

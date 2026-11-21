@@ -30,9 +30,9 @@ use super::MySqlCheckpoint;
 use super::mysql_activation::EventIdentity;
 use super::mysql_activation_window::{
     Ahead, CaptureScan, CapturedWindow, capture_and_scan,
-    is_transaction_control, touched,
+    is_transaction_control, touched, window_full,
 };
-use super::mysql_binlog_scan::MAX_BATCH_TABLES;
+use super::mysql_window_budget::Fill;
 use crate::durable_checkpoint::{mysql_checkpoint_position, order_positions};
 use crate::gtid_set::GtidSet;
 use crate::registry_scope::RegistryScope;
@@ -227,6 +227,8 @@ pub(crate) struct Collector {
     scope: Arc<RegistryScope>,
     proven: HashSet<String>,
     reserved: HashSet<(String, String)>,
+    /// The candidates taken, at their costs before capture.
+    fill: Fill,
     bound: Duration,
     max_events: usize,
     max_bytes: u64,
@@ -255,6 +257,7 @@ impl Collector {
         scope: Arc<RegistryScope>,
         proven: HashSet<String>,
         reserved: HashSet<(String, String)>,
+        fill: Fill,
         cfg: &deltaforge_config::MysqlProofCfg,
         inputs: SpecInputs,
     ) -> Self {
@@ -264,6 +267,7 @@ impl Collector {
             scope,
             proven,
             reserved,
+            fill,
             bound: Duration::from_millis(cfg.activation_window_ms),
             max_events: cfg.activation_window_events,
             max_bytes: cfg.activation_window_bytes,
@@ -382,13 +386,15 @@ impl Collector {
                 self.head_anchor = self.ahead.txn_anchor.clone();
             }
             if self.batch.insert(k.clone(), at).is_none() {
+                let key_bytes = self.scope.key(&k.0, &k.1).backend_key().len();
+                self.fill.take(key_bytes as u64);
                 self.order.push(k);
             }
         }
         if self.head.is_some() {
             self.end_seq = seq;
-            if self.batch.len() >= MAX_BATCH_TABLES {
-                self.close("tables");
+            if let Some(why) = window_full(self.batch.len(), Some(&self.fill)) {
+                self.close(why);
             } else if self.events >= self.max_events {
                 self.close("events");
             } else if self.bytes >= self.max_bytes {
