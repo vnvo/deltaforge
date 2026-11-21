@@ -48,7 +48,8 @@ pub fn record(line: &str) -> Option<Value> {
 const PROOF_RECORDS: [&str; 3] = ["scan", "request", "proof"];
 /// The activation window's measurement records: well-formed trace records
 /// that no proof summary counts.
-const MEASUREMENT_RECORDS: [&str; 3] = ["window", "release", "batch"];
+const MEASUREMENT_RECORDS: [&str; 4] =
+    ["window", "release", "batch", "abandoned"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -365,6 +366,7 @@ mod tests {
             r#"{"record":"window","tables":3}"#,
             r#"{"record":"release","window":1,"rank":0}"#,
             r#"{"record":"batch","seq":1,"tables":[]}"#,
+            r#"{"record":"abandoned","id":2,"reason":"uncovered"}"#,
             r#"{"record":"mystery","n":1}"#,
         ]
         .join("\n");
@@ -375,7 +377,7 @@ mod tests {
             .collect();
         assert_eq!(kinds, ["scan", "request", "proof"]);
         assert_eq!(malformed, 1, "the unknown type");
-        for line in text.split('\n').skip(3).take(3) {
+        for line in text.split('\n').skip(3).take(4) {
             assert!(record(line).is_none(), "{line} is not a proof record");
         }
         assert!(record(r#"{"record":"scan","scan_id":9}"#).is_some());
