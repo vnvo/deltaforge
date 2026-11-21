@@ -606,6 +606,11 @@ pub struct MysqlProofCfg {
     /// for captures, catalog reads, position queries and health checks,
     /// within the runner-wide `--max-mysql-control-connections`.
     pub control_connections: usize,
+    /// At most this many activation windows formed and captured ahead of
+    /// the window being decided, each on its own control connection
+    /// (decisions and commits stay serial, in stream order). Absent: 2, or
+    /// `control_connections - 1` when the pool is smaller.
+    pub activation_capture_concurrency: usize,
     /// The bounds of a DDL's forward-proof retries. Fixed constants, never
     /// read from configuration: a test sets them per run.
     #[serde(skip)]
@@ -663,6 +668,11 @@ pub const MYSQL_PROOF_LOCK_WAIT_SECS: std::ops::RangeInclusive<u32> = 1..=300;
 /// `control_connections`: 2 (a capture and one other use at once) to 16.
 pub const MYSQL_PROOF_CONTROL_CONNECTIONS: std::ops::RangeInclusive<usize> =
     2..=16;
+/// `activation_capture_concurrency`: 1 to 4 windows captured ahead, and at
+/// most `control_connections - 1` (the decided window's own capture needs
+/// one more).
+pub const MYSQL_PROOF_CAPTURE_CONCURRENCY: std::ops::RangeInclusive<usize> =
+    1..=4;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -679,6 +689,8 @@ struct MysqlProofCfgRaw {
     capture_lock_wait_secs: u32,
     #[serde(default = "MysqlProofCfg::default_control_connections")]
     control_connections: usize,
+    #[serde(default)]
+    activation_capture_concurrency: Option<usize>,
 }
 
 fn in_range<T: PartialOrd + std::fmt::Display + Copy>(
@@ -701,6 +713,30 @@ impl TryFrom<MysqlProofCfgRaw> for MysqlProofCfg {
     type Error = String;
 
     fn try_from(r: MysqlProofCfgRaw) -> Result<Self, String> {
+        let control_connections = in_range(
+            "control_connections",
+            r.control_connections,
+            &MYSQL_PROOF_CONTROL_CONNECTIONS,
+        )?;
+        let activation_capture_concurrency = match r
+            .activation_capture_concurrency
+        {
+            None => Self::default_capture_concurrency(control_connections),
+            Some(k) => {
+                let k = in_range(
+                    "activation_capture_concurrency",
+                    k,
+                    &MYSQL_PROOF_CAPTURE_CONCURRENCY,
+                )?;
+                if k >= control_connections {
+                    return Err(format!(
+                        "proofs.activation_capture_concurrency must be below \
+                             proofs.control_connections ({control_connections}), got {k}"
+                    ));
+                }
+                k
+            }
+        };
         Ok(Self {
             activation_window_ms: in_range(
                 "activation_window_ms",
@@ -727,11 +763,8 @@ impl TryFrom<MysqlProofCfgRaw> for MysqlProofCfg {
                 r.capture_lock_wait_secs,
                 &MYSQL_PROOF_LOCK_WAIT_SECS,
             )?,
-            control_connections: in_range(
-                "control_connections",
-                r.control_connections,
-                &MYSQL_PROOF_CONTROL_CONNECTIONS,
-            )?,
+            control_connections,
+            activation_capture_concurrency,
             forward_proof_retry: ForwardProofRetry::default(),
         })
     }
@@ -756,6 +789,9 @@ impl MysqlProofCfg {
     fn default_control_connections() -> usize {
         4
     }
+    fn default_capture_concurrency(control_connections: usize) -> usize {
+        2.min(control_connections - 1)
+    }
 }
 
 impl Default for MysqlProofCfg {
@@ -767,6 +803,9 @@ impl Default for MysqlProofCfg {
             max_seek_ms: Self::default_max_seek_ms(),
             capture_lock_wait_secs: Self::default_lock_wait_secs(),
             control_connections: Self::default_control_connections(),
+            activation_capture_concurrency: Self::default_capture_concurrency(
+                Self::default_control_connections(),
+            ),
             forward_proof_retry: ForwardProofRetry::default(),
         }
     }

@@ -47,8 +47,8 @@ use super::mysql_binlog_scan::{
 use super::mysql_event::read_next_event;
 use super::mysql_window_budget::{Caps, Fill};
 use super::mysql_window_speculation::{
-    Collector, Covers, Governs, Held, NextWindow, Pending, SpecInputs,
-    check_required, first_affecting, first_uncovered, reserved_rows_covered,
+    Chain, Collector, Covers, Governs, Held, NextWindow, Pending, SpecInputs,
+    WindowId, check_required, first_affecting, first_uncovered, first_unheld,
     statement_before,
 };
 use super::{LoopControl, MySqlCheckpoint, RunCtx};
@@ -108,6 +108,8 @@ pub(crate) struct WindowTrace {
     /// microseconds; measurement only).
     pub window_seq: u64,
     pub commit_unix_us: u128,
+    /// Windows collected and captured ahead after this one committed.
+    pub queued: usize,
 }
 
 /// Transaction control: neither a schema change nor a statement that could
@@ -331,7 +333,7 @@ async fn prefetch_histories(
     stream: &mut super::mysql_read_ahead::ReadAhead,
     head: &[(String, String, MySqlCheckpoint)],
 ) -> Result<(), LoopControl> {
-    if ctx.pending.is_some()
+    if !ctx.pending.is_empty()
         || !ctx.prefetched.is_empty()
         || ctx.prefetch_error.is_some()
     {
@@ -451,29 +453,30 @@ pub(super) async fn maybe_window(
     data: &EventData,
 ) -> Result<Head, LoopControl> {
     // A speculative window whose head passed without a window opening
-    // there is dropped unused (its task aborted).
-    if let Some(p) = &ctx.pending
+    // there is dropped unused (its task aborted), with every window
+    // collected after it.
+    if let Some(p) = ctx.pending.front()
         && (ctx.last_seq == 0 || ctx.last_seq > p.head_seq)
     {
-        ctx.pending = None;
+        abandon(ctx, 0, "passed");
     }
     let at_pending_head = ctx
         .pending
-        .as_ref()
+        .front()
         .is_some_and(|p| p.head_seq == ctx.last_seq);
     // The speculative window is current now: its tables' timelines are
     // read in one snapshot before its required set is recomputed.
     if at_pending_head && let Ok(scope) = ctx.registry_scope.current() {
         let keys: Vec<_> = ctx
             .pending
-            .as_ref()
+            .front()
             .map(|p| p.order.iter().map(|(db, t)| scope.key(db, t)).collect())
             .unwrap_or_default();
         super::mysql_selection::load_timelines(ctx, &keys).await;
     }
     let not_here = |ctx: &mut RunCtx| {
         if at_pending_head {
-            ctx.pending = None;
+            abandon(ctx, 0, "passed");
         }
         Ok(Head::Dispatch)
     };
@@ -518,8 +521,8 @@ pub(super) async fn maybe_window(
     // A window opens here: nothing held waits on its read-ahead.
     super::mysql_event::flush(&ctx.tx, &mut ctx.outbox).await;
     let pending = if at_pending_head {
-        ctx.pending.take()
-    } else if ctx.pending.is_some() {
+        ctx.pending.pop_front()
+    } else if !ctx.pending.is_empty() {
         return Err(LoopControl::Fail(invariant(
             "a window opened before the speculative window's head",
         )));
@@ -662,8 +665,11 @@ pub(super) async fn maybe_window(
     if batch.is_empty() {
         // A speculative window none of whose tables is required (all
         // proven or governed): discarded unused, its events dispatched in
-        // order with nothing admitted.
-        drop(pending);
+        // order with nothing admitted, and the windows after it with it.
+        if let Some(p) = pending {
+            abandoned(&ctx.source_id, &p, "unused");
+        }
+        abandon(ctx, 0, "unused");
         ctx.lookahead = queue;
         return Ok(Head::Dispatch);
     }
@@ -711,21 +717,57 @@ pub(super) async fn maybe_window(
         Some(f) => f.other_lineages(),
         None => other_lineages(ctx).await.map_err(LoopControl::Fail)?,
     };
-    let mut collector = Collector::new(
-        ahead,
-        ctx.allow.clone(),
-        scope,
-        ctx.selection.proven_keys(),
-        batch.keys().cloned().collect(),
-        Fill::new(Caps::current(), lineages),
-        &cfg,
-        SpecInputs {
-            capture: capture.clone(),
-            lineage: lineage.clone(),
-        },
-    );
+    // This window's number: the reservations of the windows collected
+    // after it name it.
+    let window_id = match &pending {
+        Some(p) => p.id,
+        None => take_window_id(ctx),
+    };
+    // The windows collected ahead, after the last one already queued:
+    // each reserves the tables of this window and of every window queued
+    // before it.
+    let room = cfg
+        .activation_capture_concurrency
+        .saturating_sub(ctx.pending.len());
+    let first = if room == 0 {
+        None
+    } else {
+        let mut reserved: HashMap<(String, String), WindowId> =
+            batch.keys().map(|k| (k.clone(), window_id)).collect();
+        for q in &ctx.pending {
+            for k in q.batch.keys() {
+                reserved.insert(k.clone(), q.id);
+            }
+        }
+        let after = match ctx.pending.back() {
+            None => Some((0, ahead)),
+            Some(last) if last.chainable => {
+                Some((last.end_seq, last.ahead.clone()))
+            }
+            Some(_) => None,
+        };
+        match after {
+            Some((start_after, ahead)) => Some(Collector::new(
+                take_window_id(ctx),
+                start_after,
+                ahead,
+                ctx.allow.clone(),
+                scope,
+                std::sync::Arc::new(ctx.selection.proven_keys()),
+                reserved,
+                Fill::new(Caps::current(), lineages),
+                &cfg,
+                SpecInputs {
+                    capture: capture.clone(),
+                    lineage: lineage.clone(),
+                },
+            )),
+            None => None,
+        }
+    };
+    let mut chain = Chain::new(first, room, ctx.next_window_id);
     for (received, seq, h, d) in &ctx.prefetched {
-        collector.observe(*seq, *received, h, d);
+        chain.observe(*seq, *received, h, d);
     }
     let mut prefetch = Prefetch::new(ctx, &cfg);
     let cancel = ctx.cancel.clone();
@@ -745,27 +787,31 @@ pub(super) async fn maybe_window(
         }
     };
     let admitted = prefetch
-        .during(stream, admission, &mut collector, &cancel)
+        .during(stream, admission, &mut chain, &cancel)
         .await;
     let prefetched = prefetch.events.len();
     ctx.next_held_seq = prefetch.next_seq;
+    ctx.next_window_id = chain.next_id();
     ctx.prefetched.extend(prefetch.events);
     if prefetch.error.is_some() {
         ctx.prefetch_error = prefetch.error;
     }
-    // A failed or cancelled admission drops the collector: its task is
-    // aborted. Nothing of the window was dispatched.
-    let Some(admitted) = admitted else {
-        return Err(LoopControl::Stop);
-    };
+    // A failed or cancelled admission drops the chain and every queued
+    // window: their tasks are aborted. Nothing of the window was
+    // dispatched.
     let admitted = match admitted {
-        // A stop that cancelled the window's capture (or the speculated
+        Some(Ok(admitted)) => admitted,
+        // A stop that cancelled the window's capture (or a speculated
         // one) first: nothing of the window was dispatched and the stream
         // position is still before it, so the run stops as on any stop.
-        Err(LoopControl::Fail(SourceError::Cancelled)) => {
+        None | Some(Err(LoopControl::Fail(SourceError::Cancelled))) => {
+            ctx.pending.clear();
             return Err(LoopControl::Stop);
         }
-        other => other?,
+        Some(Err(control)) => {
+            ctx.pending.clear();
+            return Err(control);
+        }
     };
     let commit_unix_us = unix_us();
     ctx.window_seq += 1;
@@ -788,16 +834,27 @@ pub(super) async fn maybe_window(
             .map(|(k, a, g)| (k.clone(), (a.clone(), g.clone())))
             .collect();
     let cut = first_uncovered(&rows_at, &decisions);
-    let candidates = collector.candidates();
-    let covered = reserved_rows_covered(&collector.reserved_rows, &decisions);
-    let (mut next, speculation) = collector.finish();
-    if cut.is_some() || !covered {
-        if next == NextWindow::Formed {
+    let queued_before = ctx.pending.len();
+    let (mut next, candidates, formed) = chain.finish();
+    ctx.pending.extend(formed);
+    let unheld = if cut.is_some() {
+        Some(0)
+    } else {
+        first_unheld(
+            ctx.pending.iter().map(|p| p.reserved_rows.as_slice()),
+            window_id,
+            &decisions,
+        )
+    };
+    if let Some(i) = unheld {
+        if next == NextWindow::Formed && i <= queued_before {
             next = NextWindow::Abandoned;
         }
-        drop(speculation);
-    } else {
-        ctx.pending = speculation;
+        abandon(ctx, i, if cut.is_some() { "cut" } else { "uncovered" });
+    }
+    // This window's rows in the queued windows are checked.
+    for p in &mut ctx.pending {
+        p.reserved_rows.retain(|(owner, ..)| *owner != window_id);
     }
     // Cut at the head: it is held in front of the whole queue.
     let held_head = cut == Some(0);
@@ -826,6 +883,7 @@ pub(super) async fn maybe_window(
         held_head,
         window_seq: ctx.window_seq,
         commit_unix_us,
+        queued: ctx.pending.len(),
     };
     observe_window(&ctx.source_id, &trace, read, &admitted);
     Ok(if held_head {
@@ -889,8 +947,56 @@ fn invariant(why: &str) -> SourceError {
     }
 }
 
-/// What reading the stream during an admission may hold: at most a
-/// window's events and bytes in all (with what is already held); nothing
+/// The next window number.
+fn take_window_id(ctx: &mut RunCtx) -> WindowId {
+    let id = ctx.next_window_id;
+    ctx.next_window_id += 1;
+    id
+}
+
+/// Abandon the queued windows from `from` on (each later one assumes the
+/// earlier ones decide as speculated): their tasks are aborted and their
+/// held events stay held for ordinary windows.
+fn abandon(ctx: &mut RunCtx, from: usize, reason: &'static str) {
+    if from >= ctx.pending.len() {
+        return;
+    }
+    for p in ctx.pending.drain(from..) {
+        abandoned(&ctx.source_id, &p, reason);
+    }
+}
+
+/// A speculated window discarded unused: counted, with how long its
+/// capture kept its sessions busy.
+fn abandoned(source_id: &str, p: &Pending, reason: &'static str) {
+    let busy = p.busy.elapsed();
+    metrics::counter!(
+        "deltaforge_mysql_activation_speculation_abandoned_total",
+        "source" => source_id.to_string(),
+        "reason" => reason,
+    )
+    .increment(1);
+    metrics::histogram!(
+        "deltaforge_mysql_activation_speculation_abandoned_seconds",
+        "source" => source_id.to_string(),
+    )
+    .record(busy.as_secs_f64());
+    if trace_enabled() {
+        let record = serde_json::json!({
+            "record": "abandoned",
+            "source": source_id,
+            "id": p.id,
+            "reason": reason,
+            "tables": p.batch.len(),
+            "busy_ms": busy.as_secs_f64() * 1e3,
+        });
+        tracing::info!(target: "deltaforge::proof_trace", "{record}");
+    }
+}
+
+/// What reading the stream during an admission may hold: at most one
+/// window's events and bytes for each window collected ahead
+/// (`activation_capture_concurrency`), in all (with what is already held); nothing
 /// after a read error, which is kept and raised where the stream is read
 /// next.
 struct Prefetch {
@@ -909,16 +1015,19 @@ impl Prefetch {
             .map(|(_, _, h, _)| u64::from(h.event_length))
             .sum();
         let stopped = ctx.prefetch_error.is_some();
+        // One window's limits for each window collected ahead.
+        let windows = cfg.activation_capture_concurrency.max(1);
         Self {
             events: VecDeque::new(),
             error: None,
             events_left: if stopped {
                 0
             } else {
-                cfg.activation_window_events
+                (cfg.activation_window_events * windows)
                     .saturating_sub(ctx.prefetched.len())
             },
-            bytes_left: cfg.activation_window_bytes.saturating_sub(held),
+            bytes_left: (cfg.activation_window_bytes * windows as u64)
+                .saturating_sub(held),
             next_seq: ctx.next_held_seq,
         }
     }
@@ -932,7 +1041,7 @@ impl Prefetch {
         &mut self,
         stream: &mut super::mysql_read_ahead::ReadAhead,
         admission: impl std::future::Future<Output = T>,
-        collector: &mut Collector,
+        collector: &mut Chain,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Option<T> {
         tokio::pin!(admission);
@@ -1012,6 +1121,31 @@ pub(crate) struct CapturedWindow {
     pub scanned: Duration,
 }
 
+/// A window's capture and scan in flight (the current window's or a
+/// speculated one's), counted until it ends or is aborted.
+struct InFlight(String);
+
+impl InFlight {
+    fn new(source_id: &str) -> Self {
+        metrics::gauge!(
+            "deltaforge_mysql_activation_captures_in_flight",
+            "source" => source_id.to_string(),
+        )
+        .increment(1.0);
+        Self(source_id.to_string())
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        metrics::gauge!(
+            "deltaforge_mysql_activation_captures_in_flight",
+            "source" => self.0.clone(),
+        )
+        .decrement(1.0);
+    }
+}
+
 /// One batched capture of the sorted `tables` (retried in the same order,
 /// at most [`CAPTURE_ATTEMPTS`] in all), then one scanner request answering
 /// every table over its own `(from_i, B]`, except a table whose rows start
@@ -1024,6 +1158,7 @@ pub(crate) async fn capture_and_scan(
     froms: &[MySqlCheckpoint],
     head: &MySqlCheckpoint,
 ) -> Result<CapturedWindow, SourceError> {
+    let _in_flight = InFlight::new(&cs.source_id);
     let tag = ScanTag {
         source_id: &cs.source_id,
         kind: ProofKind::Lazy,
@@ -2458,6 +2593,7 @@ fn observe_window(
         "held_head": t.held_head,
         "window_seq": t.window_seq,
         "commit_unix_us": t.commit_unix_us,
+        "queued": t.queued,
         "extensions_committed": t.work.extensions_committed,
         "positioned_attempts": t.work.positioned_attempts,
         "unanchored_attempts": t.work.unanchored_attempts,

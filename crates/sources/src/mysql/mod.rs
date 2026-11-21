@@ -384,9 +384,11 @@ pub(crate) struct RunCtx {
     /// The held sequence number of the event `read_next_event` last
     /// returned (0: read from the stream).
     last_seq: u64,
-    /// The speculative window, while its head is still ahead
-    /// (`mysql_window_speculation`).
-    pending: Option<mysql_window_speculation::Pending>,
+    /// The speculative windows, in stream order, while their heads are
+    /// still ahead (`mysql_window_speculation`).
+    pending: std::collections::VecDeque<mysql_window_speculation::Pending>,
+    /// The next activation window's number (reservations name windows).
+    next_window_id: u64,
     /// Windows committed so far (the proof trace's window numbers).
     window_seq: u64,
     /// While the proof trace is on: each table of the last committed window
@@ -1911,7 +1913,8 @@ impl MySqlSource {
             prefetched: Default::default(),
             next_held_seq: 1,
             last_seq: 0,
-            pending: None,
+            pending: std::collections::VecDeque::new(),
+            next_window_id: 1,
             window_seq: 0,
             release_watch: Default::default(),
             prefetch_error: None,
@@ -2120,7 +2123,7 @@ impl MySqlSource {
                         && ctx.lookahead.is_empty()
                         && ctx.prefetched.is_empty()
                         && ctx.prefetch_error.is_none()
-                        && ctx.pending.is_none()
+                        && ctx.pending.is_empty()
                     {
                         // A CloseUncertain/FailedClosed outcome returns an error from
                         // this block (gate 6); `loop_result?` re-propagates it before the
@@ -2862,8 +2865,8 @@ impl RunCtx {
         mysql_event::release_table_maps(self);
         self.parser_table_maps_installed = 0;
         self.prefetch_error = None;
-        // A speculative window goes too: its task is aborted.
-        self.pending = None;
+        // The speculative windows go too: their tasks are aborted.
+        self.pending.clear();
         self.prepared.clear();
         if !self.transaction_open() {
             return Ok(());

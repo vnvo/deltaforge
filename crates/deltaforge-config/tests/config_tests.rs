@@ -1271,9 +1271,10 @@ fn postgres_max_message_bytes_is_bounded() {
 #[test]
 fn mysql_proof_bounds_are_validated() {
     use deltaforge_config::{
-        MYSQL_PROOF_CONTROL_CONNECTIONS, MYSQL_PROOF_LOCK_WAIT_SECS,
-        MYSQL_PROOF_MAX_SEEK_MS, MYSQL_PROOF_WINDOW_BYTES,
-        MYSQL_PROOF_WINDOW_EVENTS, MYSQL_PROOF_WINDOW_MS, MysqlProofCfg,
+        MYSQL_PROOF_CAPTURE_CONCURRENCY, MYSQL_PROOF_CONTROL_CONNECTIONS,
+        MYSQL_PROOF_LOCK_WAIT_SECS, MYSQL_PROOF_MAX_SEEK_MS,
+        MYSQL_PROOF_WINDOW_BYTES, MYSQL_PROOF_WINDOW_EVENTS,
+        MYSQL_PROOF_WINDOW_MS, MysqlProofCfg,
     };
     let parse = |json: &str| serde_json::from_str::<MysqlProofCfg>(json);
     let d = parse("{}").unwrap();
@@ -1285,9 +1286,10 @@ fn mysql_proof_bounds_are_validated() {
             d.activation_window_bytes,
             d.max_seek_ms,
             d.capture_lock_wait_secs,
-            d.control_connections
+            d.control_connections,
+            d.activation_capture_concurrency
         ),
-        (50, 10_000, 16 * 1024 * 1024, 10_000, 30, 4)
+        (50, 10_000, 16 * 1024 * 1024, 10_000, 30, 4, 2)
     );
     let fields: [(&str, u64, u64); 6] = [
         (
@@ -1333,6 +1335,42 @@ fn mysql_proof_bounds_are_validated() {
             assert!(e.contains(name), "{name}={bad}: {e}");
         }
     }
+    let (min, max) = (
+        *MYSQL_PROOF_CAPTURE_CONCURRENCY.start(),
+        *MYSQL_PROOF_CAPTURE_CONCURRENCY.end(),
+    );
+    let with = |k: usize| {
+        parse(&format!(
+            r#"{{"control_connections": 16, "activation_capture_concurrency": {k}}}"#
+        ))
+    };
+    for ok in [min, max] {
+        assert_eq!(with(ok).unwrap().activation_capture_concurrency, ok);
+    }
+    for bad in [min - 1, max + 1] {
+        let e = with(bad).unwrap_err().to_string();
+        assert!(e.contains("activation_capture_concurrency"), "{bad}: {e}");
+    }
+    // The decided window's own capture needs one more connection: the
+    // default follows a smaller pool, an explicit value must fit it.
+    let small = parse(r#"{"control_connections": 2}"#).unwrap();
+    assert_eq!(small.activation_capture_concurrency, 1);
+    let e = parse(
+        r#"{"control_connections": 3, "activation_capture_concurrency": 3}"#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("below proofs.control_connections"), "{e}");
+    let fits = parse(
+        r#"{"control_connections": 5, "activation_capture_concurrency": 4}"#,
+    )
+    .unwrap();
+    assert_eq!(fits.activation_capture_concurrency, 4);
+    assert_eq!(
+        parse(&serde_json::to_string(&fits).unwrap()).unwrap(),
+        fits,
+        "round trip"
+    );
     assert!(parse(r#"{"activation_window": 5}"#).is_err());
     assert!(parse(r#"{"max_seek_ms": -1}"#).is_err());
 }

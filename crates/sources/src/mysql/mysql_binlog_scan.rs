@@ -471,6 +471,8 @@ pub(crate) fn scan_digest(
 }
 
 const ANONYMOUS_GTID: u8 = 34;
+/// The TABLE_MAP event type.
+const TABLE_MAP: u8 = 19;
 
 /// Event types the connector does not parse that cannot change table shapes
 /// or hide a gap. ANONYMOUS_GTID only in file/position mode: a GTID scan
@@ -707,6 +709,9 @@ fn event_kind(header: &EventHeader, data: &EventData) -> String {
         EventData::WriteRows(_)
         | EventData::UpdateRows(_)
         | EventData::DeleteRows(_) => "rows".into(),
+        EventData::Skipped => {
+            format!("rows or table map (type {})", header.event_type)
+        }
         EventData::Xid(_) => "Xid".into(),
         EventData::TransactionPayload(_) => "transaction payload".into(),
         EventData::Rotate(_) => "Rotate".into(),
@@ -858,6 +863,7 @@ impl Walk {
             | EventData::WriteRows(_)
             | EventData::UpdateRows(_)
             | EventData::DeleteRows(_)
+            | EventData::Skipped
             | EventData::RowsQuery(_) => {}
         }
         Ok(())
@@ -1156,6 +1162,10 @@ async fn scan(
         SessionError::NoIdentity(why) => ProofError::OtherServer(why),
         SessionError::Connect(class, why) => ProofError::Open(class, why),
     })?;
+    // The proof needs only the framing and the statements: row bodies are
+    // passed over undecoded (the change stream decodes, and fails closed on,
+    // the same events when it reads them).
+    stream.parser.skip_rows = true;
     let opened = Instant::now();
     trace.setup = opened - started;
     let mut first_at: Option<Instant> = None;
@@ -1385,6 +1395,10 @@ fn observe_event(
         | EventData::FormatDescription(_)
         | EventData::PreviousGtids(_) => d.protocol_events += 1,
         EventData::TableMap(_) => d.table_maps += 1,
+        EventData::Skipped if header.event_type == TABLE_MAP => {
+            d.table_maps += 1
+        }
+        EventData::Skipped => d.row_events += 1,
         EventData::WriteRows(_)
         | EventData::UpdateRows(_)
         | EventData::DeleteRows(_) => d.row_events += 1,
@@ -1410,6 +1424,7 @@ fn observe_event(
         (
             EventData::Query(_)
             | EventData::TableMap(_)
+            | EventData::Skipped
             | EventData::WriteRows(_)
             | EventData::UpdateRows(_)
             | EventData::DeleteRows(_)

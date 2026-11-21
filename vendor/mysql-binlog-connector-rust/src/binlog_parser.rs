@@ -38,6 +38,12 @@ pub struct BinlogParser {
     /// the table maps above; emptied when it holds
     /// [`TABLE_MAP_REUSE_MAX`] ids and a new one arrives.
     parsed_table_maps: HashMap<u64, (Vec<u8>, Arc<TableMapEvent>)>,
+    /// DeltaForge patch: return TABLE_MAP and rows events as
+    /// [`EventData::Skipped`] without reading their bodies into memory or
+    /// decoding them, for a reader that needs only the binlog's framing and
+    /// statements. Compressed transaction payloads are parsed the same way.
+    /// `false` parses them (upstream behavior).
+    pub skip_rows: bool,
 }
 
 /// DeltaForge patch: the most table ids [`BinlogParser`] keeps a parsed
@@ -59,6 +65,7 @@ impl BinlogParser {
             transaction_end: None,
             table_maps_installed: 0,
             parsed_table_maps: HashMap::new(),
+            skip_rows: false,
         }
     }
 
@@ -119,10 +126,17 @@ impl BinlogParser {
             - constants::EVENT_HEADER_LENGTH
             - self.checksum_length as usize;
 
+        let event_type = EventType::from_code(header.event_type);
+        if self.skip_rows && Self::is_rows_or_table_map(&event_type) {
+            stream.seek(SeekFrom::Current(
+                (data_length + self.checksum_length as usize) as i64,
+            ))?;
+            return Ok((header, EventData::Skipped));
+        }
+
         let buf = self.read_event_data(stream, data_length)?;
         let mut cursor = Cursor::new(&buf);
 
-        let event_type = EventType::from_code(header.event_type);
         match event_type {
             EventType::FormatDescription => {
                 let event_data = FormatDescriptionEvent::parse(&mut cursor, data_length)?;
@@ -197,7 +211,10 @@ impl BinlogParser {
 
             EventType::TransactionPayload => Ok((
                 header,
-                EventData::TransactionPayload(TransactionPayloadEvent::parse(&mut cursor)?),
+                EventData::TransactionPayload(TransactionPayloadEvent::parse_with(
+                    &mut cursor,
+                    self.skip_rows,
+                )?),
             )),
 
             EventType::RowsQuery => Ok((
@@ -226,10 +243,75 @@ impl BinlogParser {
         Ok(buf)
     }
 
+    /// DeltaForge patch: the events [`skip_rows`](Self::skip_rows) skips.
+    fn is_rows_or_table_map(event_type: &EventType) -> bool {
+        matches!(
+            event_type,
+            EventType::TableMap
+                | EventType::WriteRows
+                | EventType::ExtWriteRows
+                | EventType::UpdateRows
+                | EventType::ExtUpdateRows
+                | EventType::DeleteRows
+                | EventType::ExtDeleteRows
+        )
+    }
+
     fn get_row_event_version(event_type: &EventType) -> u8 {
         match event_type {
             EventType::ExtWriteRows | EventType::ExtUpdateRows | EventType::ExtDeleteRows => 2,
             _ => 1,
         }
+    }
+}
+
+#[cfg(test)]
+mod skip_rows_tests {
+    use super::*;
+
+    /// One event: header, `body`, a 4-byte checksum.
+    fn event(event_type: u8, body: &[u8]) -> Vec<u8> {
+        let len = (constants::EVENT_HEADER_LENGTH + body.len() + 4) as u32;
+        let mut e = Vec::new();
+        e.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+        e.push(event_type);
+        e.extend_from_slice(&1u32.to_le_bytes()); // server id
+        e.extend_from_slice(&len.to_le_bytes());
+        e.extend_from_slice(&0u32.to_le_bytes()); // next position
+        e.extend_from_slice(&0u16.to_le_bytes()); // flags
+        e.extend_from_slice(body);
+        e.extend_from_slice(&[0xaa; 4]); // checksum
+        e
+    }
+
+    /// A TABLE_MAP-less WRITE_ROWS (v2) event then an XID event.
+    fn rows_then_xid() -> Vec<u8> {
+        let mut rows = vec![7, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1, 0xff];
+        rows.extend_from_slice(&[0x5a; 40]);
+        let mut s = event(30, &rows);
+        s.extend(event(16, &42u64.to_le_bytes()));
+        s
+    }
+
+    #[test]
+    fn a_skipped_rows_event_leaves_the_next_event_framed() {
+        let bytes = rows_then_xid();
+        let mut cursor = Cursor::new(&bytes);
+        let mut parser = BinlogParser::new(4);
+        parser.skip_rows = true;
+        let (h, d) = parser.next(&mut cursor).unwrap();
+        assert_eq!(h.event_type, 30);
+        assert!(matches!(d, EventData::Skipped), "{d:?}");
+        let (_, d) = parser.next(&mut cursor).unwrap();
+        assert!(matches!(d, EventData::Xid(XidEvent { xid: 42 })), "{d:?}");
+        assert_eq!(cursor.position() as usize, bytes.len());
+    }
+
+    #[test]
+    fn without_skip_rows_the_same_rows_event_is_decoded() {
+        let bytes = rows_then_xid();
+        let mut parser = BinlogParser::new(4);
+        // No table map for table id 7: decoding the rows fails.
+        assert!(parser.next(&mut Cursor::new(&bytes)).is_err());
     }
 }

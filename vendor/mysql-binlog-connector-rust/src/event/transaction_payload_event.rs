@@ -14,6 +14,12 @@ pub struct TransactionPayloadEvent {
 
 impl TransactionPayloadEvent {
     pub fn parse(cursor: &mut Cursor<&Vec<u8>>) -> Result<Self, BinlogError> {
+        Self::parse_with(cursor, false)
+    }
+
+    /// DeltaForge patch: [`parse`](Self::parse), parsing the payload's events
+    /// with [`BinlogParser::skip_rows`] set to `skip_rows`.
+    pub fn parse_with(cursor: &mut Cursor<&Vec<u8>>, skip_rows: bool) -> Result<Self, BinlogError> {
         // refer: https://dev.mysql.com/doc/refman/8.0/en/binary-log-transaction-compression.html
         let (_compress_type, uncompressed_size) = Self::parse_meta(cursor)?;
 
@@ -24,6 +30,7 @@ impl TransactionPayloadEvent {
         // construct a new parser from the payload
         let mut payload_cursor = Cursor::new(uncompressed_payload);
         let mut parser = BinlogParser::new(0);
+        parser.skip_rows = skip_rows;
 
         // parse events in payload
         let mut uncompressed_events: Vec<(EventHeader, EventData)> = Vec::new();
