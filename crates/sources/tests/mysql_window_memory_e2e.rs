@@ -302,14 +302,26 @@ fn process_rss() -> Option<u64> {
 #[test]
 fn the_cache_estimate_covers_its_allocated_memory() {
     use sources::mysql::{CacheProbe, ProbeMix};
+    // The last field: distinct definitions over the tables (0: one per
+    // table); 40,000 tables of 100 definitions share them.
     let mixes = [
-        (40_000, 40, 1, 12, true, true),
-        (70_000, 70, 1, 6, true, true),
-        (4_096, 1, 1, 0, false, false),
-        (1_000, 10, 100, 40, true, true),
-        (10, 1, 10_000, 12, true, true),
+        (40_000, 40, 1, 12, true, true, 0),
+        (40_000, 40, 1, 12, true, true, 100),
+        (70_000, 70, 1, 6, true, true, 0),
+        (4_096, 1, 1, 0, false, false, 0),
+        (1_000, 10, 100, 40, true, true, 0),
+        (10, 1, 10_000, 12, true, true, 0),
     ];
-    for (tables, databases, records, columns, selections, versions) in mixes {
+    for (
+        tables,
+        databases,
+        records,
+        columns,
+        selections,
+        versions,
+        definitions,
+    ) in mixes
+    {
         let mix = ProbeMix {
             tables,
             databases,
@@ -317,12 +329,18 @@ fn the_cache_estimate_covers_its_allocated_memory() {
             columns,
             selections,
             versions,
+            definitions,
         };
+        // The readout is written into room reserved before the count
+        // starts and printed after it: a captured test's output buffer
+        // grows on this thread and would be counted as the cache's.
+        let mut log = String::with_capacity(1 << 16);
         let before = held();
         let (resident_before, rss_before) =
             (allocator_resident(), process_rss());
         let mut probe = CacheProbe::fill(mix);
-        let check = |probe: &CacheProbe, when: &str| {
+        let check = |probe: &CacheProbe, when: &str, log: &mut String| {
+            use std::fmt::Write;
             let estimate = probe.estimate();
             let allocated = (held() - before).max(0) as u64;
             let ratio = allocated as f64 / estimate.max(1) as f64;
@@ -330,26 +348,29 @@ fn the_cache_estimate_covers_its_allocated_memory() {
             let rss = process_rss()
                 .zip(rss_before)
                 .map(|(now, was)| now as i64 - was as i64);
-            eprintln!(
+            writeln!(
+                log,
                 "{mix:?} {when}: estimate {estimate} bytes, cache allocated \
                  {allocated} bytes (ratio {ratio:.2}); allocator resident \
                  {resident:+} bytes, process RSS {rss:+?} bytes"
-            );
+            )
+            .expect("writes");
             assert!(allocated <= estimate, "{when}: {allocated} > {estimate}");
             assert!(
                 estimate <= 2 * allocated,
                 "{when}: {estimate} > 2 x {allocated}"
             );
         };
-        check(&probe, "filled");
+        check(&probe, "filled", &mut log);
         probe.invalidate_databases(databases / 2);
         if databases > 1 {
-            check(&probe, "after a barrier on half the databases");
+            check(&probe, "after a barrier on half the databases", &mut log);
         }
         probe.evict_to(probe.estimate() / 4);
-        check(&probe, "after eviction to a quarter");
+        check(&probe, "after eviction to a quarter", &mut log);
         probe.invalidate_all();
         let left = (held() - before).max(0) as u64;
+        eprint!("{log}");
         eprintln!(
             "{mix:?} cleared: estimate {}, cache allocated {left}",
             probe.estimate()

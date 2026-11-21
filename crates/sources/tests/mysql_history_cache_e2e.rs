@@ -306,8 +306,9 @@ async fn evicted_tables_return_in_batched_reads() {
     use sources::stream_probe::{Point, hold_after, reset_event_hooks};
     const N: usize = 300;
     const ID: &str = "hist-evict";
-    // A cache of about 64 tables: most of them are evicted between bursts.
-    const BOUND: u64 = 512 << 10;
+    // A cache of about 75 tables (the 300 share one definition, held
+    // once): most of them are evicted between bursts.
+    const BOUND: u64 = 192 << 10;
     let snap = recorded();
     let (container, port) = start().await;
     let mut ddl = vec![format!("CREATE DATABASE {DB}")];
