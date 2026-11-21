@@ -45,6 +45,7 @@ use super::mysql_binlog_scan::{
     trace_enabled, trace_proof,
 };
 use super::mysql_event::read_next_event;
+use super::mysql_window_budget::{Caps, Fill};
 use super::mysql_window_speculation::{
     Collector, Covers, Governs, Held, NextWindow, Pending, SpecInputs,
     check_required, first_affecting, first_uncovered, reserved_rows_covered,
@@ -503,7 +504,10 @@ pub(super) async fn maybe_window(
         BTreeMap::new();
     // First-touch order: the order the batch commits in.
     let mut order: Vec<(String, String)> = Vec::new();
-    let mut full = admit(ctx, &mut batch, &mut order, found)
+    // What the window has taken, at its tables' costs before capture: it
+    // closes before its plan budget would defer any of them.
+    let mut fill: Option<Fill> = None;
+    let mut full = admit(ctx, &mut batch, &mut order, &mut fill, found)
         .await
         .map_err(LoopControl::Fail)?;
     // At a speculative window's head the required set is computed over
@@ -569,8 +573,8 @@ pub(super) async fn maybe_window(
                 )));
             }
         } else {
-            if full {
-                break "tables";
+            if let Some(why) = full {
+                break why;
             }
             if queue.len() >= cfg.activation_window_events {
                 break "events";
@@ -630,7 +634,7 @@ pub(super) async fn maybe_window(
                 ));
             }
             if !ahead.broken {
-                full = admit(ctx, &mut batch, &mut order, found)
+                full = admit(ctx, &mut batch, &mut order, &mut fill, found)
                     .await
                     .map_err(LoopControl::Fail)?;
             }
@@ -703,12 +707,17 @@ pub(super) async fn maybe_window(
         lock_wait_secs: cfg.capture_lock_wait_secs,
         scanner: std::sync::Arc::clone(&ctx.proof_scanner),
     };
+    let lineages = match &fill {
+        Some(f) => f.other_lineages(),
+        None => other_lineages(ctx).await.map_err(LoopControl::Fail)?,
+    };
     let mut collector = Collector::new(
         ahead,
         ctx.allow.clone(),
         scope,
         ctx.selection.proven_keys(),
         batch.keys().cloned().collect(),
+        Fill::new(Caps::current(), lineages),
         &cfg,
         SpecInputs {
             capture: capture.clone(),
@@ -1564,15 +1573,8 @@ async fn admit_batch(
     // for the next window, whose first table one of them is.
     let mut tables = tables;
     let deferred = {
-        use super::mysql_window_budget::{Caps, Prefix, table_cost};
-        let other_lineages = storage::adapters::source_lineage::load(
-            &ctx.registry_backend,
-            &ctx.tenant,
-            &ctx.source_id,
-        )
-        .await
-        .map_err(SourceError::Other)?
-        .map_or(0, |r| r.prior_lineage_hashes.len() as u64);
+        use super::mysql_window_budget::{Prefix, table_cost};
+        let other_lineages = other_lineages(ctx).await?;
         let mut prefix = Prefix::new(Caps::current());
         let mut cut = tables.len();
         for (i, ((db, table), at, _)) in tables.iter().enumerate() {
@@ -2263,17 +2265,20 @@ fn capture_failure(
 }
 
 /// Add each newly touched table that has no positional proof at its rows'
-/// start (and is in scope) to the batch, at its first start. Returns
-/// whether the batch is full ([`MAX_BATCH_TABLES`]): the window closes. A
-/// table that does not fit (one transaction touching more new tables than
-/// are left) stays out, counted and logged: its rows take the per-table
-/// proof when they are dispatched.
+/// start (and is in scope) to the batch, at its first start, and to the
+/// window's `fill`. Returns why the window is full, if it is
+/// ([`window_full`]): it closes. A table past [`MAX_BATCH_TABLES`] (one
+/// transaction touching more new tables than are left) stays out, counted
+/// and logged: its rows take the per-table proof when they are dispatched.
+/// A table past the budget is still taken: the event's other tables close
+/// the window with it, and the prefix after capture decides it.
 async fn admit(
     ctx: &mut RunCtx,
     batch: &mut BTreeMap<(String, String), MySqlCheckpoint>,
     order: &mut Vec<(String, String)>,
+    fill: &mut Option<Fill>,
     found: Vec<(String, String, MySqlCheckpoint)>,
-) -> Result<bool, SourceError> {
+) -> Result<Option<&'static str>, SourceError> {
     for (db, table, at) in found {
         let k = (db, table);
         if batch.contains_key(&k) || !ctx.allow.matches(&k.0, &k.1) {
@@ -2301,10 +2306,49 @@ async fn admit(
             .increment(1);
             continue;
         }
+        let key_bytes = ctx
+            .registry_scope
+            .current()?
+            .key(&k.0, &k.1)
+            .backend_key()
+            .len();
+        let f = match fill {
+            Some(f) => f,
+            None => fill
+                .insert(Fill::new(Caps::current(), other_lineages(ctx).await?)),
+        };
+        f.take(key_bytes as u64);
         order.push(k.clone());
         batch.insert(k, at);
     }
-    Ok(batch.len() >= MAX_BATCH_TABLES)
+    Ok(window_full(batch.len(), fill.as_ref()))
+}
+
+/// Why a window being read ahead is full, if it is: its table cap, or its
+/// plan budget before capture (`mysql_window_budget::Fill`).
+pub(crate) fn window_full(
+    tables: usize,
+    fill: Option<&Fill>,
+) -> Option<&'static str> {
+    if tables >= MAX_BATCH_TABLES {
+        Some("tables")
+    } else if fill.is_some_and(Fill::full) {
+        Some("budget")
+    } else {
+        None
+    }
+}
+
+/// The source's other lineages, which every table's plan reads.
+async fn other_lineages(ctx: &RunCtx) -> Result<u64, SourceError> {
+    Ok(storage::adapters::source_lineage::load(
+        &ctx.registry_backend,
+        &ctx.tenant,
+        &ctx.source_id,
+    )
+    .await
+    .map_err(SourceError::Other)?
+    .map_or(0, |r| r.prior_lineage_hashes.len() as u64))
 }
 
 impl RunCtx {

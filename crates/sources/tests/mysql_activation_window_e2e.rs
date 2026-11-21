@@ -552,6 +552,51 @@ async fn a_window_over_its_caps_admits_its_prefix_and_defers_the_rest() {
     );
 }
 
+/// A burst over the plan's read-item cap: each window closes as its
+/// budget fills while it reads ahead (three tables of 27 read items under a
+/// cap of 81), so no table is captured and then deferred, and every row is
+/// delivered once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn a_window_closes_when_its_budget_fills() {
+    let (container, port) = start(true).await;
+    let mut c = conn(port).await;
+    let n = 12;
+    tables(&mut c, n).await;
+    let _caps = WindowCaps::set(1 << 30, 3 * 27, 1 << 30);
+    let id = "budget";
+    let r = run(port, id, MysqlProofCfg::default()).await;
+    r.handle.pause();
+    for i in 0..n {
+        c.query_drop(format!("INSERT INTO t{i:04} VALUES (1, {i})"))
+            .await
+            .unwrap();
+    }
+    r.handle.resume();
+    r.delivered(n, Duration::from_secs(120)).await;
+    let got = r.firsts.lock().unwrap().clone();
+    for i in 0..n as i64 {
+        assert_eq!(got.get(&format!("t{i:04}")), Some(&(1, i)), "t{i:04}");
+    }
+    r.stop().await;
+    container.rm().await.ok();
+
+    let windows = records(id, "window");
+    let tables: Vec<u64> = windows.iter().map(|w| count(w, "tables")).collect();
+    assert_eq!(tables.iter().sum::<u64>(), n as u64, "{windows:?}");
+    assert!(tables.iter().all(|t| *t <= 3), "{tables:?}");
+    let budget = windows
+        .iter()
+        .filter(|w| w["closed_by"] == "budget")
+        .count();
+    assert!(budget >= 3, "closed by their budget: {windows:?}");
+    let deferred = records(id, "proof")
+        .iter()
+        .filter(|p| p["outcome"] == "deferred")
+        .count();
+    assert_eq!(deferred, 0, "nothing captured and then deferred");
+}
+
 /// A table whose state exceeds the per-table limit, or whose registration
 /// needs more reads than a plan allows, halts the source with its incident
 /// when it is reached, as the window's first table: nothing is delivered or
