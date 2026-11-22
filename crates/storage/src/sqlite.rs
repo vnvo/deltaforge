@@ -95,6 +95,16 @@ fn ensure_log_meta(
     ns: &str,
     key: &str,
 ) -> rusqlite::Result<()> {
+    // The common case (the row exists) is one primary-key probe: the
+    // stream's maximum is read only when the row is created.
+    let exists = conn
+        .prepare_cached("SELECT 1 FROM df_log_meta WHERE ns=?1 AND key=?2")?
+        .query_row(params![ns, key], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if exists {
+        return Ok(());
+    }
     conn.prepare_cached(
         "INSERT OR IGNORE INTO df_log_meta(ns, key, min_valid_from_seq, head_seq)
          VALUES(?1, ?2, 0,
@@ -143,11 +153,18 @@ impl std::fmt::Debug for SqliteStorageBackend {
     }
 }
 
+/// Prepared statements kept per connection.
+const STATEMENT_CACHE: usize = 64;
+
+/// The schema, and the connection's settings: WAL, `synchronous=NORMAL`, and
+/// a 64 MiB page cache (`cache_size` in KiB when negative) so reads of
+/// recently written pages are served from memory.
 const SCHEMA: &str = r#"
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 PRAGMA busy_timeout=5000;
 PRAGMA foreign_keys=ON;
+PRAGMA cache_size=-65536;
 
 CREATE TABLE IF NOT EXISTS df_kv (
     ns          TEXT    NOT NULL,
@@ -225,6 +242,9 @@ impl SqliteStorageBackend {
 
     fn init(conn: Connection) -> Result<Arc<Self>> {
         conn.execute_batch(SCHEMA)?;
+        // Every hot statement is prepared once and kept: more distinct
+        // statements than the default 16 are in use at once.
+        conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
         // Additive migration for pre-existing df_log tables (no destructive backfill).
         migrate_df_log_columns(&conn)?;
         // Only now that capture_id is guaranteed to exist (fresh CREATE TABLE or the
@@ -1118,7 +1138,7 @@ impl StorageBackend for SqliteStorageBackend {
         let ns = ns.to_string();
         let key = key.to_string();
         db!(self, move |conn: &Connection| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT seq, COALESCE(ts_ms, ts*1000), capture_id, content_hash, val
                  FROM df_log WHERE ns=?1 AND key=?2 AND seq>?3
                  ORDER BY seq ASC LIMIT ?4",
@@ -1415,7 +1435,7 @@ fn query_log(
     since_seq: Option<u64>,
 ) -> Result<Vec<(u64, Vec<u8>)>> {
     let entries = if let Some(since) = since_seq {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT seq, val FROM df_log WHERE ns=?1 AND key=?2 AND seq>?3 ORDER BY seq ASC",
         )?;
         stmt.query_map(params![ns, key, since as i64], |r| {
@@ -1424,8 +1444,9 @@ fn query_log(
         .map(|r| r.map_err(Into::into))
         .collect::<Result<Vec<_>>>()?
     } else {
-        let mut stmt = conn
-            .prepare("SELECT seq, val FROM df_log WHERE ns=?1 AND key=?2 ORDER BY seq ASC")?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT seq, val FROM df_log WHERE ns=?1 AND key=?2 ORDER BY seq ASC",
+        )?;
         stmt.query_map(params![ns, key], |r| {
             Ok((r.get::<_, i64>(0)? as u64, r.get(1)?))
         })?
@@ -1646,6 +1667,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.removed, 3);
+    }
+
+    /// An existing stream's metadata row is left exactly as it is; a new
+    /// stream's starts at its current maximum sequence.
+    #[test]
+    fn ensuring_log_meta_keeps_an_existing_row_and_initializes_a_new_one() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        migrate_df_log_columns(&conn).unwrap();
+        for _ in 0..3 {
+            conn.execute(
+                "INSERT INTO df_log(ns, key, val) VALUES('n', 'k', x'00')",
+                [],
+            )
+            .unwrap();
+        }
+        ensure_log_meta(&conn, "n", "k").unwrap();
+        let row = |c: &Connection| -> (i64, i64) {
+            c.query_row(
+                "SELECT min_valid_from_seq, head_seq FROM df_log_meta
+                 WHERE ns='n' AND key='k'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(row(&conn), (0, 3), "a new row starts at the maximum");
+        conn.execute(
+            "UPDATE df_log_meta SET min_valid_from_seq=2, head_seq=9",
+            [],
+        )
+        .unwrap();
+        ensure_log_meta(&conn, "n", "k").unwrap();
+        assert_eq!(row(&conn), (2, 9), "an existing row is untouched");
     }
 
     /// An old-format df_log (no replay columns, no metadata, no capture index) with
