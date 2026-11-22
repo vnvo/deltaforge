@@ -9,7 +9,7 @@
 //! otherwise the run completes, records what is missing and supports no
 //! proof-performance conclusion.
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -91,41 +91,190 @@ fn any_record(line: &str) -> Option<Value> {
     is_record(&v).then_some(v)
 }
 
-/// The log text written since `mark`.
-async fn read_since(source: &TraceSource, mark: &Mark) -> Result<String> {
+/// Feed `each` the log lines written since `mark`, one at a time, so the
+/// log is never held whole (a million active tables log about 1.2 GB).
+/// Docker's two streams are spooled to files in `spool` (the instance may
+/// log on either; stdout is read first, then stderr) and removed after.
+async fn stream_since(
+    source: &TraceSource,
+    mark: &Mark,
+    spool: &Path,
+    mut each: impl FnMut(&str),
+) -> Result<()> {
     match (source, mark) {
         (TraceSource::DockerLogs { container }, Mark::Since(t)) => {
-            let out = tokio::process::Command::new("docker")
-                .args([
-                    "logs",
-                    "--since",
-                    &t.to_rfc3339(),
-                    "--until",
-                    &Utc::now().to_rfc3339(),
-                    container,
-                ])
-                .output()
-                .await
-                .context("docker logs")?;
-            anyhow::ensure!(
-                out.status.success(),
-                "docker logs {container}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            // The instance may log on either stream.
-            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-            text.push_str(&String::from_utf8_lossy(&out.stderr));
-            Ok(text)
+            let out = spool.join(".proof-trace-stdout");
+            let err = spool.join(".proof-trace-stderr");
+            let status = async {
+                tokio::process::Command::new("docker")
+                    .args([
+                        "logs",
+                        "--since",
+                        &t.to_rfc3339(),
+                        "--until",
+                        &Utc::now().to_rfc3339(),
+                        container,
+                    ])
+                    .stdout(std::fs::File::create(&out)?)
+                    .stderr(std::fs::File::create(&err)?)
+                    .status()
+                    .await
+                    .context("docker logs")
+            }
+            .await;
+            let read = match status {
+                Ok(s) if s.success() => each_line(&out, 0, &mut each)
+                    .and_then(|()| each_line(&err, 0, &mut each)),
+                Ok(_) => {
+                    let mut head = Vec::new();
+                    if let Ok(f) = std::fs::File::open(&err) {
+                        f.take(4096).read_to_end(&mut head).ok();
+                    }
+                    Err(anyhow::anyhow!(
+                        "docker logs {container}: {}",
+                        String::from_utf8_lossy(&head)
+                    ))
+                }
+                Err(e) => Err(e),
+            };
+            std::fs::remove_file(&out).ok();
+            std::fs::remove_file(&err).ok();
+            read
         }
         (TraceSource::File { .. }, Mark::Offset(path, at)) => {
-            let mut f = std::fs::File::open(path)
-                .with_context(|| format!("open {}", path.display()))?;
-            f.seek(SeekFrom::Start(*at))?;
-            let mut text = String::new();
-            f.read_to_string(&mut text)?;
-            Ok(text)
+            each_line(path, *at, &mut each)
         }
         _ => anyhow::bail!("the trace mark does not match its source"),
+    }
+}
+
+/// Feed `each` the lines of `path` from byte `at`, without their line
+/// ending (`\n` or `\r\n`); invalid UTF-8 is replaced, not an error.
+fn each_line(path: &Path, at: u64, each: &mut impl FnMut(&str)) -> Result<()> {
+    let mut f = std::fs::File::open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    f.seek(SeekFrom::Start(at))?;
+    let mut r = BufReader::with_capacity(1 << 20, f);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if r.read_until(b'\n', &mut line)? == 0 {
+            return Ok(());
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+        }
+        each(&String::from_utf8_lossy(&line));
+    }
+}
+
+/// The run's record counts over every source in the log.
+#[derive(Debug, Clone, Copy, Default)]
+struct Counts {
+    records: u64,
+    scans: u64,
+    requests: u64,
+    proofs: u64,
+    malformed: u64,
+}
+
+/// One server's JSONL file of proof records.
+struct Out {
+    /// The records' `source`: `src-<server>`.
+    source: String,
+    path: PathBuf,
+    file: Option<BufWriter<std::fs::File>>,
+    written: u64,
+    /// The first failure to create or write the file.
+    error: Option<String>,
+}
+
+/// The log's proof records as it is read: counted, and each written at once
+/// to its server's file, so no record is held in memory. A record of
+/// another source is counted but written nowhere.
+struct Router {
+    outs: Vec<Out>,
+    counts: Counts,
+}
+
+impl Router {
+    /// One `proof-trace-<server>.jsonl` file in `dir` per server.
+    fn create(dir: &Path, servers: &[String]) -> Router {
+        let outs = servers
+            .iter()
+            .map(|name| {
+                let path = dir.join(format!("proof-trace-{name}.jsonl"));
+                let (file, error) = match std::fs::File::create(&path) {
+                    Ok(f) => (Some(BufWriter::new(f)), None),
+                    Err(e) => (None, Some(e.to_string())),
+                };
+                Out {
+                    source: format!("src-{name}"),
+                    path,
+                    file,
+                    written: 0,
+                    error,
+                }
+            })
+            .collect();
+        Router {
+            outs,
+            counts: Counts::default(),
+        }
+    }
+
+    /// One log line. Measurement records are recognized and left out; a
+    /// line that claims a record but does not parse as one, or carries an
+    /// unknown type, is malformed.
+    fn line(&mut self, line: &str) {
+        let r = match any_record(line) {
+            Some(r) => match kind(&r) {
+                Kind::Proof => r,
+                Kind::Measurement => return,
+                Kind::Unknown => {
+                    self.counts.malformed += 1;
+                    return;
+                }
+            },
+            None => {
+                if claims_record(line) {
+                    self.counts.malformed += 1;
+                }
+                return;
+            }
+        };
+        self.counts.records += 1;
+        match r["record"].as_str() {
+            Some("scan") => self.counts.scans += 1,
+            Some("request") => self.counts.requests += 1,
+            Some("proof") => self.counts.proofs += 1,
+            _ => {}
+        }
+        let Some(out) = self.outs.iter_mut().find(|o| r["source"] == o.source)
+        else {
+            return;
+        };
+        out.written += 1;
+        if let Some(f) = out.file.as_mut()
+            && let Err(e) = writeln!(f, "{r}")
+        {
+            out.error.get_or_insert(e.to_string());
+            out.file = None;
+        }
+    }
+
+    /// Flush every file.
+    fn finish(&mut self) {
+        for out in &mut self.outs {
+            if let Some(mut f) = out.file.take()
+                && let Err(e) = f.flush()
+            {
+                out.error.get_or_insert(e.to_string());
+            }
+        }
     }
 }
 
@@ -148,25 +297,6 @@ pub struct Collected {
     pub files: Vec<String>,
     /// Why the evidence is incomplete (empty when complete).
     pub errors: Vec<String>,
-}
-
-/// The proof records in `text`, and how many lines claim to carry a record
-/// but do not parse, or carry one of an unknown type. Measurement records
-/// are recognized and left out.
-fn parse(text: &str) -> (Vec<Value>, u64) {
-    let (mut records, mut malformed) = (Vec::new(), 0);
-    for line in text.lines() {
-        match any_record(line) {
-            Some(r) => match kind(&r) {
-                Kind::Proof => records.push(r),
-                Kind::Measurement => {}
-                Kind::Unknown => malformed += 1,
-            },
-            None if claims_record(line) => malformed += 1,
-            None => {}
-        }
-    }
-    (records, malformed)
 }
 
 /// A line that claims to carry a proof-trace record.
@@ -234,38 +364,34 @@ pub async fn collect(
     let Some(source) = &cfg.deltaforge.proof_trace else {
         return out;
     };
-    let text = match read_since(source, mark).await {
-        Ok(t) => t,
-        Err(e) => {
-            out.errors.push(format!("read the trace: {e:#}"));
-            return out;
+    let names: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
+    let mut router = Router::create(dir, &names);
+    if let Err(e) =
+        stream_since(source, mark, dir, |line| router.line(line)).await
+    {
+        out.errors.push(format!("read the trace: {e:#}"));
+        for o in &router.outs {
+            std::fs::remove_file(&o.path).ok();
         }
-    };
-    let records;
-    (records, out.malformed) = parse(&text);
+        return out;
+    }
+    router.finish();
+    let c = router.counts;
+    (
+        out.records,
+        out.scans,
+        out.requests,
+        out.proofs,
+        out.malformed,
+    ) = (c.records, c.scans, c.requests, c.proofs, c.malformed);
     if out.malformed > 0 {
         out.errors
             .push(format!("{} malformed proof-trace lines", out.malformed));
     }
-    out.records = records.len() as u64;
-    for r in &records {
-        match r["record"].as_str() {
-            Some("scan") => out.scans += 1,
-            Some("request") => out.requests += 1,
-            Some("proof") => out.proofs += 1,
-            _ => {}
-        }
-    }
-    for s in servers {
-        let source_id = format!("src-{}", s.name);
-        let jsonl = dir.join(format!("proof-trace-{}.jsonl", s.name));
+    for (s, o) in servers.iter().zip(router.outs) {
+        let jsonl = o.path;
         let meta = dir.join(format!("proof-trace-{}-meta.json", s.name));
-        let mine: String = records
-            .iter()
-            .filter(|r| r["source"] == source_id.as_str())
-            .map(|r| format!("{r}\n"))
-            .collect();
-        if mine.is_empty() {
+        if o.written == 0 {
             // Most often the instance's log filter drops the target.
             out.errors.push(format!(
                 "no proof-trace records for {} (is deltaforge::proof_trace \
@@ -273,7 +399,7 @@ pub async fn collect(
                 s.name
             ));
         }
-        if let Err(e) = std::fs::write(&jsonl, mine) {
+        if let Some(e) = o.error {
             out.errors.push(format!("{}: {e}", jsonl.display()));
             continue;
         }
@@ -354,29 +480,59 @@ mod tests {
         }
     }
 
+    /// Route `text` line by line for `servers` into a temporary directory:
+    /// the router and each server's written records, in file order.
+    fn route(
+        text: &str,
+        servers: &[&str],
+    ) -> (Router, Vec<Vec<Value>>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let names: Vec<String> =
+            servers.iter().map(|s| s.to_string()).collect();
+        let mut router = Router::create(dir.path(), &names);
+        for line in text.lines() {
+            router.line(line);
+        }
+        router.finish();
+        let written = router
+            .outs
+            .iter()
+            .map(|o| {
+                std::fs::read_to_string(&o.path)
+                    .unwrap()
+                    .lines()
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect()
+            })
+            .collect();
+        (router, written, dir)
+    }
+
     /// Every accepted type parses: the proof records are kept, the
     /// measurement records recognized and left out of the summary; an
     /// unknown type is malformed, not ignored.
     #[test]
     fn record_types_are_explicit() {
         let text = [
-            r#"{"record":"scan","scan_id":1}"#,
-            r#"INFO deltaforge::proof_trace: {"record":"request","served":"scanned"}"#,
-            r#"{"record":"proof","outcome":"proven"}"#,
-            r#"{"record":"window","tables":3}"#,
-            r#"{"record":"release","window":1,"rank":0}"#,
-            r#"{"record":"batch","seq":1,"tables":[]}"#,
-            r#"{"record":"abandoned","id":2,"reason":"uncovered"}"#,
-            r#"{"record":"mystery","n":1}"#,
+            r#"{"record":"scan","scan_id":1,"source":"src-a"}"#,
+            r#"INFO deltaforge::proof_trace: {"record":"request","served":"scanned","source":"src-a"}"#,
+            r#"{"record":"proof","outcome":"proven","source":"src-a"}"#,
+            r#"{"record":"window","tables":3,"source":"src-a"}"#,
+            r#"{"record":"release","window":1,"rank":0,"source":"src-a"}"#,
+            r#"{"record":"batch","seq":1,"tables":[],"source":"src-a"}"#,
+            r#"{"record":"abandoned","id":2,"reason":"uncovered","source":"src-a"}"#,
+            r#"{"record":"mystery","n":1,"source":"src-a"}"#,
         ]
         .join("\n");
-        let (records, malformed) = parse(&text);
-        let kinds: Vec<&str> = records
+        let (router, written, _dir) = route(&text, &["a"]);
+        let kinds: Vec<&str> = written[0]
             .iter()
             .map(|r| r["record"].as_str().unwrap())
             .collect();
         assert_eq!(kinds, ["scan", "request", "proof"]);
-        assert_eq!(malformed, 1, "the unknown type");
+        let c = &router.counts;
+        assert_eq!((c.records, c.scans, c.requests, c.proofs), (3, 1, 1, 1));
+        assert_eq!(c.malformed, 1, "the unknown type");
         for line in text.split('\n').skip(3).take(4) {
             assert!(record(line).is_none(), "{line} is not a proof record");
         }
@@ -392,9 +548,43 @@ mod tests {
             "INFO sources::mysql: connected",
         ]
         .join("\n");
-        let (records, malformed) = parse(&text);
-        assert_eq!(records.len(), 1);
-        assert_eq!(malformed, 2);
+        let (router, _, _dir) = route(&text, &["a"]);
+        assert_eq!(router.counts.records, 1);
+        assert_eq!(router.counts.malformed, 2);
+    }
+
+    /// Each record goes to its own server's file, in log order; a record of
+    /// another source is counted but written nowhere, and a server without
+    /// records gets an empty file.
+    #[test]
+    fn records_are_written_to_their_servers_files_in_log_order() {
+        let text = [
+            r#"{"record":"scan","scan_id":1,"source":"src-a"}"#,
+            r#"{"record":"scan","scan_id":2,"source":"src-b"}"#,
+            "INFO sources::mysql: connected",
+            r#"{"record":"proof","n":3,"source":"src-a"}"#,
+            r#"{"record":"proof","n":4,"source":"src-other"}"#,
+        ]
+        .join("\n");
+        let (router, written, _dir) = route(&text, &["a", "b", "c"]);
+        let ids = |rs: &Vec<Value>| -> Vec<String> {
+            rs.iter().map(|r| r.to_string()).collect()
+        };
+        assert_eq!(
+            ids(&written[0]),
+            [
+                r#"{"record":"scan","scan_id":1,"source":"src-a"}"#,
+                r#"{"record":"proof","n":3,"source":"src-a"}"#,
+            ]
+        );
+        assert_eq!(written[1].len(), 1);
+        assert_eq!(written[1][0]["scan_id"], 2);
+        assert!(written[2].is_empty());
+        let written_counts: Vec<u64> =
+            router.outs.iter().map(|o| o.written).collect();
+        assert_eq!(written_counts, [2, 1, 0]);
+        assert_eq!(router.counts.records, 4, "src-other is counted");
+        assert!(router.outs.iter().all(|o| o.error.is_none()));
     }
 
     #[test]
@@ -416,12 +606,20 @@ mod tests {
             b"during {\"record\":\"scan\",\"n\":2}\n",
         )
         .unwrap();
-        let text = tokio::runtime::Runtime::new()
+        std::io::Write::write_all(&mut f, b"no newline at the end").unwrap();
+        let mut lines = Vec::new();
+        tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(read_since(&source, &m))
+            .block_on(stream_since(&source, &m, dir.path(), |l| {
+                lines.push(l.to_string())
+            }))
             .unwrap();
-        let got: Vec<Value> = text.lines().filter_map(record).collect();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0]["n"], 2);
+        assert_eq!(
+            lines,
+            [
+                "during {\"record\":\"scan\",\"n\":2}",
+                "no newline at the end"
+            ]
+        );
     }
 }

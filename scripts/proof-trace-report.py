@@ -16,6 +16,10 @@ source.
 - scanned: what the scans received (events, bytes);
 - amplification: scanned / distinct. Distinct events are an estimate
   (scanned events scaled by distinct / received bytes) and labelled so.
+
+The file is read once, line by line: scans are kept whole (there are few),
+requests and proofs only as the values the report uses, so memory stays a
+small fraction of the file at a million proofs.
 """
 
 import json
@@ -23,9 +27,11 @@ import sys
 from collections import defaultdict
 
 
-def load(path):
+def records(path):
     with open(path) as f:
-        return [json.loads(line) for line in f if line.strip()]
+        for line in f:
+            if line.strip():
+                yield json.loads(line)
 
 
 def union(intervals):
@@ -70,7 +76,6 @@ def gno_max(gtid_set, uuid):
 
 
 def main(jsonl, meta_path):
-    recs = load(jsonl)
     meta = json.load(open(meta_path))
     base, acc = {}, 0
     for name, size in meta["binlogs"]:
@@ -83,8 +88,35 @@ def main(jsonl, meta_path):
         return base[p["file"]] + p["pos"]
 
     uuid, gtid = meta["server_uuid"], meta["mode"] == "gtid"
-    scans = [r for r in recs if r["record"] == "scan"]
-    proofs = [r for r in recs if r["record"] == "proof"]
+    scans, reqs, proofs = [], [], 0
+    outcomes = defaultdict(lambda: defaultdict(int))
+    lock, schema = defaultdict(list), defaultdict(list)
+    for r in records(jsonl):
+        if r["record"] == "scan":
+            scans.append(r)
+        elif r["record"] == "request":
+            failed = r["served"] == "failed"
+            reqs.append(
+                (
+                    r["kind"],
+                    r["served"],
+                    None if failed else off(r["from"]),
+                    None if failed else off(r["to"]),
+                    r["bytes"],
+                    r["events"],
+                    r["scan_ids"],
+                    r["record_statements"] or 0,
+                    r["record_bytes"] or 0,
+                    None if failed or not gtid else gno_max(r["from"]["gtid_set"], uuid),
+                    None if failed or not gtid else gno_max(r["to"]["gtid_set"], uuid),
+                )
+            )
+        elif r["record"] == "proof":
+            proofs += 1
+            outcomes[r["kind"]][r["outcome"]] += 1
+            if r.get("capture"):
+                lock[r["kind"]].append(r["capture"]["lock_wait_ms"])
+                schema[r["kind"]].append(r["capture"]["schema_ms"])
     by_kind = defaultdict(list)
     for s in scans:
         by_kind[s["kind"]].append(s)
@@ -101,7 +133,7 @@ def main(jsonl, meta_path):
         )
         if k in meta
     ]
-    print(", ".join(workload + [f"{len(scans)} scans, {len(proofs)} proofs"]) + "\n")
+    print(", ".join(workload + [f"{len(scans)} scans, {proofs} proofs"]) + "\n")
 
     def summary(name, ss):
         ok = [s for s in ss if s["outcome"] == "ok"]
@@ -171,21 +203,22 @@ def main(jsonl, meta_path):
     print(json.dumps(rows, indent=1))
     print("```\n")
 
-    reqs = [r for r in recs if r["record"] == "request"]
     if reqs:
         print("## Shared scanner requests")
         scan_by_id = {s["scan_id"]: s for s in scans}
-        for kind in sorted({r["kind"] for r in reqs}) + ["all"]:
-            rs = [r for r in reqs if kind == "all" or r["kind"] == kind]
-            spans = [(off(r["from"]), off(r["to"])) for r in rs if r["served"] != "failed"]
+        # Request tuples: kind, served, from and to offsets, bytes, events,
+        # scan ids, record statements and bytes, from and to GNOs.
+        for kind in sorted({r[0] for r in reqs}) + ["all"]:
+            rs = [r for r in reqs if kind == "all" or r[0] == kind]
+            spans = [(r[2], r[3]) for r in rs if r[1] != "failed"]
             spans = [(a, b) for a, b in spans if a is not None and b is not None]
             distinct = union(spans)
-            phys_b = sum(r["bytes"] for r in rs)
-            phys_e = sum(r["events"] for r in rs)
+            phys_b = sum(r[4] for r in rs)
+            phys_e = sum(r[5] for r in rs)
             served = defaultdict(int)
             for r in rs:
-                served[r["served"]] += 1
-            ext = sum(len(r["scan_ids"]) for r in rs)
+                served[r[1]] += 1
+            ext = sum(len(r[6]) for r in rs)
             row = {
                 "kind": kind,
                 "requests": len(rs),
@@ -196,18 +229,15 @@ def main(jsonl, meta_path):
                 "physical_bytes": phys_b,
                 "physical_events": phys_e,
                 "amplification": phys_b / distinct if distinct else None,
-                "peak_record_statements": max((r["record_statements"] or 0) for r in rs),
-                "peak_record_bytes": max((r["record_bytes"] or 0) for r in rs),
+                "peak_record_statements": max(r[7] for r in rs),
+                "peak_record_bytes": max(r[8] for r in rs),
             }
             if gtid:
-                tx = []
-                for r in rs:
-                    if r["served"] == "failed":
-                        continue
-                    a = gno_max(r["from"]["gtid_set"], uuid)
-                    b = gno_max(r["to"]["gtid_set"], uuid)
-                    if a is not None and b is not None:
-                        tx.append((a, b))
+                tx = [
+                    (r[9], r[10])
+                    for r in rs
+                    if r[1] != "failed" and r[9] is not None and r[10] is not None
+                ]
                 row["distinct_txns"] = union(tx)
                 # GTID mode: positions' file offsets are diagnostic only (not
                 # read atomically with the GTID set); amplification counts
@@ -215,7 +245,7 @@ def main(jsonl, meta_path):
                 phys_tx = sum(
                     (scan_by_id.get(i, {}).get("detail") or {}).get("source_txns", 0)
                     for r in rs
-                    for i in r["scan_ids"]
+                    for i in r[6]
                 )
                 row["physical_txns"] = phys_tx
                 row["amplification"] = (
@@ -227,13 +257,6 @@ def main(jsonl, meta_path):
             print(json.dumps(row))
         print()
 
-    outcomes = defaultdict(lambda: defaultdict(int))
-    lock, schema = defaultdict(list), defaultdict(list)
-    for p in proofs:
-        outcomes[p["kind"]][p["outcome"]] += 1
-        if p.get("capture"):
-            lock[p["kind"]].append(p["capture"]["lock_wait_ms"])
-            schema[p["kind"]].append(p["capture"]["schema_ms"])
     print("## Proof outcomes and capture timing (ms)")
     for k in sorted(outcomes):
         print(
