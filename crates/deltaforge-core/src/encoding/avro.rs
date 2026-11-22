@@ -652,12 +652,23 @@ impl AvroEncoder {
         self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()))
     }
 
-    /// Resolve subject name with caching (avoids format! allocation per event).
-    /// The subject of `topic`'s records of mapping version `mapping`.
-    fn subject(&self, topic: &str, mapping: crate::TypeMapping) -> String {
-        format!("{}-{}", self.resolve_subject(topic), mapping.as_str())
+    /// The subject of `topic`'s records named `record` (the schema's full
+    /// name) of mapping version `mapping`. The record-name strategies give
+    /// each record, so each table of a shared topic, its own subject.
+    fn subject(
+        &self,
+        topic: &str,
+        record: &str,
+        mapping: crate::TypeMapping,
+    ) -> String {
+        let base = match self.strategy {
+            SubjectStrategy::TopicName => self.resolve_subject(topic),
+            _ => self.strategy.resolve(topic, Some(record)),
+        };
+        format!("{base}-{}", mapping.as_str())
     }
 
+    /// The `topic_name` subject of `topic`, cached (one per topic).
     fn resolve_subject(&self, topic: &str) -> String {
         {
             let cache = self.subject_cache.read();
@@ -811,7 +822,7 @@ impl AvroEncoder {
             match provider.get_envelope_schema(
                 connector, database, namespace, table, &identity,
             ) {
-                EnvelopeSchemaLookup::Found(schema_json, _) => {
+                EnvelopeSchemaLookup::Found(schema_json, schema) => {
                     debug!(
                         relation = %crate::SourceRelationIdentity::of(&event.source).canonical(),
                         fingerprint = %identity.fingerprint,
@@ -821,9 +832,13 @@ impl AvroEncoder {
                         .increment(1);
                     let (schema_json, _) =
                         with_mapping_attr(&schema_json, mapping)?;
+                    let record = schema.name().map_or_else(
+                        || "deltaforge.Event".to_string(),
+                        |n| n.fullname(None),
+                    );
                     let prepared = self
                         .register(
-                            &self.subject(topic, mapping),
+                            &self.subject(topic, &record, mapping),
                             &schema_json,
                             None,
                         )
@@ -865,7 +880,7 @@ impl AvroEncoder {
         }
         let json_value = inference_json(json_value, event)?;
         self.encode_inferred(
-            &self.subject(topic, mapping),
+            &self.subject(topic, &record_name, mapping),
             &record_name,
             &json_value,
         )
