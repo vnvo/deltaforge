@@ -11,6 +11,7 @@
 pub mod arrow_schema;
 pub mod arrow_types;
 pub mod avro;
+pub mod avro_cache;
 mod avro_infer;
 pub mod avro_schema;
 pub mod avro_types;

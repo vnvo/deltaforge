@@ -165,6 +165,7 @@ impl RedisSink {
             ref subject_strategy,
             ref username,
             ref password,
+            schema_cache_bytes,
             ..
         } = cfg.encoding
         {
@@ -185,7 +186,13 @@ impl RedisSink {
                     creds.schema_registry_password().or(password.as_deref()),
                     source_schemas,
                 )
-                .context("creating Avro encoder")?,
+                .context("creating Avro encoder")?
+                .with_schema_cache(
+                    Some(schema_cache_bytes.unwrap_or_else(
+                        deltaforge_core::encoding::avro_cache::default_schema_cache_bytes,
+                    )),
+                    Some((pipeline, cfg.id.as_str())),
+                ),
             )
         } else {
             None

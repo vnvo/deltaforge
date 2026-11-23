@@ -219,6 +219,7 @@ sinks:
 | `unsigned_bigint_mode` | string | `string` | How to map MySQL `BIGINT UNSIGNED` (`string` or `long`) |
 | `enum_mode` | string | `string` | How to map ENUM types (`string` or `enum`) |
 | `naive_timestamp_mode` | string | `string` | How to map naive timestamps (`string` or `timestamp`) |
+| `schema_cache_bytes` | integer | 1/6 of the memory limit | Byte bound of the sink's Avro schema cache: each table schema in use is prepared once and kept, about 300 KB for a 12-column table (wider tables more, about 65 bytes per byte of schema JSON). 16 MiB to 64 GiB. Absent: a sixth of the process's cgroup memory limit, 64 MiB to 4 GiB (1 GiB without a limit), applied to each Avro sink. Past the bound the schemas used least recently are evicted and prepared again on their next event, without registering again while their ID stays cached (an ID cache takes 1/16 of the bound; the pipeline's cache of built schema JSON takes 1/8 of the first Avro sink's bound besides). Exported as `deltaforge_avro_schema_cache_bytes`, `deltaforge_avro_schema_cache_limit_bytes` and `deltaforge_avro_schema_cache_evictions_total` (`pipeline`, `sink` labels); evictions log a warning at most every 5 minutes. |
 
 #### Subject naming strategies
 

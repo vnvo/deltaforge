@@ -333,6 +333,9 @@ use apache_avro::Schema as AvroSchema;
 use deltaforge_core::encoding::avro::{
     EnvelopeSchemaLookup, SchemaIdentity, SourceSchemaProvider,
 };
+use deltaforge_core::encoding::avro_cache::{
+    Budget, Evict, SchemaCache, entry_overhead,
+};
 use deltaforge_core::encoding::avro_schema::{
     build_envelope_schema, build_value_schema,
 };
@@ -340,12 +343,19 @@ use deltaforge_core::encoding::avro_types::{
     AVRO_MAPPING_VERSION, ColumnDesc, TypeConversionOpts, mysql_column_to_avro,
     postgres_column_to_avro,
 };
-use parking_lot::RwLock;
 use tracing::{debug, warn};
 
 /// A cached envelope schema: the registry sequence of the version it was
-/// built from, its JSON and the parsed schema.
-type CachedAvroSchema = (Option<u64>, String, Arc<AvroSchema>);
+/// built from and its JSON (parsed again on each lookup: the encoder keeps
+/// the schema it prepared, so a lookup is a miss of the encoder's cache).
+#[derive(Clone)]
+struct CachedAvroSchema(Arc<(Option<u64>, String)>);
+
+impl Evict for CachedAvroSchema {}
+
+/// The share of the sinks' Avro schema cache bound the provider's cache of
+/// built schema JSON takes (a few KB per table against a few hundred KB).
+const PROVIDER_CACHE_SHARE: u64 = 8;
 
 /// Implements `SourceSchemaProvider` by looking up table schemas from
 /// the `SchemaProvider` (which reads from the internal schema registry)
@@ -366,8 +376,19 @@ pub struct AvroSchemaProviderImpl {
     /// The type mapping version and options (see `mapping_id`).
     mapping_id: String,
     /// Cache: (database, namespace, table, fingerprint) → (sequence,
-    /// schema_json, schema)
-    cache: RwLock<HashMap<(String, String, String, String), CachedAvroSchema>>,
+    /// schema_json), bounded by bytes (see [`Self::with_cache_bytes`]).
+    cache: SchemaCache<CachedAvroSchema>,
+}
+
+/// The cache key of a table schema version: every part length-prefixed.
+fn provider_key(parts: [&str; 4]) -> String {
+    let mut key = String::new();
+    for p in parts {
+        key.push_str(&p.len().to_string());
+        key.push(':');
+        key.push_str(p);
+    }
+    key
 }
 
 impl AvroSchemaProviderImpl {
@@ -382,14 +403,23 @@ impl AvroSchemaProviderImpl {
             connector: connector.to_string(),
             mapping_id: format!("v{AVRO_MAPPING_VERSION}:{opts:?}"),
             opts,
-            cache: RwLock::new(HashMap::new()),
+            cache: SchemaCache::new(Budget::new(None)),
         }
+    }
+
+    /// Bound the cache of built schemas to a share of `sinks_limit`, the
+    /// Avro sinks' schema cache bound (unbounded when `None`).
+    pub fn with_cache_bytes(mut self, sinks_limit: Option<u64>) -> Self {
+        self.cache = SchemaCache::new(Budget::new(
+            sinks_limit.map(|l| l / PROVIDER_CACHE_SHARE),
+        ));
+        self
     }
 
     /// Invalidate all cached schemas; each is rebuilt from its registered
     /// version on next use.
     pub fn invalidate_all(&self) {
-        self.cache.write().clear();
+        self.cache.clear();
     }
 
     /// Build the Avro envelope schema for a table from its column info.
@@ -456,13 +486,10 @@ impl SourceSchemaProvider for AvroSchemaProviderImpl {
         if connector != self.connector {
             return EnvelopeSchemaLookup::Absent;
         }
-        let key = (
-            database.to_string(),
-            namespace.to_string(),
-            table.to_string(),
-            identity.fingerprint.clone(),
-        );
-        if let Some((sequence, json, schema)) = self.cache.read().get(&key) {
+        let key =
+            provider_key([database, namespace, table, &identity.fingerprint]);
+        if let Some(CachedAvroSchema(cached)) = self.cache.get(&key) {
+            let (sequence, json) = &*cached;
             return match (sequence, identity.sequence) {
                 (Some(registered), Some(stamped)) if *registered != stamped => {
                     EnvelopeSchemaLookup::Conflict(format!(
@@ -471,7 +498,14 @@ impl SourceSchemaProvider for AvroSchemaProviderImpl {
                         identity.fingerprint
                     ))
                 }
-                _ => EnvelopeSchemaLookup::Found(json.clone(), schema.clone()),
+                _ => match AvroSchema::parse_str(json) {
+                    Ok(schema) => EnvelopeSchemaLookup::Found(
+                        json.clone(),
+                        Arc::new(schema),
+                    ),
+                    // Built and parsed once already: unreachable in practice.
+                    Err(e) => EnvelopeSchemaLookup::Unavailable(e.to_string()),
+                },
             };
         }
 
@@ -511,9 +545,14 @@ impl SourceSchemaProvider for AvroSchemaProviderImpl {
         else {
             return EnvelopeSchemaLookup::Absent;
         };
-        self.cache
-            .write()
-            .insert(key, (identity.sequence, json.clone(), schema.clone()));
+        let bytes = (json.len() + std::mem::size_of::<(Option<u64>, String)>())
+            as u64
+            + entry_overhead(&key);
+        self.cache.insert(
+            &key,
+            CachedAvroSchema(Arc::new((identity.sequence, json.clone()))),
+            bytes,
+        );
         EnvelopeSchemaLookup::Found(json, schema)
     }
 
@@ -1101,6 +1140,35 @@ mod tests {
             .iter()
             .map(|f| f["name"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bounded_avro_provider_rebuilds_an_evicted_version_exactly() {
+        let versions = two_versions();
+        // A sinks' bound whose provider share (4 KiB) holds one of these
+        // schemas (a few KB of JSON each) at a time.
+        let avro = AvroSchemaProviderImpl::new(
+            versions.clone(),
+            "mysql",
+            TypeConversionOpts::default(),
+        )
+        .with_cache_bytes(Some(8 * 4096));
+        let v1 = SchemaIdentity::of(Some("h1"), Some(1)).unwrap();
+        let v2 = SchemaIdentity::of(Some("h2"), Some(2)).unwrap();
+        let lookups =
+            || versions.lookups.load(std::sync::atomic::Ordering::SeqCst);
+        let get = |id| {
+            columns_of(
+                avro.get_envelope_schema("mysql", "shop", "shop", "orders", id),
+            )
+        };
+        assert_eq!(get(&v1), ["id"]);
+        assert_eq!(get(&v1), ["id"]);
+        assert_eq!(lookups(), 1, "cached");
+        assert_eq!(get(&v2), ["id", "extra"]);
+        // v1 was evicted for v2: rebuilt from its registered version.
+        assert_eq!(get(&v1), ["id"]);
+        assert_eq!(lookups(), 3);
     }
 
     #[tokio::test(flavor = "multi_thread")]

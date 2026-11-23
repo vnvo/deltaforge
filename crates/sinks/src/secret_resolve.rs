@@ -528,6 +528,7 @@ mod tests {
             unsigned_bigint_mode: None,
             enum_mode: None,
             naive_timestamp_mode: None,
+            schema_cache_bytes: None,
         }
     }
 

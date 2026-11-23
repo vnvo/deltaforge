@@ -110,7 +110,35 @@ pub enum EncodingCfg {
         /// How to map naive (timezone-unaware) timestamps. Default: "string" (ISO-8601).
         /// "timestamp" uses Avro timestamp logical types (semantically misleading for non-UTC).
         naive_timestamp_mode: Option<String>,
+
+        /// The byte bound of the sink's Avro schema cache (prepared table
+        /// schemas and registered IDs, a few hundred KB per table): past it
+        /// the schemas used least recently are evicted and resolved again.
+        /// Absent: a sixth of the process's memory limit, 64 MiB to 4 GiB
+        /// (1 GiB without a limit). Within [`AVRO_SCHEMA_CACHE_BYTES`].
+        schema_cache_bytes: Option<u64>,
     },
+}
+
+/// The bounds an Avro sink's `schema_cache_bytes` may take: 16 MiB to
+/// 64 GiB (one 250-column table's prepared schema is about 4.3 MB).
+pub const AVRO_SCHEMA_CACHE_BYTES: std::ops::RangeInclusive<u64> =
+    16 * 1024 * 1024..=64 * 1024 * 1024 * 1024;
+
+fn bounded_schema_cache_bytes<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<u64>, D::Error> {
+    let v = Option::<u64>::deserialize(d)?;
+    if let Some(n) = v
+        && !AVRO_SCHEMA_CACHE_BYTES.contains(&n)
+    {
+        return Err(serde::de::Error::custom(format!(
+            "schema_cache_bytes {n} is outside {}..={}",
+            AVRO_SCHEMA_CACHE_BYTES.start(),
+            AVRO_SCHEMA_CACHE_BYTES.end()
+        )));
+    }
+    Ok(v)
 }
 
 impl std::fmt::Debug for EncodingCfg {
@@ -127,6 +155,7 @@ impl std::fmt::Debug for EncodingCfg {
                 unsigned_bigint_mode,
                 enum_mode,
                 naive_timestamp_mode,
+                schema_cache_bytes,
             } => f
                 .debug_struct("Avro")
                 .field("schema_registry_url", schema_registry_url)
@@ -138,6 +167,7 @@ impl std::fmt::Debug for EncodingCfg {
                 .field("unsigned_bigint_mode", unsigned_bigint_mode)
                 .field("enum_mode", enum_mode)
                 .field("naive_timestamp_mode", naive_timestamp_mode)
+                .field("schema_cache_bytes", schema_cache_bytes)
                 .finish(),
         }
     }
@@ -160,6 +190,7 @@ impl Serialize for EncodingCfg {
                 unsigned_bigint_mode,
                 enum_mode,
                 naive_timestamp_mode,
+                schema_cache_bytes,
             } => {
                 use serde::ser::SerializeMap;
                 let mut map = serializer.serialize_map(None)?;
@@ -189,6 +220,9 @@ impl Serialize for EncodingCfg {
                 }
                 if let Some(v) = naive_timestamp_mode {
                     map.serialize_entry("naive_timestamp_mode", v)?;
+                }
+                if let Some(v) = schema_cache_bytes {
+                    map.serialize_entry("schema_cache_bytes", v)?;
                 }
                 map.end()
             }
@@ -261,6 +295,11 @@ impl<'de> Deserialize<'de> for EncodingCfg {
                         enum_mode: Option<String>,
                         #[serde(default)]
                         naive_timestamp_mode: Option<String>,
+                        #[serde(
+                            default,
+                            deserialize_with = "bounded_schema_cache_bytes"
+                        )]
+                        schema_cache_bytes: Option<u64>,
                     },
                 }
                 let tagged = Tagged::deserialize(
@@ -278,6 +317,7 @@ impl<'de> Deserialize<'de> for EncodingCfg {
                         unsigned_bigint_mode,
                         enum_mode,
                         naive_timestamp_mode,
+                        schema_cache_bytes,
                     } => EncodingCfg::Avro {
                         schema_registry_url,
                         subject_strategy,
@@ -288,6 +328,7 @@ impl<'de> Deserialize<'de> for EncodingCfg {
                         unsigned_bigint_mode,
                         enum_mode,
                         naive_timestamp_mode,
+                        schema_cache_bytes,
                     },
                 })
             }
@@ -1634,6 +1675,43 @@ mod tests {
             assert_eq!(password.as_deref(), Some("pass"));
         } else {
             panic!("expected Avro encoding");
+        }
+    }
+
+    #[test]
+    fn avro_schema_cache_bytes_is_bounded_and_round_trips() {
+        let cfg = |bytes: &str| {
+            serde_yaml::from_str::<KafkaSinkCfg>(&format!(
+                r#"
+                id: k
+                brokers: b:9092
+                topic: t
+                encoding:
+                  type: avro
+                  schema_registry_url: "http://sr:8081"
+                  {bytes}
+                "#
+            ))
+        };
+        let bound = |c: &KafkaSinkCfg| match &c.encoding {
+            EncodingCfg::Avro {
+                schema_cache_bytes, ..
+            } => *schema_cache_bytes,
+            _ => panic!("expected Avro encoding"),
+        };
+        assert_eq!(bound(&cfg("").unwrap()), None);
+        let set = cfg("schema_cache_bytes: 1073741824").unwrap();
+        assert_eq!(bound(&set), Some(1 << 30));
+        let again: KafkaSinkCfg =
+            serde_yaml::from_str(&serde_yaml::to_string(&set).unwrap())
+                .unwrap();
+        assert_eq!(bound(&again), Some(1 << 30));
+        for out in [
+            *AVRO_SCHEMA_CACHE_BYTES.start() - 1,
+            *AVRO_SCHEMA_CACHE_BYTES.end() + 1,
+        ] {
+            let e = cfg(&format!("schema_cache_bytes: {out}")).unwrap_err();
+            assert!(e.to_string().contains("schema_cache_bytes"), "{e}");
         }
     }
 
