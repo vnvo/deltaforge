@@ -29,6 +29,7 @@ use serde::Serialize;
 use tracing::debug;
 
 use super::EncodingError;
+use super::avro_cache::{Budget, Evict, SchemaCache, entry_overhead};
 use super::avro_infer::Inferred;
 use crate::canonical::CanonicalRow;
 use crate::envelope::EnvelopeData;
@@ -193,17 +194,18 @@ pub fn canonical_schema_hash(
 ///
 /// Registered schema IDs are cached per `(subject, canonical schema hash)`:
 /// a cached ID is only ever returned for the exact schema it was
-/// registered for, never for another version of the subject.
+/// registered for, never for another version of the subject. The cache
+/// holds IDs only (bounded, see [`SchemaRegistryClient::bound_ids`]): an
+/// evicted ID is registered again, idempotently.
 pub struct SchemaRegistryClient {
     client: reqwest::Client,
     base_url: String,
-    cache: Arc<RwLock<HashMap<(String, String), CachedSchema>>>,
+    ids: SchemaCache<u32>,
 }
 
-#[derive(Clone)]
-struct CachedSchema {
-    id: u32,
-    schema: Arc<AvroSchema>,
+/// The cache key of `(subject, hash)`: both parts length-prefixed.
+fn id_key(subject: &str, hash: &str) -> String {
+    format!("{}:{subject}{}:{hash}", subject.len(), hash.len())
 }
 
 /// Response from POST /subjects/{subject}/versions
@@ -242,8 +244,19 @@ impl SchemaRegistryClient {
         Ok(Self {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
-            cache: Arc::new(RwLock::new(HashMap::new())),
+            ids: SchemaCache::new(Budget::new(None)),
         })
+    }
+
+    /// Bound the ID cache to `limit` bytes (unbounded when `None`),
+    /// dropping what it holds.
+    pub fn bound_ids(&mut self, limit: Option<u64>) {
+        self.ids = SchemaCache::new(Budget::new(limit));
+    }
+
+    /// The ID cache's budget.
+    pub fn id_budget(&self) -> &Arc<Budget> {
+        self.ids.budget()
     }
 
     /// Register `schema_json` under `subject`, or return its existing ID.
@@ -257,24 +270,26 @@ impl SchemaRegistryClient {
         auth: Option<(&str, &str)>,
     ) -> Result<(u32, Arc<AvroSchema>), EncodingError> {
         let hash = canonical_schema_hash(schema_json)?;
-        self.register_hashed(subject, schema_json, &hash, auth)
-            .await
+        let schema = parse_schema(schema_json)?;
+        let id = match self.get_cached(subject, &hash) {
+            Some(id) => id,
+            None => {
+                self.register_hashed(subject, schema_json, &hash, auth)
+                    .await?
+            }
+        };
+        Ok((id, Arc::new(schema)))
     }
 
+    /// Register `schema_json` (canonical hash `hash`, already parsed by the
+    /// caller) under `subject` and cache its ID.
     async fn register_hashed(
         &self,
         subject: &str,
         schema_json: &str,
         hash: &str,
         auth: Option<(&str, &str)>,
-    ) -> Result<(u32, Arc<AvroSchema>), EncodingError> {
-        if let Some(cached) = self.get_cached(subject, hash) {
-            return Ok(cached);
-        }
-        let schema = AvroSchema::parse_str(schema_json).map_err(|e| {
-            EncodingError::Avro(format!("failed to parse schema: {e}"))
-        })?;
-
+    ) -> Result<u32, EncodingError> {
         let url = format!("{}/subjects/{}/versions", self.base_url, subject);
         let body = serde_json::json!({
             "schema": schema_json,
@@ -319,23 +334,15 @@ impl SchemaRegistryClient {
                     "invalid response from schema registry: {e}"
                 ))
             })?;
-        let schema = Arc::new(schema);
-
         debug!(
             subject,
             schema_id = register_resp.id,
             "registered Avro schema"
         );
 
-        self.cache.write().insert(
-            (subject.to_string(), hash.to_string()),
-            CachedSchema {
-                id: register_resp.id,
-                schema: schema.clone(),
-            },
-        );
-
-        Ok((register_resp.id, schema))
+        let key = id_key(subject, hash);
+        let bytes = entry_overhead(&key);
+        Ok(self.ids.insert(&key, register_resp.id, bytes))
     }
 
     /// The latest schema registered under `subject`, or `None` when the
@@ -380,21 +387,14 @@ impl SchemaRegistryClient {
 
     /// The cached ID of exactly the schema with canonical hash `hash`
     /// under `subject`.
-    pub fn get_cached(
-        &self,
-        subject: &str,
-        hash: &str,
-    ) -> Option<(u32, Arc<AvroSchema>)> {
-        self.cache
-            .read()
-            .get(&(subject.to_string(), hash.to_string()))
-            .map(|c| (c.id, c.schema.clone()))
+    pub fn get_cached(&self, subject: &str, hash: &str) -> Option<u32> {
+        self.ids.get(&id_key(subject, hash))
     }
 
-    /// Clear the schema cache; the next encode of each schema registers
-    /// it again (idempotent in the registry).
+    /// Clear the ID cache; the next encode of each schema registers it
+    /// again (idempotent in the registry).
     pub fn clear_cache(&self) {
-        self.cache.write().clear();
+        self.ids.clear();
     }
 }
 
@@ -440,6 +440,8 @@ fn resolved_key(
 ) {
     use std::fmt::Write;
     let source = &event.source;
+    // Distinct from every [`prepared_key`] (`P`) in the shared cache.
+    out.push('A');
     let mut part = |p: &str| {
         let _ = write!(out, "{}:", p.len());
         out.push_str(p);
@@ -472,12 +474,39 @@ type Registered = Arc<Prepared>;
 /// validate and encode values with it. A writer holds its own resolved copy
 /// of the schema, several times the schema's size, so a schema has one
 /// writer until concurrent encodes find every writer busy, and at most
-/// [`WRITERS`]: a catalog of many tables keeps one per table.
+/// [`WRITERS`]: a catalog of many tables keeps one per table. Each writer
+/// after the first is charged to the schema cache's budget, and none is
+/// added when the budget is full or the schema was evicted.
 struct Prepared {
     id: u32,
     schema: Arc<AvroSchema>,
     names: Names,
     writers: [OnceLock<Writer>; WRITERS],
+    budget: Arc<Budget>,
+    /// One writer's estimated bytes.
+    writer_bytes: u64,
+    /// The bytes charged for writers after the first, and whether the
+    /// schema was evicted (then nothing more is charged).
+    extra: parking_lot::Mutex<(u64, bool)>,
+}
+
+impl Evict for Registered {
+    fn evict(&self) -> u64 {
+        let mut extra = self.extra.lock();
+        extra.1 = true;
+        std::mem::take(&mut extra.0)
+    }
+}
+
+/// The estimated heap bytes of a parsed schema of `json_len` bytes of JSON
+/// and of one writer's resolved copy of it: apache-avro 0.17, a linear fit
+/// of measured sizes over envelopes of 1 to 251 columns (within a few
+/// percent; `tests/avro_encoder_memory.rs` checks it).
+fn schema_bytes(json_len: usize) -> (u64, u64) {
+    let len = json_len as u64;
+    let parsed = (len * 257 / 10).saturating_sub(17_000).max(len * 16);
+    let writer = (len * 653 / 10).saturating_sub(69_000).max(len * 32);
+    (parsed, writer)
 }
 
 type Writer = parking_lot::Mutex<apache_avro::GenericSingleObjectWriter>;
@@ -494,19 +523,46 @@ type Names = HashMap<apache_avro::schema::Name, AvroSchema>;
 const SINGLE_OBJECT_HEADER: usize = 10;
 
 impl Prepared {
+    /// The prepared schema and its estimated bytes (one writer's included).
     fn new(
         id: u32,
         schema: Arc<AvroSchema>,
-    ) -> Result<Registered, EncodingError> {
+        json_len: usize,
+        budget: Arc<Budget>,
+    ) -> Result<(Registered, u64), EncodingError> {
         let names = referenced_names(&schema)?;
         let writers: [OnceLock<Writer>; WRITERS] = Default::default();
         let _ = writers[0].set(new_writer(&schema)?);
-        Ok(Arc::new(Prepared {
-            id,
-            schema,
-            names,
-            writers,
-        }))
+        let (parsed, writer_bytes) = schema_bytes(json_len);
+        // The referenced names are small subtrees (the root never is one).
+        let names_bytes = if names.is_empty() { 0 } else { parsed / 8 };
+        let bytes = parsed
+            + writer_bytes
+            + names_bytes
+            + std::mem::size_of::<Prepared>() as u64;
+        Ok((
+            Arc::new(Prepared {
+                id,
+                schema,
+                names,
+                writers,
+                budget,
+                writer_bytes,
+                extra: parking_lot::Mutex::new((0, false)),
+            }),
+            bytes,
+        ))
+    }
+
+    /// Charge one more writer, if the budget holds it and the schema is
+    /// still cached.
+    fn charge_writer(&self) -> bool {
+        let mut extra = self.extra.lock();
+        if extra.1 || !self.budget.try_charge(self.writer_bytes) {
+            return false;
+        }
+        extra.0 += self.writer_bytes;
+        true
     }
 
     /// A free writer, searched from `slot`'s; a new one when every existing
@@ -525,10 +581,19 @@ impl Prepared {
         }
         for i in order {
             if self.writers[i].get().is_none() {
+                if !self.charge_writer() {
+                    break;
+                }
                 // The schema resolved for the first writer, so it resolves
                 // again; a failure leaves the waiting below.
-                if let Ok(w) = new_writer(&self.schema) {
-                    let _ = self.writers[i].set(w);
+                match new_writer(&self.schema) {
+                    Ok(w) => {
+                        if self.writers[i].set(w).is_err() {
+                            // Another encode set this slot first.
+                            self.release_writer();
+                        }
+                    }
+                    Err(_) => self.release_writer(),
                 }
                 if let Some(w) =
                     self.writers[i].get().and_then(|w| w.try_lock())
@@ -544,6 +609,23 @@ impl Prepared {
             .expect("the first writer exists")
             .lock()
     }
+}
+
+impl Prepared {
+    /// Return a charged writer's bytes (it was not added).
+    fn release_writer(&self) {
+        let mut extra = self.extra.lock();
+        if !extra.1 {
+            extra.0 -= self.writer_bytes;
+            self.budget.release(self.writer_bytes);
+        }
+    }
+}
+
+fn parse_schema(json: &str) -> Result<AvroSchema, EncodingError> {
+    AvroSchema::parse_str(json).map_err(|e| {
+        EncodingError::Avro(format!("failed to parse schema: {e}"))
+    })
 }
 
 fn new_writer(schema: &AvroSchema) -> Result<Writer, EncodingError> {
@@ -641,17 +723,47 @@ pub struct AvroEncoder {
     source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
     /// Cache: topic → resolved subject name (avoids format! per event)
     subject_cache: RwLock<HashMap<String, String>>,
-    /// Path A: the registered schema of each resolved version.
-    resolved: RwLock<HashMap<String, Registered>>,
+    /// Every prepared schema: Path A's by resolved version ([`resolved_key`],
+    /// `A`-prefixed), the others by subject and hash ([`prepared_key`]).
+    /// Bounded by bytes; an evicted schema is resolved again.
+    schemas: SchemaCache<Registered>,
+    /// The metric labels (pipeline, sink) of the schema cache's gauges.
+    labels: Option<(String, String)>,
+    /// When eviction was last warned about (seconds since the encoder was
+    /// built, plus one; 0: never).
+    warned: std::sync::atomic::AtomicU64,
+    built: std::time::Instant,
     /// Path C: (subject, record name) → widened inferred schema.
     inferred: RwLock<HashMap<(String, String), InferredState>>,
     /// DDL schemas by connector: (schema JSON, canonical hash).
     ddl_schemas: RwLock<HashMap<String, (String, String)>>,
     /// DDL: the registered schema of each (subject, hash, mapping version).
     ddl: RwLock<HashMap<DdlKey, Registered>>,
-    /// Every registered schema, prepared, by (subject, canonical hash).
-    prepared: RwLock<HashMap<(String, String), Registered>>,
 }
+
+/// The cache key of a schema prepared by subject and canonical hash.
+fn prepared_key(subject: &str, hash: &str) -> String {
+    format!("P{}:{subject}{}:{hash}", subject.len(), hash.len())
+}
+
+/// The share of an encoder's schema cache bound given to the Schema
+/// Registry client's ID cache (IDs are a few hundred bytes, prepared
+/// schemas a few hundred KB).
+const ID_CACHE_SHARE: u64 = 16;
+
+/// How often evictions are warned about at most.
+const EVICTION_WARNING_EVERY: std::time::Duration =
+    std::time::Duration::from_secs(300);
+
+/// `deltaforge_avro_schema_cache_bytes{pipeline,sink}`: the estimated bytes
+/// of the prepared schemas and registered IDs held.
+pub const METRIC_CACHE_BYTES: &str = "deltaforge_avro_schema_cache_bytes";
+/// `deltaforge_avro_schema_cache_limit_bytes{pipeline,sink}`: the bound in
+/// force (absent when unbounded).
+pub const METRIC_CACHE_LIMIT: &str = "deltaforge_avro_schema_cache_limit_bytes";
+/// `deltaforge_avro_schema_cache_evictions_total{pipeline,sink}`.
+pub const METRIC_CACHE_EVICTIONS: &str =
+    "deltaforge_avro_schema_cache_evictions_total";
 
 impl AvroEncoder {
     /// Create a new Avro encoder (Path C only — JSON inference fallback).
@@ -696,12 +808,96 @@ impl AvroEncoder {
             auth,
             source_schemas,
             subject_cache: RwLock::new(HashMap::new()),
-            resolved: RwLock::new(HashMap::new()),
+            schemas: SchemaCache::new(Budget::new(None)),
+            labels: None,
+            warned: std::sync::atomic::AtomicU64::new(0),
+            built: std::time::Instant::now(),
             inferred: RwLock::new(HashMap::new()),
             ddl_schemas: RwLock::new(HashMap::new()),
             ddl: RwLock::new(HashMap::new()),
-            prepared: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// Bound the prepared schemas and registered IDs to about `limit` bytes
+    /// (unbounded when `None`); `labels` (pipeline, sink) label the cache's
+    /// metrics. Past the bound, the schemas used least recently are evicted
+    /// and resolved again on their next event: the registry ID from its own
+    /// cache (a share of the bound) or by registering again, idempotently.
+    pub fn with_schema_cache(
+        mut self,
+        limit: Option<u64>,
+        labels: Option<(&str, &str)>,
+    ) -> Self {
+        let ids = limit.map(|l| l / ID_CACHE_SHARE);
+        self.registry.bound_ids(ids);
+        self.schemas = SchemaCache::new(Budget::new(
+            limit.map(|l| l - l / ID_CACHE_SHARE),
+        ));
+        self.labels = labels.map(|(p, s)| (p.to_string(), s.to_string()));
+        if let (Some((p, s)), Some(l)) = (&self.labels, limit) {
+            metrics::gauge!(METRIC_CACHE_LIMIT, "pipeline" => p.clone(), "sink" => s.clone())
+                .set(l as f64);
+        }
+        self
+    }
+
+    /// The estimated bytes of the prepared schemas and registered IDs held.
+    pub fn schema_cache_bytes(&self) -> u64 {
+        self.schemas.budget().used() + self.registry.id_budget().used()
+    }
+
+    /// Prepared schemas evicted so far.
+    pub fn schema_cache_evictions(&self) -> u64 {
+        self.schemas.evictions()
+    }
+
+    /// Cache `prepared` (`bytes` estimated) under `key`, and report the
+    /// cache's size and any evictions.
+    fn cache(&self, key: &str, prepared: Registered, bytes: u64) -> Registered {
+        let before = self.schemas.evictions();
+        let prepared =
+            self.schemas
+                .insert(key, prepared, bytes + entry_overhead(key));
+        let evicted = self.schemas.evictions() - before;
+        if let Some((p, s)) = &self.labels {
+            metrics::gauge!(METRIC_CACHE_BYTES, "pipeline" => p.clone(), "sink" => s.clone())
+                .set(self.schema_cache_bytes() as f64);
+            if evicted > 0 {
+                counter!(METRIC_CACHE_EVICTIONS, "pipeline" => p.clone(), "sink" => s.clone())
+                    .increment(evicted);
+            }
+        }
+        if evicted > 0 {
+            self.warn_eviction();
+        }
+        prepared
+    }
+
+    /// Warn, at most every [`EVICTION_WARNING_EVERY`], that the schema
+    /// cache evicts: schemas are resolved again, which costs throughput.
+    fn warn_eviction(&self) {
+        use std::sync::atomic::Ordering;
+        let now = self.built.elapsed().as_secs() + 1;
+        let last = self.warned.load(Ordering::Relaxed);
+        if last != 0 && now < last + EVICTION_WARNING_EVERY.as_secs() {
+            return;
+        }
+        if self
+            .warned
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            tracing::warn!(
+                pipeline = self.labels.as_ref().map(|l| l.0.as_str()),
+                sink = self.labels.as_ref().map(|l| l.1.as_str()),
+                limit_bytes = self.schemas.budget().limit(),
+                held_bytes = self.schema_cache_bytes(),
+                evictions = self.schemas.evictions(),
+                "the Avro schema cache is full and evicts schemas: each is \
+                 resolved again on its next event; raise the sink's \
+                 schema_cache_bytes if this repeats"
+            );
+        }
     }
 
     /// Set the source schema provider after construction.
@@ -710,7 +906,7 @@ impl AvroEncoder {
         provider: Arc<dyn SourceSchemaProvider>,
     ) {
         self.source_schemas = Some(provider);
-        self.resolved.write().clear();
+        self.schemas.clear();
     }
 
     /// Drop every cached schema and ID. Encoding afterwards resolves and
@@ -718,10 +914,9 @@ impl AvroEncoder {
     /// subject's latest registered schema.
     pub fn clear_caches(&self) {
         self.registry.clear_cache();
-        self.resolved.write().clear();
+        self.schemas.clear();
         self.inferred.write().clear();
         self.ddl.write().clear();
-        self.prepared.write().clear();
     }
 
     fn auth(&self) -> Option<(&str, &str)> {
@@ -887,7 +1082,7 @@ impl AvroEncoder {
                 fingerprint,
                 provider.mapping_id(),
             );
-            let cached = self.resolved.read().get(key.as_str()).cloned();
+            let cached = self.schemas.get(key.as_str());
             if let Some(prepared) = cached {
                 return encode_with(&prepared, &json_value, &rows);
             }
@@ -912,14 +1107,14 @@ impl AvroEncoder {
                         || "deltaforge.Event".to_string(),
                         |n| n.fullname(None),
                     );
-                    let prepared = self
-                        .register(
+                    let (prepared, bytes) = self
+                        .prepare(
                             &self.subject(topic, &record, mapping),
                             &schema_json,
                             None,
                         )
                         .await?;
-                    self.resolved.write().insert(key, prepared.clone());
+                    let prepared = self.cache(&key, prepared, bytes);
                     return encode_with(&prepared, &json_value, &rows);
                 }
                 EnvelopeSchemaLookup::Unavailable(reason) => {
@@ -1079,7 +1274,8 @@ impl AvroEncoder {
         encode_with(&prepared, json_value, &[])
     }
 
-    /// Register a schema (cached per subject and canonical hash).
+    /// Register a schema and prepare it, cached per subject and canonical
+    /// hash.
     async fn register(
         &self,
         subject: &str,
@@ -1090,15 +1286,33 @@ impl AvroEncoder {
             Some(h) => h.to_string(),
             None => canonical_schema_hash(schema_json)?,
         };
-        let key = (subject.to_string(), hash);
-        if let Some(prepared) = self.prepared.read().get(&key) {
-            return Ok(prepared.clone());
+        let key = prepared_key(subject, &hash);
+        if let Some(prepared) = self.schemas.get(&key) {
+            return Ok(prepared);
         }
-        let (id, schema) = match self.registry.get_cached(subject, &key.1) {
-            Some(cached) => cached,
+        let (prepared, bytes) =
+            self.prepare(subject, schema_json, Some(&hash)).await?;
+        Ok(self.cache(&key, prepared, bytes))
+    }
+
+    /// Register a schema (its ID cached per subject and canonical hash) and
+    /// prepare it, uncached: the prepared schema and its estimated bytes.
+    async fn prepare(
+        &self,
+        subject: &str,
+        schema_json: &str,
+        hash: Option<&str>,
+    ) -> Result<(Registered, u64), EncodingError> {
+        let hash = match hash {
+            Some(h) => h.to_string(),
+            None => canonical_schema_hash(schema_json)?,
+        };
+        let schema = Arc::new(parse_schema(schema_json)?);
+        let id = match self.registry.get_cached(subject, &hash) {
+            Some(id) => id,
             None => match self
                 .registry
-                .register_hashed(subject, schema_json, &key.1, self.auth())
+                .register_hashed(subject, schema_json, &hash, self.auth())
                 .await
             {
                 Ok(result) => {
@@ -1116,9 +1330,12 @@ impl AvroEncoder {
                 }
             },
         };
-        let prepared = Prepared::new(id, schema)?;
-        self.prepared.write().insert(key, prepared.clone());
-        Ok(prepared)
+        Prepared::new(
+            id,
+            schema,
+            schema_json.len(),
+            self.schemas.budget().clone(),
+        )
     }
 }
 
@@ -1164,12 +1381,7 @@ impl CachedEncoder<'_> {
         let prepared = match &self.last {
             Some((key, prepared)) if *key == self.key => Arc::clone(prepared),
             _ => {
-                let prepared = self
-                    .encoder
-                    .resolved
-                    .read()
-                    .get(self.key.as_str())
-                    .cloned()?;
+                let prepared = self.encoder.schemas.get(self.key.as_str())?;
                 self.last = Some((self.key.clone(), Arc::clone(&prepared)));
                 prepared
             }
@@ -2315,7 +2527,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let prepared = Prepared::new(1, schema).unwrap();
+        let (prepared, _) =
+            Prepared::new(1, schema, 100, Budget::new(None)).unwrap();
         let count = |p: &Prepared| {
             p.writers.iter().filter(|w| w.get().is_some()).count()
         };
@@ -2338,6 +2551,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["R"]
         );
+    }
+
+    #[test]
+    fn extra_writers_are_charged_and_stop_at_a_full_budget_or_eviction() {
+        let schema = Arc::new(
+            AvroSchema::parse_str(
+                r#"{"type": "record", "name": "R", "fields": [
+                    {"name": "a", "type": "long"}]}"#,
+            )
+            .unwrap(),
+        );
+        let budget = Budget::new(Some(10_000_000));
+        let (p, _) =
+            Prepared::new(1, schema.clone(), 4000, budget.clone()).unwrap();
+        assert!(p.charge_writer());
+        assert_eq!(budget.used(), p.writer_bytes);
+        // Evicted: what the writers charged is returned, and no more.
+        assert_eq!(p.evict(), p.writer_bytes);
+        assert!(!p.charge_writer());
+        let full = Budget::new(Some(0));
+        let (p, _) = Prepared::new(1, schema, 4000, full.clone()).unwrap();
+        assert!(!p.charge_writer());
+        // Every writer busy and no room: an encode waits for the busy one
+        // instead of adding one.
+        let held = p.writer(0);
+        std::thread::scope(|s| {
+            let waiter = s.spawn(|| drop(p.writer(1)));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(!waiter.is_finished());
+            assert!(p.writers[1].get().is_none());
+            drop(held);
+            waiter.join().unwrap();
+        });
+        assert_eq!(full.used(), 0);
     }
 
     #[test]
@@ -2377,7 +2624,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let prepared = Prepared::new(42, schema.clone()).unwrap();
+        let (prepared, _) =
+            Prepared::new(42, schema.clone(), 100, Budget::new(None)).unwrap();
         // Twice: the writer's buffer is reused.
         for _ in 0..2 {
             let bytes = encode_with(&prepared, &json!({"a": 7, "s": "x"}), &[])

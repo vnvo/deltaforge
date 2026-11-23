@@ -368,17 +368,19 @@ fn build_avro_provider(
                 unsigned_bigint_mode,
                 enum_mode,
                 naive_timestamp_mode,
+                schema_cache_bytes,
                 ..
             } => Some((
                 unsigned_bigint_mode.clone(),
                 enum_mode.clone(),
                 naive_timestamp_mode.clone(),
+                *schema_cache_bytes,
             )),
             _ => None,
         }
     });
 
-    let (ubm, em, ntm) = avro_cfg?;
+    let (ubm, em, ntm, cache_bytes) = avro_cfg?;
     let loader = schema_loader.as_ref()?;
 
     let connector = match &spec.spec.source {
@@ -404,11 +406,12 @@ fn build_avro_provider(
     let schema_provider =
         Arc::new(SchemaLoaderAdapter::new(Arc::clone(loader)));
 
-    Some(Arc::new(AvroSchemaProviderImpl::new(
-        schema_provider,
-        connector,
-        opts,
-    )))
+    Some(Arc::new(
+        AvroSchemaProviderImpl::new(schema_provider, connector, opts)
+            .with_cache_bytes(Some(cache_bytes.unwrap_or_else(
+            deltaforge_core::encoding::avro_cache::default_schema_cache_bytes,
+        ))),
+    ))
 }
 
 /// Build an Arrow schema resolver if any sink is an S3/Parquet sink.
