@@ -4,11 +4,10 @@
 //! untyped bytes, or a column the schema version does not define is never
 //! written and never dropped: it is a sink conversion failure.
 
-use apache_avro::Schema as AvroSchema;
-use apache_avro::schema::{RecordSchema, UnionSchema};
-use apache_avro::types::Value as AvroValue;
+use std::borrow::Cow;
 
-use super::{Cx, EncodingError, SOURCE_TYPE_ATTR, kind_of};
+use super::super::avro_plan::{Out, Plan, RecordPlan};
+use super::{Cx, EncodingError, back};
 use crate::canonical::render::{
     date_text, datetime_text, decimal_text, time_text, timestamp_text,
     uuid_text,
@@ -50,61 +49,62 @@ fn value_kind(v: &CanonicalValue) -> &'static str {
 }
 
 /// A row image as the record `r`.
-pub(super) fn convert_row(
+pub(super) fn convert_row<O: Out>(
     row: &CanonicalRow,
-    r: &RecordSchema,
+    r: &RecordPlan,
     cx: &Cx<'_>,
-) -> Result<AvroValue, EncodingError> {
-    if let Some((name, v)) =
-        row.iter().find(|(n, _)| !r.lookup.contains_key(*n))
-    {
+    out: &mut O,
+) -> Result<(), EncodingError> {
+    if let Some((name, v)) = row.iter().find(|(n, _)| !r.defines(n)) {
         return Err(cx.field(name, None).refuse(
             v,
             "record",
             "a column the event's schema version does not define",
         ));
     }
-    let mut fields = Vec::with_capacity(r.fields.len());
+    out.record_begin(r.fields.len());
     for (i, field) in r.fields.iter().enumerate() {
-        let source = field
-            .custom_attributes
-            .get(SOURCE_TYPE_ATTR)
-            .and_then(|v| v.as_str());
-        let fcx = cx.field(&field.name, source);
+        let fcx = cx.field(&field.name, field.source.as_deref());
         let value = row
             .get_hinted(i, &field.name)
             .unwrap_or(&CanonicalValue::Null);
-        fields.push((
-            field.name.clone(),
-            convert_value(value, &field.schema, &fcx)?,
-        ));
+        out.field(&field.name);
+        convert_value(value, &field.plan, &fcx, out)?;
     }
-    Ok(AvroValue::Record(fields))
+    out.record_end();
+    Ok(())
 }
 
-fn convert_union(
+fn convert_union<O: Out>(
     v: &CanonicalValue,
-    u: &UnionSchema,
+    variants: &[Plan],
     cx: &Cx<'_>,
-) -> Result<AvroValue, EncodingError> {
-    let variants = u.variants();
+    out: &mut O,
+) -> Result<(), EncodingError> {
     if v.is_null() {
-        return variants
+        let i = variants
             .iter()
-            .position(|s| matches!(s, AvroSchema::Null))
-            .map(|i| AvroValue::Union(i as u32, Box::new(AvroValue::Null)))
+            .position(|s| matches!(s, Plan::Null))
             .ok_or_else(|| {
                 cx.refuse(v, "union", "null for a non-nullable field")
-            });
+            })?;
+        out.union_branch(i as u32);
+        out.null();
+        return Ok(());
     }
     let mut last = None;
     for (i, s) in variants.iter().enumerate() {
-        if matches!(s, AvroSchema::Null) {
+        if matches!(s, Plan::Null) {
             continue;
         }
-        match convert_value(v, s, cx) {
-            Ok(x) => return Ok(AvroValue::Union(i as u32, Box::new(x))),
-            Err(e) => last = Some(e),
+        let mark = out.mark();
+        out.union_branch(i as u32);
+        match convert_value(v, s, cx, out) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                out.reset(mark);
+                last = Some(e);
+            }
         }
     }
     Err(last.unwrap_or_else(|| {
@@ -112,203 +112,212 @@ fn convert_union(
     }))
 }
 
-/// One column value as `schema`.
-pub(super) fn convert_value(
+/// One column value as `plan`.
+pub(super) fn convert_value<O: Out>(
     v: &CanonicalValue,
-    schema: &AvroSchema,
+    plan: &Plan,
     cx: &Cx<'_>,
-) -> Result<AvroValue, EncodingError> {
-    use AvroSchema as S;
-    match (schema, v) {
+    out: &mut O,
+) -> Result<(), EncodingError> {
+    match (plan, v) {
         (_, CanonicalValue::Unchanged) => Err(cx.refuse(
             v,
-            kind_of(schema),
+            plan.kind(),
             "PostgreSQL did not send the value (unchanged TOAST)",
         )),
         (_, CanonicalValue::Document(_)) => Err(cx.refuse(
             v,
-            kind_of(schema),
+            plan.kind(),
             "an untyped document in a schema-typed column",
         )),
-        (S::Union(u), _) => convert_union(v, u, cx),
+        (Plan::Union(u), _) => convert_union(v, u, cx, out),
         // Bytes encode as binary, exactly; never as another type.
-        (S::Bytes, CanonicalValue::Bytes(b)) => Ok(AvroValue::Bytes(b.clone())),
-        (S::Fixed(f), CanonicalValue::Bytes(b)) if b.len() == f.size => {
-            Ok(AvroValue::Fixed(f.size, b.clone()))
+        (Plan::Bytes, CanonicalValue::Bytes(b)) => {
+            out.bytes(b);
+            Ok(())
+        }
+        (Plan::Fixed(size), CanonicalValue::Bytes(b)) if b.len() == *size => {
+            out.fixed(b);
+            Ok(())
         }
         (_, CanonicalValue::Bytes(_)) => Err(cx.refuse(
             v,
-            kind_of(schema),
+            plan.kind(),
             "bytes for a non-binary column (or of another fixed width)",
         )),
-        (S::Ref { name }, _) => {
-            let target = cx
-                .names
-                .get(name)
-                .or_else(|| {
-                    cx.names
-                        .iter()
-                        .find(|(n, _)| n.name == name.name)
-                        .map(|(_, s)| s)
-                })
-                .ok_or_else(|| {
-                    cx.refuse(v, "named type", "unresolved named reference")
-                })?;
-            convert_value(v, target, cx)
+        (Plan::Ref(target), _) => convert_value(v, target, cx, out),
+        (Plan::Back(r), _) => convert_value(v, &back(r), cx, out),
+        (Plan::Unresolved, _) => {
+            Err(cx.refuse(v, "named type", "unresolved named reference"))
         }
-        (S::Null, CanonicalValue::Null) => Ok(AvroValue::Null),
+        (Plan::Null, CanonicalValue::Null) => {
+            out.null();
+            Ok(())
+        }
         (_, CanonicalValue::Null) => {
-            Err(cx.refuse(v, kind_of(schema), "null for a non-nullable field"))
+            Err(cx.refuse(v, plan.kind(), "null for a non-nullable field"))
         }
-        (S::String, CanonicalValue::Opaque(o)) => {
-            Ok(AvroValue::String(o.text.clone()))
+        (Plan::String, CanonicalValue::Opaque(o)) => {
+            out.string(&o.text);
+            Ok(())
         }
         (_, CanonicalValue::Opaque(_)) => Err(cx.refuse(
             v,
-            kind_of(schema),
+            plan.kind(),
             "an opaque source value has only its text",
         )),
-        (_, CanonicalValue::Db(db)) => convert_db(v, db, schema, cx),
+        (_, CanonicalValue::Db(db)) => convert_db(v, db, plan, cx, out),
     }
 }
 
-fn convert_db(
+fn convert_db<O: Out>(
     v: &CanonicalValue,
     db: &DbValue,
-    schema: &AvroSchema,
+    plan: &Plan,
     cx: &Cx<'_>,
-) -> Result<AvroValue, EncodingError> {
-    use AvroSchema as S;
-    let fail = |reason| cx.refuse(v, kind_of(schema), reason);
-    match (schema, db) {
-        (S::Boolean, DbValue::Bool(b)) => Ok(AvroValue::Boolean(*b)),
-        (S::Boolean, DbValue::Bits(b)) if b.len() == 1 => {
-            Ok(AvroValue::Boolean(b.to_u64() == 1))
+    out: &mut O,
+) -> Result<(), EncodingError> {
+    let fail = |reason| cx.refuse(v, plan.kind(), reason);
+    match (plan, db) {
+        (Plan::Boolean, DbValue::Bool(b)) => out.boolean(*b),
+        (Plan::Boolean, DbValue::Bits(b)) if b.len() == 1 => {
+            out.boolean(b.to_u64() == 1)
         }
-        (S::Int, DbValue::Int { value, .. }) => i32::try_from(*value)
-            .map(AvroValue::Int)
-            .map_err(|_| fail("not in the signed 32-bit range")),
-        (S::Int, DbValue::UInt { value, .. }) => i32::try_from(*value)
-            .map(AvroValue::Int)
-            .map_err(|_| fail("not in the signed 32-bit range")),
-        (S::Int, DbValue::Year(y)) => Ok(AvroValue::Int(*y as i32)),
-        (S::Long, DbValue::Int { value, .. }) => Ok(AvroValue::Long(*value)),
-        (S::Long, DbValue::UInt { value, .. }) => i64::try_from(*value)
-            .map(AvroValue::Long)
-            .map_err(|_| fail("an unsigned value above i64::MAX")),
-        (S::Long, DbValue::Year(y)) => Ok(AvroValue::Long(*y as i64)),
+        (Plan::Int, DbValue::Int { value, .. }) => out.int(
+            i32::try_from(*value)
+                .map_err(|_| fail("not in the signed 32-bit range"))?,
+        ),
+        (Plan::Int, DbValue::UInt { value, .. }) => out.int(
+            i32::try_from(*value)
+                .map_err(|_| fail("not in the signed 32-bit range"))?,
+        ),
+        (Plan::Int, DbValue::Year(y)) => out.int(*y as i32),
+        (Plan::Long, DbValue::Int { value, .. }) => out.long(*value),
+        (Plan::Long, DbValue::UInt { value, .. }) => out.long(
+            i64::try_from(*value)
+                .map_err(|_| fail("an unsigned value above i64::MAX"))?,
+        ),
+        (Plan::Long, DbValue::Year(y)) => out.long(*y as i64),
         // MySQL TIME: a signed duration in microseconds.
-        (S::Long, DbValue::Time(t)) => Ok(AvroValue::Long(t.micros())),
-        (S::Float, DbValue::Float32(f)) => Ok(AvroValue::Float(*f)),
-        (S::Double, DbValue::Float64(f)) => Ok(AvroValue::Double(*f)),
-        (S::Double, DbValue::Float32(f)) => Ok(AvroValue::Double(*f as f64)),
-        (S::String, db) => string_of(db)
-            .map(AvroValue::String)
-            .ok_or_else(|| fail("no exact text for the value's type")),
-        (S::Uuid, DbValue::Uuid(u)) => {
-            Ok(AvroValue::Uuid(uuid::Uuid::from_bytes(*u)))
+        (Plan::Long, DbValue::Time(t)) => out.long(t.micros()),
+        (Plan::Float, DbValue::Float32(f)) => out.float(*f),
+        (Plan::Double, DbValue::Float64(f)) => out.double(*f),
+        (Plan::Double, DbValue::Float32(f)) => out.double(*f as f64),
+        (Plan::String, db) => out.string(
+            &string_of(db)
+                .ok_or_else(|| fail("no exact text for the value's type"))?,
+        ),
+        (Plan::Uuid, DbValue::Uuid(u)) => out.uuid(u),
+        (Plan::Bytes, DbValue::Binary(b)) => out.bytes(b),
+        (Plan::Bytes, DbValue::Bits(b)) => out.bytes(b.bytes()),
+        (Plan::Fixed(size), DbValue::Bits(b)) if b.bytes().len() == *size => {
+            out.fixed(b.bytes())
         }
-        (S::Bytes, DbValue::Binary(b)) => Ok(AvroValue::Bytes(b.clone())),
-        (S::Bytes, DbValue::Bits(b)) => {
-            Ok(AvroValue::Bytes(b.bytes().to_vec()))
+        (Plan::Fixed(size), DbValue::Binary(b)) if b.len() == *size => {
+            out.fixed(b)
         }
-        (S::Fixed(f), DbValue::Bits(b)) if b.bytes().len() == f.size => {
-            Ok(AvroValue::Fixed(f.size, b.bytes().to_vec()))
+        (Plan::Fixed(16), DbValue::Uuid(u)) => out.fixed(u),
+        (Plan::Enum(symbols), DbValue::Enum(x)) => {
+            let i = symbols
+                .iter()
+                .position(|s| **s == *x.label)
+                .ok_or_else(|| fail("not a symbol of the enum"))?;
+            out.enum_symbol(i as u32, &x.label)
         }
-        (S::Fixed(f), DbValue::Binary(b)) if b.len() == f.size => {
-            Ok(AvroValue::Fixed(f.size, b.clone()))
+        (Plan::Date, DbValue::Date(DateValue::Civil(d))) => out.date(
+            d.days_since_epoch()
+                .and_then(|days| i32::try_from(days).ok())
+                .ok_or_else(|| {
+                    fail(
+                        "a MySQL zero date or one outside the 32-bit day range",
+                    )
+                })?,
+        ),
+        (Plan::Date, DbValue::Date(_)) => {
+            return Err(fail("an infinite date"));
         }
-        (S::Fixed(f), DbValue::Uuid(u)) if f.size == 16 => {
-            Ok(AvroValue::Fixed(16, u.to_vec()))
-        }
-        (S::Enum(e), DbValue::Enum(x)) => e
-            .symbols
-            .iter()
-            .position(|s| *s == x.label)
-            .map(|i| AvroValue::Enum(i as u32, x.label.clone()))
-            .ok_or_else(|| fail("not a symbol of the enum")),
-        (S::Date, DbValue::Date(DateValue::Civil(d))) => d
-            .days_since_epoch()
-            .and_then(|days| i32::try_from(days).ok())
-            .map(AvroValue::Date)
-            .ok_or_else(|| {
-                fail("a MySQL zero date or one outside the 32-bit day range")
-            }),
-        (S::Date, DbValue::Date(_)) => Err(fail("an infinite date")),
-        (S::TimeMicros, DbValue::Time(t))
+        (Plan::TimeMicros, DbValue::Time(t))
             if (0..MICROS_PER_DAY).contains(&t.micros()) =>
         {
-            Ok(AvroValue::TimeMicros(t.micros()))
+            out.time_micros(t.micros())
         }
-        (S::TimeMillis, DbValue::Time(t))
+        (Plan::TimeMillis, DbValue::Time(t))
             if (0..MICROS_PER_DAY).contains(&t.micros())
                 && t.micros() % 1000 == 0 =>
         {
-            Ok(AvroValue::TimeMillis((t.micros() / 1000) as i32))
+            out.time_millis((t.micros() / 1000) as i32)
         }
         (
-            S::TimestampMicros,
+            Plan::TimestampMicros,
             DbValue::Timestamp(TimestampValue::Instant { micros, .. }),
-        ) => Ok(AvroValue::TimestampMicros(*micros)),
+        ) => out.timestamp_micros(*micros),
         (
-            S::TimestampMillis,
+            Plan::TimestampMillis,
             DbValue::Timestamp(TimestampValue::Instant { micros, .. }),
-        ) if micros % 1000 == 0 => {
-            Ok(AvroValue::TimestampMillis(micros / 1000))
-        }
-        (S::TimestampMicros | S::TimestampMillis, DbValue::Timestamp(_)) => {
-            Err(fail(
+        ) if micros % 1000 == 0 => out.timestamp_millis(micros / 1000),
+        (
+            Plan::TimestampMicros | Plan::TimestampMillis,
+            DbValue::Timestamp(_),
+        ) => {
+            return Err(fail(
                 "a MySQL zero timestamp, an infinity, or finer than the unit",
-            ))
+            ));
         }
         (
-            S::LocalTimestampMicros,
+            Plan::LocalTimestampMicros,
             DbValue::DateTime(DateTimeValue::Civil {
                 date,
                 micros_of_day,
                 ..
             }),
-        ) => date
-            .days_since_epoch()
-            .and_then(|d| d.checked_mul(MICROS_PER_DAY))
-            .and_then(|d| d.checked_add(*micros_of_day))
-            .map(AvroValue::LocalTimestampMicros)
-            .ok_or_else(|| fail("a MySQL zero date-time")),
+        ) => out.local_timestamp_micros(
+            date.days_since_epoch()
+                .and_then(|d| d.checked_mul(MICROS_PER_DAY))
+                .and_then(|d| d.checked_add(*micros_of_day))
+                .ok_or_else(|| fail("a MySQL zero date-time"))?,
+        ),
         (
-            S::LocalTimestampMicros | S::LocalTimestampMillis,
+            Plan::LocalTimestampMicros | Plan::LocalTimestampMillis,
             DbValue::DateTime(_),
-        ) => Err(fail(
-            "a MySQL zero date-time, an infinity, or finer than the unit",
-        )),
-        (S::Array(a), DbValue::Array(arr)) => {
-            let item = cx.item();
-            arr.items()
-                .iter()
-                .map(|i| convert_value(i, &a.items, &item))
-                .collect::<Result<Vec<_>, _>>()
-                .map(AvroValue::Array)
+        ) => {
+            return Err(fail(
+                "a MySQL zero date-time, an infinity, or finer than the unit",
+            ));
         }
-        _ => Err(fail("the value's type does not match the field's type")),
+        (Plan::Array(item), DbValue::Array(arr)) => {
+            let item_cx = cx.item();
+            out.array_begin(arr.items().len());
+            for i in arr.items() {
+                convert_value(i, item, &item_cx, out)?;
+            }
+            out.array_end()
+        }
+        _ => {
+            return Err(fail(
+                "the value's type does not match the field's type",
+            ));
+        }
     }
+    Ok(())
 }
 
 /// The exact text of a value for a `string` field (DECIMAL, BIGINT UNSIGNED
 /// in string mode, ENUM and SET labels, JSON text, temporal text in string
 /// mode); `None` for values whose text form is not their typed content.
-fn string_of(db: &DbValue) -> Option<String> {
+fn string_of(db: &DbValue) -> Option<Cow<'_, str>> {
     Some(match db {
-        DbValue::Text(s) => s.clone(),
-        DbValue::Decimal(d) => decimal_text(d).to_string(),
-        DbValue::Int { value, .. } => value.to_string(),
-        DbValue::UInt { value, .. } => value.to_string(),
-        DbValue::Enum(e) => e.label.clone(),
-        DbValue::Set(s) => s.members().join(","),
-        DbValue::Json(j) => j.as_str().to_string(),
-        DbValue::Uuid(u) => uuid_text(u),
-        DbValue::Date(d) => date_text(d),
-        DbValue::Time(t) => time_text(t),
-        DbValue::DateTime(dt) => datetime_text(dt),
-        DbValue::Timestamp(ts) => timestamp_text(ts),
+        DbValue::Text(s) => Cow::Borrowed(s.as_str()),
+        DbValue::Decimal(d) => Cow::Owned(decimal_text(d).to_string()),
+        DbValue::Int { value, .. } => Cow::Owned(value.to_string()),
+        DbValue::UInt { value, .. } => Cow::Owned(value.to_string()),
+        DbValue::Enum(e) => Cow::Borrowed(e.label.as_str()),
+        DbValue::Set(s) => Cow::Owned(s.members().join(",")),
+        DbValue::Json(j) => Cow::Borrowed(j.as_str()),
+        DbValue::Uuid(u) => Cow::Owned(uuid_text(u)),
+        DbValue::Date(d) => Cow::Owned(date_text(d)),
+        DbValue::Time(t) => Cow::Owned(time_text(t)),
+        DbValue::DateTime(dt) => Cow::Owned(datetime_text(dt)),
+        DbValue::Timestamp(ts) => Cow::Owned(timestamp_text(ts)),
         _ => return None,
     })
 }

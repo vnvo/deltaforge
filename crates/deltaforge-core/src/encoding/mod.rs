@@ -13,6 +13,7 @@ pub mod arrow_types;
 pub mod avro;
 pub mod avro_cache;
 mod avro_infer;
+mod avro_plan;
 pub mod avro_schema;
 pub mod avro_types;
 mod json;

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **DDL-derived Avro schemas kept compiled, events written directly** - an Avro sink parses each table schema derived from the source's schema history once, when it is prepared, compiles it into a compact encoding plan and drops the parsed schema; events are written to Avro binary straight from their values with the plan, with no intermediate Avro value and no apache-avro writer. A cached 12-column table takes about 6 KB instead of about 300 KB, so a schema cache bound holds about 50 times more tables, and a table prepared again after an eviction parses its schema once instead of three times. Encoding takes 2.4 to 2.8 times less CPU per event with cached schemas (in-process benchmark `canonical_encode`, narrow, wide and temporal rows) and the bytes are unchanged: the Avro golden encodings are identical, and a differential test checks the direct encoding against apache-avro's for generated schemas and values. The registry ID cache now takes a quarter of the schema cache bound (was a sixteenth), so a table's ID outlives its plan. Inferred schemas and DDL event records keep apache-avro's writer.
+
 ### Fixed
 
 - **Avro encoder memory per table schema cut about sixfold** - the Avro encoder kept, for every registered table schema, eight writers that each held their own resolved copy of the schema, and a second copy of every named type, about 1.9 MB per table (a 12-column table), so a pipeline encoding tens of thousands of tables was OOM-killed. A schema now starts with one writer and adds one (up to eight) only when concurrent encodes find every writer busy, and keeps only the named types its references resolve to: about 300 KB per such table.
