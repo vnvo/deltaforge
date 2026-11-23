@@ -1,7 +1,6 @@
-//! The memory an Avro encoder holds per table: each registered table schema
-//! is kept once, with one writer until concurrent encodes of that schema need
-//! more, so the memory of a catalog of many tables stays near the size of
-//! their schemas.
+//! The memory an Avro encoder holds per table: a DDL-derived table schema is
+//! kept as its compiled plan only (a few KB), so a catalog of many tables
+//! stays small.
 
 #![allow(unsafe_code)]
 
@@ -45,7 +44,7 @@ static ALLOCATOR: Counting = Counting;
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
-async fn each_table_schema_costs_about_its_parsed_size() {
+async fn each_table_schema_costs_a_few_kilobytes() {
     let _serial = SERIAL.lock().await;
     let (url, _) = registry();
     let encoder = encoder(&url, 11, None);
@@ -57,32 +56,34 @@ async fn each_table_schema_costs_about_its_parsed_size() {
         encode(&encoder, &format!("t{i:04}")).await;
     }
     let per_table = (LIVE.load(Ordering::Relaxed) - before) / tables;
-    // A 12-column table's parsed envelope schema is about 68 KB and one
-    // writer's resolved copy of it about 204 KB (apache-avro 0.17); eight
-    // writers and every named type cloned were 1.88 MB.
-    assert!(per_table < 400_000, "{per_table} bytes per table");
+    // A 12-column table: its plan, registry ID and cache keys, about 6.4 KB
+    // (measured). Its parsed schema and one apache-avro writer were about
+    // 300 KB (eight writers and every named type cloned, 1.88 MB).
+    assert!(per_table < 16_000, "{per_table} bytes per table");
 }
 
 /// The encoder's estimate of what it holds is the heap it holds, within a
-/// tenth (measured: about 1%), for narrow and wide tables: the bound is in real bytes.
+/// tenth, for narrow and wide tables: the bound is in real bytes. Measured
+/// as the heap a clear of the caches frees (the process heap moves by more
+/// than a few small entries meanwhile).
 #[tokio::test]
 async fn the_cache_estimate_tracks_the_heap_held() {
     let _serial = SERIAL.lock().await;
     for extra in [0, 11, 60, 250] {
         let (url, _) = registry();
         let encoder = encoder(&url, extra, None);
-        encode(&encoder, "warm").await;
-        let (heap, charged) =
-            (LIVE.load(Ordering::Relaxed), encoder.schema_cache_bytes());
-        for i in 0..20 {
+        for i in 0..50 {
             encode(&encoder, &format!("t{i:04}")).await;
         }
-        let heap = (LIVE.load(Ordering::Relaxed) - heap) as f64;
-        let charged = (encoder.schema_cache_bytes() - charged) as f64;
-        let ratio = charged / heap;
+        let charged = encoder.schema_cache_bytes() as f64;
+        let before = LIVE.load(Ordering::Relaxed);
+        encoder.clear_caches();
+        let freed = (before - LIVE.load(Ordering::Relaxed)) as f64;
+        assert_eq!(encoder.schema_cache_bytes(), 0);
+        let ratio = charged / freed;
         assert!(
             (0.9..1.1).contains(&ratio),
-            "{} columns: charged {charged} for {heap} heap bytes",
+            "{} columns: charged {charged} for {freed} heap bytes",
             extra + 1
         );
     }
@@ -95,25 +96,31 @@ async fn the_cache_estimate_tracks_the_heap_held() {
 async fn a_bounded_encoder_stays_within_its_bound_and_re_resolves() {
     let _serial = SERIAL.lock().await;
     let (url, seen) = registry();
-    let limit = 4_000_000;
+    // About 150 tables of 12 columns.
+    let limit = 1_000_000;
     let encoder = encoder(&url, 11, Some(limit));
     let first = encode(&encoder, "t0000").await;
-    let before = LIVE.load(Ordering::Relaxed);
-    for i in 1..100 {
+    for i in 1..400 {
         encode(&encoder, &format!("t{i:04}")).await;
     }
-    let held = LIVE.load(Ordering::Relaxed) - before;
     assert!(encoder.schema_cache_evictions() > 0);
     // Within the bound plus one entry (an insert evicts after it charges).
-    assert!(encoder.schema_cache_bytes() < limit + 400_000);
-    assert!(held < (limit + 400_000) as isize, "{held} heap bytes held");
+    assert!(encoder.schema_cache_bytes() < limit + 16_000);
     let registered = seen.lock().unwrap().len();
-    assert_eq!(registered, 100);
+    assert_eq!(registered, 400);
     assert_eq!(encode(&encoder, "t0000").await, first);
     assert_eq!(
         seen.lock().unwrap().len(),
         registered,
         "no new registration"
+    );
+    // The heap it holds is within the bound too (what a clear frees).
+    let before = LIVE.load(Ordering::Relaxed);
+    encoder.clear_caches();
+    let freed = before - LIVE.load(Ordering::Relaxed);
+    assert!(
+        freed < (limit + 16_000) as isize * 11 / 10,
+        "{freed} heap bytes held"
     );
 }
 
