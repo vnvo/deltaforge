@@ -228,6 +228,8 @@ sinks:
 | `record_name` | `{record_name}` | One schema per record type, shared across topics |
 | `topic_record_name` | `{topic}-{record_name}` | Per-topic, per-record schema |
 
+Each subject carries the type-mapping suffix (`-v2`). A row event's record name is its table's: `deltaforge.cdc.<connector>.<database>.<table>.Envelope` for a DDL-derived schema, `deltaforge.<connector>.<database>.<table>.Value` for an inferred one. `topic_name` puts every table of a topic under the topic's one subject, which the registry's default `BACKWARD` compatibility rejects at the second table with another schema; when several tables share a topic, use `record_name` or `topic_record_name`.
+
 #### Schema source
 
 When source DDL is available (MySQL `INFORMATION_SCHEMA`, PostgreSQL `pg_catalog`), DeltaForge derives precise Avro schemas from the actual column types and nullability. This is the recommended path for production.
