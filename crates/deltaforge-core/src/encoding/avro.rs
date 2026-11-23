@@ -18,7 +18,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use apache_avro::Schema as AvroSchema;
 use apache_avro::types::Value as AvroValue;
@@ -467,17 +467,23 @@ fn resolved_key(
 /// A schema registered for a subject, prepared for encoding.
 type Registered = Arc<Prepared>;
 
-/// A registered schema prepared once for encoding: its ID, its named types
-/// (resolved once, not per event) and writers that validate and encode
-/// values with them (several, so concurrent encoders do not wait for one).
+/// A registered schema prepared once for encoding: its ID, the named types
+/// its references resolve to (resolved once, not per event) and writers that
+/// validate and encode values with it. A writer holds its own resolved copy
+/// of the schema, several times the schema's size, so a schema has one
+/// writer until concurrent encodes find every writer busy, and at most
+/// [`WRITERS`]: a catalog of many tables keeps one per table.
 struct Prepared {
     id: u32,
     schema: Arc<AvroSchema>,
     names: Names,
-    writers: Vec<parking_lot::Mutex<apache_avro::GenericSingleObjectWriter>>,
+    writers: [OnceLock<Writer>; WRITERS],
 }
 
-/// Writers per prepared schema: concurrent encoders beyond this share them.
+type Writer = parking_lot::Mutex<apache_avro::GenericSingleObjectWriter>;
+
+/// Writers per prepared schema at most: concurrent encoders beyond this
+/// share them.
 const WRITERS: usize = 8;
 
 /// A schema's named types by name.
@@ -492,24 +498,94 @@ impl Prepared {
         id: u32,
         schema: Arc<AvroSchema>,
     ) -> Result<Registered, EncodingError> {
-        let names = resolve_names(&schema)?;
-        let writers = (0..WRITERS)
-            .map(|_| {
-                apache_avro::GenericSingleObjectWriter::new_with_capacity(
-                    &schema, 1024,
-                )
-                .map(parking_lot::Mutex::new)
-                .map_err(|e| {
-                    EncodingError::Avro(format!("unresolvable schema: {e}"))
-                })
-            })
-            .collect::<Result<_, _>>()?;
+        let names = referenced_names(&schema)?;
+        let writers: [OnceLock<Writer>; WRITERS] = Default::default();
+        let _ = writers[0].set(new_writer(&schema)?);
         Ok(Arc::new(Prepared {
             id,
             schema,
             names,
             writers,
         }))
+    }
+
+    /// A free writer, searched from `slot`'s; a new one when every existing
+    /// writer is busy and fewer than [`WRITERS`] exist; else `slot`'s, once
+    /// it is free (the first writer's when `slot` has none).
+    fn writer(
+        &self,
+        slot: usize,
+    ) -> parking_lot::MutexGuard<'_, apache_avro::GenericSingleObjectWriter>
+    {
+        let order = (0..WRITERS).map(|k| (slot + k) % WRITERS);
+        for i in order.clone() {
+            if let Some(w) = self.writers[i].get().and_then(|w| w.try_lock()) {
+                return w;
+            }
+        }
+        for i in order {
+            if self.writers[i].get().is_none() {
+                // The schema resolved for the first writer, so it resolves
+                // again; a failure leaves the waiting below.
+                if let Ok(w) = new_writer(&self.schema) {
+                    let _ = self.writers[i].set(w);
+                }
+                if let Some(w) =
+                    self.writers[i].get().and_then(|w| w.try_lock())
+                {
+                    return w;
+                }
+                break;
+            }
+        }
+        self.writers[slot % WRITERS]
+            .get()
+            .or_else(|| self.writers[0].get())
+            .expect("the first writer exists")
+            .lock()
+    }
+}
+
+fn new_writer(schema: &AvroSchema) -> Result<Writer, EncodingError> {
+    apache_avro::GenericSingleObjectWriter::new_with_capacity(schema, 1024)
+        .map(parking_lot::Mutex::new)
+        .map_err(|e| EncodingError::Avro(format!("unresolvable schema: {e}")))
+}
+
+/// The named types of `schema` that its references can resolve to (by full
+/// name, or by name alone; see [`convert`]): the only ones conversion looks
+/// up, so a schema keeps no second copy of its other named types (its root
+/// record among them).
+fn referenced_names(schema: &AvroSchema) -> Result<Names, EncodingError> {
+    let mut refs = std::collections::HashSet::new();
+    collect_refs(schema, &mut refs);
+    if refs.is_empty() {
+        return Ok(Names::new());
+    }
+    let mut names = resolve_names(schema)?;
+    names.retain(|n, _| refs.contains(n.name.as_str()));
+    Ok(names)
+}
+
+/// The names (without namespace) of every reference in `schema`.
+fn collect_refs<'a>(
+    schema: &'a AvroSchema,
+    refs: &mut std::collections::HashSet<&'a str>,
+) {
+    match schema {
+        AvroSchema::Ref { name } => {
+            refs.insert(name.name.as_str());
+        }
+        AvroSchema::Record(r) => {
+            r.fields.iter().for_each(|f| collect_refs(&f.schema, refs))
+        }
+        AvroSchema::Union(u) => {
+            u.variants().iter().for_each(|v| collect_refs(v, refs))
+        }
+        AvroSchema::Array(a) => collect_refs(&a.items, refs),
+        AvroSchema::Map(m) => collect_refs(&m.types, refs),
+        AvroSchema::Decimal(d) => collect_refs(&d.inner, refs),
+        _ => {}
     }
 }
 
@@ -1131,26 +1207,19 @@ fn encode_in(
                 .increment(1);
             })?;
     let mut out = Vec::with_capacity(256);
-    // The slot's writer, or a free one (the first when every one is busy).
-    match slot {
-        Some(i) => prepared.writers[i % WRITERS].lock(),
-        None => prepared
-            .writers
-            .iter()
-            .find_map(|w| w.try_lock())
-            .unwrap_or_else(|| prepared.writers[0].lock()),
-    }
-    .write_value_ref(&avro_value, &mut out)
-    .map_err(|e| {
-        // A failed validation names the reason only: never the value.
-        let e = match e {
-            apache_avro::Error::ValidationWithReason { .. } => {
-                apache_avro::Error::Validation
-            }
-            e => e,
-        };
-        EncodingError::Avro(format!("Avro encoding failed: {e}"))
-    })?;
+    prepared
+        .writer(slot.unwrap_or(0))
+        .write_value_ref(&avro_value, &mut out)
+        .map_err(|e| {
+            // A failed validation names the reason only: never the value.
+            let e = match e {
+                apache_avro::Error::ValidationWithReason { .. } => {
+                    apache_avro::Error::Validation
+                }
+                e => e,
+            };
+            EncodingError::Avro(format!("Avro encoding failed: {e}"))
+        })?;
     // The writer's single-object header becomes the wire-format prefix.
     out.drain(..SINGLE_OBJECT_HEADER - 5);
     out[0] = 0x00;
@@ -2233,6 +2302,68 @@ mod tests {
         assert!(!item.path_is("payload.after.tags"));
         assert!(item.source_is(&["SET"]));
         assert!(root.path_is(""));
+    }
+
+    #[test]
+    fn a_schema_adds_writers_only_while_every_writer_is_busy() {
+        let schema = Arc::new(
+            AvroSchema::parse_str(
+                r#"{"type": "record", "name": "R", "fields": [
+                    {"name": "a", "type": "long"},
+                    {"name": "b", "type": ["null", "R"]}
+                ]}"#,
+            )
+            .unwrap(),
+        );
+        let prepared = Prepared::new(1, schema).unwrap();
+        let count = |p: &Prepared| {
+            p.writers.iter().filter(|w| w.get().is_some()).count()
+        };
+        assert_eq!(count(&prepared), 1);
+        // Sequential encodes, from any slot, reuse the one writer.
+        for slot in 0..20 {
+            drop(prepared.writer(slot));
+        }
+        assert_eq!(count(&prepared), 1);
+        // Each encode that finds every writer busy adds one, up to WRITERS.
+        let held: Vec<_> = (0..WRITERS).map(|s| prepared.writer(s)).collect();
+        assert_eq!(count(&prepared), WRITERS);
+        drop(held);
+        // The referenced record is kept: the only named type looked up.
+        assert_eq!(
+            prepared
+                .names
+                .keys()
+                .map(|n| n.name.as_str())
+                .collect::<Vec<_>>(),
+            ["R"]
+        );
+    }
+
+    #[test]
+    fn only_referenced_named_types_are_kept() {
+        let schema = AvroSchema::parse_str(
+            r#"{"type": "record", "name": "Envelope", "namespace": "n",
+                "fields": [
+                    {"name": "before", "type": ["null", {"type": "record",
+                        "name": "Value", "fields": [{"name": "id", "type": "long"}]}]},
+                    {"name": "after", "type": ["null", "Value"]},
+                    {"name": "source", "type": {"type": "record",
+                        "name": "Source", "fields": [{"name": "db", "type": "string"}]}}
+                ]}"#,
+        )
+        .unwrap();
+        let names = referenced_names(&schema).unwrap();
+        assert_eq!(
+            names.keys().map(|n| n.fullname(None)).collect::<Vec<_>>(),
+            ["n.Value"]
+        );
+        let no_refs = AvroSchema::parse_str(
+            r#"{"type": "record", "name": "R", "fields": [
+                {"name": "a", "type": "long"}]}"#,
+        )
+        .unwrap();
+        assert!(referenced_names(&no_refs).unwrap().is_empty());
     }
 
     #[test]
