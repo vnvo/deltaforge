@@ -1643,6 +1643,7 @@ dependencies = [
  "bytes",
  "checkpoints",
  "chrono",
+ "futures",
  "hex",
  "itoa",
  "metrics",

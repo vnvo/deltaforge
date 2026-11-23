@@ -686,6 +686,23 @@ impl Sink for NatsSink {
             Vec::with_capacity(events.len());
         let mut dlq_failures: Vec<(usize, SinkError)> = Vec::new();
 
+        // The Avro schemas the batch needs and the cache lacks, resolved
+        // several at a time before the batch is encoded in order.
+        if let Some(encoder) = self.avro_encoder.as_ref() {
+            encoder
+                .resolve_ahead(
+                    events
+                        .iter()
+                        .filter(|e| {
+                            !e.routing.as_ref().is_some_and(|r| r.raw_payload)
+                        })
+                        .filter_map(|e| {
+                            self.resolve_subject(e).ok().map(|d| (d, e))
+                        }),
+                )
+                .await;
+        }
+
         for (i, e) in events.iter().enumerate() {
             let prepared = async {
                 let subject = self.resolve_subject(e)?;

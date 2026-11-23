@@ -97,6 +97,7 @@ workspace  deltaforge-config/config_tests
 workspace  deltaforge-core/avro_golden
 workspace  deltaforge-core/avro_encoder_memory
 workspace  deltaforge-core/avro_subjects
+workspace  deltaforge-core/avro_registration_ahead
 workspace  deltaforge-core/source_handle
 workspace  processors/filter_processor_tests
 workspace  processors/flatten_processor_tests

@@ -902,6 +902,22 @@ impl Sink for KafkaSink {
         // An Avro batch's records prepared ahead on several threads (when
         // configured); a record they could not prepare without waiting is
         // prepared here, in order.
+        // The schemas the batch needs and the cache lacks, resolved several
+        // at a time before the batch is encoded in order.
+        if let Some(encoder) = self.avro_encoder.as_ref() {
+            encoder
+                .resolve_ahead(
+                    events
+                        .iter()
+                        .filter(|e| {
+                            !e.routing.as_ref().is_some_and(|r| r.raw_payload)
+                        })
+                        .filter_map(|e| {
+                            self.resolve_topic(e).ok().map(|t| (t, e))
+                        }),
+                )
+                .await;
+        }
         let mut ahead = self.prepare_parallel(events);
         for (i, e) in events.iter().enumerate() {
             // Encoding a batch is CPU work with nothing to wait on: it gives
@@ -1686,6 +1702,114 @@ mod tests {
                     e
                 })
                 .collect()
+        }
+
+        /// The envelope schema of each table `shop.<table>` (`id int`).
+        struct Tables;
+
+        impl SourceSchemaProvider for Tables {
+            fn get_envelope_schema(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                table: &str,
+                _: &SchemaIdentity,
+            ) -> EnvelopeSchemaLookup {
+                let id = mysql_column_to_avro(
+                    &ColumnDesc {
+                        name: "id".into(),
+                        data_type: "int".into(),
+                        column_type: "int".into(),
+                        nullable: true,
+                        precision: None,
+                        scale: None,
+                        unsigned: false,
+                        is_array: false,
+                        element_type: None,
+                    },
+                    &TypeConversionOpts::default(),
+                );
+                let vs = build_value_schema("mysql", "shop", table, vec![id]);
+                let (json, schema) =
+                    build_envelope_schema("mysql", "shop", table, vs).unwrap();
+                EnvelopeSchemaLookup::Found(json, Arc::new(schema))
+            }
+
+            fn mapping_id(&self) -> &str {
+                "test-mapping"
+            }
+        }
+
+        /// A batch of many tables with their own subjects registers their
+        /// schemas several at a time before it is encoded in order (the
+        /// registry sees concurrent requests), and every record is still
+        /// prepared in order: here each fails its conversion, at its index.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_batch_of_many_tables_registers_them_concurrently() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let (in_flight, peak) =
+                (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+            let (f, p) = (Arc::clone(&in_flight), Arc::clone(&peak));
+            let register =
+                move |axum::extract::Path(subject): axum::extract::Path<
+                    String,
+                >| {
+                    let (f, p) = (Arc::clone(&f), Arc::clone(&p));
+                    async move {
+                        let now = f.fetch_add(1, Ordering::SeqCst) + 1;
+                        p.fetch_max(now, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            20,
+                        ))
+                        .await;
+                        f.fetch_sub(1, Ordering::SeqCst);
+                        let id = subject.len() as u32 + 1;
+                        axum::Json(json!({ "id": id }))
+                    }
+                };
+            let app = axum::Router::new().route(
+                "/subjects/{subject}/versions",
+                axum::routing::post(register),
+            );
+            let listener =
+                tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(
+                async move { axum::serve(listener, app).await.unwrap() },
+            );
+            let cfg: KafkaSinkCfg = serde_json::from_value(json!({
+                "id": "k",
+                "brokers": "127.0.0.1:1",
+                "topic": "orders",
+                "encoding": {"type": "avro", "schema_registry_url": url,
+                    "subject_strategy": "topic_record_name"},
+            }))
+            .unwrap();
+            let sink = KafkaSink::new(
+                &cfg,
+                CancellationToken::new(),
+                "p",
+                Some(Arc::new(Tables)),
+                &crate::ResolvedSinkCreds::default(),
+            )
+            .unwrap();
+            let events: Vec<Event> = (0..24)
+                .map(|i| {
+                    let mut e = batch(1, 0).remove(0);
+                    e.source.table = format!("t{i:02}");
+                    e
+                })
+                .collect();
+            let result = sink.send_batch(&events).await.unwrap();
+            assert_eq!(sink.producer.in_flight_count(), 0, "nothing enqueued");
+            let failed: Vec<usize> =
+                result.dlq_failures.iter().map(|(i, _)| *i).collect();
+            assert_eq!(failed, (0..24).collect::<Vec<_>>());
+            assert!(
+                peak.load(Ordering::SeqCst) > 1,
+                "registered one at a time"
+            );
         }
 
         /// With the schema registered, four threads prepare every record

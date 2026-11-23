@@ -198,6 +198,56 @@ fn canonical_json(v: &serde_json::Value, out: &mut String) {
     }
 }
 
+/// The Schema Registry requests one process has in flight to one registry
+/// at most, default (every Avro sink of every pipeline together): the
+/// first registration of many tables runs this many at once, and a process
+/// never queues more than this at the registry.
+pub const DEFAULT_MAX_REGISTRY_REQUESTS: u32 = 16;
+
+/// The highest [`configure_registry_requests`] accepts.
+pub const MAX_REGISTRY_REQUESTS: u32 = 64;
+
+static REGISTRY_REQUESTS: OnceLock<u32> = OnceLock::new();
+
+/// Set the process's limit of Schema Registry requests in flight per
+/// registry (1 to [`MAX_REGISTRY_REQUESTS`]), before any Avro encoder is
+/// built. Set once: another value afterwards is an error.
+pub fn configure_registry_requests(cap: u32) -> Result<(), String> {
+    if !(1..=MAX_REGISTRY_REQUESTS).contains(&cap) {
+        return Err(format!(
+            "max_avro_registry_requests must be 1 to {MAX_REGISTRY_REQUESTS}, not {cap}"
+        ));
+    }
+    let set = *REGISTRY_REQUESTS.get_or_init(|| cap);
+    if set == cap {
+        Ok(())
+    } else {
+        Err(format!(
+            "max_avro_registry_requests is already {set} for this process"
+        ))
+    }
+}
+
+/// The limit in force.
+pub fn registry_requests() -> u32 {
+    *REGISTRY_REQUESTS.get_or_init(|| DEFAULT_MAX_REGISTRY_REQUESTS)
+}
+
+/// The permits of the registry at `base_url`, shared by every client of
+/// this process that uses it.
+fn registry_permits(base_url: &str) -> Arc<tokio::sync::Semaphore> {
+    static ALL: OnceLock<
+        parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    > = OnceLock::new();
+    ALL.get_or_init(Default::default)
+        .lock()
+        .entry(base_url.to_string())
+        .or_insert_with(|| {
+            Arc::new(tokio::sync::Semaphore::new(registry_requests() as usize))
+        })
+        .clone()
+}
+
 /// Confluent Schema Registry HTTP client.
 ///
 /// Registered schema IDs are cached per `(subject, canonical schema hash)`:
@@ -209,6 +259,10 @@ pub struct SchemaRegistryClient {
     client: reqwest::Client,
     base_url: String,
     ids: SchemaCache<u32>,
+    /// This process's requests in flight to the registry (see
+    /// [`configure_registry_requests`]); a request waits for a permit
+    /// before it is sent, so its timeout runs from the send.
+    permits: Arc<tokio::sync::Semaphore>,
 }
 
 /// The cache key of `(subject, hash)`: both parts length-prefixed.
@@ -249,11 +303,21 @@ impl SchemaRegistryClient {
             .build()
             .map_err(|e| EncodingError::SchemaRegistry(e.to_string()))?;
 
+        let base_url = base_url.trim_end_matches('/').to_string();
         Ok(Self {
             client,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            permits: registry_permits(&base_url),
+            base_url,
             ids: SchemaCache::new(Budget::new(None)),
         })
+    }
+
+    /// A permit to send one request (held until its response is read).
+    async fn permit(&self) -> tokio::sync::SemaphorePermit<'_> {
+        self.permits
+            .acquire()
+            .await
+            .expect("the registry permits are never closed")
     }
 
     /// Bound the ID cache to `limit` bytes (unbounded when `None`),
@@ -312,6 +376,7 @@ impl SchemaRegistryClient {
             req = req.basic_auth(u, Some(p));
         }
 
+        let _permit = self.permit().await;
         let resp = req.send().await.map_err(|e| {
             EncodingError::SchemaRegistryUnavailable(format!(
                 "failed to register schema for subject {subject}: {e}"
@@ -366,6 +431,7 @@ impl SchemaRegistryClient {
         if let Some((u, p)) = auth {
             req = req.basic_auth(u, Some(p));
         }
+        let _permit = self.permit().await;
         let resp = req.send().await.map_err(|e| {
             EncodingError::SchemaRegistryUnavailable(format!(
                 "latest schema lookup failed for {subject}: {e}"
@@ -1029,12 +1095,7 @@ impl AvroEncoder {
         // or rebuilt from them (Path C): the envelope holds `{}` in their
         // places, never a rendering to discard.
         let mut json_value = Self::envelope_value(event, envelope)?;
-        let (connector, database, namespace, table) = (
-            event.source.connector.as_str(),
-            event.source.db.as_str(),
-            event.source.namespace(),
-            event.source.table.as_str(),
-        );
+        let connector = event.source.connector.as_str();
         let rows = row_paths(event);
         if let (Some(provider), Some(fingerprint)) = (
             self.source_schemas.as_ref(),
@@ -1052,52 +1113,11 @@ impl AvroEncoder {
             if let Some(prepared) = cached {
                 return encode_with(&prepared, &json_value, &rows);
             }
-            let identity = SchemaIdentity {
-                fingerprint: fingerprint.to_string(),
-                sequence: event.schema_sequence,
-            };
-            match provider.get_envelope_schema(
-                connector, database, namespace, table, &identity,
-            ) {
-                EnvelopeSchemaLookup::Found(schema_json, schema) => {
-                    debug!(
-                        relation = %crate::SourceRelationIdentity::of(&event.source).canonical(),
-                        fingerprint = %identity.fingerprint,
-                        "using DDL-derived Avro schema (Path A)"
-                    );
-                    counter!("deltaforge_avro_encode_total", "path" => "ddl")
-                        .increment(1);
-                    let (schema_json, hash) =
-                        with_mapping_attr(&schema_json, mapping)?;
-                    let record = schema.name().map_or_else(
-                        || "deltaforge.Event".to_string(),
-                        |n| n.fullname(None),
-                    );
-                    // The provider's parsed schema is the registered one but
-                    // for the top-level mapping attribute, which encoding
-                    // never reads: it is compiled, not parsed again.
-                    let (prepared, bytes) = self
-                        .prepare(
-                            &self.subject(topic, &record, mapping),
-                            &schema_json,
-                            Some(&hash),
-                            Some(schema),
-                        )
-                        .await?;
-                    let prepared = self.cache(&key, prepared, bytes);
-                    return encode_with(&prepared, &json_value, &rows);
-                }
-                EnvelopeSchemaLookup::Unavailable(reason) => {
-                    return Err(EncodingError::SchemaUnavailable(format!(
-                        "{connector} {database}.{namespace}.{table}: {reason}"
-                    )));
-                }
-                EnvelopeSchemaLookup::Conflict(reason) => {
-                    return Err(EncodingError::SchemaConflict(format!(
-                        "{connector} {database}.{namespace}.{table}: {reason}"
-                    )));
-                }
-                EnvelopeSchemaLookup::Absent => {}
+            if let Some(prepared) = self
+                .resolve_ddl(topic, event, provider.as_ref(), fingerprint, &key)
+                .await?
+            {
+                return encode_with(&prepared, &json_value, &rows);
             }
         }
 
@@ -1126,6 +1146,160 @@ impl AvroEncoder {
             &json_value,
         )
         .await
+    }
+
+    /// The DDL-derived schema (Path A) of `event`, not cached under `key`
+    /// (its [`resolved_key`]): looked up from the provider, registered,
+    /// prepared and cached. `None` when the provider does not serve the
+    /// event (then Path C).
+    async fn resolve_ddl(
+        &self,
+        topic: &str,
+        event: &crate::Event,
+        provider: &dyn SourceSchemaProvider,
+        fingerprint: &str,
+        key: &str,
+    ) -> Result<Option<Registered>, EncodingError> {
+        let (connector, database, namespace, table) = (
+            event.source.connector.as_str(),
+            event.source.db.as_str(),
+            event.source.namespace(),
+            event.source.table.as_str(),
+        );
+        let identity = SchemaIdentity {
+            fingerprint: fingerprint.to_string(),
+            sequence: event.schema_sequence,
+        };
+        match provider.get_envelope_schema(
+            connector, database, namespace, table, &identity,
+        ) {
+            EnvelopeSchemaLookup::Found(schema_json, schema) => {
+                debug!(
+                    relation = %crate::SourceRelationIdentity::of(&event.source).canonical(),
+                    fingerprint = %identity.fingerprint,
+                    "using DDL-derived Avro schema (Path A)"
+                );
+                counter!("deltaforge_avro_encode_total", "path" => "ddl")
+                    .increment(1);
+                let mapping = event.type_mapping;
+                let (schema_json, hash) =
+                    with_mapping_attr(&schema_json, mapping)?;
+                let record = schema.name().map_or_else(
+                    || "deltaforge.Event".to_string(),
+                    |n| n.fullname(None),
+                );
+                // The provider's parsed schema is the registered one but for
+                // the top-level mapping attribute, which encoding never
+                // reads: it is compiled, not parsed again.
+                let (prepared, bytes) = self
+                    .prepare(
+                        &self.subject(topic, &record, mapping),
+                        &schema_json,
+                        Some(&hash),
+                        Some(schema),
+                    )
+                    .await?;
+                Ok(Some(self.cache(key, prepared, bytes)))
+            }
+            EnvelopeSchemaLookup::Unavailable(reason) => {
+                Err(EncodingError::SchemaUnavailable(format!(
+                    "{connector} {database}.{namespace}.{table}: {reason}"
+                )))
+            }
+            EnvelopeSchemaLookup::Conflict(reason) => {
+                Err(EncodingError::SchemaConflict(format!(
+                    "{connector} {database}.{namespace}.{table}: {reason}"
+                )))
+            }
+            EnvelopeSchemaLookup::Absent => Ok(None),
+        }
+    }
+
+    /// Resolve, before a batch is encoded in order, the DDL-derived schemas
+    /// (Path A) its events need and the cache lacks, several at a time: the
+    /// first event of each of many tables waits for its registry round trip
+    /// together with the others, not after them. `items` are the batch's
+    /// row events with their destinations (topic, subject, stream or URL).
+    ///
+    /// The misses of one subject resolve one after the other in event order
+    /// (registration order decides a subject's versions and compatibility
+    /// checks): with `topic_name` every table of a destination shares one
+    /// subject, so its misses stay in order; with the record-name
+    /// strategies each table has its own and tables resolve concurrently.
+    /// At most [`registry_requests`] tables resolve at once, and the
+    /// registry permits bound the requests in flight across the process.
+    ///
+    /// Nothing is returned: what resolves is cached, and a failure is
+    /// dropped, so encoding the batch in order meets the same miss and gives
+    /// its error exactly as without this step.
+    pub async fn resolve_ahead<'e, D>(
+        &self,
+        items: impl IntoIterator<Item = (D, &'e crate::Event)>,
+    ) where
+        D: AsRef<str>,
+    {
+        use futures::StreamExt;
+        let Some(provider) = self.source_schemas.as_deref() else {
+            return;
+        };
+        let mut groups: Vec<Vec<(D, &crate::Event, String)>> = Vec::new();
+        let mut group_of: HashMap<String, usize> = HashMap::new();
+        let mut seen = std::collections::HashSet::new();
+        for (dest, event) in items {
+            let Some(fingerprint) = event.schema_version.as_deref() else {
+                continue;
+            };
+            if event.ddl.is_some() {
+                continue;
+            }
+            let mut key = String::with_capacity(160);
+            resolved_key(
+                &mut key,
+                dest.as_ref(),
+                event,
+                fingerprint,
+                provider.mapping_id(),
+            );
+            if self.schemas.get(&key).is_some() || !seen.insert(key.clone()) {
+                continue;
+            }
+            // Misses that may share a subject share a group.
+            let group = match self.strategy {
+                SubjectStrategy::TopicName => format!("T{}", dest.as_ref()),
+                _ => format!(
+                    "R{}:{}{}",
+                    dest.as_ref().len(),
+                    dest.as_ref(),
+                    crate::SourceRelationIdentity::of(&event.source)
+                        .canonical()
+                ),
+            };
+            let i = *group_of.entry(group).or_insert_with(|| {
+                groups.push(Vec::new());
+                groups.len() - 1
+            });
+            groups[i].push((dest, event, key));
+        }
+        futures::stream::iter(groups)
+            .for_each_concurrent(
+                Some(registry_requests() as usize),
+                |group| async move {
+                    for (dest, event, key) in group {
+                        let fingerprint =
+                            event.schema_version.as_deref().expect("checked");
+                        let _ = self
+                            .resolve_ddl(
+                                dest.as_ref(),
+                                event,
+                                provider,
+                                fingerprint,
+                                &key,
+                            )
+                            .await;
+                    }
+                },
+            )
+            .await;
     }
 
     /// Encode a DDL event as the explicit DDL record (see
