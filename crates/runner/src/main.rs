@@ -73,6 +73,11 @@ struct Args {
     /// Each source's own pool is `proofs.control_connections`.
     #[arg(long, default_value_t = sources::mysql::mysql_control::DEFAULT_MAX_CONTROL_CONNECTIONS)]
     max_mysql_control_connections: u32,
+    /// Schema Registry requests in flight to one registry at once, across
+    /// every Avro sink of every pipeline of this process (1 to 64): the
+    /// first registration of many tables runs this many at once.
+    #[arg(long, default_value_t = deltaforge_core::encoding::avro::DEFAULT_MAX_REGISTRY_REQUESTS)]
+    max_avro_registry_requests: u32,
     /// Recovery admin listener (`deltaforge recover`). Loopback only; use an
     /// SSH tunnel for remote administration.
     #[arg(long, default_value = "127.0.0.1:9091")]
@@ -292,6 +297,11 @@ async fn main() -> Result<()> {
     // The process-wide MySQL control-plane budget, likewise.
     sources::mysql::mysql_control::configure(
         args.max_mysql_control_connections,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    // The process-wide Schema Registry request limit, before any encoder.
+    deltaforge_core::encoding::avro::configure_registry_requests(
+        args.max_avro_registry_requests,
     )
     .map_err(|e| anyhow::anyhow!(e))?;
 
