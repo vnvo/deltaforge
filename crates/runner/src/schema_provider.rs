@@ -1171,6 +1171,33 @@ mod tests {
         assert_eq!(lookups(), 3);
     }
 
+    /// The encoder builds schemas ahead of a batch on blocking threads
+    /// (`spawn_blocking`): the provider's lookup of a version not cached
+    /// (`block_in_place` around its async load) works there as on a worker.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn avro_provider_looks_up_from_a_blocking_thread() {
+        let versions = two_versions();
+        let avro = Arc::new(AvroSchemaProviderImpl::new(
+            versions.clone(),
+            "mysql",
+            TypeConversionOpts::default(),
+        ));
+        let v2 = SchemaIdentity::of(Some("h2"), Some(2)).unwrap();
+        let cols =
+            tokio::task::spawn_blocking(move || {
+                columns_of(avro.get_envelope_schema(
+                    "mysql", "shop", "shop", "orders", &v2,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(cols, ["id", "extra"]);
+        assert_eq!(
+            versions.lookups.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn avro_provider_builds_each_events_own_version() {
         let versions = two_versions();

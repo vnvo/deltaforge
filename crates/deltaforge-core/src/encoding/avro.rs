@@ -614,9 +614,11 @@ impl Prepared {
         writers: bool,
     ) -> Result<(Registered, u64), EncodingError> {
         let plan = Plan::compile(&schema)?;
-        let mut bytes =
-            plan.heap_bytes() + std::mem::size_of::<Prepared>() as u64 + 16; // the `Arc`'s counts
-        let writers = if writers {
+        if !writers {
+            return Ok(Self::from_plan(id, plan));
+        }
+        let mut bytes = Self::plan_bytes(&plan);
+        let writers = {
             let slots: [OnceLock<Writer>; WRITERS] = Default::default();
             let _ = slots[0].set(new_writer(&schema)?);
             let (parsed, writer_bytes) = schema_bytes(json_len);
@@ -629,10 +631,26 @@ impl Prepared {
                 writer_bytes,
                 extra: parking_lot::Mutex::new((0, false)),
             }))
-        } else {
-            None
         };
         Ok((Arc::new(Prepared { id, plan, writers }), bytes))
+    }
+
+    /// A schema encoded from its compiled plan alone (DDL-derived), and its
+    /// estimated bytes.
+    fn from_plan(id: u32, plan: Plan) -> (Registered, u64) {
+        let bytes = Self::plan_bytes(&plan);
+        (
+            Arc::new(Prepared {
+                id,
+                plan,
+                writers: None,
+            }),
+            bytes,
+        )
+    }
+
+    fn plan_bytes(plan: &Plan) -> u64 {
+        plan.heap_bytes() + std::mem::size_of::<Prepared>() as u64 + 16 // the `Arc`'s counts
     }
 }
 
@@ -1149,9 +1167,9 @@ impl AvroEncoder {
     }
 
     /// The DDL-derived schema (Path A) of `event`, not cached under `key`
-    /// (its [`resolved_key`]): looked up from the provider, registered,
-    /// prepared and cached. `None` when the provider does not serve the
-    /// event (then Path C).
+    /// (its [`resolved_key`]): built from the provider, registered, prepared
+    /// and cached. `None` when the provider does not serve the event (then
+    /// Path C).
     async fn resolve_ddl(
         &self,
         topic: &str,
@@ -1160,59 +1178,35 @@ impl AvroEncoder {
         fingerprint: &str,
         key: &str,
     ) -> Result<Option<Registered>, EncodingError> {
-        let (connector, database, namespace, table) = (
-            event.source.connector.as_str(),
-            event.source.db.as_str(),
-            event.source.namespace(),
-            event.source.table.as_str(),
-        );
         let identity = SchemaIdentity {
             fingerprint: fingerprint.to_string(),
             sequence: event.schema_sequence,
         };
-        match provider.get_envelope_schema(
-            connector, database, namespace, table, &identity,
-        ) {
-            EnvelopeSchemaLookup::Found(schema_json, schema) => {
-                debug!(
-                    relation = %crate::SourceRelationIdentity::of(&event.source).canonical(),
-                    fingerprint = %identity.fingerprint,
-                    "using DDL-derived Avro schema (Path A)"
-                );
-                counter!("deltaforge_avro_encode_total", "path" => "ddl")
-                    .increment(1);
-                let mapping = event.type_mapping;
-                let (schema_json, hash) =
-                    with_mapping_attr(&schema_json, mapping)?;
-                let record = schema.name().map_or_else(
-                    || "deltaforge.Event".to_string(),
-                    |n| n.fullname(None),
-                );
-                // The provider's parsed schema is the registered one but for
-                // the top-level mapping attribute, which encoding never
-                // reads: it is compiled, not parsed again.
-                let (prepared, bytes) = self
-                    .prepare(
-                        &self.subject(topic, &record, mapping),
-                        &schema_json,
-                        Some(&hash),
-                        Some(schema),
-                    )
-                    .await?;
-                Ok(Some(self.cache(key, prepared, bytes)))
-            }
-            EnvelopeSchemaLookup::Unavailable(reason) => {
-                Err(EncodingError::SchemaUnavailable(format!(
-                    "{connector} {database}.{namespace}.{table}: {reason}"
-                )))
-            }
-            EnvelopeSchemaLookup::Conflict(reason) => {
-                Err(EncodingError::SchemaConflict(format!(
-                    "{connector} {database}.{namespace}.{table}: {reason}"
-                )))
-            }
-            EnvelopeSchemaLookup::Absent => Ok(None),
+        match build_ddl(provider, &event.source, &identity, event.type_mapping)?
+        {
+            Some(built) => self
+                .register_ddl(topic, event.type_mapping, key, built)
+                .await
+                .map(Some),
+            None => Ok(None),
         }
+    }
+
+    /// Register a built DDL-derived schema under its subject and cache it
+    /// under `key`.
+    async fn register_ddl(
+        &self,
+        topic: &str,
+        mapping: crate::TypeMapping,
+        key: &str,
+        built: BuiltDdl,
+    ) -> Result<Registered, EncodingError> {
+        let subject = self.subject(topic, &built.record, mapping);
+        let id = self
+            .registered_id(&subject, &built.schema_json, &built.hash)
+            .await?;
+        let (prepared, bytes) = Prepared::from_plan(id, built.plan);
+        Ok(self.cache(key, prepared, bytes))
     }
 
     /// Resolve, before a batch is encoded in order, the DDL-derived schemas
@@ -1280,25 +1274,51 @@ impl AvroEncoder {
             });
             groups[i].push((dest, event, key));
         }
+        let Some(shared) = self.source_schemas.clone() else {
+            return;
+        };
         futures::stream::iter(groups)
-            .for_each_concurrent(
-                Some(registry_requests() as usize),
-                |group| async move {
+            .for_each_concurrent(Some(registry_requests() as usize), |group| {
+                let shared = Arc::clone(&shared);
+                async move {
                     for (dest, event, key) in group {
-                        let fingerprint =
-                            event.schema_version.as_deref().expect("checked");
-                        let _ = self
-                            .resolve_ddl(
-                                dest.as_ref(),
-                                event,
-                                provider,
-                                fingerprint,
-                                &key,
+                        // A schema is built (provider lookup, parse,
+                        // plan) on a blocking thread, so the tables
+                        // resolving at once build on several cores.
+                        let (provider, source, mapping) = (
+                            Arc::clone(&shared),
+                            event.source.clone(),
+                            event.type_mapping,
+                        );
+                        let identity = SchemaIdentity {
+                            fingerprint: event
+                                .schema_version
+                                .clone()
+                                .expect("checked"),
+                            sequence: event.schema_sequence,
+                        };
+                        let built = tokio::task::spawn_blocking(move || {
+                            build_ddl(
+                                provider.as_ref(),
+                                &source,
+                                &identity,
+                                mapping,
                             )
-                            .await;
+                        })
+                        .await;
+                        if let Ok(Ok(Some(built))) = built {
+                            let _ = self
+                                .register_ddl(
+                                    dest.as_ref(),
+                                    mapping,
+                                    &key,
+                                    built,
+                                )
+                                .await;
+                        }
                     }
-                },
-            )
+                }
+            })
             .await;
     }
 
@@ -1434,61 +1454,65 @@ impl AvroEncoder {
         if let Some(prepared) = self.schemas.get(&key) {
             return Ok(prepared);
         }
-        let (prepared, bytes) = self
-            .prepare(subject, schema_json, Some(&hash), None)
-            .await?;
+        let (prepared, bytes) =
+            self.prepare(subject, schema_json, Some(&hash)).await?;
         Ok(self.cache(&key, prepared, bytes))
     }
 
     /// Register a schema (its ID cached per subject and canonical hash) and
-    /// prepare it, uncached: the prepared schema and its estimated bytes. A
-    /// DDL-derived schema (`parsed`, already parsed) is encoded from its
-    /// plan alone; any other is parsed here and keeps apache-avro writers.
+    /// prepare it with apache-avro writers, uncached: the prepared schema
+    /// and its estimated bytes (inferred schemas and the DDL event schema).
     async fn prepare(
         &self,
         subject: &str,
         schema_json: &str,
         hash: Option<&str>,
-        parsed: Option<Arc<AvroSchema>>,
     ) -> Result<(Registered, u64), EncodingError> {
         let hash = match hash {
             Some(h) => h.to_string(),
             None => canonical_schema_hash(schema_json)?,
         };
-        let writers = parsed.is_none();
-        let schema = match parsed {
-            Some(s) => s,
-            None => Arc::new(parse_schema(schema_json)?),
-        };
-        let id = match self.registry.get_cached(subject, &hash) {
-            Some(id) => id,
-            None => match self
-                .registry
-                .register_hashed(subject, schema_json, &hash, self.auth())
-                .await
-            {
-                Ok(result) => {
-                    counter!("deltaforge_avro_schema_registrations_total")
-                        .increment(1);
-                    result
-                }
-                Err(e) => {
-                    counter!(
-                        "deltaforge_avro_encode_failure_total",
-                        "reason" => "sr_unavailable"
-                    )
-                    .increment(1);
-                    return Err(e);
-                }
-            },
-        };
+        let schema = Arc::new(parse_schema(schema_json)?);
+        let id = self.registered_id(subject, schema_json, &hash).await?;
         Prepared::new(
             id,
             schema,
             schema_json.len(),
             self.schemas.budget().clone(),
-            writers,
+            true,
         )
+    }
+
+    /// The registry ID of `schema_json` (hash `hash`) under `subject`:
+    /// cached, else registered (idempotent in the registry).
+    async fn registered_id(
+        &self,
+        subject: &str,
+        schema_json: &str,
+        hash: &str,
+    ) -> Result<u32, EncodingError> {
+        if let Some(id) = self.registry.get_cached(subject, hash) {
+            return Ok(id);
+        }
+        match self
+            .registry
+            .register_hashed(subject, schema_json, hash, self.auth())
+            .await
+        {
+            Ok(id) => {
+                counter!("deltaforge_avro_schema_registrations_total")
+                    .increment(1);
+                Ok(id)
+            }
+            Err(e) => {
+                counter!(
+                    "deltaforge_avro_encode_failure_total",
+                    "reason" => "sr_unavailable"
+                )
+                .increment(1);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -1727,19 +1751,120 @@ fn inference_json(
     Ok(envelope)
 }
 
-/// `schema_json` with `deltaforge.type_mapping` on its top-level record,
-/// and that schema's canonical hash.
+/// A DDL-derived schema built for registration: its JSON (with the mapping
+/// attribute), the hash its registry ID is cached under, its record's full
+/// name and its compiled plan.
+struct BuiltDdl {
+    schema_json: String,
+    hash: String,
+    record: String,
+    plan: Plan,
+}
+
+/// Build the DDL-derived schema (Path A) of a table at `identity` from the
+/// provider: every step of a schema miss but the registry request, all CPU
+/// (and the provider's schema-history lookup). `None` when the provider
+/// does not serve the table.
+fn build_ddl(
+    provider: &dyn SourceSchemaProvider,
+    source: &crate::SourceInfo,
+    identity: &SchemaIdentity,
+    mapping: crate::TypeMapping,
+) -> Result<Option<BuiltDdl>, EncodingError> {
+    let (connector, database, namespace, table) = (
+        source.connector.as_str(),
+        source.db.as_str(),
+        source.namespace(),
+        source.table.as_str(),
+    );
+    match provider
+        .get_envelope_schema(connector, database, namespace, table, identity)
+    {
+        EnvelopeSchemaLookup::Found(schema_json, schema) => {
+            debug!(
+                relation = %crate::SourceRelationIdentity::of(source).canonical(),
+                fingerprint = %identity.fingerprint,
+                "using DDL-derived Avro schema (Path A)"
+            );
+            counter!("deltaforge_avro_encode_total", "path" => "ddl")
+                .increment(1);
+            let (schema_json, hash) = with_mapping_attr(&schema_json, mapping)?;
+            let record = schema.name().map_or_else(
+                || "deltaforge.Event".to_string(),
+                |n| n.fullname(None),
+            );
+            // The provider's parsed schema is the registered one but for the
+            // top-level mapping attribute, which encoding never reads: it is
+            // compiled, not parsed again.
+            let plan = Plan::compile(&schema)?;
+            Ok(Some(BuiltDdl {
+                schema_json,
+                hash,
+                record,
+                plan,
+            }))
+        }
+        EnvelopeSchemaLookup::Unavailable(reason) => {
+            Err(EncodingError::SchemaUnavailable(format!(
+                "{connector} {database}.{namespace}.{table}: {reason}"
+            )))
+        }
+        EnvelopeSchemaLookup::Conflict(reason) => {
+            Err(EncodingError::SchemaConflict(format!(
+                "{connector} {database}.{namespace}.{table}: {reason}"
+            )))
+        }
+        EnvelopeSchemaLookup::Absent => Ok(None),
+    }
+}
+
+/// The attribute naming an envelope schema's type mapping.
+const MAPPING_ATTR: &str = "deltaforge.type_mapping";
+
+/// `schema_json` with `deltaforge.type_mapping` on its top-level record, and
+/// the hash its registry ID is cached under.
+///
+/// The attribute is appended to the object's text, as re-serializing the
+/// parsed JSON would place it (last), without parsing it again; the hash is
+/// the SHA-256 of that text (`t`-tagged, never equal to a canonical hash).
+/// A schema already carrying the attribute is parsed and set instead.
 fn with_mapping_attr(
     schema_json: &str,
     mapping: crate::TypeMapping,
 ) -> Result<(String, String), EncodingError> {
-    let mut v: serde_json::Value = serde_json::from_str(schema_json)
-        .map_err(|e| EncodingError::Avro(format!("schema JSON: {e}")))?;
-    if let serde_json::Value::Object(o) = &mut v {
-        o.insert("deltaforge.type_mapping".into(), mapping.as_str().into());
-    }
-    let json = v.to_string();
-    let hash = canonical_value_hash(&v, json.len());
+    use sha2::{Digest, Sha256};
+    let text = schema_json.trim();
+    let appended = (!text.contains(&format!("\"{MAPPING_ATTR}\"")))
+        .then(|| text.strip_prefix('{')?.strip_suffix('}'))
+        .flatten()
+        .map(|inner| {
+            let sep = if inner.trim().is_empty() { "" } else { "," };
+            format!(
+                "{{{inner}{sep}\"{MAPPING_ATTR}\":\"{}\"}}",
+                mapping.as_str()
+            )
+        });
+    let json = match appended {
+        Some(json) => json,
+        None => {
+            let mut v: serde_json::Value = serde_json::from_str(schema_json)
+                .map_err(|e| {
+                    EncodingError::Avro(format!("schema JSON: {e}"))
+                })?;
+            match &mut v {
+                serde_json::Value::Object(o) => {
+                    o.insert(MAPPING_ATTR.into(), mapping.as_str().into());
+                }
+                _ => {
+                    return Err(EncodingError::Avro(
+                        "a DDL-derived schema is a JSON object".into(),
+                    ));
+                }
+            }
+            v.to_string()
+        }
+    };
+    let hash = format!("t{}", hex::encode(Sha256::digest(json.as_bytes())));
     Ok((json, hash))
 }
 
@@ -2766,6 +2891,53 @@ mod tests {
             waiter.join().unwrap();
         });
         assert_eq!(full.used(), 0);
+    }
+
+    #[test]
+    fn the_mapping_attribute_is_appended_as_re_serializing_would_place_it() {
+        use super::super::avro_schema::{
+            build_envelope_schema, build_value_schema,
+        };
+        use super::super::avro_types::{
+            ColumnDesc, TypeConversionOpts, mysql_column_to_avro,
+        };
+        let id = mysql_column_to_avro(
+            &ColumnDesc {
+                name: "id".into(),
+                data_type: "int".into(),
+                column_type: "int".into(),
+                nullable: false,
+                precision: None,
+                scale: None,
+                unsigned: false,
+                is_array: false,
+                element_type: None,
+            },
+            &TypeConversionOpts::default(),
+        );
+        let value = build_value_schema("mysql", "shop", "orders", vec![id]);
+        let (json, _) =
+            build_envelope_schema("mysql", "shop", "orders", value).unwrap();
+        for mapping in [crate::TypeMapping::V1, crate::TypeMapping::V2] {
+            let (with, hash) = with_mapping_attr(&json, mapping).unwrap();
+            // What parsing, setting the attribute and re-serializing gives.
+            let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            v.as_object_mut()
+                .unwrap()
+                .insert(MAPPING_ATTR.into(), mapping.as_str().into());
+            assert_eq!(with, v.to_string());
+            assert!(AvroSchema::parse_str(&with).is_ok());
+            assert!(hash.starts_with('t'));
+            assert_ne!(hash, canonical_schema_hash(&with).unwrap());
+        }
+        // Already carrying the attribute: set, not duplicated.
+        let (with, _) =
+            with_mapping_attr(&json, crate::TypeMapping::V2).unwrap();
+        let (again, _) =
+            with_mapping_attr(&with, crate::TypeMapping::V1).unwrap();
+        assert_eq!(again.matches(MAPPING_ATTR).count(), 1);
+        let v: serde_json::Value = serde_json::from_str(&again).unwrap();
+        assert_eq!(v[MAPPING_ATTR], crate::TypeMapping::V1.as_str());
     }
 
     #[test]
