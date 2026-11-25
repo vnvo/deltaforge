@@ -1,9 +1,9 @@
 name: Test coverage
 
+# Run by hand only for now: the job does not build on the hosted runner
+# (the `v8` crate's native library is not found).
 on:
-  push:
-    branches: [ main ]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   coverage:
