@@ -348,7 +348,7 @@ async fn establish_chunk(
         &server_uuid,
         &lineage,
         &tables,
-        ctx.proofs.capture_lock_wait_secs,
+        ctx.proofs.capture_wait_secs,
         None,
     )
     .await?
@@ -814,7 +814,7 @@ async fn establish_per_table(
             &c.db,
             &c.table,
             None,
-            super::mysql_binlog_scan::LOCK_WAIT,
+            super::mysql_binlog_scan::CAPTURE_WAIT,
         )
         .await?
         {
@@ -973,6 +973,66 @@ async fn establish_per_table(
     Ok(written)
 }
 
+/// The scan of `(e, A]`, A the capture's first position, and A: for a
+/// baseline that ends at A because a schema change after the rows was not
+/// visible to the capture (`establish_at`). `None` when the rows do not
+/// start at or before A or the scan fails (the caller refuses then); a
+/// scan that reached another server is an error.
+async fn until_capture_start(
+    ctx: &RunCtx,
+    tag: &super::mysql_binlog_scan::ScanTag<'_>,
+    server_uuid: &str,
+    lineage: &str,
+    e_cp: &MySqlCheckpoint,
+    cap: &super::mysql_binlog_scan::Captured,
+) -> SourceResult<
+    Option<(
+        crate::durable_checkpoint::WmPos,
+        super::mysql_binlog_scan::ScanReport,
+    )>,
+> {
+    let (Some(e), Some(a)) = (
+        mysql_checkpoint_position(
+            &e_cp.file,
+            e_cp.pos,
+            e_cp.gtid_set.as_deref(),
+        ),
+        mysql_checkpoint_position(
+            &cap.from.file,
+            cap.from.pos,
+            cap.from.gtid_set.as_deref(),
+        ),
+    ) else {
+        return Ok(None);
+    };
+    if !matches!(
+        order_positions(&e, &a),
+        CheckpointOrder::Before | CheckpointOrder::Equal
+    ) {
+        return Ok(None);
+    }
+    match super::mysql_proof_scanner::shared_interval(
+        &ctx.proof_scanner,
+        ctx.dsn.current().expose(),
+        &ctx.source_id,
+        server_uuid,
+        lineage,
+        e_cp,
+        &cap.from,
+        ctx.stream_anchor(server_uuid, lineage).as_ref(),
+        Some(e_cp),
+        tag,
+    )
+    .await
+    {
+        Ok(report) => Ok(Some((a, report))),
+        Err(ProofError::OtherServer(found)) => {
+            Err(other_server(server_uuid, &found))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
 /// A lazy baseline (binding ruling Round 36, Q1) for one table whose rows
 /// at the evaluation position E are not positionally proven: a stable
 /// capture of its complete shape at S, E <= S in the verified lineage, and
@@ -1033,7 +1093,7 @@ pub(crate) async fn establish_at(
         db,
         table,
         None,
-        super::mysql_binlog_scan::LOCK_WAIT,
+        super::mysql_binlog_scan::CAPTURE_WAIT,
     )
     .await?
     {
@@ -1086,6 +1146,45 @@ pub(crate) async fn establish_at(
             trace_proof(&tag, db, table, Some(&cap), None, lctn, "scan_failed");
             return Ok(false);
         }
+    };
+    // A schema change after the rows that the capture's reads could not see
+    // (outside its visible bound) leaves the shape read the table's shape
+    // from the rows until that change: the baseline then ends at A, proven
+    // by the scan up to A, when nothing affects the table there (as the
+    // activation window decides, `admit_batch`).
+    let lctn_v = ctx.lower_case_table_names;
+    let first = report
+        .statements
+        .iter()
+        .find(|st| affects(st, db, table, lctn_v))
+        .map(|st| st.event.clone());
+    let (s, report) = match first {
+        None => (s, report),
+        Some(super::mysql_activation::EventIdentity::Gtid { gtid, .. })
+            if !cap.visible.contains(&gtid) =>
+        {
+            match until_capture_start(
+                ctx,
+                &tag,
+                &server_uuid,
+                &lineage,
+                &e_cp,
+                &cap,
+            )
+            .await?
+            {
+                Some((a, upto_a))
+                    if !upto_a
+                        .statements
+                        .iter()
+                        .any(|st| affects(st, db, table, lctn_v)) =>
+                {
+                    (a, upto_a)
+                }
+                _ => (s, report),
+            }
+        }
+        Some(_) => (s, report),
     };
     if report
         .statements
@@ -1632,12 +1731,6 @@ mod tests {
         #[ignore = "requires docker"]
         async fn a_first_rows_baseline_binds_the_start_barrier_gtid() {
             fresh_start(true).await;
-        }
-
-        #[tokio::test]
-        #[ignore = "requires docker"]
-        async fn a_first_rows_baseline_binds_the_start_barrier_file_position() {
-            fresh_start(false).await;
         }
 
         /// A DDL of the table after its rows (in (E, S]) prevents its lazy

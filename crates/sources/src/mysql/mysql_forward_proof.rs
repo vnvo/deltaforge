@@ -122,7 +122,7 @@ pub(crate) trait Probe {
         &self,
         db: &str,
         table: &str,
-        lock_wait: Duration,
+        capture_wait: Duration,
     ) -> Result<Result<Captured, ProofError>, Cancelled>;
 
     async fn scan(
@@ -146,7 +146,7 @@ impl Probe for LiveProbe<'_> {
         &self,
         db: &str,
         table: &str,
-        lock_wait: Duration,
+        capture_wait: Duration,
     ) -> Result<Result<Captured, ProofError>, Cancelled> {
         let ctx = self.ctx;
         capture(
@@ -156,7 +156,7 @@ impl Probe for LiveProbe<'_> {
             db,
             table,
             None,
-            lock_wait,
+            capture_wait,
         )
         .await
     }
@@ -650,7 +650,7 @@ async fn attempt<P: Probe>(
             _ = ctx.cancel.cancelled() => return Err(Stop::Cancelled),
             r = tokio::time::timeout(
                 left,
-                probe.capture_table(&db, &table, limits.lock_wait.min(left)),
+                probe.capture_table(&db, &table, limits.capture_wait.min(left)),
             ) => r,
         };
         match got {
@@ -1709,6 +1709,10 @@ mod tests {
         /// A capture of `t` at S (70) with the columns `id` and `col`.
         fn captured(col: &str) -> Captured {
             Captured {
+                visible: crate::gtid_set::GtidSet::parse(
+                    at(65).gtid_set.as_deref().unwrap_or_default(),
+                )
+                .unwrap(),
                 from: at(65),
                 position: at(70),
                 schema: MySqlTableSchema::new(vec![
@@ -2284,7 +2288,7 @@ mod tests {
             };
 
             /// One scripted capture: its outcome after its time (capped by
-            /// the capture's lock wait, as a real lock wait is).
+            /// the capture's budget, as a real end wait is).
             #[derive(Clone)]
             enum Step {
                 Ok(&'static str, Duration),
@@ -2294,8 +2298,8 @@ mod tests {
             fn contention() -> Step {
                 Step::Fail(
                     ProofError::Contention {
-                        code: 1205,
-                        why: "lock wait".into(),
+                        code: 0,
+                        why: "end wait".into(),
                     },
                     Duration::MAX,
                 )
@@ -2345,7 +2349,7 @@ mod tests {
                     &self,
                     _db: &str,
                     table: &str,
-                    lock_wait: Duration,
+                    capture_wait: Duration,
                 ) -> Result<Result<Captured, ProofError>, Cancelled>
                 {
                     self.calls
@@ -2363,11 +2367,11 @@ mod tests {
                     };
                     match step {
                         Step::Ok(col, t) => {
-                            tokio::time::sleep(t.min(lock_wait)).await;
+                            tokio::time::sleep(t.min(capture_wait)).await;
                             Ok(Ok(captured(col)))
                         }
                         Step::Fail(e, t) => {
-                            tokio::time::sleep(t.min(lock_wait)).await;
+                            tokio::time::sleep(t.min(capture_wait)).await;
                             Ok(Err(e))
                         }
                     }
@@ -2460,7 +2464,7 @@ mod tests {
             }
 
             /// With the production bounds, attempts start at 0, 31, 65 and
-            /// 111 s (each 30 s lock wait, then 1, 4 and 16 s of backoff);
+            /// 111 s (each 30 s capture wait, then 1, 4 and 16 s of backoff);
             /// the fourth, the last the bounds permit, has 9 s and proves
             /// the table. The retrying incident is a verified recovery.
             #[tokio::test(start_paused = true)]
@@ -2519,7 +2523,7 @@ mod tests {
                 assert!(
                     draft
                         .evidence
-                        .holds(EvidenceKey::ReasonClass, "lock_wait_timeout")
+                        .holds(EvidenceKey::ReasonClass, "capture_wait")
                 );
                 let rec = only_incident(&ctx).await;
                 assert_eq!(rec.retryability, Retryability::AutoRetry);
@@ -2901,7 +2905,7 @@ mod tests {
             }
 
             /// A stop during a backoff (30.5 s, in the first one), or during
-            /// a capture's lock wait (40 s, in the second attempt), ends the
+            /// a capture's wait (40 s, in the second attempt), ends the
             /// proof at once: `Cancelled`, the retrying incident withdrawn
             /// (`ended_cancelled`), nothing bound.
             #[tokio::test(start_paused = true)]
@@ -3793,12 +3797,6 @@ mod tests {
             a_live_ddl_is_bound(true).await;
         }
 
-        #[tokio::test]
-        #[ignore = "requires docker"]
-        async fn a_live_ddl_is_bound_by_its_forward_proof_file_position() {
-            a_live_ddl_is_bound(false).await;
-        }
-
         /// The registration and the binding are one atomic batch: a crash at
         /// the binding's write leaves neither (the DDL pending, no version
         /// from it), and the restart proves it again with one new version.
@@ -4668,7 +4666,7 @@ mod tests {
                 }
             }
         }
-        /// Retry bounds for the live tests: 2 s lock waits within 8 s.
+        /// Retry bounds for the live tests: 2 s capture budgets within 8 s.
         fn limits() -> deltaforge_config::ForwardProofRetry {
             deltaforge_config::ForwardProofRetry {
                 attempts: 4,
@@ -4679,7 +4677,7 @@ mod tests {
                     Duration::from_secs(2),
                 ],
                 min_capture: Duration::from_secs(1),
-                lock_wait: Duration::from_secs(2),
+                capture_wait: Duration::from_secs(2),
             }
         }
 
@@ -4714,33 +4712,49 @@ mod tests {
             all.into_iter().next().unwrap()
         }
 
-        /// A second session that holds `t`'s metadata lock: `LOCK TABLES t
-        /// WRITE`, then the DDL under it (so the proof's capture waits),
-        /// released by [`Blocker::release`].
-        struct Blocker(mysql_async::Conn);
+        /// The DDL on `t`, then a second session that owns a GTID in an open
+        /// transaction (a row of the database's `other` table), so the
+        /// proof's captures wait at their ends until [`Blocker::release`]:
+        /// a transient capture failure that takes no lock.
+        struct Blocker {
+            port: u16,
+            held: mysql_async::Conn,
+        }
 
         impl Blocker {
             async fn alter(port: u16, t: &str, ddl: &str) -> Self {
-                let mut c =
+                sql(port, &[&format!("ALTER TABLE {t} {ddl}")]).await;
+                let db = t.split_once('.').expect("db.table").0;
+                let gno = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros() as u64;
+                let mut held =
                     mysql_async::Conn::from_url(dsn(port)).await.unwrap();
-                c.query_drop(format!("LOCK TABLES {t} WRITE"))
-                    .await
-                    .unwrap();
-                c.query_drop(format!("ALTER TABLE {t} {ddl}"))
-                    .await
-                    .unwrap();
-                Self(c)
+                for q in [
+                    format!(
+                        "SET GTID_NEXT = 'aaaaaaaa-0000-4000-8000-00000000beef:{gno}'"
+                    ),
+                    "BEGIN".to_string(),
+                    format!(
+                        "INSERT INTO {db}.other VALUES ({})",
+                        1_000_000 + gno % 1_000_000_000
+                    ),
+                ] {
+                    held.query_drop(q).await.unwrap();
+                }
+                Self { port, held }
             }
 
-            /// Another statement in the blocking session (still holding the
-            /// lock).
+            /// Another statement while the GTID stays owned (on its own
+            /// session).
             async fn then(&mut self, stmt: &str) {
-                self.0.query_drop(stmt).await.unwrap();
+                sql(self.port, &[stmt]).await;
             }
 
             async fn release(mut self) {
-                self.0.query_drop("UNLOCK TABLES").await.unwrap();
-                self.0.disconnect().await.ok();
+                self.held.query_drop("COMMIT").await.unwrap();
+                self.held.disconnect().await.ok();
             }
         }
 
@@ -4791,13 +4805,13 @@ mod tests {
             .expect("a row")
         }
 
-        /// The capture sessions waiting for a metadata lock.
-        async fn lock_waiters(port: u16) -> u64 {
+        /// The capture sessions waiting at their ends for an owned GTID.
+        async fn end_waiters(port: u16) -> u64 {
             let mut c = mysql_async::Conn::from_url(dsn(port)).await.unwrap();
             let n: Option<u64> = c
                 .query_first(
                     "SELECT COUNT(*) FROM information_schema.processlist \
-                     WHERE state = 'Waiting for table metadata lock'",
+                     WHERE state = 'Waiting for GTID to be committed'",
                 )
                 .await
                 .unwrap();
@@ -4805,14 +4819,14 @@ mod tests {
             n.unwrap_or(0)
         }
 
-        /// A metadata lock held past the first capture's lock wait is a
-        /// transient failure: the proof is attempted again in place, binds
+        /// A GTID owned past the first capture's budget is a transient
+        /// failure: the proof is attempted again in place, binds
         /// the DDL once, and the row after it is decoded with the new
         /// column (by the forward proof, not a lazy baseline). The
         /// retrying incident is resolved as a verified recovery.
         #[tokio::test]
         #[ignore = "requires docker"]
-        async fn a_transient_lock_wait_is_retried_and_the_ddl_bound() {
+        async fn a_transient_capture_wait_is_retried_and_the_ddl_bound() {
             let port = server(true).await;
             let db = "fwd_retry_ok";
             prepare(port, db).await;
@@ -4823,7 +4837,7 @@ mod tests {
             let before = versions(&st, db, "t").await;
             let mut r = run_with(&st, port, db, &[&t], limits()).await;
             let blocker = Blocker::alter(port, &t, "ADD COLUMN w INT").await;
-            // Past the first capture's 2 s lock wait, released in the first
+            // Past the first capture's 2 s budget, released in the first
             // backoff.
             tokio::time::sleep(Duration::from_millis(2300)).await;
             blocker.release().await;
@@ -4871,12 +4885,12 @@ mod tests {
             stop(r.handle).await;
         }
 
-        /// A metadata lock held past every attempt stops the source before
+        /// A GTID owned past every attempt stops the source before
         /// the DDL is emitted or checkpointed, on the operator-action
         /// `mysql_forward_proof_unavailable` draft of the incident recorded
         /// while it retried; no attempt starts after the deadline, no
         /// capture session outlives it, and nothing of the DDL is bound.
-        /// The restart, once the lock is gone, binds it once and delivers
+        /// The restart, once the GTID is executed, binds it once and delivers
         /// the row after it.
         #[tokio::test]
         #[ignore = "requires docker"]
@@ -4927,12 +4941,12 @@ mod tests {
             assert!(
                 draft
                     .evidence
-                    .holds(EvidenceKey::ReasonClass, "lock_wait_timeout"),
+                    .holds(EvidenceKey::ReasonClass, "capture_wait"),
                 "{draft:?}"
             );
             // No capture session of the proof is still waiting.
             tokio::time::sleep(Duration::from_secs(1)).await;
-            assert_eq!(lock_waiters(port).await, 0);
+            assert_eq!(end_waiters(port).await, 0);
             // Recorded while retrying, as auto retry; the supervisor turns
             // the same incident into operator action from the stop's draft.
             let incident = only_incident(&st).await;
@@ -5085,14 +5099,14 @@ mod tests {
             stop(r.handle).await;
         }
 
-        /// A stop while the proof's capture waits for the metadata lock:
+        /// A stop while the proof's capture waits at its end:
         /// the source ends at once, the capture's session is killed on the
         /// server, nothing of the DDL is emitted, checkpointed or bound, and
         /// the retrying incident is withdrawn (`ended_cancelled`). The
         /// restart binds the DDL.
         #[tokio::test]
         #[ignore = "requires docker"]
-        async fn a_stop_during_a_lock_wait_ends_the_proof() {
+        async fn a_stop_during_a_capture_wait_ends_the_proof() {
             let port = server(true).await;
             let db = "fwd_retry_stop";
             prepare(port, db).await;
@@ -5107,22 +5121,22 @@ mod tests {
                 db,
                 &[&t],
                 deltaforge_config::ForwardProofRetry {
-                    lock_wait: Duration::from_secs(5),
+                    capture_wait: Duration::from_secs(5),
                     deadline: Duration::from_secs(60),
                     ..limits()
                 },
             )
             .await;
             let blocker = Blocker::alter(port, &t, "ADD COLUMN w INT").await;
-            // The first attempt fails after ~4 s (recorded as retrying);
-            // the stop lands in the second attempt's lock wait.
+            // The first attempt fails after ~5 s (recorded as retrying);
+            // the stop lands in the second attempt's wait.
             let waiting = Instant::now() + Duration::from_secs(30);
-            while lock_waiters(port).await == 0 {
+            while end_waiters(port).await == 0 {
                 assert!(Instant::now() < waiting, "no capture waits");
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             tokio::time::sleep(Duration::from_secs(7)).await;
-            assert_eq!(lock_waiters(port).await, 1, "the second attempt waits");
+            assert_eq!(end_waiters(port).await, 1, "the second attempt waits");
             let stopped = Instant::now();
             r.handle.stop();
             let ended =
@@ -5139,7 +5153,7 @@ mod tests {
                 "{ended:?}"
             );
             tokio::time::sleep(Duration::from_secs(1)).await;
-            assert_eq!(lock_waiters(port).await, 0, "the session is killed");
+            assert_eq!(end_waiters(port).await, 0, "the session is killed");
             assert_eq!(st.ckpt.get_raw(db).await.unwrap(), committed);
             let recs = records(&st, db, "t").await;
             assert_eq!(bound(&st, db, "t", &recs, ddls(&recs)[0]).await, None);
@@ -5208,8 +5222,7 @@ mod tests {
             stop(r.handle).await;
             let committed = st.ckpt.get_raw(db).await.unwrap();
             let r = run_as(&st, &user_dsn, db, &[&t], limits()).await;
-            // Revoked before the DDL (MySQL checks the privilege before any
-            // metadata-lock wait): the proof's first capture is refused.
+            // Revoked before the DDL: the proof's first capture is refused.
             sql(
                 port,
                 &[

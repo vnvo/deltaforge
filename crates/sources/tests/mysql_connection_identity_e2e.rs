@@ -664,12 +664,6 @@ async fn snapshot_connections_prove_the_server() {
     startup_sweep(true, true).await;
 }
 
-#[tokio::test]
-#[ignore = "requires docker"]
-async fn startup_connections_prove_the_server_file_position() {
-    startup_sweep(false, false).await;
-}
-
 // ----------------------------------------------------------------------------
 // Reconnect: every connection from a dropped stream to the next row.
 // ----------------------------------------------------------------------------
@@ -785,12 +779,6 @@ async fn reconnect_sweep(gtid: bool) {
 #[ignore = "requires docker"]
 async fn reconnect_connections_prove_the_server_gtid() {
     reconnect_sweep(true).await;
-}
-
-#[tokio::test]
-#[ignore = "requires docker"]
-async fn reconnect_connections_prove_the_server_file_position() {
-    reconnect_sweep(false).await;
 }
 
 // ----------------------------------------------------------------------------
@@ -1218,63 +1206,6 @@ async fn failover_must_prove_the_exact_resume_set_not_the_checkpoint() {
         !watch.saw_dump().await,
         "binlog dump on the unproven server"
     );
-    proxy.all_to(a);
-}
-
-#[tokio::test]
-#[ignore = "requires docker"]
-async fn file_position_failover_stops_even_when_the_file_name_matches() {
-    init_test_tracing();
-    let (a, b) = pair(false).await;
-    let (ua, ub) = (uuid(a).await, uuid(b).await);
-    let db = "ident_samefile";
-    prepare(a, db, "a").await;
-    prepare(b, db, "a").await; // same shape: only the position is at stake
-    let proxy = Proxy::start(a).await;
-    let st = State::new().await;
-    let id = "ident_samefile";
-    let mut r =
-        streaming_on_a(&proxy, a, id, db, &st, OnSchemaDrift::Adapt).await;
-    insert(a, db, 2, "a").await;
-    let got = rows_until(&mut r.rx, Some(2), Duration::from_secs(30)).await;
-    assert!(got.contains(&(2, "a".into())));
-
-    // B deliberately has A's current binlog file name.
-    let mut c = mysql_async::Conn::from_url(root_dsn(a, "")).await.unwrap();
-    let row: mysql_async::Row = c
-        .query_first("SHOW BINARY LOG STATUS")
-        .await
-        .unwrap()
-        .unwrap();
-    let a_file: String = row.get(0).unwrap();
-    c.disconnect().await.ok();
-    for _ in 0..50 {
-        let mut c = mysql_async::Conn::from_url(root_dsn(b, "")).await.unwrap();
-        let files: Vec<String> = c
-            .query_map("SHOW BINARY LOGS", |r: mysql_async::Row| {
-                r.get::<String, _>(0).unwrap()
-            })
-            .await
-            .unwrap();
-        if files.contains(&a_file) {
-            break;
-        }
-        c.query_drop("FLUSH BINARY LOGS").await.unwrap();
-    }
-    let before = (stored(&st).await, st.lineage(id).await);
-
-    let watch = DumpWatch::start(b);
-    proxy.all_to(b);
-    proxy.sever();
-    insert(b, db, 8000, "b").await;
-    assert_lineage_stop(r.handle, "file/position failover").await;
-    let rows = rows_until(&mut r.rx, None, Duration::from_millis(200)).await;
-    assert!(rows.iter().all(|(id, _)| *id < 8000), "{rows:?}");
-    assert_eq!((stored(&st).await, st.lineage(id).await), before);
-    assert_eq!(st.identity(id).await, Some(ua.clone()));
-    st.assert_nothing_from(id, db, &ua, &ub, "file/position failover")
-        .await;
-    assert!(!watch.saw_dump().await, "binlog dump on the other server");
     proxy.all_to(a);
 }
 

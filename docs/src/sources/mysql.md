@@ -20,7 +20,7 @@ Ensure your MySQL server has binary logging enabled with row-based format:
 -- Required server settings (my.cnf or SET GLOBAL)
 log_bin = ON
 binlog_format = ROW
-gtid_mode = ON                    -- required when the initial snapshot runs
+gtid_mode = ON                    -- required
 enforce_gtid_consistency = ON     -- required with gtid_mode = ON
 log_replica_updates = ON          -- required (the default); see below
 binlog_row_image = FULL  -- Recommended for complete before-images
@@ -29,9 +29,11 @@ binlog_row_metadata = FULL  -- Recommended: decodes rows across unobserved schem
 
 **`log_replica_updates = ON` is required on every source, primary or replica** (`log_slave_updates` before MySQL 8.0.26; the default since 8.0). With it OFF, transactions the server applies through replication - from a channel configured now or at any later time - change its tables and advance its executed GTID set without reaching the binlog DeltaForge reads, so changes would be missed and a schema change could go unseen. DeltaForge refuses such a server before it writes anything durable, reads any table or runs a snapshot, and checks again each time a binlog stream opens (startup, every reconnect, credential rotation) before reading from it, and before a failover candidate is reconciled. The setting is read-only: changing it requires a server restart, which ends the stream, so the reconnect afterwards is checked. Changing it on a running server is otherwise not possible and not supported. The check fails closed when the setting cannot be read.
 
+**`gtid_mode = ON` is required on every source.** DeltaForge captures table definitions without taking any lock on the server, and proves which transactions such a read could see from the server's executed GTID set (see [Schema Tracking](#schema-tracking)); a server without GTIDs has no such record. DeltaForge refuses a server whose `gtid_mode` is not `ON` before it writes anything durable or reads any table, and checks again each time a binlog stream opens. To enable it on a running server, follow MySQL's online procedure (`gtid_mode` steps through `OFF_PERMISSIVE` and `ON_PERMISSIVE` on every server of the topology, with `enforce_gtid_consistency = ON`). `enforce_gtid_consistency` refuses a transaction that mixes transactional and non-transactional (for example MyISAM) tables, so applications that do so must change first.
+
 If `binlog_row_image` is not `FULL`, DeltaForge will warn at startup and before-images on UPDATE/DELETE events may be incomplete. For `binlog_row_metadata`, see [Schema Tracking](#schema-tracking).
 
-**Initial-snapshot requirements.** When a snapshot runs (`snapshot.mode` = `initial` or `always`), DeltaForge fails closed at preflight unless: `gtid_mode = ON`, `binlog_format = ROW`, every snapshotted table uses the **InnoDB** storage engine, and the user holds the global **RELOAD** privilege (see [Snapshot](#snapshot-initial-load)). These are checked only when a snapshot actually runs; a CDC-only pipeline (`snapshot.mode = never`) is never rejected for them.
+**Initial-snapshot requirements.** When a snapshot runs (`snapshot.mode` = `initial` or `always`), DeltaForge fails closed at preflight unless: `binlog_format = ROW`, every snapshotted table uses the **InnoDB** storage engine, and the user holds the global **RELOAD** privilege (see [Snapshot](#snapshot-initial-load)). These are checked only when a snapshot actually runs; a CDC-only pipeline (`snapshot.mode = never`) is never rejected for them.
 
 ### User Privileges
 
@@ -118,7 +120,7 @@ configuration is loaded:
 | `activation_window_ms` | `50` | 1 to 1,000 | How long after its first event was received an activation window reads ahead to batch the first rows of newly active tables. The window holds the stream's dispatch meanwhile. |
 | `activation_window_events` | `10000` | 1 to 100,000 | At most this many events buffered by a window. |
 | `activation_window_bytes` | `16777216` | 65,536 to 268,435,456 | At most this many bytes of events buffered by a window. |
-| `capture_lock_wait_secs` | `30` | 1 to 300 | How long a window's capture waits for each table's metadata lock, on each of its three attempts. |
+| `capture_wait_secs` | `30` | 1 to 300 | How long a schema capture may wait in all, on each of its attempts: for a capture slot, a control connection and, after its reads, for transactions still committing to be executed. Captures take no lock on the server. The earlier name `capture_lock_wait_secs` is still accepted. |
 | `max_seek_ms` | `10000` | 100 to 600,000 | A proof scan with no known start offset fails closed when the server sends no transaction within this bound. |
 | `control_connections` | `4` | 2 to 16 | The source's control-plane pool: at most this many SQL connections at once for schema captures, catalog reads, position queries and health checks. |
 | `activation_capture_concurrency` | `2` | 1 to 4, below `control_connections` | At most this many activation windows collected ahead of the one being decided, each captured on its own connection. Absent with `control_connections` of 2, it is 1. Held events are bounded by `activation_window_events` and `activation_window_bytes` for each of them. |
@@ -203,7 +205,7 @@ for cancelling captures):
   most 10 s; any other closes. When the process budget is full, every idle
   connection closes at once to make room.
 - Waits are first come, first served. A capture waits at most its
-  `capture_lock_wait_secs`; a position query or a health check at most 5 s,
+  `capture_wait_secs`; a position query or a health check at most 5 s,
   one health check at a time per source; a catalog read at most 30 s.
 - An activation window's, a failover drift check's or a DDL's forward
   proof capture that gets no connection within its wait stops the source
@@ -234,12 +236,13 @@ table's new shape (a capture of it and a scan of the binlog since the DDL)
 before the DDL event is emitted. A proof that fails for a transient reason
 is retried in place, with the stream paused at the DDL:
 
-- **Retried:** a metadata-lock wait timeout or deadlock (another session
-  holds or queues the table's lock), busy capture slots, and connection
-  failures (refused, reset, timed out, closed, server shutting down).
+- **Retried:** a capture that ran out of its budget (busy capture slots,
+  or transactions still committing on the server after its reads), a
+  server lock wait timeout or deadlock, and connection failures (refused,
+  reset, timed out, closed, server shutting down).
 - **Bounds:** at most 4 attempts within 120 s from the first, with 1, 4 and
   16 s between them. A capture starts only with at least 1 s left, and
-  waits for the lock at most 30 s or the time left. Each attempt captures
+  waits at most 30 s or the time left. Each attempt captures
   and scans afresh; a table proven in one attempt is committed then and not
   captured again.
 - **Exhausted:** the source stops before the DDL is emitted or
@@ -264,8 +267,8 @@ is retried in place, with the stream paused at the DDL:
   committed and still stops the source before the DDL.
 
 `deltaforge_mysql_forward_proof_retries_total{class}` counts retried
-failures (`lock_wait_timeout`, `deadlock`, `capture_slots_busy`,
-`transport`, `read`, `not_reached`, `deadline`), and
+failures (`capture_wait`, `lock_wait_timeout`, `deadlock`, `transport`,
+`read`, `not_reached`, `deadline`), and
 `deltaforge_mysql_forward_proof_outcomes_total{outcome}` the ends of proofs
 that retried (`recovered`, `ended_deferred`, `exhausted`, `cancelled`,
 `ended_by_terminal`).
@@ -478,7 +481,7 @@ Binlog row events carry values by column position, not by name. DeltaForge decod
 - a DDL's resulting definition, captured right after the source reads the DDL and proven unchanged since;
 - with `binlog_row_metadata = FULL` and neither of the above: the single recorded definition that exactly matches the row's binlog metadata (column names, types, signedness, charsets, primary key), recorded durably before the row is emitted.
 
-Capturing a definition never requires the server to be idle. In one read-only transaction the source takes the table's shared metadata lock (the lock any `SELECT` takes: inserts, updates and deletes proceed, DDL of that table or its database waits), then reads the binlog position, the table's definition (several INFORMATION_SCHEMA queries) and the position again, then releases the lock. A DDL already running on the table finishes before the lock is granted, so the definition read is never older than the position; a DDL issued meanwhile waits a few milliseconds and lands after the capture. The source then proves from the binlog that nothing between the two positions could have changed that table, such as an unattributable statement. Ordinary writes, to any table, and DDL of other tables do not matter, so a busy server proves tables as readily as a quiet one. Only a relevant statement inside that short interval causes a retry; a binlog that cannot be read (purged, unknown events, scan limits) or a lock not granted within 30 seconds stops the proof instead. The capture needs `SELECT` on the table. Table and database names are compared as `lower_case_table_names` defines: exactly with `0`, case-insensitively with `1`, and with `2` (names stored as written, compared case-insensitively) every DDL counts as relevant.
+Capturing a definition never requires the server to be idle, and takes no lock on it: it never holds back a DDL, the writes queued behind a DDL, or any other session, and never opens the table. The source reads the binlog position and executed GTID set first, then, in one read-only `REPEATABLE READ` snapshot, the table's definition (several INFORMATION_SCHEMA queries, which read the data dictionary as non-locking reads), then the end position. MySQL adds a transaction's GTID to the executed set only after it commits, so every DDL up to the first position is visible to the reads. A DDL can be visible before its GTID is in the executed set, so the end is read as the GTIDs still owned by committing transactions, then the status, and, if any of those GTIDs are not executed yet, a server-side wait for them (`WAIT_FOR_EXECUTED_GTID_SET`, no lock) and the status again: every transaction the reads could see is before the end. The source then proves from the binlog that nothing between the two positions could have changed that table: a DDL of the table or its database, or an unattributable statement. Such a statement, issued while the capture runs, proceeds at once and is found there. Right after its snapshot opens, the capture also reads every GTID executed or owned at that moment: a statement outside that set cannot be visible to the reads, so the definition read is the table's definition from its rows until that statement, and the table is admitted until it (the statement's own proof follows when the stream reads it). Otherwise the table is refused; the definition is never assumed. A table missing from the reads is told apart with one `SELECT 1 FROM t LIMIT 0` outside any transaction: MySQL refuses a table the account has no privilege on before it opens it (an authorization failure, as before), and an absent one holds a metadata lock on its name for that one statement. Ordinary writes, to any table, and DDL of other tables do not matter, so a busy server proves tables as readily as a quiet one. A binlog that cannot be read (purged, unknown events, scan limits) or a capture that runs out of its budget (`capture_wait_secs`) stops the proof instead. The capture needs `SELECT` on the table. Table and database names are compared as `lower_case_table_names` defines: exactly with `0`, case-insensitively with `1`, and with `2` (names stored as written, compared case-insensitively) every DDL counts as relevant.
 
 When no version can be proven, the source **stops** with a schema error naming the table, emits nothing for those rows and does not advance its checkpoint. Under the default `binlog_row_metadata = MINIMAL` this happens when:
 
@@ -494,10 +497,9 @@ arrive, the source first reads ahead (an activation window, at most
 `proofs.activation_window_ms`, without advancing its position or emitting
 anything) and collects every other table whose first rows follow. A
 statement that can change a schema, or an idle stream, closes the window
-early. One read-only transaction then captures all of these tables: it
-locks their metadata in sorted order, which avoids deadlocking against a
-multi-table DDL, and reads every definition between the same two binlog
-positions. Meanwhile the source keeps reading the stream, holding what
+early. One read-only snapshot then captures all of these tables: it
+reads every definition between the same two binlog positions, as a
+single capture does, and takes no lock. Meanwhile the source keeps reading the stream, holding what
 arrives for the next window without emitting it, so tables first touched
 during an admission are not held for a second full window. Up to
 `proofs.activation_capture_concurrency` next windows (default 2) are
@@ -518,32 +520,25 @@ them or none. A failover drift check runs for every table of the window
 first, so a drift incident stops the whole window with nothing of it
 written. If the store cannot commit the window (after a few retries of the
 whole transaction), the source stops; it never falls back to admitting the
-tables one by one. If the locks are not granted
-within `proofs.capture_lock_wait_secs` on three attempts, the source stops
-with a `mysql_capture_contention` incident: nothing of the window is
-emitted, the checkpoint stays before it, and a restart retries once the
-schema change holding the lock is done. There is no fallback to one
-capture per table.
+tables one by one. If the capture does not complete within
+`proofs.capture_wait_secs` on three attempts, the source stops with a
+`mysql_capture_contention` incident: nothing of the window is emitted, the
+checkpoint stays before it, and a restart retries. There is no fallback to
+one capture per table.
 
 A window also closes once its tables fill one state-store transaction's
 read budget (about 600 tables for a source with a single lineage), so it
-captures only tables it can admit. Each capture's metadata lock opens the
-table's definition: when `table_definition_cache` holds far fewer tables
-than become active together, almost every lock is a cold open (about 1 ms
-per table measured on MySQL 8.4), and activating tens of thousands of
-tables takes tens of seconds. Raising `table_definition_cache` above the
-number of tables active together is expected to avoid most of those opens;
-its effect on activation time has not been measured.
+captures only tables it can admit. A capture reads definitions from the
+data dictionary and opens no table, so it does not depend on
+`table_open_cache` or `table_definition_cache`, and does not evict the
+workload's open tables.
 
 Windows collected ahead let several captures run at once: at most
-`activation_capture_concurrency` + 1 capture transactions, each holding
-shared metadata locks on its own tables (about 600) for about as long as a
-single capture takes. They never wait for each other. A schema change on a
-table being captured waits for that one capture to finish, as with a
-single window, and a capture that MySQL picks as a deadlock victim is
-retried within its three attempts. Each concurrent capture also opens
-table definitions on the server: lower the setting to 1 (one window ahead)
-on a server with little spare CPU. The source exports
+`activation_capture_concurrency` + 1 read-only capture snapshots, each
+reading about 600 tables' definitions. They never wait for each other or
+for anything else on the server. Each concurrent capture costs dictionary
+reads on the server: lower the setting to 1 (one window ahead) on a server
+with little spare CPU. The source exports
 `deltaforge_mysql_activation_captures_in_flight`, and
 `deltaforge_mysql_activation_speculation_abandoned_total` (by `reason`)
 with `deltaforge_mysql_activation_speculation_abandoned_seconds` for the

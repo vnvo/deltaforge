@@ -384,11 +384,11 @@ const DF_COUNTERS: [&str; 27] = [
     "deltaforge_source_schema_cache_misses_total",
     "deltaforge_schema_sensing_seconds_sum",
     // Proof requests (one per first-touched table, among others) and their
-    // cost: the bounded capture (lock wait, the connection's wait for its
-    // lock, and the schema query) and the binary-log scan.
+    // cost: the bounded capture (the end's wait for transactions still
+    // committing, and the schema queries) and the binary-log scan.
     "deltaforge_mysql_proof_requests_total",
-    "deltaforge_mysql_proof_capture_lock_wait_seconds_sum",
-    "deltaforge_mysql_proof_capture_lock_wait_seconds_count",
+    "deltaforge_mysql_proof_capture_end_wait_seconds_sum",
+    "deltaforge_mysql_proof_capture_end_wait_seconds_count",
     "deltaforge_mysql_proof_capture_schema_seconds_sum",
     "deltaforge_mysql_proof_capture_retries_total",
     "deltaforge_mysql_proof_scan_bytes_sum",
@@ -631,7 +631,7 @@ fn proof_trace(stdout: &Path) -> Value {
                 "bytes": r["bytes"], "cut": r["cut"],
                 "closed_by": r["closed_by"], "prefetched": r["prefetched"],
                 "read_ms": r["read_ms"], "capture_ms": r["capture_ms"],
-                "capture_lock_ms": r["capture_lock_ms"],
+                "capture_end_wait_ms": r["capture_end_wait_ms"],
                 "capture_schema_ms": r["capture_schema_ms"],
                 "scan_ms": r["scan_ms"], "commit_ms": r["commit_ms"],
                 "batch_conflicts": r["batch_conflicts"],

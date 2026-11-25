@@ -688,7 +688,7 @@ impl MySqlSource {
                     &d.env,
                     d.anchor,
                     &page,
-                    self.proofs.capture_lock_wait_secs,
+                    self.proofs.capture_wait_secs,
                 )
                 .await?;
             }
