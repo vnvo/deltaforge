@@ -111,7 +111,7 @@ deltaforge preflight <config-file-or-dir> --json   # machine-readable report
 Preflight resolves the config's secrets and source DSN exactly as startup does, connects to the source, and runs the source checks plus local config validation. It exits non-zero (fail closed) if any check fails, so it is safe to gate a deploy on it in CI/CD.
 
 - **PostgreSQL**: `wal_level = logical`; the publication exists and has tables; WAL-retention capacity vs estimated snapshot size. **Slot validation is mode-aware**: DeltaForge creates and owns the replication slot in every supported mode, so an absent slot on a fresh deployment is reported as informational, not a failure. An *existing* slot is checked under the same ownership rules as startup - a slot that is invalidated, WAL-lost, currently active (another consumer), or **foreign** (no matching ownership record for this server/database) fails closed.
-- **MySQL**: `log_bin` on, `binlog_format = ROW`, `gtid_mode = ON`, the `RELOAD` privilege, captured tables on InnoDB, binlog retention window. The preflight command requires `RELOAD` and `gtid_mode = ON` for every pipeline, including a CDC-only one that does not need them at runtime.
+- **MySQL**: `log_bin` on, `binlog_format = ROW`, `gtid_mode = ON`, captured tables on InnoDB, binlog retention window. No `RELOAD` privilege: nothing DeltaForge does takes a lock on the server.
 - **Both**: connectivity; **source and sink credential references** are resolved (a missing/invalid secret or an inline+reference conflict fails here); commit-policy validity vs sink count; at least one sink configured; and **source ids are unique** across the supplied config(s).
 
 Wildcard table patterns are reported as not validated per-table (server-level checks still run). Preflight validates **credentials and configuration**, not endpoints: **sink endpoint reachability is not probed** (a documented follow-up), and the slot-ownership check requires pointing preflight at the deployment's storage backend (the same `--storage-*` flags the server uses).
@@ -196,12 +196,11 @@ Schema history written by earlier releases is kept but not used automatically: a
 - `REPLICATION SLAVE, REPLICATION CLIENT ON *.*` (always).
 - `BACKUP_ADMIN ON *.*` and `SELECT ON performance_schema.log_status` for a first start without a checkpoint and without a snapshot: the capture boundary (binlog position and GTID set) is read there in one consistent query. Without them that start fails closed. Validated on MySQL 8.4; managed services are not yet qualified for these grants.
 - `SELECT, SHOW VIEW` on the captured database(s) for reads and introspection.
-- `RELOAD ON *.*` **only when an initial snapshot runs** (needed for the brief `FLUSH TABLES WITH READ LOCK` that anchors the snapshot). A CDC-only pipeline (`snapshot.mode = never`) does not need `RELOAD`.
 - Server settings enforced fail-closed at snapshot preflight: `gtid_mode = ON`, `binlog_format = ROW`, and captured tables on InnoDB (MySQL itself requires `enforce_gtid_consistency = ON` before `gtid_mode = ON`). `binlog_row_image = FULL` is recommended (a warning otherwise).
 - Server settings enforced fail-closed at every start and reconnect: MySQL 8.0.19 or later (not MariaDB), `gtid_mode = ON` and `log_replica_updates = ON`.
 - `binlog_row_metadata = FULL` is recommended: under `MINIMAL`, more DDL situations stop the source fail-closed (see [Known limitations](#known-limitations)).
 - GTID mode is required on every MySQL source, with or without a snapshot: DeltaForge reads table definitions without locking them and needs the executed GTID set to know what such a read could see. A server with GTIDs off is refused at start, before anything is read or written.
-- On managed MySQL (for example RDS/Aurora) where `RELOAD` / `FLUSH TABLES WITH READ LOCK` is unavailable, the snapshot **fails closed** with a typed error - there is no silent unsafe fallback. Grant `RELOAD`, or run `snapshot.mode = never` and perform the initial load out of band.
+- Managed MySQL (for example RDS/Aurora) needs nothing extra for a snapshot: its anchor takes no lock and needs no `RELOAD`.
 
 ### Sinks
 

@@ -53,7 +53,7 @@ A single source transaction larger than `max_tx_events`/`max_tx_bytes` is failed
 ## Concurrency and in-flight
 
 - `max_inflight` default **1** [operator]. It bounds **pipeline batch depth**, not concurrent sink delivery: delivery is processed FIFO by a single delivery task to preserve checkpoint ordering, so raising it does **not** parallelize sinks [code-derived]. With `respect_source_tx = true` (the default), `max_inflight` **must** be 1 (startup fails otherwise) [code-derived]. So the effective default is single-in-flight.
-- Snapshot parallelism [operator]: `discovery_page_size` **1,000** (catalog rows per discovery query), `max_parallel_tables` **8**, `chunk_size` **10,000** rows, `intra_table_parallel` **false**, `max_parallel_chunks` **4** (only when intra-table parallel), `lock_timeout_secs` **10**. Effective table concurrency is `min(max_parallel_tables, table_count)`.
+- Snapshot parallelism [operator]: `discovery_page_size` **1,000** (catalog rows per discovery query), `max_parallel_tables` **8**, `chunk_size` **10,000** rows, `intra_table_parallel` **false**, `max_parallel_chunks` **4** (only when intra-table parallel), `anchor_timeout_secs` **10**. Effective table concurrency is `min(max_parallel_tables, table_count)`.
 
 ## Queue and DLQ bytes
 

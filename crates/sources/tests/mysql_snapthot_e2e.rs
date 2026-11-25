@@ -1068,7 +1068,7 @@ async fn mysql_discovery_is_paged_and_each_table_prepared_once() -> Result<()> {
         assert_eq!(s.max_table_tasks, 3, "{s:?}");
     }
     // Fixed operations: identical, once each (MySQL also re-reads the
-    // catalog under the anchor's read lock, page for page).
+    // catalog at the anchor, page for page).
     assert_eq!(s25.fixed, s50.fixed);
     assert_eq!(s25.fixed, [1, 0, 1, 1, 1, 1, 1], "{s25:?}");
     for s in [s25, s50] {
@@ -1154,8 +1154,8 @@ async fn mysql_wildcard_legacy_progress_ambiguity_is_detected() -> Result<()> {
 }
 
 /// MySQL's catalog is not read in one consistent snapshot, so the anchor
-/// re-reads it under its read lock (no DDL can run) and requires exactly the
-/// planned tables: a table created after the first discovery page into the
+/// re-reads it (and proves from the binlog that nothing moved meanwhile)
+/// and requires exactly the planned tables: a table created after the first discovery page into the
 /// range that page already covered (discovery never sees it) fails the
 /// snapshot before any row is read.
 #[tokio::test]
@@ -1183,8 +1183,8 @@ async fn mysql_catalog_movement_during_discovery_fails_closed() -> Result<()> {
 }
 
 /// A prepared table altered before the anchor (the plan's schema no longer
-/// matches): the anchor re-reads every planned table's shape under its read
-/// lock and stops the snapshot before any row, never finished.
+/// matches): the anchor re-reads every planned table's shape and stops the
+/// snapshot before any row, never finished.
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_a_table_altered_before_the_anchor_stops_the_snapshot()

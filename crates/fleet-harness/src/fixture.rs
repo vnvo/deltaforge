@@ -371,7 +371,7 @@ pub async fn ensure_cdc_user(cfg: &RunConfig, server: &Server) -> Result<()> {
     ))
     .await?;
     conn.query_drop(format!(
-        "GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT, BACKUP_ADMIN ON *.* TO '{u}'@'%'"
+        "GRANT SELECT, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT, BACKUP_ADMIN ON *.* TO '{u}'@'%'"
     ))
     .await?;
     drop(conn);

@@ -1,26 +1,26 @@
 //! MySQL consistent snapshot engine.
 //!
-//! Initial load with a single consistent anchor established under a brief global
-//! read lock (snapshot-anchor hardening):
+//! Initial load from one anchor, taken without any lock on the source
+//! ([`acquire_anchor`]):
 //!
-//! 1. Hold `FLUSH TABLES WITH READ LOCK` on a dedicated non-pooled connection
-//!    while opening a bounded pool of `min(max_parallel_tables, pending)` worker
-//!    connections, each `START TRANSACTION WITH CONSISTENT SNAPSHOT` under
-//!    `REPEATABLE READ`, and capturing the binlog position + GTID set. Because no
-//!    transaction can commit while the lock is held, every worker's read view
-//!    equals the captured position - one shared anchor, no seam loss. The whole
-//!    setup is bounded by `snapshot.lock_timeout_secs`; the lock is guaranteed to
-//!    release by dropping the lock connection on any error/panic/timeout
-//!    (`UNLOCK TABLES` is only the success path).
+//! 1. The plan is verified live against the catalog between two status
+//!    reads D0 and E0, and a binlog scan of (D0, E0] proves nothing that the
+//!    plan depends on changed meanwhile (else the anchor is taken again).
+//!    E0 is the anchor. Then a bounded pool of `min(max_parallel_tables,
+//!    pending)` worker connections opens at once, each `START TRANSACTION
+//!    WITH CONSISTENT SNAPSHOT` under `REPEATABLE READ`, bounded by
+//!    `snapshot.anchor_timeout_secs`. Every view contains everything in E0;
+//!    a transaction committed after E0 may be in a view and is streamed
+//!    again (a bounded overlap, at least once), never lost.
 //! 2. Each worker reads its bucket of tables sequentially under its single
-//!    consistent snapshot and commits once when the bucket is done, so the lock
-//!    window and connection count are bounded by the worker count, not the table
-//!    count. Single-integer-PK tables use PK-range chunking; others full-scan.
-//! 3. Completed tables are recorded in the checkpoint store so a crash resumes
-//!    at the table level rather than restarting from scratch.
-//! 4. Returns the `MySqlCheckpoint` captured under the lock - pass this to
-//!    `prepare_client` as the replication start position so streaming picks up
-//!    exactly where the snapshot left off.
+//!    consistent snapshot and commits once when the bucket is done, so the
+//!    connection count is bounded by the worker count, not the table count.
+//!    Single-integer-PK tables use PK-range chunking; others full-scan.
+//! 3. A generation lives and dies with its views: losing one (a worker
+//!    connection, a DDL of a table its worker has yet to read, the process)
+//!    loses the generation, which the next start copies again in full.
+//! 4. The stream starts at E0's GTID set, so streaming picks up everything
+//!    no view was guaranteed to hold.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -125,8 +125,8 @@ pub struct SnapshotCtx<'a> {
     pub pipeline: &'a str,
     pub tenant: &'a str,
     pub cfg: &'a SnapshotCfg,
-    /// The configured table patterns (the catalog is re-read under the
-    /// anchor's read lock to verify the plan).
+    /// The configured table patterns (the anchor re-reads the catalog to
+    /// verify the plan).
     pub table_patterns: &'a [String],
     pub schema_loader: &'a MySqlSchemaLoader,
     pub chkpt_store: Arc<dyn CheckpointStore>,
@@ -415,8 +415,9 @@ pub(crate) struct MyCopyCtx<'a> {
     pub schema_loader: &'a MySqlSchemaLoader,
     pub cancel: CancellationToken,
     pub plan: PlanPages,
-    /// The workers' consistent-snapshot connections, all opened under the
-    /// anchor's read lock: each one's read view is the generation's.
+    /// The workers' consistent-snapshot connections, all opened after the
+    /// anchor's position: each one's read view contains everything up to it
+    /// (and may hold transactions just after it: the bounded overlap).
     pub workers: Vec<CopyConn>,
     pub publisher: Arc<GenerationPublisher>,
     pub generation: u64,
@@ -530,19 +531,7 @@ pub(crate) async fn copy_generation(ctx: MyCopyCtx<'_>) -> Result<()> {
 // Helpers
 // ============================================================================
 
-/// Establish the consistent snapshot anchor under a brief global read lock.
-///
-/// Holds `FLUSH TABLES WITH READ LOCK` on a dedicated **non-pooled** connection
-/// while it opens `num_workers` `REPEATABLE READ` consistent-snapshot worker
-/// connections and captures the binlog position + GTID set. Because no
-/// transaction can commit while the lock is held, every worker's read view
-/// equals the captured position - one shared anchor with no snapshot->CDC seam.
-///
-/// The whole lock-held setup is bounded by `timeout_dur`. Lock release is
-/// guaranteed: the lock connection is a non-pooled `Conn`, so on any error,
-/// panic, or timeout it is dropped, closing its session and releasing the lock
-/// server-side. `UNLOCK TABLES` is only the normal success path.
-/// The plan the anchor verifies under its read lock.
+/// The plan the anchor verifies live, between its two status reads.
 pub(crate) struct PlanCheck<'a> {
     pub patterns: &'a [String],
     pub page_size: usize,
@@ -566,17 +555,15 @@ impl PlanCheck<'static> {
     }
 }
 
-/// Under the read lock (no DDL can run), re-read the catalog with the same
-/// paged discovery and require exactly the planned tables, in order, page by
-/// page against the stored plan: a table created, dropped or renamed since
-/// discovery (between its pages, or before the anchor) fails the snapshot
-/// before any row is read. MySQL's INFORMATION_SCHEMA is not read in one
-/// consistent snapshot, so this is what makes the paged discovery a
-/// consistent view, as of the anchor.
-async fn verify_plan_under_lock(
-    conn: &mut Conn,
-    check: &mut PlanCheck<'_>,
-) -> Result<()> {
+/// Re-read the catalog with the same paged discovery and require exactly
+/// the planned tables, in order, page by page against the stored plan, and
+/// every planned table's schema as planned: a table created, dropped,
+/// renamed or altered since discovery fails the snapshot before any row is
+/// read. MySQL's INFORMATION_SCHEMA is not read in one consistent snapshot;
+/// the anchor runs this between its reads D0 and E0 and proves from the
+/// binlog that nothing it could have missed changed in (D0, E0]
+/// ([`acquire_anchor`]).
+async fn verify_plan(conn: &mut Conn, check: &mut PlanCheck<'_>) -> Result<()> {
     let mut discovery = crate::snapshot_discovery::Discovery::for_verification(
         check.patterns,
         check.page_size,
@@ -615,8 +602,8 @@ async fn verify_plan_under_lock(
     Ok(())
 }
 
-/// Under the read lock, rebuild the registered schema model of each of
-/// `planned` from INFORMATION_SCHEMA (the loader's own fetch) and require
+/// Rebuild the registered schema model of each of `planned` from
+/// INFORMATION_SCHEMA (the loader's own fetch) and require
 /// the plan's signature: a table altered since preparation stops the
 /// snapshot before any row is read.
 async fn verify_shapes(
@@ -696,58 +683,171 @@ impl std::ops::DerefMut for CopyConn {
     }
 }
 
-pub(crate) async fn acquire_locked_anchor(
+/// Anchor attempts refused by a plan-moving statement are retried at least
+/// this many times, and for at least [`ANCHOR_REFUSED_FOR`].
+const ANCHOR_ATTEMPTS: u32 = 3;
+const ANCHOR_REFUSED_FOR: Duration = Duration::from_secs(30);
+
+/// Test-only: the attempts the last anchor took.
+#[cfg(test)]
+pub(crate) static LAST_ANCHOR_ATTEMPTS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Establish a generation's anchor without any lock on the source
+/// (`docs/src/sources/mysql.md`, "Snapshot (initial load)"):
+///
+/// 1. D0: the server status (executed GTID set), on a verified connection.
+/// 2. The plan verified live against the catalog ([`verify_plan`]).
+/// 3. E0: the status again. Every GTID in E0 is committed in the engine (a
+///    GTID enters the executed set only after its engine commit), so every
+///    read view opened after this read contains it.
+/// 4. `num_workers` worker connections opened at once, each verified,
+///    `REPEATABLE READ`, its session pinned and its consistent snapshot
+///    started, within `timeout_dur`.
+/// 5. One binlog scan of (D0, E0]: a statement that can change the planned
+///    set or a planned table's shape ([`moves_plan`]) refuses the attempt.
+///    The verification in step 2 then may have missed it; the workers are
+///    closed and the anchor is taken again, at least [`ANCHOR_ATTEMPTS`]
+///    times and for [`ANCHOR_REFUSED_FOR`], then the source stops with a
+///    `mysql_snapshot_anchor_refused` incident.
+///
+/// The anchor is E0, where the stream starts. A transaction committed after
+/// E0 and visible to a worker's snapshot is in that worker's rows and again
+/// in the stream (a bounded overlap, at least once); one not visible is
+/// streamed only. None is lost. A DDL of a planned table after E0 makes its
+/// worker's read fail (the generation is lost), and the anchor baselines
+/// prove every table over (E0, S].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn acquire_anchor<'a>(
     source: &str,
     dsn: &str,
     expected_uuid: &str,
+    lineage_hash: &str,
+    patterns: &[String],
     num_workers: usize,
     timeout_dur: Duration,
-    mut check: PlanCheck<'_>,
+    mut check: impl FnMut() -> PlanCheck<'a>,
 ) -> Result<(Vec<CopyConn>, MySqlCheckpoint)> {
+    use super::mysql_binlog_scan::{
+        ProofKind, ScanLimits, ScanTag, read_position, scan_interval,
+    };
     let opts = Opts::from_url(dsn).context("parse mysql dsn")?;
-    // Each connection proves it is the verified server before it is used:
-    // the anchor position and every worker's rows must come from one server.
     let verify = |e: super::mysql_session::SessionError| {
         anyhow::Error::new(e.into_source_error(expected_uuid))
     };
-
-    // Dedicated, non-pooled lock connection: dropping it releases FTWRL.
-    let mut lock_conn = CopyConn::new(
+    let proof = |e: super::mysql_binlog_scan::ProofError| {
+        anyhow!("snapshot anchor: {e}")
+    };
+    let mut conn = CopyConn::new(
         Conn::new(opts.clone())
             .await
-            .context("connect lock connection")?,
+            .context("connect anchor connection")?,
         source,
     );
-    super::mysql_session::verify_connection(&mut lock_conn, expected_uuid)
+    super::mysql_session::verify_connection(&mut conn, expected_uuid)
         .await
         .map_err(verify)?;
-
-    // Bound how long FTWRL may wait on in-flight statements/metadata locks.
-    let lock_wait = timeout_dur.as_secs().max(1);
-    lock_conn
-        .query_drop(format!("SET SESSION lock_wait_timeout = {lock_wait}"))
+    let lctn: u8 = conn
+        .query_first("SELECT @@lower_case_table_names")
         .await
-        .ok();
-
-    // All lock-held setup runs under one deadline. On timeout the future is
-    // dropped, which drops lock_conn and releases the lock.
-    let setup = async {
-        lock_conn
-            .query_drop("FLUSH TABLES WITH READ LOCK")
+        .context("read lower_case_table_names")?
+        .context("no lower_case_table_names")?;
+    let allow = common::AllowList::new(patterns);
+    let server_id = super::mysql_helpers::derive_server_id(&format!(
+        "{source}/snapshot-anchor"
+    ));
+    let tag = ScanTag {
+        source_id: source,
+        kind: ProofKind::SnapshotAnchor,
+    };
+    let first = Instant::now();
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let d0 = read_position(&mut conn, true, lineage_hash)
             .await
-            .context("FLUSH TABLES WITH READ LOCK")?;
+            .map_err(proof)?;
+        verify_plan(&mut conn, &mut check()).await?;
+        crate::snapshot_probe::after_plan_verified().await;
+        let e0 = read_position(&mut conn, true, lineage_hash)
+            .await
+            .map_err(proof)?;
+        crate::snapshot_probe::after_anchor_position().await;
+        let workers = match timeout(
+            timeout_dur,
+            open_workers(&opts, source, expected_uuid, num_workers),
+        )
+        .await
+        {
+            Ok(w) => w?,
+            Err(_) => {
+                return Err(anyhow!(
+                    "the snapshot workers' connections did not open within \
+                     {timeout_dur:?}; increase snapshot.anchor_timeout_secs \
+                     or retry when the source accepts connections faster"
+                ));
+            }
+        };
+        let report = scan_interval(
+            dsn,
+            server_id,
+            expected_uuid,
+            lineage_hash,
+            &d0,
+            &e0,
+            &ScanLimits::default(),
+            &tag,
+        )
+        .await
+        .map_err(proof)?;
+        let Some(moved) = report
+            .statements
+            .iter()
+            .find_map(|st| moves_plan(st, &allow, lctn))
+        else {
+            drop(conn);
+            #[cfg(test)]
+            LAST_ANCHOR_ATTEMPTS
+                .store(attempt, std::sync::atomic::Ordering::SeqCst);
+            return Ok((workers, e0));
+        };
+        drop(workers);
+        warn!(source_id = %source, attempt, %moved, "a statement that can change the snapshot plan ran while the anchor was taken; taking it again");
+        if attempt >= ANCHOR_ATTEMPTS && first.elapsed() >= ANCHOR_REFUSED_FOR {
+            return Err(anyhow::Error::new(
+                crate::incident_drafts::mysql_snapshot_anchor_refused(
+                    source, attempt, &moved, &e0,
+                ),
+            ));
+        }
+        tokio::time::sleep(
+            Duration::from_millis(100 * u64::from(attempt))
+                .min(Duration::from_secs(2)),
+        )
+        .await;
+    }
+}
 
-        let mut workers = Vec::with_capacity(num_workers);
-        for _ in 0..num_workers {
+/// Open `n` snapshot workers at once: each verified, `REPEATABLE READ`, its
+/// session pinned, its consistent snapshot started.
+async fn open_workers(
+    opts: &Opts,
+    source: &str,
+    expected_uuid: &str,
+    n: usize,
+) -> Result<Vec<CopyConn>> {
+    let mut opening = tokio::task::JoinSet::new();
+    for _ in 0..n {
+        let (opts, source, uuid) =
+            (opts.clone(), source.to_string(), expected_uuid.to_string());
+        opening.spawn(async move {
             let mut c = CopyConn::new(
-                Conn::new(opts.clone())
-                    .await
-                    .context("connect snapshot worker")?,
-                source,
+                Conn::new(opts).await.context("connect snapshot worker")?,
+                &source,
             );
-            super::mysql_session::verify_connection(&mut c, expected_uuid)
+            super::mysql_session::verify_connection(&mut c, &uuid)
                 .await
-                .map_err(verify)?;
+                .map_err(|e| anyhow::Error::new(e.into_source_error(&uuid)))?;
             c.query_drop(
                 "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
             )
@@ -762,87 +862,47 @@ pub(crate) async fn acquire_locked_anchor(
             c.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT")
                 .await
                 .context("start consistent snapshot")?;
-            workers.push(c);
-        }
-
-        // Position captured while the lock is still held -> matches every
-        // worker's read view exactly.
-        let position = capture_binlog_position(&mut lock_conn).await?;
-        verify_plan_under_lock(&mut lock_conn, &mut check).await?;
-        Result::<(Vec<CopyConn>, MySqlCheckpoint)>::Ok((workers, position))
-    };
-
-    let (workers, position) = match timeout(timeout_dur, setup).await {
-        Ok(inner) => inner?, // inner Err drops lock_conn -> lock released
-        Err(_) => {
-            // timeout: `setup` future dropped -> lock_conn dropped -> released.
-            return Err(anyhow!(
-                "timed out establishing snapshot read lock within {timeout_dur:?}; \
-                 the source may be under long-running statements. Increase \
-                 snapshot.lock_timeout_secs or retry when the source is quieter."
-            ));
-        }
-    };
-
-    // Success: explicit unlock, then drop the lock connection.
-    lock_conn.query_drop("UNLOCK TABLES").await.ok();
-    drop(lock_conn);
-
-    Ok((workers, position))
+            Ok::<_, anyhow::Error>(c)
+        });
+    }
+    let mut workers = Vec::with_capacity(n);
+    while let Some(joined) = opening.join_next().await {
+        workers.push(joined.context("snapshot worker task")??);
+    }
+    Ok(workers)
 }
 
-/// Capture the current binlog position. Supports MySQL 8.4+ (`BINARY LOG STATUS`)
-/// and older (`MASTER STATUS`).
-async fn capture_binlog_position(
-    conn: &mut mysql_async::Conn,
-) -> Result<MySqlCheckpoint> {
-    let row: Option<Row> =
-        match conn.query_first("SHOW BINARY LOG STATUS").await {
-            Ok(r) => r,
-            Err(_) => conn
-                .query_first("SHOW MASTER STATUS")
-                .await
-                .context("SHOW MASTER STATUS - is binary logging enabled?")?,
-        };
-
-    let mut row = row
-        .context("no binlog position returned - is binary logging enabled?")?;
-
-    let file: String = row.take(0).context("binlog file")?;
-    let pos: u32 = row.take(1).context("binlog pos")?;
-
-    // In GTID mode the position is the executed GTID set - also when it is
-    // EMPTY (a server that has executed no GTID transaction yet), so it stays
-    // comparable with later GTID checkpoints. Outside GTID mode, no set.
-    let gtid_row: Option<Row> = conn
-        .query_first("SELECT @@GLOBAL.gtid_mode, @@GLOBAL.gtid_executed")
-        .await
-        .ok()
-        .flatten();
-    let gtid_set = gtid_row.and_then(|mut r| {
-        let mode: Option<String> = r.take::<Option<String>, _>(0).flatten();
-        let set: Option<String> = r.take::<Option<String>, _>(1).flatten();
-        mode.filter(|m| m.eq_ignore_ascii_case("ON"))
-            .map(|_| set.unwrap_or_default())
-    });
-    // The server's text (it prints newlines), in the one canonical form.
-    let gtid_set = match gtid_set {
-        Some(t) => Some(
-            crate::gtid_set::GtidSet::parse(&t)
-                .with_context(|| format!("unparseable gtid_executed {t:?}"))?
-                .to_string(),
-        ),
-        None => None,
+/// What a statement in (D0, E0] changed that the plan depends on, if
+/// anything: a table the patterns match (created, dropped, renamed or
+/// altered), a database they can match, or anything the classifier cannot
+/// attribute. With `lower_case_table_names = 2` names cannot be compared
+/// with certainty, so any shape change counts.
+pub(crate) fn moves_plan(
+    st: &super::mysql_binlog_scan::Statement,
+    allow: &common::AllowList,
+    lctn: u8,
+) -> Option<String> {
+    use super::mysql_ddl_attribution::{BarrierScopeOf, DdlEffect};
+    let matches = |db: &str, table: &str| {
+        allow.matches(db, table)
+            || (lctn != 0
+                && allow.matches(&db.to_lowercase(), &table.to_lowercase()))
     };
-
-    Ok(MySqlCheckpoint {
-        file,
-        pos: pos as u64,
-        gtid_set,
-        lineage: None,
-        snapshot_completed: None,
-        snapshot_chain: None,
-    })
+    match &st.effect {
+        DdlEffect::None | DdlEffect::SameShape(_) => None,
+        DdlEffect::Barrier(BarrierScopeOf::Lineage) => {
+            Some("a statement no table can be attributed to".into())
+        }
+        _ if lctn == 2 => Some(format!("{:?}", st.effect)),
+        DdlEffect::Barrier(BarrierScopeOf::Database(d)) => (allow
+            .may_match_qualifier(d)
+            || (lctn != 0 && allow.may_match_qualifier(&d.to_lowercase())))
+        .then(|| format!("a statement on database {d}")),
+        DdlEffect::Tables(tables) => tables
+            .iter()
+            .find(|t| matches(&t.db, &t.table))
+            .map(|t| format!("a DDL of {}.{}", t.db, t.table)),
+    }
 }
 
 // ============================================================================
@@ -1500,357 +1560,489 @@ mod cursor_tests {
 }
 
 #[cfg(test)]
-mod live_anchor_tests {
-    //! Live seam regression test for the FTWRL-bracketed anchor.
-    //!
-    //! Proves the fix: under concurrent writes, every worker connection opened by
-    //! `acquire_locked_anchor` shares ONE consistent view (identical row counts)
-    //! and the captured position is a clean cut (post-anchor commits are absent
-    //! from the snapshot, GTID captured). The pre-fix per-worker-independent
-    //! snapshot could not guarantee this - see the anchor verification report.
-    //!
-    //! Gated on `MYSQL_IT_DSN` (a live MySQL 8 with GTID + a user holding RELOAD).
+mod plan_moving_tests {
+    //! Which statements in (D0, E0] refuse an anchor ([`moves_plan`]).
     use super::*;
-    use mysql_async::prelude::Queryable;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use crate::mysql::mysql_activation::EventIdentity;
+    use crate::mysql::mysql_binlog_scan::Statement;
+    use crate::mysql::mysql_ddl_attribution::{
+        BarrierScopeOf, DdlEffect, TableName,
+    };
 
-    async fn live_uuid(dsn: &str) -> String {
-        let mut c = Conn::new(Opts::from_url(dsn).unwrap()).await.unwrap();
+    fn st(effect: DdlEffect) -> Statement {
+        Statement {
+            event: EventIdentity::Gtid {
+                gtid: "3e11fa47-71ca-11e1-9e33-c80aa9429562:7".into(),
+                ordinal: 0,
+            },
+            effect,
+        }
+    }
+
+    fn tables(names: &[(&str, &str)]) -> DdlEffect {
+        DdlEffect::Tables(
+            names
+                .iter()
+                .map(|(db, table)| TableName {
+                    db: db.to_string(),
+                    table: table.to_string(),
+                })
+                .collect(),
+        )
+    }
+
+    fn allow(patterns: &[&str]) -> common::AllowList {
+        common::AllowList::from_strs(patterns)
+    }
+
+    #[test]
+    fn a_ddl_of_a_matched_table_moves_the_plan_and_others_do_not() {
+        let a = allow(&["shop.ord%"]);
+        assert!(
+            moves_plan(&st(tables(&[("shop", "orders")])), &a, 0).is_some()
+        );
+        assert!(moves_plan(&st(tables(&[("shop", "users")])), &a, 0).is_none());
+        // A rename names both sides: into the patterns moves the plan.
+        assert!(
+            moves_plan(
+                &st(tables(&[("shop", "tmp"), ("shop", "orders_v2")])),
+                &a,
+                0
+            )
+            .is_some()
+        );
+        assert!(moves_plan(&st(DdlEffect::None), &a, 0).is_none());
+        assert!(
+            moves_plan(
+                &st(DdlEffect::SameShape(vec![TableName {
+                    db: "shop".into(),
+                    table: "orders".into(),
+                }])),
+                &a,
+                0
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_statement_on_a_database_moves_the_plan_when_patterns_can_match_it() {
+        let db = |d: &str| {
+            st(DdlEffect::Barrier(BarrierScopeOf::Database(d.into())))
+        };
+        assert!(moves_plan(&db("shop"), &allow(&["shop.orders"]), 0).is_some());
+        assert!(
+            moves_plan(&db("audit"), &allow(&["shop.orders"]), 0).is_none()
+        );
+        // A pattern without a database matches tables of any database.
+        assert!(moves_plan(&db("audit"), &allow(&["orders"]), 0).is_some());
+        assert!(
+            moves_plan(
+                &st(DdlEffect::Barrier(BarrierScopeOf::Lineage)),
+                &allow(&["shop.orders"]),
+                0
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn names_are_compared_as_the_server_stores_them() {
+        let a = allow(&["shop.orders"]);
+        let mixed = st(tables(&[("Shop", "Orders")]));
+        // 0: case-sensitive, as written.
+        assert!(moves_plan(&mixed, &a, 0).is_none());
+        // 1: stored lower case.
+        assert!(moves_plan(&mixed, &a, 1).is_some());
+        let db =
+            st(DdlEffect::Barrier(BarrierScopeOf::Database("SHOP".into())));
+        assert!(moves_plan(&db, &a, 0).is_none());
+        assert!(moves_plan(&db, &a, 1).is_some());
+        // 2: not comparable with certainty, so any shape change counts.
+        let other = st(tables(&[("audit", "log")]));
+        assert!(moves_plan(&other, &a, 2).is_some());
+        assert!(moves_plan(&st(DdlEffect::None), &a, 2).is_none());
+    }
+}
+
+#[cfg(test)]
+mod live_anchor_tests {
+    //! The lock-free anchor on a throwaway MySQL 8.4, through a user without
+    //! `RELOAD`: nothing it does waits for, or holds back, other sessions;
+    //! its position precedes every worker's view; a statement that moves the
+    //! plan in (D0, E0] refuses the attempt.
+    use super::*;
+    use deltaforge_core::incident::ReasonCode;
+    use gate_ownership::GateOwned;
+    use mysql_async::prelude::Queryable;
+    use std::sync::atomic::Ordering;
+    use testcontainers::core::WaitFor;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+    use tokio::sync::OnceCell;
+
+    static SERVER: OnceCell<(ContainerAsync<GenericImage>, u16)> =
+        OnceCell::const_new();
+    const LINEAGE: &str = "anchor-lineage";
+
+    async fn port() -> u16 {
+        SERVER
+            .get_or_init(|| async {
+                let c = GenericImage::new("mysql", "8.4")
+                    .with_wait_for(WaitFor::message_on_stderr(
+                        "ready for connections. Version: '8.4",
+                    ))
+                    .with_env_var("MYSQL_ROOT_PASSWORD", "pw")
+                    .with_cmd([
+                        "--server-id=61",
+                        "--log-bin=mysql-bin",
+                        "--binlog-format=ROW",
+                        "--gtid-mode=ON",
+                        "--enforce-gtid-consistency=ON",
+                    ])
+                    .gate_owned()
+                    .start()
+                    .await
+                    .expect("start mysql");
+                let port = c.get_host_port_ipv4(3306).await.unwrap();
+                let mut admin = None;
+                for _ in 0..60 {
+                    if let Ok(a) = Conn::from_url(root(port)).await {
+                        admin = Some(a);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                let mut admin = admin.expect("mysql up");
+                for sql in [
+                    "CREATE USER 'anc'@'%' IDENTIFIED BY 'pw'",
+                    "GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* \
+                     TO 'anc'@'%'",
+                ] {
+                    admin.query_drop(sql).await.unwrap();
+                }
+                (c, port)
+            })
+            .await
+            .1
+    }
+
+    fn root(port: u16) -> String {
+        format!("mysql://root:pw@127.0.0.1:{port}/")
+    }
+
+    fn user(port: u16) -> String {
+        format!("mysql://anc:pw@127.0.0.1:{port}/")
+    }
+
+    async fn sql(port: u16, stmts: &[&str]) {
+        let mut c = Conn::from_url(root(port)).await.unwrap();
+        for s in stmts {
+            c.query_drop(*s)
+                .await
+                .unwrap_or_else(|e| panic!("{s}: {e}"));
+        }
+        c.disconnect().await.ok();
+    }
+
+    async fn uuid(port: u16) -> String {
+        let mut c = Conn::from_url(root(port)).await.unwrap();
         c.query_first("SELECT @@GLOBAL.server_uuid")
             .await
             .unwrap()
             .unwrap()
     }
 
-    #[tokio::test]
-    #[ignore = "requires a live MySQL (set MYSQL_IT_DSN)"]
-    async fn ftwrl_anchor_consistent_under_concurrent_writes() {
-        let Ok(dsn) = std::env::var("MYSQL_IT_DSN") else {
-            eprintln!("skip: MYSQL_IT_DSN unset");
-            return;
-        };
-        let opts = Opts::from_url(&dsn).unwrap();
-        let mut admin = Conn::new(opts.clone()).await.unwrap();
-        admin
-            .query_drop("DROP TABLE IF EXISTS anchor_seam")
-            .await
-            .unwrap();
-        admin
-            .query_drop(
-                "CREATE TABLE anchor_seam(\
-                 id BIGINT PRIMARY KEY AUTO_INCREMENT, v INT) ENGINE=InnoDB",
-            )
-            .await
-            .unwrap();
-        admin
-            .query_drop("INSERT INTO anchor_seam(v) VALUES (0),(0),(0),(0),(0)")
-            .await
-            .unwrap();
+    /// A database `db` with table `t`, and the anchor over `db.*`.
+    async fn prepare(port: u16, db: &str) {
+        sql(
+            port,
+            &[
+                &format!("DROP DATABASE IF EXISTS {db}"),
+                &format!("CREATE DATABASE {db}"),
+                &format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)"),
+                &format!("INSERT INTO {db}.t VALUES (1)"),
+            ],
+        )
+        .await;
+    }
 
-        // Concurrent writer hammering commits across the anchor setup window.
-        let writer_dsn = dsn.clone();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop2 = stop.clone();
-        let writer = tokio::spawn(async move {
-            let mut c = Conn::new(Opts::from_url(&writer_dsn).unwrap())
-                .await
-                .unwrap();
-            let mut n: u64 = 0;
-            while !stop2.load(Ordering::Relaxed) {
-                let _ =
-                    c.query_drop("INSERT INTO anchor_seam(v) VALUES (1)").await;
-                n += 1;
-            }
-            n
-        });
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // Establish the anchor while writes are in flight.
-        let (mut workers, position) = acquire_locked_anchor(
-            "test",
-            &dsn,
-            &live_uuid(&dsn).await,
-            4,
+    async fn anchor(
+        port: u16,
+        db: &str,
+        workers: usize,
+    ) -> Result<(Vec<CopyConn>, MySqlCheckpoint)> {
+        acquire_anchor(
+            "anchor-test",
+            &user(port),
+            &uuid(port).await,
+            LINEAGE,
+            &[format!("{db}.*")],
+            workers,
             Duration::from_secs(10),
-            PlanCheck::nothing(),
+            PlanCheck::nothing,
         )
         .await
-        .expect("acquire anchor");
+    }
 
-        // All worker snapshots must agree - one shared consistent view.
-        let mut counts = Vec::new();
+    /// A long read of a planned table neither delays the anchor nor is
+    /// waited for, and a write inside the anchor (between its plan
+    /// verification and its position) commits at once: no lock is held.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn the_anchor_neither_waits_for_nor_blocks_other_sessions() {
+        let port = port().await;
+        let db = "anc_nolock";
+        prepare(port, db).await;
+        let mut long = Conn::from_url(root(port)).await.unwrap();
+        let read = format!("SELECT SLEEP(10) FROM {db}.t");
+        let long = tokio::spawn(async move { long.query_drop(read).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        crate::snapshot_probe::run_after_plan_verified(
+            &root(port),
+            vec![format!("INSERT INTO {db}.t VALUES (2)")],
+            1,
+        );
+        let t = Instant::now();
+        let (workers, _) = anchor(port, db, 4).await.expect("anchor");
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "the anchor waited {:?} (for the long read?)",
+            t.elapsed()
+        );
+        assert_eq!(workers.len(), 4);
+        assert!(!long.is_finished(), "the long read was not held back");
+        long.abort();
+    }
+
+    /// The position precedes every worker's view: a commit before it is in
+    /// every view and in it; one after it (before the workers open) is in
+    /// the views but not in the position, so the stream sends it again (the
+    /// bounded overlap), never neither.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn the_position_precedes_every_workers_view() {
+        let port = port().await;
+        let db = "anc_overlap";
+        prepare(port, db).await;
+        crate::snapshot_probe::run_after_anchor_position(
+            &root(port),
+            vec![format!("INSERT INTO {db}.t VALUES (3)")],
+            1,
+        );
+        let (mut workers, e0) = anchor(port, db, 3).await.expect("anchor");
+        let mut c = Conn::from_url(root(port)).await.unwrap();
+        let after: String = c
+            .query_first("SELECT @@GLOBAL.gtid_executed")
+            .await
+            .unwrap()
+            .unwrap();
+        let e0 =
+            crate::gtid_set::GtidSet::parse(e0.gtid_set.as_deref().unwrap())
+                .unwrap();
+        let after = crate::gtid_set::GtidSet::parse(&after).unwrap();
+        assert!(!after.is_subset(&e0), "the overlap commit is after E0");
         for w in workers.iter_mut() {
-            let c: Option<u64> = w
-                .query_first("SELECT COUNT(*) FROM anchor_seam")
+            let ids: Vec<i32> = w
+                .query(format!("SELECT id FROM {db}.t ORDER BY id"))
                 .await
                 .unwrap();
-            counts.push(c.unwrap_or(0));
+            assert_eq!(ids, vec![1, 3], "the view holds E0 and the overlap");
         }
-        assert!(
-            counts.windows(2).all(|w| w[0] == w[1]),
-            "worker snapshots diverged under concurrent writes: {counts:?} - \
-             anchor is not a single consistent view"
-        );
-        let anchor_count = counts[0];
-        assert!(anchor_count >= 5, "baseline rows missing from anchor");
+    }
 
-        // A commit AFTER the anchor must NOT appear in the snapshot: clean cut.
-        admin
-            .query_drop("INSERT INTO anchor_seam(v) VALUES (99)")
+    /// A table created and dropped under the patterns in (D0, E0], unseen
+    /// by the verification, refuses the attempt; the next one succeeds.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn a_plan_moving_statement_refuses_the_attempt() {
+        let port = port().await;
+        let db = "anc_moved";
+        prepare(port, db).await;
+        crate::snapshot_probe::run_after_plan_verified(
+            &root(port),
+            vec![
+                format!("CREATE TABLE {db}.brief (id INT PRIMARY KEY)"),
+                format!("DROP TABLE {db}.brief"),
+            ],
+            1,
+        );
+        anchor(port, db, 1).await.expect("the retry anchors");
+        assert_eq!(LAST_ANCHOR_ATTEMPTS.load(Ordering::SeqCst), 2);
+    }
+
+    /// The same statements outside the patterns refuse nothing.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn a_statement_outside_the_patterns_refuses_nothing() {
+        let port = port().await;
+        let db = "anc_outside";
+        prepare(port, db).await;
+        sql(port, &["CREATE DATABASE IF NOT EXISTS anc_other"]).await;
+        crate::snapshot_probe::run_after_plan_verified(
+            &root(port),
+            vec![
+                "CREATE TABLE anc_other.brief (id INT PRIMARY KEY)".into(),
+                "DROP TABLE anc_other.brief".into(),
+            ],
+            1,
+        );
+        anchor(port, db, 1).await.expect("anchors");
+        assert_eq!(LAST_ANCHOR_ATTEMPTS.load(Ordering::SeqCst), 1);
+    }
+
+    /// Under concurrent writers (each row carries its own GTID number) and
+    /// a plan-moving statement now and then, 100 anchors: every row whose
+    /// GTID is in E0 is in every worker's view (none lost), the rest of a
+    /// view is the bounded overlap, and no write waits on an anchor.
+    #[tokio::test]
+    #[ignore = "requires docker"]
+    async fn anchors_under_load_never_lose_a_committed_row() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let port = port().await;
+        let db = "anc_load";
+        sql(
+            port,
+            &[
+                &format!("DROP DATABASE IF EXISTS {db}"),
+                &format!("CREATE DATABASE {db}"),
+                &format!("CREATE TABLE {db}.t (id BIGINT PRIMARY KEY)"),
+            ],
+        )
+        .await;
+        let server = uuid(port).await;
+        // Explicit GTIDs from a fresh UUID: row id = GTID number.
+        let tag = "aaaaaaaa-0000-4000-8000-000000000001";
+        let next = Arc::new(AtomicU64::new(1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut writers = Vec::new();
+        for _ in 0..4 {
+            let (next, stop) = (Arc::clone(&next), Arc::clone(&stop));
+            let mut c = Conn::from_url(root(port)).await.unwrap();
+            writers.push(tokio::spawn(async move {
+                let mut worst = Duration::ZERO;
+                while !stop.load(Ordering::Relaxed) {
+                    let n = next.fetch_add(1, Ordering::SeqCst);
+                    let t = Instant::now();
+                    c.query_drop(format!("SET GTID_NEXT = '{tag}:{n}'"))
+                        .await
+                        .unwrap();
+                    c.query_drop(format!("INSERT INTO {db}.t VALUES ({n})"))
+                        .await
+                        .unwrap();
+                    c.query_drop("SET GTID_NEXT = 'AUTOMATIC'").await.unwrap();
+                    worst = worst.max(t.elapsed());
+                }
+                worst
+            }));
+        }
+        let mover = {
+            let stop = Arc::clone(&stop);
+            let mut c = Conn::from_url(root(port)).await.unwrap();
+            tokio::spawn(async move {
+                let mut k = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    k += 1;
+                    c.query_drop(format!("CREATE TABLE {db}.m{k} (id INT)"))
+                        .await
+                        .unwrap();
+                    c.query_drop(format!("DROP TABLE {db}.m{k}"))
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                k
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let (mut overlaps, mut refused_attempts, mut anchor_time) =
+            (Vec::new(), 0u32, Duration::ZERO);
+        for _ in 0..100 {
+            let t = Instant::now();
+            let (mut workers, e0) = acquire_anchor(
+                "anchor-test",
+                &user(port),
+                &server,
+                LINEAGE,
+                &[format!("{db}.*")],
+                2,
+                Duration::from_secs(10),
+                PlanCheck::nothing,
+            )
             .await
+            .expect("anchor");
+            anchor_time = anchor_time.max(t.elapsed());
+            refused_attempts += LAST_ANCHOR_ATTEMPTS.load(Ordering::SeqCst) - 1;
+            let e0 = crate::gtid_set::GtidSet::parse(
+                e0.gtid_set.as_deref().unwrap(),
+            )
             .unwrap();
-        let after: Option<u64> = workers[0]
-            .query_first("SELECT COUNT(*) FROM anchor_seam")
-            .await
-            .unwrap();
-        assert_eq!(
-            after.unwrap_or(0),
-            anchor_count,
-            "post-anchor commit leaked into the snapshot view"
-        );
-
-        // GTID must be captured at the anchor (mandatory for resume).
-        assert!(
-            !position.gtid_set.as_deref().unwrap_or("").is_empty(),
-            "GTID set not captured at the anchor"
-        );
-
+            for w in workers.iter_mut() {
+                let ids: Vec<u64> =
+                    w.query(format!("SELECT id FROM {db}.t")).await.unwrap();
+                let seen: std::collections::HashSet<u64> =
+                    ids.iter().copied().collect();
+                let hi = next.load(Ordering::SeqCst);
+                let in_e0: Vec<u64> = (1..hi)
+                    .filter(|n| e0.contains(&format!("{tag}:{n}")))
+                    .collect();
+                let lost: Vec<&u64> =
+                    in_e0.iter().filter(|n| !seen.contains(n)).collect();
+                assert!(
+                    lost.is_empty(),
+                    "rows in E0 missing from a view: {lost:?}"
+                );
+                let overlap = ids
+                    .iter()
+                    .filter(|n| !e0.contains(&format!("{tag}:{n}")))
+                    .count();
+                overlaps.push(overlap);
+            }
+        }
         stop.store(true, Ordering::Relaxed);
-        let _ = writer.await;
-        for mut w in workers {
-            w.query_drop("ROLLBACK").await.ok();
+        let mut worst = Duration::ZERO;
+        for w in writers {
+            worst = worst.max(w.await.unwrap());
         }
-        admin
-            .query_drop("DROP TABLE IF EXISTS anchor_seam")
-            .await
-            .ok();
+        let moved = mover.await.unwrap();
+        overlaps.sort_unstable();
+        println!(
+            "anchors=100 rows={} moves={moved} refused_attempts={refused_attempts} \
+             overlap_rows p50={} p99={} max={} anchor_max_ms={} \
+             writer_worst_ms={}",
+            next.load(Ordering::SeqCst) - 1,
+            overlaps[overlaps.len() / 2],
+            overlaps[overlaps.len() * 99 / 100],
+            overlaps.last().unwrap(),
+            anchor_time.as_millis(),
+            worst.as_millis(),
+        );
+        assert!(
+            worst < Duration::from_millis(500),
+            "a write waited {worst:?} while anchors ran"
+        );
     }
 
-    /// Success path releases the global lock: after `acquire_locked_anchor`
-    /// returns, an external write is not blocked.
+    /// A plan kept moving refuses every attempt: at least three, for at
+    /// least 30 s, then the `mysql_snapshot_anchor_refused` incident.
     #[tokio::test]
-    #[ignore = "requires a live MySQL (set MYSQL_IT_DSN)"]
-    async fn acquire_releases_lock_on_success() {
-        let Ok(dsn) = std::env::var("MYSQL_IT_DSN") else {
-            eprintln!("skip: MYSQL_IT_DSN unset");
-            return;
-        };
-        let opts = Opts::from_url(&dsn).unwrap();
-        let mut admin = Conn::new(opts.clone()).await.unwrap();
-        admin
-            .query_drop("DROP TABLE IF EXISTS lock_rel")
-            .await
-            .unwrap();
-        admin
-            .query_drop(
-                "CREATE TABLE lock_rel(id INT PRIMARY KEY) ENGINE=InnoDB",
-            )
-            .await
-            .unwrap();
-
-        let (workers, _pos) = acquire_locked_anchor(
-            "test",
-            &dsn,
-            &live_uuid(&dsn).await,
-            2,
-            Duration::from_secs(10),
-            PlanCheck::nothing(),
-        )
-        .await
-        .expect("acquire");
-        drop(workers);
-
-        // An external write must complete promptly - the lock is gone.
-        let ins = tokio::time::timeout(
-            Duration::from_secs(3),
-            admin.query_drop("INSERT INTO lock_rel(id) VALUES (1)"),
-        )
-        .await;
-        assert!(
-            ins.is_ok(),
-            "write blocked after anchor success - lock leaked"
+    #[ignore = "requires docker"]
+    async fn a_plan_kept_moving_raises_the_incident() {
+        let port = port().await;
+        let db = "anc_storm";
+        prepare(port, db).await;
+        crate::snapshot_probe::run_after_plan_verified(
+            &root(port),
+            vec![format!("ALTER TABLE {db}.t COMMENT 'moved'")],
+            usize::MAX,
         );
-        admin.query_drop("DROP TABLE IF EXISTS lock_rel").await.ok();
-    }
-
-    /// Error/panic safety: the lock is held on a non-pooled connection, so simply
-    /// dropping that connection releases FTWRL server-side (this is the mechanism
-    /// that guarantees release on any early return, `?`, or panic).
-    #[tokio::test]
-    #[ignore = "requires a live MySQL (set MYSQL_IT_DSN)"]
-    async fn dropped_lock_conn_releases_ftwrl() {
-        let Ok(dsn) = std::env::var("MYSQL_IT_DSN") else {
-            eprintln!("skip: MYSQL_IT_DSN unset");
-            return;
-        };
-        let opts = Opts::from_url(&dsn).unwrap();
-        let mut lock_conn = Conn::new(opts.clone()).await.unwrap();
-        lock_conn
-            .query_drop("FLUSH TABLES WITH READ LOCK")
-            .await
-            .unwrap();
-
-        // While held, an external write blocks.
-        let mut writer = Conn::new(opts.clone()).await.unwrap();
-        let blocked = tokio::time::timeout(
-            Duration::from_secs(2),
-            writer.query_drop("CREATE TABLE lock_drop_probe(id INT)"),
-        )
-        .await;
-        assert!(blocked.is_err(), "write was not blocked while FTWRL held");
-
-        // Dropping the lock connection (no UNLOCK) must release the lock.
-        drop(lock_conn);
-
-        let unblocked = tokio::time::timeout(
-            Duration::from_secs(5),
-            writer.query_drop("CREATE TABLE lock_drop_probe(id INT)"),
-        )
-        .await;
-        assert!(
-            unblocked.is_ok(),
-            "lock not released after dropping the lock connection"
-        );
-        writer
-            .query_drop("DROP TABLE IF EXISTS lock_drop_probe")
-            .await
-            .ok();
-    }
-
-    /// Timeout path releases: when FTWRL cannot be acquired within the budget
-    /// (a conflicting table lock is held), `acquire_locked_anchor` fails and
-    /// leaves no lingering lock.
-    #[tokio::test]
-    #[ignore = "requires a live MySQL (set MYSQL_IT_DSN)"]
-    async fn acquire_times_out_and_releases_when_blocked() {
-        let Ok(dsn) = std::env::var("MYSQL_IT_DSN") else {
-            eprintln!("skip: MYSQL_IT_DSN unset");
-            return;
-        };
-        let opts = Opts::from_url(&dsn).unwrap();
-        let mut admin = Conn::new(opts.clone()).await.unwrap();
-        admin
-            .query_drop("DROP TABLE IF EXISTS lock_to")
-            .await
-            .unwrap();
-        admin
-            .query_drop(
-                "CREATE TABLE lock_to(id INT PRIMARY KEY) ENGINE=InnoDB",
-            )
-            .await
-            .unwrap();
-
-        // Blocker: hold a WRITE table lock so FTWRL must wait.
-        let mut blocker = Conn::new(opts.clone()).await.unwrap();
-        blocker
-            .query_drop("LOCK TABLES lock_to WRITE")
-            .await
-            .unwrap();
-
-        let started = Instant::now();
-        let res = acquire_locked_anchor(
-            "test",
-            &dsn,
-            &live_uuid(&dsn).await,
-            2,
-            Duration::from_secs(2),
-            PlanCheck::nothing(),
-        )
-        .await;
-        assert!(res.is_err(), "expected timeout while FTWRL was blocked");
-        assert!(
-            started.elapsed() < Duration::from_secs(15),
-            "acquire did not honor the timeout budget"
-        );
-
-        // Release the blocker; the anchor must now succeed (no lingering lock).
-        blocker.query_drop("UNLOCK TABLES").await.unwrap();
-        drop(blocker);
-        let (workers, _pos) = acquire_locked_anchor(
-            "test",
-            &dsn,
-            &live_uuid(&dsn).await,
-            2,
-            Duration::from_secs(10),
-            PlanCheck::nothing(),
-        )
-        .await
-        .expect("acquire after blocker released");
-        drop(workers);
-        admin.query_drop("DROP TABLE IF EXISTS lock_to").await.ok();
-    }
-
-    /// Managed-MySQL refusal: a user without the global RELOAD privilege cannot
-    /// FLUSH TABLES WITH READ LOCK, so preflight fails closed with a permission
-    /// error (no silent fallback to an unsafe anchor).
-    #[tokio::test]
-    #[ignore = "requires a live MySQL (set MYSQL_IT_DSN)"]
-    async fn managed_mysql_without_reload_fails_closed() {
-        let Ok(dsn) = std::env::var("MYSQL_IT_DSN") else {
-            eprintln!("skip: MYSQL_IT_DSN unset");
-            return;
-        };
-        let opts = Opts::from_url(&dsn).unwrap();
-        let mut admin = Conn::new(opts.clone()).await.unwrap();
-        // Fresh table + a limited user that intentionally lacks RELOAD.
-        admin
-            .query_drop("DROP TABLE IF EXISTS ltd_t")
-            .await
-            .unwrap();
-        admin
-            .query_drop("CREATE TABLE ltd_t(id INT PRIMARY KEY) ENGINE=InnoDB")
-            .await
-            .unwrap();
-        admin.query_drop("DROP USER IF EXISTS 'ltd'@'%'").await.ok();
-        admin
-            .query_drop("CREATE USER 'ltd'@'%' IDENTIFIED BY 'ltd'")
-            .await
-            .unwrap();
-        admin
-            .query_drop(
-                "GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* \
-                 TO 'ltd'@'%'",
-            )
-            .await
-            .unwrap();
-        admin.query_drop("FLUSH PRIVILEGES").await.ok();
-
-        // Build the limited-user DSN by swapping credentials.
-        let base = dsn.split('@').nth(1).unwrap();
-        let ltd_dsn = format!("mysql://ltd:ltd@{base}");
-
-        let report = health::run_preflight(
-            &ltd_dsn,
-            &[("seam".to_string(), "ltd_t".to_string())],
-            4,
-        )
-        .await
-        .expect("preflight runs");
-        assert!(
-            report.permission_error,
-            "expected a permission (RELOAD) hard error for a no-RELOAD user"
-        );
-        assert!(
-            report.hard_errors.iter().any(|e| e.contains("RELOAD")),
-            "hard errors should name RELOAD: {:?}",
-            report.hard_errors
-        );
-
-        // A full-privilege user (root) passes the RELOAD gate.
-        let root_report = health::run_preflight(
-            &dsn,
-            &[("seam".to_string(), "ltd_t".to_string())],
-            4,
-        )
-        .await
-        .expect("preflight runs");
-        assert!(
-            !root_report.permission_error,
-            "root should hold RELOAD: {:?}",
-            root_report.hard_errors
-        );
-
-        admin.query_drop("DROP USER IF EXISTS 'ltd'@'%'").await.ok();
-        admin.query_drop("DROP TABLE IF EXISTS ltd_t").await.ok();
+        let t = Instant::now();
+        let err = anchor(port, db, 1).await.err().expect("refused");
+        crate::snapshot_probe::run_after_plan_verified(&root(port), vec![], 0);
+        assert!(t.elapsed() >= ANCHOR_REFUSED_FOR, "{:?}", t.elapsed());
+        let err = err.downcast::<deltaforge_core::SourceError>().unwrap();
+        let draft = err.draft().expect("an incident");
+        assert_eq!(draft.reason_code, ReasonCode::MysqlSnapshotAnchorRefused);
+        assert!(format!("{err:#}").contains("snapshot_plan_ddl"), "{err:#}");
     }
 }

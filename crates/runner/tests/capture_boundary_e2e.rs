@@ -282,7 +282,7 @@ async fn mysql_user(port: u16, user: &str, log_status: bool) {
     let mut sql = vec![
         format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'pw'"),
         format!(
-            "GRANT REPLICATION SLAVE, REPLICATION CLIENT, RELOAD ON *.* TO '{user}'@'%'"
+            "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{user}'@'%'"
         ),
         format!("GRANT SELECT ON shop.* TO '{user}'@'%'"),
     ];

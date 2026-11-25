@@ -33,7 +33,7 @@ binlog_row_metadata = FULL  -- Recommended: decodes rows across unobserved schem
 
 If `binlog_row_image` is not `FULL`, DeltaForge will warn at startup and before-images on UPDATE/DELETE events may be incomplete. For `binlog_row_metadata`, see [Schema Tracking](#schema-tracking).
 
-**Initial-snapshot requirements.** When a snapshot runs (`snapshot.mode` = `initial` or `always`), DeltaForge fails closed at preflight unless: `binlog_format = ROW`, every snapshotted table uses the **InnoDB** storage engine, and the user holds the global **RELOAD** privilege (see [Snapshot](#snapshot-initial-load)). These are checked only when a snapshot actually runs; a CDC-only pipeline (`snapshot.mode = never`) is never rejected for them.
+**Initial-snapshot requirements.** When a snapshot runs (`snapshot.mode` = `initial` or `always`), DeltaForge fails closed at preflight unless: `binlog_format = ROW`, and every snapshotted table uses the **InnoDB** storage engine (see [Snapshot](#snapshot-initial-load)). No `RELOAD` privilege is needed. These are checked only when a snapshot actually runs; a CDC-only pipeline (`snapshot.mode = never`) is never rejected for them.
 
 ### User Privileges
 
@@ -52,17 +52,13 @@ GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'deltaforge'@'%';
 GRANT BACKUP_ADMIN ON *.* TO 'deltaforge'@'%';
 GRANT SELECT ON performance_schema.log_status TO 'deltaforge'@'%';
 
--- Global RELOAD (required only when the initial snapshot runs; used for the
--- brief FLUSH TABLES WITH READ LOCK that brackets the consistent anchor)
-GRANT RELOAD ON *.* TO 'deltaforge'@'%';
-
 -- Schema introspection (required for table discovery)
 GRANT SELECT, SHOW VIEW ON your_database.* TO 'deltaforge'@'%';
 
 FLUSH PRIVILEGES;
 ```
 
-For capturing all databases, grant `SELECT` on `*.*` instead. `RELOAD` is only required if the pipeline will run an initial snapshot; a CDC-only pipeline (`snapshot.mode = never`) does not need it.
+For capturing all databases, grant `SELECT` on `*.*` instead. No `RELOAD` is needed: neither the snapshot nor the change stream takes a lock on the server.
 
 ## Configuration
 
@@ -307,46 +303,58 @@ tables without manual backfills.
 
 ### How it works
 
-DeltaForge establishes a single consistent anchor under a **brief** global read
-lock. It holds `FLUSH TABLES WITH READ LOCK` on a dedicated connection only while
-it opens a bounded pool of `REPEATABLE READ` `START TRANSACTION WITH CONSISTENT
-SNAPSHOT` workers and captures the binlog position + GTID set, then releases the
-lock. Because no transaction can commit while the lock is held, every worker
-shares one consistent view that matches the captured position exactly - so a row
-committed during snapshot setup is never lost from both the snapshot and the CDC
-stream. Workers then read in parallel (bounded by `max_parallel_tables`), each
-reading its tables under its single snapshot and committing once.
+DeltaForge takes the snapshot's anchor **without any lock on the server**:
 
-The lock window is bounded by `snapshot.lock_timeout_secs` (default 10s); if the
-lock cannot be acquired in time, the snapshot fails closed rather than stalling
-writes. The lock is always released - the dedicated lock connection is dropped on
-any error, panic, or timeout, which releases it server-side.
+1. It reads the server status (D0), re-reads the planned tables and their
+   definitions from the catalog, and reads the status again (E0). E0 is the
+   anchor: the stream continues from its GTID set.
+2. It opens a bounded pool of `REPEATABLE READ` `START TRANSACTION WITH
+   CONSISTENT SNAPSHOT` workers at once (bounded by `max_parallel_tables`).
+   Every worker's view holds every transaction in E0: a GTID enters the
+   executed set only after the transaction is committed.
+3. One scan of the binlog over (D0, E0] proves that no statement changed the
+   tables the plan depends on while the catalog was read: a table the
+   patterns match created, dropped, renamed or altered, a statement on a
+   database they can match, or one no table can be attributed to. If one
+   did, the workers are closed and the anchor is taken again; after at least
+   three attempts and 30 s it stops with a `mysql_snapshot_anchor_refused`
+   incident, before any row.
 
-> **Correctness note.** This closes a real initial-snapshot data-loss window in
-> earlier versions, where per-worker snapshots were opened independently and the
-> position was captured afterward, so a change committed during snapshot setup
-> could be absent from both the snapshot and the CDC stream.
+Workers then read in parallel, each reading its tables under its single
+snapshot and committing once.
+
+**A bounded overlap, never a loss.** A transaction committed after E0, while
+the workers open (milliseconds), may already be in a worker's view: its rows
+are then in the snapshot and its changes in the stream again, at later
+positions. Current-state sinks converge by source position; append-only sinks
+receive those changes twice. A transaction no view holds is after E0 and is
+streamed. This is the same at-least-once overlap as the PostgreSQL anchor.
+
+A DDL of a planned table after the anchor makes its worker's read fail
+(`Table definition has changed`, or the table is gone); the generation is
+lost and copied again in full at the next start. No row of the changed table
+is published.
+
+Opening the workers is bounded by `snapshot.anchor_timeout_secs` (default
+10 s; `lock_timeout_secs` is the earlier name, still accepted).
 
 **Requirements (fail closed at preflight when a snapshot runs):** `gtid_mode =
-ON`, `binlog_format = ROW`, all snapshotted tables **InnoDB**, and the global
-**RELOAD** privilege.
+ON`, `binlog_format = ROW`, and all snapshotted tables **InnoDB**. No `RELOAD`
+privilege: the snapshot runs on managed MySQL (RDS, Aurora and similar) as
+on any server.
 
-**Managed MySQL (RDS/Aurora and similar).** Where `FLUSH TABLES WITH READ LOCK`
-is unavailable (RELOAD restricted), the snapshot **fails closed** with a typed
-permission error - DeltaForge does **not** silently fall back to an unsafe
-anchor. Remediation:
-
-- grant the global `RELOAD` privilege if your provider allows it; or
-- run without an initial load by setting `snapshot.mode = never` to stream only
-  changes from the current position (this is **not** a complete initial load); or
-- perform the initial load out of band (e.g. a provider snapshot/dump) and start
-  DeltaForge in `never` mode.
+**Long copies hold back purge.** A worker keeps its read view for its whole
+bucket of tables, so InnoDB keeps the old row versions every other write
+creates meanwhile. Measured on MySQL 8.4 copying a 20,000,000-row table
+(298 s) while another table took about 20,000 row updates per second: the
+history list grew from about 370 to 27,743, and an index scan of the updated
+table went from 14 ms to 146 ms (p50) until the copy ended; it recovered
+within two minutes. Snapshot large tables when the server can afford it.
 
 ### Additional privileges
 ```sql
--- Required for snapshot: SELECT (introspection + reads) and global RELOAD.
+-- Required for snapshot: SELECT (introspection and reads).
 GRANT SELECT ON your_database.* TO 'deltaforge'@'%';
-GRANT RELOAD ON *.* TO 'deltaforge'@'%';
 ```
 
 ### Configuration
@@ -360,16 +368,18 @@ source:
       - shop.orders
     snapshot:
       mode: initial           # initial | always | never (default: never)
-      max_parallel_tables: 8  # tables snapshotted concurrently (also caps workers under the lock)
+      strategy: anchor        # how the snapshot meets the stream (anchor only)
+      max_parallel_tables: 8  # tables snapshotted concurrently (also the workers opened at the anchor)
       chunk_size: 10000       # rows per chunk for integer-PK tables
-      lock_timeout_secs: 10   # bound on the brief FLUSH TABLES WITH READ LOCK setup window
+      anchor_timeout_secs: 10 # bound on opening the workers' snapshots at the anchor
 ```
 
 | Field | Default | Description |
 |-------|---------|-------------|
 | `mode` | `never` | `initial`: run once if no checkpoint exists; `always`: re-snapshot on every restart; `never`: skip |
-| `max_parallel_tables` | `8` | Tables snapshotted concurrently; also bounds the worker connections opened under the read lock |
-| `lock_timeout_secs` | `10` | Upper bound on acquiring the consistent-anchor lock; the snapshot fails closed if exceeded |
+| `strategy` | `anchor` | How the snapshot meets the change stream: `anchor`, one position the stream continues from (the only strategy) |
+| `max_parallel_tables` | `8` | Tables snapshotted concurrently; also the worker connections opened at the anchor |
+| `anchor_timeout_secs` | `10` | Upper bound on opening the workers' consistent snapshots at the anchor; the snapshot fails closed if exceeded. `lock_timeout_secs` is the earlier name, still accepted |
 | `chunk_size` | `10000` | Rows per range chunk (integer single-column PK tables only; others do a full scan) |
 | `discovery_page_size` | `1000` | Tables read per catalog query during discovery; also the most plan entries held in memory |
 | `max_snapshot_connections` | `max_parallel_tables x max_parallel_chunks + 2` | This source's share of the process-wide snapshot connection cap (`--max-snapshot-connections`, default 64) |

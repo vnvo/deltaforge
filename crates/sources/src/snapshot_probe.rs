@@ -19,11 +19,12 @@ pub enum FixedOp {
     LineageCapture,
     GenerationAllocation,
     Preflight,
-    /// The consistent anchor (PostgreSQL exported snapshot, MySQL read lock).
+    /// The consistent anchor (PostgreSQL exported snapshot, MySQL position
+    /// and worker snapshots).
     Anchor,
     /// MySQL: the `binlog_row_image` check.
     RowImageCheck,
-    /// MySQL: the re-discovery under the anchor's read lock.
+    /// MySQL: the anchor's live re-discovery of the plan.
     CatalogVerification,
 }
 
@@ -84,7 +85,7 @@ pub struct SnapshotShape {
     pub max_table_tasks: u64,
     /// Fixed operations, by [`FixedOp`] (identical for any table count).
     pub fixed: [u64; FIXED_OPS],
-    /// MySQL: catalog pages read again under the anchor's read lock.
+    /// MySQL: catalog pages read again by the anchor.
     pub verification_queries: u64,
     /// Schema-registry reads during preparation (one per table at most).
     pub registry_reads: u64,
@@ -304,7 +305,7 @@ static BEFORE_ANCHOR: Mutex<Option<(Arc<Notify>, Arc<Notify>)>> =
 
 /// Arm a one-shot hold in the real snapshot path: the next snapshot run
 /// notifies `reached` after preparation, right before its consistent anchor
-/// (PostgreSQL exported snapshot, MySQL read lock), then waits for
+/// (PostgreSQL exported snapshot, MySQL anchor), then waits for
 /// `release`. Test seam: lets a test change a prepared table's schema.
 pub fn hold_before_anchor() -> (Arc<Notify>, Arc<Notify>) {
     let gate = (Arc::new(Notify::new()), Arc::new(Notify::new()));
@@ -319,6 +320,70 @@ pub(crate) async fn before_anchor() {
         reached.notify_one();
         release.notified().await;
     }
+}
+
+/// Statements a test runs, on their own connection to a DSN, at a MySQL
+/// anchor point, for the next `times` anchor attempts.
+type AnchorStatements = Option<(String, Vec<String>, usize)>;
+
+static AFTER_PLAN_VERIFIED: Mutex<AnchorStatements> = Mutex::new(None);
+static AFTER_ANCHOR_POSITION: Mutex<AnchorStatements> = Mutex::new(None);
+
+/// Arm statements for the MySQL anchor's next `times` attempts, right after
+/// its live plan verification and before its position E0. Test seam: lands
+/// a change the verification cannot see inside (D0, E0].
+pub fn run_after_plan_verified(
+    dsn: &str,
+    statements: Vec<String>,
+    times: usize,
+) {
+    *AFTER_PLAN_VERIFIED.lock().expect("anchor statements") =
+        Some((dsn.to_string(), statements, times));
+}
+
+/// Arm statements for the MySQL anchor's next `times` attempts, right after
+/// its position E0 and before its workers open. Test seam: commits inside
+/// the bounded overlap.
+pub fn run_after_anchor_position(
+    dsn: &str,
+    statements: Vec<String>,
+    times: usize,
+) {
+    *AFTER_ANCHOR_POSITION.lock().expect("anchor statements") =
+        Some((dsn.to_string(), statements, times));
+}
+
+async fn run_armed(slot: &Mutex<AnchorStatements>) {
+    let armed = {
+        let mut g = slot.lock().expect("anchor statements");
+        match g.as_mut() {
+            Some((dsn, statements, times)) if *times > 0 => {
+                *times -= 1;
+                Some((dsn.clone(), statements.clone()))
+            }
+            _ => None,
+        }
+    };
+    if let Some((dsn, statements)) = armed {
+        use mysql_async::prelude::Queryable;
+        let mut c = mysql_async::Conn::from_url(dsn.as_str())
+            .await
+            .expect("anchor statements connection");
+        for st in &statements {
+            c.query_drop(st).await.expect("anchor statement");
+        }
+        c.disconnect().await.ok();
+    }
+}
+
+/// The point after the anchor's plan verification; a no-op unless armed.
+pub(crate) async fn after_plan_verified() {
+    run_armed(&AFTER_PLAN_VERIFIED).await;
+}
+
+/// The point after the anchor's position E0; a no-op unless armed.
+pub(crate) async fn after_anchor_position() {
+    run_armed(&AFTER_ANCHOR_POSITION).await;
 }
 
 /// A point of the authorized slot recreation at a generation start

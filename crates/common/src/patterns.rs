@@ -118,6 +118,26 @@ impl AllowList {
         })
     }
 
+    /// Whether some name under `qualifier` could match: every pattern
+    /// without a qualifier, or one whose qualifier matches. An empty allow
+    /// list matches everything.
+    ///
+    /// ```
+    /// use common::AllowList;
+    ///
+    /// let list = AllowList::new(&["shop.orders".to_string(), "audit".to_string()]);
+    /// assert!(list.may_match_qualifier("shop"));
+    /// assert!(list.may_match_qualifier("other")); // `audit` has no qualifier
+    /// assert!(!AllowList::new(&["shop.%".to_string()]).may_match_qualifier("other"));
+    /// ```
+    pub fn may_match_qualifier(&self, qualifier: &str) -> bool {
+        self.items.is_empty()
+            || self.items.iter().any(|(q, _)| {
+                q.as_ref()
+                    .is_none_or(|q| Self::pattern_matches_single(q, qualifier))
+            })
+    }
+
     /// Check if a full name (without qualifier) matches.
     ///
     /// This is useful when the source doesn't have hierarchical naming.
