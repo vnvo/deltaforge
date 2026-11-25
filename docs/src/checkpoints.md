@@ -36,7 +36,7 @@ Tracks binlog position:
 ```
 file:     binlog.000042
 pos:      12345
-gtid_set: (optional, if GTID replication is enabled)
+gtid_set: (the executed GTID set; GTID mode is required)
 ```
 
 ### PostgreSQL
@@ -87,7 +87,7 @@ GTID checkpoint without `gtid_format: 2` does not load, older MySQL GTID
 durable watermarks (before version 3) are incomparable, and older
 activation records and failover anchors are refused. The source stops with
 an error naming the cause. Configure it under a new source id to start it
-again with a snapshot. File/position checkpoints are unaffected.
+again with a snapshot.
 
 ### Best Practices
 

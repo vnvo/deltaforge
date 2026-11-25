@@ -150,6 +150,6 @@ Use `halt` when your failover environments do not guarantee DDL sync to replicas
 
 For clean automatic failover:
 
-- **MySQL**: GTID mode must be enabled (`gtid_mode=ON`, `enforce_gtid_consistency=ON`). Without GTID, DeltaForge falls back to file/position coordinates which are meaningless across servers.
+- **MySQL**: GTID mode (`gtid_mode=ON`, `enforce_gtid_consistency=ON`), which every MySQL source requires: the GTID set is what DeltaForge continues from on another server.
 - **PostgreSQL**: continuation on another cluster is not supported (it is refused). After a promotion of a physical standby the source continues only when [promotion continuity](#postgresql-promotion-continuity) is proven, which needs PostgreSQL 17 synchronized failover slots.
 - **MySQL**: the CDC user must exist on B with the same privileges as on A.
