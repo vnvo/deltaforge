@@ -2009,6 +2009,8 @@ pub(crate) async fn capture_with(
         if let Some(hook) = between {
             hook().await;
         }
+        #[cfg(test)]
+        between_next().await;
         let position = read_capture_end(
             &mut conn,
             lineage_hash,
@@ -2251,6 +2253,26 @@ fn source_statement_error(
 pub(crate) static STARVE_NEXT: std::sync::Mutex<
     Option<(super::mysql_control::ControlPool, Duration)>,
 > = std::sync::Mutex::new(None);
+
+/// Test-only: the next single-table capture runs these statements (on its
+/// own connection to this DSN) between its schema reads and its end, as a
+/// `between` hook does, on paths that pass none (the lazy baseline).
+#[cfg(test)]
+pub(crate) static BETWEEN_NEXT: std::sync::Mutex<
+    Option<(String, Vec<String>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+async fn between_next() {
+    let next = BETWEEN_NEXT.lock().unwrap().take();
+    if let Some((dsn, stmts)) = next {
+        let mut c = mysql_async::Conn::from_url(dsn.as_str()).await.unwrap();
+        for s in &stmts {
+            c.query_drop(s).await.unwrap();
+        }
+        c.disconnect().await.ok();
+    }
+}
 
 /// The pool a capture draws on, and its wait: the run's, within what its
 /// budget leaves.

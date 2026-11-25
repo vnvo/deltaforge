@@ -1774,6 +1774,68 @@ mod tests {
             assert_eq!(st.ckpt.get_raw(db).await.unwrap().unwrap(), committed);
         }
 
+        /// A DDL of the table its lazy baseline's capture could not see (it
+        /// lands between the schema reads and the end, outside the visible
+        /// bound) leaves the shape read the table's shape until that DDL:
+        /// the baseline ends at A, the rows before the DDL are delivered, and
+        /// the stream then proves the DDL itself. The lazy baseline is the
+        /// proof of a table a window could not take: one transaction (here
+        /// compressed, one event) touching more new tables than it has room
+        /// for.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_ddl_its_lazy_capture_could_not_see_still_admits_the_rows() {
+            reset_hooks();
+            let port = server(true).await;
+            let db = "base_unseen";
+            prepare(port, db, &["a", "t"]).await;
+            let (a, t) = (format!("{db}.a"), format!("{db}.t"));
+            let st = state().await;
+            crate::mysql::mysql_activation_window::BATCH_TABLES
+                .store(1, std::sync::atomic::Ordering::SeqCst);
+            // t's capture sees a DDL of t land after its schema reads.
+            *crate::mysql::mysql_binlog_scan::BETWEEN_NEXT
+                .lock()
+                .unwrap() = Some((
+                dsn(port, ""),
+                vec![format!("ALTER TABLE {t} ADD COLUMN x INT")],
+            ));
+            let (rows, res) = run(
+                &st,
+                port,
+                db,
+                &[&a, &t],
+                SnapshotMode::Never,
+                &[
+                    "SET SESSION binlog_transaction_compression = ON".into(),
+                    "BEGIN".into(),
+                    format!("INSERT INTO {a} VALUES (1, 1)"),
+                    format!("INSERT INTO {t} VALUES (2, 2)"),
+                    "COMMIT".into(),
+                ],
+            )
+            .await;
+            let ran = crate::mysql::mysql_binlog_scan::BETWEEN_NEXT
+                .lock()
+                .unwrap()
+                .is_none();
+            reset_hooks();
+            assert!(ran, "t's lazy capture ran the DDL");
+            res.unwrap();
+            let two = deltaforge_core::canonical::fixture::value(
+                &serde_json::json!(2),
+            );
+            let row = rows
+                .iter()
+                .find(|e| e.source.table == "t")
+                .expect("t's row before the DDL is delivered");
+            assert_eq!(row.after.as_ref().unwrap().get("id"), Some(&two));
+            assert!(row.after.as_ref().unwrap().get("x").is_none());
+            assert_eq!(rows.len(), 2, "a's row and t's");
+            let (table, _) = timeline(&st, db, "t").await;
+            assert_eq!(baselines(&table).len(), 1, "{table:?}");
+        }
+
         /// A saturated control plane for the next capture: a runner budget
         /// whose only ordinary permit another source holds (released by
         /// dropping what is returned); the capture waits at most 1 s.
@@ -1967,6 +2029,11 @@ mod tests {
             super::super::hooks::CHUNKS.store(0, SeqCst);
             *super::super::hooks::BEFORE_COMMIT.lock().unwrap() = None;
             crate::stream_probe::set_window_caps(None);
+            *crate::mysql::mysql_binlog_scan::BETWEEN_NEXT
+                .lock()
+                .unwrap() = None;
+            crate::mysql::mysql_activation_window::BATCH_TABLES
+                .store(0, SeqCst);
         }
 
         /// One baseline per table, each at the anchor and binding its

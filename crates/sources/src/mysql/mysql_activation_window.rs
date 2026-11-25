@@ -11,9 +11,9 @@
 //! event or byte bound, a statement that can change a schema (any query
 //! other than transaction control), or a heartbeat (the stream is idle).
 //!
-//! Then one batched capture locks every batch table's metadata in sorted
-//! order and reads all their shapes between two positions; `B` is the
-//! second. One request on the shared proof scanner answers every table over
+//! Then one batched capture reads every batch table's shape between two
+//! positions, holding no lock (`mysql_binlog_scan`, module docs); `B` is
+//! the second. One request on the shared proof scanner answers every table over
 //! its own `(A_i, B]`. Each table's capture and answer are kept as its
 //! prepared proof, which the lazy baseline of its rows consumes in place of
 //! a capture and a scan of its own ([`super::mysql_baseline::establish_at`]):
@@ -25,8 +25,9 @@
 //!
 //! Outcomes are all or nothing and bounded: at most
 //! [`CAPTURE_ATTEMPTS`] batched captures per window, never a per-table
-//! capture; a capture that cannot lock fails the window closed with a
-//! `mysql_capture_contention` incident, and a failed shared extension fails
+//! capture; a capture whose end stays unexecuted past its wait (or that
+//! the server refuses as a deadlock or a lock wait timeout) fails the
+//! window closed with a `mysql_capture_contention` incident, and a failed shared extension fails
 //! it closed with the scanner's error. Either way nothing of the window is
 //! dispatched and the checkpoint stays at the boundary before it.
 
@@ -2559,7 +2560,7 @@ async fn admit(
         if !super::mysql_selection::unproven_at(ctx, &k.0, &k.1, &row).await? {
             continue;
         }
-        if batch.len() >= MAX_BATCH_TABLES {
+        if batch.len() >= batch_tables() {
             warn!(source_id = %ctx.source_id, db = %k.0, table = %k.1, "activation window full: the table is proved on its own");
             metrics::counter!(
                 "deltaforge_mysql_activation_window_overflow_total",
@@ -2586,13 +2587,32 @@ async fn admit(
     Ok(window_full(batch.len(), fill.as_ref()))
 }
 
+/// Test-only: the window's table cap in place of [`MAX_BATCH_TABLES`]
+/// (0: that one), so a transaction can touch more new tables than a window
+/// takes.
+#[cfg(test)]
+pub(crate) static BATCH_TABLES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The window's table cap: [`MAX_BATCH_TABLES`].
+fn batch_tables() -> usize {
+    #[cfg(test)]
+    {
+        let n = BATCH_TABLES.load(std::sync::atomic::Ordering::SeqCst);
+        if n > 0 {
+            return n;
+        }
+    }
+    MAX_BATCH_TABLES
+}
+
 /// Why a window being read ahead is full, if it is: its table cap, or its
 /// plan budget before capture (`mysql_window_budget::Fill`).
 pub(crate) fn window_full(
     tables: usize,
     fill: Option<&Fill>,
 ) -> Option<&'static str> {
-    if tables >= MAX_BATCH_TABLES {
+    if tables >= batch_tables() {
         Some("tables")
     } else if fill.is_some_and(Fill::full) {
         Some("budget")
@@ -4147,7 +4167,7 @@ mod tests {
         }
     }
 
-    /// Exhausted lock attempts are the contention incident and saturation
+    /// Exhausted capture attempts are the contention incident and saturation
     /// the saturation incident; other failures keep their connection or
     /// schema class (never an incident).
     #[test]
@@ -4162,10 +4182,10 @@ mod tests {
             snapshot_chain: None,
         };
         let fail = |e| capture_failure("s", &tables, 3, &at, e);
-        for code in [1205, 1213] {
+        for code in [0, 1205, 1213] {
             let e = fail(BatchCaptureError::Contention {
                 code,
-                why: "lock".into(),
+                why: "contention".into(),
             });
             assert_eq!(
                 e.draft().map(|d| d.reason_code),
