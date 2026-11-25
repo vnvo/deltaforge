@@ -1,10 +1,10 @@
 # Initial Snapshots
 
-An initial snapshot copies the existing rows of every captured table, then hands over to the change stream at a single anchor. This page covers what PostgreSQL and MySQL share: generations, restarts, completion under the commit policy, bounds and blocking, connection limits, the upgrade from earlier releases, and measured scale. The engine-specific mechanics (anchors, locks, privileges) are on the [MySQL](sources/mysql.md#snapshot-initial-load) and [PostgreSQL](sources/postgres.md#snapshot-initial-load) pages.
+An initial snapshot copies the existing rows of every captured table, then hands over to the change stream at a single anchor. This page covers what PostgreSQL and MySQL share: generations, restarts, completion under the commit policy, bounds and blocking, connection limits, the upgrade from earlier releases, and measured scale. The engine-specific mechanics (anchors, overlaps, privileges) are on the [MySQL](sources/mysql.md#snapshot-initial-load) and [PostgreSQL](sources/postgres.md#snapshot-initial-load) pages.
 
 ## Generations
 
-Each snapshot is a **generation**: one complete copy of one sealed table plan, read in one database read view and anchored at one stream position.
+Each snapshot is a **generation**: one complete copy of one sealed table plan, read in database read views opened at its anchor, one stream position.
 
 - The source discovers its tables in catalog pages and writes each table to a durable plan in the state store. The plan is sealed at the anchor and never changes.
 - Before any row of a generation is published, every sink of the pipeline moves its own checkpoint into that generation (the **start barrier**). Every sink must accept, including optional ones. A sink that is unavailable, or whose stored position cannot move into the generation (another snapshot chain, a later generation, an unknown format), fails the start: the pipeline stops, and each later start tries again with a new generation.

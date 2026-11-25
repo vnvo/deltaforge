@@ -248,6 +248,46 @@ pub(crate) fn mysql_timeline_too_large(
     )
 }
 
+/// A MySQL snapshot anchor refused on every attempt for its whole bound
+/// (`mysql_snapshot::acquire_anchor`): each time, a statement that can
+/// change the plan ran between the anchor's two reads. No row was read, no
+/// lock was taken; `at` is the last attempt's anchor position.
+pub(crate) fn mysql_snapshot_anchor_refused(
+    source_id: &str,
+    attempts: u32,
+    moved: &str,
+    at: &crate::mysql::MySqlCheckpoint,
+) -> SourceError {
+    let position = window_position(at);
+    let draft = IncidentDraft::new(
+        ReasonCode::MysqlSnapshotAnchorRefused,
+        Component::Source {
+            id: source_id.to_string(),
+        },
+        Retryability::AutoRetry,
+        SafetyState::HaltedSafe,
+        CauseCode::SourceSchema,
+    )
+    .with_evidence(|e| {
+        e.text(K::SourceId, source_id)
+            .count(K::Attempts, u64::from(attempts))
+            .text(K::ReasonClass, "snapshot_plan_ddl")
+            .text(K::SchemaChange, moved)
+            .text(K::CheckpointPosition, &position);
+    })
+    .with_actions(&[ActionCode::InspectLogs]);
+    SourceError::incident(
+        draft,
+        SourceError::Schema {
+            details: format!(
+                "the snapshot anchor was refused {attempts} time(s) \
+                 (snapshot_plan_ddl): {moved} ran while it was taken"
+            )
+            .into(),
+        },
+    )
+}
+
 /// The checkpoint position a window stays before, as evidence text.
 /// What a `mysql_forward_proof_unavailable` incident says
 /// (`docs/design/mysql-forward-proof-retry.md`, section 3.8).

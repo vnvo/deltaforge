@@ -124,11 +124,16 @@ pub enum ReasonCode {
     /// before the DDL is emitted or checkpointed (operator action), as it
     /// does at once for an authentication or authorization failure.
     MysqlForwardProofUnavailable,
+    /// A MySQL snapshot's anchor kept being refused: a statement that can
+    /// change the snapshot's plan ran while each attempt was taken. Retried
+    /// for at least 30 s; then the source stops before any row (auto
+    /// retry on restart).
+    MysqlSnapshotAnchorRefused,
 }
 
 impl ReasonCode {
     /// Every reason (bounded metric label values).
-    pub const ALL: [ReasonCode; 31] = [
+    pub const ALL: [ReasonCode; 32] = [
         Self::PgDifferentCluster,
         Self::PgContinuityUnproven,
         Self::PgFailoverSlotUnavailable,
@@ -160,6 +165,7 @@ impl ReasonCode {
         Self::MysqlControlPlaneSaturated,
         Self::MysqlTimelineTooLarge,
         Self::MysqlForwardProofUnavailable,
+        Self::MysqlSnapshotAnchorRefused,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -203,6 +209,7 @@ impl ReasonCode {
             Self::MysqlForwardProofUnavailable => {
                 "mysql_forward_proof_unavailable"
             }
+            Self::MysqlSnapshotAnchorRefused => "mysql_snapshot_anchor_refused",
         }
     }
 }
@@ -981,6 +988,14 @@ pub fn explain(
             ev.show(K::Attempts),
             ev.show(K::ReasonClass),
             ev.show(K::CheckpointPosition),
+        ),
+        ReasonCode::MysqlSnapshotAnchorRefused => format!(
+            "{component} could not anchor its snapshot: {} attempt(s) were \
+             refused ({}; last: {}). No row was read and no lock was taken on \
+             the source; a restart takes the anchor again.",
+            ev.show(K::Attempts),
+            ev.show(K::ReasonClass),
+            ev.show(K::SchemaChange),
         ),
         ReasonCode::SchemaDriftBlocked => format!(
             "{component} stopped on a schema change of table {} ({}) under \

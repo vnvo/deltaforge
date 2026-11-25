@@ -871,14 +871,8 @@ impl MySqlSource {
         let retention = report.retention_secs;
         if !report.hard_errors.is_empty() {
             let details = report.hard_errors.join("; ");
-            return Err(if report.permission_error {
-                SourceError::Permission {
-                    details: details.into(),
-                }
-            } else {
-                SourceError::Incompatible {
-                    details: details.into(),
-                }
+            return Err(SourceError::Incompatible {
+                details: details.into(),
             });
         }
         Ok(retention)
@@ -1002,9 +996,9 @@ impl MySqlSource {
     }
 
     /// Run generation `control` (design sections 2 to 6): the snapshot
-    /// connections, the plan, the preflight, the anchor under the read lock
-    /// (every worker's consistent snapshot opened under it, the plan
-    /// verified under it), the start barrier, the copy, the final check,
+    /// connections, the plan, the preflight, the anchor (the plan verified
+    /// and proven unmoved, every worker's consistent snapshot opened after
+    /// its position, no lock), the start barrier, the copy, the final check,
     /// `rows_produced` and the terminal barrier. Returns the anchor, where
     /// the stream starts.
     #[allow(clippy::too_many_arguments)]
@@ -1064,32 +1058,38 @@ impl MySqlSource {
         }
         let workers = 1 + extras.len();
 
-        // 3. The anchor: every worker's consistent snapshot opened under the
-        // read lock, the position captured and the plan verified under it.
+        // 3. The anchor, without any lock on the source: the plan verified
+        // live and proven unmoved from the binlog, the position E0, every
+        // worker's consistent snapshot opened after it.
         crate::snapshot_probe::before_anchor().await;
-        let (worker_conns, mut position) =
-            mysql_snapshot::acquire_locked_anchor(
-                &self.id,
-                self.dsn.expose(),
-                server_uuid,
-                workers,
-                Duration::from_secs(cfg.lock_timeout_secs.max(1)),
-                mysql_snapshot::PlanCheck {
-                    patterns: &self.tables,
-                    page_size: cfg.discovery_page_size,
-                    expected: mysql_snapshot::PlanPages::new(
-                        queue.clone(),
-                        control.generation,
-                        cfg.discovery_page_size,
-                    ),
-                },
-            )
-            .await
-            .map_err(|e| {
-                e.downcast::<SourceError>().unwrap_or_else(|e| {
-                    other(e.context("acquire locked snapshot anchor"))
-                })
+        let lineage_hash = checkpoint_lineage(&self.registry_scope)
+            .ok_or_else(|| SourceError::Lineage {
+                details: "no registry lineage for the snapshot anchor".into(),
             })?;
+        let (worker_conns, mut position) = mysql_snapshot::acquire_anchor(
+            &self.id,
+            self.dsn.expose(),
+            server_uuid,
+            &lineage_hash,
+            &self.tables,
+            workers,
+            Duration::from_secs(cfg.anchor_timeout_secs.max(1)),
+            || mysql_snapshot::PlanCheck {
+                patterns: &self.tables,
+                page_size: cfg.discovery_page_size,
+                expected: mysql_snapshot::PlanPages::new(
+                    queue.clone(),
+                    control.generation,
+                    cfg.discovery_page_size,
+                ),
+            },
+        )
+        .await
+        .map_err(|e| {
+            e.downcast::<SourceError>().unwrap_or_else(|e| {
+                other(e.context("acquire the snapshot anchor"))
+            })
+        })?;
         crate::snapshot_probe::record_fixed(
             crate::snapshot_probe::FixedOp::Anchor,
         );

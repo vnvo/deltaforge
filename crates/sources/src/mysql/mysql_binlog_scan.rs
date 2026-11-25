@@ -180,6 +180,8 @@ pub(crate) enum ProofKind {
     Snapshot,
     Forward,
     FailoverDrift,
+    /// The snapshot anchor's plan proof over (D0, E0].
+    SnapshotAnchor,
 }
 
 impl ProofKind {
@@ -190,6 +192,7 @@ impl ProofKind {
             ProofKind::Snapshot => "snapshot",
             ProofKind::Forward => "forward",
             ProofKind::FailoverDrift => "failover_drift",
+            ProofKind::SnapshotAnchor => "snapshot_anchor",
         }
     }
 }

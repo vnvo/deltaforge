@@ -94,7 +94,7 @@ enum Command {
     ///
     /// Resolves secrets, connects to the source, and runs the source preflight
     /// checks (PostgreSQL: wal_level, replication slot, publication, WAL
-    /// retention; MySQL: gtid_mode, binlog_format, RELOAD privilege, InnoDB) plus
+    /// retention; MySQL: gtid_mode, binlog_format, InnoDB) plus
     /// local config validation. Exits non-zero if any check fails.
     Preflight {
         /// Pipeline config file or directory.

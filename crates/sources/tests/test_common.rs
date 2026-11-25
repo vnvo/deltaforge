@@ -662,10 +662,9 @@ async fn mysql_provision_cdc_user(port: u16) -> Result<()> {
         MYSQL_CDC_USER, MYSQL_CDC_PASSWORD
     ))
     .await?;
-    // RELOAD is required for FLUSH TABLES WITH READ LOCK, which brackets the
-    // consistent snapshot anchor (snapshot-anchor hardening / MY-1).
+    // No RELOAD: the snapshot anchor takes no lock on the source.
     conn.query_drop(format!(
-        "GRANT RELOAD, REPLICATION SLAVE, REPLICATION CLIENT, BACKUP_ADMIN ON *.* TO '{}'@'%'",
+        "GRANT REPLICATION SLAVE, REPLICATION CLIENT, BACKUP_ADMIN ON *.* TO '{}'@'%'",
         MYSQL_CDC_USER
     ))
     .await?;
