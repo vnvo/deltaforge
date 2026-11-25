@@ -592,6 +592,7 @@ pub(crate) async fn check_snapshot_tables(
                 env.server_uuid,
                 &anchor.current_lineage,
                 &names,
+                Some(from),
                 wait_secs,
                 None,
             )
@@ -887,6 +888,7 @@ async fn shape_at_failover(
         &anchor.current_lineage,
         db,
         table,
+        Some(&from),
         None,
         super::mysql_binlog_scan::CAPTURE_WAIT,
     )
@@ -2234,6 +2236,7 @@ mod tests {
                 &here,
                 &anchor.current_lineage,
                 &names,
+                None,
                 8,
                 None,
             )

@@ -122,6 +122,7 @@ pub(crate) trait Probe {
         &self,
         db: &str,
         table: &str,
+        at_least: &MySqlCheckpoint,
         capture_wait: Duration,
     ) -> Result<Result<Captured, ProofError>, Cancelled>;
 
@@ -146,6 +147,7 @@ impl Probe for LiveProbe<'_> {
         &self,
         db: &str,
         table: &str,
+        at_least: &MySqlCheckpoint,
         capture_wait: Duration,
     ) -> Result<Result<Captured, ProofError>, Cancelled> {
         let ctx = self.ctx;
@@ -155,6 +157,7 @@ impl Probe for LiveProbe<'_> {
             self.lineage,
             db,
             table,
+            Some(at_least),
             None,
             capture_wait,
         )
@@ -650,7 +653,12 @@ async fn attempt<P: Probe>(
             _ = ctx.cancel.cancelled() => return Err(Stop::Cancelled),
             r = tokio::time::timeout(
                 left,
-                probe.capture_table(&db, &table, limits.capture_wait.min(left)),
+                probe.capture_table(
+                    &db,
+                    &table,
+                    &run.ddl,
+                    limits.capture_wait.min(left),
+                ),
             ) => r,
         };
         match got {
@@ -2349,6 +2357,7 @@ mod tests {
                     &self,
                     _db: &str,
                     table: &str,
+                    _at_least: &MySqlCheckpoint,
                     capture_wait: Duration,
                 ) -> Result<Result<Captured, ProofError>, Cancelled>
                 {

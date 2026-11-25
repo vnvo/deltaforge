@@ -1179,6 +1179,8 @@ pub(crate) async fn capture_and_scan(
             &cs.server_uuid,
             &cs.lineage,
             tables,
+            // The window's rows are covered by its behind wait.
+            None,
             cs.wait_secs,
             None,
         )

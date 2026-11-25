@@ -390,9 +390,8 @@ macro_rules! cases {
     )*};
 }
 
-// The cut transaction is aborted (GTID mode) and read again; a cut after
-// its XID needs no abort. File-position mode has no transaction markers:
-// the cut transaction's rows are delivered again (duplicates).
+// The cut transaction is aborted and read again; a cut after its XID needs
+// no abort. (Sources require GTID mode.)
 cases! {
     gtid_after_gtid: true, Point::AfterGtid, 1, 1;
     gtid_after_begin: true, Point::AfterBegin, 1, 1;
@@ -400,11 +399,6 @@ cases! {
     gtid_between_rows: true, Point::AfterRows, 1, 1;
     gtid_before_xid: true, Point::AfterRows, 3, 1;
     gtid_after_xid: true, Point::AfterXid, 1, 0;
-    file_after_begin: false, Point::AfterBegin, 1, 0;
-    file_after_table_map: false, Point::AfterTableMap, 1, 0;
-    file_between_rows: false, Point::AfterRows, 1, 0;
-    file_before_xid: false, Point::AfterRows, 3, 0;
-    file_after_xid: false, Point::AfterXid, 1, 0;
 }
 
 /// A real killed connection while the source is backpressured inside a
@@ -443,13 +437,6 @@ async fn killed_during_backpressure(gtid: bool, name: &str) {
 async fn gtid_killed_during_backpressure() {
     test_common::init_test_tracing();
     killed_during_backpressure(true, "gtid_bp").await;
-}
-
-#[tokio::test]
-#[ignore = "requires docker"]
-async fn file_killed_during_backpressure() {
-    test_common::init_test_tracing();
-    killed_during_backpressure(false, "file_bp").await;
 }
 
 /// The process's metrics, recorded for reading back (installed once).
@@ -654,11 +641,4 @@ async fn table_id_churn(gtid: bool, name: &str) {
 async fn gtid_table_id_churn() {
     test_common::init_test_tracing();
     table_id_churn(true, "gtid_churn").await;
-}
-
-#[tokio::test]
-#[ignore = "requires docker"]
-async fn file_table_id_churn() {
-    test_common::init_test_tracing();
-    table_id_churn(false, "file_churn").await;
 }

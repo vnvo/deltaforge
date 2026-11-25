@@ -348,6 +348,7 @@ async fn establish_chunk(
         &server_uuid,
         &lineage,
         &tables,
+        None,
         ctx.proofs.capture_wait_secs,
         None,
     )
@@ -814,6 +815,7 @@ async fn establish_per_table(
             &c.db,
             &c.table,
             None,
+            None,
             super::mysql_binlog_scan::CAPTURE_WAIT,
         )
         .await?
@@ -1092,6 +1094,8 @@ pub(crate) async fn establish_at(
         &lineage,
         db,
         table,
+        // The rows' position: A must contain it.
+        Some(&e_cp),
         None,
         super::mysql_binlog_scan::CAPTURE_WAIT,
     )

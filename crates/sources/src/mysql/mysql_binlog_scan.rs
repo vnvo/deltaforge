@@ -1571,6 +1571,47 @@ fn require_gtid_mode(mode: Option<&str>) -> Result<(), ProofError> {
     }
 }
 
+/// Wait, server-side and holding no lock, until the executed set contains
+/// `at_least`'s (a capture's claim point: a DDL the stream just read, the
+/// rows' position): the stream sends a transaction once its binlog is
+/// written, which can be before its GTID is executed, and A must contain
+/// the claim point ([`covers`]). Within `wait`; a claim point still not
+/// executed then fails the capture as contention (retried).
+async fn wait_executed(
+    conn: &mut mysql_async::Conn,
+    at_least: Option<&MySqlCheckpoint>,
+    wait: Duration,
+) -> Result<(), ProofError> {
+    let Some(set) = at_least.and_then(|p| p.gtid_set.as_deref()) else {
+        return Ok(());
+    };
+    let set = GtidSet::parse(set).ok_or_else(|| {
+        ProofError::Positions(format!("unparseable claim point {set:?}"))
+    })?;
+    if set.is_empty() {
+        return Ok(());
+    }
+    let secs = wait.max(Duration::from_millis(100));
+    let q = format!(
+        "SELECT WAIT_FOR_EXECUTED_GTID_SET('{set}', {:.3})",
+        secs.as_secs_f64()
+    );
+    let timed_out: Option<u8> = conn
+        .query_first(&q)
+        .await
+        .map_err(|e| statement_error(&e, "WAIT_FOR_EXECUTED_GTID_SET"))?;
+    if timed_out != Some(0) {
+        return Err(ProofError::Contention {
+            code: 0,
+            why: format!(
+                "the claim point was not executed within {secs:?}: the \
+                 server has not committed it"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// The capture's read view, opened after A: one REPEATABLE READ snapshot
 /// for every schema read, holding no lock. On failure, the error and the
 /// statement.
@@ -1835,12 +1876,14 @@ pub(crate) const CAPTURE_WAIT: Duration =
 /// requires the server to be quiet: the positions may differ. `budget`
 /// bounds the slot wait, the connect and the end's wait together (at least
 /// 1 s).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn capture(
     cx: &CaptureCtx,
     server_uuid: &str,
     lineage_hash: &str,
     db: &str,
     table: &str,
+    at_least: Option<&MySqlCheckpoint>,
     between: Option<BetweenHook<'_>>,
     budget: Duration,
 ) -> Result<Result<Captured, ProofError>, Cancelled> {
@@ -1851,6 +1894,7 @@ pub(crate) async fn capture(
         lineage_hash,
         db,
         table,
+        at_least,
         between,
         budget,
     )
@@ -1866,6 +1910,7 @@ pub(crate) async fn capture_with(
     lineage_hash: &str,
     db: &str,
     table: &str,
+    at_least: Option<&MySqlCheckpoint>,
     between: Option<BetweenHook<'_>>,
     budget: Duration,
 ) -> Result<Result<Captured, ProofError>, Cancelled> {
@@ -1916,6 +1961,14 @@ pub(crate) async fn capture_with(
             .map_err(|e| statement_error(&e, "SELECT @@GLOBAL.gtid_mode"))?;
         require_gtid_mode(mode.as_deref())?;
         trace.connect = t0.elapsed();
+        let t = Instant::now();
+        wait_executed(
+            &mut conn,
+            at_least,
+            budget.saturating_sub(waited.elapsed()),
+        )
+        .await?;
+        trace.end_wait += t.elapsed();
         // A first, then the snapshot (module docs): every transaction in
         // A's executed set is committed before the reads, so visible.
         let t = Instant::now();
@@ -2256,6 +2309,7 @@ pub(crate) async fn capture_batch(
     server_uuid: &str,
     lineage_hash: &str,
     tables: &[(String, String)],
+    at_least: Option<&MySqlCheckpoint>,
     wait_secs: u32,
     between: Option<BetweenHook<'_>>,
 ) -> Result<Result<BatchCaptured, BatchCaptureError>, Cancelled> {
@@ -2265,6 +2319,7 @@ pub(crate) async fn capture_batch(
         server_uuid,
         lineage_hash,
         tables,
+        at_least,
         wait_secs,
         between,
     )
@@ -2272,12 +2327,14 @@ pub(crate) async fn capture_batch(
 }
 
 /// [`capture_batch`] under the given capture slots.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn capture_batch_with(
     slots: &'static CaptureSlots,
     cx: &CaptureCtx,
     server_uuid: &str,
     lineage_hash: &str,
     tables: &[(String, String)],
+    at_least: Option<&MySqlCheckpoint>,
     wait_secs: u32,
     between: Option<BetweenHook<'_>>,
 ) -> Result<Result<BatchCaptured, BatchCaptureError>, Cancelled> {
@@ -2341,6 +2398,20 @@ pub(crate) async fn capture_batch_with(
             .map_err(|e| batch_error(e, "gtid_mode"))?;
         require_gtid_mode(mode.as_deref()).map_err(failed)?;
         trace.connect = t0.elapsed();
+        let t = Instant::now();
+        wait_executed(
+            &mut conn,
+            at_least,
+            budget.saturating_sub(waited.elapsed()),
+        )
+        .await
+        .map_err(|e| match e {
+            ProofError::Contention { code, why } => {
+                BatchCaptureError::Contention { code, why }
+            }
+            e => failed(e),
+        })?;
+        trace.end_wait += t.elapsed();
         // A first, then the snapshot (module docs): every transaction in
         // A's executed set is committed before the reads, so visible.
         let t = Instant::now();
@@ -2629,6 +2700,7 @@ pub(crate) async fn capture_proven(
                 lineage_hash,
                 db,
                 table,
+                None,
                 between,
                 CAPTURE_WAIT,
             )
@@ -4158,6 +4230,16 @@ pub(crate) mod tests {
             pub(super) struct OwnedGtid(mysql_async::Conn);
 
             impl OwnedGtid {
+                /// The GTID this transaction owns.
+                pub(super) async fn gtid(&mut self) -> String {
+                    let g: Option<String> = self
+                        .0
+                        .query_first("SELECT @@SESSION.gtid_next")
+                        .await
+                        .unwrap();
+                    g.unwrap()
+                }
+
                 /// Owns the next GTID of a test server UUID, writing a row
                 /// of `db.t` (an `id INT PRIMARY KEY` table).
                 pub(super) async fn hold(dsn: &str, db: &str) -> Self {
@@ -4228,6 +4310,7 @@ pub(crate) mod tests {
                         db,
                         "t",
                         None,
+                        None,
                         CAPTURE_WAIT,
                     )
                     .await
@@ -4286,6 +4369,7 @@ pub(crate) mod tests {
                             &u,
                             LINEAGE,
                             &tables,
+                            None,
                             300,
                             Some(&hook),
                         )
@@ -4299,6 +4383,7 @@ pub(crate) mod tests {
                             LINEAGE,
                             db,
                             "t",
+                            None,
                             Some(&hook),
                             CAPTURE_WAIT,
                         )
@@ -4398,6 +4483,96 @@ pub(crate) mod tests {
                         "{db}: a kill failed"
                     );
                     holder.release().await;
+                }
+            }
+
+            /// A capture waits, server-side, for its claim point to be
+            /// executed before it reads A: a claim point holding a GTID still
+            /// owned (written to the binlog, not yet committed) is waited
+            /// for, and A contains it once it commits (single and batched).
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn a_capture_waits_for_its_claim_point_to_be_executed() {
+                let dsn = server(true).await;
+                for (db, batched) in
+                    [("claim_one", false), ("claim_batch", true)]
+                {
+                    sql(
+                        &dsn,
+                        &[
+                            &format!("CREATE DATABASE {db}"),
+                            &format!(
+                                "CREATE TABLE {db}.t (id INT PRIMARY KEY)"
+                            ),
+                        ],
+                    )
+                    .await;
+                    let mut holder = OwnedGtid::hold(&dsn, db).await;
+                    let owned = holder.gtid().await;
+                    let mut claim = position(&dsn).await;
+                    let mut set =
+                        GtidSet::parse(claim.gtid_set.as_deref().unwrap())
+                            .unwrap();
+                    assert!(set.insert(&owned));
+                    claim.gtid_set = Some(set.to_string());
+                    let (d, u) = (dsn.clone(), uuid(&dsn).await);
+                    let task = tokio::spawn(async move {
+                        let cx = CaptureCtx::detached(d.as_str());
+                        if batched {
+                            let tables =
+                                vec![(db.to_string(), "t".to_string())];
+                            capture_batch(
+                                &cx,
+                                &u,
+                                LINEAGE,
+                                &tables,
+                                Some(&claim),
+                                30,
+                                None,
+                            )
+                            .await
+                            .expect("not cancelled")
+                            .map(|c| c.from)
+                            .map_err(|e| format!("{e:?}"))
+                        } else {
+                            capture(
+                                &cx,
+                                &u,
+                                LINEAGE,
+                                db,
+                                "t",
+                                Some(&claim),
+                                None,
+                                CAPTURE_WAIT,
+                            )
+                            .await
+                            .expect("not cancelled")
+                            .map(|c| c.from)
+                            .map_err(|e| format!("{e:?}"))
+                        }
+                    });
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while waiting_capture(&dsn).await.is_empty() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "{db}: the capture did not wait"
+                        );
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    assert!(!task.is_finished());
+                    holder.release().await;
+                    let from =
+                        tokio::time::timeout(Duration::from_secs(10), task)
+                            .await
+                            .expect("returns once executed")
+                            .unwrap()
+                            .unwrap();
+                    assert!(
+                        GtidSet::parse(from.gtid_set.as_deref().unwrap())
+                            .unwrap()
+                            .contains(&owned),
+                        "{db}: A contains the claim point"
+                    );
                 }
             }
 
@@ -4577,7 +4752,7 @@ pub(crate) mod tests {
                                 release.acquire().await.unwrap().forget();
                             })
                         };
-                        capture_with(slots, &CaptureCtx::detached(d.as_str()), &u, LINEAGE, db, &format!("t{i}"), Some(&hook), CAPTURE_WAIT).await.expect("not cancelled")
+                        capture_with(slots, &CaptureCtx::detached(d.as_str()), &u, LINEAGE, db, &format!("t{i}"), None, Some(&hook), CAPTURE_WAIT).await.expect("not cancelled")
                     }));
                 }
                 tokio::time::sleep(Duration::from_secs(3)).await;
@@ -4628,6 +4803,7 @@ pub(crate) mod tests {
                             &u,
                             LINEAGE,
                             &tables,
+                            None,
                             8,
                             Some(&hook),
                         )
@@ -4644,6 +4820,7 @@ pub(crate) mod tests {
                     &u,
                     LINEAGE,
                     &tables,
+                    None,
                     1,
                     None,
                 )
@@ -4693,7 +4870,7 @@ pub(crate) mod tests {
                             })
                         };
                         let tables = vec![(db.to_string(), format!("t{i}"))];
-                        capture_batch_with(slots, &CaptureCtx::detached(d.as_str()), &u, LINEAGE, &tables, 8, Some(&hook)).await.expect("not cancelled")
+                        capture_batch_with(slots, &CaptureCtx::detached(d.as_str()), &u, LINEAGE, &tables, None, 8, Some(&hook)).await.expect("not cancelled")
                     }));
                 }
                 let deadline = Instant::now() + Duration::from_secs(20);
@@ -4783,6 +4960,7 @@ pub(crate) mod tests {
                             &u,
                             LINEAGE,
                             &tables,
+                            None,
                             8,
                             Some(&hook),
                         )
@@ -4841,6 +5019,7 @@ pub(crate) mod tests {
                     &u,
                     LINEAGE,
                     &tables,
+                    None,
                     1,
                     None,
                 )
@@ -4907,7 +5086,7 @@ pub(crate) mod tests {
                     tokio::spawn(async move {
                         let tables = vec![(db.to_string(), "t".to_string())];
                         capture_batch_with(
-                            slots, &cx, &u, LINEAGE, &tables, 30, None,
+                            slots, &cx, &u, LINEAGE, &tables, None, 30, None,
                         )
                         .await
                         .expect("not cancelled")
@@ -5002,6 +5181,7 @@ pub(crate) mod tests {
                     &uuid(&dsn).await,
                     LINEAGE,
                     &ranked,
+                    None,
                     8,
                     None,
                 )
@@ -5023,6 +5203,7 @@ pub(crate) mod tests {
                     &uuid(&dsn).await,
                     LINEAGE,
                     &ranked,
+                    None,
                     8,
                     None,
                 )
@@ -5442,6 +5623,7 @@ pub(crate) mod tests {
                     &uuid(&dsn).await,
                     LINEAGE,
                     &tables,
+                    None,
                     8,
                     Some(&hook),
                 )
@@ -5496,6 +5678,7 @@ pub(crate) mod tests {
                     &uuid(&dsn).await,
                     LINEAGE,
                     &tables,
+                    None,
                     1,
                     None,
                 )
@@ -5540,6 +5723,7 @@ pub(crate) mod tests {
                     &uuid(&dsn).await,
                     LINEAGE,
                     &tables,
+                    None,
                     1,
                     None,
                 )
@@ -5572,6 +5756,7 @@ pub(crate) mod tests {
                     &uuid(&dsn).await,
                     LINEAGE,
                     &tables,
+                    None,
                     5,
                     None,
                 )
@@ -5604,6 +5789,7 @@ pub(crate) mod tests {
                     &uuid(&dsn).await,
                     LINEAGE,
                     &tables,
+                    None,
                     5,
                     None,
                 )
@@ -6910,6 +7096,7 @@ pub(crate) mod tests {
                     LINEAGE,
                     db,
                     "t",
+                    None,
                     Some(&hook),
                     CAPTURE_WAIT,
                 )
@@ -7049,6 +7236,7 @@ pub(crate) mod tests {
                         LINEAGE,
                         db,
                         "t",
+                        None,
                         hook.as_ref().map(|h| h as BetweenHook<'_>),
                         CAPTURE_WAIT,
                     )
@@ -7118,6 +7306,7 @@ pub(crate) mod tests {
                         db,
                         t,
                         None,
+                        None,
                         CAPTURE_WAIT,
                     )
                     .await
@@ -7144,6 +7333,7 @@ pub(crate) mod tests {
                         &u,
                         LINEAGE,
                         &tables,
+                        None,
                         5,
                         None,
                     )
@@ -7183,6 +7373,7 @@ pub(crate) mod tests {
                 LINEAGE,
                 "cap_nogtid",
                 "t",
+                None,
                 None,
                 CAPTURE_WAIT,
             )
@@ -7363,6 +7554,7 @@ pub(crate) mod tests {
                 "cap_fail",
                 "t",
                 None,
+                None,
                 CAPTURE_WAIT,
             )
             .await
@@ -7374,6 +7566,7 @@ pub(crate) mod tests {
                 LINEAGE,
                 "cap_fail",
                 "missing",
+                None,
                 None,
                 CAPTURE_WAIT,
             )
@@ -7466,6 +7659,7 @@ pub(crate) mod tests {
                     LINEAGE,
                     db,
                     "t",
+                    None,
                     None,
                     CAPTURE_WAIT,
                 )
@@ -7581,6 +7775,7 @@ pub(crate) mod tests {
                 LINEAGE,
                 db,
                 "t",
+                None,
                 Some(&hook),
                 CAPTURE_WAIT,
             )
@@ -7674,6 +7869,7 @@ pub(crate) mod tests {
                 LINEAGE,
                 "cap_cover",
                 "t",
+                None,
                 Some(&hook),
                 CAPTURE_WAIT,
             )
@@ -7984,7 +8180,7 @@ pub(crate) mod tests {
                 );
                 let tables = vec![(db.to_string(), "t".to_string())];
                 let t = Instant::now();
-                let r = capture_batch(&cx, &u, LINEAGE, &tables, 1, None)
+                let r = capture_batch(&cx, &u, LINEAGE, &tables, None, 1, None)
                     .await
                     .expect("not cancelled");
                 let Err(BatchCaptureError::Failed(
@@ -8025,9 +8221,10 @@ pub(crate) mod tests {
                 }
                 held.release().await;
                 // With the permit back, the capture proceeds.
-                let ok = capture_batch(&cx, &u, LINEAGE, &tables, 5, None)
-                    .await
-                    .expect("not cancelled");
+                let ok =
+                    capture_batch(&cx, &u, LINEAGE, &tables, None, 5, None)
+                        .await
+                        .expect("not cancelled");
                 assert!(ok.is_ok(), "{ok:?}");
             }
         }

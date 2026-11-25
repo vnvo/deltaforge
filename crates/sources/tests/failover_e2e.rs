@@ -1531,27 +1531,6 @@ impl storage::StorageBackend for FailIdentityWrites {
     }
 }
 
-/// MySQL 8.4 container in non-GTID (file/pos) mode.
-async fn start_mysql_nongtid() -> (ContainerAsync<GenericImage>, u16) {
-    let c = GenericImage::new("mysql", "8.4")
-        .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
-        .with_env_var("MYSQL_ROOT_PASSWORD", MYSQL_ROOT_PASSWORD)
-        .with_cmd([
-            "--server-id=1",
-            "--log-bin=mysql-bin",
-            "--binlog-format=ROW",
-            "--binlog-row-image=FULL",
-            "--binlog-checksum=NONE",
-        ])
-        .gate_owned()
-        .start()
-        .await
-        .expect("start mysql (non-gtid)");
-    let port = c.get_host_port_ipv4(3306).await.expect("mysql port");
-    provision_mysql_cdc_user(port).await;
-    (c, port)
-}
-
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_startup_identity_persist_failure_opens_no_stream()
@@ -1628,53 +1607,6 @@ async fn mysql_startup_identity_persist_failure_opens_no_stream() -> Result<()>
                 "expected an identity-persistence error, got: {e}"
             );
             info!("✓ mysql (gtid) source stopped on identity-persist failure");
-        }
-        Ok(Ok(())) => {
-            panic!("source must not succeed when identity persistence fails")
-        }
-        Err(_) => panic!("source did not stop within timeout"),
-    }
-
-    assert_eq!(
-        streams_opened(),
-        0,
-        "no binlog stream must ever be opened when identity persist fails"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires docker"]
-async fn mysql_nongtid_startup_identity_persist_failure_opens_no_stream()
--> Result<()> {
-    init_test_tracing();
-    const DB: &str = "shop";
-
-    // Non-GTID (file/pos) mode: previously the startup path performed NO identity
-    // comparison before opening the stream. It must now fail closed too.
-    let (_c, port) = start_mysql_nongtid().await;
-    mysql_create_schema(port, DB).await;
-
-    let backend: ArcStorageBackend = Arc::new(FailIdentityWrites::new());
-    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-
-    let src =
-        make_mysql_source("no_open", &mysql_cdc_dsn(port, DB), DB, backend)
-            .await;
-    let (tx, _rx) = test_common::acked_channel(&src, &ckpt, &src.id, 64);
-    reset_streams_opened();
-    let handle = src.run(tx, ckpt).await;
-
-    match timeout(Duration::from_secs(30), handle.join()).await {
-        Ok(Err(e)) => {
-            assert!(
-                e.to_string().contains("IdentityStore")
-                    || e.to_string().contains("identity"),
-                "expected an identity-persistence error, got: {e}"
-            );
-            info!(
-                "✓ mysql (non-gtid) source stopped on identity-persist failure"
-            );
         }
         Ok(Ok(())) => {
             panic!("source must not succeed when identity persistence fails")
