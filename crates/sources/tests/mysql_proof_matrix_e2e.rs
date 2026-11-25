@@ -512,18 +512,6 @@ async fn replay_across_drop_column_gtid() {
 
 #[tokio::test]
 #[ignore = "requires docker"]
-async fn replay_across_drop_column_file_position() {
-    replay_across(
-        false,
-        "pm_dropcol_fp",
-        &["ALTER TABLE t DROP COLUMN a"],
-        &["id", "b"],
-    )
-    .await;
-}
-
-#[tokio::test]
-#[ignore = "requires docker"]
 async fn replay_across_drop_and_recreate() {
     replay_across(
         true,
@@ -1204,12 +1192,6 @@ async fn rows_event_identity_gtid() {
     rows_event_identity(true).await;
 }
 
-#[tokio::test]
-#[ignore = "requires docker"]
-async fn rows_event_identity_file_position() {
-    rows_event_identity(false).await;
-}
-
 /// The FULL fallback writes its observation, and emits the row, only if
 /// the observation then decides the row: another unmatched record at the
 /// row's position (here an `unknown` record beside the barrier it binds)
@@ -1391,12 +1373,6 @@ async fn busy_lazy_baseline_and_forward_proofs(gtid: bool) {
 #[ignore = "requires docker"]
 async fn busy_server_lazy_baseline_and_forward_proofs_gtid() {
     busy_lazy_baseline_and_forward_proofs(true).await;
-}
-
-#[tokio::test]
-#[ignore = "requires docker"]
-async fn busy_server_lazy_baseline_and_forward_proofs_file_position() {
-    busy_lazy_baseline_and_forward_proofs(false).await;
 }
 
 /// A snapshot proves its tables at the anchor (start baseline) on a busy

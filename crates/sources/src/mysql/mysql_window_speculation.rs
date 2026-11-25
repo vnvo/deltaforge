@@ -14,7 +14,7 @@
 //! snapshot of the cache's proven flags taken when the current admission
 //! starts, and the tables the current window reserved. Its task writes
 //! nothing and changes no cache; it is aborted (its capture connection
-//! dropped, so the server rolls back and releases its metadata locks)
+//! dropped, so the server ends its read-only transaction)
 //! whenever the window is abandoned or the run stops.
 //!
 //! Up to `activation_capture_concurrency` windows are collected ahead, in

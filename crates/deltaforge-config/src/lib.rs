@@ -634,9 +634,11 @@ pub struct MysqlProofCfg {
     /// server sends no transaction within this bound (its seek through the
     /// binlog file's earlier events).
     pub max_seek_ms: u64,
-    /// How long a window's capture waits for each table's metadata lock (a
-    /// schema change in progress holds it) before the attempt fails.
-    pub capture_lock_wait_secs: u32,
+    /// How long a schema capture may wait in all: for a capture slot, a
+    /// control connection and, after its reads, for transactions still
+    /// committing to be executed. A capture takes no lock on the source.
+    /// Accepted under its earlier name `capture_lock_wait_secs`.
+    pub capture_wait_secs: u32,
     /// The source's control-plane pool: at most this many SQL connections
     /// for captures, catalog reads, position queries and health checks,
     /// within the runner-wide `--max-mysql-control-connections`.
@@ -664,8 +666,8 @@ pub struct ForwardProofRetry {
     pub backoff: Vec<std::time::Duration>,
     /// No capture starts with less than this left before the deadline.
     pub min_capture: std::time::Duration,
-    /// A capture's longest lock wait (less when less is left).
-    pub lock_wait: std::time::Duration,
+    /// A capture's longest budget (less when less is left).
+    pub capture_wait: std::time::Duration,
 }
 
 impl Default for ForwardProofRetry {
@@ -680,7 +682,7 @@ impl Default for ForwardProofRetry {
                 Duration::from_secs(16),
             ],
             min_capture: Duration::from_secs(1),
-            lock_wait: Duration::from_secs(30),
+            capture_wait: Duration::from_secs(30),
         }
     }
 }
@@ -697,9 +699,9 @@ pub const MYSQL_PROOF_WINDOW_BYTES: std::ops::RangeInclusive<u64> =
 /// `max_seek_ms`: 100 ms to 600 s (a proof scan's whole time limit).
 pub const MYSQL_PROOF_MAX_SEEK_MS: std::ops::RangeInclusive<u64> =
     100..=600_000;
-/// `capture_lock_wait_secs`: 1 s (MySQL's least `lock_wait_timeout`) to
-/// 300 s (three attempts hold the stream).
-pub const MYSQL_PROOF_LOCK_WAIT_SECS: std::ops::RangeInclusive<u32> = 1..=300;
+/// `capture_wait_secs`: 1 s to 300 s (three attempts hold the stream).
+pub const MYSQL_PROOF_CAPTURE_WAIT_SECS: std::ops::RangeInclusive<u32> =
+    1..=300;
 /// `control_connections`: 2 (a capture and one other use at once) to 16.
 pub const MYSQL_PROOF_CONTROL_CONNECTIONS: std::ops::RangeInclusive<usize> =
     2..=16;
@@ -720,8 +722,11 @@ struct MysqlProofCfgRaw {
     activation_window_bytes: u64,
     #[serde(default = "MysqlProofCfg::default_max_seek_ms")]
     max_seek_ms: u64,
-    #[serde(default = "MysqlProofCfg::default_lock_wait_secs")]
-    capture_lock_wait_secs: u32,
+    #[serde(
+        default = "MysqlProofCfg::default_capture_wait_secs",
+        alias = "capture_lock_wait_secs"
+    )]
+    capture_wait_secs: u32,
     #[serde(default = "MysqlProofCfg::default_control_connections")]
     control_connections: usize,
     #[serde(default)]
@@ -793,10 +798,10 @@ impl TryFrom<MysqlProofCfgRaw> for MysqlProofCfg {
                 r.max_seek_ms,
                 &MYSQL_PROOF_MAX_SEEK_MS,
             )?,
-            capture_lock_wait_secs: in_range(
-                "capture_lock_wait_secs",
-                r.capture_lock_wait_secs,
-                &MYSQL_PROOF_LOCK_WAIT_SECS,
+            capture_wait_secs: in_range(
+                "capture_wait_secs",
+                r.capture_wait_secs,
+                &MYSQL_PROOF_CAPTURE_WAIT_SECS,
             )?,
             control_connections,
             activation_capture_concurrency,
@@ -818,7 +823,7 @@ impl MysqlProofCfg {
     fn default_max_seek_ms() -> u64 {
         10_000
     }
-    fn default_lock_wait_secs() -> u32 {
+    fn default_capture_wait_secs() -> u32 {
         30
     }
     fn default_control_connections() -> usize {
@@ -836,7 +841,7 @@ impl Default for MysqlProofCfg {
             activation_window_events: Self::default_window_events(),
             activation_window_bytes: Self::default_window_bytes(),
             max_seek_ms: Self::default_max_seek_ms(),
-            capture_lock_wait_secs: Self::default_lock_wait_secs(),
+            capture_wait_secs: Self::default_capture_wait_secs(),
             control_connections: Self::default_control_connections(),
             activation_capture_concurrency: Self::default_capture_concurrency(
                 Self::default_control_connections(),

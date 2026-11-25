@@ -435,12 +435,6 @@ async fn a_burst_is_batched_gtid() {
     burst(true).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires docker"]
-async fn a_burst_is_batched_file_position() {
-    burst(false).await;
-}
-
 /// A schema change closes the window before it: the tables touched before
 /// it are one batch, those touched after it are proven after it (the
 /// changed table by its DDL's forward proof), all delivered.
@@ -694,9 +688,10 @@ async fn a_schema_change_closes_the_window() {
     assert_eq!(tabled, 19, "{windows:?}");
 }
 
-/// A batch table write-locked throughout: three sorted capture attempts,
-/// then a `mysql_capture_contention` incident; nothing of the window is
-/// delivered and no per-table capture is made.
+/// A GTID owned throughout (a transaction that never commits): three
+/// capture attempts, each waiting at its end for its 1 s budget, then a
+/// `mysql_capture_contention` incident (`capture_wait`); nothing of the
+/// window is delivered and no per-table capture is made.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires docker"]
 async fn capture_contention_fails_closed() {
@@ -708,7 +703,7 @@ async fn capture_contention_fails_closed() {
         port,
         id,
         MysqlProofCfg {
-            capture_lock_wait_secs: 1,
+            capture_wait_secs: 1,
             ..Default::default()
         },
     )
@@ -720,8 +715,7 @@ async fn capture_contention_fails_closed() {
             .unwrap();
     }
     // Held by another session until the test ends.
-    let mut locker = conn(port).await;
-    locker.query_drop("LOCK TABLES t0001 WRITE").await.unwrap();
+    let locker = hold(port, 1).await;
     r.handle.resume();
     let ended = tokio::time::timeout(Duration::from_secs(60), r.handle.join)
         .await
@@ -736,7 +730,7 @@ async fn capture_contention_fails_closed() {
     );
     assert_eq!(
         draft.evidence.text_of(EvidenceKey::ReasonClass),
-        Some("lock_wait_timeout")
+        Some("capture_wait")
     );
     // Exactly the bounded attempts, never a fourth.
     assert!(
@@ -754,7 +748,7 @@ async fn capture_contention_fails_closed() {
         "no per-table capture or proof"
     );
     r.drain.abort();
-    locker.query_drop("UNLOCK TABLES").await.unwrap();
+    locker.release().await;
     container.rm().await.ok();
 }
 
@@ -798,8 +792,7 @@ async fn admission_meanwhile(id: &str, drop: bool) -> Vec<serde_json::Value> {
     c.query_drop("INSERT INTO t0000 VALUES (1, 0)")
         .await
         .unwrap();
-    let mut locker = conn(port).await;
-    locker.query_drop("LOCK TABLES t0000 WRITE").await.unwrap();
+    let locker = hold(port, 0).await;
     if drop {
         sources::stream_probe::reset_event_hooks();
         sources::stream_probe::disconnect_after(
@@ -817,7 +810,7 @@ async fn admission_meanwhile(id: &str, drop: bool) -> Vec<serde_json::Value> {
     txn.push("COMMIT".to_string());
     c.query_drop(txn.join("; ")).await.unwrap();
     sleep(Duration::from_millis(300)).await;
-    locker.query_drop("UNLOCK TABLES").await.unwrap();
+    locker.release().await;
     r.delivered(n, Duration::from_secs(60)).await;
     // Anything delivered twice would have arrived by now.
     sleep(Duration::from_secs(2)).await;
@@ -898,14 +891,50 @@ async fn prefetched_events_go_with_a_dropped_stream() {
     assert_eq!(tabled, 20, "{windows:?}");
 }
 
-/// Sessions waiting for a metadata lock on `table` (a blocked capture).
-async fn mdl_waiters(port: u16, table: &str) -> Vec<u64> {
+/// A session owning a GTID of its own server UUID (one per `tag`, so two
+/// holds never merge into one interval), not committed while held: every
+/// capture that reads its end meanwhile waits for it, server-side, holding
+/// no lock. The tests' `tag` is the number of the table whose window it
+/// holds. `release` commits it (an empty transaction).
+struct Hold(mysql_async::Conn);
+
+fn hold_uuid(tag: u16) -> String {
+    format!("aaaaaaaa-0000-4000-8000-00000000{tag:04x}")
+}
+
+async fn hold(port: u16, tag: u16) -> Hold {
+    let gno = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros();
+    let mut c = conn(port).await;
+    c.query_drop(format!("SET GTID_NEXT = '{}:{gno}'", hold_uuid(tag)))
+        .await
+        .unwrap();
+    Hold(c)
+}
+
+impl Hold {
+    async fn release(mut self) {
+        self.0.query_drop("BEGIN").await.unwrap();
+        self.0.query_drop("COMMIT").await.unwrap();
+        self.0
+            .query_drop("SET GTID_NEXT = 'AUTOMATIC'")
+            .await
+            .unwrap();
+        self.0.disconnect().await.ok();
+    }
+}
+
+/// Sessions of captures waiting at their ends for the GTID of hold `tag`.
+async fn end_waiters(port: u16, tag: u16) -> Vec<u64> {
     let mut c = conn(port).await;
     let ids: Vec<u64> = c
         .query(format!(
             "SELECT ID FROM information_schema.PROCESSLIST \
-             WHERE STATE = 'Waiting for table metadata lock' \
-             AND INFO LIKE '%{table}%'"
+             WHERE STATE = 'Waiting for GTID to be committed' \
+             AND INFO LIKE '%{}:%'",
+            hold_uuid(tag)
         ))
         .await
         .unwrap();
@@ -913,38 +942,38 @@ async fn mdl_waiters(port: u16, table: &str) -> Vec<u64> {
     ids
 }
 
-async fn wait_for_waiter(port: u16, table: &str) -> u64 {
+async fn wait_for_waiter(port: u16, tag: u16) -> u64 {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if let Some(id) = mdl_waiters(port, table).await.first() {
+        if let Some(id) = end_waiters(port, tag).await.first() {
             return *id;
         }
-        assert!(Instant::now() < deadline, "no capture waits on {table}");
+        assert!(Instant::now() < deadline, "no capture waits on hold {tag}");
         sleep(Duration::from_millis(50)).await;
     }
 }
 
-async fn wait_for_no_waiter(port: u16, table: &str) {
+async fn wait_for_no_waiter(port: u16, tag: u16) {
     let deadline = Instant::now() + Duration::from_secs(20);
-    while !mdl_waiters(port, table).await.is_empty() {
+    while !end_waiters(port, tag).await.is_empty() {
         assert!(
             Instant::now() < deadline,
-            "a capture still waits on {table}"
+            "a capture still waits on hold {tag}"
         );
         sleep(Duration::from_millis(100)).await;
     }
 }
 
-/// Kill the capture session waiting on `table`, `times` times (each
+/// Kill the capture session waiting on hold `tag`, `times` times (each
 /// attempt of a capture fails as a lost connection).
-async fn kill_waiting(port: u16, table: &str, times: usize) {
+async fn kill_waiting(port: u16, tag: u16, times: usize) {
     let mut c = conn(port).await;
     for _ in 0..times {
-        let id = wait_for_waiter(port, table).await;
+        let id = wait_for_waiter(port, tag).await;
         c.query_drop(format!("KILL {id}")).await.ok();
         // The next attempt is a new session.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while mdl_waiters(port, table).await.contains(&id) {
+        while end_waiters(port, tag).await.contains(&id) {
             assert!(Instant::now() < deadline, "{id} survived KILL");
             sleep(Duration::from_millis(20)).await;
         }
@@ -981,35 +1010,35 @@ async fn ended(
 
 /// Window 1 (`t0000`) waits for a lock; the next window's tables
 /// `t0001..t0004` arrive meanwhile, and `t0004` is locked so the next
-/// window's capture waits too. Returns the lockers of `t0000` and `t0004`.
+/// window's capture waits too. Returns the holds of `t0000` and `t0004`.
 async fn two_windows_present(
     port: u16,
     r: &Running,
     c: &mut mysql_async::Conn,
-) -> (mysql_async::Conn, mysql_async::Conn) {
+) -> (Hold, Hold) {
     r.handle.pause();
     c.query_drop("INSERT INTO t0000 VALUES (1, 0)")
         .await
         .unwrap();
-    let mut first = conn(port).await;
-    first.query_drop("LOCK TABLES t0000 WRITE").await.unwrap();
+    let first = hold(port, 0).await;
     r.handle.resume();
-    wait_for_waiter(port, "t0000").await;
+    wait_for_waiter(port, 0).await;
+    // Held before the next window's rows, so its capture certainly reads
+    // its end while the hold is owned.
+    let second = hold(port, 4).await;
     c.query_drop(
         "BEGIN; INSERT INTO t0001 VALUES (1, 1); INSERT INTO t0002 VALUES (1, 2); \
          INSERT INTO t0003 VALUES (1, 3); INSERT INTO t0004 VALUES (1, 4); COMMIT",
     )
     .await
     .unwrap();
-    let mut second = conn(port).await;
-    second.query_drop("LOCK TABLES t0004 WRITE").await.unwrap();
-    wait_for_waiter(port, "t0004").await;
+    wait_for_waiter(port, 4).await;
     (first, second)
 }
 
 /// The first window fails before its commit (the store rejects it) while
 /// the second window's capture is in flight: the speculative capture is
-/// aborted (its metadata-lock wait ends at once), nothing of either window
+/// aborted (its end's wait ends at once), nothing of either window
 /// is delivered or written, and no schema or activation record exists for
 /// the second window's tables.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1022,16 +1051,16 @@ async fn a_failed_first_window_aborts_the_speculative_capture() {
     let faults = Arc::new(FaultBackend::new());
     let store = Store::on(faults.clone());
     let r = run_on(port, id, MysqlProofCfg::default(), &store).await;
-    let (mut first, mut second) = two_windows_present(port, &r, &mut c).await;
+    let (first, second) = two_windows_present(port, &r, &mut c).await;
     faults
         .fail_writes_to
         .lock()
         .unwrap()
         .push("schemas.v1.activation".into());
-    first.query_drop("UNLOCK TABLES").await.unwrap();
+    first.release().await;
     let (r, end) = ended(r, Duration::from_secs(60)).await;
     assert!(end.is_err(), "the first window fails closed");
-    wait_for_no_waiter(port, "t0004").await;
+    wait_for_no_waiter(port, 4).await;
     assert_eq!(r.rows.load(std::sync::atomic::Ordering::SeqCst), 0);
     for i in 0..5 {
         let t = format!("t{i:04}");
@@ -1044,14 +1073,14 @@ async fn a_failed_first_window_aborts_the_speculative_capture() {
             "no speculative registration of {t}"
         );
     }
-    second.query_drop("UNLOCK TABLES").await.unwrap();
+    second.release().await;
     r.drain.abort();
     container.rm().await.ok();
 }
 
 /// A stop while window 1's capture waits for `t0000`'s metadata lock and
 /// the next window's speculative capture waits for `t0004`'s: the source
-/// ends at once, whatever `capture_lock_wait_secs` allows
+/// ends at once, whatever `capture_wait_secs` allows
 /// (here its 300 s maximum). Both queued sessions are killed, and nothing
 /// of either window is delivered, recorded or checkpointed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1066,7 +1095,7 @@ async fn a_stop_cancels_the_waiting_window_and_speculative_captures() {
         port,
         id,
         MysqlProofCfg {
-            capture_lock_wait_secs: 300,
+            capture_wait_secs: 300,
             ..Default::default()
         },
         &store,
@@ -1078,7 +1107,7 @@ async fn a_stop_cancels_the_waiting_window_and_speculative_captures() {
         .await
         .unwrap()
         .unwrap();
-    let (mut first, mut second) = two_windows_present(port, &r, &mut c).await;
+    let (first, second) = two_windows_present(port, &r, &mut c).await;
 
     let t = Instant::now();
     r.handle.stop();
@@ -1090,11 +1119,11 @@ async fn a_stop_cancels_the_waiting_window_and_speculative_captures() {
     assert!(took < Duration::from_secs(5), "the stop took {took:?}");
     // A stop is not a failure: the run ends as on any other stop.
     assert!(end.is_ok(), "{end:?}");
-    // A kill ends a queued session at once; one no kill reaches keeps
-    // waiting for the lock (up to 300 s).
+    // A kill ends a waiting session at once; one no kill reaches keeps
+    // waiting (up to 300 s).
     let deadline = Instant::now() + Duration::from_secs(3);
-    for t in ["t0000", "t0004"] {
-        while !mdl_waiters(port, t).await.is_empty() {
+    for t in [0, 4] {
+        while !end_waiters(port, t).await.is_empty() {
             assert!(Instant::now() < deadline, "a capture still waits on {t}");
             sleep(Duration::from_millis(50)).await;
         }
@@ -1112,14 +1141,14 @@ async fn a_stop_cancels_the_waiting_window_and_speculative_captures() {
     let raw = raw.expect("the stop writes its checkpoint");
     let cp: serde_json::Value = serde_json::from_slice(&raw).unwrap();
     assert_eq!(cp["gtid_set"].as_str(), Some(before.trim()), "{cp}");
-    first.query_drop("UNLOCK TABLES").await.unwrap();
-    second.query_drop("UNLOCK TABLES").await.unwrap();
+    first.release().await;
+    second.release().await;
     r.drain.abort();
     container.rm().await.ok();
 }
 
-/// A stop while a schema change's forward proof waits for the table's
-/// metadata lock (a single-table capture, whose own lock wait is 30 s):
+/// A stop while a schema change's forward proof capture waits at its end
+/// (a single-table capture, whose own budget is 30 s):
 /// the source ends at once and the queued session is killed. The schema
 /// change stays pending and the checkpoint unchanged, so a restart proves
 /// it.
@@ -1140,14 +1169,12 @@ async fn a_stop_cancels_a_waiting_forward_proof_capture() {
     assert!(checkpoint.is_some(), "the clean stop wrote no checkpoint");
     let r = run_on(port, id, MysqlProofCfg::default(), &store).await;
     r.handle.pause();
-    let mut locker = conn(port).await;
-    locker
-        .query_drop("CREATE TABLE t0009 (id INT PRIMARY KEY, v INT NOT NULL)")
+    c.query_drop("CREATE TABLE t0009 (id INT PRIMARY KEY, v INT NOT NULL)")
         .await
         .unwrap();
-    locker.query_drop("LOCK TABLES t0009 WRITE").await.unwrap();
+    let locker = hold(port, 9).await;
     r.handle.resume();
-    wait_for_waiter(port, "t0009").await;
+    wait_for_waiter(port, 9).await;
 
     let t = Instant::now();
     r.handle.stop();
@@ -1159,7 +1186,7 @@ async fn a_stop_cancels_a_waiting_forward_proof_capture() {
     assert!(took < Duration::from_secs(5), "the stop took {took:?}");
     assert!(end.is_ok(), "{end:?}");
     let deadline = Instant::now() + Duration::from_secs(3);
-    while !mdl_waiters(port, "t0009").await.is_empty() {
+    while !end_waiters(port, 9).await.is_empty() {
         assert!(Instant::now() < deadline, "the capture still waits");
         sleep(Duration::from_millis(50)).await;
     }
@@ -1172,7 +1199,7 @@ async fn a_stop_cancels_a_waiting_forward_proof_capture() {
         checkpoint,
         "the checkpoint moved"
     );
-    locker.query_drop("UNLOCK TABLES").await.unwrap();
+    locker.release().await;
     r.drain.abort();
 
     // The restart, from the unchanged checkpoint, handles the schema
@@ -1206,9 +1233,9 @@ async fn a_lost_first_commit_ack_is_resolved_before_the_next_window_decides() {
     let store = Store::on(memory.clone());
     let r = run_on(port, id, MysqlProofCfg::default(), &store).await;
     memory.set_batch_fault(Some(BatchFault::AfterCommit));
-    let (mut first, mut second) = two_windows_present(port, &r, &mut c).await;
-    second.query_drop("UNLOCK TABLES").await.unwrap();
-    first.query_drop("UNLOCK TABLES").await.unwrap();
+    let (first, second) = two_windows_present(port, &r, &mut c).await;
+    second.release().await;
+    first.release().await;
     r.delivered(5, Duration::from_secs(60)).await;
     assert!(
         !memory.batch_fault_armed(),
@@ -1242,9 +1269,9 @@ async fn a_speculative_failure_surfaces_in_order_before_the_first_commit() {
     tables(&mut c, 5).await;
     let id = "spec-fail-before";
     let r = run(port, id, MysqlProofCfg::default()).await;
-    let (mut first, mut second) = two_windows_present(port, &r, &mut c).await;
-    kill_waiting(port, "t0004", 3).await;
-    first.query_drop("UNLOCK TABLES").await.unwrap();
+    let (first, second) = two_windows_present(port, &r, &mut c).await;
+    kill_waiting(port, 4, 3).await;
+    first.release().await;
     let (r, end) = ended(r, Duration::from_secs(60)).await;
     let err = end.expect_err("the second window fails closed");
     assert!(
@@ -1256,7 +1283,7 @@ async fn a_speculative_failure_surfaces_in_order_before_the_first_commit() {
         vec![("t0000".to_string(), 1)],
         "the first window delivered, nothing of the second"
     );
-    second.query_drop("UNLOCK TABLES").await.unwrap();
+    second.release().await;
     r.drain.abort();
     container.rm().await.ok();
 }
@@ -1273,8 +1300,8 @@ async fn a_speculative_failure_surfaces_in_order_after_the_first_commit() {
     let id = "spec-fail-after";
     let store = Store::memory();
     let r = run_on(port, id, MysqlProofCfg::default(), &store).await;
-    let (mut first, mut second) = two_windows_present(port, &r, &mut c).await;
-    first.query_drop("UNLOCK TABLES").await.unwrap();
+    let (first, second) = two_windows_present(port, &r, &mut c).await;
+    first.release().await;
     let deadline = Instant::now() + Duration::from_secs(30);
     while r.order.lock().unwrap().is_empty() {
         assert!(Instant::now() < deadline, "the first window delivered");
@@ -1287,7 +1314,7 @@ async fn a_speculative_failure_surfaces_in_order_after_the_first_commit() {
         assert!(store.activation(port, id, &t).await.is_empty(), "{t}");
         assert!(!store.registered(port, id, &t).await, "{t}");
     }
-    kill_waiting(port, "t0004", 3).await;
+    kill_waiting(port, 4, 3).await;
     let (r, end) = ended(r, Duration::from_secs(60)).await;
     let err = end.expect_err("the second window fails closed");
     assert!(
@@ -1295,7 +1322,7 @@ async fn a_speculative_failure_surfaces_in_order_after_the_first_commit() {
         "{err}"
     );
     assert_eq!(*r.order.lock().unwrap(), vec![("t0000".to_string(), 1)]);
-    second.query_drop("UNLOCK TABLES").await.unwrap();
+    second.release().await;
     r.drain.abort();
     container.rm().await.ok();
 }
@@ -1318,10 +1345,9 @@ async fn a_reserved_tables_later_rows_follow_its_decision() {
     c.query_drop("INSERT INTO t0009 VALUES (1, 9)")
         .await
         .unwrap();
-    let mut locker = conn(port).await;
-    locker.query_drop("LOCK TABLES t0009 WRITE").await.unwrap();
+    let locker = hold(port, 9).await;
     r.handle.resume();
-    wait_for_waiter(port, "t0009").await;
+    wait_for_waiter(port, 9).await;
     c.query_drop("INSERT INTO t0000 VALUES (2, 0)")
         .await
         .unwrap();
@@ -1332,7 +1358,7 @@ async fn a_reserved_tables_later_rows_follow_its_decision() {
     .await
     .unwrap();
     sleep(Duration::from_millis(300)).await;
-    locker.query_drop("UNLOCK TABLES").await.unwrap();
+    locker.release().await;
     r.delivered(5, Duration::from_secs(60)).await;
     sleep(Duration::from_secs(1)).await;
     let order = r.order.lock().unwrap().clone();
@@ -1363,7 +1389,7 @@ async fn a_reserved_tables_later_rows_follow_its_decision() {
 }
 
 /// A stop with two windows present: the admission is dropped, the
-/// speculative capture aborted (no metadata-lock wait remains), and a
+/// speculative capture aborted (no end wait remains), and a
 /// restart from the same store delivers every row exactly once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires docker"]
@@ -1374,16 +1400,16 @@ async fn stopping_with_two_windows_present_aborts_the_speculation() {
     let id = "spec-stop";
     let store = Store::memory();
     let r = run_on(port, id, MysqlProofCfg::default(), &store).await;
-    let (mut first, mut second) = two_windows_present(port, &r, &mut c).await;
+    let (first, second) = two_windows_present(port, &r, &mut c).await;
     r.handle.stop();
     let (r, end) = ended(r, Duration::from_secs(15)).await;
     assert!(end.is_ok(), "a clean stop: {end:?}");
-    wait_for_no_waiter(port, "t0004").await;
-    wait_for_no_waiter(port, "t0000").await;
+    wait_for_no_waiter(port, 4).await;
+    wait_for_no_waiter(port, 0).await;
     assert_eq!(r.rows.load(std::sync::atomic::Ordering::SeqCst), 0);
     r.drain.abort();
-    first.query_drop("UNLOCK TABLES").await.unwrap();
-    second.query_drop("UNLOCK TABLES").await.unwrap();
+    first.release().await;
+    second.release().await;
     let again = run_on(port, id, MysqlProofCfg::default(), &store).await;
     again.delivered(5, Duration::from_secs(60)).await;
     sleep(Duration::from_secs(1)).await;
@@ -1395,26 +1421,25 @@ async fn stopping_with_two_windows_present_aborts_the_speculation() {
 /// Three windows present (`activation_capture_concurrency` 2): the first
 /// window's capture waits for `t0000`, the first queued window's (`t0001`
 /// to `t0004`) for `t0004`, the second queued window's (`t0005`, `t0006`)
-/// for `t0006`. Returns the three lock holders.
+/// for `t0006`. Returns the three holds.
 async fn three_windows_present(
     port: u16,
     r: &Running,
     c: &mut mysql_async::Conn,
-) -> [mysql_async::Conn; 3] {
+) -> [Hold; 3] {
     let (first, second) = two_windows_present(port, r, c).await;
+    let third = hold(port, 6).await;
     c.query_drop(
         "BEGIN; INSERT INTO t0005 VALUES (1, 5); INSERT INTO t0006 VALUES (1, 6); COMMIT",
     )
     .await
     .unwrap();
-    let mut third = conn(port).await;
-    third.query_drop("LOCK TABLES t0006 WRITE").await.unwrap();
-    wait_for_waiter(port, "t0006").await;
+    wait_for_waiter(port, 6).await;
     [first, second, third]
 }
 
-/// A stop with three windows present: every capture is aborted (no
-/// metadata-lock wait remains) and a restart from the same store delivers
+/// A stop with three windows present: every capture is aborted (no end
+/// wait remains) and a restart from the same store delivers
 /// every row exactly once. Meanwhile a fourth window's tables are never
 /// captured: at most two windows are collected ahead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1426,32 +1451,31 @@ async fn stopping_with_three_windows_present_aborts_every_capture() {
     let id = "spec-stop-three";
     let store = Store::memory();
     let r = run_on(port, id, MysqlProofCfg::default(), &store).await;
-    let mut held = three_windows_present(port, &r, &mut c).await;
+    let held = three_windows_present(port, &r, &mut c).await;
+    let fourth = hold(port, 8).await;
     c.query_drop(
         "BEGIN; INSERT INTO t0007 VALUES (1, 7); INSERT INTO t0008 VALUES (1, 8); COMMIT",
     )
     .await
     .unwrap();
-    let mut fourth = conn(port).await;
-    fourth.query_drop("LOCK TABLES t0008 WRITE").await.unwrap();
     sleep(Duration::from_millis(1500)).await;
     assert_eq!(
-        mdl_waiters(port, "t0008").await.len(),
+        end_waiters(port, 8).await.len(),
         0,
         "no fourth capture while two windows are queued"
     );
     r.handle.stop();
     let (r, end) = ended(r, Duration::from_secs(15)).await;
     assert!(end.is_ok(), "a clean stop: {end:?}");
-    for t in ["t0000", "t0004", "t0006"] {
+    for t in [0, 4, 6] {
         wait_for_no_waiter(port, t).await;
     }
     assert_eq!(r.rows.load(std::sync::atomic::Ordering::SeqCst), 0);
     r.drain.abort();
-    for h in &mut held {
-        h.query_drop("UNLOCK TABLES").await.unwrap();
+    for h in held {
+        h.release().await;
     }
-    fourth.query_drop("UNLOCK TABLES").await.unwrap();
+    fourth.release().await;
     let again = run_on(port, id, MysqlProofCfg::default(), &store).await;
     again.delivered(9, Duration::from_secs(60)).await;
     sleep(Duration::from_secs(1)).await;
@@ -1482,26 +1506,18 @@ async fn a_rename_spanning_three_windows_never_deadlocks() {
     c.query_drop("INSERT INTO t0003 VALUES (1, 3)")
         .await
         .unwrap();
-    let mut held = Vec::new();
-    let lock = |t: &'static str| async move {
-        let mut h = conn(port).await;
-        h.query_drop(format!("LOCK TABLES {t} WRITE"))
-            .await
-            .unwrap();
-        h
-    };
-    held.push(lock("t0003").await);
+    let mut held = vec![hold(port, 3).await];
     r.handle.resume();
-    wait_for_waiter(port, "t0003").await;
-    for (a, b) in [(1, 4), (2, 5)] {
+    wait_for_waiter(port, 3).await;
+    for (a, b) in [(1u16, 4u16), (2, 5)] {
+        held.push(hold(port, b).await);
         c.query_drop(format!(
             "BEGIN; INSERT INTO t{a:04} VALUES (1, {a}); \
              INSERT INTO t{b:04} VALUES (1, {b}); COMMIT"
         ))
         .await
         .unwrap();
-        held.push(lock(if b == 4 { "t0004" } else { "t0005" }).await);
-        wait_for_waiter(port, &format!("t{b:04}")).await;
+        wait_for_waiter(port, b).await;
     }
     let rename = tokio::spawn(async move {
         let mut c = conn(port).await;
@@ -1511,9 +1527,9 @@ async fn a_rename_spanning_three_windows_never_deadlocks() {
         .await
         .unwrap();
     });
-    for mut h in held {
+    for h in held {
         sleep(Duration::from_millis(300)).await;
-        h.query_drop("UNLOCK TABLES").await.unwrap();
+        h.release().await;
     }
     tokio::time::timeout(Duration::from_secs(30), rename)
         .await
@@ -1564,17 +1580,16 @@ async fn a_cut_in_the_current_window_abandons_every_queued_window() {
     )
     .await
     .unwrap();
-    let mut locker = conn(port).await;
-    locker.query_drop("LOCK TABLES t0000 WRITE").await.unwrap();
+    let locker = hold(port, 0).await;
     r.handle.resume();
-    wait_for_waiter(port, "t0000").await;
+    wait_for_waiter(port, 0).await;
     for i in [3, 4] {
         c.query_drop(format!("INSERT INTO t{i:04} (id, v) VALUES (1, {i})"))
             .await
             .unwrap();
         sleep(Duration::from_millis(300)).await;
     }
-    locker.query_drop("UNLOCK TABLES").await.unwrap();
+    locker.release().await;
     r.delivered(5, Duration::from_secs(120)).await;
     sleep(Duration::from_secs(1)).await;
     let order = r.order.lock().unwrap().clone();
@@ -1621,18 +1636,16 @@ async fn a_rename_spanning_both_windows_never_deadlocks() {
     c.query_drop("INSERT INTO t0002 VALUES (1, 2)")
         .await
         .unwrap();
-    let mut first = conn(port).await;
-    first.query_drop("LOCK TABLES t0002 WRITE").await.unwrap();
+    let first = hold(port, 2).await;
     r.handle.resume();
-    wait_for_waiter(port, "t0002").await;
+    wait_for_waiter(port, 2).await;
+    let second = hold(port, 3).await;
     c.query_drop(
         "BEGIN; INSERT INTO t0001 VALUES (1, 1); INSERT INTO t0003 VALUES (1, 3); COMMIT",
     )
     .await
     .unwrap();
-    let mut second = conn(port).await;
-    second.query_drop("LOCK TABLES t0003 WRITE").await.unwrap();
-    wait_for_waiter(port, "t0003").await;
+    wait_for_waiter(port, 3).await;
     let rename = tokio::spawn(async move {
         let mut c = conn(port).await;
         c.query_drop("RENAME TABLE t0000 TO r0000, t0001 TO r0001")
@@ -1640,9 +1653,9 @@ async fn a_rename_spanning_both_windows_never_deadlocks() {
             .unwrap();
     });
     sleep(Duration::from_millis(300)).await;
-    first.query_drop("UNLOCK TABLES").await.unwrap();
+    first.release().await;
     sleep(Duration::from_millis(300)).await;
-    second.query_drop("UNLOCK TABLES").await.unwrap();
+    second.release().await;
     tokio::time::timeout(Duration::from_secs(30), rename)
         .await
         .expect("the RENAME completes")
@@ -1694,17 +1707,16 @@ async fn held_events_stay_within_the_queued_windows_bounds() {
     c.query_drop("INSERT INTO t0000 VALUES (1, 0)")
         .await
         .unwrap();
-    let mut locker = conn(port).await;
-    locker.query_drop("LOCK TABLES t0000 WRITE").await.unwrap();
+    let locker = hold(port, 0).await;
     r.handle.resume();
-    wait_for_waiter(port, "t0000").await;
+    wait_for_waiter(port, 0).await;
     for i in 1..n {
         c.query_drop(format!("INSERT INTO t{i:04} VALUES (1, {i})"))
             .await
             .unwrap();
     }
     sleep(Duration::from_millis(300)).await;
-    locker.query_drop("UNLOCK TABLES").await.unwrap();
+    locker.release().await;
     r.delivered(n, Duration::from_secs(120)).await;
     sleep(Duration::from_secs(1)).await;
     assert_eq!(r.rows.load(std::sync::atomic::Ordering::SeqCst), n);
@@ -1884,10 +1896,9 @@ async fn extra_speculative_candidates_are_discarded() {
     c.query_drop("INSERT INTO t0000 VALUES (1, 0)")
         .await
         .unwrap();
-    let mut locker = conn(port).await;
-    locker.query_drop("LOCK TABLES t0000 WRITE").await.unwrap();
+    let locker = hold(port, 0).await;
     r.handle.resume();
-    wait_for_waiter(port, "t0000").await;
+    wait_for_waiter(port, 0).await;
     let mut txn = vec!["BEGIN".to_string()];
     for i in 1..6 {
         txn.push(format!("INSERT INTO t{i:04} VALUES (2, {i})"));
@@ -1896,7 +1907,7 @@ async fn extra_speculative_candidates_are_discarded() {
     txn.push("COMMIT".into());
     c.query_drop(txn.join("; ")).await.unwrap();
     sleep(Duration::from_millis(300)).await;
-    locker.query_drop("UNLOCK TABLES").await.unwrap();
+    locker.release().await;
     r.delivered(7, Duration::from_secs(60)).await;
     sleep(Duration::from_secs(1)).await;
     assert_eq!(r.rows.load(std::sync::atomic::Ordering::SeqCst), 7);
@@ -1925,10 +1936,9 @@ async fn held_events_after_a_statement_form_an_ordinary_window_by_receipt() {
     c.query_drop("INSERT INTO t0000 VALUES (1, 0)")
         .await
         .unwrap();
-    let mut locker = conn(port).await;
-    locker.query_drop("LOCK TABLES t0000 WRITE").await.unwrap();
+    let locker = hold(port, 0).await;
     r.handle.resume();
-    wait_for_waiter(port, "t0000").await;
+    wait_for_waiter(port, 0).await;
     c.query_drop("ALTER TABLE t0009 ADD COLUMN w INT")
         .await
         .unwrap();
@@ -1939,7 +1949,7 @@ async fn held_events_after_a_statement_form_an_ordinary_window_by_receipt() {
     .await
     .unwrap();
     sleep(Duration::from_millis(300)).await;
-    locker.query_drop("UNLOCK TABLES").await.unwrap();
+    locker.release().await;
     r.delivered(5, Duration::from_secs(60)).await;
     sleep(Duration::from_secs(1)).await;
     let expected: Vec<(String, i64)> =
@@ -1984,19 +1994,17 @@ async fn no_window_is_collected_after_a_queued_statement() {
     c.query_drop("INSERT INTO t0000 VALUES (1, 0)")
         .await
         .unwrap();
-    let mut first = conn(port).await;
-    first.query_drop("LOCK TABLES t0000 WRITE").await.unwrap();
+    let first = hold(port, 0).await;
     r.handle.resume();
-    wait_for_waiter(port, "t0000").await;
-    // The first queued window: its capture waits for `t0002`.
+    wait_for_waiter(port, 0).await;
+    // The first queued window: its capture waits for hold 2.
+    let second = hold(port, 2).await;
     c.query_drop(
         "BEGIN; INSERT INTO t0001 VALUES (1, 1); INSERT INTO t0002 VALUES (1, 2); COMMIT",
     )
     .await
     .unwrap();
-    let mut second = conn(port).await;
-    second.query_drop("LOCK TABLES t0002 WRITE").await.unwrap();
-    wait_for_waiter(port, "t0002").await;
+    wait_for_waiter(port, 2).await;
     // The second queued window, closed by the statement.
     c.query_drop(
         "INSERT INTO t0003 VALUES (1, 3); ALTER TABLE t0005 ADD COLUMN w INT",
@@ -2011,9 +2019,9 @@ async fn no_window_is_collected_after_a_queued_statement() {
     sleep(Duration::from_millis(300)).await;
     // The first window commits; the first queued one is admitted (its
     // capture still waits) with the rows after the statement held.
-    first.query_drop("UNLOCK TABLES").await.unwrap();
+    first.release().await;
     sleep(Duration::from_millis(500)).await;
-    second.query_drop("UNLOCK TABLES").await.unwrap();
+    second.release().await;
     r.delivered(6, Duration::from_secs(60)).await;
     let deadline = Instant::now() + Duration::from_secs(30);
     while r.rows.load(std::sync::atomic::Ordering::SeqCst) < 7 {
@@ -2063,10 +2071,9 @@ async fn ddl_closes_a_window_during_admission(gtid: bool, ddl: &str, id: &str) {
         .await
         .unwrap();
     c.query_drop(ddl).await.unwrap();
-    let mut locker = conn(port).await;
-    locker.query_drop("LOCK TABLES t0000 WRITE").await.unwrap();
+    let locker = hold(port, 0).await;
     r.handle.resume();
-    wait_for_waiter(port, "t0000").await;
+    wait_for_waiter(port, 0).await;
     c.query_drop(
         "BEGIN; INSERT INTO t0001 VALUES (1, 1); INSERT INTO t0002 VALUES (1, 2); \
          INSERT INTO t0003 VALUES (1, 3); INSERT INTO t0004 VALUES (1, 4); COMMIT",
@@ -2083,7 +2090,7 @@ async fn ddl_closes_a_window_during_admission(gtid: bool, ddl: &str, id: &str) {
         })
         .unwrap();
     sleep(Duration::from_millis(300)).await;
-    locker.query_drop("UNLOCK TABLES").await.unwrap();
+    locker.release().await;
     r.delivered(5, Duration::from_secs(60)).await;
     sleep(Duration::from_secs(2)).await;
     assert!(!r.handle.join.is_finished(), "the source keeps running");
@@ -2116,17 +2123,6 @@ async fn a_ddl_closing_a_window_starts_the_next_after_it_gtid() {
         true,
         "ALTER TABLE t0009 ADD COLUMN w INT",
         "ddl-close-gtid",
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires docker"]
-async fn a_ddl_closing_a_window_starts_the_next_after_it_file_position() {
-    ddl_closes_a_window_during_admission(
-        false,
-        "ALTER TABLE t0009 ADD COLUMN w INT",
-        "ddl-close-filepos",
     )
     .await;
 }

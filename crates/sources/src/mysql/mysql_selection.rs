@@ -52,6 +52,11 @@ use crate::durable_checkpoint::{ParsedPos, WmPos, order_positions};
 /// a DDL or barrier affecting the table lands inside the capture interval).
 const CAPTURE_ATTEMPTS: u32 = 5;
 
+/// How long the live capture is retried while schema changes of its table
+/// keep landing inside it, before the source stops with the auto-retry
+/// `mysql_capture_contention` incident (`relevant_ddl`).
+const REFUSED_FOR: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A table's validated timeline: its records and the barrier streams that
 /// apply to it (its lineage's, then its database's), shared with every
 /// timeline they apply to.
@@ -2502,6 +2507,7 @@ async fn full_fallback(
         // Shared by every capture and the wait.
         let ctx: &RunCtx = ctx;
         let (uuid, lineage_hash) = (server_uuid.as_str(), lineage.as_str());
+        let row_at = &row_cp;
         let capture = move || async move {
             match capture_proven(
                 &ctx.capture,
@@ -2512,6 +2518,7 @@ async fn full_fallback(
                 table,
                 ctx.lower_case_table_names,
                 CAPTURE_ATTEMPTS,
+                REFUSED_FOR,
                 &ScanLimits::default(),
                 None,
                 &super::mysql_binlog_scan::ScanTag {
@@ -2536,6 +2543,20 @@ async fn full_fallback(
                     }
                     let at = cap.position.clone();
                     Ok((cap, at))
+                }
+                Err(ProofError::Unstable(attempts)) => {
+                    Err(crate::incident_drafts::mysql_capture_contention(
+                        &ctx.source_id,
+                        &[(db.to_string(), table.to_string())],
+                        attempts,
+                        "relevant_ddl",
+                        row_at,
+                        &format!(
+                            "schema changes of the table landed inside every \
+                             capture for {} s",
+                            REFUSED_FOR.as_secs()
+                        ),
+                    ))
                 }
                 Err(ProofError::OtherServer(found)) => Err(SourceError::Lineage {
                     details: format!(

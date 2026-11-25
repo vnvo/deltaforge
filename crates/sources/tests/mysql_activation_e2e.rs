@@ -386,12 +386,6 @@ async fn records_precede_events_and_replay_identically_gtid() {
 
 #[tokio::test]
 #[ignore = "requires docker"]
-async fn records_precede_events_and_replay_identically_file_position() {
-    records_precede_events_and_replay_identically(false).await;
-}
-
-#[tokio::test]
-#[ignore = "requires docker"]
 async fn a_ddl_whose_record_cannot_be_persisted_is_not_emitted_or_passed() {
     init_test_tracing();
     let port = server(true).await;

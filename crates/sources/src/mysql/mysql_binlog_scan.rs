@@ -10,23 +10,39 @@
 //!   a gap), a framing error (incl. a transaction without a GTID in a GTID
 //!   interval), passing `to` without reaching it, or a resource limit (a
 //!   guard, never "no DDL").
-//! - [`capture`] reads the server position A, one table's shape and the
-//!   position B on ONE connection, after proving the server's identity on it,
-//!   while holding the table's shared-read metadata lock in a transaction.
-//!   That lock is compatible with DML and conflicts with every DDL of the
-//!   table: it is granted only once a DDL already running on the table has
-//!   committed (binlog event written, dictionary change visible), and no DDL
-//!   of the table can commit until it is released after B. So a DDL of the
-//!   table at or before A is visible to the shape read (closing the window in
-//!   which a binlog position already includes a DDL whose dictionary change is
-//!   not yet visible), and none lands in (A, B]. The server is never required
-//!   to be quiet: ordinary writes, to the table or any other, continue, and
-//!   DDL of other tables is irrelevant. The lock's schema intention lock also
-//!   holds off DDL of the table's database. Unattributable statements that
-//!   are neither are not locked out: a scan proves the interval free of them, a covering scan by
-//!   the caller ([`covers`]) or the capture's own interval
-//!   ([`capture_proven`], which retries only when something affecting the
-//!   table landed inside it).
+//! - [`capture`] reads one table's shape between two server positions on
+//!   ONE connection, after proving the server's identity on it, and takes
+//!   no lock on the source: it never holds back the server's DDL or the
+//!   writes queued behind a DDL, and never opens the table. GTID mode only.
+//!   1. **A first.** The status (file, position, executed set) is read
+//!      before the read view opens. MySQL adds a transaction's GTID to the
+//!      executed set only after its engine commit, so every transaction in
+//!      A's set is committed before the reads, and visible to them. A claim
+//!      from a position at or before A ([`covers`]) therefore sees every
+//!      DDL up to it.
+//!   2. **One snapshot.** `START TRANSACTION WITH CONSISTENT SNAPSHOT, READ
+//!      ONLY` at REPEATABLE READ: every schema read of the capture sees the
+//!      same dictionary state (dictionary tables are read as non-locking
+//!      consistent reads).
+//!   3. **The end.** A transaction can be committed (visible) before its
+//!      GTID is in the executed set, so B is not a plain status read: the
+//!      owned GTIDs are read, then the status; what was owned and is not yet
+//!      executed is waited for server-side, then the status is read again
+//!      ([`read_capture_end`]). A GTID leaves the owned set and enters the
+//!      executed set in one step, and both reads see it on one side, so
+//!      every transaction the reads could see is in B's set.
+//!
+//!   Nothing prevents a DDL of the table from committing during the reads:
+//!   the caller's covering scan finds every DDL or barrier affecting the
+//!   table in its interval, which contains `(A, B]`, and refuses the table
+//!   ([`covers`], [`capture_proven`], which retries only then). Right after
+//!   the snapshot opens, the capture also reads its visible bound
+//!   ([`read_visible_bound`], `Captured::visible`): a DDL outside it was
+//!   not visible to the reads, so the activation window and the lazy
+//!   baseline admit the table with the shape read until that DDL, with a
+//!   baseline ending at A. Ordinary writes, to the table or any other, and
+//!   DDL of other tables are irrelevant. The server is never required to be
+//!   quiet.
 //!
 //! The scan digest is deterministic for an interval: it binds the classifier
 //! version, both boundaries and every classified statement with its binlog
@@ -263,9 +279,10 @@ pub(crate) enum ProofError {
     Open(Failure, String),
     #[error("reading the interval failed ({}): {1}", .0.as_str())]
     Read(Failure, String),
-    /// A capture could not take its table's metadata lock: a lock wait
-    /// timeout (1205), a deadlock (1213), or every lock-holding capture slot
-    /// busy (code 0).
+    /// A capture could not complete in its budget: every capture slot busy,
+    /// or transactions still owned after its reads not executed in time
+    /// (code 0). Codes 1205 and 1213 are a server's lock wait timeout and
+    /// deadlock, should one reach a capture.
     #[error("{why}")]
     Contention { code: u16, why: String },
     #[error("binlog INCIDENT event: the binlog declares a gap")]
@@ -1464,6 +1481,10 @@ fn observe_event(
 pub(crate) struct Captured {
     pub from: MySqlCheckpoint,
     pub position: MySqlCheckpoint,
+    /// Every GTID executed or owned when the snapshot had just opened
+    /// ([`read_visible_bound`]): a transaction outside it cannot be visible
+    /// to the reads.
+    pub visible: GtidSet,
     pub schema: MySqlTableSchema,
     pub attempts: u32,
     pub trace: CaptureTrace,
@@ -1474,11 +1495,12 @@ pub(crate) struct Captured {
 pub(crate) struct CaptureTrace {
     /// Connection, GTID-mode and identity queries.
     pub connect: Duration,
-    /// Waiting for the table's metadata lock (a DDL of the table running).
-    pub lock_wait: Duration,
-    /// The schema query itself, under the lock.
+    /// Waiting, after the schema reads, for the GTIDs still owned to be
+    /// executed ([`read_capture_end`]): zero when none were left.
+    pub end_wait: Duration,
+    /// The schema queries (and, batched, the existence read).
     pub schema: Duration,
-    /// Both server position reads.
+    /// The server position reads (A, and every read of the end).
     pub positions: Duration,
     /// `capture_proven`: each retried attempt's cause.
     pub retries: Vec<String>,
@@ -1537,6 +1559,176 @@ pub(crate) async fn read_position(
     Ok(at)
 }
 
+/// A capture runs only in GTID mode: without an executed set no read shows
+/// which transactions are committed (module docs).
+fn require_gtid_mode(mode: Option<&str>) -> Result<(), ProofError> {
+    match mode {
+        Some(m) if m.eq_ignore_ascii_case("ON") => Ok(()),
+        other => Err(ProofError::Capture(format!(
+            "gtid_mode is {:?}: a schema capture requires gtid_mode=ON",
+            other.unwrap_or("unknown")
+        ))),
+    }
+}
+
+/// Wait, server-side and holding no lock, until the executed set contains
+/// `at_least`'s (a capture's claim point: a DDL the stream just read, the
+/// rows' position): the stream sends a transaction once its binlog is
+/// written, which can be before its GTID is executed, and A must contain
+/// the claim point ([`covers`]). Within `wait`; a claim point still not
+/// executed then fails the capture as contention (retried).
+async fn wait_executed(
+    conn: &mut mysql_async::Conn,
+    at_least: Option<&MySqlCheckpoint>,
+    wait: Duration,
+) -> Result<(), ProofError> {
+    let Some(set) = at_least.and_then(|p| p.gtid_set.as_deref()) else {
+        return Ok(());
+    };
+    let set = GtidSet::parse(set).ok_or_else(|| {
+        ProofError::Positions(format!("unparseable claim point {set:?}"))
+    })?;
+    if set.is_empty() {
+        return Ok(());
+    }
+    let secs = wait.max(Duration::from_millis(100));
+    let q = format!(
+        "SELECT WAIT_FOR_EXECUTED_GTID_SET('{set}', {:.3})",
+        secs.as_secs_f64()
+    );
+    let timed_out: Option<u8> = conn
+        .query_first(&q)
+        .await
+        .map_err(|e| statement_error(&e, "WAIT_FOR_EXECUTED_GTID_SET"))?;
+    if timed_out != Some(0) {
+        return Err(ProofError::Contention {
+            code: 0,
+            why: format!(
+                "the claim point was not executed within {secs:?}: the \
+                 server has not committed it"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The capture's read view, opened after A: one REPEATABLE READ snapshot
+/// for every schema read, holding no lock. On failure, the error and the
+/// statement.
+async fn open_snapshot(
+    conn: &mut mysql_async::Conn,
+) -> Result<(), (mysql_async::Error, &'static str)> {
+    for q in [
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+        "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY",
+    ] {
+        conn.query_drop(q).await.map_err(|e| (e, q))?;
+    }
+    Ok(())
+}
+
+/// Every GTID executed or owned, read right after the capture's snapshot
+/// opened: the owned GTIDs, then the executed set. A transaction is given
+/// its GTID before its engine commit and holds it until the GTID is
+/// executed, so a transaction committed before the snapshot opened is in
+/// this set, and one outside it is not visible to the capture's reads
+/// (module docs, "The end").
+pub(crate) async fn read_visible_bound(
+    conn: &mut mysql_async::Conn,
+    lineage_hash: &str,
+) -> Result<GtidSet, ProofError> {
+    let owned: Option<String> = conn
+        .query_first("SELECT @@GLOBAL.gtid_owned")
+        .await
+        .map_err(|e| statement_error(&e, "SELECT @@GLOBAL.gtid_owned"))?;
+    let owned = owned.unwrap_or_default();
+    let owned = crate::gtid_set::owned_gtids(&owned).ok_or_else(|| {
+        ProofError::Capture(format!("unparseable gtid_owned {owned:?}"))
+    })?;
+    let mut bound =
+        executed_of(&read_position(conn, true, lineage_hash).await?)?;
+    for g in &owned {
+        if !bound.insert(g) {
+            return Err(ProofError::Capture(format!("unparseable GTID {g}")));
+        }
+    }
+    Ok(bound)
+}
+
+/// A capture's end B, read after its schema reads (module docs, "The end"):
+/// the owned GTIDs `O`, then the status `E`; B is `E` when `O` is inside it,
+/// else, once the server has executed what `O` holds beyond it
+/// (`WAIT_FOR_EXECUTED_GTID_SET`, server-side and holding no lock, within
+/// `wait`: what the capture's budget leaves), a new status read. So every transaction the reads could
+/// see is in B's executed set. GTIDs still owned past the wait fail the
+/// capture as contention (retried).
+pub(crate) async fn read_capture_end(
+    conn: &mut mysql_async::Conn,
+    lineage_hash: &str,
+    wait: Duration,
+    trace: &mut CaptureTrace,
+) -> Result<MySqlCheckpoint, ProofError> {
+    let t = Instant::now();
+    let owned: Option<String> = conn
+        .query_first("SELECT @@GLOBAL.gtid_owned")
+        .await
+        .map_err(|e| statement_error(&e, "SELECT @@GLOBAL.gtid_owned"))?;
+    let owned = owned.unwrap_or_default();
+    let owned = crate::gtid_set::owned_gtids(&owned).ok_or_else(|| {
+        ProofError::Capture(format!("unparseable gtid_owned {owned:?}"))
+    })?;
+    let first = read_position(conn, true, lineage_hash).await?;
+    trace.positions += t.elapsed();
+    let executed = executed_of(&first)?;
+    let mut left = GtidSet::new();
+    for g in owned.iter().filter(|g| !executed.contains(g)) {
+        if !left.insert(g) {
+            return Err(ProofError::Capture(format!("unparseable GTID {g}")));
+        }
+    }
+    if left.is_empty() {
+        return Ok(first);
+    }
+    let t = Instant::now();
+    let secs = wait.max(Duration::from_millis(100));
+    // The set as a literal (its canonical text is hex digits, digits,
+    // `:`, `-` and `,` only), so the waiting session names it.
+    let wait_sql = format!(
+        "SELECT WAIT_FOR_EXECUTED_GTID_SET('{left}', {:.3})",
+        secs.as_secs_f64()
+    );
+    let timed_out: Option<u8> = conn
+        .query_first(&wait_sql)
+        .await
+        .map_err(|e| statement_error(&e, &wait_sql))?;
+    trace.end_wait += t.elapsed();
+    if timed_out != Some(0) {
+        return Err(ProofError::Contention {
+            code: 0,
+            why: format!(
+                "GTIDs {left} stayed owned and unexecuted for {secs:?} after \
+                 the schema reads"
+            ),
+        });
+    }
+    let t = Instant::now();
+    let end = read_position(conn, true, lineage_hash).await?;
+    trace.positions += t.elapsed();
+    let executed = executed_of(&end)?;
+    if !left.is_subset(&executed) {
+        return Err(ProofError::Capture(format!(
+            "the server reported {left} executed, but its executed set \
+             {executed} does not contain it"
+        )));
+    }
+    Ok(end)
+}
+
+fn executed_of(c: &MySqlCheckpoint) -> Result<GtidSet, ProofError> {
+    GtidSet::parse(c.gtid_set.as_deref().unwrap_or_default())
+        .ok_or_else(|| ProofError::Capture("unparseable executed set".into()))
+}
+
 /// The server's binary log position and, in GTID mode, its executed set.
 pub(crate) async fn read_server_status(
     conn: &mut mysql_async::Conn,
@@ -1585,13 +1777,35 @@ pub(crate) async fn read_server_status(
     })
 }
 
-/// Bound on waiting for the table's metadata lock (a DDL in progress on the
-/// table): a capture that cannot lock fails, never reads unlocked.
-pub(crate) const LOCK_WAIT_SECS: u32 = 30;
+/// A capture's default budget: its slot wait, connect and end wait together.
+pub(crate) const CAPTURE_WAIT_SECS: u32 = 30;
 
 fn quoted(db: &str, table: &str) -> String {
     let q = |s: &str| format!("`{}`", s.replace('`', "``"));
     format!("{}.{}", q(db), q(table))
+}
+
+/// Whether `db.table`, missing from a capture's reads, is absent or hidden
+/// from the account: information_schema omits tables the account has no
+/// privilege on, so both read alike. One `SELECT 1 FROM t LIMIT 0`, outside
+/// any transaction, tells them apart. MySQL checks the account's privileges
+/// before it opens the table (`Sql_cmd_dml::prepare`: `precheck`, then
+/// `open_tables_for_query`), so a denied table is refused without any lock;
+/// an absent one holds a metadata lock on its name for this one statement.
+/// Denied is the authorization failure; anything else leaves the caller's
+/// outcome as it was.
+async fn absent_or_denied(
+    conn: &mut mysql_async::Conn,
+    db: &str,
+    table: &str,
+) -> Result<(), ProofError> {
+    let q = format!("SELECT 1 FROM {} LIMIT 0", quoted(db, table));
+    match conn.query_drop(&q).await {
+        Err(e) if matches!(of_mysql(&e), Failure::Authorization) => {
+            Err(statement_error(&e, &q))
+        }
+        _ => Ok(()),
+    }
 }
 
 fn wm(c: &MySqlCheckpoint) -> Result<WmPos, ProofError> {
@@ -1600,11 +1814,12 @@ fn wm(c: &MySqlCheckpoint) -> Result<WmPos, ProofError> {
     )
 }
 
-/// The most captures holding metadata locks at once, runner-wide (`L`).
-pub(crate) const MAX_LOCK_HOLDING_CAPTURES: usize = 4;
+/// The most captures at once, runner-wide (`L`): the source server's
+/// concurrent capture load.
+pub(crate) const MAX_CAPTURES: usize = 4;
 /// Cancellation connections reserved for them (`R` = `L`): every capture
 /// that can need a kill has one, and a kill never waits for anything else.
-pub(crate) const KILL_RESERVE: usize = MAX_LOCK_HOLDING_CAPTURES;
+pub(crate) const KILL_RESERVE: usize = MAX_CAPTURES;
 /// The bound on one cancellation (connect and `KILL`).
 const KILL_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -1634,7 +1849,7 @@ impl CaptureSlots {
     }
 
     /// Slots retired for the life of the process: their sessions may still
-    /// hold metadata locks.
+    /// be running.
     pub(crate) fn retired(&self) -> u64 {
         self.retired.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -1642,7 +1857,7 @@ impl CaptureSlots {
 
 /// The runner's capture slots.
 pub(crate) static CAPTURE_SLOTS: CaptureSlots =
-    CaptureSlots::new(MAX_LOCK_HOLDING_CAPTURES, KILL_RESERVE);
+    CaptureSlots::new(MAX_CAPTURES, KILL_RESERVE);
 
 static KILL_FAILURES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -1653,22 +1868,24 @@ pub(crate) fn kill_failures() -> u64 {
     KILL_FAILURES.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// A capture's lock wait unless its caller has less time ([`LOCK_WAIT_SECS`]).
-pub(crate) const LOCK_WAIT: Duration =
-    Duration::from_secs(LOCK_WAIT_SECS as u64);
+/// A capture's budget unless its caller has less time ([`CAPTURE_WAIT_SECS`]).
+pub(crate) const CAPTURE_WAIT: Duration =
+    Duration::from_secs(CAPTURE_WAIT_SECS as u64);
 
 /// Read `db.table`'s shape between two positions (module docs). Never
-/// requires the server to be quiet: the positions may differ. `lock_wait`
-/// bounds the slot wait, the connect and the metadata-lock wait together
-/// (at least 1 s: MySQL's least `lock_wait_timeout`).
+/// requires the server to be quiet: the positions may differ. `budget`
+/// bounds the slot wait, the connect and the end's wait together (at least
+/// 1 s).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn capture(
     cx: &CaptureCtx,
     server_uuid: &str,
     lineage_hash: &str,
     db: &str,
     table: &str,
+    at_least: Option<&MySqlCheckpoint>,
     between: Option<BetweenHook<'_>>,
-    lock_wait: Duration,
+    budget: Duration,
 ) -> Result<Result<Captured, ProofError>, Cancelled> {
     capture_with(
         &CAPTURE_SLOTS,
@@ -1677,8 +1894,9 @@ pub(crate) async fn capture(
         lineage_hash,
         db,
         table,
+        at_least,
         between,
-        lock_wait,
+        budget,
     )
     .await
 }
@@ -1692,8 +1910,9 @@ pub(crate) async fn capture_with(
     lineage_hash: &str,
     db: &str,
     table: &str,
+    at_least: Option<&MySqlCheckpoint>,
     between: Option<BetweenHook<'_>>,
-    lock_wait: Duration,
+    budget: Duration,
 ) -> Result<Result<Captured, ProofError>, Cancelled> {
     let dsn = &cx.dsn;
     let mut trace = CaptureTrace::default();
@@ -1708,18 +1927,17 @@ pub(crate) async fn capture_with(
         permit: None,
     };
     let body = async {
-        // A lock-holding slot first, within the lock-wait budget: a capture
-        // waiting for one holds no connection. Then a connection of the
-        // source's pool, proven to be the server, within what remains;
-        // then the table's metadata lock, held until COMMIT (module docs).
-        let budget = lock_wait.max(Duration::from_secs(1));
+        // A capture slot first, within the budget: a capture waiting for
+        // one holds no connection. Then a connection of the source's pool,
+        // proven to be the server, within what remains (module docs).
+        let budget = budget.max(Duration::from_secs(1));
         let waited = Instant::now();
         let permit = tokio::time::timeout(budget, slots.holding.acquire())
             .await
             .map_err(|_| ProofError::Contention {
                 code: 0,
                 why: format!(
-                    "every lock-holding capture slot stayed busy for {} s",
+                    "every capture slot stayed busy for {} s",
                     budget.as_secs()
                 ),
             })?
@@ -1741,27 +1959,27 @@ pub(crate) async fn capture_with(
             .query_first("SELECT @@GLOBAL.gtid_mode")
             .await
             .map_err(|e| statement_error(&e, "SELECT @@GLOBAL.gtid_mode"))?;
-        let gtid_mode = mode.is_some_and(|m| m.eq_ignore_ascii_case("ON"));
-        let remaining =
-            budget.saturating_sub(waited.elapsed()).as_secs().max(1);
-        for q in [
-            format!("SET SESSION lock_wait_timeout = {remaining}"),
-            "START TRANSACTION READ ONLY".to_string(),
-        ] {
-            conn.query_drop(&q)
-                .await
-                .map_err(|e| statement_error(&e, &q))?;
-        }
+        require_gtid_mode(mode.as_deref())?;
         trace.connect = t0.elapsed();
         let t = Instant::now();
-        let lock = format!("SELECT 1 FROM {} LIMIT 0", quoted(db, table));
-        conn.query_drop(&lock)
-            .await
-            .map_err(|e| statement_error(&e, &lock))?;
-        trace.lock_wait = t.elapsed();
+        wait_executed(
+            &mut conn,
+            at_least,
+            budget.saturating_sub(waited.elapsed()),
+        )
+        .await?;
+        trace.end_wait += t.elapsed();
+        // A first, then the snapshot (module docs): every transaction in
+        // A's executed set is committed before the reads, so visible.
         let t = Instant::now();
-        let from = read_position(&mut conn, gtid_mode, lineage_hash).await?;
+        let from = read_position(&mut conn, true, lineage_hash).await?;
         trace.positions = t.elapsed();
+        open_snapshot(&mut conn)
+            .await
+            .map_err(|(e, q)| statement_error(&e, q))?;
+        let t = Instant::now();
+        let visible = read_visible_bound(&mut conn, lineage_hash).await?;
+        trace.positions += t.elapsed();
         let t = Instant::now();
         let schema = match fetch_table_schema_on(
             &mut conn,
@@ -1775,16 +1993,31 @@ pub(crate) async fn capture_with(
             Ok(Live::OtherLineage(who)) => {
                 return Err(ProofError::OtherServer(who));
             }
-            Err(e) => return Err(source_statement_error(&e, "schema read")),
+            Err(e) => {
+                let e = source_statement_error(&e, "schema read");
+                if matches!(e, ProofError::Capture(_)) {
+                    // Not found: absent, or hidden from the account.
+                    conn.query_drop("ROLLBACK")
+                        .await
+                        .map_err(|e| statement_error(&e, "ROLLBACK"))?;
+                    absent_or_denied(&mut conn, db, table).await?;
+                }
+                return Err(e);
+            }
         };
         trace.schema = t.elapsed();
         if let Some(hook) = between {
             hook().await;
         }
-        let t = Instant::now();
-        let position =
-            read_position(&mut conn, gtid_mode, lineage_hash).await?;
-        trace.positions += t.elapsed();
+        #[cfg(test)]
+        between_next().await;
+        let position = read_capture_end(
+            &mut conn,
+            lineage_hash,
+            budget.saturating_sub(waited.elapsed()),
+            &mut trace,
+        )
+        .await?;
         match order_positions(&wm(&from)?, &wm(&position)?) {
             CheckpointOrder::Before | CheckpointOrder::Equal => {}
             other => {
@@ -1802,6 +2035,7 @@ pub(crate) async fn capture_with(
         Ok(Captured {
             from,
             position,
+            visible,
             schema,
             attempts: 1,
             trace: CaptureTrace::default(),
@@ -1810,7 +2044,7 @@ pub(crate) async fn capture_with(
     let result = tokio::select! {
         biased;
         // A stop: the capture is dropped where it stands and its armed
-        // guard kills its session (a lock wait ends at once).
+        // guard kills its session (a running read or wait ends at once).
         _ = cx.cancel.cancelled() => return Err(Cancelled),
         r = body => r,
     };
@@ -1831,7 +2065,7 @@ struct KillOnDrop {
     source: String,
     id: u32,
     slots: &'static CaptureSlots,
-    /// The capture's lock-holding slot, held until its session is gone.
+    /// The capture's slot, held until its session is gone.
     permit: Option<tokio::sync::SemaphorePermit<'static>>,
 }
 impl Drop for KillOnDrop {
@@ -1896,8 +2130,8 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// A cancellation did not resolve: the session may still hold metadata
-/// locks, so its slot is retired for the life of the process (capacity
+/// A cancellation did not resolve: the session may still be running, so its
+/// slot is retired for the life of the process (capacity
 /// degrades safely until a restart; the bound is never exceeded). Counted,
 /// logged and exported.
 fn kill_failed(
@@ -1926,14 +2160,15 @@ fn kill_failed(
 }
 
 /// The shapes of a window's tables read between two server positions in one
-/// transaction (`docs/design/mysql-proof-seek.md`, "Batched capture"): every
-/// table's metadata lock is taken first, in sorted `(schema, table)` order,
-/// and held across both position reads, so each table's shape is exactly
-/// what [`capture`] would read over `[from, position]`.
+/// transaction (`docs/design/mysql-proof-seek.md`, "Batched capture"), read
+/// as [`capture`] reads one (module docs), so each table's shape is exactly
+/// what it would read over `[from, position]`.
 #[derive(Debug, Clone)]
 pub(crate) struct BatchCaptured {
     pub from: MySqlCheckpoint,
     pub position: MySqlCheckpoint,
+    /// As [`Captured::visible`].
+    pub visible: GtidSet,
     pub schemas: HashMap<(String, String), MySqlTableSchema>,
     /// Tables that do not exist (dropped since their rows): no shape.
     pub missing: Vec<(String, String)>,
@@ -1953,6 +2188,7 @@ impl BatchCaptured {
         Some(Captured {
             from: self.from.clone(),
             position: self.position.clone(),
+            visible: self.visible.clone(),
             schema: schema.clone(),
             attempts: 1,
             trace: self.trace.clone(),
@@ -1960,8 +2196,8 @@ impl BatchCaptured {
     }
 }
 
-/// Why a batched capture failed: a lock it could not take (a timeout or a
-/// deadlock: retried in the same sorted order) or anything else.
+/// Why a batched capture failed: contention (no slot, or the end's wait
+/// timed out: retried) or anything else.
 #[derive(Debug)]
 pub(crate) enum BatchCaptureError {
     Contention { code: u16, why: String },
@@ -1969,34 +2205,9 @@ pub(crate) enum BatchCaptureError {
 }
 
 /// The most tables one batched capture takes (an activation window closes
-/// at it), and the most bytes of its lock request: one request a server
-/// accepts whatever its `max_allowed_packet` (at least 1 MiB) and limit of
-/// prepared-statement parameters.
+/// at it): within a server's limit of prepared-statement parameters for its
+/// reads.
 pub(crate) const MAX_BATCH_TABLES: usize = 2048;
-pub(crate) const MAX_LOCK_REQUEST_BYTES: usize = 1024 * 1024;
-
-/// The lock statements of a batch, in its sorted order, as one request:
-/// one `SELECT 1 FROM t LIMIT 0` per table. `None` when the request would
-/// exceed its bounds.
-fn lock_request(tables: &[(&str, &str)]) -> Option<String> {
-    if tables.len() > MAX_BATCH_TABLES {
-        return None;
-    }
-    let mut sql = String::new();
-    for (db, table) in tables {
-        sql.push_str("SELECT 1 FROM ");
-        sql.push_str(&quoted(db, table));
-        sql.push_str(" LIMIT 0;");
-        if sql.len() > MAX_LOCK_REQUEST_BYTES {
-            return None;
-        }
-    }
-    Some(sql)
-}
-
-const ER_LOCK_WAIT_TIMEOUT: u16 = 1205;
-const ER_LOCK_DEADLOCK: u16 = 1213;
-const ER_NO_SUCH_TABLE: u16 = 1146;
 
 /// A failed statement of a single capture, by its failure's class: lock
 /// contention, a connection failure (`Open`), or anything else the server
@@ -2034,13 +2245,6 @@ fn source_statement_error(
     }
 }
 
-fn server_code(e: &mysql_async::Error) -> Option<u16> {
-    match e {
-        mysql_async::Error::Server(s) => Some(s.code),
-        _ => None,
-    }
-}
-
 /// A failed statement of a batched capture: the connection (I/O or the
 /// driver) as `Open`, anything the server answered as `Capture`.
 /// Test-only: the next capture draws on this pool, waiting at most this
@@ -2050,8 +2254,28 @@ pub(crate) static STARVE_NEXT: std::sync::Mutex<
     Option<(super::mysql_control::ControlPool, Duration)>,
 > = std::sync::Mutex::new(None);
 
+/// Test-only: the next single-table capture runs these statements (on its
+/// own connection to this DSN) between its schema reads and its end, as a
+/// `between` hook does, on paths that pass none (the lazy baseline).
+#[cfg(test)]
+pub(crate) static BETWEEN_NEXT: std::sync::Mutex<
+    Option<(String, Vec<String>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+async fn between_next() {
+    let next = BETWEEN_NEXT.lock().unwrap().take();
+    if let Some((dsn, stmts)) = next {
+        let mut c = mysql_async::Conn::from_url(dsn.as_str()).await.unwrap();
+        for s in &stmts {
+            c.query_drop(s).await.unwrap();
+        }
+        c.disconnect().await.ok();
+    }
+}
+
 /// The pool a capture draws on, and its wait: the run's, within what its
-/// lock-wait budget leaves.
+/// budget leaves.
 fn control_for(
     cx: &CaptureCtx,
     wait: Duration,
@@ -2097,58 +2321,19 @@ fn batch_error(e: mysql_async::Error, what: &str) -> BatchCaptureError {
     })
 }
 
-/// Take `tables`' metadata locks, in their order, in one request.
-async fn lock_all(
-    conn: &mut mysql_async::Conn,
-    tables: &[(&str, &str)],
-) -> Result<(), BatchCaptureError> {
-    if tables.is_empty() {
-        return Ok(());
-    }
-    let sql = lock_request(tables).ok_or_else(|| {
-        BatchCaptureError::Failed(ProofError::Capture(format!(
-            "the lock request for {} tables exceeds its bounds ({MAX_BATCH_TABLES} \
-             tables, {MAX_LOCK_REQUEST_BYTES} bytes)",
-            tables.len()
-        )))
-    })?;
-    let lock_failed = |e: mysql_async::Error| match server_code(&e) {
-        Some(code @ (ER_LOCK_WAIT_TIMEOUT | ER_LOCK_DEADLOCK)) => {
-            BatchCaptureError::Contention {
-                code,
-                why: format!("metadata locks: {e}"),
-            }
-        }
-        _ => batch_error(e, "metadata locks"),
-    };
-    // Exactly one result per statement, read in turn: a statement's error
-    // (its lock timeout or deadlock) surfaces as its result is read.
-    let mut result = conn.query_iter(sql).await.map_err(lock_failed)?;
-    for _ in 0..tables.len() {
-        result.for_each(|_| {}).await.map_err(lock_failed)?;
-    }
-    let extra = !result.is_empty();
-    result.drop_result().await.map_err(lock_failed)?;
-    if extra {
-        return Err(BatchCaptureError::Failed(ProofError::Capture(format!(
-            "the lock request returned more than its {} results",
-            tables.len()
-        ))));
-    }
-    Ok(())
-}
-
-/// One batched capture attempt (see [`BatchCaptured`]); `lock_wait_secs`
-/// bounds each table's lock wait. `after_first_lock` runs once the first
-/// table is locked (tests use it to race a multi-table DDL; production
-/// passes `None`).
+/// One batched capture attempt (see [`BatchCaptured`]); `wait_secs`
+/// bounds the slot wait, the connect and the end's wait together.
+/// `between` runs between the schema reads and the end (tests use it to
+/// land a statement inside the capture interval; production passes
+/// `None`).
 pub(crate) async fn capture_batch(
     cx: &CaptureCtx,
     server_uuid: &str,
     lineage_hash: &str,
     tables: &[(String, String)],
-    lock_wait_secs: u32,
-    after_first_lock: Option<BetweenHook<'_>>,
+    at_least: Option<&MySqlCheckpoint>,
+    wait_secs: u32,
+    between: Option<BetweenHook<'_>>,
 ) -> Result<Result<BatchCaptured, BatchCaptureError>, Cancelled> {
     capture_batch_with(
         &CAPTURE_SLOTS,
@@ -2156,26 +2341,29 @@ pub(crate) async fn capture_batch(
         server_uuid,
         lineage_hash,
         tables,
-        lock_wait_secs,
-        after_first_lock,
+        at_least,
+        wait_secs,
+        between,
     )
     .await
 }
 
 /// [`capture_batch`] under the given capture slots.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn capture_batch_with(
     slots: &'static CaptureSlots,
     cx: &CaptureCtx,
     server_uuid: &str,
     lineage_hash: &str,
     tables: &[(String, String)],
-    lock_wait_secs: u32,
-    after_first_lock: Option<BetweenHook<'_>>,
+    at_least: Option<&MySqlCheckpoint>,
+    wait_secs: u32,
+    between: Option<BetweenHook<'_>>,
 ) -> Result<Result<BatchCaptured, BatchCaptureError>, Cancelled> {
     let dsn = &cx.dsn;
     let failed = |e: ProofError| BatchCaptureError::Failed(e);
     // The window's rank order (first touch) for the schema read; the
-    // sorted order for the locks.
+    // sorted order for the existence read.
     let mut ranked: Vec<(String, String)> = Vec::with_capacity(tables.len());
     for t in tables {
         if !ranked.contains(t) {
@@ -2188,8 +2376,8 @@ pub(crate) async fn capture_batch_with(
     let t0 = Instant::now();
     // A capture dropped mid-flight (its window failed, was abandoned or
     // the run stopped) is killed on the server: its read-only transaction
-    // rolls back and its metadata locks are released at once, instead of
-    // when its query ends.
+    // and any query or wait it runs end at once, instead of when the query
+    // ends.
     let mut guard = KillOnDrop {
         dsn: dsn.clone(),
         source: cx.control.source().to_string(),
@@ -2198,19 +2386,18 @@ pub(crate) async fn capture_batch_with(
         permit: None,
     };
     let body = async {
-        // A lock-holding slot first (the runner-wide bound), within the
-        // lock-wait budget: a capture waiting for one holds no connection
-        // and no lock. Then a connection of the source's pool, proven to be
-        // the server (nothing is locked or read on another), within what
-        // remains; the session's own lock wait gets the rest.
-        let budget = Duration::from_secs(u64::from(lock_wait_secs));
+        // A capture slot first (the runner-wide bound), within the budget:
+        // a capture waiting for one holds no connection. Then a connection
+        // of the source's pool, proven to be the server (nothing is read on
+        // another), within what remains; the end's wait gets the rest.
+        let budget = Duration::from_secs(u64::from(wait_secs));
         let waited = Instant::now();
         let permit = tokio::time::timeout(budget, slots.holding.acquire())
             .await
             .map_err(|_| BatchCaptureError::Contention {
                 code: 0,
                 why: format!(
-                    "every lock-holding capture slot stayed busy for {lock_wait_secs} s"
+                    "every capture slot stayed busy for {wait_secs} s"
                 ),
             })?
             .expect("capture slots are never closed");
@@ -2231,18 +2418,38 @@ pub(crate) async fn capture_batch_with(
             .query_first("SELECT @@GLOBAL.gtid_mode")
             .await
             .map_err(|e| batch_error(e, "gtid_mode"))?;
-        let gtid_mode = mode.is_some_and(|m| m.eq_ignore_ascii_case("ON"));
-        let remaining =
-            budget.saturating_sub(waited.elapsed()).as_secs().max(1);
-        for q in [
-            format!("SET SESSION lock_wait_timeout = {remaining}"),
-            "START TRANSACTION READ ONLY".to_string(),
-        ] {
-            conn.query_drop(&q).await.map_err(|e| batch_error(e, &q))?;
-        }
+        require_gtid_mode(mode.as_deref()).map_err(failed)?;
         trace.connect = t0.elapsed();
-        // Which tables exist (one query): a dropped table has no shape and
-        // no lock. One dropped after this check fails the attempt (1146).
+        let t = Instant::now();
+        wait_executed(
+            &mut conn,
+            at_least,
+            budget.saturating_sub(waited.elapsed()),
+        )
+        .await
+        .map_err(|e| match e {
+            ProofError::Contention { code, why } => {
+                BatchCaptureError::Contention { code, why }
+            }
+            e => failed(e),
+        })?;
+        trace.end_wait += t.elapsed();
+        // A first, then the snapshot (module docs): every transaction in
+        // A's executed set is committed before the reads, so visible.
+        let t = Instant::now();
+        let from = read_position(&mut conn, true, lineage_hash)
+            .await
+            .map_err(failed)?;
+        trace.positions = t.elapsed();
+        open_snapshot(&mut conn)
+            .await
+            .map_err(|(e, q)| batch_error(e, q))?;
+        let t = Instant::now();
+        let visible = read_visible_bound(&mut conn, lineage_hash)
+            .await
+            .map_err(failed)?;
+        trace.positions += t.elapsed();
+        // Which tables exist (one query): a dropped table has no shape.
         let t = Instant::now();
         let mut missing = Vec::new();
         let present: Vec<(&str, &str)> = {
@@ -2272,27 +2479,6 @@ pub(crate) async fn capture_batch_with(
                 })
                 .collect()
         };
-        // Every table's metadata lock, in sorted order (any other order can
-        // deadlock against a multi-table DDL), held until COMMIT: one
-        // request, every statement's result consumed, so a lock timeout or
-        // deadlock of any of them surfaces with its code. A request beyond
-        // its bounds fails the capture (never one round trip per table).
-        let rest = match (after_first_lock, present.split_first()) {
-            (Some(hook), Some((one, rest))) => {
-                lock_all(&mut conn, std::slice::from_ref(one)).await?;
-                hook().await;
-                rest
-            }
-            _ => &present[..],
-        };
-        lock_all(&mut conn, rest).await?;
-        trace.lock_wait = t.elapsed();
-        let t = Instant::now();
-        let from = read_position(&mut conn, gtid_mode, lineage_hash)
-            .await
-            .map_err(failed)?;
-        trace.positions = t.elapsed();
-        let t = Instant::now();
         // In rank order, within the plan budget: the tables past it are
         // deferred, unread (`mysql_window_budget`).
         let in_rank: Vec<(&str, &str)> = ranked
@@ -2319,11 +2505,22 @@ pub(crate) async fn capture_batch_with(
             .iter()
             .map(|(db, table)| (db.to_string(), table.to_string()))
             .collect();
-        let t = Instant::now();
-        let position = read_position(&mut conn, gtid_mode, lineage_hash)
-            .await
-            .map_err(failed)?;
-        trace.positions += t.elapsed();
+        if let Some(hook) = between {
+            hook().await;
+        }
+        let position = read_capture_end(
+            &mut conn,
+            lineage_hash,
+            budget.saturating_sub(waited.elapsed()),
+            &mut trace,
+        )
+        .await
+        .map_err(|e| match e {
+            ProofError::Contention { code, why } => {
+                BatchCaptureError::Contention { code, why }
+            }
+            e => failed(e),
+        })?;
         match order_positions(
             &wm(&from).map_err(failed)?,
             &wm(&position).map_err(failed)?,
@@ -2338,12 +2535,19 @@ pub(crate) async fn capture_batch_with(
         conn.query_drop("COMMIT")
             .await
             .map_err(|e| batch_error(e, "COMMIT"))?;
+        // A table missing from the reads: absent, or hidden from the account.
+        for (db, table) in &missing {
+            absent_or_denied(&mut conn, db, table)
+                .await
+                .map_err(failed)?;
+        }
         // Unarmed first: a returned connection is never killed.
         guard.id = 0;
         conn.release().await;
         Ok(BatchCaptured {
             from,
             position,
+            visible,
             schemas,
             missing,
             deferred,
@@ -2365,17 +2569,17 @@ pub(crate) async fn capture_batch_with(
     }))
 }
 
-/// Bounded capture metrics (lock wait and schema query apart). Never fails.
+/// Bounded capture metrics (end wait and schema queries apart). Never fails.
 pub(crate) fn observe_capture(tag: &ScanTag<'_>, cap: &Captured) {
     let labels = [
         ("source", tag.source_id.to_string()),
         ("kind", tag.kind.as_str().to_string()),
     ];
     metrics::histogram!(
-        "deltaforge_mysql_proof_capture_lock_wait_seconds",
+        "deltaforge_mysql_proof_capture_end_wait_seconds",
         &labels
     )
-    .record(cap.trace.lock_wait.as_secs_f64());
+    .record(cap.trace.end_wait.as_secs_f64());
     metrics::histogram!(
         "deltaforge_mysql_proof_capture_schema_seconds",
         &labels
@@ -2431,7 +2635,7 @@ pub(crate) fn trace_proof(
             "to": {"file": c.position.file, "pos": c.position.pos, "gtid_set": c.position.gtid_set},
             "attempts": c.attempts,
             "connect_ms": c.trace.connect.as_secs_f64() * 1e3,
-            "lock_wait_ms": c.trace.lock_wait.as_secs_f64() * 1e3,
+            "end_wait_ms": c.trace.end_wait.as_secs_f64() * 1e3,
             "schema_ms": c.trace.schema.as_secs_f64() * 1e3,
             "positions_ms": c.trace.positions.as_secs_f64() * 1e3,
             "retries": c.trace.retries,
@@ -2474,8 +2678,11 @@ pub(crate) struct SharedProofs<'a> {
 /// `(from, position]` in which nothing affects `db.table` (a DDL naming it, a
 /// database barrier of its database, a lineage barrier). Ordinary writes and
 /// other tables' DDL never cause a retry; only a relevant statement inside the
-/// interval does, up to `attempts` times. Anything the scan cannot prove
-/// (retention, unknown events, limits, another server) fails closed.
+/// interval does (a capture takes no lock, so a DDL of the table can land
+/// there): at least `attempts` times, and on until `refused_for` has passed
+/// since the first attempt, with pauses growing to 1 s. Then it fails with
+/// [`ProofError::Unstable`]. Anything the scan cannot prove (retention,
+/// unknown events, limits, another server) fails closed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn capture_proven(
     cx: &CaptureCtx,
@@ -2486,6 +2693,7 @@ pub(crate) async fn capture_proven(
     table: &str,
     lower_case_table_names: u8,
     attempts: u32,
+    refused_for: Duration,
     limits: &ScanLimits,
     between: Option<BetweenHook<'_>>,
     tag: &ScanTag<'_>,
@@ -2504,15 +2712,19 @@ pub(crate) async fn capture_proven(
     let dsn = cx.dsn();
     let proven = async {
         let mut retries = Vec::new();
-        for attempt in 1..=attempts.max(1) {
+        let first = Instant::now();
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
             let mut cap = capture(
                 cx,
                 server_uuid,
                 lineage_hash,
                 db,
                 table,
+                None,
                 between,
-                LOCK_WAIT,
+                CAPTURE_WAIT,
             )
             .await
             .map_err(|Cancelled| Ended::Stopped)??;
@@ -2570,8 +2782,14 @@ pub(crate) async fn capture_proven(
                 return Ok(cap);
             }
             retries.push("relevant statement in the capture interval".into());
-            tokio::time::sleep(Duration::from_millis(20 * u64::from(attempt)))
-                .await;
+            if attempt >= attempts.max(1) && first.elapsed() >= refused_for {
+                break;
+            }
+            tokio::time::sleep(
+                Duration::from_millis(20 * u64::from(attempt))
+                    .min(Duration::from_secs(1)),
+            )
+            .await;
         }
         trace_proof(
             tag,
@@ -2582,7 +2800,7 @@ pub(crate) async fn capture_proven(
             lower_case_table_names,
             "unstable",
         );
-        Err(Ended::Failed(ProofError::Unstable(attempts.max(1))))
+        Err(Ended::Failed(ProofError::Unstable(attempt)))
     };
     match proven.await {
         Ok(cap) => Ok(Ok(cap)),
@@ -2635,7 +2853,7 @@ pub(crate) mod tests {
     /// each capture path passes the run's context on (forward proofs,
     /// snapshot and lazy baselines, failover drift, FULL fallback and
     /// activation windows). A capture with another token would outlast a
-    /// stop by its whole lock wait.
+    /// stop by its whole budget.
     #[test]
     fn every_capture_path_shares_the_runs_capture_context() {
         let sources = production_sources();
@@ -2813,36 +3031,6 @@ pub(crate) mod tests {
         ] {
             assert_ne!(base, other);
         }
-    }
-
-    /// One request: every table's lock statement, in the given order; a
-    /// request beyond its table or byte bound is refused, never split.
-    #[test]
-    fn the_lock_request_is_bounded() {
-        let names: Vec<(String, String)> =
-            (0..3).map(|i| ("d".to_string(), format!("t{i}"))).collect();
-        let tables: Vec<(&str, &str)> = names
-            .iter()
-            .map(|(d, t)| (d.as_str(), t.as_str()))
-            .collect();
-        assert_eq!(
-            lock_request(&tables).unwrap(),
-            "SELECT 1 FROM `d`.`t0` LIMIT 0;SELECT 1 FROM `d`.`t1` LIMIT 0;\
-             SELECT 1 FROM `d`.`t2` LIMIT 0;"
-        );
-        let many: Vec<(String, String)> = (0..=MAX_BATCH_TABLES)
-            .map(|i| ("d".to_string(), format!("t{i}")))
-            .collect();
-        let many: Vec<(&str, &str)> =
-            many.iter().map(|(d, t)| (d.as_str(), t.as_str())).collect();
-        assert!(lock_request(&many[..MAX_BATCH_TABLES]).is_some());
-        assert!(lock_request(&many).is_none(), "too many tables");
-        // 64-character names of 4-byte characters, all quoted: too many
-        // bytes well before the table bound.
-        let wide = "\u{1F600}".repeat(64);
-        let wide: Vec<(&str, &str)> =
-            vec![(wide.as_str(), wide.as_str()); MAX_BATCH_TABLES];
-        assert!(lock_request(&wide).is_none(), "too many bytes");
     }
 
     #[test]
@@ -4045,28 +4233,79 @@ pub(crate) mod tests {
                 assert_eq!(next.positioned_at.unwrap().0, c2.file);
             }
 
-            /// The session of a capture waiting for its table's metadata
-            /// lock, if any.
-            async fn waiting_capture(
-                dsn: &str,
-                db: &str,
-                table: &str,
-            ) -> Vec<u64> {
+            /// The sessions of captures waiting, at their end, for an owned
+            /// GTID to be executed ([`read_capture_end`]).
+            pub(super) async fn waiting_capture(dsn: &str) -> Vec<u64> {
                 let mut c = mysql_async::Conn::from_url(dsn).await.unwrap();
-                c.exec(
-                    "SELECT ID FROM information_schema.PROCESSLIST WHERE INFO = ?",
-                    (format!("SELECT 1 FROM `{db}`.`{table}` LIMIT 0"),),
+                c.query(
+                    "SELECT ID FROM information_schema.PROCESSLIST \
+                     WHERE STATE = 'Waiting for GTID to be committed' \
+                     AND INFO LIKE 'SELECT WAIT_FOR_EXECUTED_GTID_SET%'",
                 )
                 .await
                 .unwrap()
             }
 
-            /// A single-table capture dropped while it waits for its table's
-            /// metadata lock is killed on the server: its session does not
-            /// stay queued for the lock (finding 3, the unguarded capture).
+            /// A transaction that owns a GTID and has not committed: every
+            /// capture ending meanwhile waits for it (its end's wait), and
+            /// none holds or needs a lock. `release` commits it.
+            pub(super) struct OwnedGtid(mysql_async::Conn);
+
+            impl OwnedGtid {
+                /// The GTID this transaction owns.
+                pub(super) async fn gtid(&mut self) -> String {
+                    let g: Option<String> = self
+                        .0
+                        .query_first("SELECT @@SESSION.gtid_next")
+                        .await
+                        .unwrap();
+                    g.unwrap()
+                }
+
+                /// Owns the next GTID of a test server UUID, writing a row
+                /// of `db.t` (an `id INT PRIMARY KEY` table).
+                pub(super) async fn hold(dsn: &str, db: &str) -> Self {
+                    static NEXT: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let n = NEXT.fetch_add(1, Ordering::SeqCst) + 1;
+                    // Unique across the tests' runs on one server.
+                    let base = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros() as u64;
+                    let gno = base * 100 + n;
+                    let mut c = mysql_async::Conn::from_url(dsn).await.unwrap();
+                    for q in [
+                        format!(
+                            "SET GTID_NEXT = 'aaaaaaaa-0000-4000-8000-00000000dead:{gno}'"
+                        ),
+                        "BEGIN".to_string(),
+                        format!(
+                            "INSERT INTO {db}.t (id) VALUES ({})",
+                            gno % 1_000_000_000
+                        ),
+                    ] {
+                        c.query_drop(q).await.unwrap();
+                    }
+                    Self(c)
+                }
+
+                pub(super) async fn release(mut self) {
+                    self.0.query_drop("COMMIT").await.unwrap();
+                    self.0
+                        .query_drop("SET GTID_NEXT = 'AUTOMATIC'")
+                        .await
+                        .unwrap();
+                }
+            }
+
+            /// A single-table capture dropped while it waits at its end (an
+            /// owned GTID not yet executed) is killed on the server: its
+            /// session does not stay waiting (finding 3, the unguarded
+            /// capture).
             #[tokio::test]
             #[ignore = "requires docker"]
-            async fn a_dropped_single_capture_is_killed_while_it_waits_for_its_lock()
+            async fn a_dropped_single_capture_is_killed_while_it_waits_at_its_end()
              {
                 let dsn = server(true).await;
                 let db = "cancel_single";
@@ -4078,13 +4317,9 @@ pub(crate) mod tests {
                     ],
                 )
                 .await;
-                // Another session holds the table: the capture queues.
-                let mut holder =
-                    mysql_async::Conn::from_url(&dsn).await.unwrap();
-                holder
-                    .query_drop(format!("LOCK TABLES {db}.t WRITE"))
-                    .await
-                    .unwrap();
+                // Another session owns a GTID it has not committed: the
+                // capture waits for it at its end.
+                let holder = OwnedGtid::hold(&dsn, db).await;
                 let slots: &'static CaptureSlots =
                     Box::leak(Box::new(CaptureSlots::new(4, 4)));
                 let (d, u) = (dsn.clone(), uuid(&dsn).await);
@@ -4097,34 +4332,37 @@ pub(crate) mod tests {
                         db,
                         "t",
                         None,
-                        LOCK_WAIT,
+                        None,
+                        CAPTURE_WAIT,
                     )
                     .await
                     .expect("not cancelled")
                 });
-                let deadline = Instant::now() + Duration::from_secs(20);
-                while waiting_capture(&dsn, db, "t").await.is_empty() {
+                let deadline = Instant::now() + Duration::from_secs(4);
+                while waiting_capture(&dsn).await.is_empty() {
                     assert!(
                         Instant::now() < deadline,
-                        "the capture never queued"
+                        "the capture never waited"
                     );
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
+                let dropped = Instant::now();
                 task.abort();
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while !waiting_capture(&dsn, db, "t").await.is_empty() {
+                // Gone well before its own wait (its budget) would end it.
+                while !waiting_capture(&dsn).await.is_empty() {
                     assert!(
-                        Instant::now() < deadline,
-                        "the dropped capture's session still waits for the lock"
+                        dropped.elapsed() < Duration::from_secs(1),
+                        "the dropped capture's session still waits"
                     );
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                holder.query_drop("UNLOCK TABLES").await.unwrap();
+                holder.release().await;
             }
 
             /// A capture under `cx` on `db.t` (single, or the batched form
-            /// with a 300 s lock wait); `hold` pauses it, once locked, until
-            /// it is dropped. A failed capture is its error's text.
+            /// with a 300 s budget); `hold` pauses it inside its transaction,
+            /// after its schema reads, until it is dropped. A failed capture
+            /// is its error's text.
             pub(super) fn cancellable(
                 slots: &'static CaptureSlots,
                 cx: CaptureCtx,
@@ -4153,6 +4391,7 @@ pub(crate) mod tests {
                             &u,
                             LINEAGE,
                             &tables,
+                            None,
                             300,
                             Some(&hook),
                         )
@@ -4166,8 +4405,9 @@ pub(crate) mod tests {
                             LINEAGE,
                             db,
                             "t",
+                            None,
                             Some(&hook),
-                            LOCK_WAIT,
+                            CAPTURE_WAIT,
                         )
                         .await
                         .map(|r| r.map(|_| ()).map_err(|e| format!("{e:?}")))
@@ -4175,7 +4415,7 @@ pub(crate) mod tests {
                 })
             }
 
-            /// Whether `db.t`'s metadata lock is held by anyone.
+            /// Whether any session holds a metadata lock on `db.t`.
             async fn locked(dsn: &str, db: &str) -> bool {
                 let mut c = mysql_async::Conn::from_url(dsn).await.unwrap();
                 let held: Vec<String> = c
@@ -4189,13 +4429,12 @@ pub(crate) mod tests {
                 !held.is_empty()
             }
 
-            /// A capture cancelled while it waits for its table's metadata
-            /// lock (single, with its 30 s wait, and batched, with 300 s)
-            /// returns `Cancelled` at once; its session is killed and its
-            /// slot returns, with no failed kill.
+            /// A capture cancelled while it waits at its end (single and
+            /// batched) returns `Cancelled` at once; its session is killed
+            /// and its slot returns, with no failed kill.
             #[tokio::test]
             #[ignore = "requires docker"]
-            async fn a_cancelled_capture_ends_its_lock_wait_at_once() {
+            async fn a_cancelled_capture_ends_its_end_wait_at_once() {
                 let dsn = server(true).await;
                 for (db, batched) in
                     [("stop_wait_one", false), ("stop_wait_batch", true)]
@@ -4210,12 +4449,7 @@ pub(crate) mod tests {
                         ],
                     )
                     .await;
-                    let mut holder =
-                        mysql_async::Conn::from_url(&dsn).await.unwrap();
-                    holder
-                        .query_drop(format!("LOCK TABLES {db}.t WRITE"))
-                        .await
-                        .unwrap();
+                    let holder = OwnedGtid::hold(&dsn, db).await;
                     let slots: &'static CaptureSlots =
                         Box::leak(Box::new(CaptureSlots::new(4, 4)));
                     let cx = CaptureCtx::detached(dsn.as_str());
@@ -4228,13 +4462,13 @@ pub(crate) mod tests {
                         batched,
                         None,
                     );
-                    let deadline = Instant::now() + Duration::from_secs(20);
-                    while waiting_capture(&dsn, db, "t").await.is_empty() {
+                    let deadline = Instant::now() + Duration::from_secs(4);
+                    while waiting_capture(&dsn).await.is_empty() {
                         assert!(
                             Instant::now() < deadline,
-                            "{db}: the capture never queued"
+                            "{db}: the capture never waited"
                         );
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                     let t = Instant::now();
                     cx.stop();
@@ -4248,13 +4482,13 @@ pub(crate) mod tests {
                         "{db}: {:?}",
                         t.elapsed()
                     );
-                    let deadline = Instant::now() + Duration::from_secs(3);
-                    while !waiting_capture(&dsn, db, "t").await.is_empty() {
+                    let deadline = Instant::now() + Duration::from_secs(1);
+                    while !waiting_capture(&dsn).await.is_empty() {
                         assert!(
                             Instant::now() < deadline,
                             "{db}: the session still waits"
                         );
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                     let deadline = Instant::now() + Duration::from_secs(3);
                     while slots.holding.available_permits() < 4 {
@@ -4270,19 +4504,111 @@ pub(crate) mod tests {
                         failures,
                         "{db}: a kill failed"
                     );
-                    holder.query_drop("UNLOCK TABLES").await.unwrap();
+                    holder.release().await;
                 }
             }
 
-            /// A capture cancelled while it holds its table's metadata lock
-            /// (single and batched): a DDL queued behind it completes at
-            /// once, and its slot returns.
+            /// A capture waits, server-side, for its claim point to be
+            /// executed before it reads A: a claim point holding a GTID still
+            /// owned (written to the binlog, not yet committed) is waited
+            /// for, and A contains it once it commits (single and batched).
             #[tokio::test]
             #[ignore = "requires docker"]
-            async fn a_cancelled_capture_lets_a_queued_ddl_proceed() {
+            async fn a_capture_waits_for_its_claim_point_to_be_executed() {
                 let dsn = server(true).await;
                 for (db, batched) in
-                    [("stop_ddl_one", false), ("stop_ddl_batch", true)]
+                    [("claim_one", false), ("claim_batch", true)]
+                {
+                    sql(
+                        &dsn,
+                        &[
+                            &format!("CREATE DATABASE {db}"),
+                            &format!(
+                                "CREATE TABLE {db}.t (id INT PRIMARY KEY)"
+                            ),
+                        ],
+                    )
+                    .await;
+                    let mut holder = OwnedGtid::hold(&dsn, db).await;
+                    let owned = holder.gtid().await;
+                    let mut claim = position(&dsn).await;
+                    let mut set =
+                        GtidSet::parse(claim.gtid_set.as_deref().unwrap())
+                            .unwrap();
+                    assert!(set.insert(&owned));
+                    claim.gtid_set = Some(set.to_string());
+                    let (d, u) = (dsn.clone(), uuid(&dsn).await);
+                    let task = tokio::spawn(async move {
+                        let cx = CaptureCtx::detached(d.as_str());
+                        if batched {
+                            let tables =
+                                vec![(db.to_string(), "t".to_string())];
+                            capture_batch(
+                                &cx,
+                                &u,
+                                LINEAGE,
+                                &tables,
+                                Some(&claim),
+                                30,
+                                None,
+                            )
+                            .await
+                            .expect("not cancelled")
+                            .map(|c| c.from)
+                            .map_err(|e| format!("{e:?}"))
+                        } else {
+                            capture(
+                                &cx,
+                                &u,
+                                LINEAGE,
+                                db,
+                                "t",
+                                Some(&claim),
+                                None,
+                                CAPTURE_WAIT,
+                            )
+                            .await
+                            .expect("not cancelled")
+                            .map(|c| c.from)
+                            .map_err(|e| format!("{e:?}"))
+                        }
+                    });
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while waiting_capture(&dsn).await.is_empty() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "{db}: the capture did not wait"
+                        );
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    assert!(!task.is_finished());
+                    holder.release().await;
+                    let from =
+                        tokio::time::timeout(Duration::from_secs(10), task)
+                            .await
+                            .expect("returns once executed")
+                            .unwrap()
+                            .unwrap();
+                    assert!(
+                        GtidSet::parse(from.gtid_set.as_deref().unwrap())
+                            .unwrap()
+                            .contains(&owned),
+                        "{db}: A contains the claim point"
+                    );
+                }
+            }
+
+            /// A capture takes no lock on the source (single and batched):
+            /// paused inside its transaction, after its schema reads, it
+            /// holds no metadata lock on its table, and a DDL of the table
+            /// completes at once instead of waiting for it. Cancelled, it
+            /// returns at once and its slot returns.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn a_capture_never_holds_back_a_ddl_of_its_table() {
+                let dsn = server(true).await;
+                for (db, batched) in
+                    [("nolock_one", false), ("nolock_batch", true)]
                 {
                     sql(
                         &dsn,
@@ -4308,57 +4634,39 @@ pub(crate) mod tests {
                     );
                     let deadline = Instant::now() + Duration::from_secs(20);
                     while inside.load(Ordering::SeqCst) == 0 {
-                        assert!(
-                            Instant::now() < deadline,
-                            "{db}: never locked"
-                        );
+                        assert!(Instant::now() < deadline, "{db}: never read");
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                     assert!(
-                        locked(&dsn, db).await,
-                        "{db}: the capture holds no lock"
+                        !locked(&dsn, db).await,
+                        "{db}: the capture holds a metadata lock"
                     );
-                    let d = dsn.clone();
-                    let ddl = tokio::spawn(async move {
-                        let mut c =
-                            mysql_async::Conn::from_url(&d).await.unwrap();
-                        c.query_drop(format!(
-                            "ALTER TABLE {db}.t ADD COLUMN c INT"
-                        ))
+                    let mut c =
+                        mysql_async::Conn::from_url(&dsn).await.unwrap();
+                    c.query_drop("SET SESSION lock_wait_timeout = 2")
                         .await
-                    });
-                    let deadline = Instant::now() + Duration::from_secs(20);
-                    loop {
-                        let mut c =
-                            mysql_async::Conn::from_url(&dsn).await.unwrap();
-                        let queued: Vec<u64> = c
-                            .exec(
-                                "SELECT ID FROM information_schema.PROCESSLIST \
-                                 WHERE STATE = 'Waiting for table metadata lock' AND INFO LIKE ?",
-                                (format!("ALTER TABLE {db}.t%"),),
-                            )
-                            .await
-                            .unwrap();
-                        if !queued.is_empty() {
-                            break;
-                        }
-                        assert!(
-                            Instant::now() < deadline,
-                            "{db}: the DDL never queued"
-                        );
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
+                        .unwrap();
+                    let t = Instant::now();
+                    c.query_drop(format!(
+                        "ALTER TABLE {db}.t ADD COLUMN c INT"
+                    ))
+                    .await
+                    .expect("the DDL does not wait for the capture");
+                    assert!(
+                        t.elapsed() < Duration::from_secs(1),
+                        "{db}: the DDL took {:?}",
+                        t.elapsed()
+                    );
+                    assert!(
+                        !task.is_finished(),
+                        "{db}: the capture stays inside its transaction"
+                    );
                     cx.stop();
                     let r = tokio::time::timeout(Duration::from_secs(2), task)
                         .await
                         .expect("the cancelled capture returns at once")
                         .unwrap();
                     assert!(matches!(r, Err(Cancelled)), "{db}: {r:?}");
-                    tokio::time::timeout(Duration::from_secs(3), ddl)
-                        .await
-                        .expect("the queued DDL proceeds")
-                        .unwrap()
-                        .unwrap();
                     let deadline = Instant::now() + Duration::from_secs(3);
                     while slots.holding.available_permits() < 4 {
                         assert!(
@@ -4372,7 +4680,7 @@ pub(crate) mod tests {
 
             /// A cancelled capture whose kill fails still returns at once;
             /// the failure is counted and the slot retired (its session may
-            /// still hold the lock).
+            /// still be running).
             #[tokio::test]
             #[ignore = "requires docker"]
             async fn a_cancelled_capture_whose_kill_fails_retires_its_slot() {
@@ -4401,7 +4709,7 @@ pub(crate) mod tests {
                 );
                 let deadline = Instant::now() + Duration::from_secs(20);
                 while inside.load(Ordering::SeqCst) == 0 {
-                    assert!(Instant::now() < deadline, "never locked");
+                    assert!(Instant::now() < deadline, "never read");
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 let failures = kill_failures();
@@ -4428,11 +4736,11 @@ pub(crate) mod tests {
                 );
             }
 
-            /// At most `holding` captures hold metadata locks at once: the
-            /// next one waits, holding nothing, until a slot frees.
+            /// At most `holding` captures run at once: the next one waits,
+            /// holding no connection, until a slot frees.
             #[tokio::test]
             #[ignore = "requires docker"]
-            async fn at_most_the_bound_of_captures_hold_locks_at_once() {
+            async fn at_most_the_bound_of_captures_run_at_once() {
                 let dsn = server(true).await;
                 let db = "cancel_bound";
                 sql(&dsn, &[&format!("CREATE DATABASE {db}")]).await;
@@ -4466,14 +4774,14 @@ pub(crate) mod tests {
                                 release.acquire().await.unwrap().forget();
                             })
                         };
-                        capture_with(slots, &CaptureCtx::detached(d.as_str()), &u, LINEAGE, db, &format!("t{i}"), Some(&hook), LOCK_WAIT).await.expect("not cancelled")
+                        capture_with(slots, &CaptureCtx::detached(d.as_str()), &u, LINEAGE, db, &format!("t{i}"), None, Some(&hook), CAPTURE_WAIT).await.expect("not cancelled")
                     }));
                 }
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 assert_eq!(
                     inside.load(Ordering::SeqCst),
                     4,
-                    "captures holding locks at once"
+                    "captures running at once"
                 );
                 release.add_permits(5);
                 for t in tasks {
@@ -4482,11 +4790,11 @@ pub(crate) mod tests {
                 assert_eq!(inside.load(Ordering::SeqCst), 5);
             }
 
-            /// A capture waiting for a slot spends its lock-wait budget: with
-            /// every slot held, it ends as contention within that budget.
+            /// A capture waiting for a slot spends its budget: with every slot
+            /// held, it ends as contention within that budget.
             #[tokio::test]
             #[ignore = "requires docker"]
-            async fn waiting_for_a_capture_slot_counts_toward_the_lock_wait() {
+            async fn waiting_for_a_capture_slot_counts_toward_the_budget() {
                 let dsn = server(true).await;
                 let db = "cancel_wait";
                 sql(
@@ -4517,6 +4825,7 @@ pub(crate) mod tests {
                             &u,
                             LINEAGE,
                             &tables,
+                            None,
                             8,
                             Some(&hook),
                         )
@@ -4533,6 +4842,7 @@ pub(crate) mod tests {
                     &u,
                     LINEAGE,
                     &tables,
+                    None,
                     1,
                     None,
                 )
@@ -4547,8 +4857,8 @@ pub(crate) mod tests {
                 assert!(held.await.unwrap().is_ok());
             }
 
-            /// With every slot held by a lock-holding capture, dropping them
-            /// all kills every session: cancellation draws only on its own
+            /// With every slot held by a running capture, dropping them all
+            /// kills every session: cancellation draws only on its own
             /// reserve, never on what the captures hold.
             #[tokio::test]
             #[ignore = "requires docker"]
@@ -4582,7 +4892,7 @@ pub(crate) mod tests {
                             })
                         };
                         let tables = vec![(db.to_string(), format!("t{i}"))];
-                        capture_batch_with(slots, &CaptureCtx::detached(d.as_str()), &u, LINEAGE, &tables, 8, Some(&hook)).await.expect("not cancelled")
+                        capture_batch_with(slots, &CaptureCtx::detached(d.as_str()), &u, LINEAGE, &tables, None, 8, Some(&hook)).await.expect("not cancelled")
                     }));
                 }
                 let deadline = Instant::now() + Duration::from_secs(20);
@@ -4634,7 +4944,7 @@ pub(crate) mod tests {
             }
 
             /// A cancellation that does not resolve retires its slot: the
-            /// session may still hold its locks, so the slot never returns,
+            /// session may still be running, so the slot never returns,
             /// further captures get only the remaining capacity, and a
             /// successful cancellation still returns its own slot.
             #[tokio::test]
@@ -4672,6 +4982,7 @@ pub(crate) mod tests {
                             &u,
                             LINEAGE,
                             &tables,
+                            None,
                             8,
                             Some(&hook),
                         )
@@ -4684,25 +4995,17 @@ pub(crate) mod tests {
                     while inside.load(Ordering::SeqCst) == 0 {
                         assert!(
                             Instant::now() < deadline,
-                            "the capture never held its lock"
+                            "the capture never read"
                         );
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                 };
 
-                // A holds a real metadata lock, and its kill fails.
+                // A is inside its transaction (holding no lock), and its
+                // kill fails.
                 let a_inside = Arc::new(AtomicU32::new(0));
                 let a = held("a", a_inside.clone());
                 until(a_inside).await;
-                let mut c = mysql_async::Conn::from_url(&dsn).await.unwrap();
-                let locked: Vec<String> = c
-                    .exec(
-                        "SELECT OBJECT_NAME FROM performance_schema.metadata_locks WHERE OBJECT_SCHEMA = ? AND OBJECT_NAME = 'a'",
-                        (db,),
-                    )
-                    .await
-                    .unwrap();
-                assert!(!locked.is_empty(), "the capture held no lock");
                 slots.fail_kills.store(true, Ordering::SeqCst);
                 let failures = kill_failures();
                 a.abort();
@@ -4738,6 +5041,7 @@ pub(crate) mod tests {
                     &u,
                     LINEAGE,
                     &tables,
+                    None,
                     1,
                     None,
                 )
@@ -4768,9 +5072,9 @@ pub(crate) mod tests {
             }
 
             /// A cancellation connects with the run's DSN as it is when the
-            /// kill runs: a capture started on credentials A and blocked on a
-            /// held lock, dropped after a rotation replaced the shared DSN
-            /// with B and revoked A, is still killed.
+            /// kill runs: a capture started on credentials A and waiting at
+            /// its end, dropped after a rotation replaced the shared DSN with
+            /// B and revoked A, is still killed.
             #[tokio::test]
             #[ignore = "requires docker"]
             async fn a_cancellation_uses_the_dsn_replaced_after_its_capture_started()
@@ -4794,12 +5098,7 @@ pub(crate) mod tests {
                     |pw: &str| format!("mysql://{user}:{pw}@127.0.0.1:{port}/");
                 let shared =
                     crate::credentials::SharedDsn::from(as_user("pw-before"));
-                let mut holder =
-                    mysql_async::Conn::from_url(&dsn).await.unwrap();
-                holder
-                    .query_drop(format!("LOCK TABLES {db}.t WRITE"))
-                    .await
-                    .unwrap();
+                let holder = OwnedGtid::hold(&dsn, db).await;
                 let slots: &'static CaptureSlots =
                     Box::leak(Box::new(CaptureSlots::new(4, 4)));
                 let u = uuid(&dsn).await;
@@ -4809,7 +5108,7 @@ pub(crate) mod tests {
                     tokio::spawn(async move {
                         let tables = vec![(db.to_string(), "t".to_string())];
                         capture_batch_with(
-                            slots, &cx, &u, LINEAGE, &tables, 30, None,
+                            slots, &cx, &u, LINEAGE, &tables, None, 30, None,
                         )
                         .await
                         .expect("not cancelled")
@@ -4821,20 +5120,20 @@ pub(crate) mod tests {
                     let ids: Vec<u64> = c
                         .exec(
                             "SELECT ID FROM information_schema.PROCESSLIST WHERE USER = ? \
-                             AND STATE = 'Waiting for table metadata lock' AND ID <> CONNECTION_ID()",
+                             AND STATE = 'Waiting for GTID to be committed' AND ID <> CONNECTION_ID()",
                             (user,),
                         )
                         .await
                         .unwrap();
                     ids
                 };
-                let deadline = Instant::now() + Duration::from_secs(20);
+                let deadline = Instant::now() + Duration::from_secs(3);
                 while waiting(dsn.clone()).await.is_empty() {
                     assert!(
                         Instant::now() < deadline,
-                        "the capture never queued"
+                        "the capture never waited"
                     );
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 // Rotate: A stops working (the queued session stays), the
                 // shared DSN becomes B.
@@ -4848,16 +5147,17 @@ pub(crate) mod tests {
                 shared.replace(as_user("pw-after").into());
                 let failures = kill_failures();
                 task.abort();
-                let deadline = Instant::now() + Duration::from_secs(3);
+                // Gone well before its own wait (its budget) would end it.
+                let deadline = Instant::now() + Duration::from_secs(1);
                 while !waiting(dsn.clone()).await.is_empty() {
                     assert!(
                         Instant::now() < deadline,
                         "the cancelled capture was not killed with the replaced DSN"
                     );
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 assert_eq!(kill_failures(), failures, "the kill failed");
-                holder.query_drop("UNLOCK TABLES").await.unwrap();
+                holder.release().await;
                 sql(&dsn, &[&format!("DROP USER '{user}'@'%'")]).await;
             }
 
@@ -4903,6 +5203,7 @@ pub(crate) mod tests {
                     &uuid(&dsn).await,
                     LINEAGE,
                     &ranked,
+                    None,
                     8,
                     None,
                 )
@@ -4924,6 +5225,7 @@ pub(crate) mod tests {
                     &uuid(&dsn).await,
                     LINEAGE,
                     &ranked,
+                    None,
                     8,
                     None,
                 )
@@ -5298,14 +5600,14 @@ pub(crate) mod tests {
                 assert_eq!(later.schemas.len(), 1);
             }
 
-            /// A batched capture locks its tables in sorted order, whatever
-            /// order it is given: a two-table RENAME taking the same locks
-            /// (MySQL locks a multi-table statement's tables in that order)
-            /// waits for it instead of deadlocking (probe 7: the reverse order
-            /// deadlocks, 1213).
+            /// A multi-table RENAME of a batch's tables during its capture
+            /// neither waits for it nor deadlocks with it (with locks, the
+            /// reverse order deadlocked, 1213): it completes at once, the
+            /// capture reads both tables as they were before it, and the
+            /// RENAME is inside the capture's interval.
             #[tokio::test]
             #[ignore = "requires docker"]
-            async fn a_batched_capture_locks_in_sorted_order() {
+            async fn a_rename_of_a_batchs_tables_never_waits_for_its_capture() {
                 let dsn = server(true).await;
                 let db = "batch_order";
                 sql(
@@ -5317,24 +5619,23 @@ pub(crate) mod tests {
                     ],
                 )
                 .await;
-                let rename = std::sync::Arc::new(tokio::sync::Mutex::new(None));
-                let (d, r) = (dsn.clone(), rename.clone());
+                let d = dsn.clone();
                 let hook = move || -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-                let (d, r) = (d.clone(), r.clone());
-                Box::pin(async move {
-                    // The RENAME queues behind the first lock; give it time
-                    // to take what it can before the batch's second lock.
-                    let task = tokio::spawn(async move {
+                    let d = d.clone();
+                    Box::pin(async move {
                         let mut c = mysql_async::Conn::from_url(&d).await.unwrap();
-                        c.query_drop(format!(
-                            "RENAME TABLE {db}.t010 TO {db}.r010, {db}.t011 TO {db}.r011"
-                        ))
+                        c.query_drop("SET SESSION lock_wait_timeout = 2").await.unwrap();
+                        tokio::time::timeout(
+                            Duration::from_secs(2),
+                            c.query_drop(format!(
+                                "RENAME TABLE {db}.t010 TO {db}.r010, {db}.t011 TO {db}.r011"
+                            )),
+                        )
                         .await
-                    });
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    *r.lock().await = Some(task);
-                })
-            };
+                        .expect("the rename does not wait for the capture")
+                        .unwrap();
+                    })
+                };
                 let tables = vec![
                     (db.to_string(), "t011".to_string()),
                     (db.to_string(), "t010".to_string()),
@@ -5344,6 +5645,7 @@ pub(crate) mod tests {
                     &uuid(&dsn).await,
                     LINEAGE,
                     &tables,
+                    None,
                     8,
                     Some(&hook),
                 )
@@ -5353,20 +5655,26 @@ pub(crate) mod tests {
                 let cap = cap.unwrap();
                 assert_eq!(cap.schemas.len(), 2);
                 assert!(cap.missing.is_empty());
-                let task = rename.lock().await.take().expect("the rename ran");
-                task.await
-                    .unwrap()
-                    .expect("the rename waits, then succeeds");
+                let r = scan(&dsn, &cap.from, &cap.position).await.unwrap();
+                for t in ["t010", "t011"] {
+                    assert!(
+                        r.statements.iter().any(|st| {
+                            crate::mysql::mysql_baseline::affects(st, db, t, 0)
+                        }),
+                        "{t}: the rename is inside the capture's interval: {:?}",
+                        affected(&r)
+                    );
+                }
             }
 
-            /// A lock timeout fails the attempt as contention, and the attempt
-            /// holds no lock afterwards: a DDL on the batch's other table runs
-            /// at once.
+            /// A capture takes no lock: a table another session holds with
+            /// `LOCK TABLES ... WRITE` is captured at once, within a 1 s
+            /// budget.
             #[tokio::test]
             #[ignore = "requires docker"]
-            async fn a_lock_timeout_is_contention_and_holds_nothing() {
+            async fn a_table_locked_by_another_session_is_captured_at_once() {
                 let dsn = server(true).await;
-                let db = "batch_timeout";
+                let db = "batch_locked";
                 sql(
                     &dsn,
                     &[
@@ -5386,11 +5694,58 @@ pub(crate) mod tests {
                     (db.to_string(), "b".to_string()),
                     (db.to_string(), "a".to_string()),
                 ];
+                let t = Instant::now();
+                let cap = capture_batch(
+                    &CaptureCtx::detached(dsn.as_str()),
+                    &uuid(&dsn).await,
+                    LINEAGE,
+                    &tables,
+                    None,
+                    1,
+                    None,
+                )
+                .await
+                .expect("not cancelled")
+                .expect("captured while the table is locked");
+                assert!(
+                    t.elapsed() < Duration::from_secs(1),
+                    "{:?}",
+                    t.elapsed()
+                );
+                assert!(
+                    cap.table(db, "a").is_some()
+                        && cap.table(db, "b").is_some()
+                );
+                locker.query_drop("UNLOCK TABLES").await.unwrap();
+            }
+
+            /// An end whose owned GTIDs are not executed within the budget
+            /// is contention (code 0), and leaves nothing behind: the
+            /// session's wait is over and a DDL of its tables runs at once.
+            #[tokio::test]
+            #[ignore = "requires docker"]
+            async fn an_end_wait_past_the_budget_is_contention_and_holds_nothing()
+             {
+                let dsn = server(true).await;
+                let db = "batch_end_timeout";
+                sql(
+                    &dsn,
+                    &[
+                        &format!("CREATE DATABASE {db}"),
+                        &format!("CREATE TABLE {db}.t (id INT PRIMARY KEY)"),
+                        &format!("CREATE TABLE {db}.a (id INT PRIMARY KEY)"),
+                    ],
+                )
+                .await;
+                let holder = OwnedGtid::hold(&dsn, db).await;
+                let tables = vec![(db.to_string(), "a".to_string())];
+                let t = Instant::now();
                 let r = capture_batch(
                     &CaptureCtx::detached(dsn.as_str()),
                     &uuid(&dsn).await,
                     LINEAGE,
                     &tables,
+                    None,
                     1,
                     None,
                 )
@@ -5399,18 +5754,37 @@ pub(crate) mod tests {
                 assert!(
                     matches!(
                         r,
-                        Err(BatchCaptureError::Contention { code: 1205, .. })
+                        Err(BatchCaptureError::Contention { code: 0, .. })
                     ),
                     "{r:?}"
                 );
+                assert!(
+                    t.elapsed() < Duration::from_secs(3),
+                    "{:?}",
+                    t.elapsed()
+                );
+                assert!(waiting_capture(&dsn).await.is_empty());
                 let mut ddl = mysql_async::Conn::from_url(&dsn).await.unwrap();
                 ddl.query_drop("SET SESSION lock_wait_timeout = 2")
                     .await
                     .unwrap();
                 ddl.query_drop(format!("ALTER TABLE {db}.a ADD COLUMN c INT"))
                     .await
-                    .expect("no lock on a is left behind");
-                locker.query_drop("UNLOCK TABLES").await.unwrap();
+                    .expect("nothing is left behind on a");
+                holder.release().await;
+                // Once executed, the end is reached.
+                capture_batch(
+                    &CaptureCtx::detached(dsn.as_str()),
+                    &uuid(&dsn).await,
+                    LINEAGE,
+                    &tables,
+                    None,
+                    5,
+                    None,
+                )
+                .await
+                .expect("not cancelled")
+                .expect("captured once the GTID is executed");
             }
 
             /// A table that no longer exists has no shape: the batch captures
@@ -5437,6 +5811,7 @@ pub(crate) mod tests {
                     &uuid(&dsn).await,
                     LINEAGE,
                     &tables,
+                    None,
                     5,
                     None,
                 )
@@ -6198,6 +6573,7 @@ pub(crate) mod tests {
                 "t",
                 0,
                 attempts,
+                Duration::ZERO,
                 &limits(),
                 hook.as_ref().map(|h| h as BetweenHook<'_>),
                 &TAG,
@@ -6570,8 +6946,8 @@ pub(crate) mod tests {
             shared_equals_direct(false, "shared_f").await;
         }
 
-        /// A FULL-fallback capture records its proof: lock wait and schema
-        /// query apart, the scan that proved it.
+        /// A FULL-fallback capture records its proof: end wait and schema
+        /// queries apart, the scan that proved it.
         #[tokio::test]
         #[ignore = "requires docker"]
         async fn a_proven_capture_is_traced() {
@@ -6599,7 +6975,7 @@ pub(crate) mod tests {
                 (p["db"].as_str(), p["table"].as_str()),
                 (Some("trace_c"), Some("t"))
             );
-            assert!(p["capture"]["lock_wait_ms"].is_number());
+            assert!(p["capture"]["end_wait_ms"].is_number());
             assert!(p["capture"]["schema_ms"].is_number());
             assert!(cap.trace.schema > Duration::ZERO);
             let scans = records.of("scan");
@@ -6676,7 +7052,9 @@ pub(crate) mod tests {
         #[tokio::test]
         #[ignore = "requires docker"]
         async fn a_quiet_server_gives_an_empty_capture_interval() {
-            for gtid in [true, false] {
+            {
+                // Captures run in GTID mode only (`a_capture_requires_gtid_mode`).
+                let gtid = true;
                 let dsn = server(gtid).await;
                 let db = if gtid { "cap_quiet_g" } else { "cap_quiet_f" };
                 capture_table(&dsn, db).await;
@@ -6701,7 +7079,9 @@ pub(crate) mod tests {
         #[tokio::test]
         #[ignore = "requires docker"]
         async fn ordinary_writes_never_prevent_a_capture() {
-            for gtid in [true, false] {
+            {
+                // Captures run in GTID mode only (`a_capture_requires_gtid_mode`).
+                let gtid = true;
                 let dsn = server(gtid).await;
                 let db = if gtid { "cap_busy_g" } else { "cap_busy_f" };
                 capture_table(&dsn, db).await;
@@ -6738,8 +7118,9 @@ pub(crate) mod tests {
                     LINEAGE,
                     db,
                     "t",
+                    None,
                     Some(&hook),
-                    LOCK_WAIT,
+                    CAPTURE_WAIT,
                 )
                 .await
                 .expect("not cancelled")
@@ -6754,7 +7135,9 @@ pub(crate) mod tests {
         #[tokio::test]
         #[ignore = "requires docker"]
         async fn unrelated_ddl_does_not_invalidate_a_capture() {
-            for gtid in [true, false] {
+            {
+                // Captures run in GTID mode only (`a_capture_requires_gtid_mode`).
+                let gtid = true;
                 let dsn = server(gtid).await;
                 let db = if gtid { "cap_unrel_g" } else { "cap_unrel_f" };
                 capture_table(&dsn, db).await;
@@ -6803,116 +7186,286 @@ pub(crate) mod tests {
         }
 
         /// The schema read is four separate queries. A DDL of the table or
-        /// its database (an ALTER, a rename swap, an ALTER DATABASE) issued between any two of them, or after
-        /// the last, waits for the capture's lock: the capture reads one
-        /// coherent shape (never one assembled from two versions), the DDL
-        /// lands after its interval, and the next capture reads the new
-        /// shape.
+        /// its database (an ALTER, a rename swap, an ALTER DATABASE) issued
+        /// between any two of them, or after the last, completes at once
+        /// (the capture takes no lock). The capture still reads one coherent
+        /// shape, the one before the DDL (one snapshot, never assembled from
+        /// two versions); the DDL lands inside its interval, so the scan of
+        /// that interval finds it and the capture's own proof refuses it;
+        /// the next capture reads the new shape.
         #[tokio::test]
         #[ignore = "requires docker"]
-        async fn a_ddl_between_any_two_reads_waits_for_the_capture() {
-            for gtid in [true, false] {
-                let dsn = server(gtid).await;
-                for step in 1..=4u8 {
-                    for (k, ddl, new_shape) in [
-                        (
-                            "alter",
-                            "ALTER TABLE {db}.t ADD COLUMN c INT",
-                            vec!["id", "name", "c"],
-                        ),
-                        (
-                            "database",
-                            "ALTER DATABASE {db} CHARACTER SET utf8mb4",
-                            vec!["id", "name"],
-                        ),
-                        (
-                            "swap",
-                            "RENAME TABLE {db}.t TO {db}.t_tmp, {db}.t_x TO {db}.t, {db}.t_tmp TO {db}.t_x",
-                            vec!["id", "other"],
-                        ),
-                    ] {
-                        let db = format!(
-                            "cap_rel_{}_{step}_{k}",
-                            if gtid { "g" } else { "f" }
-                        );
-                        let db: &'static str = Box::leak(db.into_boxed_str());
-                        capture_table(&dsn, db).await;
-                        sql(&dsn, &[&format!(
-                            "CREATE TABLE {db}.t_x (id INT PRIMARY KEY, other INT)"
-                        )])
-                        .await;
-                        let ddl = ddl.replace("{db}", db);
-                        let task: Arc<
-                            std::sync::Mutex<
-                                Option<tokio::task::JoinHandle<()>>,
-                            >,
-                        > = Default::default();
-                        let (d, slot) = (dsn.clone(), task.clone());
-                        let issue: Action = Arc::new(move || {
-                            let (dsn, slot, ddl) =
-                                (d.clone(), slot.clone(), ddl.clone());
-                            Box::pin(async move {
-                                let t = tokio::spawn(async move {
-                                    sql(&dsn, &[&ddl]).await;
-                                });
-                                tokio::time::sleep(Duration::from_millis(300))
-                                    .await;
-                                assert!(!t.is_finished(), "the DDL must wait");
-                                *slot.lock().unwrap() = Some(t);
-                            })
-                        });
-                        let between = if step == 4 {
-                            Some(issue)
-                        } else {
-                            read_hook::set(
-                                db,
-                                Arc::new(move |s| {
-                                    let issue = issue.clone();
-                                    Box::pin(async move {
-                                        if s == step {
-                                            issue().await;
-                                        }
-                                    })
-                                }),
-                            );
-                            None
-                        };
-                        let r = proven(&dsn, db, 1, between.as_ref()).await;
-                        read_hook::clear(db);
-                        let c = r.unwrap();
-                        assert_eq!(
-                            columns(&c),
-                            ["id", "name"],
-                            "gtid={gtid} step={step} {k}"
-                        );
-                        let t =
-                            task.lock().unwrap().take().expect("DDL issued");
-                        tokio::time::timeout(Duration::from_secs(10), t)
+        async fn a_ddl_between_any_two_reads_lands_inside_the_capture() {
+            let dsn = server(true).await;
+            for step in 1..=4u8 {
+                for (k, ddl, new_shape) in [
+                    (
+                        "alter",
+                        "ALTER TABLE {db}.t ADD COLUMN c INT",
+                        vec!["id", "name", "c"],
+                    ),
+                    (
+                        "database",
+                        "ALTER DATABASE {db} CHARACTER SET utf8mb4",
+                        vec!["id", "name"],
+                    ),
+                    (
+                        "swap",
+                        "RENAME TABLE {db}.t TO {db}.t_tmp, {db}.t_x TO {db}.t, {db}.t_tmp TO {db}.t_x",
+                        vec!["id", "other"],
+                    ),
+                ] {
+                    let db = format!("cap_rel_{step}_{k}");
+                    let db: &'static str = Box::leak(db.into_boxed_str());
+                    capture_table(&dsn, db).await;
+                    sql(&dsn, &[&format!(
+                        "CREATE TABLE {db}.t_x (id INT PRIMARY KEY, other INT)"
+                    )])
+                    .await;
+                    let ddl = ddl.replace("{db}", db);
+                    let d = dsn.clone();
+                    let issue: Action = Arc::new(move || {
+                        let (dsn, ddl) = (d.clone(), ddl.clone());
+                        Box::pin(async move {
+                            tokio::time::timeout(
+                                Duration::from_secs(2),
+                                sql(&dsn, &[&ddl]),
+                            )
                             .await
-                            .expect("the DDL proceeds after the capture")
-                            .unwrap();
-                        assert!(strictly_before(
-                            &c.position,
-                            &position(&dsn).await
-                        ));
-                        let after = proven(&dsn, db, 1, None).await.unwrap();
-                        assert_eq!(
-                            columns(&after),
-                            new_shape,
-                            "gtid={gtid} step={step} {k}"
+                            .expect("the DDL does not wait for the capture");
+                        })
+                    });
+                    let between = if step == 4 {
+                        Some(issue)
+                    } else {
+                        read_hook::set(
+                            db,
+                            Arc::new(move |s| {
+                                let issue = issue.clone();
+                                Box::pin(async move {
+                                    if s == step {
+                                        issue().await;
+                                    }
+                                })
+                            }),
                         );
-                    }
+                        None
+                    };
+                    let hook = between.map(|a| move || a());
+                    let c = capture(
+                        &CaptureCtx::detached(dsn.as_str()),
+                        &uuid(&dsn).await,
+                        LINEAGE,
+                        db,
+                        "t",
+                        None,
+                        hook.as_ref().map(|h| h as BetweenHook<'_>),
+                        CAPTURE_WAIT,
+                    )
+                    .await
+                    .expect("not cancelled");
+                    read_hook::clear(db);
+                    let c = c.unwrap();
+                    assert_eq!(
+                        columns(&c),
+                        ["id", "name"],
+                        "step={step} {k}: one coherent shape, before the DDL"
+                    );
+                    let r = scan(&dsn, &c.from, &c.position).await.unwrap();
+                    assert!(
+                        r.statements.iter().any(|st| {
+                            crate::mysql::mysql_baseline::affects(
+                                st, db, "t", 0,
+                            )
+                        }),
+                        "step={step} {k}: the DDL is inside the interval"
+                    );
+                    let after = proven(&dsn, db, 1, None).await.unwrap();
+                    assert_eq!(columns(&after), new_shape, "step={step} {k}");
                 }
             }
         }
 
-        /// Lineage barriers (unattributable statements) that are not DDL of
-        /// the table or its database are not held off by the lock: one inside
-        /// the interval refuses the attempt.
+        /// A table missing from a capture's reads is told apart: hidden
+        /// from the account (no privilege on it) is an authorization
+        /// failure, single and batched; a dropped table the account may
+        /// read keeps its outcome (single: not found; batched: missing).
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_table_hidden_from_the_account_is_an_authorization_failure() {
+            let root = server(true).await;
+            let db = "cap_hidden";
+            let user = "cap_hidden_u";
+            sql(
+                &root,
+                &[
+                    &format!("DROP DATABASE IF EXISTS {db}"),
+                    &format!("CREATE DATABASE {db}"),
+                    &format!("CREATE TABLE {db}.seen (id INT PRIMARY KEY)"),
+                    &format!("CREATE TABLE {db}.hidden (id INT PRIMARY KEY)"),
+                    &format!("DROP USER IF EXISTS '{user}'@'%'"),
+                    &format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'pw'"),
+                    &format!("GRANT REPLICATION CLIENT ON *.* TO '{user}'@'%'"),
+                    &format!("GRANT SELECT ON {db}.seen TO '{user}'@'%'"),
+                    // A table the account may read, dropped since (the grant
+                    // stays). Without a grant, MySQL refuses a missing table as
+                    // denied too, so as not to reveal whether it exists.
+                    &format!("CREATE TABLE {db}.dropped (id INT PRIMARY KEY)"),
+                    &format!("GRANT SELECT ON {db}.dropped TO '{user}'@'%'"),
+                    &format!("DROP TABLE {db}.dropped"),
+                ],
+            )
+            .await;
+            let dsn = root.replacen("root:pw@", &format!("{user}:pw@"), 1);
+            let u = uuid(&root).await;
+            let one = |t: &'static str| {
+                let (d, u) = (dsn.clone(), u.clone());
+                async move {
+                    capture(
+                        &CaptureCtx::detached(d.as_str()),
+                        &u,
+                        LINEAGE,
+                        db,
+                        t,
+                        None,
+                        None,
+                        CAPTURE_WAIT,
+                    )
+                    .await
+                    .expect("not cancelled")
+                }
+            };
+            assert!(one("seen").await.is_ok());
+            let r = one("hidden").await;
+            assert!(
+                matches!(&r, Err(ProofError::Open(Failure::Authorization, _))),
+                "{r:?}"
+            );
+            let r = one("dropped").await;
+            assert!(matches!(&r, Err(ProofError::Capture(_))), "{r:?}");
+            let batch = |t: &'static str| {
+                let (d, u) = (dsn.clone(), u.clone());
+                async move {
+                    let tables = vec![
+                        (db.to_string(), "seen".to_string()),
+                        (db.to_string(), t.to_string()),
+                    ];
+                    capture_batch(
+                        &CaptureCtx::detached(d.as_str()),
+                        &u,
+                        LINEAGE,
+                        &tables,
+                        None,
+                        5,
+                        None,
+                    )
+                    .await
+                    .expect("not cancelled")
+                }
+            };
+            let r = batch("hidden").await;
+            assert!(
+                matches!(
+                    &r,
+                    Err(BatchCaptureError::Failed(ProofError::Open(
+                        Failure::Authorization,
+                        _
+                    )))
+                ),
+                "{r:?}"
+            );
+            let cap = batch("dropped").await.unwrap();
+            assert_eq!(
+                cap.missing,
+                vec![(db.to_string(), "dropped".to_string())]
+            );
+            sql(&root, &[&format!("DROP USER '{user}'@'%'")]).await;
+        }
+
+        /// A capture runs only in GTID mode: on a file-position server it
+        /// fails before reading anything, naming the requirement.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_capture_requires_gtid_mode() {
+            let dsn = server(false).await;
+            capture_table(&dsn, "cap_nogtid").await;
+            let r = capture(
+                &CaptureCtx::detached(dsn.as_str()),
+                &uuid(&dsn).await,
+                LINEAGE,
+                "cap_nogtid",
+                "t",
+                None,
+                None,
+                CAPTURE_WAIT,
+            )
+            .await
+            .expect("not cancelled");
+            assert!(
+                matches!(&r, Err(ProofError::Capture(why)) if why.contains("gtid_mode=ON")),
+                "{r:?}"
+            );
+        }
+
+        /// A schema change of the table inside every capture is retried
+        /// past the minimum attempts until the refusal bound has passed
+        /// since the first, then fails `Unstable` with every attempt made.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn refusals_are_retried_until_their_bound() {
+            let dsn = server(true).await;
+            let db = "cap_refused";
+            capture_table(&dsn, db).await;
+            let n = Arc::new(AtomicU32::new(0));
+            let (d, k) = (dsn.clone(), n.clone());
+            let every = move || {
+                let (dsn, k) = (d.clone(), k.clone());
+                Box::pin(async move {
+                    let i = k.fetch_add(1, Ordering::SeqCst);
+                    sql(
+                        &dsn,
+                        &[&format!("ALTER TABLE {db}.t ADD COLUMN c{i} INT")],
+                    )
+                    .await;
+                })
+                    as std::pin::Pin<
+                        Box<dyn std::future::Future<Output = ()> + Send>,
+                    >
+            };
+            let t = Instant::now();
+            let r = capture_proven(
+                &CaptureCtx::detached(dsn.as_str()),
+                4_000_142,
+                &uuid(&dsn).await,
+                LINEAGE,
+                db,
+                "t",
+                0,
+                2,
+                Duration::from_secs(2),
+                &limits(),
+                Some(&every),
+                &TAG,
+                None,
+            )
+            .await
+            .expect("not cancelled");
+            let made = n.load(Ordering::SeqCst);
+            assert!(
+                matches!(r, Err(ProofError::Unstable(a)) if a == made && a > 2),
+                "{r:?} after {made} attempts"
+            );
+            assert!(t.elapsed() >= Duration::from_secs(2), "{:?}", t.elapsed());
+        }
+
+        /// Lineage barriers (unattributable statements) inside the interval
+        /// refuse the attempt, like any DDL of the table or its database.
         #[tokio::test]
         #[ignore = "requires docker"]
         async fn barriers_in_the_interval_are_detected() {
-            for gtid in [true, false] {
+            {
+                // Captures run in GTID mode only (`a_capture_requires_gtid_mode`).
+                let gtid = true;
                 let dsn = server(gtid).await;
                 let db = if gtid { "cap_bar_g" } else { "cap_bar_f" };
                 for stmts in [
@@ -7003,6 +7556,7 @@ pub(crate) mod tests {
                 "t",
                 0,
                 3,
+                Duration::ZERO,
                 &ScanLimits {
                     max_events: 1,
                     ..limits()
@@ -7022,7 +7576,8 @@ pub(crate) mod tests {
                 "cap_fail",
                 "t",
                 None,
-                LOCK_WAIT,
+                None,
+                CAPTURE_WAIT,
             )
             .await
             .expect("not cancelled");
@@ -7034,7 +7589,8 @@ pub(crate) mod tests {
                 "cap_fail",
                 "missing",
                 None,
-                LOCK_WAIT,
+                None,
+                CAPTURE_WAIT,
             )
             .await
             .expect("not cancelled");
@@ -7055,111 +7611,222 @@ pub(crate) mod tests {
             n
         }
 
-        /// While the capture runs, its connection holds the table's
-        /// SHARED_READ metadata lock for the transaction: inserts and
-        /// updates of the table proceed, a DDL of the table waits until the
-        /// capture ends and lands after its interval.
+        /// The wrong-shape check, live: a schema change storm on one table
+        /// (each `ADD COLUMN` under a known GTID) while writes and captures
+        /// run. For every capture, the shape implied by the changes before
+        /// its start A (`expected`) is what it must have read whenever it
+        /// would be admitted: with nothing affecting the table in its
+        /// interval, or (the narrowed rule) with the first change in it
+        /// outside the capture's visible bound. Both cases must occur.
         #[tokio::test]
         #[ignore = "requires docker"]
-        async fn the_capture_lock_admits_writes_and_holds_off_ddl() {
-            for gtid in [true, false] {
-                let dsn = server(gtid).await;
-                let db = if gtid { "cap_lock_g" } else { "cap_lock_f" };
-                capture_table(&dsn, db).await;
-                sql(&dsn, &[&format!("INSERT INTO {db}.t VALUES (1, 'a')")])
-                    .await;
-                let alter: Arc<
-                    std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-                > = Default::default();
-                let (d, slot) = (dsn.clone(), alter.clone());
-                let hook = move || {
-                    let (dsn, slot) = (d.clone(), slot.clone());
-                    Box::pin(async move {
-                        let mut c =
-                            mysql_async::Conn::from_url(&dsn).await.unwrap();
-                        let held: Option<String> = c
-                            .query_first(format!(
-                                "SELECT CONCAT(LOCK_TYPE, '/', LOCK_DURATION, '/', LOCK_STATUS) \
-                                 FROM performance_schema.metadata_locks \
-                                 WHERE OBJECT_TYPE = 'TABLE' AND OBJECT_SCHEMA = '{db}' \
-                                 AND OBJECT_NAME = 't'"
-                            ))
+        async fn captures_under_a_schema_change_storm_never_admit_a_wrong_shape()
+         {
+            let dsn = server(true).await;
+            let db = "cap_storm";
+            sql(&dsn, &[
+                &format!("DROP DATABASE IF EXISTS {db}"),
+                &format!("CREATE DATABASE {db}"),
+                &format!("CREATE TABLE {db}.t (id INT AUTO_INCREMENT PRIMARY KEY)"),
+            ])
+            .await;
+            const W: &str = "bbbbbbbb-0000-4000-8000-00000000c0de";
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // The storm: change k adds column `c{k}` under GTID W:k.
+            let storm = {
+                let (d, stop) = (dsn.clone(), stop.clone());
+                tokio::spawn(async move {
+                    let mut c = mysql_async::Conn::from_url(&d).await.unwrap();
+                    let mut k = 0u64;
+                    while !stop.load(Ordering::SeqCst) && k < 400 {
+                        k += 1;
+                        c.query_drop(format!("SET GTID_NEXT = '{W}:{k}'"))
                             .await
                             .unwrap();
-                        assert_eq!(
-                            held.as_deref(),
-                            Some("SHARED_READ/TRANSACTION/GRANTED")
-                        );
-                        // Writes to the table are not held off.
-                        tokio::time::timeout(Duration::from_secs(5), async {
-                            c.query_drop(format!(
-                                "INSERT INTO {db}.t VALUES (2, 'b')"
-                            ))
-                            .await
-                            .unwrap();
-                            c.query_drop(format!(
-                                "UPDATE {db}.t SET name = 'u' WHERE id = 1"
-                            ))
-                            .await
-                            .unwrap();
-                        })
+                        c.query_drop(format!(
+                            "ALTER TABLE {db}.t ADD COLUMN c{k} INT"
+                        ))
                         .await
-                        .expect("DML proceeds under the capture lock");
-                        c.disconnect().await.ok();
-                        // A DDL of the table waits for the lock.
-                        let task = tokio::spawn(async move {
-                            sql(
-                                &dsn,
-                                &[&format!(
-                                    "ALTER TABLE {db}.t ADD COLUMN c INT"
-                                )],
-                            )
-                            .await;
-                        });
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        assert!(!task.is_finished(), "the DDL must wait");
-                        *slot.lock().unwrap() = Some(task);
-                    })
-                        as std::pin::Pin<
-                            Box<dyn std::future::Future<Output = ()> + Send>,
-                        >
-                };
+                        .unwrap();
+                        c.query_drop("SET GTID_NEXT = 'AUTOMATIC'")
+                            .await
+                            .unwrap();
+                        // Bursts with quiet gaps: some captures see none.
+                        let pause = if k.is_multiple_of(10) { 400 } else { 3 };
+                        tokio::time::sleep(Duration::from_millis(pause)).await;
+                    }
+                    k
+                })
+            };
+            let writes = {
+                let (d, stop) = (dsn.clone(), stop.clone());
+                tokio::spawn(async move {
+                    let mut c = mysql_async::Conn::from_url(&d).await.unwrap();
+                    while !stop.load(Ordering::SeqCst) {
+                        c.query_drop(format!(
+                            "INSERT INTO {db}.t (id) VALUES (NULL)"
+                        ))
+                        .await
+                        .ok();
+                    }
+                })
+            };
+            let u = uuid(&dsn).await;
+            let (mut plain, mut narrowed) = (0u32, 0u32);
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(8) {
                 let c = capture(
                     &CaptureCtx::detached(dsn.as_str()),
-                    &uuid(&dsn).await,
+                    &u,
                     LINEAGE,
                     db,
                     "t",
-                    Some(&hook),
-                    LOCK_WAIT,
+                    None,
+                    None,
+                    CAPTURE_WAIT,
                 )
                 .await
                 .expect("not cancelled")
                 .unwrap();
-                assert_eq!(columns(&c), ["id", "name"]);
-                let task = alter.lock().unwrap().take().unwrap();
-                tokio::time::timeout(Duration::from_secs(10), task)
-                    .await
-                    .expect("the DDL proceeds once the capture ends")
+                let a = GtidSet::parse(c.from.gtid_set.as_deref().unwrap())
                     .unwrap();
-                assert!(strictly_before(&c.position, &position(&dsn).await));
-                // The DDL is after the interval: the capture's own proof holds.
+                let expected: Vec<String> = std::iter::once("id".to_string())
+                    .chain(
+                        (1..=400u64)
+                            .take_while(|k| a.contains(&format!("{W}:{k}")))
+                            .map(|k| format!("c{k}")),
+                    )
+                    .collect();
                 let r = scan(&dsn, &c.from, &c.position).await.unwrap();
-                assert!(affected(&r).iter().all(|a| a != &format!("{db}.t")));
+                let first = r.statements.iter().find(|st| {
+                    crate::mysql::mysql_baseline::affects(st, db, "t", 0)
+                });
+                let admitted = match first.map(|st| &st.event) {
+                    None => {
+                        plain += 1;
+                        true
+                    }
+                    Some(
+                        crate::mysql::mysql_activation::EventIdentity::Gtid {
+                            gtid,
+                            ..
+                        },
+                    ) if !c.visible.contains(gtid) => {
+                        narrowed += 1;
+                        true
+                    }
+                    _ => false,
+                };
+                if admitted {
+                    assert_eq!(
+                        columns(&c),
+                        expected,
+                        "a wrong shape at {:?}",
+                        c.from
+                    );
+                }
             }
+            stop.store(true, Ordering::SeqCst);
+            let changes = storm.await.unwrap();
+            writes.await.unwrap();
+            assert!(changes > 30, "{changes} schema changes");
+            assert!(
+                plain > 0 && narrowed > 0,
+                "plain {plain}, narrowed {narrowed}"
+            );
+        }
+
+        /// While the capture runs, its connection holds no metadata lock on
+        /// the table: inserts, updates and a DDL of the table all proceed at
+        /// once. The DDL lands inside the capture's interval, where its scan
+        /// finds it.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_capture_holds_no_lock_and_holds_nothing_off() {
+            let dsn = server(true).await;
+            let db = "cap_nolock";
+            capture_table(&dsn, db).await;
+            sql(&dsn, &[&format!("INSERT INTO {db}.t VALUES (1, 'a')")]).await;
+            let d = dsn.clone();
+            let hook = move || {
+                let dsn = d.clone();
+                Box::pin(async move {
+                    let mut c =
+                        mysql_async::Conn::from_url(&dsn).await.unwrap();
+                    let held: Vec<String> = c
+                        .query(format!(
+                            "SELECT CONCAT(LOCK_TYPE, '/', LOCK_DURATION, '/', LOCK_STATUS) \
+                             FROM performance_schema.metadata_locks \
+                             WHERE OBJECT_TYPE = 'TABLE' AND OBJECT_SCHEMA = '{db}' \
+                             AND OBJECT_NAME = 't'"
+                        ))
+                        .await
+                        .unwrap();
+                    assert!(held.is_empty(), "the capture holds {held:?}");
+                    c.query_drop("SET SESSION lock_wait_timeout = 2")
+                        .await
+                        .unwrap();
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        c.query_drop(format!(
+                            "INSERT INTO {db}.t VALUES (2, 'b')"
+                        ))
+                        .await
+                        .unwrap();
+                        c.query_drop(format!(
+                            "UPDATE {db}.t SET name = 'u' WHERE id = 1"
+                        ))
+                        .await
+                        .unwrap();
+                        c.query_drop(format!(
+                            "ALTER TABLE {db}.t ADD COLUMN c INT"
+                        ))
+                        .await
+                        .unwrap();
+                    })
+                    .await
+                    .expect("writes and the DDL proceed during the capture");
+                    c.disconnect().await.ok();
+                })
+                    as std::pin::Pin<
+                        Box<dyn std::future::Future<Output = ()> + Send>,
+                    >
+            };
+            let c = capture(
+                &CaptureCtx::detached(dsn.as_str()),
+                &uuid(&dsn).await,
+                LINEAGE,
+                db,
+                "t",
+                None,
+                Some(&hook),
+                CAPTURE_WAIT,
+            )
+            .await
+            .expect("not cancelled")
+            .unwrap();
+            assert_eq!(columns(&c), ["id", "name"], "read before the DDL");
+            let r = scan(&dsn, &c.from, &c.position).await.unwrap();
+            assert!(
+                affected(&r).iter().any(|a| a == &format!("{db}.t")),
+                "the DDL is inside the capture's interval"
+            );
         }
 
         /// The adversarial window: a DDL of the table whose binlog event is
         /// already written (the binlog position includes it) while its
         /// dictionary change is not yet visible (the group commit holds it
         /// before the engine commit). A capture then must not read the prior
-        /// shape as if valid at that position: it waits for the DDL and reads
-        /// the new shape.
+        /// shape as if valid at that position: the DDL owns its GTID until it
+        /// commits, so the capture's end waits for it and contains it, the
+        /// DDL is inside the capture's interval, and the proven capture is
+        /// the next one, with the new shape.
         #[tokio::test]
         #[ignore = "requires docker"]
         async fn a_ddl_in_the_binlog_but_not_yet_visible_is_never_captured_stale()
          {
-            for gtid in [false, true] {
+            {
+                // Captures run in GTID mode only (`a_capture_requires_gtid_mode`).
+                let gtid = true;
                 // Own server: the commit delay is global.
                 let (_c, port) = start(gtid).await;
                 let dsn = dsn_of(port);
@@ -7224,8 +7891,9 @@ pub(crate) mod tests {
                 LINEAGE,
                 "cap_cover",
                 "t",
+                None,
                 Some(&hook),
-                LOCK_WAIT,
+                CAPTURE_WAIT,
             )
             .await
             .expect("not cancelled")
@@ -7292,7 +7960,7 @@ pub(crate) mod tests {
                 (stop, task)
             }
 
-            /// Captures queued for a lock-holding slot (single and batched)
+            /// Captures queued for a capture slot (single and batched)
             /// stay within the source's pool: one source never holds more
             /// than `P` control connections, however many captures wait.
             #[tokio::test]
@@ -7312,7 +7980,7 @@ pub(crate) mod tests {
                 let u = uuid(&root).await;
                 let slots: &'static CaptureSlots =
                     Box::leak(Box::new(CaptureSlots::new(1, 1)));
-                // The only lock-holding slot is taken: every capture queues.
+                // The only capture slot is taken: every capture queues.
                 let held = slots.holding.acquire().await.unwrap();
                 let cx = CaptureCtx::detached(dsn.as_str());
                 let tasks: Vec<_> = (0..2 * P)
@@ -7410,10 +8078,9 @@ pub(crate) mod tests {
             }
 
             /// Cancellation never waits behind ordinary work: with every
-            /// ordinary permit of the runner held by `L` captures queued
-            /// for their tables' metadata locks (single and batched), a stop
-            /// kills each of them through the reserve, at once, with no
-            /// failed kill.
+            /// ordinary permit of the runner held by `L` captures waiting at
+            /// their ends (single and batched), a stop kills each of them
+            /// through the reserve, at once, with no failed kill.
             #[tokio::test]
             #[ignore = "requires docker"]
             async fn cancellation_draws_on_its_reserve_with_the_budget_full() {
@@ -7427,12 +8094,7 @@ pub(crate) mod tests {
                     ],
                 )
                 .await;
-                let mut holder =
-                    mysql_async::Conn::from_url(&root).await.unwrap();
-                holder
-                    .query_drop(format!("LOCK TABLES {db}.t WRITE"))
-                    .await
-                    .unwrap();
+                let holder = positioned::OwnedGtid::hold(&root, db).await;
                 const L: usize = 2;
                 // G = R + L: the L captures take every ordinary permit.
                 let budget: &'static crate::mysql::mysql_control::Budget =
@@ -7461,13 +8123,13 @@ pub(crate) mod tests {
                         )
                     })
                     .collect();
-                let deadline = Instant::now() + Duration::from_secs(20);
-                while positioned_waiting(&root, db).await < L {
+                let deadline = Instant::now() + Duration::from_secs(4);
+                while positioned::waiting_capture(&root).await.len() < L {
                     assert!(
                         Instant::now() < deadline,
-                        "the captures never queued"
+                        "the captures never waited"
                     );
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 assert_eq!(
                     budget.available(),
@@ -7483,38 +8145,23 @@ pub(crate) mod tests {
                         .unwrap();
                     assert!(matches!(r, Err(Cancelled)), "{r:?}");
                 }
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while positioned_waiting(&root, db).await > 0 {
+                // Gone well before their own waits (their budget) would end them.
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while !positioned::waiting_capture(&root).await.is_empty() {
                     assert!(
                         Instant::now() < deadline,
                         "a killed session still waits"
                     );
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 assert!(
-                    t.elapsed() < Duration::from_secs(5),
+                    t.elapsed() < Duration::from_secs(2),
                     "{:?}",
                     t.elapsed()
                 );
                 assert_eq!(kill_failures(), failures, "a kill failed");
                 assert_eq!(slots.retired(), 0);
-                holder.query_drop("UNLOCK TABLES").await.unwrap();
-            }
-
-            /// Sessions queued for `db.t`'s metadata lock.
-            async fn positioned_waiting(dsn: &str, db: &str) -> usize {
-                let mut c = mysql_async::Conn::from_url(dsn).await.unwrap();
-                let n: Option<u64> = c
-                    .exec_first(
-                        "SELECT COUNT(*) FROM information_schema.PROCESSLIST \
-                         WHERE STATE = 'Waiting for table metadata lock' AND DB IS NULL \
-                         AND INFO LIKE ?",
-                        (format!("%`{db}`.`t`%"),),
-                    )
-                    .await
-                    .unwrap();
-                c.disconnect().await.ok();
-                n.unwrap_or(0) as usize
+                holder.release().await;
             }
 
             /// A capture that gets no control-plane connection within its
@@ -7555,7 +8202,7 @@ pub(crate) mod tests {
                 );
                 let tables = vec![(db.to_string(), "t".to_string())];
                 let t = Instant::now();
-                let r = capture_batch(&cx, &u, LINEAGE, &tables, 1, None)
+                let r = capture_batch(&cx, &u, LINEAGE, &tables, None, 1, None)
                     .await
                     .expect("not cancelled");
                 let Err(BatchCaptureError::Failed(
@@ -7596,9 +8243,10 @@ pub(crate) mod tests {
                 }
                 held.release().await;
                 // With the permit back, the capture proceeds.
-                let ok = capture_batch(&cx, &u, LINEAGE, &tables, 5, None)
-                    .await
-                    .expect("not cancelled");
+                let ok =
+                    capture_batch(&cx, &u, LINEAGE, &tables, None, 5, None)
+                        .await
+                        .expect("not cancelled");
                 assert!(ok.is_ok(), "{ok:?}");
             }
         }

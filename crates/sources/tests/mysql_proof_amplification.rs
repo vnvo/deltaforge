@@ -517,12 +517,6 @@ async fn bounded_gtid() {
     bounded(true).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires docker"]
-async fn bounded_file_position() {
-    bounded(false).await;
-}
-
 /// With relevant DDL and barriers in the interval: the record holds them,
 /// FULL fallback and forward proofs are served by the shared scanner, and
 /// the proofs still read the distinct interval about once.
@@ -558,12 +552,6 @@ async fn bounded_ddl_gtid() {
     bounded_ddl(true).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires docker"]
-async fn bounded_ddl_file_position() {
-    bounded_ddl(false).await;
-}
-
 /// The evidence run (environment-sized), reported offline.
 async fn evidence(gtid: bool) {
     let a = amplification(
@@ -581,10 +569,4 @@ async fn evidence(gtid: bool) {
 #[ignore = "evidence harness"]
 async fn gtid() {
     evidence(true).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "evidence harness"]
-async fn file_position() {
-    evidence(false).await;
 }

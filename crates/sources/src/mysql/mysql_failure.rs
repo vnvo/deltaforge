@@ -42,7 +42,7 @@ impl Failure {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Contention(1213) => "deadlock",
-            Self::Contention(0) => "capture_slots_busy",
+            Self::Contention(0) => "capture_wait",
             Self::Contention(_) => "lock_wait_timeout",
             Self::Transport => "transport",
             Self::Authentication => "authentication",

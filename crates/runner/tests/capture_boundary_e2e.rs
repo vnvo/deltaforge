@@ -11,7 +11,8 @@
 //! - a failure between the durable boundary and the stream opening resumes
 //!   at that boundary, never a newer one (MySQL, PostgreSQL);
 //! - a snapshot pipeline is `starting` until its generation completes;
-//! - MySQL with GTID off; a MySQL user without the `log_status` privileges.
+//! - MySQL with GTID off (refused at start); a MySQL user without the
+//!   `log_status` privileges.
 //!
 //! The boundary seams (`sources::stream_probe`) are process-wide: one test
 //! at a time. Run with:
@@ -414,34 +415,20 @@ async fn mysql_a_write_after_running_is_delivered() -> Result<()> {
     Ok(())
 }
 
-/// GTID off: the boundary is the position alone, read in the same one
-/// statement; a write after running is delivered.
+/// GTID off: the source refuses the server before it fixes a boundary or
+/// reads anything (a schema capture needs the executed set to show what is
+/// committed), so the pipeline fails and records no capture start.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires docker"]
-async fn mysql_gtid_off_captures_from_the_position() -> Result<()> {
+async fn mysql_gtid_off_is_refused_at_start() -> Result<()> {
     let (_my, port) = start_mysql(false).await;
     mysql_user(port, "df", true).await;
     let hook = Hook::start().await;
     let (mgr, _) = manager().await;
     mgr.start_pipeline(mysql_spec("mynogtid", port, "df", "never", &hook.url))
         .await?;
-    until_status(&mgr, "mynogtid", "running").await;
-    match capture_start(&mgr, "mynogtid").await {
-        CaptureStart::Mysql {
-            origin,
-            gtid_set,
-            file,
-            pos,
-            ..
-        } => {
-            assert_eq!(origin, CaptureOrigin::FirstStart);
-            assert_eq!(gtid_set, None);
-            assert!(!file.is_empty() && pos > 0, "{file}:{pos}");
-        }
-        other => panic!("{other:?}"),
-    }
-    mysql_insert(port, 2_000).await;
-    hook.until_accepted(2_000).await;
+    until_status(&mgr, "mynogtid", "failed").await;
+    assert_eq!(info(&mgr, "mynogtid").await.capture_start, None);
     Ok(())
 }
 

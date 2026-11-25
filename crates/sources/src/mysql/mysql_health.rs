@@ -893,7 +893,38 @@ pub(crate) async fn require_supported_server(
     if let Some(refusal) = server_version_refusal(&version) {
         return Err(refusal);
     }
+    require_gtid_mode(conn).await?;
     require_complete_binlog(conn).await
+}
+
+/// Refuse a server without GTIDs: a schema capture takes no lock on the
+/// source and proves which transactions its reads could see from the
+/// executed GTID set (`mysql_binlog_scan`), which a server with
+/// `gtid_mode` other than `ON` does not keep. Fails closed when it cannot
+/// be read.
+async fn require_gtid_mode(
+    conn: &mut mysql_async::Conn,
+) -> std::result::Result<(), String> {
+    let mode: Option<String> = conn
+        .query_first("SELECT @@GLOBAL.gtid_mode")
+        .await
+        .map_err(|e| format!("cannot read gtid_mode: {e}"))?;
+    gtid_mode_refusal(mode.as_deref()).map_or(Ok(()), Err)
+}
+
+/// The refusal for a `gtid_mode` value, `None` for `ON`.
+fn gtid_mode_refusal(mode: Option<&str>) -> Option<String> {
+    match mode {
+        Some(m) if m.eq_ignore_ascii_case("ON") => None,
+        other => Some(format!(
+            "gtid_mode is {:?}, must be ON: DeltaForge captures table \
+             definitions without locking them and needs the executed GTID set \
+             to know which transactions a capture could see. Enable it with \
+             enforce_gtid_consistency=ON (online, through OFF_PERMISSIVE and \
+             ON_PERMISSIVE on every server of the topology).",
+            other.unwrap_or("unknown")
+        )),
+    }
 }
 
 /// Refuse a server whose binlog may not hold every transaction it applies:
@@ -1003,6 +1034,21 @@ mod tests {
         assert_eq!(format_duration(30), "30s");
         assert_eq!(format_duration(90), "1m30s");
         assert_eq!(format_duration(3661), "1h1m");
+    }
+
+    #[test]
+    fn every_source_requires_gtid_mode_on() {
+        assert_eq!(gtid_mode_refusal(Some("ON")), None);
+        assert_eq!(gtid_mode_refusal(Some("on")), None);
+        for other in [
+            Some("OFF"),
+            Some("ON_PERMISSIVE"),
+            Some("OFF_PERMISSIVE"),
+            None,
+        ] {
+            let why = gtid_mode_refusal(other).expect("refused");
+            assert!(why.contains("must be ON"), "{why}");
+        }
     }
 
     #[test]

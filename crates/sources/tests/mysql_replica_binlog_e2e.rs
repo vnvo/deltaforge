@@ -460,12 +460,6 @@ async fn replica_behavior_and_refusal_gtid() {
     replica_binlog(true).await;
 }
 
-#[tokio::test]
-#[ignore = "requires docker"]
-async fn replica_behavior_and_refusal_file_position() {
-    replica_binlog(false).await;
-}
-
 /// A server with no replication channel and the setting OFF is refused: a
 /// channel can be configured on it at any time. Configuring one does not
 /// change the outcome.
@@ -498,12 +492,6 @@ async fn a_primary_without_log_replica_updates_is_refused_gtid() {
     no_channel_is_not_enough(true).await;
 }
 
-#[tokio::test]
-#[ignore = "requires docker"]
-async fn a_primary_without_log_replica_updates_is_refused_file_position() {
-    no_channel_is_not_enough(false).await;
-}
-
 /// A channel added to a running source's server (ON, as required) keeps its
 /// binlog complete: the replicated rows reach the stream.
 async fn a_channel_added_while_streaming(gtid: bool) {
@@ -534,12 +522,6 @@ async fn a_channel_added_while_streaming(gtid: bool) {
 #[ignore = "requires docker"]
 async fn a_channel_added_while_streaming_stays_complete_gtid() {
     a_channel_added_while_streaming(true).await;
-}
-
-#[tokio::test]
-#[ignore = "requires docker"]
-async fn a_channel_added_while_streaming_stays_complete_file_position() {
-    a_channel_added_while_streaming(false).await;
 }
 
 /// An initial snapshot on an OFF server is refused before anything: no
@@ -704,12 +686,6 @@ async fn a_restart_into_off(gtid: bool) {
 #[ignore = "requires docker"]
 async fn a_restart_into_off_is_refused_on_reconnect_gtid() {
     a_restart_into_off(true).await;
-}
-
-#[tokio::test]
-#[ignore = "requires docker"]
-async fn a_restart_into_off_is_refused_on_reconnect_file_position() {
-    a_restart_into_off(false).await;
 }
 
 /// A failover at every boundary of a transaction. The source is held inside

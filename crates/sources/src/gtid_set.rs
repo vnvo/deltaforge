@@ -236,6 +236,62 @@ fn split_gtid(gtid: &str) -> Option<(std::borrow::Cow<'_, str>, u64)> {
     (n > 0).then_some((uuid, n))
 }
 
+/// The GTIDs (`uuid:n`, lowercase) of a global `@@gtid_owned` read: per
+/// owned GTID `:<n>#<thread>` after its server's UUID, servers concatenated
+/// without a separator (`Owned_gtids::to_string`). Each UUID is found by its
+/// fixed dash positions, so a thread id's digits are never read as the start
+/// of the next UUID. `None` on anything else, a tagged GTID included.
+pub(crate) fn owned_gtids(s: &str) -> Option<Vec<String>> {
+    fn uuid_at(b: &[u8], i: usize) -> bool {
+        b.len() >= i + 36
+            && (0..36).all(|k| match k {
+                8 | 13 | 18 | 23 => b[i + k] == b'-',
+                _ => b[i + k].is_ascii_hexdigit(),
+            })
+    }
+    let s = s.trim();
+    let b = s.as_bytes();
+    // Every UUID's start, left to right.
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if uuid_at(b, i) {
+            starts.push(i);
+            i += 36;
+        } else {
+            i += 1;
+        }
+    }
+    if starts.first().is_some_and(|&f| f != 0)
+        || (starts.is_empty() && !s.is_empty())
+    {
+        return None;
+    }
+    let mut out = Vec::new();
+    for (k, &start) in starts.iter().enumerate() {
+        let uuid = s[start..start + 36].to_ascii_lowercase();
+        let end = starts.get(k + 1).copied().unwrap_or(b.len());
+        let rest = &s[start + 36..end];
+        // `(:<n>#<thread>)+`
+        let entries = rest.strip_prefix(':')?;
+        for entry in entries.split(':') {
+            let (n, thread) = entry.split_once('#')?;
+            let digits = |t: &str| {
+                !t.is_empty() && t.bytes().all(|c| c.is_ascii_digit())
+            };
+            if !digits(n) || !digits(thread) {
+                return None;
+            }
+            let n: u64 = n.parse().ok()?;
+            if n == 0 {
+                return None;
+            }
+            out.push(format!("{uuid}:{n}"));
+        }
+    }
+    Some(out)
+}
+
 /// Sort and merge overlapping or adjacent intervals.
 fn normalize(ivs: &mut Intervals) {
     ivs.sort_unstable();
@@ -265,6 +321,44 @@ mod tests {
 
     fn ins(s: &mut GtidSet, g: &str) {
         assert!(s.insert(g), "inserts {g}");
+    }
+
+    #[test]
+    fn owned_gtids_are_read_from_the_servers_concatenated_text() {
+        assert_eq!(owned_gtids(""), Some(vec![]));
+        assert_eq!(
+            owned_gtids(&format!("{U}:5#12")),
+            Some(vec![format!("{U}:5")])
+        );
+        // Several GTIDs of one server, then another server with no
+        // separator, whose UUID starts with digits that could read as the
+        // thread id.
+        let w = "12345678-0000-11f1-8000-000000000002";
+        assert_eq!(
+            owned_gtids(&format!("{U}:5#12:9#3{w}:7#41")),
+            Some(vec![format!("{U}:5"), format!("{U}:9"), format!("{w}:7")])
+        );
+        // Upper case is the same server.
+        assert_eq!(
+            owned_gtids(&format!("{}:2#1", V.to_ascii_uppercase())),
+            Some(vec![format!("{V}:2")])
+        );
+    }
+
+    #[test]
+    fn owned_gtids_refuse_what_is_not_the_servers_format() {
+        for bad in [
+            U.to_string(),
+            format!("{U}:5"),
+            format!("{U}:5#"),
+            format!("{U}:0#1"),
+            format!("{U}:tag:5#1"),
+            format!("{U}:5#1,{V}:2#1"),
+            format!("x{U}:5#1"),
+            "ANONYMOUS".to_string(),
+        ] {
+            assert_eq!(owned_gtids(&bad), None, "{bad}");
+        }
     }
 
     #[test]

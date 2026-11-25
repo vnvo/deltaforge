@@ -91,17 +91,30 @@ pub(crate) fn source_decode_failed(
     )
 }
 
-/// An activation window's batched capture could not lock its tables'
-/// metadata within its attempts (`docs/design/mysql-proof-seek.md`,
-/// "Capture contention fails closed"). Nothing of the window was
-/// dispatched; the checkpoint stays at `at`, the boundary before it. A
-/// restart (the normal recovery policy) retries once the schema change
-/// holding the lock is done.
+/// The reason class of a capture's contention code: a server deadlock or
+/// lock wait timeout, else `capture_wait` (no capture slot, or transactions
+/// still owned after the reads not executed in time).
+pub(crate) fn contention_class(code: u16) -> &'static str {
+    match code {
+        1213 => "deadlock",
+        1205 => "lock_wait_timeout",
+        _ => "capture_wait",
+    }
+}
+
+/// A schema capture could not complete within its attempts
+/// (`docs/design/mysql-proof-seek.md`, "Capture contention fails closed"):
+/// `class` is [`contention_class`], or `relevant_ddl` when schema changes of
+/// the table kept landing inside every capture for its whole refusal bound.
+/// A capture takes no lock on the source, so nothing here holds the server
+/// back. Nothing that needed the capture was dispatched; the checkpoint
+/// stays at `at`, the boundary before it. A restart (the normal recovery
+/// policy) retries.
 pub(crate) fn mysql_capture_contention(
     source_id: &str,
     tables: &[(String, String)],
     attempts: u32,
-    code: u16,
+    class: &str,
     at: &crate::mysql::MySqlCheckpoint,
     details: &str,
 ) -> SourceError {
@@ -109,10 +122,6 @@ pub(crate) fn mysql_capture_contention(
         .first()
         .map(|(d, t)| format!("{d}.{t}"))
         .unwrap_or_default();
-    let class = match code {
-        1213 => "deadlock",
-        _ => "lock_wait_timeout",
-    };
     let position = match &at.gtid_set {
         Some(g) => g.clone(),
         None => format!("{}:{}", at.file, at.pos),
@@ -140,9 +149,8 @@ pub(crate) fn mysql_capture_contention(
         draft,
         SourceError::Schema {
             details: format!(
-                "activation window: the metadata of {} table(s) (first {first}) \
-                 could not be locked for their schema capture after {attempts} \
-                 attempt(s): {details}",
+                "the schema capture of {} table(s) (first {first}) did not \
+                 complete after {attempts} attempt(s) ({class}): {details}",
                 tables.len()
             )
             .into(),

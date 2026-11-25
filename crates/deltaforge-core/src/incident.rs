@@ -909,10 +909,12 @@ pub fn explain(
             ev.show(K::ReasonClass),
         ),
         ReasonCode::MysqlCaptureContention => format!(
-            "{component} could not lock the metadata of {} table(s) (first {}) \
-             for their schema capture after {} attempt(s) ({}). It stopped \
-             before the rows that first touched them; the checkpoint stays at \
-             {}. A schema change holding a lock on one of them must finish.",
+            "{component} could not complete the schema capture of {} table(s) \
+             (first {}) after {} attempt(s) ({}). It stopped before the rows \
+             that needed it; the checkpoint stays at {}, and a restart retries. \
+             capture_wait: the capture's budget ran out (no capture slot, or \
+             transactions still committing on the server); relevant_ddl: schema \
+             changes of the table kept landing inside every capture.",
             ev.show(K::BlockingCount),
             ev.show(K::Table),
             ev.show(K::Attempts),
@@ -973,9 +975,7 @@ pub fn explain(
             "{component} could not prove the schema of {} table(s) (first {}) \
              after a DDL: {} attempt(s), last failure {}. It stopped before \
              the DDL; the checkpoint stays at {}, and a restart replays the \
-             DDL and proves it again. For lock contention, \
-             performance_schema.metadata_locks names the session holding the \
-             table's metadata lock.",
+             DDL and proves it again.",
             ev.show(K::BlockingCount),
             ev.show(K::Table),
             ev.show(K::Attempts),

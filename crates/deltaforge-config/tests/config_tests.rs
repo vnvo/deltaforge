@@ -1271,8 +1271,8 @@ fn postgres_max_message_bytes_is_bounded() {
 #[test]
 fn mysql_proof_bounds_are_validated() {
     use deltaforge_config::{
-        MYSQL_PROOF_CAPTURE_CONCURRENCY, MYSQL_PROOF_CONTROL_CONNECTIONS,
-        MYSQL_PROOF_LOCK_WAIT_SECS, MYSQL_PROOF_MAX_SEEK_MS,
+        MYSQL_PROOF_CAPTURE_CONCURRENCY, MYSQL_PROOF_CAPTURE_WAIT_SECS,
+        MYSQL_PROOF_CONTROL_CONNECTIONS, MYSQL_PROOF_MAX_SEEK_MS,
         MYSQL_PROOF_WINDOW_BYTES, MYSQL_PROOF_WINDOW_EVENTS,
         MYSQL_PROOF_WINDOW_MS, MysqlProofCfg,
     };
@@ -1285,7 +1285,7 @@ fn mysql_proof_bounds_are_validated() {
             d.activation_window_events,
             d.activation_window_bytes,
             d.max_seek_ms,
-            d.capture_lock_wait_secs,
+            d.capture_wait_secs,
             d.control_connections,
             d.activation_capture_concurrency
         ),
@@ -1313,9 +1313,9 @@ fn mysql_proof_bounds_are_validated() {
             *MYSQL_PROOF_MAX_SEEK_MS.end(),
         ),
         (
-            "capture_lock_wait_secs",
-            u64::from(*MYSQL_PROOF_LOCK_WAIT_SECS.start()),
-            u64::from(*MYSQL_PROOF_LOCK_WAIT_SECS.end()),
+            "capture_wait_secs",
+            u64::from(*MYSQL_PROOF_CAPTURE_WAIT_SECS.start()),
+            u64::from(*MYSQL_PROOF_CAPTURE_WAIT_SECS.end()),
         ),
         (
             "control_connections",
@@ -1335,6 +1335,14 @@ fn mysql_proof_bounds_are_validated() {
             assert!(e.contains(name), "{name}={bad}: {e}");
         }
     }
+    // The earlier name is still read, and bounded alike.
+    assert_eq!(
+        parse(r#"{"capture_lock_wait_secs": 7}"#)
+            .unwrap()
+            .capture_wait_secs,
+        7
+    );
+    assert!(parse(r#"{"capture_lock_wait_secs": 0}"#).is_err());
     let (min, max) = (
         *MYSQL_PROOF_CAPTURE_CONCURRENCY.start(),
         *MYSQL_PROOF_CAPTURE_CONCURRENCY.end(),

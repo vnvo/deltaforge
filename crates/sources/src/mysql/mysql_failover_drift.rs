@@ -551,7 +551,7 @@ pub(crate) async fn check_snapshot_tables(
     env: &DriftEnv<'_>,
     anchor: &FailoverAnchor,
     tables: &[(String, String)],
-    lock_wait_secs: u32,
+    wait_secs: u32,
 ) -> SourceResult<()> {
     use super::mysql_binlog_scan::{BatchCaptureError, capture_batch};
     let mut decided = Vec::new();
@@ -592,7 +592,8 @@ pub(crate) async fn check_snapshot_tables(
                 env.server_uuid,
                 &anchor.current_lineage,
                 &names,
-                lock_wait_secs,
+                Some(from),
+                wait_secs,
                 None,
             )
             .await?
@@ -887,8 +888,9 @@ async fn shape_at_failover(
         &anchor.current_lineage,
         db,
         table,
+        Some(&from),
         None,
-        super::mysql_binlog_scan::LOCK_WAIT,
+        super::mysql_binlog_scan::CAPTURE_WAIT,
     )
     .await?
     {
@@ -2234,6 +2236,7 @@ mod tests {
                 &here,
                 &anchor.current_lineage,
                 &names,
+                None,
                 8,
                 None,
             )

@@ -348,7 +348,8 @@ async fn establish_chunk(
         &server_uuid,
         &lineage,
         &tables,
-        ctx.proofs.capture_lock_wait_secs,
+        None,
+        ctx.proofs.capture_wait_secs,
         None,
     )
     .await?
@@ -814,7 +815,8 @@ async fn establish_per_table(
             &c.db,
             &c.table,
             None,
-            super::mysql_binlog_scan::LOCK_WAIT,
+            None,
+            super::mysql_binlog_scan::CAPTURE_WAIT,
         )
         .await?
         {
@@ -973,6 +975,66 @@ async fn establish_per_table(
     Ok(written)
 }
 
+/// The scan of `(e, A]`, A the capture's first position, and A: for a
+/// baseline that ends at A because a schema change after the rows was not
+/// visible to the capture (`establish_at`). `None` when the rows do not
+/// start at or before A or the scan fails (the caller refuses then); a
+/// scan that reached another server is an error.
+async fn until_capture_start(
+    ctx: &RunCtx,
+    tag: &super::mysql_binlog_scan::ScanTag<'_>,
+    server_uuid: &str,
+    lineage: &str,
+    e_cp: &MySqlCheckpoint,
+    cap: &super::mysql_binlog_scan::Captured,
+) -> SourceResult<
+    Option<(
+        crate::durable_checkpoint::WmPos,
+        super::mysql_binlog_scan::ScanReport,
+    )>,
+> {
+    let (Some(e), Some(a)) = (
+        mysql_checkpoint_position(
+            &e_cp.file,
+            e_cp.pos,
+            e_cp.gtid_set.as_deref(),
+        ),
+        mysql_checkpoint_position(
+            &cap.from.file,
+            cap.from.pos,
+            cap.from.gtid_set.as_deref(),
+        ),
+    ) else {
+        return Ok(None);
+    };
+    if !matches!(
+        order_positions(&e, &a),
+        CheckpointOrder::Before | CheckpointOrder::Equal
+    ) {
+        return Ok(None);
+    }
+    match super::mysql_proof_scanner::shared_interval(
+        &ctx.proof_scanner,
+        ctx.dsn.current().expose(),
+        &ctx.source_id,
+        server_uuid,
+        lineage,
+        e_cp,
+        &cap.from,
+        ctx.stream_anchor(server_uuid, lineage).as_ref(),
+        Some(e_cp),
+        tag,
+    )
+    .await
+    {
+        Ok(report) => Ok(Some((a, report))),
+        Err(ProofError::OtherServer(found)) => {
+            Err(other_server(server_uuid, &found))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
 /// A lazy baseline (binding ruling Round 36, Q1) for one table whose rows
 /// at the evaluation position E are not positionally proven: a stable
 /// capture of its complete shape at S, E <= S in the verified lineage, and
@@ -1032,8 +1094,10 @@ pub(crate) async fn establish_at(
         &lineage,
         db,
         table,
+        // The rows' position: A must contain it.
+        Some(&e_cp),
         None,
-        super::mysql_binlog_scan::LOCK_WAIT,
+        super::mysql_binlog_scan::CAPTURE_WAIT,
     )
     .await?
     {
@@ -1086,6 +1150,45 @@ pub(crate) async fn establish_at(
             trace_proof(&tag, db, table, Some(&cap), None, lctn, "scan_failed");
             return Ok(false);
         }
+    };
+    // A schema change after the rows that the capture's reads could not see
+    // (outside its visible bound) leaves the shape read the table's shape
+    // from the rows until that change: the baseline then ends at A, proven
+    // by the scan up to A, when nothing affects the table there (as the
+    // activation window decides, `admit_batch`).
+    let lctn_v = ctx.lower_case_table_names;
+    let first = report
+        .statements
+        .iter()
+        .find(|st| affects(st, db, table, lctn_v))
+        .map(|st| st.event.clone());
+    let (s, report) = match first {
+        None => (s, report),
+        Some(super::mysql_activation::EventIdentity::Gtid { gtid, .. })
+            if !cap.visible.contains(&gtid) =>
+        {
+            match until_capture_start(
+                ctx,
+                &tag,
+                &server_uuid,
+                &lineage,
+                &e_cp,
+                &cap,
+            )
+            .await?
+            {
+                Some((a, upto_a))
+                    if !upto_a
+                        .statements
+                        .iter()
+                        .any(|st| affects(st, db, table, lctn_v)) =>
+                {
+                    (a, upto_a)
+                }
+                _ => (s, report),
+            }
+        }
+        Some(_) => (s, report),
     };
     if report
         .statements
@@ -1634,12 +1737,6 @@ mod tests {
             fresh_start(true).await;
         }
 
-        #[tokio::test]
-        #[ignore = "requires docker"]
-        async fn a_first_rows_baseline_binds_the_start_barrier_file_position() {
-            fresh_start(false).await;
-        }
-
         /// A DDL of the table after its rows (in (E, S]) prevents its lazy
         /// baseline and the source stops before those rows; another table's
         /// earlier rows still get theirs.
@@ -1675,6 +1772,68 @@ mod tests {
             assert_eq!(baselines(&timeline(&st, db, "u").await.0).len(), 1);
             assert!(baselines(&timeline(&st, db, "t").await.0).is_empty());
             assert_eq!(st.ckpt.get_raw(db).await.unwrap().unwrap(), committed);
+        }
+
+        /// A DDL of the table its lazy baseline's capture could not see (it
+        /// lands between the schema reads and the end, outside the visible
+        /// bound) leaves the shape read the table's shape until that DDL:
+        /// the baseline ends at A, the rows before the DDL are delivered, and
+        /// the stream then proves the DDL itself. The lazy baseline is the
+        /// proof of a table a window could not take: one transaction (here
+        /// compressed, one event) touching more new tables than it has room
+        /// for.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_ddl_its_lazy_capture_could_not_see_still_admits_the_rows() {
+            reset_hooks();
+            let port = server(true).await;
+            let db = "base_unseen";
+            prepare(port, db, &["a", "t"]).await;
+            let (a, t) = (format!("{db}.a"), format!("{db}.t"));
+            let st = state().await;
+            crate::mysql::mysql_activation_window::BATCH_TABLES
+                .store(1, std::sync::atomic::Ordering::SeqCst);
+            // t's capture sees a DDL of t land after its schema reads.
+            *crate::mysql::mysql_binlog_scan::BETWEEN_NEXT
+                .lock()
+                .unwrap() = Some((
+                dsn(port, ""),
+                vec![format!("ALTER TABLE {t} ADD COLUMN x INT")],
+            ));
+            let (rows, res) = run(
+                &st,
+                port,
+                db,
+                &[&a, &t],
+                SnapshotMode::Never,
+                &[
+                    "SET SESSION binlog_transaction_compression = ON".into(),
+                    "BEGIN".into(),
+                    format!("INSERT INTO {a} VALUES (1, 1)"),
+                    format!("INSERT INTO {t} VALUES (2, 2)"),
+                    "COMMIT".into(),
+                ],
+            )
+            .await;
+            let ran = crate::mysql::mysql_binlog_scan::BETWEEN_NEXT
+                .lock()
+                .unwrap()
+                .is_none();
+            reset_hooks();
+            assert!(ran, "t's lazy capture ran the DDL");
+            res.unwrap();
+            let two = deltaforge_core::canonical::fixture::value(
+                &serde_json::json!(2),
+            );
+            let row = rows
+                .iter()
+                .find(|e| e.source.table == "t")
+                .expect("t's row before the DDL is delivered");
+            assert_eq!(row.after.as_ref().unwrap().get("id"), Some(&two));
+            assert!(row.after.as_ref().unwrap().get("x").is_none());
+            assert_eq!(rows.len(), 2, "a's row and t's");
+            let (table, _) = timeline(&st, db, "t").await;
+            assert_eq!(baselines(&table).len(), 1, "{table:?}");
         }
 
         /// A saturated control plane for the next capture: a runner budget
@@ -1870,6 +2029,11 @@ mod tests {
             super::super::hooks::CHUNKS.store(0, SeqCst);
             *super::super::hooks::BEFORE_COMMIT.lock().unwrap() = None;
             crate::stream_probe::set_window_caps(None);
+            *crate::mysql::mysql_binlog_scan::BETWEEN_NEXT
+                .lock()
+                .unwrap() = None;
+            crate::mysql::mysql_activation_window::BATCH_TABLES
+                .store(0, SeqCst);
         }
 
         /// One baseline per table, each at the anchor and binding its

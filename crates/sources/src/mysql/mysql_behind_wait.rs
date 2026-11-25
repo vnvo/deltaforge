@@ -6,7 +6,7 @@
 //! within [`BEHIND_WAIT`] in all (pool acquisition, queries and backoff),
 //! or the window fails closed. The bound covers this readiness wait only,
 //! not the whole recovery: the recapture that follows has its own budget
-//! (the capture's lock wait, `capture_lock_wait_secs`).
+//! (the capture's budget, `capture_wait_secs`).
 //!
 //! The position read is a readiness check, not proof: it does not show that
 //! the recapture covers the rows, so a recapture still behind after a

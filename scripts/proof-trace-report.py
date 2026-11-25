@@ -90,7 +90,7 @@ def main(jsonl, meta_path):
     uuid, gtid = meta["server_uuid"], meta["mode"] == "gtid"
     scans, reqs, proofs = [], [], 0
     outcomes = defaultdict(lambda: defaultdict(int))
-    lock, schema = defaultdict(list), defaultdict(list)
+    wait, schema = defaultdict(list), defaultdict(list)
     for r in records(jsonl):
         if r["record"] == "scan":
             scans.append(r)
@@ -115,7 +115,10 @@ def main(jsonl, meta_path):
             proofs += 1
             outcomes[r["kind"]][r["outcome"]] += 1
             if r.get("capture"):
-                lock[r["kind"]].append(r["capture"]["lock_wait_ms"])
+                # The end's wait (`lock_wait_ms` in traces of captures that
+                # took metadata locks).
+                c = r["capture"]
+                wait[r["kind"]].append(c.get("end_wait_ms", c.get("lock_wait_ms")))
                 schema[r["kind"]].append(r["capture"]["schema_ms"])
     by_kind = defaultdict(list)
     for s in scans:
@@ -260,8 +263,8 @@ def main(jsonl, meta_path):
     print("## Proof outcomes and capture timing (ms)")
     for k in sorted(outcomes):
         print(
-            f"- {k}: {dict(outcomes[k])}; lock wait p50/p99/max "
-            f"{pct(lock[k], .5)}/{pct(lock[k], .99)}/{max(lock[k], default=None)}; "
+            f"- {k}: {dict(outcomes[k])}; capture wait p50/p99/max "
+            f"{pct(wait[k], .5)}/{pct(wait[k], .99)}/{max(wait[k], default=None)}; "
             f"schema p50/p99/max {pct(schema[k], .5)}/{pct(schema[k], .99)}/"
             f"{max(schema[k], default=None)}"
         )
