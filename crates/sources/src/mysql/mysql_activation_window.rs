@@ -1790,7 +1790,8 @@ async fn admit_batch(
     let deferred = {
         use super::mysql_window_budget::{Prefix, table_cost};
         let other_lineages = other_lineages(ctx).await?;
-        let mut prefix = Prefix::new(Caps::current());
+        let caps = Caps::current();
+        let mut prefix = Prefix::new(caps);
         let mut cut = tables.len();
         for (i, ((db, table), at, _)) in tables.iter().enumerate() {
             // Past the capture's budget: unread, so the prefix ends here. The
@@ -1834,7 +1835,16 @@ async fn admit_batch(
                     .map_err(SourceError::Other)?
                 }
             };
-            match prefix.offer(cost) {
+            // The window's first table must fit an empty plan: deferred, it
+            // would open the next window again, deferred again, its rows
+            // held for ever. No plan can take it: invalid, fail closed.
+            let offered = match prefix.offer(cost) {
+                Ok(false) if i == 0 => {
+                    Prefix::fits_alone(caps, cost).map(|()| false)
+                }
+                offered => offered,
+            };
+            match offered {
                 Ok(true) => {}
                 Ok(false) => {
                     cut = i;
