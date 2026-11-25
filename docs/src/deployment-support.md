@@ -198,9 +198,9 @@ Schema history written by earlier releases is kept but not used automatically: a
 - `SELECT, SHOW VIEW` on the captured database(s) for reads and introspection.
 - `RELOAD ON *.*` **only when an initial snapshot runs** (needed for the brief `FLUSH TABLES WITH READ LOCK` that anchors the snapshot). A CDC-only pipeline (`snapshot.mode = never`) does not need `RELOAD`.
 - Server settings enforced fail-closed at snapshot preflight: `gtid_mode = ON`, `binlog_format = ROW`, and captured tables on InnoDB (MySQL itself requires `enforce_gtid_consistency = ON` before `gtid_mode = ON`). `binlog_row_image = FULL` is recommended (a warning otherwise).
-- Server settings enforced fail-closed at every start and reconnect: MySQL 8.0.19 or later (not MariaDB) and `log_replica_updates = ON`.
+- Server settings enforced fail-closed at every start and reconnect: MySQL 8.0.19 or later (not MariaDB), `gtid_mode = ON` and `log_replica_updates = ON`.
 - `binlog_row_metadata = FULL` is recommended: under `MINIMAL`, more DDL situations stop the source fail-closed (see [Known limitations](#known-limitations)).
-- GTID mode is required for snapshots, failover and live credential rotation; CDC alone also runs with file and position coordinates.
+- GTID mode is required on every MySQL source, with or without a snapshot: DeltaForge reads table definitions without locking them and needs the executed GTID set to know what such a read could see. A server with GTIDs off is refused at start, before anything is read or written.
 - On managed MySQL (for example RDS/Aurora) where `RELOAD` / `FLUSH TABLES WITH READ LOCK` is unavailable, the snapshot **fails closed** with a typed error - there is no silent unsafe fallback. Grant `RELOAD`, or run `snapshot.mode = never` and perform the initial load out of band.
 
 ### Sinks
