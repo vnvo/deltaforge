@@ -1836,6 +1836,41 @@ mod tests {
             assert_eq!(baselines(&table).len(), 1, "{table:?}");
         }
 
+        /// A window whose first table does not fit an empty plan (a plan
+        /// cap below the per-table limit) fails closed with the table's
+        /// too-large incident, never deferring that table to the next
+        /// window again and again with its rows held.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_window_whose_first_table_fits_no_plan_fails_closed() {
+            reset_hooks();
+            let port = server(true).await;
+            let db = "base_nofit";
+            prepare(port, db, &["t"]).await;
+            let st = state().await;
+            let t = format!("{db}.t");
+            crate::stream_probe::set_window_caps(Some((1, 16_384, 1 << 30)));
+            let (rows, res) = run(
+                &st,
+                port,
+                db,
+                &[&t],
+                SnapshotMode::Never,
+                &[format!("INSERT INTO {t} VALUES (1, 1)")],
+            )
+            .await;
+            reset_hooks();
+            assert!(rows.is_empty(), "{rows:?}");
+            let err = res.expect_err("the window fails closed");
+            assert_eq!(
+                err.draft().map(|d| d.reason_code),
+                Some(
+                    deltaforge_core::incident::ReasonCode::MysqlTableStateTooLarge
+                ),
+                "{err:#}"
+            );
+        }
+
         /// A saturated control plane for the next capture: a runner budget
         /// whose only ordinary permit another source holds (released by
         /// dropping what is returned); the capture waits at most 1 s.
