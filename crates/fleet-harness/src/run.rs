@@ -571,6 +571,12 @@ async fn run_inner(
             max: opts.drain_max,
         };
         let expected = partitions.clone();
+        let registry = cfg
+            .verifier
+            .schema_registry_url
+            .as_deref()
+            .map(crate::avro::Registry::new)
+            .transpose()?;
         tokio::spawn(async move {
             consumer::run(
                 &brokers,
@@ -583,6 +589,7 @@ async fn run_inner(
                 expected,
                 ready_tx,
                 observed,
+                registry,
             )
             .await
         })

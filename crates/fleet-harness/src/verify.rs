@@ -1,7 +1,8 @@
 //! The verifying consumer (design section 4.4).
 //!
-//! Every event is decoded from DeltaForge's native envelope. Its logical row
-//! comes from `after`, or from `before` for deletes, never from the Kafka
+//! Every event is decoded from DeltaForge's native envelope, also inside a
+//! `{"schema", "payload"}` wrapper or framed as Avro. Its logical row comes
+//! from `after`, or from `before` for deletes, never from the Kafka
 //! message key. In-stream it checks message keys (when primary-key keys are
 //! expected), schema probes after DDL, end-to-end lag, and recovery marks;
 //! every event is spilled as a [`Record`] for the offline completeness and
@@ -72,6 +73,21 @@ pub fn parse_micros(v: &Value) -> Option<i64> {
 pub fn decode(naming: &Naming, server: u16, payload: &[u8]) -> Result<Event> {
     let v: Value =
         serde_json::from_slice(payload).context("event is not JSON")?;
+    decode_value(naming, server, v)
+}
+
+/// Decode one event already parsed (or decoded from Avro) as JSON. A
+/// `{"schema", "payload"}` wrapper is unwrapped to its payload.
+pub fn decode_value(naming: &Naming, server: u16, v: Value) -> Result<Event> {
+    let v = match v {
+        Value::Object(mut o)
+            if o.contains_key("schema")
+                && o.get("payload").is_some_and(Value::is_object) =>
+        {
+            o.remove("payload").unwrap_or_default()
+        }
+        v => v,
+    };
     let Some(op) = v.get("op").and_then(Value::as_str) else {
         return Ok(Event::Other);
     };
@@ -252,6 +268,10 @@ impl Verifier {
         })
     }
 
+    pub fn naming(&self) -> &Naming {
+        &self.naming
+    }
+
     /// Verify only rows written by the run tagged `tag`.
     pub fn for_run(mut self, tag: u64) -> Self {
         self.run_tag = Some(tag);
@@ -268,8 +288,29 @@ impl Verifier {
         payload: &[u8],
         received_micros: i64,
     ) -> Result<()> {
+        let event = decode(&self.naming, server, payload);
+        self.observe_event(
+            server,
+            partition,
+            offset,
+            key,
+            event,
+            received_micros,
+        )
+    }
+
+    /// Verify one consumed message of `server`, already decoded (or not).
+    pub fn observe_event(
+        &mut self,
+        server: u16,
+        partition: i32,
+        offset: i64,
+        key: Option<&[u8]>,
+        event: Result<Event>,
+        received_micros: i64,
+    ) -> Result<()> {
         self.report.events += 1;
-        let d = match decode(&self.naming, server, payload) {
+        let d = match event {
             Ok(Event::Row(d)) => d,
             Ok(Event::Other) => {
                 self.report.other_events += 1;
@@ -402,6 +443,18 @@ mod tests {
         assert_eq!(del.committed_micros, None);
         let other = serde_json::to_vec(&json!({"op": "c", "after": {"id": 1}, "source": {"db": "mysql", "table": "user"}})).unwrap();
         assert_eq!(decode(&naming(), 1, &other).unwrap(), Event::Other);
+        // A `{"schema", "payload"}` wrapper carries the same event.
+        let native: Value =
+            serde_json::from_slice(&event("u", json!({"id": 7, "version": 4})))
+                .unwrap();
+        let wrapped =
+            serde_json::to_vec(&json!({"schema": null, "payload": native}))
+                .unwrap();
+        assert_eq!(
+            decode(&naming(), 1, &wrapped).unwrap(),
+            decode(&naming(), 1, &serde_json::to_vec(&native).unwrap())
+                .unwrap()
+        );
     }
 
     #[test]
