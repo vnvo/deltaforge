@@ -147,9 +147,27 @@ impl Timeline {
 /// they share and barrier streams (each once), and the maps' buckets. No
 /// count of tables: as many as fit.
 ///
+/// The least default bound (the fixed bound before it followed the memory
+/// limit), and the bound of a cache built without a source (tests).
+///
 /// [`mysql_cache_cost`]: super::mysql_cache_cost
-pub(crate) const SELECTION_CACHE_BYTES: u64 =
-    deltaforge_config::MYSQL_SELECTION_CACHE_BYTES_DEFAULT;
+pub(crate) const SELECTION_CACHE_BYTES: u64 = 256 * MIB;
+
+const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
+
+/// The bound of a source that sets none: a quarter of the process's memory
+/// limit, 256 MiB to 8 GiB; 1 GiB when no limit is set. Measured on a
+/// 1M-table catalog in a 6 GiB container, about 2.7 KB per active table of
+/// shared definitions: 256 MiB held about 112,000 tables, and a bound that
+/// held all of them (up to 640,000 at 2 GiB) kept the process within about
+/// 1.4 times the bound.
+fn default_bound(memory_limit: Option<u64>) -> u64 {
+    match memory_limit {
+        Some(limit) => (limit / 4).clamp(SELECTION_CACHE_BYTES, 8 * GIB),
+        None => GIB,
+    }
+}
 
 /// The shortest interval between two warnings that the cache is evicting.
 const EVICTION_WARNING_EVERY: std::time::Duration =
@@ -427,19 +445,25 @@ impl Caches {
         source: &str,
         configured: Option<u64>,
     ) -> Self {
-        Self::new_with(pipeline, source, configured, |name| {
-            std::env::var(name).ok()
-        })
+        Self::new_with(
+            pipeline,
+            source,
+            configured,
+            |name| std::env::var(name).ok(),
+            deltaforge_core::memory_limit::memory_limit(),
+        )
     }
 
-    /// [`Self::new`] with `var` for the process environment. The bound: a
-    /// test's, else a measurement build's from `var` (perf-phases; a default
-    /// build ignores it), else the configured one, else the default.
+    /// [`Self::new`] with `var` for the process environment and
+    /// `memory_limit` for the process's. The bound: a test's, else a
+    /// measurement build's from `var` (perf-phases; a default build ignores
+    /// it), else the configured one, else [`default_bound`].
     fn new_with(
         pipeline: &str,
         source: &str,
         configured: Option<u64>,
         var: impl Fn(&str) -> Option<String>,
+        memory_limit: Option<u64>,
     ) -> Self {
         let (bytes, origin) = crate::stream_probe::selection_cache_bytes()
             .map(|b| (b, "test"))
@@ -448,13 +472,23 @@ impl Caches {
                     .map(|b| (b, "measurement override"))
             })
             .or(configured.map(|b| (b, "selection_cache_bytes")))
-            .unwrap_or((SELECTION_CACHE_BYTES, "default"));
+            .unwrap_or_else(|| {
+                (
+                    default_bound(memory_limit),
+                    if memory_limit.is_some() {
+                        "default (a quarter of the memory limit)"
+                    } else {
+                        "default (no memory limit)"
+                    },
+                )
+            });
         crate::perf_phases::cache_limit(bytes);
         tracing::info!(
             pipeline,
             source,
             bytes,
             origin,
+            memory_limit,
             "mysql selection cache bound"
         );
         let labels = [
@@ -5596,12 +5630,13 @@ mod perf_tests {
         move |name| bytes.clone().filter(|_| name == ENV_CACHE_BYTES)
     }
 
-    /// A default build ignores the variable: the code's bound.
+    /// A default build ignores the variable: the default bound.
     #[cfg(not(feature = "perf-phases"))]
     #[test]
     fn perf_default_builds_ignore_the_cache_override() {
-        let c = Caches::new_with("p", "s", None, env(Some("1024".into())));
-        assert_eq!(c.max_bytes, SELECTION_CACHE_BYTES);
+        let c =
+            Caches::new_with("p", "s", None, env(Some("1024".into())), None);
+        assert_eq!(c.max_bytes, GIB);
     }
 
     /// The eviction warning: at the first eviction, then at most once per
@@ -5618,14 +5653,29 @@ mod perf_tests {
         assert_eq!(c.unreported_evictions, 0, "reported");
     }
 
-    /// The source's setting bounds the cache; absent, the default does.
+    /// The source's setting bounds the cache; absent, the default for the
+    /// process's memory limit does.
     #[cfg(not(feature = "perf-phases"))]
     #[test]
     fn the_configured_bound_is_the_caches() {
-        let c = Caches::new_with("p", "s", Some(64 << 20), env(None));
+        let limit = Some(6 * GIB);
+        let c = Caches::new_with("p", "s", Some(64 << 20), env(None), limit);
         assert_eq!(c.max_bytes, 64 << 20);
-        let c = Caches::new_with("p", "s", None, env(None));
-        assert_eq!(c.max_bytes, SELECTION_CACHE_BYTES);
+        let c = Caches::new_with("p", "s", None, env(None), limit);
+        assert_eq!(c.max_bytes, 6 * GIB / 4);
+    }
+
+    #[test]
+    fn the_default_bound_is_a_quarter_of_the_memory_limit_within_its_range() {
+        assert_eq!(default_bound(Some(6 * GIB)), 6 * GIB / 4);
+        assert_eq!(default_bound(Some(16 * GIB)), 4 * GIB);
+        assert_eq!(
+            default_bound(Some(GIB)),
+            SELECTION_CACHE_BYTES,
+            "never below the earlier fixed 256 MiB"
+        );
+        assert_eq!(default_bound(Some(512 * GIB)), 8 * GIB, "cap");
+        assert_eq!(default_bound(None), GIB, "no limit");
     }
 
     /// The counters a measurement build exports, as `name labels value`
@@ -5675,8 +5725,13 @@ mod perf_tests {
             c.bytes()
         };
         let seen = perf_metrics(|| {
-            let mut c =
-                Caches::new_with("p", "s", None, env(Some(two.to_string())));
+            let mut c = Caches::new_with(
+                "p",
+                "s",
+                None,
+                env(Some(two.to_string())),
+                None,
+            );
             assert_eq!(c.max_bytes, two);
             for t in ["a", "b", "c"] {
                 c.seed_for_test(&key(t));
