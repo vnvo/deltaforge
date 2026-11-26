@@ -159,9 +159,8 @@ const GIB: u64 = 1024 * MIB;
 /// The bound of a source that sets none: a quarter of the process's memory
 /// limit, 256 MiB to 8 GiB; 1 GiB when no limit is set. Measured on a
 /// 1M-table catalog in a 6 GiB container, about 2.7 KB per active table of
-/// shared definitions: 256 MiB held about 112,000 tables, and a bound that
-/// held all of them (up to 640,000 at 2 GiB) kept the process within about
-/// 1.4 times the bound.
+/// shared definitions: 256 MiB held about 112,000 tables, and with bounds of
+/// 512 MiB to 3 GiB the process peaked at the bound plus 0.4 to 1.3 GiB.
 fn default_bound(memory_limit: Option<u64>) -> u64 {
     match memory_limit {
         Some(limit) => (limit / 4).clamp(SELECTION_CACHE_BYTES, 8 * GIB),
