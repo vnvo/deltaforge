@@ -328,6 +328,10 @@ pub struct Verifier {
     /// Where ledgers and consumed records are spilled for the final
     /// completeness check.
     pub work_dir: String,
+    /// The schema registry the sink's Avro events are framed against
+    /// (as the verifier reaches it), when the sink encodes Avro.
+    #[serde(default)]
+    pub schema_registry_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

@@ -20,6 +20,7 @@ chrono.workspace = true
 futures.workspace = true
 parking_lot.workspace = true
 reqwest.workspace = true
+apache-avro.workspace = true
 rdkafka.workspace = true
 clap = { version = "4", features = ["derive"] }
 rand = "0.9"

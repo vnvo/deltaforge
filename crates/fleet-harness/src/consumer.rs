@@ -16,7 +16,7 @@ use rdkafka::message::Message;
 use rdkafka::types::RDKafkaErrorCode;
 use tokio::sync::watch;
 
-use crate::verify::Verifier;
+use crate::verify::{Verifier, decode, decode_value};
 
 /// How the consumer ends after the stop signal.
 #[derive(Debug, Clone, Copy)]
@@ -120,6 +120,7 @@ pub async fn run(
     expected: BTreeMap<String, usize>,
     ready: watch::Sender<bool>,
     observed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    mut registry: Option<crate::avro::Registry>,
 ) -> Result<Verifier> {
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", brokers)
@@ -158,12 +159,22 @@ pub async fn run(
             msg = tokio::time::timeout(wait, consumer.recv()) => match msg {
                 Ok(Ok(m)) => {
                     let Some(&server) = topic_to_server.get(m.topic()) else { continue };
-                    verifier.observe(
+                    let payload = m.payload().unwrap_or_default();
+                    let event = match registry.as_mut() {
+                        Some(r) if crate::avro::Registry::is_framed(payload) => {
+                            match r.decode(payload).await {
+                                Ok(v) => decode_value(verifier.naming(), server, v),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        _ => decode(verifier.naming(), server, payload),
+                    };
+                    verifier.observe_event(
                         server,
                         m.partition(),
                         m.offset(),
                         m.key(),
-                        m.payload().unwrap_or_default(),
+                        event,
                         Utc::now().timestamp_micros(),
                     )?;
                     observed.store(

@@ -9,6 +9,7 @@
 
 pub mod actions;
 pub mod activeset;
+pub mod avro;
 pub mod backlog;
 pub mod config;
 pub mod consumer;
