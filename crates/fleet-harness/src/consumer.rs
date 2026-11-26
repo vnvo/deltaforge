@@ -3,7 +3,7 @@
 //! run's topics are created before any pipeline exists, and no write starts
 //! before the verifier holds every partition of them.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -16,7 +16,9 @@ use rdkafka::message::Message;
 use rdkafka::types::RDKafkaErrorCode;
 use tokio::sync::watch;
 
-use crate::verify::{Verifier, decode, decode_value};
+use crate::avro::{Registry, Slot, frame_id};
+use crate::topology::Naming;
+use crate::verify::{Event, Verifier, decode, decode_value};
 
 /// How the consumer ends after the stop signal.
 #[derive(Debug, Clone, Copy)]
@@ -120,7 +122,7 @@ pub async fn run(
     expected: BTreeMap<String, usize>,
     ready: watch::Sender<bool>,
     observed: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    mut registry: Option<crate::avro::Registry>,
+    mut registry: Option<Registry>,
 ) -> Result<Verifier> {
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", brokers)
@@ -136,6 +138,9 @@ pub async fn run(
         .context("subscribe the verifying consumer")?;
     let mut stopped_at: Option<tokio::time::Instant> = None;
     let mut assigned = false;
+    // Messages behind one whose writer schema is still being fetched wait
+    // here, in arrival order (so in partition order).
+    let mut queue: VecDeque<Queued> = VecDeque::new();
     loop {
         if !assigned && let Ok(list) = consumer.assignment() {
             let mut held: BTreeMap<String, usize> = BTreeMap::new();
@@ -150,24 +155,59 @@ pub async fn run(
         if stopped_at.is_none() && *stop.borrow() {
             stopped_at = Some(tokio::time::Instant::now());
         }
+        while let Some(q) = queue.front() {
+            let Some(event) = event_of(
+                registry.as_ref(),
+                verifier.naming(),
+                q.server,
+                &q.payload,
+            ) else {
+                break;
+            };
+            let q = queue.pop_front().expect("front");
+            verifier.observe_event(
+                q.server,
+                q.partition,
+                q.offset,
+                q.key.as_deref(),
+                event,
+                Utc::now().timestamp_micros(),
+            )?;
+            observed.store(
+                verifier.report.row_events,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        let fetching = registry.as_ref().is_some_and(Registry::in_flight);
         let wait = if stopped_at.is_some() {
             drain.idle
         } else {
             Duration::from_secs(1)
         };
         tokio::select! {
-            msg = tokio::time::timeout(wait, consumer.recv()) => match msg {
+            msg = tokio::time::timeout(wait, consumer.recv()), if queue.len() < QUEUED => match msg {
                 Ok(Ok(m)) => {
                     let Some(&server) = topic_to_server.get(m.topic()) else { continue };
                     let payload = m.payload().unwrap_or_default();
-                    let event = match registry.as_mut() {
-                        Some(r) if crate::avro::Registry::is_framed(payload) => {
-                            match r.decode(payload).await {
-                                Ok(v) => decode_value(verifier.naming(), server, v),
-                                Err(e) => Err(e),
-                            }
-                        }
-                        _ => decode(verifier.naming(), server, payload),
+                    if let Some(r) = registry.as_mut()
+                        && let Some(id) = frame_id(payload)
+                    {
+                        r.request(id);
+                    }
+                    let event = if queue.is_empty() {
+                        event_of(registry.as_ref(), verifier.naming(), server, payload)
+                    } else {
+                        None
+                    };
+                    let Some(event) = event else {
+                        queue.push_back(Queued {
+                            server,
+                            partition: m.partition(),
+                            offset: m.offset(),
+                            key: m.key().map(<[u8]>::to_vec),
+                            payload: payload.to_vec(),
+                        });
+                        continue;
                     };
                     verifier.observe_event(
                         server,
@@ -183,9 +223,11 @@ pub async fn run(
                     );
                 }
                 Ok(Err(e)) => eprintln!("  verifier: kafka error: {e}"),
-                Err(_) if stopped_at.is_some() => break, // idle after stop
+                // Idle after stop, with nothing left to decode.
+                Err(_) if stopped_at.is_some() && queue.is_empty() && !fetching => break,
                 Err(_) => {}
             },
+            () = async { registry.as_mut().expect("fetching").arrive().await }, if fetching => {}
             _ = stop.changed(), if stopped_at.is_none() => {}
         }
         if let Some(at) = stopped_at
@@ -195,6 +237,42 @@ pub async fn run(
         }
     }
     Ok(verifier)
+}
+
+/// Messages held while an earlier message's writer schema is fetched.
+const QUEUED: usize = 100_000;
+
+/// A consumed message waiting for its turn.
+struct Queued {
+    server: u16,
+    partition: i32,
+    offset: i64,
+    key: Option<Vec<u8>>,
+    payload: Vec<u8>,
+}
+
+/// The decoded event of `payload`, or `None` while its writer schema is
+/// being fetched. A framed payload without a registry is read as JSON (and
+/// fails as such).
+fn event_of(
+    registry: Option<&Registry>,
+    naming: &Naming,
+    server: u16,
+    payload: &[u8],
+) -> Option<Result<Event>> {
+    let (Some(r), Some(id)) = (registry, frame_id(payload)) else {
+        return Some(decode(naming, server, payload));
+    };
+    match r.slot(id) {
+        Slot::Ready(d) => Some(
+            r.decode(d, &payload[5..])
+                .and_then(|v| decode_value(naming, server, v)),
+        ),
+        Slot::Failed(e) => {
+            Some(Err(anyhow::anyhow!("writer schema {id}: {e}")))
+        }
+        Slot::Pending | Slot::Unknown => None,
+    }
 }
 
 #[cfg(test)]

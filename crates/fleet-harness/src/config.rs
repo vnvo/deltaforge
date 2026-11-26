@@ -332,6 +332,11 @@ pub struct Verifier {
     /// (as the verifier reaches it), when the sink encodes Avro.
     #[serde(default)]
     pub schema_registry_url: Option<String>,
+    /// Decode every n-th Avro event also through apache-avro and count a
+    /// difference as a decode error (checks the compiled decoder on a
+    /// run's real schemas).
+    #[serde(default)]
+    pub avro_crosscheck_every: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

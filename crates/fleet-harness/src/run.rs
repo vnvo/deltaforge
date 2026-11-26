@@ -575,7 +575,12 @@ async fn run_inner(
             .verifier
             .schema_registry_url
             .as_deref()
-            .map(crate::avro::Registry::new)
+            .map(|url| {
+                crate::avro::Registry::new(
+                    url,
+                    cfg.verifier.avro_crosscheck_every,
+                )
+            })
             .transpose()?;
         tokio::spawn(async move {
             consumer::run(
