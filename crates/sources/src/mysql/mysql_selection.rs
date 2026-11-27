@@ -400,6 +400,9 @@ pub(crate) struct Caches {
     /// The TableMap signature digests (outside the byte bound, within
     /// their own: [`super::mysql_signature::SignatureMemo`]).
     pub(crate) signatures: super::mysql_signature::SignatureMemo,
+    /// The keys of the cached timelines flagged proven, kept with every
+    /// change to them (outside the byte bound: a key shared with its entry).
+    proven: super::mysql_proven_index::ProvenIndex,
 }
 
 /// The cache's metrics: evictions, and its own accounting (estimated bytes
@@ -530,6 +533,7 @@ impl Caches {
             signatures: super::mysql_signature::SignatureMemo::for_cache(
                 max_bytes,
             ),
+            proven: Default::default(),
         }
     }
 
@@ -589,8 +593,19 @@ impl Caches {
     /// Remove `key`'s entry, with its accounting.
     fn remove(&mut self, key: &CacheKey) {
         if let Some(e) = self.entries.pop(key) {
+            self.unprove(key, &e);
             self.unindex(key, e.slot);
             self.forget(e);
+        }
+    }
+
+    /// `key`'s entry `e` leaves the cache: a proven timeline's key leaves
+    /// the proven index with it.
+    fn unprove(&mut self, key: &CacheKey, e: &Entry) {
+        if let (CacheKey::Timeline(k), Cached::Timeline(_, true)) =
+            (key, &e.cached)
+        {
+            self.proven.remove(k);
         }
     }
 
@@ -649,6 +664,7 @@ impl Caches {
         let Some((key, e)) = self.entries.pop_lru() else {
             return false;
         };
+        self.unprove(&key, &e);
         self.unindex(&key, e.slot);
         crate::perf_phases::cache_eviction(match &e.cached {
             Cached::Timeline(..) => "timeline",
@@ -712,6 +728,11 @@ impl Caches {
         }
         let load = if self.loading { self.load } else { 0 };
         let (key, slot) = self.index.insert(key);
+        if let (CacheKey::Timeline(k), Cached::Timeline(_, true)) =
+            (&key, &cached)
+        {
+            self.proven.insert(k);
+        }
         self.entries.push(
             key,
             Entry {
@@ -793,8 +814,17 @@ impl Caches {
         }
     }
 
-    /// The backend keys of every table flagged proven, read without
-    /// touching recency (a speculative window's candidate filter).
+    /// The proven tables' backend keys now (a speculative window's
+    /// candidate filter), without walking the cache.
+    pub(crate) fn proven_snapshot(
+        &self,
+    ) -> super::mysql_proven_index::ProvenSnapshot {
+        self.proven.snapshot()
+    }
+
+    /// The backend keys of every table flagged proven, by a walk of the
+    /// cache that leaves recency alone ([`Self::proven_snapshot`]'s oracle).
+    #[cfg(test)]
     pub(crate) fn proven_keys(&self) -> std::collections::HashSet<String> {
         self.entries
             .iter()
@@ -838,8 +868,10 @@ impl Caches {
             cached: Cached::Timeline(_, proven),
             ..
         }) = self.entries.peek_mut(&CacheKey::Timeline(key.clone()))
+            && !*proven
         {
             *proven = true;
+            self.proven.insert(key);
         }
     }
 
@@ -1191,6 +1223,7 @@ impl Caches {
             assert_eq!(holders.get(name.as_str()), Some(refs), "{name}");
         }
         assert_eq!(held, self.held, "bytes held");
+        assert_eq!(self.proven.snapshot().keys(), self.proven_keys(), "proven");
         assert_eq!(table_bytes, self.table_bytes, "tables' bytes");
         self.index
             .audit(self.entries.iter().map(|(k, e)| (k, e.slot)));
@@ -1271,6 +1304,7 @@ impl Caches {
         self.barriers = Default::default();
         self.index = Default::default();
         self.definitions = Default::default();
+        self.proven.clear();
         self.timelines = 0;
         self.held = 0;
         self.table_bytes = 0;
@@ -4553,6 +4587,87 @@ mod tests {
             assert_eq!(c.timelines(), 10_000);
             assert!(c.bytes() <= SELECTION_CACHE_BYTES);
             c.audit();
+        }
+
+        /// Under every way a table's proven flag or its timeline changes
+        /// (marks, eviction under a small bound, invalidation, a current
+        /// install, a database barrier, a full clear), the proven index
+        /// equals a walk of the cache after every step, and a snapshot keeps
+        /// the keys of the moment it was taken.
+        #[test]
+        fn the_proven_index_equals_a_walk_of_the_cache_at_every_step() {
+            let mut c = Caches::default();
+            c.set_limit_for_test(768 * 1024);
+            // Folds at this test's sizes (the production minimum is 1,024).
+            c.proven =
+                crate::mysql::mysql_proven_index::ProvenIndex::folding_past(16);
+            let mut read = HashMap::new();
+            let selection = loaded(6);
+            let mut snaps = Vec::new();
+            let mut cached: Vec<Arc<str>> = Vec::new();
+            let mut most = 0;
+            let mut x: u64 = 0x2545f4914f6cdd1d;
+            for step in 0..12_000usize {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = key((x % 5) as usize, ((x >> 8) % 1_500) as usize);
+                let bk: Arc<str> = k.backend_key().into();
+                match (x >> 32) % 20 {
+                    0..=5 => {
+                        c.put_timeline(
+                            bk.to_string(),
+                            timeline_of(&k, 300, &mut read),
+                        );
+                        cached.push(bk);
+                    }
+                    // A table cached lately (it may since have gone).
+                    6..=11 if !cached.is_empty() => {
+                        let at = cached.len()
+                            - 1
+                            - (x as usize % 300).min(cached.len() - 1);
+                        c.mark_proven_at(&cached[at].clone());
+                    }
+                    12 => {
+                        c.put_selection(
+                            (bk.clone(), format!("d{step}"), "sig".into()),
+                            selection.clone(),
+                        );
+                    }
+                    13 => {
+                        c.put_version(bk.to_string(), version(1, 6));
+                    }
+                    14 | 15 => c.invalidate(&k),
+                    16 | 17 => {
+                        if let Some(t) = c.timeline_at(&bk) {
+                            let next = timeline_of(&k, 300, &mut read);
+                            c.install_if_current(&k, &t, next);
+                        }
+                    }
+                    _ => {}
+                }
+                if step % 1_000 == 500 {
+                    c.barrier_appended(&database((x % 5) as usize));
+                }
+                if step == 7_000 {
+                    c.invalidate_all();
+                }
+                let keys = c.proven_keys();
+                assert_eq!(c.proven_snapshot().keys(), keys, "step {step}");
+                most = most.max(keys.len());
+                if step % 499 == 0 {
+                    snaps.push((c.proven_snapshot(), c.proven_keys()));
+                }
+                if step % 997 == 0 {
+                    c.audit();
+                }
+            }
+            assert!(most > 200, "at most {most} proven at once");
+            assert!(c.proven.folds() > 20, "{} folds", c.proven.folds());
+            assert!(c.warned_at.is_some(), "the cache evicted");
+            for (snap, then) in &snaps {
+                assert_eq!(&snap.keys(), then);
+            }
         }
 
         /// Under churn of every entry kind (timelines sharing barrier

@@ -25,7 +25,7 @@
 //! the first window that cannot hold such a row is abandoned with every
 //! window after it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -309,7 +309,7 @@ pub(crate) struct Collector {
     ahead: Ahead,
     allow: AllowList,
     scope: Arc<RegistryScope>,
-    proven: Arc<HashSet<String>>,
+    proven: super::mysql_proven_index::ProvenSnapshot,
     /// The tables reserved by the windows before it, each with its window.
     reserved: HashMap<(String, String), WindowId>,
     /// The candidates taken, at their costs before capture.
@@ -344,7 +344,7 @@ impl Collector {
         ahead: Ahead,
         allow: AllowList,
         scope: Arc<RegistryScope>,
-        proven: Arc<HashSet<String>>,
+        proven: super::mysql_proven_index::ProvenSnapshot,
         reserved: HashMap<(String, String), WindowId>,
         fill: Fill,
         cfg: &deltaforge_config::MysqlProofCfg,
@@ -390,7 +390,7 @@ impl Collector {
             ahead: self.ahead.clone(),
             allow: self.allow.clone(),
             scope: Arc::clone(&self.scope),
-            proven: Arc::clone(&self.proven),
+            proven: self.proven.clone(),
             reserved,
             fill: Fill::new(Caps::current(), self.fill.other_lineages()),
             bound: self.bound,

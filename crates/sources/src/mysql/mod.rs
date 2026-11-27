@@ -46,6 +46,7 @@ mod mysql_forward_proof;
 mod mysql_helpers;
 mod mysql_history;
 mod mysql_proof_scanner;
+mod mysql_proven_index;
 mod mysql_read_ahead;
 mod mysql_selection;
 mod mysql_session;
