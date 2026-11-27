@@ -754,7 +754,7 @@ pub(super) async fn maybe_window(
                 ahead,
                 ctx.allow.clone(),
                 scope,
-                std::sync::Arc::new(ctx.selection.proven_keys()),
+                ctx.selection.proven_snapshot(),
                 reserved,
                 Fill::new(Caps::current(), lineages),
                 &cfg,
