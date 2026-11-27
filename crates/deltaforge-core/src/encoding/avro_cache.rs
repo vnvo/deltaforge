@@ -209,7 +209,7 @@ impl<V: Clone + Evict> SchemaCache<V> {
 /// overhead grows with eviction churn).
 pub fn default_schema_cache_bytes() -> u64 {
     static DEFAULT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *DEFAULT.get_or_init(|| default_bound(memory_limit()))
+    *DEFAULT.get_or_init(|| default_bound(crate::memory_limit::memory_limit()))
 }
 
 const MIB: u64 = 1024 * 1024;
@@ -220,25 +220,6 @@ fn default_bound(memory_limit: Option<u64>) -> u64 {
         Some(limit) => (limit / 6).clamp(64 * MIB, 4 * GIB),
         None => GIB,
     }
-}
-
-/// The process's cgroup memory limit (v2 `memory.max`, else v1
-/// `memory.limit_in_bytes`), `None` when unlimited or unreadable.
-fn memory_limit() -> Option<u64> {
-    [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ]
-    .iter()
-    .find_map(|p| std::fs::read_to_string(p).ok())
-    .and_then(|s| parse_limit(&s))
-}
-
-/// A cgroup limit file's value: `max` (v2) and v1's page-rounded
-/// `i64::MAX` mean no limit.
-fn parse_limit(text: &str) -> Option<u64> {
-    let n: u64 = text.trim().parse().ok()?;
-    (n < 1 << 60).then_some(n)
 }
 
 #[cfg(test)]
@@ -252,10 +233,6 @@ mod tests {
         assert_eq!(default_bound(Some(256 * MIB)), 64 * MIB, "floor");
         assert_eq!(default_bound(Some(64 * GIB)), 4 * GIB, "cap");
         assert_eq!(default_bound(None), GIB, "no limit");
-        assert_eq!(parse_limit("6442450944\n"), Some(6 * GIB));
-        assert_eq!(parse_limit("max\n"), None);
-        assert_eq!(parse_limit("9223372036854771712\n"), None);
-        assert_eq!(parse_limit(""), None);
     }
 
     fn cache(limit: u64) -> SchemaCache<u32> {

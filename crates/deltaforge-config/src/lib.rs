@@ -564,9 +564,9 @@ pub struct MysqlSrcCfg {
     )]
     pub decode_workers: Option<usize>,
     /// The byte bound of the source's selection cache (validated timelines
-    /// and selected schemas of its active tables): absent keeps the default
-    /// ([`MYSQL_SELECTION_CACHE_BYTES_DEFAULT`]). Within
-    /// [`MYSQL_SELECTION_CACHE_BYTES`].
+    /// and selected schemas of its active tables): absent, a quarter of the
+    /// process's memory limit, 256 MiB to 8 GiB (1 GiB with no limit).
+    /// Within [`MYSQL_SELECTION_CACHE_BYTES`].
     #[serde(
         default,
         deserialize_with = "bounded_selection_cache_bytes",
@@ -577,9 +577,6 @@ pub struct MysqlSrcCfg {
 
 /// Most decode workers a MySQL source may configure.
 pub const MYSQL_DECODE_WORKERS_MAX: usize = 64;
-
-/// The selection cache's bound when a MySQL source sets none: 256 MiB.
-pub const MYSQL_SELECTION_CACHE_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
 
 /// The bounds a MySQL source's `selection_cache_bytes` may take: 16 MiB to
 /// 10 GiB, enough for about 1M active tables of distinct definitions (about

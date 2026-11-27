@@ -47,6 +47,7 @@ pub use event_id::{
 };
 
 pub mod journal;
+pub mod memory_limit;
 pub use journal::{DlqMeta, JournalEntry};
 
 pub mod canonical;
