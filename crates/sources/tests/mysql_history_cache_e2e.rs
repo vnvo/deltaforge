@@ -446,3 +446,47 @@ async fn evicted_tables_return_in_batched_reads() {
          not batched (ceiling {ceiling})"
     );
 }
+
+/// Tables an activation window admits are dispatched from the cache: the
+/// version each one registered in the window's commit is cached with it, so
+/// their first rows read no version back from the store (an index lookup
+/// and a log read each).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn admitted_tables_read_no_version_back() {
+    const N: usize = 300;
+    let (container, port) = start().await;
+    let mut ddl = vec![format!("CREATE DATABASE {DB}")];
+    ddl.extend((0..N).map(|i| {
+        format!("CREATE TABLE {DB}.t{i:03} (id INT PRIMARY KEY, v INT)")
+    }));
+    sql(port, &ddl).await;
+    let counting =
+        Arc::new(CountingBackend::new(Arc::new(MemoryStorageBackend::new())));
+    let (handle, rows) =
+        run(port, "hist-admitted", &counting, MysqlProofCfg::default()).await;
+    counting.record_keys(true);
+    sql_at_once(
+        port,
+        &(0..N)
+            .map(|i| format!("INSERT INTO {DB}.t{i:03} VALUES (1, 1)"))
+            .collect::<Vec<_>>(),
+    )
+    .await;
+    delivered(&rows, N, 1).await;
+    exactly(&rows, N, 1);
+    let version_reads = counting
+        .reads()
+        .iter()
+        .filter(|r| {
+            r.primitive == "log_read_meta_since" && r.ns == "schemas.v1"
+        })
+        .count();
+    handle.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(30), handle.join).await;
+    container.rm().await.ok();
+    assert_eq!(
+        version_reads, 0,
+        "{version_reads} versions of {N} admitted tables read back from the store"
+    );
+}

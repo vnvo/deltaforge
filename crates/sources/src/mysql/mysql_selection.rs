@@ -1246,13 +1246,19 @@ impl Caches {
     }
 
     /// An atomic batch committed the record admitted into `timeline`: it is
-    /// the table's timeline now (see [`Self::install`]).
+    /// the table's timeline now (see [`Self::install`]). `version`, the
+    /// version the same batch registered for it, is cached with it, so the
+    /// table's first rows do not read it back.
     pub(crate) fn install_committed(
         &mut self,
         key: &SchemaKey,
         timeline: Arc<Timeline>,
+        version: Option<schema_registry::SchemaVersion>,
     ) {
         self.install(key, timeline);
+        if let Some(v) = version {
+            self.put_version(key.backend_key(), v);
+        }
     }
 
     /// Install `timeline` for `key` only while the cache still holds

@@ -2382,8 +2382,20 @@ async fn admit_batch(
                 Some((op, _, mut augmented)) => {
                     augmented.table_head =
                         seqs[op].expect("a committed log write");
-                    ctx.selection
-                        .install_committed(key, std::sync::Arc::new(augmented));
+                    // The version this batch registered for it, as the
+                    // registry reads it back.
+                    let version = req_of[i]
+                        .and_then(|r| Some((r, reg_entry[r]?.1)))
+                        .and_then(|(r, e)| {
+                            regs[r].committed_version(
+                                seqs[e].expect("a committed log write"),
+                            )
+                        });
+                    ctx.selection.install_committed(
+                        key,
+                        std::sync::Arc::new(augmented),
+                        version,
+                    );
                     governs.push((
                         (db.clone(), table.clone()),
                         at.clone(),
