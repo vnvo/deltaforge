@@ -223,6 +223,23 @@ pub struct PlannedRegistration {
     entry: Option<LogEntry>,
 }
 
+impl PlannedRegistration {
+    /// The version this registration's entry is, once committed at `seq`:
+    /// what [`DurableSchemaRegistry::get_version`] reads back for it. `None`
+    /// when it writes no entry (the version was registered before).
+    pub fn committed_version(&self, seq: u64) -> Option<SchemaVersion> {
+        let entry = self.entry.as_ref()?;
+        Some(SchemaVersion {
+            version: self.version,
+            hash: entry.hash.clone(),
+            schema_json: entry.schema_json.clone(),
+            registered_at: entry.registered_at,
+            sequence: seq,
+            checkpoint: entry.checkpoint.clone(),
+        })
+    }
+}
+
 /// The outcome of [`DurableSchemaRegistry::plan_registrations`].
 #[derive(Debug, Clone)]
 pub enum RegistrationPlanning {
@@ -1177,20 +1194,11 @@ impl DurableSchemaRegistry {
     /// A planned registration committed with its entry at `seq`: the cache
     /// and the sequence high-water learn it. Only after the commit.
     pub fn admit_committed(&self, reg: &PlannedRegistration, seq: u64) {
-        let Some(entry) = &reg.entry else { return };
+        let Some(version) = reg.committed_version(seq) else {
+            return;
+        };
         self.sequence.fetch_max(seq, Ordering::SeqCst);
-        self.cache_admit(
-            &reg.key.backend_key(),
-            &reg.key,
-            SchemaVersion {
-                version: reg.version,
-                hash: entry.hash.clone(),
-                schema_json: entry.schema_json.clone(),
-                registered_at: entry.registered_at,
-                sequence: seq,
-                checkpoint: entry.checkpoint.clone(),
-            },
-        );
+        self.cache_admit(&reg.key.backend_key(), &reg.key, version);
     }
 
     // ---- legacy reads + proof-gated adoption mechanics --------------------
@@ -3027,6 +3035,56 @@ mod tests {
                 schema_json: json!({"cols": [hash]}),
                 checkpoint: Some(b"cp".to_vec()),
             }
+        }
+
+        /// A committed registration's version is what the store reads back
+        /// for it, field by field (a first version, a later one and a
+        /// second table); one that writes no entry (a known shape) has none.
+        #[tokio::test]
+        async fn a_committed_version_is_what_the_store_reads_back() {
+            let (_f, b) = backend();
+            let r = reg(&b).await;
+            let (a, c) = (skey("src", "lin", "t1"), skey("src", "lin", "t2"));
+            plan_and_commit(&r, &b, &[req(&a, "h1")]).await.unwrap();
+            let reqs = [req(&a, "h2"), req(&c, "h1"), req(&a, "h1")];
+            let RegistrationPlanning::Planned {
+                preconditions,
+                registrations,
+            } = r.plan_registrations(&reqs, Utc::now()).await.unwrap()
+            else {
+                panic!("needs repair");
+            };
+            let mut batch = AtomicBatch {
+                preconditions,
+                ops: Vec::new(),
+            };
+            let bases: Vec<usize> = registrations
+                .iter()
+                .map(|p| batch.push_group(p.ops.clone()))
+                .collect();
+            let CommitResult::Committed(seqs) =
+                commit_atomic(b.as_ref(), &batch, 3).await.unwrap()
+            else {
+                panic!("conflict");
+            };
+            let mut compared = 0;
+            for (p, base) in registrations.iter().zip(bases) {
+                let Some(e) = p.entry_op else {
+                    assert!(p.committed_version(1).is_none(), "{p:?}");
+                    continue;
+                };
+                let got = p.committed_version(seqs[base + e].unwrap()).unwrap();
+                let stored =
+                    r.get_version(&p.key, p.version).await.unwrap().unwrap();
+                assert_eq!(got.version, stored.version);
+                assert_eq!(got.hash, stored.hash);
+                assert_eq!(got.schema_json, stored.schema_json);
+                assert_eq!(got.sequence, stored.sequence);
+                assert_eq!(got.checkpoint, stored.checkpoint);
+                assert_eq!(got.registered_at, stored.registered_at);
+                compared += 1;
+            }
+            assert_eq!(compared, 2, "two new entries, one known shape");
         }
 
         /// A new table, a new shape of a known table and a known shape:

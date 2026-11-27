@@ -4721,10 +4721,12 @@ mod tests {
             all.into_iter().next().unwrap()
         }
 
-        /// The DDL on `t`, then a second session that owns a GTID in an open
-        /// transaction (a row of the database's `other` table), so the
-        /// proof's captures wait at their ends until [`Blocker::release`]:
-        /// a transient capture failure that takes no lock.
+        /// A second session that owns a GTID in an open transaction (a row of
+        /// the database's `other` table), then the DDL on `t`, so the proof's
+        /// captures wait at their ends until [`Blocker::release`]: a
+        /// transient capture failure that takes no lock. The GTID is owned
+        /// before the DDL is written: a proof that captured between the two
+        /// would find nothing owned and never wait.
         struct Blocker {
             port: u16,
             held: mysql_async::Conn,
@@ -4732,7 +4734,6 @@ mod tests {
 
         impl Blocker {
             async fn alter(port: u16, t: &str, ddl: &str) -> Self {
-                sql(port, &[&format!("ALTER TABLE {t} {ddl}")]).await;
                 let db = t.split_once('.').expect("db.table").0;
                 let gno = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -4752,6 +4753,7 @@ mod tests {
                 ] {
                     held.query_drop(q).await.unwrap();
                 }
+                sql(port, &[&format!("ALTER TABLE {t} {ddl}")]).await;
                 Self { port, held }
             }
 
