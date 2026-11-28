@@ -20,6 +20,7 @@ pub mod evidence;
 pub mod fixture;
 pub mod ledger;
 pub mod measure;
+pub mod neighbour;
 pub mod pgqual;
 pub mod pgqual_check;
 pub mod results;

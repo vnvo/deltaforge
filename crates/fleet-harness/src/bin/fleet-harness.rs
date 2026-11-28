@@ -37,6 +37,18 @@ enum Cmd {
     },
     /// Print the pipeline specs the run would create.
     Render { config: String },
+    /// Run the configuration's neighbour workload alone on its first server
+    /// for `secs` (its calibration): records to `<out>/neighbour-<server>.jsonl`.
+    Neighbour {
+        config: String,
+        #[arg(long)]
+        secs: u64,
+        /// Override the configured offered rate.
+        #[arg(long)]
+        ops_per_sec: Option<f64>,
+        #[arg(long, default_value = ".")]
+        out: String,
+    },
     /// Run the configured scenario for every source count and repetition.
     Run {
         config: String,
@@ -142,6 +154,35 @@ async fn main() -> Result<()> {
                     )?)?
                 );
             }
+        }
+        Cmd::Neighbour {
+            config,
+            secs,
+            ops_per_sec,
+            out,
+        } => {
+            let mut cfg = RunConfig::load(&config)?;
+            let n = cfg
+                .neighbour
+                .as_mut()
+                .context("the configuration has no neighbour section")?;
+            if let Some(r) = ops_per_sec {
+                n.ops_per_sec = r;
+            }
+            cfg.validate()?;
+            let server = cfg.topology.servers[0].clone();
+            let running = fleet_harness::neighbour::start(
+                &cfg,
+                &server,
+                std::path::Path::new(&out),
+            )
+            .await?;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(secs)) => {}
+                why = stop_signal() => eprintln!("{why}: stopping the neighbour"),
+            }
+            let s = running.finish().await?;
+            println!("{}", serde_json::to_string_pretty(&s)?);
         }
         Cmd::Run {
             config,
