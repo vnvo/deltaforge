@@ -84,6 +84,10 @@ cargo run --release -p fleet-harness -- pg-qualify crates/fleet-harness/qualific
 # Run the configured scenario at every source count and repetition.
 cargo run --release -p fleet-harness -- run crates/fleet-harness/configs/t1-exploratory.yaml
 
+# The configuration's neighbour workload alone, for its calibration (records
+# to <out>/neighbour-<server>.jsonl).
+cargo run --release -p fleet-harness -- neighbour <config>.yaml --secs 90 --ops-per-sec 4000 --out cal
+
 # One cell of the physical state-store matrix, on an empty PostgreSQL store.
 cargo run --release -p fleet-harness -- store-matrix --dsn postgres://... \
   --sources 1 --tables-per-source 400000 --versions-changed 10 --changed-fraction 0.1
@@ -165,6 +169,28 @@ configuration. `{server}`, `{pipeline}` and `{pid}` are substituted.
 An action whose hook or proxy is missing is recorded as **not run** in the
 result, never silently skipped.
 
+## Neighbour workload
+
+An optional `neighbour:` section adds load the pipelines do not capture, on a
+database outside the captured prefix of each server: `database`, `tables`,
+`rows_per_table`, `connections`, `ops_per_sec`, `mix` (`point_select`,
+`update`, `insert`, summing to 1), `lead_secs` and `interval_secs`. The tables
+(`<database>.t0` and on, `id BIGINT PRIMARY KEY, k INT, c CHAR(120),
+pad CHAR(60)`) must be built and filled first; the workload refuses to start
+otherwise.
+
+- **Open loop:** each connection runs a fixed schedule, and latency counts from
+  the scheduled start, so a stall shows as latency instead of a lower rate.
+- **No self-contention:** each connection updates only its own rows and inserts
+  ids unique to the connection and the run, so any row lock wait it records is
+  someone else's.
+- **Records:** every `interval_secs`, `neighbour-<server>.jsonl` in the run
+  directory holds the interval's started and done operations, errors, latency
+  (p50, p99, p99.9, max) and the server's row lock and metadata lock wait
+  counters; `neighbour-<server>-summary.json` holds the totals.
+- **In a run** it starts before the pipelines, runs alone for `lead_secs` (the
+  baseline), and stops with the writers.
+
 ## Not covered yet
 
 Each result records these:
@@ -183,4 +209,9 @@ Each result records these:
 
   ```bash
   cargo test -p fleet-harness --test harness_smoke -- --include-ignored --test-threads=1
+  ```
+- Neighbour workload against MySQL 8.4 (Docker):
+
+  ```bash
+  cargo test -p fleet-harness --test neighbour_live -- --include-ignored
   ```

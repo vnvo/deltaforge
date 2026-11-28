@@ -144,6 +144,82 @@ pub struct RunConfig {
     pub actions: BTreeMap<String, String>,
     pub measure: Measure,
     pub run: Run,
+    /// A loaded-source run's neighbour workload ([`crate::neighbour`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub neighbour: Option<Neighbour>,
+}
+
+/// An open-loop OLTP load on tables outside the captured databases, on
+/// every server of the run: `<database>.t0` .. `t<tables - 1>`, each with
+/// the filled rows `1..=rows_per_table` (`id BIGINT PRIMARY KEY, k INT,
+/// c CHAR(120), pad CHAR(60)`), built before the run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Neighbour {
+    pub database: String,
+    pub tables: u32,
+    pub rows_per_table: u64,
+    pub connections: u32,
+    /// Offered operations per second per server, on a fixed schedule.
+    pub ops_per_sec: f64,
+    pub mix: NeighbourMix,
+    /// Seconds the neighbour runs alone before the pipelines are created.
+    #[serde(default)]
+    pub lead_secs: u64,
+    #[serde(default = "default_interval")]
+    pub interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NeighbourMix {
+    /// Select by primary key, any row.
+    pub point_select: f64,
+    /// Update by primary key, a row the connection owns.
+    pub update: f64,
+    /// Insert with an id unique to the connection and the run.
+    pub insert: f64,
+}
+
+impl Neighbour {
+    fn validate(&self, database_prefix: &str) -> Result<()> {
+        if self.database.is_empty()
+            || !self
+                .database
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            bail!("neighbour.database must be a plain identifier");
+        }
+        if self.database.starts_with(database_prefix) {
+            bail!(
+                "neighbour.database {} is inside the captured prefix {database_prefix}",
+                self.database
+            );
+        }
+        if self.tables == 0 || self.rows_per_table == 0 || self.connections == 0
+        {
+            bail!(
+                "neighbour.tables, rows_per_table and connections must be positive"
+            );
+        }
+        if u64::from(self.connections) > self.rows_per_table {
+            bail!(
+                "neighbour.connections must not exceed rows_per_table (each owns rows)"
+            );
+        }
+        if !(self.ops_per_sec.is_finite() && self.ops_per_sec > 0.0) {
+            bail!("neighbour.ops_per_sec must be positive");
+        }
+        let m = self.mix;
+        let shares = [m.point_select, m.update, m.insert];
+        if shares.iter().any(|s| !(s.is_finite() && *s >= 0.0))
+            || (shares.iter().sum::<f64>() - 1.0).abs() > 1e-6
+        {
+            bail!("neighbour.mix must be non-negative shares summing to 1");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -616,6 +692,9 @@ impl RunConfig {
         {
             bail!("run.restart_after_drain needs a backlog drain (D1 or D2)");
         }
+        if let Some(n) = &self.neighbour {
+            n.validate(&self.topology.database_prefix)?;
+        }
         Ok(())
     }
 
@@ -754,6 +833,39 @@ pub(crate) mod tests {
         assert!(cfg.proof_trace_required());
         cfg.deltaforge.proof_trace = None;
         assert!(!cfg.proof_trace_required(), "nothing requested");
+    }
+
+    /// A neighbour section parses and is checked: it must stay outside the
+    /// captured databases, and its shares and sizes must make sense.
+    #[test]
+    fn a_neighbour_is_validated_outside_the_captured_prefix() {
+        let mut cfg: RunConfig = serde_yaml::from_str(EXAMPLE).unwrap();
+        assert!(cfg.neighbour.is_none(), "absent by default");
+        let n: Neighbour = serde_yaml::from_str(
+            "{database: oltp, tables: 8, rows_per_table: 250000, connections: 16, \
+             ops_per_sec: 2000, mix: {point_select: 0.7, update: 0.2, insert: 0.1}, lead_secs: 300}",
+        )
+        .unwrap();
+        assert_eq!(n.interval_secs, 5);
+        cfg.neighbour = Some(n.clone());
+        cfg.validate().unwrap();
+        let prefix = cfg.topology.database_prefix.clone();
+        let bad = |f: &dyn Fn(&mut Neighbour)| {
+            let mut c = cfg.clone();
+            f(c.neighbour.as_mut().unwrap());
+            c.validate().unwrap_err().to_string()
+        };
+        assert!(
+            bad(&|n| n.database = format!("{prefix}x"))
+                .contains("captured prefix")
+        );
+        assert!(
+            bad(&|n| n.database = "a-b".into()).contains("plain identifier")
+        );
+        assert!(bad(&|n| n.mix.insert = 0.2).contains("summing to 1"));
+        assert!(bad(&|n| n.ops_per_sec = 0.0).contains("ops_per_sec"));
+        assert!(bad(&|n| n.connections = 0).contains("positive"));
+        assert!(bad(&|n| n.rows_per_table = 4).contains("owns rows"));
     }
 
     #[test]

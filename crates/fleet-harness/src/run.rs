@@ -463,6 +463,26 @@ async fn run_inner(
         .as_ref()
         .map(|t| crate::trace::mark(t, Utc::now()));
 
+    // The neighbour workload (a loaded-source run): checked and started on
+    // every server before any pipeline, then alone for its lead.
+    let mut neighbours = Vec::new();
+    if let Some(nb) = &cfg.neighbour {
+        stage("neighbour");
+        for (_, s) in &servers {
+            neighbours.push(crate::neighbour::start(&cfg, s, &dir).await?);
+        }
+        let lead = tokio::time::sleep(Duration::from_secs(nb.lead_secs));
+        match opts.abort.clone() {
+            Some(mut a) => {
+                tokio::select! {
+                    _ = lead => {}
+                    _ = a.wait_for(|r| r.is_some()) => {}
+                }
+            }
+            None => lead.await,
+        }
+    }
+
     // Pipelines.
     stage("pipelines");
     let api = Api::new(&cfg.deltaforge.api_url)?;
@@ -766,6 +786,26 @@ async fn run_inner(
     // after every writer has finished and the committed counts are final.
     stage("drain");
     monitor.abort();
+    // The neighbour stops with the writers; its summary is kept with the run.
+    for nb in neighbours {
+        let name = format!("neighbour-{}-summary.json", nb.server());
+        let server = nb.server().to_string();
+        let v = match nb.finish().await {
+            Ok(s) => serde_json::to_value(&s).unwrap_or_default(),
+            Err(e) => {
+                serde_json::json!({"server": server, "error": format!("{e:#}")})
+            }
+        };
+        match serde_json::to_vec_pretty(&v) {
+            Ok(b) => {
+                if let Err(e) = std::fs::write(dir.join(&name), b) {
+                    eprintln!("  neighbour: {name} not written: {e}");
+                }
+            }
+            Err(e) => eprintln!("  neighbour: summary: {e}"),
+        }
+        eprintln!("  neighbour: {v}");
+    }
     let paused = shared.paused.lock().take();
     let (writer_errors, final_counters) =
         crate::backlog::after_writers(&driver_stop_tx, writers, || async {
